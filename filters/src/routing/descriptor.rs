@@ -161,7 +161,8 @@ pub(crate) struct CandidateConfig {
     /// Site that owns this capability.
     pub site: String,
 
-    /// Optional bounded weight used only by weighted selection.
+    /// Optional weight for an overlay using `selection_policy.mode: weightedRandom`.
+    /// Inline static candidates cannot use traffic weights.
     #[serde(default)]
     pub traffic_weight: Option<u32>,
 }
@@ -229,6 +230,39 @@ pub(crate) struct RouteCandidate {
 
     /// Deterministic identifier for session affinity binding.
     pub stable_id: Arc<str>,
+
+    /// Complete provider routing profile from a trusted, versioned overlay.
+    pub provider_profile: Option<ProviderProfile>,
+}
+
+/// API dialect for a trusted provider route profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderApiFormat {
+    /// OpenAI Chat Completions-compatible provider.
+    OpenAiChat,
+    /// Anthropic Messages provider.
+    Messages,
+}
+
+impl ProviderApiFormat {
+    /// Return the stable external metadata spelling.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiChat => "openai-chat",
+            Self::Messages => "messages",
+        }
+    }
+}
+
+/// Fields that must be selected and validated as one provider route profile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderProfile {
+    /// Provider request dialect.
+    pub api_format: ProviderApiFormat,
+    /// Provider request path.
+    pub path: Arc<str>,
+    /// Provider target model name.
+    pub target_model: Arc<str>,
 }
 
 // -----------------------------------------------------------------------------
@@ -258,15 +292,26 @@ pub(crate) fn default_stable_id(kind: CapabilityKind, name: &str, site: &str, cl
 /// # Errors
 ///
 /// Returns [`FilterError`] if:
-/// - the candidate list is empty or exceeds [`MAX_CANDIDATES`]
+/// - the static or legacy candidate list is empty or exceeds [`MAX_CANDIDATES`]
 /// - any name/site/cluster field is blank or oversized
 /// - duplicate (kind, name, site, cluster) tuples exist
-#[expect(
-    clippy::too_many_lines,
-    reason = "single validation loop, splitting hurts readability"
-)]
 pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
-    if raw.is_empty() {
+    validate_candidates_with_empty(raw, false)
+}
+
+/// Validate candidates from the versioned routing-overlay contract, where an
+/// empty list is an authoritative no-route revision.
+pub(crate) fn validate_overlay_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
+    validate_candidates_with_empty(raw, true)
+}
+
+/// Apply the shared candidate invariants with an explicit empty-list policy.
+#[expect(clippy::too_many_lines, reason = "candidate validation is one cohesive pass")]
+fn validate_candidates_with_empty(
+    raw: Vec<CandidateConfig>,
+    allow_empty: bool,
+) -> Result<Vec<RouteCandidate>, FilterError> {
+    if raw.is_empty() && !allow_empty {
         return Err("routing: candidates list must not be empty".into());
     }
     if raw.len() > MAX_CANDIDATES {
@@ -307,6 +352,7 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
             selection_tier: None,
             site: Arc::from(c.site.as_str()),
             stable_id,
+            provider_profile: None,
         });
     }
 
@@ -356,13 +402,8 @@ pub(crate) fn validate_local_site(value: &str) -> Result<(), FilterError> {
     validate_name("local_site", value)
 }
 
-/// Validate a cluster identifier used outside an inline candidate.
-pub(crate) fn validate_cluster_name(field: &str, value: &str) -> Result<(), FilterError> {
-    validate_name(field, value)
-}
-
 /// Validate a bounded, non-blank identifier.
-fn validate_name(field: &str, value: &str) -> Result<(), FilterError> {
+pub(crate) fn validate_name(field: &str, value: &str) -> Result<(), FilterError> {
     if value.trim().is_empty() || value.len() > MAX_NAME_LEN {
         return Err(format!("routing: {field} must be 1-{MAX_NAME_LEN} non-blank characters").into());
     }

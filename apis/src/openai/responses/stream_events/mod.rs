@@ -21,7 +21,7 @@ mod config;
 mod local_tools;
 
 use std::{
-    collections::{BTreeSet, hash_map::DefaultHasher},
+    collections::{BTreeSet, HashMap, hash_map::DefaultHasher},
     hash::{Hash as _, Hasher as _},
     time::{Duration, Instant},
 };
@@ -30,8 +30,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState,
-    StreamTerminationCause, SubRequestResponseMode, parse_filter_config,
+    StreamBodySuppressed, StreamTerminationCause, SubRequestResponseMode, parse_filter_config,
 };
+use serde::{Serialize, ser::SerializeMap as _};
 use serde_json::Value;
 use tracing::{debug, trace, warn};
 
@@ -48,7 +49,7 @@ use crate::{
         responses::{
             error::{responses_error_rejection, responses_error_sse_payload},
             openai_client_tool_compat::{restore_snapshot, restore_snapshot_tools},
-            state::{EmittedItem, ResponsesState},
+            state::{ClientToolRestore, EmittedItem, ResponsesState},
         },
         sse::{SseFrame, SseFrameParser, SseParseError, SseParserConfig, responses::ResponsesEvent},
     },
@@ -60,6 +61,22 @@ struct DeferredTerminalEvent {
     event_type: String,
     /// Parsed event payload.
     payload: Value,
+}
+
+/// An output-item SSE event held behind an earlier still-deferred opening (#1767).
+///
+/// Held as a parsed event plus its planned disposition so it is rendered — and
+/// `sequence_number`-stamped — in emission order once the earlier opening is announced,
+/// never in the (different) order it arrived relative to the deferred opening.
+struct StagedEvent {
+    /// Raw output index the held event carries, used to order releases.
+    output_index: u64,
+    /// Serialized byte size, charged against and refunded from the retained-byte total.
+    byte_len: usize,
+    /// The deferred event.
+    event: ResponsesEvent,
+    /// Its planned client-tool disposition.
+    disposition: client_tools::ClientToolDisposition,
 }
 
 /// Completion state observed while parsing a Responses SSE stream.
@@ -94,7 +111,7 @@ pub(super) struct StreamEventsState {
     /// Stream completion state (`Open` / `TerminalLifecycle` / `Error`).
     completion_state: CompletionState,
     /// Accumulated function-call argument deltas, keyed by item id or output index.
-    tool_call_args: std::collections::HashMap<String, String>,
+    tool_call_args: HashMap<String, String>,
     /// Tool-call keys whose arguments exceeded the configured byte cap.
     rejected_tool_call_args: std::collections::HashSet<String>,
     /// Cap on accumulated bytes per tool-call argument string.
@@ -124,18 +141,39 @@ pub(super) struct StreamEventsState {
     /// most once per round rather than re-serializing every local item ahead of
     /// each resumed event.
     local_items_flushed: bool,
+    /// This round's local tool events were reserved before chunk emission.
+    local_synthesis_reserved: bool,
     /// Locally-executable tool items opened this round, keyed by `item:{id}` and
     /// `index:{output_index}` → suppression mode (§4.1). Transient per-round: created
     /// in `arm()`, dropped when the state is removed at `finalize_logical_stream`.
-    local_tool_items: std::collections::HashMap<String, local_tools::LocalToolMode>,
+    local_tool_items: HashMap<String, local_tools::LocalToolMode>,
     /// #1159: lowered client-tool items tracked across their streaming lifecycle,
     /// so the plan pass can enforce lifecycle order and (Tasks 5-7) synthesize the
     /// typed restoration. Empty for native (non-lowered) traffic.
     client_tool_items: Vec<client_tools::ClientToolStreamItem>,
+    /// #1767: output indices of deferred `Shell`/`ToolSearch` openings whose typed
+    /// `output_item.added` has not yet been synthesized. A suppressed raw `added`
+    /// records its index here; the synthesized typed `added` at `arguments.done`
+    /// clears it. While any is pending, later output-item events are staged so the
+    /// deferred opening is still announced before them (the OpenAI SDK's streaming
+    /// accumulator requires contiguous, ascending opening order).
+    client_tool_pending_opens: BTreeSet<u64>,
+    /// #1767: output-item events held behind an earlier pending deferred opening.
+    /// Held as parsed events (not serialized bytes) so they are rendered — and
+    /// `sequence_number`-stamped — in emission order once the earlier opening is
+    /// announced. Empty unless a deferred opening is overtaken by a later item, so
+    /// native and in-order lowered traffic pay nothing.
+    client_tool_staged: Vec<StagedEvent>,
+    /// #1767: running serialized byte size of `client_tool_staged`, charged against
+    /// `max_accumulated_bytes` so a deferred opening cannot retain an unbounded
+    /// volume of later events (text/reasoning deltas are otherwise un-accumulated).
+    client_tool_staged_bytes: usize,
     /// #1159 C1: once any chunk fails, the whole logical stream is poisoned; every
     /// later chunk is dropped closed so a post-failure event (e.g. a co-batched
     /// lowered `output_item.done` whose `.added` was rolled back) cannot emit.
     stream_failed: bool,
+    /// Budget exhaustion suppresses any later local synthesis or success tail.
+    retained_budget_failed: bool,
 }
 
 /// Composes the current IRR execution into one logical Responses stream.
@@ -144,8 +182,8 @@ pub(super) struct StreamEventsState {
 /// elsewhere is a misconfiguration and fails closed at request time.
 /// Place it after `load_balancer` so IRR body hooks run with a selected
 /// peer when needed. `timeout_secs` is an absolute deadline from the first
-/// SSE chunk; each chunk recaps the remaining time onto the live body through
-/// [`praxis_filter::HttpFilterContext::cap_stream_read_timeout`].
+/// SSE chunk; each chunk recaps that absolute cutoff onto the live body through
+/// [`praxis_filter::HttpFilterContext::cap_stream_deadline`].
 ///
 /// # YAML
 ///
@@ -159,7 +197,7 @@ pub(super) struct StreamEventsState {
 /// # max_accumulated_bytes: 67108864
 /// # max_output_items: 100000
 /// ```
-pub struct OpenaiStreamEventsFilter {
+pub struct StreamEventsFilter {
     /// Configuration for the SSE frame parser.
     parser_config: SseParserConfig,
     /// Cap on accumulated bytes per tool-call argument string.
@@ -170,7 +208,7 @@ pub struct OpenaiStreamEventsFilter {
     max_output_items: usize,
 }
 
-impl OpenaiStreamEventsFilter {
+impl StreamEventsFilter {
     /// Create a filter from parsed YAML config.
     ///
     /// # Errors
@@ -215,7 +253,7 @@ impl OpenaiStreamEventsFilter {
             started_at: None,
             completed_at: None,
             completion_state: CompletionState::Open,
-            tool_call_args: std::collections::HashMap::new(),
+            tool_call_args: HashMap::new(),
             rejected_tool_call_args: std::collections::HashSet::new(),
             max_tool_call_argument_bytes: self.max_tool_call_argument_bytes,
             max_accumulated_bytes: self.max_accumulated_bytes,
@@ -225,9 +263,14 @@ impl OpenaiStreamEventsFilter {
             deferred_terminal: None,
             deferred_done: false,
             local_items_flushed: false,
-            local_tool_items: std::collections::HashMap::new(),
+            local_synthesis_reserved: false,
+            local_tool_items: HashMap::new(),
             client_tool_items: Vec::new(),
+            client_tool_pending_opens: BTreeSet::new(),
+            client_tool_staged: Vec::new(),
+            client_tool_staged_bytes: 0,
             stream_failed: false,
+            retained_budget_failed: false,
         }
     }
 
@@ -305,7 +348,7 @@ impl OpenaiStreamEventsFilter {
 
 /// Outcome of the request-phase IRR-placement guard.
 ///
-/// Factored out of [`OpenaiStreamEventsFilter`]'s `on_request` so the guard's
+/// Factored out of [`StreamEventsFilter`]'s `on_request` so the guard's
 /// fail-closed decision table — the invariant that logical composition only
 /// arms inside an `iterative_request_router` step — is exhaustively unit
 /// testable. The runtime signal it depends on, an [`IterationState`] in request
@@ -347,9 +390,9 @@ const fn arm_decision(is_streaming_responses: bool, inside_irr: bool) -> ArmDeci
 ///
 /// The `iterative_request_router` runner moves request extensions into each
 /// step but builds a fresh `filter_metadata` map, so metadata set by pre-IRR
-/// filters (e.g. `openai_responses_format`) is not visible here. `ResponsesState`
+/// filters (e.g. `openai_responses_request`) is not visible here. `ResponsesState`
 /// is created pre-IRR and travels through extensions, so fall back to it for
-/// format and stream detection — mirroring how `responses_to_chat_completions`
+/// format and stream detection — mirroring how `openai_responses_to_chat_completions`
 /// resolves `request_is_streaming`. `IterationState` is inserted by the IRR
 /// runner before the request phase of every iteration (including iteration 0),
 /// so its presence is the runtime signal that the filter is placed inside an
@@ -371,16 +414,16 @@ fn arm_decision_for(ctx: &HttpFilterContext<'_>) -> ArmDecision {
         .unwrap_or(false);
     let is_responses = is_responses_create(&ctx.request.method, ctx.request.uri.path())
         && (typed_streaming
-            || ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+            || ctx.get_metadata("openai_responses_request.format") == Some("openai_responses")
             || has_responses_state);
     let is_streaming =
-        typed_streaming || ctx.get_metadata("openai_responses_format.stream") == Some("true") || body_stream;
+        typed_streaming || ctx.get_metadata("openai_responses_request.stream") == Some("true") || body_stream;
     let inside_irr = ctx.extensions.get::<IterationState>().is_some();
     arm_decision(is_responses && is_streaming, inside_irr)
 }
 
 #[async_trait]
-impl HttpFilter for OpenaiStreamEventsFilter {
+impl HttpFilter for StreamEventsFilter {
     fn name(&self) -> &'static str {
         "openai_stream_events"
     }
@@ -480,6 +523,13 @@ impl HttpFilter for OpenaiStreamEventsFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        // A request-phase terminal has already replaced this subrequest's body.
+        // Core runs completion hooks while suppressing the abandoned stream;
+        // those hooks must not synthesize a second terminal from empty input.
+        if ctx.extensions.get::<StreamBodySuppressed>().is_some() {
+            ctx.remove_filter_state::<StreamEventsState>();
+            return Ok(FilterAction::Continue);
+        }
         if !Self::is_armed(ctx) {
             debug!("stream_events not armed, passing through");
             return Ok(FilterAction::Continue);
@@ -505,7 +555,7 @@ fn stream_deadline_at(state: &StreamEventsState) -> Option<Instant> {
 /// Publish the absolute stream cutoff for the streaming executor to copy onto
 /// the live body after this body-filter pass.
 fn recap_stream_deadline(ctx: &mut HttpFilterContext<'_>, deadline: Instant) {
-    ctx.cap_stream_read_timeout(deadline.saturating_duration_since(Instant::now()));
+    ctx.cap_stream_deadline(deadline);
 }
 
 /// Whether an `Io` termination is the stream deadline, not a reset.
@@ -581,6 +631,11 @@ fn process_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
     // sticky before re-inserting state so the next chunk fails closed at the top
     // of `parse_and_accumulate` — a co-batched lowered `output_item.done` whose
     // `.added` was rolled back by this chunk must never emit its raw private name.
+    if matches!(&parsed, Err(SseParseError::RetainedPayloadLimitExceeded)) {
+        state.retained_budget_failed = true;
+        state.deferred_terminal = None;
+        state.deferred_done = false;
+    }
     if parsed.is_err() {
         state.stream_failed = true;
     }
@@ -616,8 +671,17 @@ fn handle_parse_result(
 }
 
 /// Record a parse failure and suppress unnormalized logical-stream bytes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one failure classification preserves the first sticky stream error"
+)]
 fn handle_parse_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, error: &SseParseError) {
     warn!(%error, "SSE parse error in stream_events");
+    if matches!(error, SseParseError::StreamPoisoned) && ctx.get_metadata("responses.stream_error_code").is_some() {
+        // Keep the first failure's client-visible cause on repeated input.
+        *body = None;
+        return;
+    }
     ctx.set_metadata("responses.stream_parse_error", "true".to_owned());
     ctx.set_metadata("responses.stream_error_code", "server_error");
     // M3: surface a client-tool-restore-specific message when the failure is a
@@ -626,6 +690,9 @@ fn handle_parse_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>,
     // dedicated message; all other error kinds keep the generic message.
     // Diagnostic-only — control flow is unchanged.
     match error {
+        SseParseError::RetainedPayloadLimitExceeded => {
+            record_retained_payload_failure(ctx);
+        },
         SseParseError::ClientToolRestore { reason, .. } => {
             ctx.set_metadata(
                 "responses.stream_error_message",
@@ -667,6 +734,26 @@ fn parse_and_accumulate(
 
     check_timeout(state, now)?;
 
+    // Charge the raw SSE transport before SseFrameParser copies a partial
+    // frame or ResponsesEvent allocates a parsed payload. The charge survives
+    // per-round re-arming in ResponsesState. A failed charge is sticky through
+    // stream_failed, so subsequent chunks cannot revive the logical stream.
+    if let Some(budget) = ctx
+        .extensions
+        .get_mut::<ResponsesState>()
+        .and_then(|responses| responses.simple_budget.as_mut())
+        && !budget.admit_stream_chunk(bytes)
+    {
+        return Err(SseParseError::RetainedPayloadLimitExceeded);
+    }
+
+    if !state.local_synthesis_reserved {
+        if !reserve_local_synthesis(ctx) {
+            return Err(SseParseError::RetainedPayloadLimitExceeded);
+        }
+        state.local_synthesis_reserved = true;
+    }
+
     // A prior chunk or round may have tripped the aggregate accumulation budget.
     // Fail every remaining chunk closed before parsing so a later terminal event
     // cannot commit on a poisoned stream. The budget is request-wide, so this
@@ -697,6 +784,89 @@ fn parse_and_accumulate(
     Ok((!logical_output.is_empty()).then(|| Bytes::from(logical_output)))
 }
 
+/// Preflight the local lifecycle envelopes while their canonical items are
+/// still borrowed. The later synthesis may clone an item into opening and done
+/// events and grow the encoded wire, so admission must precede that mutation.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one admission covers both local synthesis queues atomically"
+)]
+fn reserve_local_synthesis(ctx: &mut HttpFilterContext<'_>) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return true;
+    };
+    if state.simple_budget.is_none() {
+        return true;
+    }
+    let mut item_bytes = 0_usize;
+    let mut event_count = 0_usize;
+    let mut reserved_items = HashMap::new();
+    for (index, item) in state.accumulated_output.iter().enumerate() {
+        if !is_local_tool_item(item) {
+            continue;
+        }
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !state.locally_executed_output_items.contains(id)
+            || plan_pending_item(state.emitted_output_items.get(id), item, item_digest(item)).is_none()
+        {
+            continue;
+        }
+        if !count_unreserved_synthesis(state, index, &mut item_bytes, &mut event_count, &mut reserved_items) {
+            return false;
+        }
+    }
+    for (index, _) in &state.pending_local_tool_synthesis {
+        if !count_unreserved_synthesis(state, *index, &mut item_bytes, &mut event_count, &mut reserved_items) {
+            return false;
+        }
+    }
+    let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+        return false;
+    };
+    if !state
+        .simple_budget
+        .as_mut()
+        .is_some_and(|budget| budget.admit_stream_synthesis(item_bytes, event_count))
+    {
+        return false;
+    }
+    state.stream_synthesis_reserved.extend(reserved_items);
+    true
+}
+
+/// Count one new or changed local item once, even when both local flush and
+/// file-search synthesis reference the same absolute output index.
+fn count_unreserved_synthesis(
+    state: &ResponsesState,
+    index: usize,
+    item_bytes: &mut usize,
+    event_count: &mut usize,
+    reserved_items: &mut HashMap<usize, u64>,
+) -> bool {
+    let Some(item) = state.accumulated_output.get(index) else {
+        return false;
+    };
+    let digest = item_digest(item);
+    if state.stream_synthesis_reserved.get(&index) == Some(&digest) || reserved_items.contains_key(&index) {
+        return true;
+    }
+    let Some(bytes) = super::bounded_json_size(item, usize::MAX).ok().flatten() else {
+        return false;
+    };
+    let Some(next_bytes) = item_bytes.checked_add(bytes) else {
+        return false;
+    };
+    let Some(next_events) = event_count.checked_add(8) else {
+        return false;
+    };
+    *item_bytes = next_bytes;
+    *event_count = next_events;
+    reserved_items.insert(index, digest);
+    true
+}
+
 /// Phase 1: parse and validate every frame in a chunk before any mutation.
 ///
 /// Returns the parsed non-`[DONE]` events, failing closed on the first malformed
@@ -715,6 +885,14 @@ fn parse_chunk_events(
             continue;
         }
 
+        if let Some(budget) = ctx
+            .extensions
+            .get_mut::<ResponsesState>()
+            .and_then(|responses| responses.simple_budget.as_mut())
+            && !budget.admit_stream_frame(&frame.data)
+        {
+            return Err(SseParseError::RetainedPayloadLimitExceeded);
+        }
         state.event_count += 1;
         let event = ResponsesEvent::from_frame(frame)?;
         record_completion(state, &event, now)?;
@@ -737,14 +915,6 @@ fn parse_chunk_events(
 /// contributes to shared state, and the budget bounds total accumulated memory even
 /// when every individual event stays within `max_buffer_bytes`.
 ///
-/// The one accumulator whose growth is *not* bounded by the driving frame is the
-/// `tool_calls` list: a `function_call_arguments.done` clones the whole retained
-/// output item (whose payload arrived in an earlier frame) rather than the small
-/// `done` frame. That clone is charged in phase 2 ([`commit_chunk_events`]), where
-/// it is actually performed and its size is known exactly, instead of being
-/// predicted here — so the byte budget cannot diverge from the item the commit
-/// retains, and no per-event history rescan is needed.
-///
 /// The running total lives in [`ResponsesState::stream_accumulated_bytes`], so it
 /// is charged once per request and survives the per-round re-arm: a multi-round
 /// stream cannot reset the counter between IRR rounds and accumulate unbounded
@@ -759,14 +929,14 @@ fn parse_chunk_events(
 /// buffered path would accept.
 ///
 /// Terminal lifecycle events (`response.completed`/`incomplete`/`failed`) are
-/// charged: their payload snapshots the full accumulated output plus usage into
-/// `response_object` and is retained a second time as the deferred terminal, so a
-/// terminal frame that alone exceeds the ceiling (yet still fits
-/// `max_buffer_bytes`) must fail closed like any other accumulator growth. The
-/// per-frame `added`/`done`/terminal charges over-count an item that also streams
-/// the paired envelopes; that is a deliberately conservative, fail-closed-earlier
-/// byte bound. The distinct item-count dimension is enforced separately from the
-/// retained output (see [`accumulation_count_exceeded`]).
+/// charged: their payload can snapshot the full accumulated output plus usage.
+/// The response tree moves into `response_object` while the deferred terminal
+/// keeps only envelope metadata. A terminal frame that alone exceeds the ceiling
+/// (yet still fits `max_buffer_bytes`) must fail closed like any other
+/// accumulator growth. Per-frame `added`/`done`/terminal charges may count one
+/// item more than once. This conservative charge can reject early while bounding
+/// retained state. The distinct item-count limit applies to the retained output
+/// separately (see [`accumulation_count_exceeded`]).
 ///
 /// Runs in phase 1 (parse) so a frame-bounded accumulator's growth aborts the chunk
 /// atomically before [`commit_chunk_events`] mutates shared state.
@@ -861,12 +1031,8 @@ fn accumulation_count_exceeded(state: &StreamEventsState, ctx: &HttpFilterContex
 /// Split into two passes so both retained-state budgets are validated before any
 /// delivery milestone is recorded:
 ///
-/// - Phase 2a accumulates every event into the retained output (`output_items`, `tool_calls`, `response_object`) — the
-///   only state the count derives from, and state no delivery milestone depends on. As it accumulates it charges the
-///   one byte-bearing growth the phase-1 frame charge cannot bound: the `tool_calls` clone a
-///   `function_call_arguments.done` makes of a whole retained output item (see [`charge_accumulation_budget`]). That
-///   clone is measured, not predicted, so the charge equals the item the commit actually retained and a `done` that
-///   re-clones a large item fails the chunk closed the instant the request-wide byte total exceeds the cap.
+/// - Phase 2a accumulates every event into the retained output (`output_items`, `response_object`) — the only state the
+///   count derives from, and state no delivery milestone depends on.
 /// - The count guard then runs against the grown output, *before* any delivery milestone is recorded. A chunk that
 ///   overflows the item cap therefore fails closed without leaving a committed local-tool milestone that EOS recovery
 ///   would trust for bytes the client never received (review finding: the former post-commit count check let an
@@ -875,8 +1041,7 @@ fn accumulation_count_exceeded(state: &StreamEventsState, ctx: &HttpFilterContex
 ///
 /// On a rejected chunk phase 2a has already grown the retained output past a cap, so
 /// the request-wide guards in [`accumulation_budget_exceeded`] stay sticky for every
-/// later chunk and round. The byte guard fails closed per event, so transient
-/// overshoot is bounded to the single clone that trips the cap. Phase 2b's only
+/// later chunk and round. Phase 2b's only
 /// fallible step, the client-tool restoration plan pass (see
 /// [`restore_and_append_chunk`]), runs before any byte is appended or milestone is
 /// recorded, so a malformed lowered lifecycle fails the chunk closed with nothing
@@ -885,11 +1050,11 @@ fn accumulation_count_exceeded(state: &StreamEventsState, ctx: &HttpFilterContex
 fn commit_chunk_events(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
-    events: Vec<ResponsesEvent>,
+    mut events: Vec<ResponsesEvent>,
 ) -> Result<Vec<u8>, SseParseError> {
-    // Phase 2a: accumulate every event and charge the retained-clone byte budget,
-    // capturing lowered client-tool completion artifacts for the restore plan.
-    let completions = accumulate_chunk(state, ctx, &events)?;
+    // Phase 2a: accumulate every event and capture lowered client-tool
+    // completion artifacts for the restore plan.
+    let completions = accumulate_chunk(state, ctx, &mut events);
 
     // The retained item count only exists after phase 2a grows it. Enforce it here,
     // before phase 2b records any delivery milestone, so a rejected chunk leaves no
@@ -916,46 +1081,27 @@ fn commit_chunk_events(
 }
 
 /// Phase 2a of the chunk commit: accumulate every event into `ResponsesState`,
-/// charge the retained-clone byte budget, and capture lowered client-tool
-/// completion artifacts for the phase-2b restore plan (#1159).
+/// and capture lowered client-tool completion artifacts for the phase-2b
+/// restore plan (#1159).
 ///
 /// Split out of [`commit_chunk_events`] so the per-event byte charge and the
-/// artifact capture stay under one owner. Fails closed the instant the request-wide
-/// accumulation byte total exceeds the cap (#556); the returned completions are the
-/// authoritative source the plan pass reads when synthesizing the `custom_tool_call`
-/// lifecycle.
+/// artifact capture stay under one owner. The returned completions are the
+/// authoritative source the plan pass reads when synthesizing the
+/// `custom_tool_call` lifecycle.
 fn accumulate_chunk(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
-    events: &[ResponsesEvent],
-) -> Result<Vec<client_tools::ClientToolCompletion>, SseParseError> {
+    events: &mut [ResponsesEvent],
+) -> Vec<client_tools::ClientToolCompletion> {
     let mut completions: Vec<client_tools::ClientToolCompletion> = Vec::new();
     for event in events {
-        let retained_clone_bytes = accumulate_event(ctx, state, event);
-        // A `function_call_arguments.done` clones a whole retained output item into
-        // `tool_calls` — the one accumulator whose growth the driving `done` frame
-        // does not bound. Charge that measured clone here, where it happens, and fail
-        // the chunk closed the instant the request-wide byte total exceeds the cap.
-        // Charging the actual clone (not a phase-1 prediction) is exact and
-        // O(clone size): it cannot diverge from the item the commit retained, and the
-        // per-event check bounds transient overshoot to a single clone.
-        if retained_clone_bytes > 0 {
-            let accumulated_bytes = {
-                let responses = ctx.extensions.get_or_insert_with(ResponsesState::default);
-                responses.stream_accumulated_bytes =
-                    responses.stream_accumulated_bytes.saturating_add(retained_clone_bytes);
-                responses.stream_accumulated_bytes
-            };
-            if let Some(error) = accumulation_bytes_exceeded(state, accumulated_bytes) {
-                return Err(error);
-            }
-        }
+        accumulate_event(ctx, state, event);
         // Capture the just-completed lowered `function_call` item (now carrying its
         // final arguments in `ResponsesState`) so the plan pass can restore the
         // canonical `custom_tool_call` lifecycle without re-borrowing mutable state.
         capture_client_tool_completion(ctx, &mut completions, event);
     }
-    Ok(completions)
+    completions
 }
 
 /// Capture the completed lowered `function_call` item at
@@ -964,8 +1110,8 @@ fn accumulate_chunk(
 /// Only fires when client-tool lowering is armed and the just-accumulated item's
 /// name is a lowering-map key, so native (non-lowered) traffic pays nothing. The
 /// completed item lives in [`ResponsesState::output_items`] after [`accumulate_event`]
-/// merged its arguments; the accumulator's own copy is moved into `tool_calls`, so
-/// the plan pass needs this owned snapshot to synthesize the restored lifecycle.
+/// merged its arguments; the plan pass needs this owned snapshot to synthesize
+/// the restored lifecycle.
 fn capture_client_tool_completion(
     ctx: &HttpFilterContext<'_>,
     completions: &mut Vec<client_tools::ClientToolCompletion>,
@@ -983,20 +1129,26 @@ fn capture_client_tool_completion(
     let Some(item) = find_output_item(responses.output_items(), payload) else {
         return;
     };
-    let is_lowered = item
+    let restore = item
         .get("name")
         .and_then(Value::as_str)
-        .is_some_and(|name| responses.client_tool_lowering.contains_key(name));
-    if !is_lowered {
+        .and_then(|name| responses.client_tool_lowering.get(name))
+        .map(|lowered| lowered.restore);
+    // Namespace function calls only rename the arguments event; their restore
+    // plan never reads a completed-item snapshot.
+    if restore.is_none_or(|restore| restore == ClientToolRestore::Namespace) {
         return;
     }
     let Some(key) = tool_call_key(payload) else {
         return;
     };
-    // Necessary clone (AGENTS.md boundary): the accumulator moved its only owned copy
-    // of the completed item into `tool_calls`, so the plan pass needs an owned
-    // snapshot to restore the `custom_tool_call` lifecycle without re-borrowing the
-    // mutable `ResponsesState` (#1159).
+    // The restore planner uses the first artifact for a key. Repeated done
+    // events in one chunk must not retain another full payload per frame.
+    if completions.iter().any(|completion| completion.key == key) {
+        return;
+    }
+    // Necessary clone (AGENTS.md boundary): the restore plan needs an owned
+    // snapshot of this lowered call after releasing the shared state borrow.
     completions.push(client_tools::ClientToolCompletion {
         key,
         item: item.clone(),
@@ -1036,18 +1188,260 @@ fn restore_and_append_chunk(
     };
 
     let mut logical_output = Vec::new();
-    for (index, event) in events.into_iter().enumerate() {
-        match dispositions.as_ref().and_then(|dispositions| dispositions.get(index)) {
-            None | Some(client_tools::ClientToolDisposition::Passthrough) => {
+    match dispositions {
+        // Native / no lowering armed: no client-tool opening is ever deferred, so no
+        // staging can occur. Encode each event directly into the chunk output — no
+        // per-event scratch buffer or copy (#1767 keeps this path zero-overhead).
+        None => {
+            for event in events {
                 append_logical_event(state, ctx, event, &mut logical_output);
-            },
-            Some(client_tools::ClientToolDisposition::Suppress) => {},
-            Some(disposition) => {
-                apply_client_tool_disposition(state, ctx, disposition, event, &mut logical_output);
-            },
-        }
+            }
+        },
+        Some(dispositions) => {
+            append_lowered_chunk(state, ctx, events, dispositions, &mut logical_output)?;
+        },
     }
     Ok(logical_output)
+}
+
+/// Append a lowered-traffic chunk, honoring #1767 output-item staging.
+///
+/// Fails the chunk closed BEFORE rendering any event — and therefore before any event
+/// commits a delivery milestone — if the events it would hold behind a deferred opening
+/// push the retained staged volume past the ceiling. Keeping the only fallible step ahead
+/// of every append preserves the invariant that a rejected chunk leaves no milestone for
+/// bytes the client never received.
+fn append_lowered_chunk(
+    state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    events: Vec<ResponsesEvent>,
+    dispositions: Vec<client_tools::ClientToolDisposition>,
+    output: &mut Vec<u8>,
+) -> Result<(), SseParseError> {
+    let projected = state.client_tool_staged_bytes.saturating_add(projected_staged_bytes(
+        &state.client_tool_pending_opens,
+        &events,
+        &dispositions,
+    ));
+    if projected > state.max_accumulated_bytes {
+        return Err(SseParseError::AccumulationLimitExceeded {
+            dimension: "client_tool_staged_bytes",
+            value: projected,
+            limit: state.max_accumulated_bytes,
+        });
+    }
+    for (event, disposition) in events.into_iter().zip(dispositions) {
+        append_or_stage_event(state, ctx, event, disposition, output);
+    }
+    Ok(())
+}
+
+/// Sum the bytes this chunk would newly stage behind a deferred opening (#1767) —
+/// each event plus any owned restoration payload its disposition carries — replaying the
+/// opening-hole transitions over a scratch copy of the pending set without rendering.
+/// Intentionally does not model intra-chunk releases, so it is a safe upper bound on the
+/// staged volume this chunk can reach — used to admit the chunk before any event renders.
+fn projected_staged_bytes(
+    pending: &BTreeSet<u64>,
+    events: &[ResponsesEvent],
+    dispositions: &[client_tools::ClientToolDisposition],
+) -> usize {
+    let mut pending = pending.clone();
+    let mut total = 0_usize;
+    for (event, disposition) in events.iter().zip(dispositions) {
+        let event_index = event_output_index(event);
+        if matches!(disposition, client_tools::ClientToolDisposition::Suppress) {
+            if matches!(event, ResponsesEvent::OutputItemAdded(_))
+                && let Some(idx) = event_index
+            {
+                pending.insert(idx);
+            }
+            continue;
+        }
+        if matches!(disposition, client_tools::ClientToolDisposition::EmitTypedAdded { .. })
+            && let Some(idx) = event_index
+        {
+            pending.remove(&idx);
+        }
+        if let Some(min_pending) = pending.iter().next().copied()
+            && event_index.is_some_and(|idx| idx > min_pending)
+        {
+            total = total.saturating_add(staged_event_bytes(event, disposition));
+        }
+    }
+    total
+}
+
+/// Apply one committed event's client-tool disposition to the logical stream,
+/// honoring #1767 output-item staging.
+///
+/// A suppressed `output_item.added` is a deferred `Shell`/`ToolSearch` typed opening
+/// whose complete call is synthesized at `arguments.done` (#1159 Task 6): its index is
+/// recorded as a pending opening so a later item that overtakes it is staged behind it
+/// (#1767). Every other `Suppress` just drops the event. A deferred typed opening
+/// (`EmitTypedAdded`) clears its pending index before the staging gate. An event whose
+/// index is behind an still-pending earlier opening is held (as a parsed event, so it
+/// is `sequence_number`-stamped in emission order when later rendered); otherwise it is
+/// rendered now. Filling an opening then releases every staged event the fill unblocked,
+/// in ascending index order, so both opening order and per-item lifecycle order hold.
+fn append_or_stage_event(
+    state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    event: ResponsesEvent,
+    disposition: client_tools::ClientToolDisposition,
+    output: &mut Vec<u8>,
+) {
+    let event_index = event_output_index(&event);
+    if matches!(disposition, client_tools::ClientToolDisposition::Suppress) {
+        if matches!(event, ResponsesEvent::OutputItemAdded(_))
+            && let Some(idx) = event_index
+        {
+            state.client_tool_pending_opens.insert(idx);
+        }
+        return;
+    }
+    let fills_hole = matches!(disposition, client_tools::ClientToolDisposition::EmitTypedAdded { .. });
+    if fills_hole && let Some(idx) = event_index {
+        state.client_tool_pending_opens.remove(&idx);
+    }
+    // Hold events whose index is behind a still-pending earlier opening. The staged
+    // volume was already admitted by the pre-loop preflight, so holding never fails here.
+    if let Some(min_pending) = state.client_tool_pending_opens.iter().next().copied()
+        && event_index.is_some_and(|idx| idx > min_pending)
+    {
+        // `event_index` is Some by the guard above.
+        stage_event(state, event_index.unwrap_or_default(), event, disposition);
+        return;
+    }
+    render_restored_event(state, ctx, event, disposition, output);
+    if fills_hole {
+        release_unblocked_staged(state, ctx, output);
+    }
+}
+
+/// The raw (pre-offset) output index an event's payload carries, if any. Lifecycle
+/// events (`response.created`/`completed`/...) carry no `output_index` and return
+/// `None`, so they never participate in #1767 output-item staging.
+fn event_output_index(event: &ResponsesEvent) -> Option<u64> {
+    event.payload().get("output_index").and_then(Value::as_u64)
+}
+
+/// Render one committed event to the logical stream by its disposition. `Passthrough`
+/// forwards the event; every other emitting disposition is applied by
+/// [`apply_client_tool_disposition`]. `Suppress` is handled before dispatch and must
+/// never reach here.
+fn render_restored_event(
+    state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    event: ResponsesEvent,
+    disposition: client_tools::ClientToolDisposition,
+    output: &mut Vec<u8>,
+) {
+    match disposition {
+        client_tools::ClientToolDisposition::Passthrough => append_logical_event(state, ctx, event, output),
+        client_tools::ClientToolDisposition::Suppress => {
+            debug_assert!(false, "Suppress is handled before render_restored_event");
+        },
+        other => apply_client_tool_disposition(state, ctx, &other, event, output),
+    }
+}
+
+/// Hold one output-item event behind an earlier still-deferred opening (#1767),
+/// tracking its retained size in the running staged-byte total. The ceiling is
+/// enforced by the pre-loop preflight in [`restore_and_append_chunk`] before any event
+/// renders, so this records the hold without re-checking (and never fails mid-append).
+fn stage_event(
+    state: &mut StreamEventsState,
+    output_index: u64,
+    event: ResponsesEvent,
+    disposition: client_tools::ClientToolDisposition,
+) {
+    let byte_len = staged_event_bytes(&event, &disposition);
+    state.client_tool_staged_bytes = state.client_tool_staged_bytes.saturating_add(byte_len);
+    state.client_tool_staged.push(StagedEvent {
+        output_index,
+        byte_len,
+        event,
+        disposition,
+    });
+}
+
+/// Bytes a staged event retains while held: its own payload plus every owned payload its
+/// disposition carries. A synthesized `EmitTypedAdded`/`EmitCustom*`/`RestoreSnapshot`
+/// holds a full restored item, and the retype/custom-input variants hold owned
+/// identifier/name strings the raw frame does not bound (names are hashed to shorter
+/// backend forms). Charging only the raw event would let a deferred opening retain far
+/// more than the ceiling admits. Allocation-free via `bounded_json_size` (no throwaway
+/// serialized copy).
+fn staged_event_bytes(event: &ResponsesEvent, disposition: &client_tools::ClientToolDisposition) -> usize {
+    use client_tools::ClientToolDisposition as D;
+    let json_size = |value: &Value| {
+        crate::openai::responses::bounded_json_size(value, usize::MAX)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    };
+    let disposition_bytes = match disposition {
+        D::EmitCustomShell { item }
+        | D::EmitCustomItemDone { item }
+        | D::EmitTypedAdded { item }
+        | D::EmitTypedDone { item } => json_size(item),
+        D::RestoreSnapshot { response } => json_size(response),
+        D::EmitCustomInput {
+            key, item_id, input, ..
+        } => key.len().saturating_add(item_id.len()).saturating_add(input.len()),
+        D::RetypeInPlace { name, namespace, .. } => {
+            name.len().saturating_add(namespace.as_ref().map_or(0, String::len))
+        },
+        D::RetypeArgumentsName { name } => name.len(),
+        D::Passthrough | D::Suppress => 0,
+    };
+    json_size(event.payload()).saturating_add(disposition_bytes)
+}
+
+/// Render every staged event that is no longer behind a pending earlier opening.
+///
+/// Called after a deferred opening is filled: events whose index is below the new
+/// smallest pending opening (or all staged events when none remain) are released in
+/// ascending output-index order (a stable sort keeps each item's own events in arrival
+/// order), so both opening order and `sequence_number` stay monotonic. Arrival order
+/// alone is not enough: a synthesized opening is produced at its `arguments.done`, which
+/// can arrive after a later item's events, so the staged queue is not index-ordered.
+fn release_unblocked_staged(state: &mut StreamEventsState, ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) {
+    if state.client_tool_staged.is_empty() {
+        return;
+    }
+    let barrier = state.client_tool_pending_opens.iter().next().copied();
+    let mut staged = std::mem::take(&mut state.client_tool_staged);
+    staged.sort_by_key(|staged_event| staged_event.output_index);
+    let mut retained = Vec::new();
+    for staged_event in staged {
+        if barrier.is_some_and(|barrier| staged_event.output_index >= barrier) {
+            retained.push(staged_event);
+        } else {
+            state.client_tool_staged_bytes = state.client_tool_staged_bytes.saturating_sub(staged_event.byte_len);
+            render_restored_event(state, ctx, staged_event.event, staged_event.disposition, output);
+        }
+    }
+    state.client_tool_staged = retained;
+}
+
+/// Fail-safe drain of any staged events still held at stream finalization (#1767).
+///
+/// A well-formed stream fills every deferred opening before the terminal, leaving this
+/// empty; it only releases events a truncated stream left behind an opening that never
+/// arrived, in ascending index order, so their bytes reach the client rather than being
+/// dropped.
+fn drain_remaining_staged(state: &mut StreamEventsState, ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) {
+    if state.client_tool_staged.is_empty() {
+        return;
+    }
+    let mut staged = std::mem::take(&mut state.client_tool_staged);
+    staged.sort_by_key(|staged_event| staged_event.output_index);
+    state.client_tool_staged_bytes = 0;
+    for staged_event in staged {
+        render_restored_event(state, ctx, staged_event.event, staged_event.disposition, output);
+    }
 }
 
 /// Whether an event is a response lifecycle-creation event
@@ -1081,11 +1475,11 @@ fn append_logical_event(
     let file_search_active = ctx
         .extensions
         .get::<ResponsesState>()
-        .is_some_and(crate::openai::responses::file_search_callout::has_file_search_tool);
+        .is_some_and(crate::openai::responses::file_search_dispatch::has_file_search_tool);
     if file_search_active && event.event_type() == "response.output_item.added" {
         let payload = event.payload();
         if let Some(item) = payload.get("item") {
-            use crate::openai::responses::file_search_callout::{
+            use crate::openai::responses::file_search_dispatch::{
                 is_file_search_function_call, is_pending_file_search_call,
             };
             if is_file_search_function_call(item) {
@@ -1167,7 +1561,15 @@ fn append_logical_event(
         return;
     }
 
-    let event_type = event.event_type().to_owned();
+    // Parsing groups equivalent reasoning aliases into one variant. Preserve
+    // the validated wire discriminator so SSE event and data.type still agree
+    // when forwarding OpenAI's reasoning_text events through the logical stream.
+    let event_type = event
+        .payload()
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| event.event_type())
+        .to_owned();
     let mut payload = event.into_payload();
     normalize_logical_payload(ctx, &mut payload, state.output_index_offset);
     encode_sse_event(&event_type, &payload, output);
@@ -1557,7 +1959,7 @@ fn is_local_tool_item(item: &Value) -> bool {
 /// envelope.
 ///
 /// The whole item is hashed rather than keyed on `type|status` alone so a payload
-/// the model never streamed — e.g. the `action.sources` list `openai_web_search`
+/// the model never streamed — e.g. the `action.sources` list `openai_web_search_dispatch`
 /// adds to a `web_search_call` after local execution — is detected as a change even
 /// when the item's type and status are unchanged.
 ///
@@ -2020,7 +2422,7 @@ fn normalize_logical_payload(ctx: &mut HttpFilterContext<'_>, payload: &mut Valu
 }
 
 /// Encode one canonical single-line SSE event.
-fn encode_sse_event(event_type: &str, payload: &Value, output: &mut Vec<u8>) {
+fn encode_sse_event<T: Serialize + ?Sized>(event_type: &str, payload: &T, output: &mut Vec<u8>) {
     output.extend_from_slice(b"event: ");
     output.extend_from_slice(event_type.as_bytes());
     output.extend_from_slice(b"\ndata: ");
@@ -2052,11 +2454,20 @@ fn write_json_or_rollback<E>(output: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u
 /// the response-body finalizer cannot emit the deferred terminal event. Build
 /// the same canonical terminal representation directly from shared response
 /// state for IRR to append after already-emitted logical stream chunks.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one terminal path handles local lifecycle and canonical response"
+)]
 pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option<Bytes> {
     let parser_deferred_done = ctx
         .get_filter_state::<StreamEventsState>()
         .is_some_and(|state| state.deferred_done);
-    let mut output = prepare_local_terminal_events(ctx);
+    let Some(mut output) = prepare_local_terminal_events(ctx) else {
+        let mut output = Vec::new();
+        emit_retained_payload_error(ctx, 0, &mut output);
+        return Some(Bytes::from(output));
+    };
     let state = ctx.extensions.get_mut::<ResponsesState>()?;
     let deferred_done = state.deferred_stream_done || parser_deferred_done;
     if !state.response_object.is_object() {
@@ -2068,6 +2479,11 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     // narrower eligibility to match.
     let restore_previous_response_id = state.history_rehydrated;
     if let Err(e) = canonicalize_logical_response(state, restore_previous_response_id) {
+        if matches!(e, SseParseError::RetainedPayloadLimitExceeded) {
+            output.clear();
+            emit_retained_payload_error(ctx, 0, &mut output);
+            return Some(Bytes::from(output));
+        }
         // #1159: a lossy terminal restore fails closed. `output` already holds the
         // drained local-tool events, so emit the error terminal INLINE rather than via
         // `encode_local_error` (which would re-drain those events).
@@ -2080,12 +2496,6 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     let sequence_number = state.logical_stream_sequence;
     state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
 
-    // #937: deliberately do NOT set `logical_stream_terminal_emitted` here.
-    // Unlike `emit_deferred_terminal`, this local completion is returned to the
-    // store as a buffered `TerminalResponse` at end-of-stream (see
-    // `finish_deferred_local_response`), where the store already persists before
-    // the body is written. Marking the flag would make the store skip that
-    // end-of-stream persist and lose the record (#937 review regression).
     output.extend_from_slice(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":");
     serde_json::to_writer(&mut output, &state.response_object).ok()?;
     output.extend_from_slice(b",\"sequence_number\":");
@@ -2094,6 +2504,11 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     if deferred_done {
         output.extend_from_slice(b"data: [DONE]\n\n");
     }
+    // IRR can surface the local terminal body to outer filters as a non-EOS
+    // chunk. Mark it only after encoding succeeded so they persist before
+    // releasing that chunk; the store retains an EOS fallback if no such chunk
+    // arrives.
+    state.local_stream_terminal_emitted = true;
     Some(Bytes::from(output))
 }
 
@@ -2104,6 +2519,7 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
 /// `prepare_local_terminal_events`, so the error frame is appended directly rather
 /// than through `encode_local_error` (which would re-drain those events). Marks the
 /// record un-persistable so a later GET cannot serve the private lowered shape.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 fn encode_local_restore_error(ctx: &mut HttpFilterContext<'_>, mut output: Vec<u8>, error: &SseParseError) -> Bytes {
     let message = error.to_string();
     let sequence_number = ctx.extensions.get_mut::<ResponsesState>().map_or(0, |state| {
@@ -2127,7 +2543,7 @@ fn encode_local_restore_error(ctx: &mut HttpFilterContext<'_>, mut output: Vec<u
 /// The dispatch owner (`openai_agentic_loop`) calls this during request-body
 /// EOS when a request-phase dispatcher recorded a
 /// [`DispatchFailure`](crate::openai::responses::state::DispatchFailure) after
-/// the stream was already committed. It mirrors [`encode_local_completion`]: the
+/// the stream was already committed. It mirrors `encode_local_completion`: the
 /// terminal frame is built directly from shared response state so IRR can append
 /// it after the logical stream chunks already emitted this round, rather than
 /// through the response-body finalizer (no upstream response body exists on a
@@ -2137,7 +2553,11 @@ fn encode_local_restore_error(ctx: &mut HttpFilterContext<'_>, mut output: Vec<u
 /// error event is itself the stream terminator, matching the response-body
 /// finalizer's own error branch, which emits the error and stops.
 pub(crate) fn encode_local_error(ctx: &mut HttpFilterContext<'_>, code: &str, message: &str) -> Option<Bytes> {
-    let mut output = prepare_local_terminal_events(ctx);
+    let Some(mut output) = prepare_local_terminal_events(ctx) else {
+        let mut output = Vec::new();
+        emit_retained_payload_error(ctx, 0, &mut output);
+        return Some(Bytes::from(output));
+    };
     let state = ctx.extensions.get_mut::<ResponsesState>()?;
     let sequence_number = state.logical_stream_sequence;
     state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
@@ -2155,14 +2575,17 @@ pub(crate) fn encode_local_error(ctx: &mut HttpFilterContext<'_>, code: &str, me
 /// Request-phase completion and dispatch failure have no later upstream
 /// response, so the normal response-body finalizer cannot drain pending
 /// synthesis or flush locally generated output items for them.
-fn prepare_local_terminal_events(ctx: &mut HttpFilterContext<'_>) -> Vec<u8> {
+fn prepare_local_terminal_events(ctx: &mut HttpFilterContext<'_>) -> Option<Vec<u8>> {
+    if !reserve_local_synthesis(ctx) {
+        return None;
+    }
     let mut output = Vec::new();
     local_tools::drain_local_tool_synthesis(ctx, &mut output);
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.provider_streamed_terminal_ids.clear();
     }
     flush_local_output_items(ctx, &mut output);
-    output
+    Some(output)
 }
 
 /// Emit the held terminal event only when the current IRR step is terminal.
@@ -2174,7 +2597,7 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     // Preserve any non-terminal logical events `process_chunk` already emitted
     // for this final chunk, then append synthesized local-tool events and the
     // deferred terminal. A transport that reassembles the whole stream before
-    // releasing it (e.g. `responses_to_chat_completions`) delivers the
+    // releasing it (e.g. `openai_responses_to_chat_completions`) delivers the
     // created/delta events and deferred terminal together in the end-of-stream
     // chunk; starting from an empty buffer here would drop those earlier events.
     let mut output = body.take().map_or_else(Vec::new, |bytes| bytes.to_vec());
@@ -2186,7 +2609,13 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     // reconciliation. A validation failure here calls fs_end_stream_with_error_ctx
     // (site (b), §7.3) so the error branch below is selected and the router does not
     // re-fire.
-    local_tools::drain_local_tool_synthesis(ctx, &mut output);
+    if !parser_state.retained_budget_failed && reserve_local_synthesis(ctx) {
+        local_tools::drain_local_tool_synthesis(ctx, &mut output);
+    } else if !parser_state.retained_budget_failed {
+        parser_state.retained_budget_failed = true;
+        output.clear();
+        record_retained_payload_failure(ctx);
+    }
     // #313 P1 (DoS bound): this round's provider-streamed observation set is stale
     // once the round that recorded it finalizes; clear it unconditionally here — NOT
     // inside drain_local_tool_synthesis, which early-returns on an empty synthesis
@@ -2234,7 +2663,11 @@ fn finalize_emit_terminal(
         // #276: surface any locally executed tool items that never reached the
         // client before the stream terminates with an error, so already-executed
         // tool activity is not silently dropped by a resumed-round parse failure.
-        flush_local_output_items(ctx, output);
+        if parser_state.retained_budget_failed {
+            output.clear();
+        } else {
+            flush_local_output_items(ctx, output);
+        }
         normalize_logical_payload(ctx, &mut error, parser_state.output_index_offset);
         encode_sse_event("error", &error, output);
     } else if !continues
@@ -2244,8 +2677,33 @@ fn finalize_emit_terminal(
         // #1159: a lossy terminal client-tool restore fails the whole logical stream
         // closed. `emit_deferred_terminal` bailed before writing the terminal frame,
         // so `output` holds only the flushed local items.
-        emit_deferred_terminal_restore_error(ctx, output, &e);
+        if matches!(e, SseParseError::RetainedPayloadLimitExceeded) {
+            output.clear();
+            emit_retained_payload_error(ctx, parser_state.output_index_offset, output);
+        } else {
+            emit_deferred_terminal_restore_error(ctx, output, &e);
+        }
     }
+}
+
+/// A failed terminal admission emits one error frame and no success tail.
+fn emit_retained_payload_error(ctx: &mut HttpFilterContext<'_>, output_index_offset: u64, output: &mut Vec<u8>) {
+    record_retained_payload_failure(ctx);
+    let mut error = responses_error_sse_payload("server_error", RETAINED_PAYLOAD_OVERFLOW_MESSAGE);
+    normalize_logical_payload(ctx, &mut error, output_index_offset);
+    encode_sse_event("error", &error, output);
+}
+
+/// Client-safe terminal reason for a request-wide retained payload overflow.
+const RETAINED_PAYLOAD_OVERFLOW_MESSAGE: &str =
+    "The request exceeds a processing limit set by the platform administrator.";
+
+/// Make an overflow sticky across the remaining logical-stream hooks.
+fn record_retained_payload_failure(ctx: &mut HttpFilterContext<'_>) {
+    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.set_metadata("responses.stream_error_message", RETAINED_PAYLOAD_OVERFLOW_MESSAGE);
+    ctx.set_metadata("responses.skip_persist", "true");
+    crate::openai::responses::fs_arm_stream_stop(ctx);
 }
 
 /// Emit the deferred terminal snapshot as the logical stream's final event,
@@ -2253,41 +2711,45 @@ fn finalize_emit_terminal(
 fn emit_deferred_terminal(
     ctx: &mut HttpFilterContext<'_>,
     terminal: &mut DeferredTerminalEvent,
-    parser_state: &StreamEventsState,
+    parser_state: &mut StreamEventsState,
     output: &mut Vec<u8>,
 ) -> Result<(), SseParseError> {
     // #276: stream any locally generated tool items that never reached the
     // client as incremental events before the terminal snapshot.
     flush_local_output_items(ctx, output);
+    // #1767 fail-safe: a well-formed stream drains every staged output-item event
+    // when its deferred opening is synthesized, so this is normally a no-op; it only
+    // releases events a truncated stream left held behind an opening that never
+    // arrived, keeping them ahead of the terminal rather than dropping them.
+    drain_remaining_staged(parser_state, ctx, output);
     let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
     // Match the wire-rewrite decision so the persisted store source cannot disagree
     // with the streamed frame (#1150).
     let restore_previous_response_id = state.previous_response_id_stream_restore_armed;
-    let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id)?;
+    canonicalize_logical_response(state, restore_previous_response_id)?;
     // #937: `response_object` is now canonical and the client-visible terminal
     // frame is appended below as a deferred, non-end-of-stream chunk. Signal the
-    // pre-IRR `openai_response_store` to persist BEFORE it releases that chunk so
+    // pre-IRR `openai_responses_store` to persist BEFORE it releases that chunk so
     // completion is never observed before the record is durable. Only this
     // deferred path sets the flag; a buffered local completion
     // (`encode_local_completion`) persists at end-of-stream and must not.
-    state.logical_stream_terminal_emitted = true;
-    if let Some(response) = terminal.payload.get_mut("response").and_then(Value::as_object_mut) {
-        response.insert("output".to_owned(), Value::Array(accumulated_output));
-        if !usage.is_null() {
-            response.insert("usage".to_owned(), usage);
-        }
-    }
-    // #1159: the upstream deferred terminal echoes the LOWERED private tools/tool_choice.
-    // Restore them on the wire copy — this is the only place tools are restored on the
-    // deferred path (the output items were already restored inside canonicalize). No-op
-    // when nothing was lowered (echo is None).
-    if let Some(response) = terminal.payload.get_mut("response") {
-        restore_snapshot_tools(response, state.client_tool_echo.as_ref());
-    }
     normalize_logical_payload(ctx, &mut terminal.payload, parser_state.output_index_offset);
-    encode_sse_event(&terminal.event_type, &terminal.payload, output);
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return Err(SseParseError::StreamPoisoned);
+    };
+    encode_sse_event(
+        &terminal.event_type,
+        &BorrowedTerminalPayload {
+            metadata: &terminal.payload,
+            response: &state.response_object,
+        },
+        output,
+    );
     if parser_state.deferred_done {
         output.extend_from_slice(b"data: [DONE]\n\n");
+    }
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.logical_stream_terminal_emitted = true;
     }
     Ok(())
 }
@@ -2341,24 +2803,56 @@ fn logical_stream_error(ctx: &HttpFilterContext<'_>) -> Option<Value> {
 ///
 /// Either way the id is only ever restored, never fabricated: a non-rehydrated
 /// turn keeps the real value the backend echoed.
+#[expect(
+    clippy::too_many_lines,
+    reason = "terminal canonicalization reserves before moving and annotating its output"
+)]
 fn canonicalize_logical_response(
     state: &mut ResponsesState,
     restore_previous_response_id: bool,
-) -> Result<(Vec<Value>, Value), SseParseError> {
+) -> Result<(), SseParseError> {
     let logical_id = state.logical_stream_response_id.clone();
-    let usage = state.usage.clone();
     let restored_previous_response_id = restore_previous_response_id
         .then(|| state.previous_response_id.clone())
         .flatten();
+    if state.simple_budget.is_some() {
+        let output = if state.accumulated_output.is_empty() {
+            state.output_items()
+        } else {
+            &state.accumulated_output
+        };
+        let output_bytes = super::bounded_json_size(output, usize::MAX)
+            .map_err(|_error| SseParseError::RetainedPayloadLimitExceeded)?
+            .ok_or(SseParseError::RetainedPayloadLimitExceeded)?;
+        let citation_staging = crate::openai::responses::file_search_dispatch::citations::annotation_staging_bytes(
+            output,
+            &state.citation_files,
+        )
+        .map_err(|_error| SseParseError::RetainedPayloadLimitExceeded)?;
+        if !state.simple_budget.as_mut().is_some_and(|budget| {
+            budget.admit_stream_terminal(output_bytes) && budget.reserve_additional_input(citation_staging)
+        }) {
+            return Err(SseParseError::RetainedPayloadLimitExceeded);
+        }
+    }
     // Prefer the cross-round accumulator populated by dispatch/loop filters
     // (agentic pipelines). When no such filter ran — a plain one-round logical
     // stream — it stays empty, so fall back to the terminal event's own output
     // rather than clobber it with nothing. Mirrors `finalize_response_body`.
-    let mut output = if state.accumulated_output.is_empty() {
-        state.output_items().to_vec()
-    } else {
-        state.accumulated_output.clone()
-    };
+    if !state.accumulated_output.is_empty()
+        && let Some(response) = state.response_object.as_object_mut()
+    {
+        response.insert(
+            "output".to_owned(),
+            Value::Array(std::mem::take(&mut state.accumulated_output)),
+        );
+    }
+    // All dispatch assignments index the accumulator that has just moved.
+    state.tool_calls.clear();
+    #[cfg(any(test, feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
+    state.tool_search_calls.clear();
+    state.web_search_calls.clear();
+    state.stream_synthesis_reserved.clear();
     // Rewrite file_search citation markers into typed annotations on the final
     // assistant message, mirroring the buffered `annotate_response` finalize
     // path. In streaming the dispatcher reconciled `citation_files` during a
@@ -2367,10 +2861,15 @@ fn canonicalize_logical_response(
     // No-op when no dispatcher recorded citation files. Best-effort: the logical
     // stream is already committed here, so a malformed marker degrades to
     // un-annotated text rather than aborting the terminal.
-    if let Err(error) = crate::openai::responses::file_search_callout::citations::annotate_output_items(
-        &mut output,
-        &state.citation_files,
-    ) {
+    let output = state
+        .response_object
+        .get_mut("output")
+        .and_then(Value::as_array_mut)
+        .map(Vec::as_mut_slice)
+        .unwrap_or_default();
+    if let Err(error) =
+        crate::openai::responses::file_search_dispatch::citations::annotate_output_items(output, &state.citation_files)
+    {
         tracing::warn!(%error, "failed to annotate logical stream response citations");
     }
     if let Some(response) = state.response_object.as_object_mut() {
@@ -2380,49 +2879,67 @@ fn canonicalize_logical_response(
         if let Some(prev_id) = restored_previous_response_id {
             response.insert("previous_response_id".to_owned(), Value::String(prev_id));
         }
-        response.insert("output".to_owned(), Value::Array(output.clone()));
-        if !usage.is_null() {
-            response.insert("usage".to_owned(), usage.clone());
+        if !state.usage.is_null() {
+            response.insert("usage".to_owned(), state.usage.clone());
         }
     }
-    restore_terminal_client_tools(state, &mut output)?;
-    Ok((output, usage))
+    restore_terminal_client_tools(state)
 }
 
 /// #1159: last-chance restoration of every lowered client-tool call plus
 /// `tools`/`tool_choice` on the terminal response object. A lossy restore fails
 /// the whole logical stream closed rather than leaking a private lowered shape.
 ///
-/// Re-syncs `output` from the now-restored `response_object`, since the
-/// deferred-terminal caller writes THAT vec to the wire (not the object). No-op
-/// when nothing was lowered.
-fn restore_terminal_client_tools(state: &mut ResponsesState, output: &mut Vec<Value>) -> Result<(), SseParseError> {
-    if state.client_tool_lowering.is_empty() {
-        return Ok(());
-    }
-    // The output items were inserted into `response_object` above; restore needs
-    // that object. If it is not an object we cannot restore -> fail closed rather
-    // than return the un-restored (lowered) output.
-    if !state.response_object.is_object() {
-        return Err(SseParseError::ClientToolRestore {
-            key: "terminal".to_owned(),
-            reason: "terminal response object unavailable for client-tool restore".to_owned(),
-        });
-    }
-    restore_snapshot(&mut state.response_object, &state.client_tool_lowering).map_err(|item_type| {
-        SseParseError::ClientToolRestore {
-            key: "terminal".to_owned(),
-            reason: format!("lossy restore of {item_type}"),
+/// The deferred-terminal encoder borrows the restored response object.
+fn restore_terminal_client_tools(state: &mut ResponsesState) -> Result<(), SseParseError> {
+    if !state.client_tool_lowering.is_empty() {
+        // The output items were inserted into `response_object` above; restore needs
+        // that object. If it is not an object we cannot restore -> fail closed rather
+        // than return the un-restored (lowered) output.
+        if !state.response_object.is_object() {
+            return Err(SseParseError::ClientToolRestore {
+                key: "terminal".to_owned(),
+                reason: "terminal response object unavailable for client-tool restore".to_owned(),
+            });
         }
-    })?;
-    restore_snapshot_tools(&mut state.response_object, state.client_tool_echo.as_ref());
-    // Re-sync the returned vec from the now-restored object (an ownership boundary
-    // returning an owned restored vec) — a once-per-logical-stream terminal clone,
-    // not a per-chunk clone.
-    if let Some(restored) = state.response_object.get("output").and_then(Value::as_array) {
-        output.clone_from(restored);
+        restore_snapshot(&mut state.response_object, &state.client_tool_lowering).map_err(|item_type| {
+            SseParseError::ClientToolRestore {
+                key: "terminal".to_owned(),
+                reason: format!("lossy restore of {item_type}"),
+            }
+        })?;
     }
+    restore_snapshot_tools(&mut state.response_object, state.client_tool_echo.as_ref());
     Ok(())
+}
+
+/// Keep only terminal metadata in the deferred event. The response is borrowed
+/// from shared state while the final SSE frame is serialized.
+struct BorrowedTerminalPayload<'a> {
+    /// Deferred event fields other than the canonical response object.
+    metadata: &'a Value,
+    /// Shared canonical response serialized directly into the terminal frame.
+    response: &'a Value,
+}
+
+impl Serialize for BorrowedTerminalPayload<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let Some(metadata) = self.metadata.as_object() else {
+            return self.metadata.serialize(serializer);
+        };
+        let mut map = serializer.serialize_map(Some(metadata.len()))?;
+        for (key, value) in metadata {
+            if key == "response" {
+                map.serialize_entry(key, self.response)?;
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
 }
 
 /// Check whether the stream has exceeded its wall-clock timeout.

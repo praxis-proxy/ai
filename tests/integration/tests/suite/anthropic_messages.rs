@@ -688,7 +688,7 @@ listeners:
 filter_chains:
   - name: passthrough
     filters:
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
       - filter: router
         routes:
@@ -717,9 +717,7 @@ listeners:
 filter_chains:
   - name: passthrough
     filters:
-      - filter: anthropic_messages_format
-        on_invalid: continue
-      - filter: anthropic_validate
+      - filter: anthropic_messages_request
       - filter: anthropic_messages_protocol
         default_version: "2023-06-01"
       - filter: router
@@ -749,7 +747,7 @@ listeners:
 filter_chains:
   - name: transform
     filters:
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
       - filter: anthropic_messages_to_chat_completions
         max_body_bytes: 1048576

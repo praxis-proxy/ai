@@ -21,9 +21,14 @@ use std::{
 use async_trait::async_trait;
 
 use crate::{
+    json_values_charge, json_values_fit,
     owner::StateOwner,
+    retained_charge,
     traits::{ConversationItemStore, ResponseStore},
-    types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
+    types::{
+        BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
+        ResponseEventRecord, ResponseRecord, StoreError,
+    },
 };
 
 /// Owner-qualified key for owner-scoped rows.
@@ -55,6 +60,11 @@ struct Inner {
     item_ids: HashSet<OwnerKey>,
     /// `(owner, response_id, approval_id)` -> approval + consumption stamp.
     approvals: HashMap<(StateOwner, String, String), StoredApproval>,
+    /// `(owner, response_id)` -> durable SSE event log (unordered; sorted on
+    /// read). A `response_id` is globally unique with exactly one owner, so this
+    /// owner-qualified key mirrors the SQL `PRIMARY KEY (response_id,
+    /// sequence_number)` plus the owner-gated `WHERE EXISTS` insert guard.
+    events: HashMap<OwnerKey, Vec<ResponseEventRecord>>,
 }
 
 /// In-memory implementation of [`ResponseStore`] and [`ConversationItemStore`].
@@ -79,11 +89,43 @@ impl InMemoryStore {
     }
 }
 
-/// Rebuild a conversation's denormalized message cache from its items in order.
-fn rebuild_messages(items: &[ConversationItemRecord]) -> serde_json::Value {
+/// Read owned history from the memory backend; copies occur only at the read
+/// ownership boundary, never to refresh a second cache on mutations.
+fn ordered_messages(items: &[ConversationItemRecord]) -> Vec<serde_json::Value> {
     let mut sorted: Vec<&ConversationItemRecord> = items.iter().collect();
     sorted.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.item_id.cmp(&b.item_id)));
-    serde_json::Value::Array(sorted.into_iter().map(|item| item.item_data.clone()).collect())
+    sorted.into_iter().map(|item| item.item_data.clone()).collect()
+}
+
+/// Preserve cache-only history at the first append, without creating item rows.
+fn preserve_legacy_history(inner: &mut Inner, key: &(StateOwner, String)) -> Result<(), StoreError> {
+    let has_items = inner.items.get(key).is_some_and(|items| !items.is_empty());
+    if let Some(record) = inner.conversations.get_mut(key) {
+        if record
+            .messages
+            .get("legacy_messages")
+            .is_some_and(serde_json::Value::is_array)
+        {
+            return Ok(());
+        }
+        if !has_items && !record.messages.is_null() && !record.messages.is_array() {
+            return Err(StoreError::Serialization(
+                "invalid legacy conversation history".to_owned(),
+            ));
+        }
+        if !has_items && record.messages.as_array().is_some_and(|messages| !messages.is_empty()) {
+            let messages = std::mem::take(&mut record.messages);
+            record.messages = serde_json::json!({"legacy_messages": messages});
+        } else {
+            record.messages = serde_json::json!([]);
+        }
+    }
+    Ok(())
+}
+
+/// Cache writers may not replace an authoritative legacy prefix.
+fn replaces_legacy_history(current: &serde_json::Value, replacement: &serde_json::Value) -> bool {
+    current.get("legacy_messages").is_some_and(serde_json::Value::is_array) && current != replacement
 }
 
 /// Upsert a response, rejecting an id already owned by another principal.
@@ -186,6 +228,30 @@ fn record_approvals_into(inner: &mut Inner, owner: &StateOwner, response_id: &st
     }
 }
 
+/// Append events insert-if-absent on `sequence_number`, gated on the parent
+/// response existing under `owner`.
+///
+/// Mirrors the SQL `WHERE EXISTS(... responses ... owner triple)` gate plus
+/// `ON CONFLICT (response_id, sequence_number) DO NOTHING`: events for an absent
+/// or cross-owner response are dropped, and a re-released chunk never overwrites
+/// an already-stored sequence.
+fn append_events_into(inner: &mut Inner, owner: &StateOwner, response_id: &str, events: &[ResponseEventRecord]) {
+    if !inner
+        .responses
+        .get(response_id)
+        .is_some_and(|response| &response.owner == owner)
+    {
+        return;
+    }
+    let log = inner.events.entry((owner.clone(), response_id.to_owned())).or_default();
+    for event in events {
+        if log.iter().any(|stored| stored.sequence_number == event.sequence_number) {
+            continue;
+        }
+        log.push(event.clone());
+    }
+}
+
 #[async_trait]
 impl ResponseStore for InMemoryStore {
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError> {
@@ -196,6 +262,49 @@ impl ResponseStore for InMemoryStore {
     async fn get_response(&self, owner: &StateOwner, id: &str) -> Result<Option<ResponseRecord>, StoreError> {
         let inner = self.lock()?;
         Ok(inner.responses.get(id).filter(|record| &record.owner == owner).cloned())
+    }
+
+    async fn get_response_bounded(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ResponseRecord>, StoreError> {
+        let inner = self.lock()?;
+        let Some(record) = inner.responses.get(id).filter(|record| &record.owner == owner) else {
+            return Ok(None);
+        };
+        let Some(json_allowance) = max_bytes.checked_sub(record.model.len()) else {
+            return Err(StoreError::PayloadTooLarge);
+        };
+        if !json_values_fit(
+            &[&record.response_object, &record.input, &record.messages],
+            json_allowance,
+        ) {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        Ok(Some(record.clone()))
+    }
+
+    async fn get_response_budgeted(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ResponseRecord>>, StoreError> {
+        let inner = self.lock()?;
+        let Some(record) = inner.responses.get(id).filter(|record| &record.owner == owner) else {
+            return Ok(None);
+        };
+        let charge = json_values_charge(
+            [&record.response_object, &record.input, &record.messages],
+            &[&record.id, &record.model],
+            max_charge_bytes,
+        )?;
+        Ok(Some(BudgetedRecord {
+            record: record.clone(),
+            charge_bytes: charge,
+        }))
     }
 
     async fn delete_response(&self, owner: &StateOwner, id: &str) -> Result<bool, StoreError> {
@@ -209,6 +318,9 @@ impl ResponseStore for InMemoryStore {
         inner
             .approvals
             .retain(|(row_owner, response_id, _), _| !(row_owner == owner && response_id == id));
+        // The durable SSE event log is removed with the response so nothing
+        // stays replayable after a DELETE.
+        inner.events.remove(&(owner.clone(), id.to_owned()));
         Ok(removed)
     }
 
@@ -222,6 +334,95 @@ impl ResponseStore for InMemoryStore {
             .conversations
             .get(&(owner.clone(), conversation_id.to_owned()))
             .cloned())
+    }
+
+    async fn get_conversation_bounded(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        let inner = self.lock()?;
+        let key = (owner.clone(), conversation_id.to_owned());
+        let Some(record) = inner.conversations.get(&key) else {
+            return Ok(None);
+        };
+        // Post-#1509 the `messages` column is a lazy snapshot, so reconstruct the
+        // full history (legacy prefix + items) before enforcing the byte ceiling.
+        let items = inner.items.get(&key).map_or(&[][..], Vec::as_slice);
+        let mut history = record
+            .messages
+            .get("legacy_messages")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if items.is_empty() && history.is_empty() {
+            history = record.messages.as_array().cloned().unwrap_or_default();
+        }
+        history.extend(ordered_messages(items));
+        let messages = serde_json::Value::Array(history);
+        if !json_values_fit(&[&record.metadata, &messages], max_bytes) {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        let mut record = record.clone();
+        record.messages = messages;
+        Ok(Some(record))
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "legacy/item reconstruction and charge accounting share one locked snapshot"
+    )]
+    async fn get_conversation_budgeted(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ConversationRecord>>, StoreError> {
+        let inner = self.lock()?;
+        let key = (owner.clone(), conversation_id.to_owned());
+        let Some(record) = inner.conversations.get(&key) else {
+            return Ok(None);
+        };
+        let items = inner.items.get(&key).map_or(&[][..], Vec::as_slice);
+        let mut legacy = record
+            .messages
+            .get("legacy_messages")
+            .and_then(serde_json::Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        if items.is_empty() && legacy.is_empty() {
+            legacy = record.messages.as_array().map_or(&[][..], Vec::as_slice);
+        }
+        let item_count = legacy
+            .len()
+            .checked_add(items.len())
+            .ok_or(StoreError::PayloadTooLarge)?;
+        let array_syntax_bytes = if item_count == 0 {
+            2
+        } else {
+            item_count.checked_add(1).ok_or(StoreError::PayloadTooLarge)?
+        };
+        let projection_overhead = retained_charge(array_syntax_bytes, 1).ok_or(StoreError::PayloadTooLarge)?;
+        let values = std::iter::once(&record.metadata)
+            .chain(legacy.iter())
+            .chain(items.iter().map(|item| &item.item_data));
+        let charge = json_values_charge(values, &[&record.conversation_id], max_charge_bytes)?
+            .checked_add(projection_overhead)
+            .filter(|charge| *charge <= max_charge_bytes)
+            .ok_or(StoreError::PayloadTooLarge)?;
+
+        let mut history = legacy.to_vec();
+        history.extend(ordered_messages(items));
+        Ok(Some(BudgetedRecord {
+            record: ConversationRecord {
+                conversation_id: record.conversation_id.clone(),
+                owner: record.owner.clone(),
+                created_at: record.created_at,
+                metadata: record.metadata.clone(),
+                messages: serde_json::Value::Array(history),
+            },
+            charge_bytes: charge,
+        }))
     }
 
     async fn record_pending_approvals(
@@ -250,6 +451,20 @@ impl ResponseStore for InMemoryStore {
         Ok(())
     }
 
+    async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.lock()?;
+        if inner.responses.contains_key(&record.id) {
+            return Ok(false);
+        }
+        upsert_response_into(&mut inner, record)?;
+        record_approvals_into(&mut inner, &record.owner, &record.id, pending_approvals);
+        Ok(true)
+    }
+
     async fn get_pending_approvals(
         &self,
         owner: &StateOwner,
@@ -267,6 +482,30 @@ impl ResponseStore for InMemoryStore {
             })
             .collect();
         Ok(found)
+    }
+
+    async fn pending_approval_payload_bytes(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        let inner = self.lock()?;
+        inner
+            .approvals
+            .iter()
+            .filter(|((stored_owner, stored_response, stored_id), _)| {
+                stored_owner == owner && stored_response == response_id && approval_ids.contains(&stored_id.as_str())
+            })
+            .try_fold(0_usize, |used, (_, stored)| {
+                let record = &stored.record;
+                used.checked_add(record.approval_id.len())
+                    .and_then(|bytes| bytes.checked_add(record.server_label.len()))
+                    .and_then(|bytes| bytes.checked_add(record.tool_name.len()))
+                    .and_then(|bytes| bytes.checked_add(record.arguments.len()))
+                    .and_then(|bytes| bytes.checked_add(record.target_fingerprint.len()))
+                    .ok_or_else(|| StoreError::Database("pending approval payload size overflow".to_owned()))
+            })
     }
 
     async fn consume_approvals(
@@ -299,6 +538,53 @@ impl ResponseStore for InMemoryStore {
         }
         Ok(None)
     }
+
+    async fn append_events(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        events: &[ResponseEventRecord],
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock()?;
+        append_events_into(&mut inner, owner, response_id, events);
+        Ok(())
+    }
+
+    async fn list_events_after(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+        let inner = self.lock()?;
+        let Some(log) = inner.events.get(&(owner.clone(), response_id.to_owned())) else {
+            return Ok(Vec::new());
+        };
+        // Filter and order references first, then clone only the bounded page so
+        // one replay page copies at most `limit` events, not the full tail.
+        let mut ordered: Vec<&ResponseEventRecord> = log
+            .iter()
+            .filter(|event| after.is_none_or(|cursor| event.sequence_number > cursor))
+            .collect();
+        ordered.sort_unstable_by_key(|event| event.sequence_number);
+        Ok(ordered.into_iter().take(limit as usize).cloned().collect())
+    }
+
+    async fn event_log_status(&self, owner: &StateOwner, response_id: &str) -> Result<EventLogStatus, StoreError> {
+        let inner = self.lock()?;
+        let Some(log) = inner.events.get(&(owner.clone(), response_id.to_owned())) else {
+            return Ok(EventLogStatus::Absent);
+        };
+        let Some(max_sequence) = log.iter().map(|event| event.sequence_number).max() else {
+            return Ok(EventLogStatus::Absent);
+        };
+        if log.iter().any(|event| event.terminal) {
+            Ok(EventLogStatus::Replayable { max_sequence })
+        } else {
+            Ok(EventLogStatus::Incomplete { max_sequence })
+        }
+    }
 }
 
 #[async_trait]
@@ -311,6 +597,15 @@ impl ConversationItemStore for InMemoryStore {
             return Err(StoreError::Database("conversation id collision".to_owned()));
         }
         let key = (record.owner.clone(), record.conversation_id.clone());
+        if inner
+            .conversations
+            .get(&key)
+            .is_some_and(|existing| replaces_legacy_history(&existing.messages, &record.messages))
+        {
+            return Err(StoreError::Database(
+                "conversation upsert would replace legacy history".to_owned(),
+            ));
+        }
         // Preserve the original creation time on update; refreshes of metadata
         // or messages must not rewrite created_at.
         let created_at = inner
@@ -337,11 +632,11 @@ impl ConversationItemStore for InMemoryStore {
             .conversations
             .get_mut(&(owner.clone(), conversation_id.to_owned()))
         {
-            Some(record) => {
+            Some(record) if !replaces_legacy_history(&record.messages, messages) => {
                 record.messages = messages.clone();
                 Ok(true)
             },
-            None => Ok(false),
+            _ => Ok(false),
         }
     }
 
@@ -376,7 +671,9 @@ impl ConversationItemStore for InMemoryStore {
             .conversations
             .get_mut(&(owner.clone(), conversation_id.to_owned()))
         {
-            Some(record) if &record.messages == expected_messages => {
+            Some(record)
+                if &record.messages == expected_messages && !replaces_legacy_history(&record.messages, messages) =>
+            {
                 record.messages = messages.clone();
                 Ok(true)
             },
@@ -541,35 +838,47 @@ impl ConversationItemStore for InMemoryStore {
             .unwrap_or(0))
     }
 
+    async fn conversation_history(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, StoreError> {
+        let inner = self.lock()?;
+        let key = (owner.clone(), conversation_id.to_owned());
+        let Some(record) = inner.conversations.get(&key) else {
+            return Ok(None);
+        };
+        let items = inner.items.get(&key).map_or(&[][..], Vec::as_slice);
+        let mut history = record
+            .messages
+            .get("legacy_messages")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if items.is_empty() && history.is_empty() {
+            history = record.messages.as_array().cloned().unwrap_or_default();
+        }
+        history.extend(ordered_messages(items));
+        Ok(Some(history))
+    }
+
     async fn create_items_and_sync_messages(
         &self,
         owner: &StateOwner,
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
-        let mut inner = self.lock()?;
-        let key = (owner.clone(), conversation_id.to_owned());
-        require_conversation_scope(&inner, owner, conversation_id, items)?;
-        reject_duplicate_item_ids(&inner, items)?;
-        let mut next = inner
-            .items
-            .get(&key)
-            .and_then(|items| items.iter().map(|i| i.position).max())
-            .unwrap_or(0);
-        for item in items {
-            next += 1;
-            // Positions are assigned within the "transaction"; the input
-            // position field is ignored.
-            let mut stored = item.clone();
-            stored.position = next;
-            inner.item_ids.insert((stored.owner.clone(), stored.item_id.clone()));
-            inner.items.entry(key.clone()).or_default().push(stored);
-        }
-        let rebuilt = rebuild_messages(inner.items.get(&key).map_or(&[][..], |items| items.as_slice()));
-        if let Some(conversation) = inner.conversations.get_mut(&key) {
-            conversation.messages = rebuilt;
-        }
-        Ok(())
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, None)
+    }
+
+    async fn create_items_and_sync_messages_bounded(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_append_charge_bytes: usize,
+    ) -> Result<(), StoreError> {
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, Some(max_append_charge_bytes))
     }
 
     async fn delete_item_and_sync_messages(
@@ -592,17 +901,90 @@ impl ConversationItemStore for InMemoryStore {
                 "conversation disappeared during message sync: {conversation_id}"
             )));
         }
+        preserve_legacy_history(&mut inner, &key)?;
         let items = inner
             .items
             .get_mut(&key)
             .ok_or_else(|| StoreError::Database("conversation items disappeared during message sync".to_owned()))?;
         items.remove(index);
         inner.item_ids.remove(&(owner.clone(), item_id.to_owned()));
-        let rebuilt = rebuild_messages(inner.items.get(&key).map_or(&[][..], |items| items.as_slice()));
-        if let Some(conversation) = inner.conversations.get_mut(&key) {
-            conversation.messages = rebuilt;
-        }
         Ok(true)
+    }
+}
+
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "bounded cache helper sits beside its trait implementation"
+)]
+impl InMemoryStore {
+    /// Validate bounded new append work before updating items.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "preflight and the mutex-protected commit form one atomic operation"
+    )]
+    fn create_items_and_sync_messages_with_limit(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_append_charge_bytes: Option<usize>,
+    ) -> Result<(), StoreError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.lock()?;
+        let key = (owner.clone(), conversation_id.to_owned());
+        require_conversation_scope(&inner, owner, conversation_id, items)?;
+        reject_duplicate_item_ids(&inner, items)?;
+        if let Some(max_append_charge_bytes) = max_append_charge_bytes {
+            let mut charge = json_values_charge(std::iter::empty(), &[conversation_id], max_append_charge_bytes)?;
+            for item in items {
+                let item_charge =
+                    json_values_charge([&item.item_data], &[&item.item_id], max_append_charge_bytes - charge)?;
+                charge = charge.checked_add(item_charge).ok_or(StoreError::PayloadTooLarge)?;
+            }
+            let has_items = inner.items.get(&key).is_some_and(|existing| !existing.is_empty());
+            if !has_items
+                && inner
+                    .conversations
+                    .get(&key)
+                    .and_then(|record| record.messages.as_array())
+                    .is_some_and(|messages| !messages.is_empty())
+            {
+                let remaining = max_append_charge_bytes
+                    .checked_sub(charge)
+                    .ok_or(StoreError::PayloadTooLarge)?;
+                let cached = &inner.conversations.get(&key).ok_or(StoreError::NotFound)?.messages;
+                let cached_charge = json_values_charge([cached], &[], remaining)?;
+                charge = charge.checked_add(cached_charge).ok_or(StoreError::PayloadTooLarge)?;
+                // The first append wraps a cache-only array as an explicit legacy
+                // prefix; reserve the wrapper before moving it into the record.
+                let wrapper_charge = retained_charge(20, 2).ok_or(StoreError::PayloadTooLarge)?;
+                charge
+                    .checked_add(wrapper_charge)
+                    .filter(|total| *total <= max_append_charge_bytes)
+                    .ok_or(StoreError::PayloadTooLarge)?;
+            }
+        }
+        // Invalidate the denormalized message cache incrementally (#1509): snapshot
+        // the current projection as legacy history, then append without an eager
+        // rebuild. Reads reconstruct the cache lazily from the retired snapshot.
+        preserve_legacy_history(&mut inner, &key)?;
+        let mut next = inner
+            .items
+            .get(&key)
+            .and_then(|items| items.iter().map(|i| i.position).max())
+            .unwrap_or(0);
+        for item in items {
+            next += 1;
+            // Positions are assigned within the "transaction"; the input
+            // position field is ignored.
+            let mut stored = item.clone();
+            stored.position = next;
+            inner.item_ids.insert((stored.owner.clone(), stored.item_id.clone()));
+            inner.items.entry(key.clone()).or_default().push(stored);
+        }
+        Ok(())
     }
 }
 
@@ -656,6 +1038,62 @@ mod tests {
             .unwrap();
         assert!(store.get_response(&a, "r1").await.unwrap().is_some());
         assert!(store.get_response(&b, "r1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_response_counts_model_before_cloning() {
+        let store = InMemoryStore::new();
+        let owner = owner("a");
+        store
+            .upsert_response(&ResponseRecord {
+                id: "r1".to_owned(),
+                owner: owner.clone(),
+                created_at: 1,
+                model: "m".repeat(16_384),
+                response_object: serde_json::json!({}),
+                input: serde_json::json!({}),
+                messages: serde_json::json!([]),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.get_response_bounded(&owner, "r1", 4_096).await,
+            Err(StoreError::PayloadTooLarge)
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_conversation_append_keeps_prior_cache_on_overflow() {
+        let store = InMemoryStore::new();
+        let o = owner("a");
+        store
+            .upsert_conversation(&ConversationRecord {
+                conversation_id: "c1".to_owned(),
+                owner: o.clone(),
+                created_at: 1,
+                metadata: serde_json::json!({}),
+                messages: serde_json::json!([]),
+            })
+            .await
+            .unwrap();
+        store
+            .create_items_and_sync_messages(&o, "c1", &[item(&o, "c1", "prior", 0)])
+            .await
+            .unwrap();
+        let rejected = store
+            .create_items_and_sync_messages_bounded(&o, "c1", &[item(&o, "c1", "new", 0)], 1)
+            .await;
+        assert!(matches!(rejected, Err(StoreError::PayloadTooLarge)));
+        let listed = store.list_conversation_items(&o, "c1", None, 10, true).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed.first().map(|item| item.item_id.as_str()), Some("prior"));
+        // Post-#1509 the plain `messages` cache is lazy, so the reconstructed
+        // bounded view is what proves the prior item survived the rejected append.
+        let conversation = ResponseStore::get_conversation_bounded(&store, &o, "c1", 65_536)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(conversation.messages.as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -731,7 +1169,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_items_and_sync_assigns_positions_and_rebuilds() {
+    async fn create_items_and_sync_assigns_positions_and_invalidates() {
         let store = InMemoryStore::new();
         let o = owner("a");
         store
@@ -756,7 +1194,8 @@ mod tests {
             .await
             .unwrap()
             .expect("conversation");
-        assert_eq!(conversation.messages.as_array().map(Vec::len), Some(2));
+        assert_eq!(conversation.messages, serde_json::json!([]));
+        assert_eq!(store.conversation_history(&o, "c1").await.unwrap().unwrap().len(), 2);
     }
 
     #[tokio::test]

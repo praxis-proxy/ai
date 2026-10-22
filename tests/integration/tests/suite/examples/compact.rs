@@ -15,8 +15,8 @@ use std::{
 };
 
 use praxis_test_utils::{
-    Backend, TempSqlite, bind_unique_port, example_config_path, free_port, http_send, json_post, parse_body,
-    parse_status, patch_yaml, start_proxy,
+    Backend, StatefulCapturingBackend, StatefulCapturingGuard, TempSqlite, bind_unique_port, example_config_path,
+    free_port, http_send, json_post, parse_body, parse_status, patch_yaml, start_proxy,
 };
 use sqlx::Row as _;
 
@@ -712,12 +712,12 @@ async fn compact_explicit_endpoint() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_explicit_endpoint_response_is_valid_follow_up_target() {
-    assert_compaction_follow_up(false).await;
+    Box::pin(assert_compaction_follow_up(false)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_explicit_endpoint_compressed_response_is_valid_follow_up_target() {
-    assert_compaction_follow_up(true).await;
+    Box::pin(assert_compaction_follow_up(true)).await;
 }
 
 /// Verify persisted compaction can be rehydrated with either storage codec.
@@ -1161,4 +1161,554 @@ async fn compact_reactive_with_store_false_does_not_persist() {
         inference_persisted, 0,
         "the store:false inference response must not be persisted"
     );
+}
+
+// -----------------------------------------------------------------------------
+// Malformed-field rejection through the full compact graph (issue #1403)
+// -----------------------------------------------------------------------------
+
+/// Count the summarization/inference POSTs a capturing backend received,
+/// ignoring GET/HEAD readiness probes so the count reflects real callouts.
+fn callout_count(backend: &StatefulCapturingGuard) -> usize {
+    backend.requests().iter().filter(|r| r.method == "POST").count()
+}
+
+/// Count persisted response rows in the test database.
+async fn count_response_rows(db_url: &str) -> i64 {
+    let pool = sqlx::SqlitePool::connect(db_url)
+        .await
+        .expect("should connect to test database");
+    let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM openai_responses")
+        .fetch_one(&pool)
+        .await
+        .expect("count query should run")
+        .get("n");
+    pool.close().await;
+    n
+}
+
+/// Assert `raw` is an HTTP 400 `invalid_request_error` whose body mentions `needle`.
+fn assert_rejected_400(raw: &str, needle: &str) {
+    assert_eq!(
+        parse_status(raw),
+        400,
+        "malformed compact request must return 400: {raw}"
+    );
+    assert!(
+        raw.contains("invalid_request_error"),
+        "response should be an invalid_request_error: {raw}"
+    );
+    assert!(
+        raw.contains(needle),
+        "response should explain the error ({needle}): {raw}"
+    );
+}
+
+/// Send a single compact `body` (no stored history) against a capturing backend
+/// and return `(raw_response, callout_count, persisted_row_count)`.
+async fn run_inline_compact(db_name: &str, body: &str) -> (String, usize, i64) {
+    let backend =
+        StatefulCapturingBackend::new(vec![(200, CHAT_COMPLETIONS_RESPONSE.to_owned()); 4]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new(db_name);
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+        .expect("example config should exist");
+    let config = load_compact_config(&yaml, db.url(), proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses/compact", body));
+    let callouts = callout_count(&backend);
+    drop(proxy);
+    let rows = count_response_rows(db.url()).await;
+    (raw, callouts, rows)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_wrong_typed_instructions() {
+    // Issue #1403 case 1: a numeric `instructions` must 400, not be silently
+    // dropped and summarized with the caller's instructions treated as absent.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_instructions",
+        r#"{"model":"gpt-4.1","input":"INLINE-CONTENT","instructions":123}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "instructions must be a string");
+    assert_eq!(
+        callouts, 0,
+        "wrong-typed instructions must not trigger a summarization callout"
+    );
+    assert_eq!(rows, 0, "wrong-typed instructions must not persist a compaction");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_non_object_input_item() {
+    // Issue #1403 case 2: `[123]` must 400, not be accepted into the input list
+    // where it would summarize empty content.
+    let (raw, callouts, rows) =
+        run_inline_compact("compact_reject_input_item", r#"{"model":"gpt-4.1","input":[123]}"#).await;
+    assert_rejected_400(&raw, "input[0] must be an object");
+    assert_eq!(
+        callouts, 0,
+        "a malformed input item must not trigger a summarization callout"
+    );
+    assert_eq!(rows, 0, "a malformed input item must not persist a compaction");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_malformed_message_content() {
+    // Issue #1403 follow-up: an object item whose `content` is wrong-typed used
+    // to pass the object check and then be silently formatted into empty text,
+    // returning 200 with one empty-conversation callout and one persisted row.
+    // It must now 400 before any callout or store write.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_message_content",
+        r#"{"model":"gpt-4.1","input":[{"role":"user","content":123}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "input[0].content must be a string or an array");
+    assert_eq!(
+        callouts, 0,
+        "a message with malformed content must not trigger a summarization callout"
+    );
+    assert_eq!(
+        rows, 0,
+        "a message with malformed content must not persist a compaction"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_non_text_content_before_callout() {
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_non_text_content",
+        r#"{"model":"gpt-4.1","input":[{"role":"user","content":[{"type":"input_text","text":"look"},{"type":"input_image","image_url":"https://example.test/image.png"}]}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "input_image");
+    assert_eq!(
+        callouts, 0,
+        "non-text content must not trigger a lossy summarization callout"
+    );
+    assert_eq!(rows, 0, "rejected non-text content must not be persisted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_output_text_annotations_before_callout() {
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_output_annotations",
+        r#"{"model":"gpt-4.1","input":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"source","annotations":[{"type":"url_citation","url":"https://example.test"}]}]}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "annotations");
+    assert_eq!(
+        callouts, 0,
+        "annotated text must not trigger a lossy summarization callout"
+    );
+    assert_eq!(rows, 0, "rejected annotated text must not be persisted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_wrong_typed_input_scalar() {
+    // A wrong-typed scalar input with no prior id must 400 with the type error
+    // rather than the generic "input or previous_response_id" message.
+    let (raw, callouts, rows) =
+        run_inline_compact("compact_reject_input_scalar", r#"{"model":"gpt-4.1","input":123}"#).await;
+    assert_rejected_400(&raw, "input must be a string or an array of items");
+    assert_eq!(
+        callouts, 0,
+        "wrong-typed input must not trigger a summarization callout"
+    );
+    assert_eq!(rows, 0, "wrong-typed input must not persist a compaction");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_wrong_typed_previous_response_id() {
+    // Existing prior-id rejection control: a non-string `previous_response_id`
+    // is rejected (by rehydrate ahead of compact) with 400 and no callout.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_prev_id",
+        r#"{"model":"gpt-4.1","input":"INLINE-CONTENT","previous_response_id":123}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "previous_response_id must be a string");
+    assert_eq!(
+        callouts, 0,
+        "wrong-typed previous_response_id must not trigger a callout"
+    );
+    assert_eq!(
+        rows, 0,
+        "wrong-typed previous_response_id must not persist a compaction"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_wrong_typed_input_with_valid_history() {
+    // Issue #1403 case 3: wrong-typed input must 400 even when the referenced
+    // previous_response_id points at valid stored history (it must never
+    // silently collapse to an empty input and summarize history alone).
+
+    // Phase 1: store a response so there is valid history to reference.
+    let backend1 = Backend::fixed(FIRST_RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("compact_reject_input_history");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+        .expect("example config should exist");
+
+    let config1 = load_compact_config(&yaml, db.url(), proxy_port, backend1.port());
+    let proxy1 = start_proxy(&config1);
+    let raw1 = http_send(
+        proxy1.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"HISTORY-CONTENT"}"#),
+    );
+    assert_eq!(parse_status(&raw1), 200, "first request should store response");
+    drop(backend1);
+    drop(proxy1);
+    assert_eq!(
+        count_response_rows(db.url()).await,
+        1,
+        "precondition: exactly the stored history row exists"
+    );
+
+    // Phase 2: a wrong-typed input alongside the valid prior id must be rejected
+    // before any summarization callout, leaving the stored history untouched.
+    let backend2 =
+        StatefulCapturingBackend::new(vec![(200, CHAT_COMPLETIONS_RESPONSE.to_owned()); 4]).start_with_shutdown();
+    let config2 = load_compact_config(&yaml, db.url(), proxy_port, backend2.port());
+    let proxy2 = start_proxy(&config2);
+    let raw = http_send(
+        proxy2.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-4.1","input":123,"previous_response_id":"resp_compact"}"#,
+        ),
+    );
+    assert_rejected_400(&raw, "input must be a string or an array of items");
+    assert_eq!(
+        callout_count(&backend2),
+        0,
+        "wrong-typed input must not trigger a callout even with valid history"
+    );
+    drop(proxy2);
+    assert_eq!(
+        count_response_rows(db.url()).await,
+        1,
+        "no new compaction may be persisted for the rejected request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_valid_inline_input_makes_one_callout_and_persists() {
+    // Positive control contrasting the #1403 rejection cases: a valid inline
+    // input compacts with exactly one summarization callout and one stored row.
+    let backend =
+        StatefulCapturingBackend::new(vec![(200, CHAT_COMPLETIONS_RESPONSE.to_owned()); 4]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("compact_valid_inline_counts");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+        .expect("example config should exist");
+    let config = load_compact_config(&yaml, db.url(), proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-4.1","input":[{"role":"user","content":"Explain TCP vs UDP"},{"role":"assistant","content":"TCP is reliable."}]}"#,
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "valid inline compact should succeed: {raw}");
+
+    let requests = backend.requests();
+    let callouts: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
+    assert_eq!(
+        callouts.len(),
+        1,
+        "valid compact must make exactly one summarization callout"
+    );
+    assert!(
+        callouts[0].body.contains("Explain TCP vs UDP"),
+        "the summarization callout must carry the inline conversation: {}",
+        callouts[0].body
+    );
+    drop(proxy);
+
+    assert_eq!(
+        count_response_rows(db.url()).await,
+        1,
+        "valid compact must persist exactly one compaction row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_accepts_function_call_output_content_list() {
+    // Regression for the #1403 follow-up fix: a `function_call_output` whose
+    // `output` is a content-list (`string | content-list` in the Responses API)
+    // must be accepted, not 400-rejected, and its text must reach the callout
+    // rather than being dropped.
+    let backend =
+        StatefulCapturingBackend::new(vec![(200, CHAT_COMPLETIONS_RESPONSE.to_owned()); 4]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("compact_function_output_content_list");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+        .expect("example config should exist");
+    let config = load_compact_config(&yaml, db.url(), proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-4.1","input":[{"type":"function_call","call_id":"c1","name":"get_weather","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":[{"type":"input_text","text":"pass"},{"type":"input_text","text":"word"}]}]}"#,
+        ),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "a content-list function_call_output must be accepted: {raw}"
+    );
+
+    let requests = backend.requests();
+    let callouts: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
+    assert_eq!(callouts.len(), 1, "a valid compact must make exactly one callout");
+    // Parts are joined with no separator, matching the translation layer, so the
+    // summarizer sees "password" (the fact the backend would see), not "pass word".
+    assert!(
+        callouts[0].body.contains("password"),
+        "the callout must carry the joined content-list output text: {}",
+        callouts[0].body
+    );
+    drop(proxy);
+
+    assert_eq!(
+        count_response_rows(db.url()).await,
+        1,
+        "a valid compact must persist exactly one compaction row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_unrepresentable_additional_tools_item() {
+    // The item remains schema-valid input, but the text renderer has no lossless
+    // representation for it, so compaction must fail before replacement.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_additional_tools",
+        r#"{"model":"gpt-4.1","input":[{"type":"additional_tools","role":"developer","tools":[]},{"role":"user","content":"Hello"}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "additional_tools");
+    assert_eq!(callouts, 0, "unrepresentable tool metadata must not trigger a callout");
+    assert_eq!(rows, 0, "unrepresentable tool metadata must not be persisted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_unrepresentable_item_reference() {
+    // ItemReferenceParam.type may be null, so syntax parsing accepts this shape.
+    // Compaction still rejects it because the renderer omits the reference id.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_null_type_item_reference",
+        r#"{"model":"gpt-4.1","input":[{"type":null,"id":"resp_123"},{"role":"user","content":"Hello"}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "item_reference");
+    assert_eq!(callouts, 0, "an item reference must not trigger a lossy callout");
+    assert_eq!(rows, 0, "an item reference must not be persisted after rejection");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_null_type_without_id() {
+    // Issue #1403 follow-up: the null-`type` tolerance applies only to the
+    // item_reference shape, which requires a string `id`. A null `type` with no `id`
+    // is malformed and must 400 through the full graph before the summarizer is
+    // called or a compaction is stored, not be formatted as an empty message.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_null_type_no_id",
+        r#"{"model":"gpt-4.1","input":[{"type":null}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "input[0].type must be a string");
+    assert_eq!(callouts, 0, "a null-typed item with no id must not trigger a callout");
+    assert_eq!(rows, 0, "a null-typed item with no id must not persist a compaction");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_null_message_content() {
+    // Issue #1403 follow-up: a message `content` is a required string or content
+    // list, so an explicit null must 400 through the full graph before the
+    // summarizer is called or a compaction is stored.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_null_content",
+        r#"{"model":"gpt-4.1","input":[{"role":"user","content":null}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "input[0].content must be a string or an array");
+    assert_eq!(
+        callouts, 0,
+        "null message content must not trigger a summarization callout"
+    );
+    assert_eq!(rows, 0, "null message content must not persist a compaction");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_untyped_item_with_wrong_typed_content() {
+    // Issue #1403 follow-up: `append_item`'s catch-all reads `content` even from an
+    // untyped, role-less item, so a wrong-typed `content` would otherwise be
+    // silently dropped to empty text and summarized/stored with HTTP 200.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_untyped_content",
+        r#"{"model":"gpt-4.1","input":[{"content":123}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "input[0].content must be a string or an array");
+    assert_eq!(
+        callouts, 0,
+        "a malformed untyped item must not trigger a summarization callout"
+    );
+    assert_eq!(rows, 0, "a malformed untyped item must not persist a compaction");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_null_input_text_part() {
+    // Issue #1403 follow-up: an `input_text` part requires a string `text`, so a
+    // null value must 400 through the full graph rather than be summarized as empty.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_null_text_part",
+        r#"{"model":"gpt-4.1","input":[{"role":"user","content":[{"type":"input_text","text":null}]}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "input[0].content[0].text must be a string");
+    assert_eq!(callouts, 0, "a null text part must not trigger a summarization callout");
+    assert_eq!(rows, 0, "a null text part must not persist a compaction");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_null_function_call_name() {
+    // Issue #1403 follow-up: a function call `name` is a required string, so a null
+    // value must 400 rather than be summarized as `function_call: unknown(...)`.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_null_call_name",
+        r#"{"model":"gpt-4.1","input":[{"type":"function_call","call_id":"c1","name":null,"arguments":"{}"}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "input[0].name must be a string");
+    assert_eq!(
+        callouts, 0,
+        "a null function name must not trigger a summarization callout"
+    );
+    assert_eq!(rows, 0, "a null function name must not persist a compaction");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_null_message_role() {
+    // Issue #1403 follow-up: a message `role` is a required string, so a null value
+    // must 400 through the full graph rather than reach the summarizer as `unknown`.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_null_role",
+        r#"{"model":"gpt-4.1","input":[{"role":null,"content":"hello"}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "input[0].role must be a string");
+    assert_eq!(callouts, 0, "a null role must not trigger a summarization callout");
+    assert_eq!(rows, 0, "a null role must not persist a compaction");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_null_compaction_encrypted_content() {
+    // Issue #1403 follow-up: a compaction item's `encrypted_content` is a required
+    // string, so a null value must 400 rather than store an empty compaction.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_null_encrypted_content",
+        r#"{"model":"gpt-4.1","input":[{"type":"compaction","encrypted_content":null}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "input[0].encrypted_content must be a string");
+    assert_eq!(
+        callouts, 0,
+        "a null encrypted_content must not trigger a summarization callout"
+    );
+    assert_eq!(rows, 0, "a null encrypted_content must not persist a compaction");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_unrenderable_compaction_content() {
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_unrenderable_encrypted_content",
+        r#"{"model":"gpt-4.1","input":[{"type":"compaction","encrypted_content":"provider-opaque-state"}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "item type `compaction` cannot be represented");
+    assert_eq!(
+        callouts, 0,
+        "unrenderable compaction content must not trigger a summarization callout"
+    );
+    assert_eq!(
+        rows, 0,
+        "unrenderable compaction content must not persist a replacement"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_null_item_type() {
+    // Issue #1403 follow-up: an explicit null item `type` must 400 rather than be
+    // read as "omitted" and silently reinterpreted as a message through the graph.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_null_item_type",
+        r#"{"model":"gpt-4.1","input":[{"type":null,"content":"hi"}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "input[0].type must be a string");
+    assert_eq!(callouts, 0, "a null item type must not trigger a summarization callout");
+    assert_eq!(rows, 0, "a null item type must not persist a compaction");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_null_content_part_type() {
+    // Issue #1403 follow-up: a content part's null `type` must 400 rather than
+    // escape the text-part check and send an empty conversation to the summarizer.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_null_part_type",
+        r#"{"model":"gpt-4.1","input":[{"role":"user","content":[{"type":null,"text":null}]}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "input[0].content[0].type must be a string");
+    assert_eq!(
+        callouts, 0,
+        "a null content part type must not trigger a summarization callout"
+    );
+    assert_eq!(rows, 0, "a null content part type must not persist a compaction");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_content_part_without_type() {
+    // Issue #1403 follow-up: the content-part union requires a `type` discriminator,
+    // so a part with no type and null text must 400 rather than omit the part and
+    // summarize an empty conversation.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_part_no_type",
+        r#"{"model":"gpt-4.1","input":[{"role":"user","content":[{"text":null}]}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "input[0].content[0].type must be a string");
+    assert_eq!(
+        callouts, 0,
+        "a type-less content part must not trigger a summarization callout"
+    );
+    assert_eq!(rows, 0, "a type-less content part must not persist a compaction");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_text_kind_part_with_null_text() {
+    // Issue #1403 follow-up: the `text` kind requires a string `text` (the
+    // translator collapses it), so a null value must 400 rather than be dropped.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_text_kind_null",
+        r#"{"model":"gpt-4.1","input":[{"role":"user","content":[{"type":"text","text":null}]}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "input[0].content[0].text must be a string");
+    assert_eq!(
+        callouts, 0,
+        "a null text-kind part must not trigger a summarization callout"
+    );
+    assert_eq!(rows, 0, "a null text-kind part must not persist a compaction");
 }

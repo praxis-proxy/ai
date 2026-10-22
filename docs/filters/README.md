@@ -78,6 +78,7 @@ Other hosts (such as ExtProc) must do the same.
 ## Related documentation
 
 - [Generated filter reference](reference.md)
+- [Responses retained-payload budget](../architecture/responses-retained-payload.md)
 - [Feature overview](../features.md)
 - [Example configurations](../../examples/README.md)
 - [Writing extensions](extensions.md)

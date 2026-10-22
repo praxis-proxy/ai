@@ -6,7 +6,7 @@
 //! `docs/conformance/openresponses-translation.md`.
 //!
 //! Coverage is `supported / (supported + unsupported)` — the fraction of
-//! in-scope suite templates the `responses_to_chat_completions` filter passes.
+//! in-scope suite templates the `openai_responses_to_chat_completions` filter passes.
 //! `inapplicable` templates (wrong transport, a backend modality the pinned CPU
 //! model lacks, operations outside the translation surface) are excluded from
 //! the denominator. Fixing a translation gap promotes an `unsupported` template
@@ -185,7 +185,7 @@ fn render_doc(m: &Manifest) -> String {
     .unwrap();
     writeln!(
         out,
-        "against the `responses_to_chat_completions` translation filter — never against"
+        "against the `openai_responses_to_chat_completions` translation filter — never against"
     )
     .unwrap();
     writeln!(out, "native Responses passthrough.").unwrap();

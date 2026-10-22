@@ -12,12 +12,22 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use openssl::rand::rand_bytes;
 use serde_json::{Map, Value, json};
 use tracing::warn;
 
 // -----------------------------------------------------------------------------
-// Tool-call Slots
+// Tool-call Slots & Bounds
 // -----------------------------------------------------------------------------
+
+/// Maximum candidate choices allowed in a single stream.
+pub(crate) const MAX_STREAM_CANDIDATES: u64 = 64;
+
+/// Maximum byte length of an upstream `responseId` retained in a client response.
+const MAX_RESPONSE_ID_BYTES: usize = 256;
+
+/// Maximum tool-call slots allowed per candidate in a single stream.
+pub(crate) const MAX_STREAM_TOOL_CALL_SLOTS: usize = 128;
 
 /// Disambiguator mixed into minted OpenAI `tool_calls[].id` values.
 ///
@@ -110,6 +120,11 @@ impl StreamTranslateState {
         self.expected_candidate_count = count.max(1);
     }
 
+    /// Return the maximum candidate count allowed for admission.
+    pub(crate) fn allowed_candidate_count(&self) -> u64 {
+        self.expected_candidate_count.min(MAX_STREAM_CANDIDATES)
+    }
+
     /// Enable the OpenAI trailing usage chunk for this stream.
     pub(crate) fn set_include_usage(&mut self, include_usage: bool) {
         self.include_usage = include_usage;
@@ -129,19 +144,39 @@ impl StreamTranslateState {
         }
     }
 
-    /// Set the OpenAI completion id once: Vertex `responseId` when the first
-    /// frame has one, otherwise the shared fallback. Later frames cannot
-    /// change it (a late `responseId` must not rewrite earlier chunk ids).
-    fn ensure_completion_id(&mut self, response_id: Option<&str>) {
+    /// Set the OpenAI completion id once when an emitted chunk first needs it:
+    /// use Vertex `responseId` when present, otherwise generate a fallback.
+    /// Later frames cannot change it (a late `responseId` must not rewrite
+    /// earlier chunk ids).
+    fn ensure_completion_id(&mut self, response_id: Option<&str>) -> Result<(), String> {
         if self.completion_id.is_none() {
-            self.completion_id = Some(
-                response_id
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map_or_else(|| super::FALLBACK_RESPONSE_ID.to_owned(), str::to_owned),
-            );
+            self.completion_id = Some(response_id_or_minted_fallback(response_id)?);
         }
+        Ok(())
     }
+}
+
+/// Preserve a bounded, usable Vertex response ID, or mint an OpenAI-shaped fallback.
+///
+/// A blank or oversized identifier is not useful to clients, so it follows the
+/// same path as an omitted one. The generated ID is opaque and unique across
+/// requests; stream state keeps it stable across all chunks for one response.
+fn response_id_or_minted_fallback(response_id: Option<&str>) -> Result<String, String> {
+    response_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && id.len() <= MAX_RESPONSE_ID_BYTES)
+        .map_or_else(mint_fallback_completion_id, |id| Ok(id.to_owned()))
+}
+
+/// Mint an OpenAI-shaped completion ID from 128 bits of OpenSSL randomness.
+fn mint_fallback_completion_id() -> Result<String, String> {
+    let mut random = [0_u8; 16];
+    rand_bytes(&mut random).map_err(|error| format!("failed to generate fallback completion id: {error}"))?;
+    Ok(format!(
+        "{}{:032x}",
+        super::FALLBACK_RESPONSE_ID_PREFIX,
+        u128::from_be_bytes(random)
+    ))
 }
 
 // -----------------------------------------------------------------------------
@@ -163,10 +198,7 @@ pub(crate) fn transform_response(body: &[u8], model: &str) -> Result<Vec<u8>, St
 
     let obj = value.as_object();
 
-    let id = obj
-        .and_then(|o| o.get("responseId"))
-        .and_then(Value::as_str)
-        .unwrap_or(super::FALLBACK_RESPONSE_ID);
+    let id = response_id_or_minted_fallback(obj.and_then(|o| o.get("responseId")).and_then(Value::as_str))?;
 
     let candidates = obj.and_then(|o| o.get("candidates")).and_then(Value::as_array);
 
@@ -177,18 +209,21 @@ pub(crate) fn transform_response(body: &[u8], model: &str) -> Result<Vec<u8>, St
 
     let choices = convert_candidates(candidates)?;
 
-    let usage = obj
-        .and_then(|o| o.get("usageMetadata"))
-        .map_or_else(|| json!({}), convert_usage);
-
-    let response = json!({
+    let mut response = json!({
         "id": id,
         "object": "chat.completion",
         "created": created_timestamp(),
         "model": model,
         "choices": choices,
-        "usage": usage,
     });
+
+    if let Some(usage) = obj
+        .and_then(|o| o.get("usageMetadata"))
+        .filter(|usage| usage.is_object())
+        && let Some(response) = response.as_object_mut()
+    {
+        response.insert("usage".to_owned(), convert_usage(usage));
+    }
 
     serde_json::to_vec(&response).map_err(|e| format!("serialization failed: {e}"))
 }
@@ -212,29 +247,24 @@ fn convert_candidate(candidate: &Value, default_index: usize) -> Result<Value, S
         .get("index")
         .and_then(Value::as_u64)
         .unwrap_or(default_index as u64);
-
     let parts = candidate
         .get("content")
         .and_then(|c| c.get("parts"))
         .and_then(Value::as_array);
-
     let (content, tool_calls) = extract_content_and_tool_calls(parts)?;
     let has_tool_calls = !tool_calls.is_empty();
 
-    let finish_reason = convert_finish_reason(candidate.get("finishReason").and_then(Value::as_str), has_tool_calls);
+    let raw_finish_reason = candidate.get("finishReason").and_then(Value::as_str);
+    validate_finish_reason(raw_finish_reason)?;
+    let finish_reason = convert_finish_reason(raw_finish_reason, has_tool_calls);
 
-    let mut message = Map::new();
-    message.insert("role".to_owned(), Value::String("assistant".to_owned()));
-    message.insert("content".to_owned(), content);
-
-    if has_tool_calls {
-        message.insert("tool_calls".to_owned(), Value::Array(tool_calls));
-    }
+    let message = convert_message(content, tool_calls);
 
     let mut choice = json!({
         "index": index,
         "message": message,
         "finish_reason": finish_reason,
+        "logprobs": null,
     });
 
     if let Some(logprobs) = candidate.get("logprobsResult").and_then(convert_logprobs_result)
@@ -246,6 +276,19 @@ fn convert_candidate(candidate: &Value, default_index: usize) -> Result<Value, S
     Ok(choice)
 }
 
+/// Build the schema-complete assistant message for one finite choice.
+fn convert_message(content: Value, tool_calls: Vec<Value>) -> Value {
+    let mut message = Map::from_iter([
+        ("role".to_owned(), Value::String("assistant".to_owned())),
+        ("content".to_owned(), content),
+        ("refusal".to_owned(), Value::Null),
+    ]);
+    if !tool_calls.is_empty() {
+        message.insert("tool_calls".to_owned(), Value::Array(tool_calls));
+    }
+    Value::Object(message)
+}
+
 // -----------------------------------------------------------------------------
 // Parts → content + tool_calls
 // -----------------------------------------------------------------------------
@@ -253,6 +296,7 @@ fn convert_candidate(candidate: &Value, default_index: usize) -> Result<Value, S
 /// Extract text content and tool calls from Gemini response parts.
 ///
 /// - `text` parts → concatenated into a single string (or `null` if none)
+/// - signature-only parts → ignored because they have no Chat text or tool call
 /// - `functionCall` parts → converted to OpenAI `tool_calls` entries
 /// - `thoughtSignature` on a function-call part is copied onto the tool call as
 ///   `extra_content.google.thought_signature` so the client can send it back on the next turn (Gemini 3 rejects
@@ -262,6 +306,10 @@ fn convert_candidate(candidate: &Value, default_index: usize) -> Result<Value, S
 /// `functionCall.id` when present; otherwise mint a unique id. Do not derive
 /// the id from `responseId` or the function name — those collide across rounds
 /// or parallel same-name calls.
+#[expect(
+    clippy::too_many_lines,
+    reason = "validates and accumulates each Gemini response part"
+)]
 fn extract_content_and_tool_calls(parts: Option<&Vec<Value>>) -> Result<(Value, Vec<Value>), String> {
     let Some(parts) = parts else {
         return Ok((Value::Null, Vec::new()));
@@ -271,6 +319,19 @@ fn extract_content_and_tool_calls(parts: Option<&Vec<Value>>) -> Result<(Value, 
     let mut tool_calls = Vec::new();
 
     for part in parts {
+        validate_response_part(part)?;
+        let has_text = part.get("text").is_some();
+        let has_function_call = part.get("functionCall").is_some();
+        let has_signature = part.get("thoughtSignature").is_some_and(Value::is_string);
+        if has_text && !part.get("text").is_some_and(Value::is_string) {
+            return Err("Gemini response text part must contain a string".to_owned());
+        }
+        if has_function_call && !part.get("functionCall").is_some_and(Value::is_object) {
+            return Err("Gemini response functionCall part must be an object".to_owned());
+        }
+        if !has_text && !has_function_call && !has_signature {
+            return Err("unsupported Gemini response content part".to_owned());
+        }
         if let Some(text) = part.get("text").and_then(Value::as_str) {
             text_segments.push(text);
         }
@@ -287,6 +348,26 @@ fn extract_content_and_tool_calls(parts: Option<&Vec<Value>>) -> Result<(Value, 
     };
 
     Ok((content, tool_calls))
+}
+
+/// Refuse provider response fields that would be silently discarded.
+fn validate_response_part(part: &Value) -> Result<(), String> {
+    let fields = part
+        .as_object()
+        .ok_or("Gemini response content part must be an object")?;
+    if fields
+        .keys()
+        .any(|key| !matches!(key.as_str(), "text" | "functionCall" | "thought" | "thoughtSignature"))
+        || fields
+            .get("thought")
+            .is_some_and(|value| !value.is_null() && value != &Value::Bool(false))
+    {
+        return Err("unsupported Gemini response content part".to_owned());
+    }
+    // A text Part or a metadata-only Part may carry a thought signature.
+    // Gemini does not require that signature on a later non-function-call
+    // turn, and Chat Completions has no corresponding text-content field.
+    Ok(())
 }
 
 /// Convert a Gemini `functionCall` part to an OpenAI `tool_calls` entry.
@@ -413,6 +494,34 @@ fn convert_finish_reason(reason: Option<&str>, has_tool_calls: bool) -> &'static
     }
 }
 
+/// Unknown provider terminal reasons must not be reported as a clean stop.
+fn validate_finish_reason(reason: Option<&str>) -> Result<(), String> {
+    if matches!(
+        reason,
+        None | Some(
+            "STOP"
+                | "MAX_TOKENS"
+                | "SAFETY"
+                | "RECITATION"
+                | "BLOCKLIST"
+                | "PROHIBITED_CONTENT"
+                | "SPII"
+                | "IMAGE_SAFETY"
+                | "LANGUAGE"
+                | "OTHER"
+                | "MODEL_ARMOR"
+                | "MALFORMED_FUNCTION_CALL"
+        )
+    ) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unsupported Gemini finishReason `{}`",
+            reason.unwrap_or_default()
+        ))
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Usage
 // -----------------------------------------------------------------------------
@@ -451,36 +560,38 @@ fn convert_logprobs_result(logprobs_result: &Value) -> Option<Value> {
     if chosen.is_empty() {
         return None;
     }
-
     let top = logprobs_result.get("topCandidates").and_then(Value::as_array);
-
     let content: Vec<Value> = chosen
         .iter()
         .enumerate()
-        .map(|(i, chosen_token)| {
-            let token = chosen_token.get("token").and_then(Value::as_str).unwrap_or("");
-            let logprob = chosen_token
-                .get("logProbability")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-
-            let top_logprobs: Vec<Value> = top
-                .and_then(|t| t.get(i))
-                .and_then(|tc| tc.get("candidates"))
-                .and_then(Value::as_array)
-                .map(|candidates| candidates.iter().map(convert_logprob_entry).collect())
-                .unwrap_or_default();
-
-            json!({
-                "token": token,
-                "logprob": logprob,
-                "bytes": token_utf8_bytes(token),
-                "top_logprobs": top_logprobs,
-            })
-        })
+        .map(|(i, chosen_token)| convert_chosen_logprob(chosen_token, top.and_then(|entries| entries.get(i))))
         .collect();
 
-    Some(json!({ "content": content }))
+    Some(json!({
+        "content": content,
+        "refusal": null,
+    }))
+}
+
+/// Merge one chosen Gemini token with the alternatives at the same step.
+fn convert_chosen_logprob(chosen_token: &Value, top: Option<&Value>) -> Value {
+    let token = chosen_token.get("token").and_then(Value::as_str).unwrap_or("");
+    let logprob = chosen_token
+        .get("logProbability")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let top_logprobs: Vec<Value> = top
+        .and_then(|entry| entry.get("candidates"))
+        .and_then(Value::as_array)
+        .map(|candidates| candidates.iter().map(convert_logprob_entry).collect())
+        .unwrap_or_default();
+
+    json!({
+        "token": token,
+        "logprob": logprob,
+        "bytes": token_utf8_bytes(token),
+        "top_logprobs": top_logprobs,
+    })
 }
 
 /// Convert a single Gemini token candidate to an OpenAI `top_logprobs` entry.
@@ -527,7 +638,6 @@ pub(crate) fn transform_stream_chunk(
     let value: Value = serde_json::from_slice(data).map_err(|e| format!("invalid JSON: {e}"))?;
     let obj = value.as_object();
 
-    state.ensure_completion_id(obj.and_then(|o| o.get("responseId")).and_then(Value::as_str));
     state.capture_usage(obj);
 
     // Detect upstream errors and content blocks that arrive as valid JSON
@@ -546,6 +656,7 @@ pub(crate) fn transform_stream_chunk(
         return Ok(None);
     }
 
+    state.ensure_completion_id(obj.and_then(|o| o.get("responseId")).and_then(Value::as_str))?;
     serialize_stream_chunk(choices, model, state)
 }
 
@@ -555,8 +666,12 @@ fn serialize_stream_chunk(
     model: &str,
     state: &StreamTranslateState,
 ) -> Result<Option<Vec<u8>>, String> {
+    let completion_id = state
+        .completion_id
+        .as_deref()
+        .ok_or("stream completion id was not initialized")?;
     let mut chunk = json!({
-        "id": state.completion_id.as_deref().unwrap_or(super::FALLBACK_RESPONSE_ID),
+        "id": completion_id,
         "object": "chat.completion.chunk",
         "created": state.created,
         "model": model,
@@ -597,9 +712,15 @@ pub(crate) fn take_stream_usage_chunk(state: &mut StreamTranslateState, model: &
     if !state.include_usage {
         return None;
     }
+    state.usage.as_ref()?;
+    if let Err(error) = state.ensure_completion_id(None) {
+        warn!(%error, "failed to generate completion id for trailing usage chunk");
+        return None;
+    }
     let usage = state.usage.take()?;
+    let completion_id = state.completion_id.as_deref()?;
     let chunk = json!({
-        "id": state.completion_id.as_deref().unwrap_or(super::FALLBACK_RESPONSE_ID),
+        "id": completion_id,
         "object": "chat.completion.chunk",
         "created": state.created,
         "model": model,
@@ -645,6 +766,10 @@ fn resolve_stream_candidate_indices(candidates: &[Value]) -> Result<Vec<u64>, St
 }
 
 /// Build a single OpenAI streaming choice from a Gemini candidate.
+#[expect(
+    clippy::too_many_lines,
+    reason = "builds streaming choice delta and extracts logprobs and tool calls"
+)]
 fn build_stream_choice(
     candidate: &Value,
     candidate_index: u64,
@@ -653,6 +778,12 @@ fn build_stream_choice(
     if should_ignore_finished_candidate(candidate, candidate_index, state)? {
         return Ok(None);
     }
+    let max_allowed = state.allowed_candidate_count();
+    if candidate_index >= max_allowed {
+        return Err(format!(
+            "candidate index {candidate_index} exceeds allowed candidate count ({max_allowed})"
+        ));
+    }
     state.seen_candidates.insert(candidate_index);
     let parts = candidate
         .get("content")
@@ -660,6 +791,7 @@ fn build_stream_choice(
         .and_then(Value::as_array);
 
     let finish_reason = candidate.get("finishReason").and_then(Value::as_str);
+    validate_finish_reason(finish_reason)?;
     if finish_reason.is_some() {
         state.finished_candidates.insert(candidate_index);
     }
@@ -757,6 +889,10 @@ fn reject_upstream_error_frame(obj: Option<&Map<String, Value>>) -> Result<(), S
 /// Tool-call `index` is the slot position and is set on every delta —
 /// this repo's Chat Completions stream consumer fails closed when
 /// `index` is missing and would otherwise merge parallel calls.
+#[expect(
+    clippy::too_many_lines,
+    reason = "validates and accumulates each streamed response part"
+)]
 fn extract_stream_content_and_tool_calls(
     parts: Option<&Vec<Value>>,
     slots: &mut Vec<ToolCallSlot>,
@@ -769,6 +905,19 @@ fn extract_stream_content_and_tool_calls(
     let mut tool_calls = Vec::new();
 
     for part in parts {
+        validate_response_part(part)?;
+        let has_text = part.get("text").is_some();
+        let has_function_call = part.get("functionCall").is_some();
+        let has_signature = part.get("thoughtSignature").is_some_and(Value::is_string);
+        if has_text && !part.get("text").is_some_and(Value::is_string) {
+            return Err("Gemini response text part must contain a string".to_owned());
+        }
+        if has_function_call && !part.get("functionCall").is_some_and(Value::is_object) {
+            return Err("Gemini response functionCall part must be an object".to_owned());
+        }
+        if !has_text && !has_function_call && !has_signature {
+            return Err("unsupported Gemini response content part".to_owned());
+        }
         if let Some(text) = part.get("text").and_then(Value::as_str) {
             text_segments.push(text);
         }
@@ -801,7 +950,7 @@ fn stream_tool_call_delta(
     fc: &Map<String, Value>,
     slots: &mut Vec<ToolCallSlot>,
 ) -> Result<Option<Value>, String> {
-    let index = resolve_stream_slot(fc, slots);
+    let index = resolve_stream_slot(fc, slots)?;
     #[expect(
         clippy::indexing_slicing,
         reason = "resolve_stream_slot returns an existing index or the slot just pushed"
@@ -883,16 +1032,22 @@ fn attach_first_stream_tool_call_fields(call: &mut Map<String, Value>, slot: &To
 }
 
 /// Find or create the slot for this `functionCall`.
-fn resolve_stream_slot(fc: &Map<String, Value>, slots: &mut Vec<ToolCallSlot>) -> usize {
+fn resolve_stream_slot(fc: &Map<String, Value>, slots: &mut Vec<ToolCallSlot>) -> Result<usize, String> {
     if let Some(gid) = google_function_call_id(fc)
         && let Some(index) = slots.iter().position(|s| s.google_id.as_deref() == Some(gid))
     {
-        return index;
+        return Ok(index);
     }
 
     let name = fc.get("name").and_then(Value::as_str).unwrap_or("");
     if name.is_empty() && google_function_call_id(fc).is_none() && !slots.is_empty() {
-        return slots.len() - 1;
+        return Ok(slots.len() - 1);
+    }
+
+    if slots.len() >= MAX_STREAM_TOOL_CALL_SLOTS {
+        return Err(format!(
+            "exceeded maximum tool-call slots per candidate ({MAX_STREAM_TOOL_CALL_SLOTS})"
+        ));
     }
 
     let google_id = google_function_call_id(fc).map(ToOwned::to_owned);
@@ -906,7 +1061,7 @@ fn resolve_stream_slot(fc: &Map<String, Value>, slots: &mut Vec<ToolCallSlot>) -
         thought_sent: None,
         emitted_args: None,
     });
-    slots.len() - 1
+    Ok(slots.len() - 1)
 }
 
 /// Build the `delta` object for a streaming chunk.
@@ -944,6 +1099,20 @@ pub(crate) fn created_timestamp() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unsupported_response_parts_fail_in_finite_and_stream_modes() {
+        for part in [
+            json!({"inlineData": {"mimeType": "image/png", "data": "AA=="}}),
+            json!({"text": "caption", "inlineData": {"mimeType": "image/png", "data": "AA=="}}),
+            json!({"text": "internal reasoning", "thought": true}),
+        ] {
+            let parts = vec![part];
+            assert!(extract_content_and_tool_calls(Some(&parts)).is_err());
+            assert!(extract_stream_content_and_tool_calls(Some(&parts), &mut Vec::new()).is_err());
+        }
+        assert!(validate_finish_reason(Some("FUTURE_REASON")).is_err());
+    }
+
     fn new_stream_state(created: u64) -> StreamTranslateState {
         let mut state = StreamTranslateState::new();
         state.created = created;
@@ -972,11 +1141,37 @@ mod tests {
         assert_eq!(parsed["model"], "gemini-1.5-pro");
         assert_eq!(parsed["choices"][0]["message"]["role"], "assistant");
         assert_eq!(parsed["choices"][0]["message"]["content"], "Hello!");
+        assert!(parsed["choices"][0]["message"]["refusal"].is_null());
         assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
         assert_eq!(parsed["choices"][0]["index"], 0);
+        assert!(parsed["choices"][0]["logprobs"].is_null());
         assert_eq!(parsed["usage"]["prompt_tokens"], 5);
         assert_eq!(parsed["usage"]["completion_tokens"], 2);
         assert_eq!(parsed["usage"]["total_tokens"], 7);
+    }
+
+    #[test]
+    fn text_part_with_default_thought_and_signature_translates() {
+        let body = br#"{"candidates":[{"content":{"parts":[
+            {"text":"Hello", "thought":false},
+            {"text":" world", "thoughtSignature":"sig-text"}
+        ]},"finishReason":"STOP"}]}"#;
+        let output = transform_response(body, "gemini-1.5-pro").unwrap();
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["choices"][0]["message"]["content"], "Hello world");
+        assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn signature_only_part_after_text_translates() {
+        let body = br#"{"candidates":[{"content":{"parts":[
+            {"text":"Hello"},
+            {"thoughtSignature":"sig-only"}
+        ]},"finishReason":"STOP"}]}"#;
+        let output = transform_response(body, "gemini-1.5-pro").unwrap();
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["choices"][0]["message"]["content"], "Hello");
+        assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
     }
 
     #[test]
@@ -992,12 +1187,50 @@ mod tests {
     }
 
     #[test]
-    fn missing_response_id_uses_fallback() {
-        let body = br#"{"candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}]}"#;
+    fn response_id_trims_whitespace() {
+        let body = br#"{
+            "responseId": "  resp-padded  ",
+            "candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}]
+        }"#;
         let output = transform_response(body, "gemini-1.5-pro").unwrap();
         let parsed: Value = serde_json::from_slice(&output).unwrap();
 
-        assert_eq!(parsed["id"], "chatcmpl-vertex");
+        assert_eq!(parsed["id"], "resp-padded");
+    }
+
+    #[test]
+    fn oversized_response_id_mints_fallback() {
+        let accepted = "a".repeat(MAX_RESPONSE_ID_BYTES);
+        let fallback = "a".repeat(MAX_RESPONSE_ID_BYTES + 1);
+
+        assert_eq!(response_id_or_minted_fallback(Some(&accepted)).unwrap(), accepted);
+        assert!(
+            response_id_or_minted_fallback(Some(&fallback))
+                .unwrap()
+                .starts_with("chatcmpl-vertex-")
+        );
+    }
+
+    #[test]
+    fn missing_response_id_mints_unique_fallback_per_response() {
+        let body = br#"{"candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}]}"#;
+        let first: Value = serde_json::from_slice(&transform_response(body, "gemini-1.5-pro").unwrap()).unwrap();
+        let second: Value = serde_json::from_slice(&transform_response(body, "gemini-1.5-pro").unwrap()).unwrap();
+
+        let first_id = first["id"].as_str().unwrap();
+        let second_id = second["id"].as_str().unwrap();
+        assert!(first_id.starts_with("chatcmpl-vertex-"));
+        assert!(second_id.starts_with("chatcmpl-vertex-"));
+        assert_ne!(first_id, second_id);
+    }
+
+    #[test]
+    fn blank_response_id_mints_fallback() {
+        let body =
+            br#"{"responseId":"   ","candidates":[{"content":{"parts":[{"text":"Hi"}]},"finishReason":"STOP"}]}"#;
+        let parsed: Value = serde_json::from_slice(&transform_response(body, "gemini-1.5-pro").unwrap()).unwrap();
+
+        assert!(parsed["id"].as_str().unwrap().starts_with("chatcmpl-vertex-"));
     }
 
     #[test]
@@ -1355,12 +1588,21 @@ mod tests {
     }
 
     #[test]
-    fn missing_usage_returns_empty_object() {
+    fn missing_usage_is_omitted() {
         let body = br#"{"candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}]}"#;
         let output = transform_response(body, "gemini-1.5-pro").unwrap();
         let parsed: Value = serde_json::from_slice(&output).unwrap();
 
-        assert!(parsed["usage"].is_object());
+        assert!(parsed.get("usage").is_none());
+    }
+
+    #[test]
+    fn null_usage_is_omitted() {
+        let body = br#"{"candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}], "usageMetadata": null}"#;
+        let output = transform_response(body, "gemini-1.5-pro").unwrap();
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+        assert!(parsed.get("usage").is_none());
     }
 
     #[test]
@@ -1391,15 +1633,16 @@ mod tests {
         assert_eq!(lp["bytes"], json!([72, 105]));
         assert_eq!(lp["top_logprobs"].as_array().unwrap().len(), 2);
         assert_eq!(lp["top_logprobs"][1]["token"], "Hello");
+        assert!(parsed["choices"][0]["logprobs"]["refusal"].is_null());
     }
 
     #[test]
-    fn logprobs_absent_when_not_requested() {
+    fn logprobs_is_null_when_not_requested() {
         let body = br#"{"candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}]}"#;
         let output = transform_response(body, "gemini-1.5-pro").unwrap();
         let parsed: Value = serde_json::from_slice(&output).unwrap();
 
-        assert!(parsed["choices"][0].get("logprobs").is_none());
+        assert!(parsed["choices"][0]["logprobs"].is_null());
     }
 
     #[test]
@@ -1451,10 +1694,44 @@ mod tests {
 
         assert_eq!(parsed["object"], "chat.completion.chunk");
         assert_eq!(parsed["created"], 1_700_000_000);
-        assert_eq!(parsed["id"], "chatcmpl-vertex");
+        assert!(parsed["id"].as_str().unwrap().starts_with("chatcmpl-vertex-"));
         assert_eq!(parsed["choices"][0]["delta"]["role"], "assistant");
         assert_eq!(parsed["choices"][0]["delta"]["content"], "Hi");
         assert!(parsed["choices"][0]["finish_reason"].is_null());
+    }
+
+    #[test]
+    fn stream_text_part_with_default_thought_and_signature_translates() {
+        let mut state = new_stream_state(1_700_000_000);
+        let first = translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"text":"Hello", "thought":false}]}}]}"#,
+        );
+        let last = translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"text":"", "thoughtSignature":"sig-text"}]},"finishReason":"STOP"}]}"#,
+        );
+        assert_eq!(first["choices"][0]["delta"]["content"], "Hello");
+        assert_eq!(last["choices"][0]["delta"]["content"], "");
+        assert_eq!(last["choices"][0]["finish_reason"], "stop");
+        assert!(state.is_complete());
+    }
+
+    #[test]
+    fn stream_signature_only_terminal_part_translates() {
+        let mut state = new_stream_state(1_700_000_000);
+        let first = translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}"#,
+        );
+        let last = translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"thoughtSignature":"sig-only"}]},"finishReason":"STOP"}]}"#,
+        );
+        assert_eq!(first["choices"][0]["delta"]["content"], "Hello");
+        assert!(last["choices"][0]["delta"]["content"].is_null());
+        assert_eq!(last["choices"][0]["finish_reason"], "stop");
+        assert!(state.is_complete());
     }
 
     #[test]
@@ -1649,9 +1926,36 @@ mod tests {
             br#"{"responseId":"resp-late","candidates":[{"content":{"parts":[{"text":"!"}]}}]}"#,
         );
 
-        assert_eq!(first["id"], "chatcmpl-vertex");
-        assert_eq!(second["id"], "chatcmpl-vertex");
+        assert!(first["id"].as_str().unwrap().starts_with("chatcmpl-vertex-"));
+        assert_eq!(first["id"], second["id"]);
         assert_ne!(second["id"], "resp-late");
+    }
+
+    #[test]
+    fn stream_completion_id_trims_upstream_response_id() {
+        let mut state = new_stream_state(1);
+        let parsed = translate_stream(
+            &mut state,
+            br#"{"responseId":"  resp-padded  ","candidates":[{"content":{"parts":[{"text":"Hi"}]}}]}"#,
+        );
+
+        assert_eq!(parsed["id"], "resp-padded");
+    }
+
+    #[test]
+    fn missing_response_id_mints_unique_fallback_per_stream() {
+        let data = br#"{"candidates":[{"content":{"parts":[{"text":"Hi"}]}}]}"#;
+        let mut first_state = new_stream_state(1);
+        let mut second_state = new_stream_state(1);
+
+        let first = translate_stream(&mut first_state, data);
+        let second = translate_stream(&mut second_state, data);
+        let first_id = first["id"].as_str().unwrap();
+        let second_id = second["id"].as_str().unwrap();
+
+        assert!(first_id.starts_with("chatcmpl-vertex-"));
+        assert!(second_id.starts_with("chatcmpl-vertex-"));
+        assert_ne!(first_id, second_id);
     }
 
     #[test]
@@ -1816,6 +2120,7 @@ mod tests {
     #[test]
     fn stream_preserves_all_candidates_and_their_indices() {
         let mut state = new_stream_state(1);
+        state.set_expected_candidate_count(2);
         let parsed = translate_stream(
             &mut state,
             br#"{"candidates":[{"index":0,"content":{"parts":[{"text":"first"}]}},{"index":1,"content":{"parts":[{"text":"second"}]},"finishReason":"STOP"}]}"#,
@@ -1843,6 +2148,7 @@ mod tests {
     #[test]
     fn stream_multi_candidate_frame_requires_explicit_indices() {
         let mut state = new_stream_state(1);
+        state.set_expected_candidate_count(2);
         let err = transform_stream_chunk(
             br#"{"candidates":[{"index":1,"content":{"parts":[{"text":"second"}]}},{"content":{"parts":[{"text":"first"}]}}]}"#,
             "gemini-1.5-pro",
@@ -1856,6 +2162,7 @@ mod tests {
     #[test]
     fn stream_multi_candidate_frame_rejects_duplicate_indices() {
         let mut state = new_stream_state(1);
+        state.set_expected_candidate_count(2);
         let err = transform_stream_chunk(
             br#"{"candidates":[{"index":1,"content":{"parts":[{"text":"one"}]}},{"index":1,"content":{"parts":[{"text":"two"}]}}]}"#,
             "gemini-1.5-pro",
@@ -1869,6 +2176,7 @@ mod tests {
     #[test]
     fn stream_late_single_candidate_uses_explicit_index() {
         let mut state = new_stream_state(1);
+        state.set_expected_candidate_count(2);
         let parsed = translate_stream(
             &mut state,
             br#"{"candidates":[{"index":1,"content":{"parts":[{"text":"continued"}]}}]}"#,
@@ -1922,6 +2230,7 @@ mod tests {
     #[test]
     fn stream_tracks_first_delta_and_tool_slots_per_candidate() {
         let mut state = new_stream_state(1);
+        state.set_expected_candidate_count(2);
         let first = translate_stream(
             &mut state,
             br#"{"candidates":[{"index":0,"content":{"parts":[{"functionCall":{"name":"search","args":{"q":"first"}}}]}}]}"#,
@@ -2011,6 +2320,34 @@ mod tests {
             serde_json::from_slice(&take_stream_usage_chunk(&mut state, "gemini-2.0-flash").unwrap()).unwrap();
         assert_eq!(usage["choices"], json!([]));
         assert_eq!(usage["usage"]["total_tokens"], 15);
+        assert!(usage["id"].as_str().unwrap().starts_with("chatcmpl-vertex-"));
+    }
+
+    #[test]
+    fn stream_metadata_first_preserves_later_response_id() {
+        let mut state = new_stream_state(1);
+        state.set_include_usage(true);
+        assert!(
+            transform_stream_chunk(
+                br#"{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#,
+                "gemini-2.0-flash",
+                &mut state,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(state.completion_id.is_none());
+
+        let content = translate_stream(
+            &mut state,
+            br#"{"responseId":"resp-after-metadata","candidates":[{"content":{"parts":[{"text":"Hi"}]},"finishReason":"STOP"}]}"#,
+        );
+        assert_eq!(content["id"], "resp-after-metadata");
+
+        let usage: Value =
+            serde_json::from_slice(&take_stream_usage_chunk(&mut state, "gemini-2.0-flash").unwrap()).unwrap();
+        assert_eq!(usage["id"], "resp-after-metadata");
+        assert_eq!(usage["usage"]["total_tokens"], 15);
     }
 
     #[test]
@@ -2048,5 +2385,78 @@ mod tests {
             br#"{"candidates":[{"content":{"parts":[]},"finishReason":"SAFETY"}]}"#,
         );
         assert_eq!(parsed["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    #[test]
+    fn stream_candidate_index_exceeding_expected_count_is_rejected() {
+        let mut state = new_stream_state(1); // n: 1 -> expected_candidate_count = 1
+        let data = br#"{"candidates":[{"index":1,"content":{"parts":[{"text":"hello"}]}}]}"#;
+        let err = transform_stream_chunk(data, "gemini-2.0-flash", &mut state).unwrap_err();
+        assert!(
+            err.contains("candidate index 1 exceeds allowed candidate count (1)"),
+            "expected candidate index error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn stream_candidate_count_above_max_limit_fails_completion() {
+        let mut state = new_stream_state(1);
+        state.set_expected_candidate_count(65);
+        assert_eq!(state.expected_candidate_count, 65);
+        assert_eq!(state.allowed_candidate_count(), MAX_STREAM_CANDIDATES);
+
+        for i in 0..MAX_STREAM_CANDIDATES {
+            state.seen_candidates.insert(i);
+            state.finished_candidates.insert(i);
+        }
+        assert!(
+            !state.is_complete(),
+            "64 finished candidates when 65 expected must not be complete"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "tests tool call slot overflow limit")]
+    fn stream_tool_call_slots_exceeding_max_limit_is_rejected() {
+        let mut state = new_stream_state(1);
+        for i in 0..MAX_STREAM_TOOL_CALL_SLOTS {
+            let data = json!({
+                "candidates": [{
+                    "index": 0,
+                    "content": {
+                        "parts": [{
+                            "functionCall": {
+                                "id": format!("id-{i}"),
+                                "name": "f",
+                                "args": {}
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string();
+            transform_stream_chunk(data.as_bytes(), "gemini-2.0-flash", &mut state).unwrap();
+        }
+
+        let overflow_data = json!({
+            "candidates": [{
+                "index": 0,
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "id": "id-overflow",
+                            "name": "f",
+                            "args": {}
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let err = transform_stream_chunk(overflow_data.as_bytes(), "gemini-2.0-flash", &mut state).unwrap_err();
+        assert!(
+            err.contains("exceeded maximum tool-call slots per candidate"),
+            "expected slot limit error, got: {err}"
+        );
     }
 }

@@ -327,10 +327,13 @@ fn start_binary(config: &Path, addr: &str, client_config: &Arc<ClientConfig>, en
     let dir = tempfile::tempdir().expect("temp dir");
     let stdout = dir.path().join("stdout.log");
     let stderr = dir.path().join("stderr.log");
+    // When the harness runs as root, inject allow_root into a temp copy so the
+    // product binary can start; the caller's on-disk fixture stays locked down.
+    let config_path = praxis_test_utils::config_path_for_harness(config, dir.path());
     let mut command = Command::new(praxis_ai_bin());
     command
         .arg("-c")
-        .arg(config)
+        .arg(&config_path)
         .env_remove("PRAXIS_REQUIRE_FIPS")
         .env_remove("PRAXIS_CONFIG")
         .stdin(Stdio::null())
@@ -632,11 +635,15 @@ fn the_binary_serves_under_require_fips_exactly_on_a_fips_host() {
     let client = certs.client_config();
 
     // The suite's features mirror the spawned binary's (the PRAXIS_AI_BIN
-    // contract): with the policy engine (`standard`) or the store compiled
-    // in, the binary refuses PRAXIS_REQUIRE_FIPS even on a FIPS host,
-    // naming the filters (the server's fips_blocker), because their
-    // dependencies do their own cryptography outside the system OpenSSL.
-    let carries_non_fips_filters = cfg!(any(feature = "standard", feature = "store"));
+    // contract): with the policy engine (`standard`) or an uncleared store
+    // profile compiled in, the binary refuses PRAXIS_REQUIRE_FIPS even on a
+    // FIPS host, naming the filters (the server's fips_blocker), because their
+    // dependencies do their own cryptography outside the system OpenSSL. Ask
+    // the real blocker so this expectation cannot drift from its exact
+    // compile-time profile rules.
+    let registry_client = praxis_test_utils::test_subrequest_client();
+    let registry = praxis_ai::build_full_registry(&registry_client);
+    let carries_non_fips_filters = praxis_ai::fips_blocker(&registry).is_some();
 
     match start_binary(&config, &addr, &client, &[("PRAXIS_REQUIRE_FIPS", "1")]) {
         Startup::Exited { success, stderr } => {

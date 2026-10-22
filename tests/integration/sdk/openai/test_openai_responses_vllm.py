@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27,<1",
-#     "openai>=2.0,<3",
+#     "openai>=2.0,<4",
 #     "pytest>=8.0,<9",
 # ]
 # ///
@@ -17,12 +17,14 @@ gateway, persistence, tool-loop, and SDK protocol coverage. Tests marked
 ``real_inference`` or ``vllm_compat`` are skipped in simulator mode.
 
 Usage:
-    cargo build -p praxis-ai-proxy --features full
+    cargo build -p praxis-ai-proxy --features full,openai-all,store-sqlite
     uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
 """
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import io
+from itertools import islice
 import json
 import os
 import signal
@@ -32,13 +34,22 @@ import sys
 import tempfile
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from typing import Any, ClassVar
 from urllib.parse import urlparse
 
 import httpx
+import openai
 import pytest
-from openai import BadRequestError, NotFoundError, OpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    BadRequestError,
+    NotFoundError,
+    OpenAI,
+    PermissionDeniedError,
+)
+from openai.types.responses import ResponseCustomToolCall
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -52,20 +63,6 @@ PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 REQUIRE_LIVE_WEB_SEARCH = os.environ.get("PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH") == "1"
 CONFIG_PATH = "examples/configs/openai/responses/full-flow-agentic.yaml"
-AGENTIC_CONFIG_PATH = "examples/configs/openai/responses/agentic-loop.yaml"
-IRR_STREAMING_CONFIG_PATH = (
-    "examples/configs/openai/responses/irr-terminal-streaming.yaml"
-)
-CHAT_STREAMING_CONFIG_PATH = (
-    "examples/configs/openai/responses/responses-to-chat-completions.yaml"
-)
-REASONING_CONFIG_PATH = (
-    "examples/configs/openai/responses/responses-to-chat-completions-reasoning.yaml"
-)
-COMPACT_CONFIG_PATH = "examples/configs/openai/responses/compact.yaml"
-WEB_SEARCH_CHAT_STREAMING_CONFIG_PATH = (
-    "examples/configs/openai/responses/web-search-chat-completions.yaml"
-)
 # The full-flow example trusts these only after an authentication gateway has
 # overwritten them. This harness connects directly to Praxis, so it emulates
 # that boundary for clients using the full-flow configuration.
@@ -73,12 +70,19 @@ TRUSTED_OWNER_HEADERS = {
     "x-auth-tenant": "test-tenant",
     "x-auth-user": "test-user",
 }
-CLIENT_TOOL_COMPAT_CONFIG_PATH = (
-    "examples/configs/openai/responses/client-tool-compat.yaml"
-)
-CLIENT_TOOL_COMPAT_CHAT_CONFIG_PATH = (
-    "examples/configs/openai/responses/client-tool-compat-chat-completions.yaml"
-)
+# These emulated values are normally established by a trusted authentication
+# boundary and captured into the dedicated MCP credential/assertion slots.
+TRUSTED_MCP_HEADERS = {
+    "x-user-mcp-key": "sdk-mcp-user-key",
+    "x-mcp-authorized": "Bearer sdk-mcp-authorized",
+}
+# The full-flow binding router maps model "vllm-chat" to the Chat Completions
+# backend — the ONLY route that runs openai_responses_to_chat_completions. Every
+# Chat-translation test MUST send this model or it silently routes to the native
+# Responses backend instead. The writer's chat_translation_model kwarg then
+# rewrites the body model (instance A) at whatever the live Chat backend serves.
+CHAT_TRANSLATION_MODEL = "vllm-chat"
+TTFT_CONFIG_PATH = "examples/configs/time-to-first-token.yaml"
 
 TERMINAL_RESPONSE_EVENTS = {
     "response.cancelled",
@@ -111,6 +115,22 @@ def requires_vllm_compat(test):
         reason="test requires real vLLM compatibility behavior",
     )(test)
 
+
+def requires_simulator(test):
+    """Mark a deterministic simulator-only test and skip it in live mode."""
+    return pytest.mark.skipif(
+        VLLM_TEST_BACKEND != "simulator",
+        reason="test requires deterministic simulator behavior",
+    )(test)
+
+
+def qualification_profile(name):
+    """Override GPU report attribution for a test with dynamic fixtures."""
+    def decorate(test):
+        test.qualification_profile = name
+        return test
+    return decorate
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -131,7 +151,7 @@ def _find_binary() -> str:
         if os.path.isfile(candidate):
             return candidate
     raise FileNotFoundError(
-        "praxis-ai binary not found: run `cargo build -p praxis-ai-proxy --features full` first"
+        "praxis-ai binary not found: run `cargo build -p praxis-ai-proxy --features full,openai-all,store-sqlite` first"
     )
 
 
@@ -147,6 +167,25 @@ def _ogx_endpoint() -> str:
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or 8321
     return f"{host}:{port}"
+
+
+def _make_openai_client(
+    praxis_port: int,
+    *,
+    default_headers: dict[str, str] | None = None,
+    timeout: float = 300,
+) -> OpenAI:
+    """Point an SDK client at a test proxy with the shared client settings."""
+    options: dict[str, Any] = {}
+    if default_headers is not None:
+        options["default_headers"] = default_headers
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{praxis_port}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=timeout,
+        **options,
+    )
 
 
 def _patch_store_backend(config: str, db_path: str) -> str:
@@ -167,7 +206,7 @@ def _patch_store_backend(config: str, db_path: str) -> str:
 
 
 def _enable_response_store_compression(config: str) -> str:
-    """Append a zstd compression block to the openai_response_store filter."""
+    """Append a zstd compression block to the openai_responses_store filter."""
     anchor = (
         "        responses_table: openai_responses\n"
         "        conversations_table: openai_conversations\n"
@@ -208,24 +247,254 @@ def _persist_config(config: str) -> str:
     return path
 
 
-def _write_config(praxis_port: int, db_path: str, compression: bool = False) -> str:
-    with open(CONFIG_PATH) as f:
+def _load_example_config(
+    example_path: str,
+    praxis_port: int,
+    *,
+    backend_endpoint: str | None = None,
+    db_path: str | None = None,
+) -> str:
+    """Load a shipped example and substitute its routine test endpoints."""
+    with open(example_path) as f:
         config = f.read()
 
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
-    config = config.replace("127.0.0.1:9999", _ogx_endpoint())
-    # The unified gateway wires openai_web_search into the IRR; its config
-    # resolves ${WEB_SEARCH_API_KEY} at startup and fails closed when unset.
-    # These vLLM turns never emit a web_search_call, so a literal placeholder
-    # key keeps the dispatcher inert while letting the binary start.
-    config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
-    config = _patch_store_backend(config, db_path)
+    if backend_endpoint is not None:
+        config = config.replace("127.0.0.1:3001", backend_endpoint)
+    if db_path is not None:
+        config = _patch_store_backend(config, db_path)
+    return config
+
+
+def _write_full_flow_config(
+    praxis_port: int,
+    db_path: str,
+    compression: bool = False,
+    *,
+    backend_endpoint: str | None = None,
+    search_port: int | None = None,
+    mcp_endpoint: str | None = None,
+    nemo_port: int | None = None,
+    max_event_bytes: int | None = None,
+    chat_rewrite_model: str | None = None,
+    chat_translation_model: str | None = None,
+    reasoning_dialect: str | None = None,
+    compact_inference_port: int | None = None,
+    compact_default_model: str | None = None,
+    vector_store_endpoint: str | None = None,
+    ogx_endpoint: str | None = None,
+    file_url_origin: str | None = None,
+    web_search_provider: str = "brave",
+    tool_admission: str | None = None,
+    require_connector: bool | None = None,
+    mcp_minimum_approval: str | None = None,
+) -> str:
+    """Patch the shared full-flow example for live or recording backends."""
+    resolved_backend = backend_endpoint or _vllm_endpoint()
+    config = _load_example_config(
+        CONFIG_PATH,
+        praxis_port,
+        backend_endpoint=resolved_backend,
+    )
+    if tool_admission is not None:
+        # Inject an operator metadata-admission policy under the resolver so the
+        # SDK suite can exercise protected mode (#1724).
+        marker = "      - filter: openai_mcp_tool_resolve\n"
+        assert config.count(marker) == 1, config
+        config = config.replace(marker, marker + tool_admission)
+    if require_connector is not None:
+        marker = "        require_connector: true\n"
+        assert config.count(marker) == 1, config
+        config = config.replace(
+            marker,
+            f"        require_connector: {str(require_connector).lower()}\n",
+        )
+    config = config.replace("127.0.0.1:9999", ogx_endpoint or _ogx_endpoint())
+    # The unified gateway wires openai_web_search_dispatch into the IRR; its config
+    # resolves the `env_var: WEB_SEARCH_API_KEY` source at startup and fails closed
+    # when unset. These vLLM turns never emit a web_search_call, so a literal inline
+    # key keeps the dispatcher inert while letting the binary start. The Tavily
+    # provider rejects ``user_credential`` at startup, so a Tavily test replaces
+    # the whole provider block below instead of swapping in the placeholder key.
+    if web_search_provider != "tavily":
+        config = config.replace(
+            "env_var: WEB_SEARCH_API_KEY", "value: test-key"
+        )
+    else:
+        provider_block = (
+            "                provider: brave\n"
+            "                api_key:\n"
+            "                  env_var: WEB_SEARCH_API_KEY\n"
+            "                # Require the per-user key captured by the outer\n"
+            "                # callout_credentials filter. The secret is injected only at\n"
+            "                # the exact resolved provider authority.\n"
+            "                user_credential: brave_search\n"
+        )
+        assert config.count(provider_block) == 1, config
+        config = config.replace(
+            provider_block,
+            "                provider: tavily\n"
+            "                api_key:\n"
+            "                  env_var: TAVILY_API_KEY\n",
+        )
+    if chat_rewrite_model is not None:
+        # The native Chat ingress model policy (instance B) rewrites the
+        # client-facing ``codex-*`` alias and the default model to the example's
+        # placeholder. Retarget both at the model the live Chat backend actually
+        # serves so the rewritten name is accepted rather than 404'd.
+        assert config.count("llama-3.3-70b") == 2, config
+        config = config.replace("llama-3.3-70b", chat_rewrite_model)
+    if chat_translation_model is not None:
+        # Model-rewrite instance A (path /v1/responses) ships the identity alias
+        # ``vllm-chat`` -> ``vllm-chat``. Retarget ONLY the alias value at the
+        # model the live Chat backend actually serves. The router key
+        # (x-praxis-ai-model) was frozen from the ORIGINAL body before this
+        # filter, so cluster selection still binds chat-completions-backend while
+        # the translated POST /v1/chat/completions carries an accepted model.
+        anchor = '"vllm-chat": "vllm-chat"'
+        assert config.count(anchor) == 1, config
+        config = config.replace(anchor, f'"vllm-chat": "{chat_translation_model}"')
+    if reasoning_dialect is not None:
+        # full-flow hardcodes ``dialect: vllm`` on openai_responses_to_chat_completions.
+        # Retarget it so the dialect=none fail-closed path survives convergence
+        # (passing "vllm" is a no-op that still runs the drift guard).
+        assert config.count("dialect: vllm") == 1, config
+        config = config.replace("dialect: vllm", f"dialect: {reasoning_dialect}")
+    if compact_inference_port is not None:
+        # Retarget ONLY the openai_responses_compact summarization callout at the
+        # deterministic mock while the shared inference backend keeps serving real
+        # model turns, so the mock records summarizer callouts alone. The 3001
+        # cluster was already rewritten to ``resolved_backend`` by the loader.
+        compact_anchor = (
+            f'inference_url: "http://{resolved_backend}/v1/chat/completions"'
+        )
+        assert config.count(compact_anchor) == 1, config
+        config = config.replace(
+            compact_anchor,
+            f'inference_url: "http://127.0.0.1:{compact_inference_port}'
+            '/v1/chat/completions"',
+        )
+    if compact_default_model is not None:
+        # The summarizer callout body's model defaults to the compact filter's
+        # default_model; retarget it at the model the mock/backend expects.
+        assert config.count("default_model: gpt-4o-mini") == 1, config
+        config = config.replace(
+            "default_model: gpt-4o-mini",
+            f"default_model: {compact_default_model}",
+        )
+    if vector_store_endpoint is not None:
+        # Retarget the IRR openai_file_search_dispatch at the test vector store
+        # (a recording shim or OGX directly). The deferred ogx_files credential
+        # binds to this authority, so Authorization is injected at the callout.
+        anchor = "vector_store_url: http://127.0.0.1:3002"
+        assert config.count(anchor) == 1, config
+        config = config.replace(
+            anchor, f"vector_store_url: http://{vector_store_endpoint}"
+        )
+    if file_url_origin is not None:
+        # full-flow omits allowed_file_url_origins (file_url downloads default to
+        # the public-only policy). Permit the loopback file_url stub used by the
+        # file-resolve outbound-chain test. ``on_missing: reject`` is unique.
+        anchor = "        on_missing: reject\n"
+        assert config.count(anchor) == 1, config
+        config = config.replace(
+            anchor,
+            "        allowed_file_url_origins:\n"
+            f'          - "{file_url_origin}"\n' + anchor,
+        )
+    if search_port is not None:
+        search_anchor = "value: test-key\n                # Require the per-user key"
+        assert config.count(search_anchor) == 1
+        config = config.replace(
+            search_anchor,
+            "value: test-key\n"
+            f"                base_url: http://127.0.0.1:{search_port}\n"
+            "                # Require the per-user key",
+        )
+    if mcp_endpoint is not None:
+        mcp_anchor = "server_url: http://127.0.0.1:8001/mcp"
+        assert config.count(mcp_anchor) == 1, config
+        config = config.replace(mcp_anchor, f"server_url: {mcp_endpoint}")
+    if nemo_port is not None:
+        nemo_anchor = "http://127.0.0.1:3003/v1/checks"
+        assert config.count(nemo_anchor) == 1
+        config = config.replace(
+            nemo_anchor,
+            f"http://127.0.0.1:{nemo_port}/v1/checks",
+        )
+    if max_event_bytes is not None:
+        anchor = (
+            "        responses_table: openai_responses\n"
+            "        conversations_table: openai_conversations\n"
+        )
+        assert config.count(anchor) == 1
+        config = config.replace(anchor, anchor + f"        max_event_bytes: {max_event_bytes}\n")
+    if mcp_minimum_approval is not None:
+        # Inject the operator approval floor onto openai_mcp_dispatch so the
+        # pipeline requires approval for every MCP call regardless of the client's
+        # per-tool require_approval (issue #1723).
+        anchor = "              - filter: openai_mcp_dispatch\n"
+        assert config.count(anchor) == 1, config
+        config = config.replace(
+            anchor,
+            anchor + f"                minimum_approval: {mcp_minimum_approval}\n",
+        )
     if compression:
         config = _enable_response_store_compression(config)
 
-    path = _persist_config(config)
-    return path
+    # Widen the IRR inference deadlines for slow CPU-only vLLM, matching the
+    # file-search fixtures. The shipped example ships a 300s per-step budget
+    # tuned for a fast provider, but a full-context prefill (the
+    # over-context truncation case forwards the complete oversized history for
+    # vLLM to truncate natively) takes ~160s on a healthy CI runner and tips
+    # past 300s on a slow/co-located one, surfacing as a sub-request 504. Keep
+    # the production example untouched; only the test config gets the headroom.
+    config = config.replace("step_timeout_ms: 300000", "step_timeout_ms: 600000")
+    config = config.replace("timeout_ms: 360000", "timeout_ms: 660000")
+
+    config = _patch_store_backend(config, db_path)
+    return _persist_config(config)
+
+
+def _write_ttft_config(praxis_port: int, metrics_port: int, *, backend_endpoint: str) -> str:
+    """Patch the TTFT example to target the test backend and expose /metrics.
+
+    The shipped example forwards every path to one backend and records the
+    ``praxis_ai_ttft_seconds`` histogram. An ``admin`` block with a
+    ``metrics_address`` listener is appended so the test can scrape that histogram
+    and confirm the model label ``openai_chat_completions_request`` published for a
+    native chat completion. Since praxis 0.7.4 the admin ``address`` serves only
+    ``/api/*``; ``/metrics`` (and ``/healthy``, ``/ready``) moved to the separate
+    ``metrics_address`` listener.
+    """
+    with open(TTFT_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3000", backend_endpoint)
+
+    admin_block = f'\nadmin:\n  metrics_address: "127.0.0.1:{metrics_port}"\n'
+    anchor = "\ninsecure_options:\n"
+    assert config.count(anchor) == 1, "TTFT example should declare insecure_options once"
+    config = config.replace(anchor, admin_block + anchor, 1)
+
+    return _persist_config(config)
+
+
+def _scrape_metrics(metrics_port: int) -> str:
+    """Fetch the Prometheus exposition text from the metrics endpoint."""
+    response = httpx.get(f"http://127.0.0.1:{metrics_port}/metrics", timeout=5)
+    response.raise_for_status()
+    return response.text
+
+
+def _has_ttft_sample_for_model(metrics_text: str, model: str) -> bool:
+    """Whether the TTFT histogram carries a sample labeled with ``model``."""
+    label = f'model="{model}"'
+    return any(
+        line.startswith("praxis_ai_ttft_seconds") and label in line
+        for line in metrics_text.splitlines()
+    )
 
 
 def _read_log_tail(log_path: str, max_lines: int = 50) -> str:
@@ -298,183 +567,46 @@ def _assert_stream_contract(
     return terminal
 
 
-def _write_irr_streaming_config(praxis_port: int) -> str:
-    with open(IRR_STREAMING_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
-
-    path = _persist_config(config)
-    return path
-
-
-def _write_chat_streaming_config(
-    praxis_port: int, db_path: str, backend_endpoint: str
-) -> str:
-    """Patch the shipped Responses-to-Chat example for the selected backend."""
-    with open(CHAT_STREAMING_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:3001", backend_endpoint)
-    config = _patch_store_backend(config, db_path)
-
-    path = _persist_config(config)
-    return path
-
-
-def _write_client_tool_compat_config(praxis_port: int, db_path: str) -> str:
-    """Patch the client-tool-compat example for live vLLM.
-
-    The compat config only references the proxy listener, a single
-    inference-backend cluster endpoint, and the SQLite store, so patching is
-    limited to those three (no OGX, no mock side-servers).
-    """
-    with open(CLIENT_TOOL_COMPAT_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
-    config = _patch_store_backend(config, db_path)
-
-    return _persist_config(config)
-
-
-def _write_client_tool_compat_chat_config(praxis_port: int, db_path: str) -> str:
-    """Patch the composed client-tool-compat + Chat Completions example (#1206).
-
-    The composed config points at the proxy listener, a single Chat Completions
-    backend endpoint, and the SQLite store, so patching is limited to those three
-    (no OGX, no mock side-servers). Unlike ``_write_client_tool_compat_config`` the
-    backend receives ``POST /v1/chat/completions`` because
-    ``responses_to_chat_completions`` translates the lowered Responses request.
-    """
-    with open(CLIENT_TOOL_COMPAT_CHAT_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
-    config = _patch_store_backend(config, db_path)
-
-    return _persist_config(config)
-
-
-def _write_reasoning_config(praxis_port: int, db_path: str) -> str:
-    """Patch the shipped reasoning-dialect example for live vLLM."""
-    with open(REASONING_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
-    config = _patch_store_backend(config, db_path)
-
-    return _persist_config(config)
-
-
-def _write_reasoning_backend_config(
-    praxis_port: int,
-    db_path: str,
-    backend_port: int,
-    dialect: str = "vllm",
-) -> str:
-    """Patch the reasoning example to target a specific Chat backend port.
-
-    Identical to :func:`_write_reasoning_config` except the ``127.0.0.1:3001``
-    backend is pointed at ``backend_port`` (a capturing mock) so a test can
-    observe the exact Chat Completions request body the backend receives after
-    the proxy replays reasoning in the assistant reasoning field.
-    """
-    with open(REASONING_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
-    config = config.replace("dialect: vllm", f"dialect: {dialect}")
-    config = _patch_store_backend(config, db_path)
-
-    return _persist_config(config)
-
-
-def test_reasoning_config_writers_inherit_root_override(tmp_path, monkeypatch):
-    """Keep every reasoning fixture compatible with the root-run GPU worker."""
+@qualification_profile("supporting")
+def test_full_flow_config_writer_inherits_root_override(tmp_path, monkeypatch):
+    """Keep the converged full-flow writer compatible with the root-run GPU worker."""
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     db_path = str(tmp_path / "responses.db")
-    paths = [
-        _write_reasoning_config(18_080, db_path),
-        _write_reasoning_backend_config(18_081, db_path, 18_082),
-    ]
+    path = _write_full_flow_config(
+        18_080,
+        db_path,
+        backend_endpoint=_vllm_endpoint(),
+        chat_translation_model=VLLM_MODEL,
+        reasoning_dialect="vllm",
+        require_connector=False,
+    )
     try:
-        for path in paths:
-            with open(path) as config_file:
-                config = config_file.read()
-            assert config.count("allow_root: true") == 1, config
+        with open(path) as config_file:
+            config = config_file.read()
+        assert config.count("allow_root: true") == 1, config
+        assert config.count("require_connector: false") == 1, config
     finally:
-        for path in paths:
-            os.unlink(path)
+        os.unlink(path)
 
 
-def _write_compact_config(
-    praxis_port: int,
-    db_path: str,
-    compaction_port: int,
-) -> str:
-    """Patch the compact example for inference and a deterministic summary."""
-    with open(COMPACT_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:9999", _ogx_endpoint())
-    config = config.replace(
-        "http://localhost:11434/v1/chat/completions",
-        f"http://127.0.0.1:{compaction_port}/v1/chat/completions",
-    )
-    config = config.replace(
-        "default_model: llama3.2:1b", f"default_model: {VLLM_MODEL}"
-    )
-    config = config.replace("timeout_ms: 60000", "timeout_ms: 300000")
-    config = config.replace("127.0.0.1:11434", _vllm_endpoint())
-    config = _patch_store_backend(config, db_path)
-
-    path = _persist_config(config)
-    return path
-
-
-def _write_web_search_chat_streaming_config(
-    praxis_port: int, search_port: int, backend_endpoint: str
-) -> str:
-    """Patch the streaming web-search-through-Chat example for testing.
-
-    Points the loop at the selected Chat backend and swaps the Brave provider's
-    ``${WEB_SEARCH_API_KEY}`` placeholder for the in-process mock search server.
-    """
-    with open(WEB_SEARCH_CHAT_STREAMING_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace(
-        '- "127.0.0.1:3001"',
-        f'- "{backend_endpoint}"\n'
-        "                    read_timeout_ms: 300000",
-    )
-    config = config.replace(
-        "- filter: openai_web_search\n"
-        "                provider: brave\n"
-        "                api_key: ${WEB_SEARCH_API_KEY}",
-        "- filter: openai_web_search\n"
-        "                provider: brave\n"
-        "                api_key: test-key\n"
-        f"                base_url: http://127.0.0.1:{search_port}",
-    )
-    # The provider callout targets a loopback mock, so the executor's SSRF check
-    # requires the operator opt-in on the outbound pipeline.
-    config = config.replace(
-        "allow_private_endpoints: true",
-        "allow_private_endpoints: true\n  allow_private_upstreams: true",
-    )
-
-    path = _persist_config(config)
-    return path
+@qualification_profile("supporting")
+@pytest.mark.parametrize(
+    ("writer", "args", "postgres_port"),
+    [
+        (_write_full_flow_config, (18_080, "/unused.db"), 9999),
+        (_write_full_flow_config, (18_080, "/unused.db"), 3001),
+    ],
+)
+def test_store_url_survives_endpoint_rewrites(writer, args, postgres_port, monkeypatch):
+    database_url = f"postgres://test:test@127.0.0.1:{postgres_port}/responses"
+    monkeypatch.setattr(sys.modules[__name__], "DATABASE_URL", database_url)
+    path = writer(*args)
+    try:
+        with open(path) as config_file:
+            config = config_file.read()
+        assert f'database_url: "{database_url}"' in config
+    finally:
+        os.unlink(path)
 
 
 def _wait_for_proxy(
@@ -530,9 +662,18 @@ class MCPHandler(BaseHTTPRequestHandler):
     """Streamable HTTP MCP server with deterministic weather/time tools."""
 
     authorization_headers: ClassVar[list[str | None]] = []
+    assertion_headers: ClassVar[list[str | None]] = []
 
+    _request_count = 0
+    _request_count_lock = threading.Lock()
     _tool_call_count = 0
     _tool_call_count_lock = threading.Lock()
+
+    @classmethod
+    def request_count(cls) -> int:
+        """Return the number of MCP requests received by this test process."""
+        with cls._request_count_lock:
+            return cls._request_count
 
     @classmethod
     def tool_call_count(cls) -> int:
@@ -541,7 +682,10 @@ class MCPHandler(BaseHTTPRequestHandler):
             return cls._tool_call_count
 
     def do_POST(self):
+        with type(self)._request_count_lock:
+            type(self)._request_count += 1
         type(self).authorization_headers.append(self.headers.get("Authorization"))
+        type(self).assertion_headers.append(self.headers.get("x-mcp-authorized"))
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         req = json.loads(body)
         method = req.get("method")
@@ -573,6 +717,9 @@ class MCPHandler(BaseHTTPRequestHandler):
                                 "required": ["city"],
                                 "additionalProperties": False,
                             },
+                            # Read-only annotation so require_approval read_only
+                            # selectors can classify this tool (issue #1398).
+                            "annotations": {"readOnlyHint": True},
                         },
                         {
                             "name": "get_time",
@@ -660,6 +807,93 @@ class MCPHandler(BaseHTTPRequestHandler):
         pass
 
 
+class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
+    """Deterministic native Responses backend that drives one schema-invalid
+    MCP tool call, then a final message once the gateway rejects it.
+
+    The handler is stateless: it replies based on whether the forwarded input
+    already carries the rejection (a ``function_call_output``), so it needs no
+    request counter and tolerates retries. On the first turn it emits a
+    ``function_call`` to the resolved ``get_weather`` function tool with a
+    type-invalid ``city`` argument; ``openai_mcp_dispatch`` must reject it against
+    the advertised ``inputSchema`` before any outbound ``tools/call``.
+    """
+
+    @staticmethod
+    def _encoded_get_weather(request_body: dict) -> str:
+        """Find the function tool the resolver advertised for ``get_weather``."""
+        for tool in request_body.get("tools") or []:
+            name = tool.get("name", "")
+            if tool.get("type") == "function" and name.endswith("get_weather"):
+                return name
+        return "weather__get_weather"
+
+    @staticmethod
+    def _already_rejected(request_body: dict) -> bool:
+        """True once the loop has fed the rejection back for a second turn."""
+        items = request_body.get("input")
+        if not isinstance(items, list):
+            return False
+        return any(
+            isinstance(item, dict) and item.get("type") == "function_call_output"
+            for item in items
+        )
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        request_body = json.loads(body) if body else {}
+
+        if self._already_rejected(request_body):
+            output = [
+                {
+                    "id": "msg_mcp_invalid_final",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "I passed the wrong type; let me correct it.",
+                        }
+                    ],
+                }
+            ]
+        else:
+            output = [
+                {
+                    "id": "fc_mcp_invalid_1",
+                    "type": "function_call",
+                    "call_id": "call_mcp_invalid_1",
+                    "name": self._encoded_get_weather(request_body),
+                    # ``city`` must be a string per the advertised schema; a number
+                    # violates it, so the gateway rejects it before dispatch.
+                    "arguments": json.dumps({"city": 42}),
+                    "status": "completed",
+                }
+            ]
+
+        payload = json.dumps(
+            {
+                "id": f"resp_mcp_invalid_{time.time_ns()}",
+                "object": "response",
+                "created_at": int(time.time()),
+                "model": request_body.get("model", VLLM_MODEL),
+                "status": "completed",
+                "output": output,
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        self.wfile.flush()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
 class BraveSearchHandler(BaseHTTPRequestHandler):
     """Mock Brave Search API returning canned results.
 
@@ -669,16 +903,34 @@ class BraveSearchHandler(BaseHTTPRequestHandler):
 
     #: Total queries served across all instances since the last reset.
     request_count = 0
+    response_code = 200
+    successful_requests_remaining: ClassVar[int | None] = None
 
     @classmethod
     def reset(cls):
         cls.request_count = 0
+        cls.response_code = 200
+        cls.successful_requests_remaining = None
+        cls.request_paths.clear()
 
     request_paths: ClassVar[list[str]] = []
 
     def do_GET(self):
         type(self).request_paths.append(self.path)
         BraveSearchHandler.request_count += 1
+        response_code = BraveSearchHandler.response_code
+        if (
+            response_code == 200
+            and BraveSearchHandler.successful_requests_remaining is not None
+        ):
+            if BraveSearchHandler.successful_requests_remaining > 0:
+                BraveSearchHandler.successful_requests_remaining -= 1
+            else:
+                response_code = 503
+        if response_code != 200:
+            self.send_response(response_code)
+            self.end_headers()
+            return
         payload = json.dumps(
             {
                 "web": {
@@ -692,6 +944,36 @@ class BraveSearchHandler(BaseHTTPRequestHandler):
                 }
             }
         ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class NemoGuardrailsHandler(BaseHTTPRequestHandler):
+    """Passing NeMo `/v1/checks` mock used by the full-flow SDK tests."""
+
+    #: Total `/v1/checks` requests served across all instances since the last reset.
+    request_count: ClassVar[int] = 0
+    requests: ClassVar[list[dict[str, Any]]] = []
+    lock: ClassVar[threading.Lock] = threading.Lock()
+
+    @classmethod
+    def reset(cls):
+        with cls.lock:
+            cls.requests.clear()
+            cls.request_count = 0
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        with self.lock:
+            type(self).requests.append(json.loads(body))
+            type(self).request_count += 1
+        payload = json.dumps({"status": "passed", "content": "safe"}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -747,6 +1029,10 @@ class ChatCaptureHandler(BaseHTTPRequestHandler):
     """
 
     captured_bodies: ClassVar[list[dict]] = []
+    stream_deltas: ClassVar[list[dict]] = []
+    # When set, replaces the default single-choice array of the finite
+    # (non-streaming) response so a test can script alternative shapes.
+    finite_choices: ClassVar[list[dict] | None] = None
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -756,23 +1042,39 @@ class ChatCaptureHandler(BaseHTTPRequestHandler):
                 type(self).captured_bodies.append(json.loads(body))
             except json.JSONDecodeError:
                 pass
+        if body and json.loads(body).get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for delta in type(self).stream_deltas:
+                chunk = {
+                    "id": "chatcmpl_reasoning_capture", "object": "chat.completion.chunk",
+                    "model": VLLM_MODEL, "choices": [{"index": 0, "delta": delta}],
+                }
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                self.wfile.flush()
+            self.wfile.write(b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+            self.wfile.flush()
+            return
+        choices = type(self).finite_choices or [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning": "I picked 42.",
+                },
+            }
+        ]
         payload = json.dumps(
             {
                 "id": "chatcmpl_reasoning_capture",
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": VLLM_MODEL,
-                "choices": [
-                    {
-                        "index": 0,
-                        "finish_reason": "stop",
-                        "message": {
-                            "role": "assistant",
-                            "content": None,
-                            "reasoning": "I picked 42.",
-                        },
-                    }
-                ],
+                "choices": choices,
                 "usage": {
                     "prompt_tokens": 12,
                     "completion_tokens": 1,
@@ -795,31 +1097,55 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
 
     Captures the JSON body of every request the backend receives, then forwards
     it transparently and streams the response back so the full
-    native Responses pipeline still completes. Tests use the captured bodies to
-    assert on what the proxy actually forwards upstream after its rewrites
-    (rehydration, ``previous_response_id`` stripping, ``truncation`` passthrough).
+    native Responses pipeline still completes. The synthetic
+    ``sdk-conversation-stream`` model returns deterministic native responses
+    for Conversation append tests. Tests use the captured bodies to assert on
+    what the proxy actually forwards upstream after its rewrites.
     """
 
     forwarded_bodies: ClassVar[list[dict]] = []
+    concurrent_barrier: ClassVar[threading.Barrier | None] = None
+    terminal_gate: ClassVar[threading.Event | None] = None
+    tool_round_count: ClassVar[int] = 0
 
     def log_message(self, fmt, *args):
         pass
 
     def _forward(self):
+        """Capture the request and serve a synthetic or forwarded response."""
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
+        request_body = None
         if body:
             try:
-                type(self).forwarded_bodies.append(json.loads(body))
+                request_body = json.loads(body)
+                type(self).forwarded_bodies.append(request_body)
             except json.JSONDecodeError:
                 pass
+        if request_body and request_body.get("background") is True:
+            self._send_background_response(request_body)
+            return
+        if request_body and request_body.get("prompt") is not None:
+            self._send_prompt_response(request_body)
+            return
+        if request_body and request_body.get("model") in {
+            "sdk-conversation-stream",
+            "sdk-conversation-tool-stream",
+        }:
+            self._send_conversation_response(request_body)
+            return
         headers = {
             k: v
             for k, v in self.headers.items()
             if k.lower() not in ("host", "content-length")
         }
         url = f"{VLLM_BASE_URL.rstrip('/')}{self.path}"
-        with httpx.Client(timeout=300.0) as client:
+        # Match the widened IRR/SDK deadlines: the over-context truncation test
+        # forwards a full ~context-length prompt that vLLM prefills on CPU, which
+        # can run past 300s on a slow runner. A 300s cap here would drop the
+        # upstream connection mid-prefill and surface as a spurious 502 before
+        # the backend ever applies its context policy.
+        with httpx.Client(timeout=600.0) as client:
             with client.stream(
                 self.command, url, headers=headers, content=body
             ) as upstream:
@@ -838,11 +1164,288 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
                         self.wfile.write(chunk)
                         self.wfile.flush()
 
+    def _send_background_response(self, request_body):
+        """Serve a provider-owned background create response."""
+        response = {
+            "id": f"resp_sdk_background_{time.time_ns()}",
+            "object": "response",
+            "created_at": int(time.time()),
+            "model": request_body.get("model", "gpt-5"),
+            "status": "queued",
+            "background": True,
+            "output": [],
+        }
+
+        if request_body.get("stream"):
+            created = {**response, "status": "in_progress"}
+            completed = {**response, "status": "completed"}
+            events = [
+                {
+                    "type": "response.created",
+                    "sequence_number": 0,
+                    "response": created,
+                },
+                {
+                    "type": "response.completed",
+                    "sequence_number": 1,
+                    "response": completed,
+                },
+            ]
+            payload = b"".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+                for event in events
+            ) + b"data: [DONE]\n\n"
+            content_type = "text/event-stream"
+        else:
+            payload = json.dumps(response).encode()
+            content_type = "application/json"
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        self.wfile.flush()
+
+    def _send_prompt_response(self, request_body):
+        """Serve an OpenAI-owned prompt-template response."""
+        response = {
+            "id": f"resp_sdk_prompt_{time.time_ns()}",
+            "object": "response",
+            "created_at": int(time.time()),
+            "model": request_body.get("model", "gpt-5"),
+            "status": "completed",
+            "background": False,
+            "output": [],
+        }
+
+        if request_body.get("stream"):
+            created = {**response, "status": "in_progress"}
+            events = [
+                {
+                    "type": "response.created",
+                    "sequence_number": 0,
+                    "response": created,
+                },
+                {
+                    "type": "response.completed",
+                    "sequence_number": 1,
+                    "response": response,
+                },
+            ]
+            payload = b"".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+                for event in events
+            ) + b"data: [DONE]\n\n"
+            content_type = "text/event-stream"
+        else:
+            payload = json.dumps(response).encode()
+            content_type = "application/json"
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        self.wfile.flush()
+
+    def _send_conversation_response(self, request_body):
+        """Serve native Responses without a model so append/hydration is deterministic."""
+        request_input = json.dumps(request_body.get("input"))
+        leading_bom = "STREAM-LEADING-BOM-1546" in request_input
+        local_tool_limit = "STREAM-LOCAL-DELETE-410" in request_input
+        web_call_limit = "STREAM-WEB-LIMIT-410" in request_input
+        tool_model = request_body["model"] == "sdk-conversation-tool-stream"
+        if tool_model:
+            type(self).tool_round_count += 1
+        tool_first_round = tool_model and type(self).tool_round_count == 1
+        if "STREAM-CONCURRENT-410" in request_input:
+            barrier = type(self).concurrent_barrier
+            assert barrier is not None
+            barrier.wait(timeout=15)
+        response_id = f"resp_sdk_conv_{time.time_ns()}"
+        response = {
+            "id": response_id,
+            "object": "response",
+            "created_at": int(time.time()),
+            "model": request_body["model"],
+            "status": "completed",
+            "output": (
+                [
+                    {
+                        "id": f"ws_{response_id}",
+                        "type": "web_search_call",
+                        "status": "completed",
+                        "action": {"type": "search", "queries": ["test"]},
+                    }
+                ]
+                if local_tool_limit or tool_first_round
+                else [
+                    {
+                        "id": f"msg_{response_id}",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "SDK tool answer" if tool_model else "SDK streamed turn",
+                            }
+                        ],
+                    }
+                ]
+            ),
+        }
+        if web_call_limit:
+            # The full-flow example allows 32 web calls per round. A completed
+            # upstream snapshot with 33 calls makes IRR emit an SSE error in
+            # place of the deferred response.completed terminal.
+            response["output"] = [
+                {
+                    "id": f"ws_{response_id}_{index}",
+                    "type": "web_search_call",
+                    "status": "completed",
+                    "action": {"type": "search", "queries": ["test"]},
+                }
+                for index in range(33)
+            ]
+        if request_body.get("stream"):
+            created = {**response, "status": "in_progress", "output": []}
+            if web_call_limit:
+                # Exceed the one-byte replay limit plus decoder headroom before
+                # IRR replaces the held completed terminal with an SSE error.
+                created["instructions"] = "x" * 3072
+            frames = [
+                {"type": "response.created", "sequence_number": 0, "response": created},
+                {"type": "response.completed", "sequence_number": 1, "response": response},
+            ]
+            if leading_bom:
+                encoded_frames = [
+                    f"data: {json.dumps(event)}\n\n".encode() for event in frames
+                ]
+            else:
+                encoded_frames = [
+                    f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+                    for event in frames
+                ]
+            payload = (
+                (b"\xef\xbb\xbf" if leading_bom else b"")
+                + b"".join(encoded_frames)
+                + b"data: [DONE]\n\n"
+            )
+            content_type = "text/event-stream"
+        else:
+            payload = json.dumps(response).encode()
+            content_type = "application/json"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if request_body.get("stream") and (
+            "STREAM-DELETE-410" in request_input
+            or "STREAM-DISCONNECT-410" in request_input
+            or local_tool_limit
+        ):
+            self.wfile.write(encoded_frames[0])
+            self.wfile.flush()
+            gate = type(self).terminal_gate
+            assert gate is not None
+            assert gate.wait(timeout=15), "test did not release the terminal event"
+            self.wfile.write(encoded_frames[1] + b"data: [DONE]\n\n")
+        else:
+            self.wfile.write(payload)
+        self.wfile.flush()
+
     def do_POST(self):
         self._forward()
 
     def do_GET(self):
         self._forward()
+
+
+class NativeCompactionBackendHandler(BaseHTTPRequestHandler):
+    """Deterministic native Responses backend for SDK rehydration coverage."""
+
+    requests: ClassVar[list[dict]] = []
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        request_body = json.loads(body)
+        type(self).requests.append(request_body)
+        request_number = len(type(self).requests)
+        output = []
+        if request_number == 1:
+            output = [
+                {
+                    "type": "compaction",
+                    "id": "cmp_provider_sdk",
+                    "encrypted_content": "provider-opaque-state",
+                }
+            ]
+        payload = json.dumps(
+            {
+                "id": f"resp_provider_compaction_sdk_{request_number}",
+                "object": "response",
+                "created_at": 1,
+                "model": VLLM_MODEL,
+                "status": "completed",
+                "output": output,
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class OversizedCallIdBackendHandler(BaseHTTPRequestHandler):
+    """Native Responses backend scripting one MCP call with an escaping id.
+
+    Issue #1400: a provider-emitted ``call_id`` at the raw-byte bound but whose
+    JSON-serialized fallback exceeds the retained reservation must fail closed
+    before an approval is persisted or the tool executes. Real vLLM cannot be
+    forced to emit such an id, so this handler scripts deterministic output.
+    """
+
+    request_count: ClassVar[int] = 0
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length:
+            self.rfile.read(length)
+        type(self).request_count += 1
+        payload = json.dumps(
+            {
+                "id": "resp_oversized_call_id",
+                "object": "response",
+                "created_at": 1,
+                "model": VLLM_MODEL,
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": "fc_oversized_call_id",
+                        "call_id": "\0" * 128,
+                        "name": "weather__get_weather",
+                        "arguments": json.dumps({"city": "Paris"}),
+                        "status": "completed",
+                    }
+                ],
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
 
 class SimulatorBackendHandler(BaseHTTPRequestHandler):
@@ -858,6 +1461,8 @@ class SimulatorBackendHandler(BaseHTTPRequestHandler):
     """
 
     recorded_requests: ClassVar[list[tuple[str, dict[str, Any]]]] = []
+    web_search_queries: ClassVar[list[str]] = []
+    web_search_multi_query_call: ClassVar[bool] = False
 
     def log_message(self, fmt, *args):
         pass
@@ -871,6 +1476,9 @@ class SimulatorBackendHandler(BaseHTTPRequestHandler):
         scripted_tool = self._scripted_tool_name(request_body)
         if scripted_tool is not None:
             self._send_scripted_chat_response(request_body, scripted_tool)
+            return
+        if self._wants_service_tier_response(request_body):
+            self._send_service_tier_chat_response(request_body)
             return
 
         headers = {
@@ -912,6 +1520,51 @@ class SimulatorBackendHandler(BaseHTTPRequestHandler):
                 return hosted_tool
         return None
 
+    def _wants_service_tier_response(self, request_body: dict[str, Any]) -> bool:
+        if not self.path.rstrip("/").endswith("/v1/chat/completions"):
+            return False
+        return any(
+            message.get("content") == "STREAM-SERVICE-TIER-1549"
+            for message in request_body.get("messages", [])
+            if isinstance(message, dict)
+        )
+
+    def _send_service_tier_chat_response(self, request_body: dict[str, Any]) -> None:
+        completion_id = f"chatcmpl_service_tier_{time.time_ns()}"
+        chunks = [
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request_body.get("model", VLLM_MODEL),
+                "choices": [{"index": 0, "delta": {"role": "assistant"}}],
+            },
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request_body.get("model", VLLM_MODEL),
+                "service_tier": "scale",
+                "choices": [{"index": 0, "delta": {"content": "Service tier recorded"}}],
+            },
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request_body.get("model", VLLM_MODEL),
+                "service_tier": "scale",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            },
+        ]
+        payload = b"".join(
+            f"data: {json.dumps(chunk)}\n\n".encode() for chunk in chunks
+        ) + b"data: [DONE]\n\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def _send_scripted_chat_response(
         self, request_body: dict[str, Any], tool_name: str
     ) -> None:
@@ -933,24 +1586,50 @@ class SimulatorBackendHandler(BaseHTTPRequestHandler):
             }
             finish_reason = "stop"
         else:
-            query = (
-                "latest Praxis Proxy release"
+            queries = (
+                SimulatorBackendHandler.web_search_queries
                 if tool_name == "web_search"
-                else "Praxis marker"
+                and SimulatorBackendHandler.web_search_queries
+                else [
+                    "latest Praxis Proxy release"
+                    if tool_name == "web_search"
+                    else "Praxis marker"
+                ]
             )
-            message = {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
+            if (
+                tool_name == "web_search"
+                and SimulatorBackendHandler.web_search_multi_query_call
+            ):
+                tool_calls = [
                     {
                         "id": f"call_simulator_{tool_name}",
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps({"queries": queries}),
+                        },
+                    }
+                ]
+            else:
+                tool_calls = [
+                    {
+                        "id": (
+                            f"call_simulator_{tool_name}_{index}"
+                            if len(queries) > 1
+                            else f"call_simulator_{tool_name}"
+                        ),
                         "type": "function",
                         "function": {
                             "name": tool_name,
                             "arguments": json.dumps({"query": query}),
                         },
                     }
-                ],
+                    for index, query in enumerate(queries)
+                ]
+            message = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": tool_calls,
             }
             finish_reason = "tool_calls"
 
@@ -1008,24 +1687,44 @@ def _assert_simulator_auto_tool_round(
             65_536,
         ),
     }[tool_name]
+    if tool_name == "web_search":
+        parameters = {
+            "type": "object",
+            "properties": {
+                "queries": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": max_length,
+                    },
+                    "minItems": 1,
+                    "maxItems": 64,
+                }
+            },
+            "required": ["queries"],
+            "additionalProperties": False,
+        }
+    else:
+        parameters = {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": max_length,
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        }
     expected_tools = [
         {
             "type": "function",
             "function": {
                 "name": tool_name,
                 "description": description,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": max_length,
-                        }
-                    },
-                    "required": ["query"],
-                    "additionalProperties": False,
-                },
+                "parameters": parameters,
                 "strict": True,
             },
         }
@@ -1046,116 +1745,6 @@ def _assert_simulator_auto_tool_round(
     ]
     assert "tool" not in first_roles, first
     assert "tool" in reentry_roles, reentry
-
-
-
-def _write_witness_config(
-    praxis_port: int,
-    db_path: str,
-    backend_port: int,
-) -> str:
-    """Patch full-flow-agentic.yaml to route the native backend through the shim.
-
-    Identical to :func:`_write_config` except the ``127.0.0.1:3001`` backend is
-    pointed at the recording shim (which forwards to vLLM) instead of vLLM
-    directly, so a test can observe the exact request bodies the backend sees.
-    """
-    with open(CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
-    config = config.replace("127.0.0.1:9999", _ogx_endpoint())
-    config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
-    config = _patch_store_backend(config, db_path)
-
-    path = _persist_config(config)
-    return path
-
-
-def _write_agentic_config(
-    praxis_port: int,
-    db_path: str,
-    mcp_port: int,
-    search_port: int,
-    *,
-    translate_to_chat: bool = False,
-    backend_endpoint: str | None = None,
-    real_web_search: bool = False,
-) -> str:
-    """Patch agentic-loop.yaml for mocked or credentialed agentic tests."""
-    with open(AGENTIC_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    vllm = backend_endpoint if translate_to_chat else _vllm_endpoint()
-    if vllm is None:
-        raise ValueError("translated agentic config requires a backend endpoint")
-    config = config.replace('- "127.0.0.1:3001"', f'- "{vllm}"')
-    if config.count("read_timeout_ms:") != 1:
-        raise RuntimeError(
-            "agentic-loop.yaml must declare exactly one cluster read_timeout_ms; "
-            "the vLLM harness no longer injects a second copy"
-        )
-    # agentic-loop.yaml is the canonical unified config (#1046): it wires all
-    # three request-phase dispatchers (web_search, mcp_dispatch,
-    # file_search_callout) under the single agentic-loop owner. Retarget the
-    # file-search vector store at OGX so the file-search dispatcher is live here
-    # too; it stays inert for web/mcp-only tests that emit no file_search_call.
-    config = config.replace("http://127.0.0.1:8001", f"http://{_ogx_endpoint()}")
-    config = _patch_store_backend(config, db_path)
-    # The loopback MCP callout's SSRF posture is governed by
-    # ``insecure_options.allow_private_upstreams`` (no per-filter opt-in), which
-    # agentic-loop.yaml already enables -- so no injection is needed here.
-    config = config.replace(
-        "max_iterations: 11\n",
-        # agentic-loop.yaml already sets the IRR's overall ``timeout_ms``;
-        # inject only ``step_timeout_ms`` here to avoid a duplicate key.
-        "max_iterations: 11\n"
-        "        step_timeout_ms: 300000\n",
-    )
-    configured_web_search = (
-        "- filter: openai_web_search\n"
-        "                provider: brave\n"
-        "                api_key: ${WEB_SEARCH_API_KEY}"
-    )
-    if real_web_search:
-        replacement_web_search = (
-            "- filter: openai_web_search\n"
-            "                provider: tavily\n"
-            "                api_key: ${TAVILY_API_KEY}"
-        )
-    else:
-        replacement_web_search = (
-            "- filter: openai_web_search\n"
-            "                provider: brave\n"
-            "                api_key: test-key\n"
-            f"                base_url: http://127.0.0.1:{search_port}"
-        )
-    if configured_web_search not in config:
-        raise RuntimeError("agentic-loop.yaml web-search block changed")
-    config = config.replace(configured_web_search, replacement_web_search, 1)
-    # agentic-loop.yaml already declares ``allow_private_upstreams: true`` in its
-    # ``insecure_options``, which is the operator opt-in the executor's SSRF check
-    # requires for the loopback provider callout — no test-time injection needed.
-    if translate_to_chat:
-        config = config.replace(
-            "              - filter: openai_responses_proxy\n"
-            "              - filter: router",
-            "              - filter: responses_to_chat_completions\n"
-            "              - filter: path_rewrite\n"
-            "                replace:\n"
-            '                  pattern: "^/v1/responses/?$"\n'
-            '                  replacement: "/v1/chat/completions"\n'
-            "                conditions:\n"
-            "                  - when:\n"
-            '                      path_prefix: "/v1/responses"\n'
-            "                      methods: [POST]\n"
-            "              - filter: router",
-        )
-
-    path = _persist_config(config)
-    return path
 
 
 # ---------------------------------------------------------------------------
@@ -1183,12 +1772,12 @@ def backend_endpoint():
 
 
 @pytest.fixture(scope="session")
-def praxis_proxy(tmp_path_factory, request):
+def praxis_proxy(tmp_path_factory, request, backend_endpoint):
     """Start a Praxis proxy backed by vLLM for the test session."""
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_config(port, db_path)
+    config_path = _write_full_flow_config(port, db_path, backend_endpoint=backend_endpoint)
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -1222,12 +1811,53 @@ def praxis_proxy(tmp_path_factory, request):
 
 
 @pytest.fixture(scope="session")
-def compression_proxy(tmp_path_factory, request):
+def ttft_proxy(tmp_path_factory, request, backend_endpoint):
+    """Start a Praxis proxy on the TTFT example with the /metrics endpoint exposed.
+
+    Native ``POST /v1/chat/completions`` is forwarded straight to the backend, so
+    ``openai_chat_completions_request`` publishes the request model for the
+    ``time_to_first_token`` histogram. Yields the proxy and admin (metrics) ports.
+    """
+    port = _free_port()
+    metrics_port = _free_port()
+    log_dir = tmp_path_factory.mktemp("ttft")
+    config_path = _write_ttft_config(port, metrics_port, backend_endpoint=backend_endpoint)
+    binary = _find_binary()
+
+    log_path = str(log_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port, metrics_port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(f"\n=== TTFT proxy Praxis logs ===\n{f.read()}", file=sys.stderr)
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def compression_proxy(tmp_path_factory, request, backend_endpoint):
     """Start a Praxis proxy whose response store has zstd compression enabled."""
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-compression")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_config(port, db_path, compression=True)
+    config_path = _write_full_flow_config(port, db_path, compression=True, backend_endpoint=backend_endpoint)
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -1261,51 +1891,23 @@ def compression_proxy(tmp_path_factory, request):
 
 
 @pytest.fixture(scope="session")
-def irr_streaming_proxy(tmp_path_factory, request):
-    """Start a Praxis proxy with terminal Responses streaming through IRR."""
-    port = _free_port()
-    config_path = _write_irr_streaming_config(port)
-    binary = _find_binary()
-
-    log_dir = tmp_path_factory.mktemp("irr-terminal-streaming")
-    log_path = str(log_dir / "praxis.log")
-    log_file = open(log_path, "w")
-    started = False
-
-    proc = subprocess.Popen(
-        [binary, "-c", config_path],
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-    )
-    try:
-        _wait_for_proxy(port, proc, log_path)
-        started = True
-        yield port
-    finally:
-        proc.send_signal(signal.SIGINT)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        log_file.close()
-        if not started or request.session.testsfailed > 0:
-            with open(log_path) as f:
-                print(
-                    f"\n=== IRR streaming Praxis logs ===\n{f.read()}",
-                    file=sys.stderr,
-                )
-        os.unlink(config_path)
-
-
-@pytest.fixture(scope="session")
 def chat_streaming_proxy(tmp_path_factory, request, backend_endpoint):
-    """Start the Responses-to-Chat streaming example."""
+    """Start the shared full-flow gateway on its Chat-translation route.
+
+    The full-flow router binds model ``vllm-chat`` to the Chat Completions
+    backend, so every request on this fixture must send ``CHAT_TRANSLATION_MODEL``
+    to reach ``openai_responses_to_chat_completions``. ``chat_translation_model``
+    retargets the managed Chat-translation alias (instance A) at the model the
+    live Chat backend actually serves so the rewritten name is accepted.
+    """
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-chat-streaming")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_chat_streaming_config(
-        port, db_path, backend_endpoint
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=backend_endpoint,
+        chat_translation_model=VLLM_MODEL,
     )
     binary = _find_binary()
 
@@ -1345,7 +1947,12 @@ def reasoning_proxy(tmp_path_factory, request):
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-reasoning")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_reasoning_config(port, db_path)
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=_vllm_endpoint(),
+        chat_translation_model=VLLM_MODEL,
+    )
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -1384,7 +1991,11 @@ def client_tool_compat_proxy(tmp_path_factory, request):
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("client-tool-compat")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_client_tool_compat_config(port, db_path)
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=_vllm_endpoint(),
+    )
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -1420,11 +2031,8 @@ def client_tool_compat_proxy(tmp_path_factory, request):
 @pytest.fixture(scope="session")
 def client_tool_compat_client(client_tool_compat_proxy):
     """Return an SDK client using the client-tool-compat pipeline."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{client_tool_compat_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
+    return _make_openai_client(
+        client_tool_compat_proxy, default_headers=TRUSTED_OWNER_HEADERS
     )
 
 
@@ -1434,7 +2042,12 @@ def client_tool_compat_chat_proxy(tmp_path_factory, request):
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("client-tool-compat-chat")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_client_tool_compat_chat_config(port, db_path)
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=_vllm_endpoint(),
+        chat_translation_model=VLLM_MODEL,
+    )
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -1470,11 +2083,8 @@ def client_tool_compat_chat_proxy(tmp_path_factory, request):
 @pytest.fixture(scope="session")
 def client_tool_compat_chat_client(client_tool_compat_chat_proxy):
     """Return an SDK client using the composed compat + Chat Completions pipeline."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{client_tool_compat_chat_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
+    return _make_openai_client(
+        client_tool_compat_chat_proxy, default_headers=TRUSTED_OWNER_HEADERS
     )
 
 
@@ -1495,10 +2105,11 @@ def compact_proxy(tmp_path_factory, request, compaction_server):
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-compact")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_compact_config(
+    config_path = _write_full_flow_config(
         port,
         db_path,
-        compaction_server,
+        compact_inference_port=compaction_server,
+        compact_default_model=VLLM_MODEL,
     )
     binary = _find_binary()
 
@@ -1531,7 +2142,9 @@ def compact_proxy(tmp_path_factory, request, compaction_server):
         os.unlink(config_path)
 
 
-def _witness_proxy_session(tmp_path_factory, request):
+def _witness_proxy_session(
+    tmp_path_factory, request, search_port=None, max_event_bytes=None, nemo_port=None
+):
     """Start a proxy whose native backend is a recording shim in front of vLLM.
 
     Shared generator body for the witness fixtures. Yields ``(client,
@@ -1540,16 +2153,24 @@ def _witness_proxy_session(tmp_path_factory, request):
     the proxy actually forwards upstream after its rewrites.
     """
     ResponsesWitnessHandler.forwarded_bodies = []
+    ResponsesWitnessHandler.tool_round_count = 0
     forwarded = ResponsesWitnessHandler.forwarded_bodies
     backend_port = _free_port()
-    server = HTTPServer(("127.0.0.1", backend_port), ResponsesWitnessHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", backend_port), ResponsesWitnessHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-witness")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_witness_config(port, db_path, backend_port)
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=f"127.0.0.1:{backend_port}",
+        search_port=search_port,
+        nemo_port=nemo_port,
+        max_event_bytes=max_event_bytes,
+    )
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -1563,13 +2184,7 @@ def _witness_proxy_session(tmp_path_factory, request):
     try:
         _wait_for_proxy(port, proc, log_path)
         started = True
-        client = OpenAI(
-            base_url=f"http://127.0.0.1:{port}/v1",
-            api_key="test",
-            default_headers=TRUSTED_OWNER_HEADERS,
-            max_retries=0,
-            timeout=300,
-        )
+        client = _make_openai_client(port, default_headers=TRUSTED_OWNER_HEADERS)
         yield client, forwarded
     finally:
         proc.send_signal(signal.SIGINT)
@@ -1580,6 +2195,8 @@ def _witness_proxy_session(tmp_path_factory, request):
             proc.wait()
         log_file.close()
         server.shutdown()
+        ResponsesWitnessHandler.concurrent_barrier = None
+        ResponsesWitnessHandler.terminal_gate = None
         if not started or request.session.testsfailed > 0:
             with open(log_path) as f:
                 print(
@@ -1595,26 +2212,56 @@ def witness_backend_client(tmp_path_factory, request):
     yield from _witness_proxy_session(tmp_path_factory, request)
 
 
-def _reasoning_capture_session(tmp_path_factory, request):
-    """Start the reasoning example with a capturing mock Chat backend.
+@pytest.fixture()
+def witness_backend_tool_client(tmp_path_factory, request, nemo_guardrails_server):
+    """Witness proxy whose IRR tool-result guardrail has a reachable NeMo endpoint.
 
-    Yields ``(client, captured_bodies)`` where ``captured_bodies`` accumulates
-    the Chat Completions request bodies the backend receives. A mock backend
-    (rather than live vLLM) keeps the assertion deterministic and independent of
-    model output: the test checks the assistant reasoning field forwarded upstream.
+    A request-side tool-limit completion still produces a (failed) tool result
+    that the full-flow guardrail screens before re-entry, so the phase needs a
+    live endpoint even though no hosted search is dispatched.
     """
-    ChatCaptureHandler.captured_bodies = []
-    captured = ChatCaptureHandler.captured_bodies
+    yield from _witness_proxy_session(
+        tmp_path_factory, request, nemo_port=nemo_guardrails_server
+    )
+
+
+@pytest.fixture()
+def witness_tool_client(tmp_path_factory, request, search_server, nemo_guardrails_server):
+    """Full-flow witness with a deterministic hosted web-search endpoint."""
+    yield from _witness_proxy_session(
+        tmp_path_factory, request, search_server, nemo_port=nemo_guardrails_server
+    )
+
+
+@pytest.fixture()
+def witness_replay_limited_tool_client(
+    tmp_path_factory, request, search_server, nemo_guardrails_server
+):
+    """Hosted web-search witness whose Response replay limit is one byte."""
+    yield from _witness_proxy_session(
+        tmp_path_factory,
+        request,
+        search_server,
+        max_event_bytes=1,
+        nemo_port=nemo_guardrails_server,
+    )
+
+
+@pytest.fixture()
+def provider_compaction_client(tmp_path_factory, request):
+    """Function-scoped native Responses backend with a provider compaction."""
+    NativeCompactionBackendHandler.requests = []
+    requests = NativeCompactionBackendHandler.requests
     backend_port = _free_port()
-    server = HTTPServer(("127.0.0.1", backend_port), ChatCaptureHandler)
+    server = HTTPServer(("127.0.0.1", backend_port), NativeCompactionBackendHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
     port = _free_port()
-    db_dir = tmp_path_factory.mktemp("responses-reasoning-capture")
+    db_dir = tmp_path_factory.mktemp("responses-provider-compaction")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_reasoning_backend_config(
-        port, db_path, backend_port, getattr(request, "param", "vllm"),
+    config_path = _write_full_flow_config(
+        port, db_path, backend_endpoint=f"127.0.0.1:{backend_port}"
     )
     binary = _find_binary()
 
@@ -1629,11 +2276,77 @@ def _reasoning_capture_session(tmp_path_factory, request):
     try:
         _wait_for_proxy(port, proc, log_path)
         started = True
-        client = OpenAI(
-            base_url=f"http://127.0.0.1:{port}/v1",
-            api_key="test",
-            max_retries=0,
-            timeout=300,
+        client = _make_openai_client(port, default_headers=TRUSTED_OWNER_HEADERS)
+        yield client, requests
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        server.shutdown()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Provider compaction Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+def _reasoning_capture_session(tmp_path_factory, request):
+    """Start the reasoning example with a capturing mock Chat backend.
+
+    Yields ``(client, captured_bodies)`` where ``captured_bodies`` accumulates
+    the Chat Completions request bodies the backend receives. A mock backend
+    (rather than live vLLM) keeps the assertion deterministic and independent of
+    model output: the test checks the assistant reasoning field forwarded upstream.
+    """
+    ChatCaptureHandler.captured_bodies = []
+    ChatCaptureHandler.stream_deltas = [{"reasoning": "I picked "}, {"reasoning_content": "42."}]
+    ChatCaptureHandler.finite_choices = None
+    captured = ChatCaptureHandler.captured_bodies
+    backend_port = _free_port()
+    server = HTTPServer(("127.0.0.1", backend_port), ChatCaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("responses-reasoning-capture")
+    db_path = str(db_dir / "responses.db")
+    # Converged onto full-flow-agentic.yaml: the binding router maps model
+    # "vllm-chat" (CHAT_TRANSLATION_MODEL) to the Chat Completions backend, and
+    # model-rewrite then rewrites that body model to VLLM_MODEL. Reasoning tests
+    # MUST send CHAT_TRANSLATION_MODEL to route through the translator; a native
+    # VLLM_MODEL request lands on the Responses backend instead. full-flow's IRR
+    # step already runs openai_agentic_loop ahead of
+    # openai_responses_to_chat_completions (so the "agentic" param needs no extra
+    # wiring). Map that param onto the vLLM dialect; "none" disables it.
+    param = getattr(request, "param", "vllm")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=f"127.0.0.1:{backend_port}",
+        chat_translation_model=VLLM_MODEL,
+        reasoning_dialect="vllm" if param == "agentic" else param,
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        client = _make_openai_client(
+            port, default_headers=TRUSTED_OWNER_HEADERS
         )
         yield client, captured
     finally:
@@ -1663,95 +2376,71 @@ def reasoning_capture_client(tmp_path_factory, request):
 @pytest.fixture(scope="session")
 def openai_client(praxis_proxy):
     """Return an OpenAI client pointed at the local Praxis proxy."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
-        api_key="test",
+    return _make_openai_client(
+        praxis_proxy,
         default_headers={
             **TRUSTED_OWNER_HEADERS,
             "x-user-ogx-key": "Bearer test",
         },
-        max_retries=0,
-        timeout=300,
     )
 
 
 @pytest.fixture(scope="session")
 def other_owner_openai_client(praxis_proxy):
     """Return a same-tenant Responses client with another subject."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
-        api_key="test",
+    return _make_openai_client(
+        praxis_proxy,
         default_headers={**TRUSTED_OWNER_HEADERS, "x-auth-user": "other-test-user"},
-        max_retries=0,
-        timeout=300,
     )
 
 
 @pytest.fixture(scope="session")
 def compression_openai_client(compression_proxy):
     """Return an OpenAI client pointed at the compression-enabled proxy."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{compression_proxy}/v1",
-        api_key="test",
-        default_headers=TRUSTED_OWNER_HEADERS,
-        max_retries=0,
-        timeout=300,
-    )
-
-
-@pytest.fixture(scope="session")
-def irr_streaming_client(irr_streaming_proxy):
-    """Return an OpenAI client using the terminal-streaming IRR proxy."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{irr_streaming_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
+    return _make_openai_client(
+        compression_proxy, default_headers=TRUSTED_OWNER_HEADERS
     )
 
 
 @pytest.fixture(scope="session")
 def chat_streaming_client(chat_streaming_proxy):
     """Return an SDK client using Responses-to-Chat stream translation."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{chat_streaming_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
+    return _make_openai_client(
+        chat_streaming_proxy, default_headers=TRUSTED_OWNER_HEADERS
     )
 
 
 @pytest.fixture(scope="session")
 def reasoning_client(reasoning_proxy):
     """Return an SDK client using the reasoning-dialect example."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{reasoning_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
+    return _make_openai_client(
+        reasoning_proxy, default_headers=TRUSTED_OWNER_HEADERS
     )
 
 
 @pytest.fixture(scope="session")
 def compact_client(compact_proxy):
     """Return an SDK client using the compact filter example."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{compact_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
+    return _make_openai_client(
+        compact_proxy, default_headers=TRUSTED_OWNER_HEADERS
     )
 
 
 @pytest.fixture(scope="session")
 def web_search_chat_streaming_proxy(
-    tmp_path_factory, request, search_server, backend_endpoint
+    tmp_path_factory, request, search_server, backend_endpoint, nemo_guardrails_server
 ):
     """Start the streaming web-search-through-Chat example."""
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("web-search-chat-streaming")
-    config_path = _write_web_search_chat_streaming_config(
-        port, search_server, backend_endpoint
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=backend_endpoint,
+        search_port=search_server,
+        chat_translation_model=VLLM_MODEL,
+        nemo_port=nemo_guardrails_server,
     )
     binary = _find_binary()
 
@@ -1789,11 +2478,8 @@ def web_search_chat_streaming_proxy(
 def web_search_chat_streaming_client(web_search_chat_streaming_proxy):
     """Return an SDK client using streaming web-search-through-Chat translation."""
     proxy_port, _ = web_search_chat_streaming_proxy
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{proxy_port}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
+    return _make_openai_client(
+        proxy_port, default_headers=TRUSTED_OWNER_HEADERS
     )
 
 
@@ -1918,7 +2604,7 @@ class TestOpenAIResponsesVLLM:
 
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.responses.retrieve(response.id)
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "store=false response must not be retrievable"
 
     def test_store_and_retrieve(self, openai_client):
         response = openai_client.responses.create(
@@ -2020,6 +2706,18 @@ class TestOpenAIResponsesVLLM:
         assert next_page.has_more is False
         assert "Repeat the marker" in next_page.data[0].content[0].text
 
+        desc_page = openai_client.responses.input_items.list(
+            response.id,
+            limit=1,
+            order="desc",
+        )
+        assert desc_page.object == "list"
+        assert len(desc_page.data) == 1
+        assert desc_page.first_id == desc_page.data[0].id
+        assert desc_page.last_id == desc_page.data[-1].id
+        assert desc_page.first_id == next_page.data[0].id
+        assert desc_page.has_more is True
+
         assert openai_client.responses.delete(response.id) is None
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.responses.retrieve(response.id)
@@ -2028,19 +2726,55 @@ class TestOpenAIResponsesVLLM:
             openai_client.responses.input_items.list(response.id)
         assert exc_info.value.status_code == 404
 
+    def test_duplicate_input_item_ids_auto_paginate(self, witness_backend_client):
+        client, _forwarded = witness_backend_client
+        response = client.responses.create(
+            model="sdk-conversation-stream",
+            input=[
+                {"type": "item_reference", "id": "dup"},
+                {"type": "item_reference", "id": "dup"},
+                {"type": "item_reference", "id": "c"},
+            ],
+            store=True,
+            max_output_tokens=16,
+        )
+
+        first = client.responses.input_items.list(
+            response.id,
+            limit=1,
+            order="asc",
+        )
+        pages = list(islice(first.iter_pages(), 3))
+        assert len(pages) == 2, (
+            "SDK pagination must advance past an ambiguous duplicate target and terminate"
+        )
+        assert all(len(page.data) == 1 for page in pages), (
+            "the requested one-item page size must remain stable during SDK iteration"
+        )
+        ids = [page.data[0].id for page in pages]
+        assert ids == ["dup", "c"], (
+            "SDK-derived after=dup must reach the later unique item without rewriting the reference target"
+        )
+        assert all(page.last_id == page.data[-1].id for page in pages), (
+            "the documented last_id field must remain the final returned item ID"
+        )
+        assert pages[-1].has_more is False, (
+            "SDK pagination must terminate after reaching the final unique item"
+        )
+
     def test_response_resource_not_found_errors(self, openai_client):
         missing_id = "resp_missing_sdk_integration"
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.responses.retrieve(missing_id)
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "retrieving a missing response must return 404"
 
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.responses.input_items.list(missing_id)
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "listing input items for a missing response must return 404"
 
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.responses.delete(missing_id)
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "deleting a missing response must return 404"
 
     def test_invalid_previous_response_id_is_rejected(self, openai_client):
         with pytest.raises(BadRequestError) as exc_info:
@@ -2050,8 +2784,8 @@ class TestOpenAIResponsesVLLM:
                 previous_response_id="resp_missing_sdk_integration",
                 store=True,
             )
-        assert exc_info.value.status_code == 400
-        assert "resp_missing_sdk_integration" in str(exc_info.value)
+        assert exc_info.value.status_code == 400, "unknown previous_response_id must return 400"
+        assert "resp_missing_sdk_integration" in str(exc_info.value), "error must name the missing previous_response_id"
 
     def test_streaming_validation_failure_returns_json_not_sse(self, openai_client):
         """Issue #1001: a request that fails pre-stream validation must return
@@ -2078,8 +2812,8 @@ class TestOpenAIResponsesVLLM:
                 stream=True,
                 store=True,
             )
-        assert exc_info.value.status_code == 400
-        assert "resp_missing_sdk_integration" in str(exc_info.value)
+        assert exc_info.value.status_code == 400, "stream:true rejection must return 400"
+        assert "resp_missing_sdk_integration" in str(exc_info.value), "error must name the missing previous_response_id"
 
         # Assert the wire shape precisely: a stream:true rejection must be an
         # application/json error envelope, not an SSE error event.
@@ -2095,16 +2829,16 @@ class TestOpenAIResponsesVLLM:
             },
             timeout=10,
         )
-        assert raw.status_code == 400
+        assert raw.status_code == 400, "stream:true pre-stream rejection must return 400"
         content_type = raw.headers.get("content-type", "")
         assert content_type.startswith("application/json"), (
             "a stream:true pre-stream rejection must use application/json, not "
             f"text/event-stream; got: {content_type!r}"
         )
         error = raw.json()["error"]
-        assert isinstance(error["message"], str) and error["message"]
-        assert isinstance(error["type"], str) and error["type"]
-        assert "resp_missing_sdk_integration" in error["message"]
+        assert isinstance(error["message"], str) and error["message"], "error envelope must carry a non-empty message string"
+        assert isinstance(error["type"], str) and error["type"], "error envelope must carry a non-empty type string"
+        assert "resp_missing_sdk_integration" in error["message"], "error message must name the missing previous_response_id"
 
     def test_malformed_request_has_sdk_compatible_error(self, openai_client):
         response = httpx.post(
@@ -2113,12 +2847,12 @@ class TestOpenAIResponsesVLLM:
             json={},
             timeout=10,
         )
-        assert response.status_code == 400
+        assert response.status_code == 400, "malformed request must return 400"
         error = response.json()["error"]
-        assert isinstance(error["message"], str)
-        assert error["message"]
-        assert isinstance(error["type"], str)
-        assert error["type"]
+        assert isinstance(error["message"], str), "error envelope message must be a string"
+        assert error["message"], "error envelope message must be non-empty"
+        assert isinstance(error["type"], str), "error envelope type must be a string"
+        assert error["type"], "error envelope type must be non-empty"
 
     def test_invalid_input_container_is_rejected(self, openai_client):
         with pytest.raises(BadRequestError) as exc_info:
@@ -2127,7 +2861,7 @@ class TestOpenAIResponsesVLLM:
                 input=["not-an-input-item"],
                 store=False,
             )
-        assert exc_info.value.status_code == 400
+        assert exc_info.value.status_code == 400, "invalid input item must return 400"
 
     @pytest.mark.critical_vllm
     @requires_real_inference
@@ -2203,6 +2937,435 @@ class TestOpenAIResponsesVLLM:
             f"request; got: {second.previous_response_id!r}"
         )
 
+    def test_leading_bom_preserves_first_data_only_stream_event(
+        self, witness_backend_client
+    ):
+        """A leading UTF-8 BOM must not hide the first data-only SSE event.
+
+        RFC 3629 Section 6 documents U+FEFF's UTF-8 BOM representation:
+        https://datatracker.ietf.org/doc/html/rfc3629#section-6
+        The requirement to strip one leading BOM while interpreting SSE comes
+        from the WHATWG HTML Standard Section 9.2.6:
+        https://html.spec.whatwg.org/multipage/server-sent-events.html#interpreting-an-event-stream
+        """
+        client, _ = witness_backend_client
+
+        events = list(
+            client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-LEADING-BOM-1546",
+                stream=True,
+                store=False,
+            )
+        )
+        event_types = [event.type for event in events]
+
+        assert event_types == ["response.created", "response.completed"], (
+            "the OpenAI client must receive the first data-only event after the "
+            f"proxy strips one leading UTF-8 BOM; got: {event_types}"
+        )
+
+    def test_streamed_conversation_append_and_follow_up(self, witness_backend_client):
+        """The shipped full-flow graph appends a streamed turn before completion.
+
+        The witness backend supplies deterministic native SSE. The same test
+        runs with SQLite locally and PostgreSQL when DATABASE_URL is set.
+        """
+        client, forwarded = witness_backend_client
+        conversation = client.conversations.create(metadata={"retained": "yes"})
+        try:
+            foreign_client = OpenAI(
+                base_url=client.base_url,
+                api_key="test",
+                default_headers={**TRUSTED_OWNER_HEADERS, "x-auth-user": "other-user"},
+                max_retries=0,
+            )
+            try:
+                with pytest.raises(BadRequestError):
+                    foreign_client.responses.create(
+                        model="sdk-conversation-stream",
+                        input="foreign turn",
+                        conversation=conversation.id,
+                        stream=True,
+                    )
+            finally:
+                foreign_client.close()
+
+            events = list(
+                client.responses.create(
+                    model="sdk-conversation-stream",
+                    input="STREAM-FIRST-410",
+                    conversation=conversation.id,
+                    stream=True,
+                    store=True,
+                )
+            )
+            completed = [event for event in events if event.type == "response.completed"]
+            assert len(completed) == 1
+            first = completed[0].response
+            assert first.status == "completed"
+            assert client.responses.retrieve(first.id).output == first.output
+
+            items = client.conversations.items.list(conversation.id, order="asc")
+            assert [item.role for item in items.data if item.type == "message"] == [
+                "user",
+                "assistant",
+            ]
+            assert len(items.data) == 2
+            assert "STREAM-FIRST-410" in json.dumps(
+                [item.model_dump() for item in items.data], default=str
+            )
+            retrieved_conversation = client.conversations.retrieve(conversation.id)
+            assert retrieved_conversation.metadata == {"retained": "yes"}
+            assert retrieved_conversation.created_at == conversation.created_at
+
+            before_follow_up = len(forwarded)
+            second = client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-SECOND-410",
+                conversation=conversation.id,
+                store=True,
+            )
+            assert second.status == "completed"
+            assert len(forwarded) == before_follow_up + 1
+            replay = json.dumps(forwarded[-1]["input"])
+            assert "STREAM-FIRST-410" in replay
+            assert "SDK streamed turn" in replay
+            assert "STREAM-SECOND-410" in replay
+
+            items = client.conversations.items.list(conversation.id, order="asc")
+            assert [item.role for item in items.data if item.type == "message"] == [
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+            ]
+
+            unstored = list(
+                client.responses.create(
+                    model="sdk-conversation-stream",
+                    input="STREAM-UNSTORED-410",
+                    conversation=conversation.id,
+                    stream=True,
+                    store=False,
+                )
+            )
+            unstored_completed = [event for event in unstored if event.type == "response.completed"]
+            assert len(unstored_completed) == 1
+            with pytest.raises(NotFoundError):
+                client.responses.retrieve(unstored_completed[0].response.id)
+            items = client.conversations.items.list(conversation.id, order="asc")
+            assert [item.role for item in items.data if item.type == "message"] == [
+                "user", "assistant", "user", "assistant", "user", "assistant"
+            ]
+
+            # Hold both backend completions until both requests have read the
+            # same Conversation snapshot. Their inserts must then allocate
+            # distinct positions atomically instead of overwriting one turn.
+            ResponsesWitnessHandler.concurrent_barrier = threading.Barrier(2)
+
+            def concurrent_turn(marker):
+                worker = OpenAI(
+                    base_url=client.base_url,
+                    api_key="test",
+                    default_headers=TRUSTED_OWNER_HEADERS,
+                    max_retries=0,
+                    timeout=30,
+                )
+                try:
+                    events = list(
+                        worker.responses.create(
+                            model="sdk-conversation-stream",
+                            input=f"STREAM-CONCURRENT-410-{marker}",
+                            conversation=conversation.id,
+                            stream=True,
+                            store=True,
+                        )
+                    )
+                    completed = [
+                        event for event in events if event.type == "response.completed"
+                    ]
+                    assert len(completed) == 1
+                    return completed[0].response.id
+                finally:
+                    worker.close()
+
+            try:
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    ids = list(executor.map(concurrent_turn, ("A", "B")))
+            finally:
+                ResponsesWitnessHandler.concurrent_barrier = None
+            assert len(set(ids)) == 2
+            items = client.conversations.items.list(
+                conversation.id, order="asc", limit=20
+            )
+            assert len(items.data) == 10
+            payload = json.dumps([item.model_dump() for item in items.data], default=str)
+            assert "STREAM-CONCURRENT-410-A" in payload
+            assert "STREAM-CONCURRENT-410-B" in payload
+        finally:
+            client.conversations.delete(conversation.id)
+
+    def test_streamed_hosted_tool_appends_once_and_rehydrates(self, witness_tool_client):
+        """A real IRR search round appends one canonical tool item and replays its turn."""
+        client, forwarded = witness_tool_client
+        conversation = client.conversations.create()
+        searches_before = BraveSearchHandler.request_count
+        with NemoGuardrailsHandler.lock:
+            nemo_before = NemoGuardrailsHandler.request_count
+        try:
+            events = list(
+                client.responses.create(
+                    model="sdk-conversation-tool-stream",
+                    input="STREAM-TOOL-410",
+                    conversation=conversation.id,
+                    stream=True,
+                    store=True,
+                    tools=[{"type": "web_search"}],
+                    max_tool_calls=1,
+                    extra_headers={"x-user-brave-key": "controlled-test-only"},
+                )
+            )
+            completed = [event for event in events if event.type == "response.completed"]
+            assert len(completed) == 1
+            output = completed[0].response.output
+            assert [item.type for item in output] == ["web_search_call", "message"]
+            assert BraveSearchHandler.request_count == searches_before + 1
+            with NemoGuardrailsHandler.lock:
+                assert NemoGuardrailsHandler.request_count == nemo_before + 1
+                nemo_request = NemoGuardrailsHandler.requests[-1]
+            assert "Mock Search Result" in json.dumps(nemo_request["messages"]), (
+                "NeMo must inspect the hosted search result before model re-entry"
+            )
+            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
+            assert "Mock Search Result" in json.dumps(forwarded[1]["input"])
+
+            items = client.conversations.items.list(conversation.id, order="asc")
+            assert [item.type for item in items.data] == [
+                "message",
+                "web_search_call",
+                "message",
+            ]
+            assert items.data[0].role == "user"
+            assert items.data[2].role == "assistant"
+            assert items.data[1].id == output[0].id
+
+            follow_up = client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-TOOL-FOLLOW-UP-410",
+                conversation=conversation.id,
+                store=True,
+            )
+            assert follow_up.status == "completed"
+            replay = json.dumps(forwarded[-1]["input"])
+            assert "STREAM-TOOL-410" in replay
+            assert "SDK tool answer" in replay
+            items = client.conversations.items.list(conversation.id, order="asc")
+            assert [item.type for item in items.data] == [
+                "message",
+                "web_search_call",
+                "message",
+                "message",
+                "message",
+            ]
+        finally:
+            client.conversations.delete(conversation.id)
+
+    @qualification_profile("supporting")
+    @pytest.mark.parametrize("replay_limited", [False, True], ids=["default", "replay-limit"])
+    def test_failed_irr_stream_does_not_append_completed_upstream_snapshot(
+        self, request, replay_limited
+    ):
+        """An IRR error must not hydrate a model snapshot hidden from the client."""
+        fixture = (
+            "witness_replay_limited_tool_client" if replay_limited else "witness_tool_client"
+        )
+        client, forwarded = request.getfixturevalue(fixture)
+        conversation = client.conversations.create()
+        searches_before = BraveSearchHandler.request_count
+        try:
+            events = list(
+                client.responses.create(
+                    model="sdk-conversation-stream",
+                    input="STREAM-WEB-LIMIT-410",
+                    conversation=conversation.id,
+                    stream=True,
+                    store=True,
+                    tools=[{"type": "web_search"}],
+                    extra_headers={"x-user-brave-key": "controlled-test-only"},
+                )
+            )
+            assert any(event.type == "error" for event in events)
+            assert not any(event.type == "response.completed" for event in events)
+            assert BraveSearchHandler.request_count == searches_before
+            assert len(forwarded) == 1
+            assert client.conversations.items.list(conversation.id).data == []
+            with pytest.raises(NotFoundError):
+                client.responses.retrieve(events[0].response.id)
+
+            follow_up = client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-WEB-LIMIT-FOLLOW-UP-410",
+                conversation=conversation.id,
+                store=True,
+            )
+            assert follow_up.status == "completed"
+            replay = json.dumps(forwarded[-1]["input"])
+            assert "STREAM-WEB-LIMIT-410" not in replay
+            assert "STREAM-WEB-LIMIT-FOLLOW-UP-410" in replay
+            assert "web_search_call" not in replay
+        finally:
+            client.conversations.delete(conversation.id)
+
+    @pytest.mark.parametrize("client_close_pause", [0.75, 1.5])
+    def test_streamed_client_close_can_commit_completed_turn(
+        self, witness_backend_client, client_close_pause
+    ):
+        """An unobserved close may commit a terminal the SDK never consumed."""
+        client, forwarded = witness_backend_client
+        conversation = client.conversations.create()
+        gate = threading.Event()
+        ResponsesWitnessHandler.terminal_gate = gate
+        try:
+            stream = client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-DISCONNECT-410",
+                conversation=conversation.id,
+                stream=True,
+                store=True,
+            )
+            first = next(iter(stream))
+            assert first.type == "response.created"
+            stream.close()
+            time.sleep(client_close_pause)
+            gate.set()
+
+            deadline = time.monotonic() + 5
+            while True:
+                items = client.conversations.items.list(conversation.id, order="asc")
+                if len(items.data) == 2 or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.1)
+            assert [item.role for item in items.data] == ["user", "assistant"]
+            assert client.responses.retrieve(first.response.id).status == "completed"
+            follow_up = client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-DISCONNECT-FOLLOW-UP-410",
+                conversation=conversation.id,
+                store=True,
+            )
+            assert follow_up.status == "completed"
+            replay = json.dumps(forwarded[-1]["input"])
+            assert "STREAM-DISCONNECT-410" in replay
+            assert "SDK streamed turn" in replay
+        finally:
+            gate.set()
+            ResponsesWitnessHandler.terminal_gate = None
+            client.conversations.delete(conversation.id)
+
+    def test_streamed_append_failure_withholds_committed_terminal(
+        self, witness_backend_client
+    ):
+        """An append failure after early SSE delivery must abort before completion."""
+        client, _ = witness_backend_client
+        conversation = client.conversations.create()
+        gate = threading.Event()
+        ResponsesWitnessHandler.terminal_gate = gate
+        stream = None
+        try:
+            stream = client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-DELETE-410",
+                conversation=conversation.id,
+                stream=True,
+                store=True,
+            )
+            first = next(iter(stream))
+            assert first.type == "response.created"
+            client.conversations.delete(conversation.id)
+            gate.set()
+
+            observed = []
+            try:
+                for event in stream:
+                    observed.append(event)
+            except (APIConnectionError, httpx.RemoteProtocolError, httpx.ReadError):
+                pass
+            assert not any(event.type == "response.completed" for event in observed)
+            assert client.responses.retrieve(first.response.id).status == "completed"
+        finally:
+            gate.set()
+            ResponsesWitnessHandler.terminal_gate = None
+            if stream is not None:
+                stream.close()
+
+    def test_streamed_local_completion_append_failure_withholds_terminal(
+        self, witness_backend_tool_client
+    ):
+        """A request-side tool-limit completion must append before its SSE terminal."""
+        client, _ = witness_backend_tool_client
+        conversation = client.conversations.create()
+        gate = threading.Event()
+        ResponsesWitnessHandler.terminal_gate = gate
+        stream = None
+        try:
+            stream = client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-LOCAL-DELETE-410",
+                conversation=conversation.id,
+                stream=True,
+                store=True,
+                tools=[{"type": "web_search"}],
+                max_tool_calls=0,
+                extra_headers={"x-user-brave-key": "controlled-test-only"},
+            )
+            first = next(iter(stream))
+            assert first.type == "response.created"
+            client.conversations.delete(conversation.id)
+            gate.set()
+
+            observed = []
+            try:
+                for event in stream:
+                    observed.append(event)
+            except (APIConnectionError, httpx.RemoteProtocolError, httpx.ReadError):
+                pass
+            assert not any(event.type == "response.completed" for event in observed)
+            assert client.responses.retrieve(first.response.id).status == "completed"
+        finally:
+            gate.set()
+            ResponsesWitnessHandler.terminal_gate = None
+            if stream is not None:
+                stream.close()
+
+    def test_sdk_replays_provider_compaction_on_previous_response_id(
+        self, provider_compaction_client
+    ):
+        """Native provider compaction survives SDK-driven local rehydration."""
+        client, forwarded = provider_compaction_client
+        first = client.responses.create(
+            model=VLLM_MODEL,
+            input="Start the provider-compaction conversation.",
+            store=True,
+        )
+        second = client.responses.create(
+            model=VLLM_MODEL,
+            input="Continue after provider compaction.",
+            previous_response_id=first.id,
+            store=True,
+        )
+
+        assert second.status == "completed"
+        assert len(forwarded) == 2, forwarded
+        replayed = forwarded[1]
+        assert replayed.get("previous_response_id") is None, replayed
+        assert any(
+            item.get("type") == "compaction"
+            and item.get("id") == "cmp_provider_sdk"
+            and item.get("encrypted_content") == "provider-opaque-state"
+            for item in replayed.get("input", [])
+        ), replayed
+
     def test_truncation_forwarded_to_backend_through_rehydration(
         self, witness_backend_client
     ):
@@ -2263,6 +3426,199 @@ class TestOpenAIResponsesVLLM:
         # into `input` instead.
         assert second_backend.get("previous_response_id") is None, second_backend
         assert isinstance(second_backend.get("input"), list), second_backend
+
+    def test_complete_conversation_history_replayed_after_delete_and_append(
+        self, witness_backend_client
+    ):
+        """#532: native replay includes every surviving item, not one API page."""
+        client, forwarded = witness_backend_client
+        conversation = client.conversations.create()
+        try:
+            # PostgreSQL SDK lanes share tables, and deleting a conversation
+            # deliberately retains its item rows. Scope IDs to this conversation.
+            expected = []
+            for batch in range(6):
+                items = [
+                    {
+                        "id": f"item_replay_{conversation.id}_{batch}_{index}",
+                        "type": "message",
+                        "role": "user",
+                        "content": f"HISTORY-{batch}-{index}",
+                    }
+                    for index in range(20)
+                ]
+                client.conversations.items.create(conversation.id, items=items)
+                expected.extend(items)
+            for item in [expected[0], expected[19], expected[-1]]:
+                client.conversations.items.delete(
+                    item["id"], conversation_id=conversation.id
+                )
+                expected.remove(item)
+            appended = {
+                "id": f"item_replay_{conversation.id}_appended",
+                "type": "message",
+                "role": "user",
+                "content": "HISTORY-APPENDED",
+            }
+            client.conversations.items.create(conversation.id, items=[appended])
+            expected.append(appended)
+
+            before = len(forwarded)
+            # The replayed prompt is ~1.2k tokens. The CI inference simulator
+            # runs in echo mode and rejects max_output_tokens below the prompt
+            # length, so a small budget fails before the replay is observable.
+            # A real backend stops at the end of the reply regardless.
+            current_input = 'Reply OK. café "quoted". /no_think'
+            response = client.responses.create(
+                model=VLLM_MODEL,
+                conversation=conversation.id,
+                input=current_input,
+                store=True,
+                max_output_tokens=2048,
+            )
+            assert response.status == "completed"
+            requests = forwarded[before:]
+            assert len(requests) == 1, requests
+            replay = requests[0]["input"]
+            texts = []
+            for item in replay:
+                content = item.get("content", [])
+                if isinstance(content, str):
+                    texts.append(content)
+                else:
+                    texts.extend(
+                        part["text"]
+                        for part in content
+                        if part.get("type") in {"input_text", "output_text"}
+                    )
+            assert texts == [item["content"] for item in expected] + [current_input], (
+                "replay must preserve history order and include current input exactly once"
+            )
+
+            before = len(forwarded)
+            next_input = "Reply OK again. /no_think"
+            continuation = client.responses.create(
+                model=VLLM_MODEL,
+                conversation=conversation.id,
+                input=next_input,
+                store=True,
+                # Echo mode also replays the first response on this turn.
+                max_output_tokens=4096 if VLLM_TEST_BACKEND == "simulator" else 2048,
+            )
+            assert continuation.status == "completed"
+            requests = forwarded[before:]
+            assert len(requests) == 1, requests
+            user_texts = []
+            for item in requests[0]["input"]:
+                if item.get("role") != "user":
+                    continue
+                content = item.get("content", [])
+                if isinstance(content, str):
+                    user_texts.append(content)
+                else:
+                    user_texts.extend(
+                        part["text"]
+                        for part in content
+                        if part.get("type") == "input_text"
+                    )
+            assert user_texts == [item["content"] for item in expected] + [
+                current_input, next_input
+            ], "selected-upstream replay must not duplicate history or current input"
+        finally:
+            client.conversations.delete(conversation.id)
+
+    @pytest.mark.critical_vllm
+    @requires_vllm_compat
+    @pytest.mark.parametrize("truncation", ["auto", "disabled"])
+    def test_over_context_conversation_history_truncation(
+        self, witness_backend_client, truncation
+    ):
+        """#532: native vLLM, not Praxis, applies the requested context policy."""
+        client, forwarded = witness_backend_client
+        # vLLM publishes the actual configured limit, which may differ from the
+        # model's advertised maximum or the GPU runner's launch defaults.
+        with httpx.Client(timeout=10) as backend:
+            models = backend.get(f"{VLLM_BASE_URL.rstrip('/')}/v1/models")
+            models.raise_for_status()
+        model = next(
+            item for item in models.json()["data"] if item["id"] == VLLM_MODEL
+        )
+        context_limit = model.get("max_model_len")
+        assert isinstance(context_limit, int) and context_limit > 0, model
+        oversized_history = "obsolete " * (context_limit * 2)
+        conversation = client.conversations.create(
+            items=[
+                {"type": "message", "role": "user", "content": oversized_history},
+                {"type": "message", "role": "user", "content": "Reply OK. /no_think"},
+            ]
+        )
+        try:
+            before = len(forwarded)
+            options = {
+                "model": VLLM_MODEL,
+                "conversation": conversation.id,
+                "input": "Reply OK. /no_think",
+                "truncation": truncation,
+                "max_output_tokens": 32,
+                "store": True,
+            }
+            if truncation == "disabled":
+                with pytest.raises(BadRequestError) as error:
+                    client.responses.create(**options)
+                assert error.value.status_code == 400
+                message = str(error.value).lower()
+                assert "context" in message or "token" in message, message
+            else:
+                # vLLM — not Praxis — owns the context policy here. With `auto`
+                # it truncates the forwarded over-context history to fit the
+                # window; the full ~context-length prefill runs on CPU and can
+                # take minutes on a slow runner. Give the client a timeout that
+                # outlasts every backend deadline (the witness shim's upstream
+                # read, and the IRR step/total budgets) so it always receives an
+                # HTTP verdict instead of raising an uncatchable client-side
+                # timeout. The small CPU model's native truncation lands right on
+                # the context boundary (it does not reserve room for
+                # max_output_tokens), so it nondeterministically either completes
+                # or rejects the already-forwarded prompt: a clean 400 when it
+                # validates up front, a bare 502 when it raises post-prefill and
+                # drops the connection, or a 504 when the prefill outruns an IRR
+                # deadline. All are legitimate backend outcomes; #532 only
+                # requires Praxis to forward the complete history, which the
+                # assertions below verify regardless of the backend's verdict.
+                try:
+                    response = client.with_options(timeout=720).responses.create(
+                        **options
+                    )
+                    assert response.status in {"completed", "incomplete"}
+                    assert response.output, response
+                    if response.status == "completed":
+                        # A successful managed turn must append only its new
+                        # input/output items. Existing over-context history is
+                        # admitted during rehydration and not recharged during
+                        # this append-back.
+                        items = client.conversations.items.list(
+                            conversation.id, order="asc"
+                        ).data
+                        assert len(items) > 2, items
+                        assert any(
+                            item.type == "message" and item.role == "assistant"
+                            for item in items[2:]
+                        ), items
+                except APIStatusError as exc:
+                    assert exc.status_code in {400, 502, 504}, exc
+
+            requests = forwarded[before:]
+            assert len(requests) == 1, requests
+            request = requests[0]
+            assert request["truncation"] == truncation
+            content = request["input"][0]["content"]
+            history_text = content if isinstance(content, str) else content[0]["text"]
+            assert history_text == oversized_history, (
+                "the gateway must forward complete history even beyond the backend context limit"
+            )
+            assert len(request["input"]) == 3
+        finally:
+            client.conversations.delete(conversation.id)
 
     @requires_real_inference
     def test_conversation_context_and_append_back(self, openai_client):
@@ -2364,6 +3720,40 @@ class TestOpenAIResponsesVLLM:
         finally:
             openai_client.conversations.delete(conversation.id)
 
+    def test_streaming_conversation_append_back_with_store_false(self, openai_client):
+        """The SDK observes a completed SSE turn and its local Conversation items."""
+        conversation = openai_client.conversations.create()
+        try:
+            events = _collect_stream(
+                openai_client.responses.create(
+                    model=VLLM_MODEL,
+                    input=[{"role": "user", "content": "Reply with a short greeting. /no_think"}],
+                    conversation=conversation.id,
+                    stream=True,
+                    store=False,
+                    temperature=0,
+                    max_output_tokens=2048,
+                )
+            )
+            completed = [
+                event.response
+                for event in events
+                if event.type == "response.completed"
+            ]
+            assert len(completed) == 1, [event.type for event in events]
+            assert completed[0].status == "completed"
+            assert completed[0].output_text
+
+            items = openai_client.conversations.items.list(conversation.id, order="asc")
+            messages = [item for item in items.data if item.type == "message"]
+            assert [item.role for item in messages] == ["user", "assistant"]
+            assert "short greeting" in messages[0].content[0].text
+            assert messages[1].content[0].text == completed[0].output_text, (
+                "the appended assistant item must match the streamed terminal output"
+            )
+        finally:
+            openai_client.conversations.delete(conversation.id)
+
     def test_nonexistent_conversation_is_rejected(self, openai_client):
         with pytest.raises(BadRequestError) as exc_info:
             openai_client.responses.create(
@@ -2372,8 +3762,8 @@ class TestOpenAIResponsesVLLM:
                 conversation="conv_00000000000000000000000000000000",
                 store=True,
             )
-        assert exc_info.value.status_code == 400
-        assert "conv_00000000000000000000000000000000" in str(exc_info.value)
+        assert exc_info.value.status_code == 400, "unknown conversation must return 400"
+        assert "conv_00000000000000000000000000000000" in str(exc_info.value), "error must name the missing conversation id"
 
     def test_streaming_rehydrated_response_echoes_previous_response_id(
         self, openai_client
@@ -2479,6 +3869,163 @@ class TestOpenAIResponsesVLLM:
             f"got: {retrieved.previous_response_id!r}"
         )
 
+    def test_streaming_replay_returns_stored_events_in_order(self, openai_client):
+        """Local Responses SSE replay: ``GET /v1/responses/{id}?stream=true`` on a
+        completed response created with ``stream=true`` replays the exact stored
+        event log -- the same normalized events, in original sequence order,
+        terminating in the same terminal event -- without reconstructing deltas.
+
+        Metadata-only and provider-neutral: asserts the ``(type,
+        sequence_number)`` sequence and terminal identity, not model text, so it
+        stays deterministic on the simulator or a real backend.
+        """
+        live_events = _collect_stream(
+            openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="Say exactly: REPLAY-OK /no_think",
+                store=True,
+                stream=True,
+                max_output_tokens=128,
+            )
+        )
+        terminal = _assert_stream_contract(live_events, require_usage=False)
+        response_id = terminal.id
+        live_seq = [(event.type, event.sequence_number) for event in live_events]
+
+        # The record and its event log persist as the proxy finishes the body.
+        _retrieve_with_retry(openai_client, response_id)
+
+        replay_events = _collect_replay_with_retry(openai_client, response_id)
+        replay_seq = [(event.type, event.sequence_number) for event in replay_events]
+
+        # Replay serves the identical normalized events the client observed live,
+        # in the same order -- not a reconstruction.
+        assert replay_seq == live_seq, (replay_seq, live_seq)
+        assert replay_events[0].type == "response.created", replay_seq
+        assert replay_events[-1].type in TERMINAL_RESPONSE_EVENTS, replay_seq
+        assert replay_events[-1].response.id == response_id
+        numbers = [event.sequence_number for event in replay_events]
+        assert numbers == sorted(numbers), numbers
+
+    def test_streaming_replay_starting_after_skips_earlier_events(
+        self, openai_client
+    ):
+        """``starting_after=N`` replays only events whose ``sequence_number > N``,
+        while still delivering the terminal event."""
+        live_events = _collect_stream(
+            openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="Say exactly: REPLAY-CURSOR /no_think",
+                store=True,
+                stream=True,
+                max_output_tokens=128,
+            )
+        )
+        response_id = _assert_stream_contract(live_events, require_usage=False).id
+        _retrieve_with_retry(openai_client, response_id)
+
+        full = _collect_replay_with_retry(openai_client, response_id)
+        assert len(full) >= 2, [event.type for event in full]
+
+        cursor = full[0].sequence_number
+        after = _collect_replay_with_retry(
+            openai_client, response_id, starting_after=cursor
+        )
+
+        assert after, "replay after the first event must still return events"
+        assert all(event.sequence_number > cursor for event in after), [
+            event.sequence_number for event in after
+        ]
+        assert [event.sequence_number for event in after] == [
+            event.sequence_number for event in full if event.sequence_number > cursor
+        ]
+        # The terminal event always survives the cursor so a resumed reader still
+        # observes completion.
+        assert after[-1].type in TERMINAL_RESPONSE_EVENTS, [
+            event.type for event in after
+        ]
+
+    def test_streaming_replay_requires_a_stored_event_log(self, openai_client):
+        """A response created without ``stream=true`` has no replay log; replaying
+        it returns a 400 ``invalid_request_error`` -- never a 404 and never a
+        fabricated stream reconstructed from the stored JSON."""
+        buffered = openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say exactly: NO-REPLAY /no_think",
+            store=True,
+            stream=False,
+            max_output_tokens=128,
+        )
+        _retrieve_with_retry(openai_client, buffered.id)
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.responses.retrieve(buffered.id, stream=True)
+        assert exc_info.value.status_code == 400, "replaying a non-streamed response must return 400"
+        assert "replayable" in str(exc_info.value).lower(), str(exc_info.value)
+
+    def test_streaming_replay_starting_after_requires_stream(self, openai_client):
+        """``starting_after`` without ``stream=true`` is rejected with a 400 rather
+        than silently returning the plain JSON record."""
+        live_events = _collect_stream(
+            openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="Say exactly: CURSOR-NEEDS-STREAM /no_think",
+                store=True,
+                stream=True,
+                max_output_tokens=128,
+            )
+        )
+        response_id = _assert_stream_contract(live_events, require_usage=False).id
+        _retrieve_with_retry(openai_client, response_id)
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.responses.retrieve(response_id, starting_after=0)
+        assert exc_info.value.status_code == 400, "starting_after without stream must return 400"
+
+    def test_streaming_replay_is_owner_scoped(
+        self, openai_client, other_owner_openai_client
+    ):
+        """Replay honors ownership: another owner in the same tenant gets a 404,
+        never another owner's stored events, while the owner still replays."""
+        live_events = _collect_stream(
+            openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="Say exactly: REPLAY-PRIVATE /no_think",
+                store=True,
+                stream=True,
+                max_output_tokens=128,
+            )
+        )
+        response_id = _assert_stream_contract(live_events, require_usage=False).id
+        _retrieve_with_retry(openai_client, response_id)
+
+        with pytest.raises(NotFoundError):
+            other_owner_openai_client.responses.retrieve(response_id, stream=True)
+
+        owner_events = _collect_replay_with_retry(openai_client, response_id)
+        assert owner_events[-1].type in TERMINAL_RESPONSE_EVENTS
+
+    def test_streaming_replay_removed_on_delete(self, openai_client):
+        """Deleting a response removes its replay log: a subsequent replay returns
+        404, matching the plain JSON record's lifecycle."""
+        live_events = _collect_stream(
+            openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="Say exactly: REPLAY-DELETE /no_think",
+                store=True,
+                stream=True,
+                max_output_tokens=128,
+            )
+        )
+        response_id = _assert_stream_contract(live_events, require_usage=False).id
+        _retrieve_with_retry(openai_client, response_id)
+
+        assert _collect_replay_with_retry(openai_client, response_id)
+        assert openai_client.responses.delete(response_id) is None
+
+        with pytest.raises(NotFoundError):
+            openai_client.responses.retrieve(response_id, stream=True)
+
     @pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streaming"])
     def test_conflicting_history_selectors_error_shape(self, openai_client, stream):
         with pytest.raises(BadRequestError) as exc_info:
@@ -2491,7 +4038,7 @@ class TestOpenAIResponsesVLLM:
             )
 
         error = exc_info.value
-        assert error.status_code == 400
+        assert error.status_code == 400, "conflicting history selectors must return 400"
         assert error.body == {
             "code": "mutually_exclusive_parameters",
             "message": (
@@ -2500,7 +4047,7 @@ class TestOpenAIResponsesVLLM:
             ),
             "param": None,
             "type": "invalid_request_error",
-        }
+        }, "error envelope must report mutually_exclusive_parameters"
 
     def test_background_mode_is_rejected_before_inference(self, openai_client):
         with pytest.raises(BadRequestError) as exc_info:
@@ -2511,13 +4058,121 @@ class TestOpenAIResponsesVLLM:
             )
 
         error = exc_info.value
-        assert error.status_code == 400
+        assert error.status_code == 400, "background mode must return 400"
         assert error.body == {
             "code": "invalid_request_error",
             "message": "background mode is not supported",
             "param": None,
             "type": "invalid_request_error",
+        }, "error envelope must report background mode is unsupported"
+
+    def test_openai_bound_background_create_and_stream(self, witness_backend_client):
+        """The stock full-flow pipeline preserves OpenAI-owned background creates."""
+        client, forwarded = witness_backend_client
+
+        queued = client.responses.create(
+            model="gpt-5",
+            input="SDK finite background passthrough",
+            background=True,
+            store=True,
+        )
+        assert queued.status == "queued"
+        assert queued.background is True
+
+        stream = client.responses.create(
+            model="gpt-5",
+            input="SDK streaming background passthrough",
+            background=True,
+            store=True,
+            stream=True,
+        )
+        events = list(stream)
+        assert [event.type for event in events] == [
+            "response.created",
+            "response.completed",
+        ]
+        streamed = events[-1].response
+        assert streamed.status == "completed"
+        assert streamed.background is True
+
+        background_creates = [
+            body
+            for body in forwarded
+            if body.get("background") is True and body.get("model") == "gpt-5"
+        ]
+        assert len(background_creates) == 2
+        assert [body.get("input") for body in background_creates] == [
+            "SDK finite background passthrough",
+            "SDK streaming background passthrough",
+        ]
+        assert all(body.get("store") is True for body in background_creates)
+        assert {body.get("stream", False) for body in background_creates} == {
+            False,
+            True,
         }
+
+    def test_prompt_template_policy_follows_provider_binding(
+        self, witness_backend_client
+    ):
+        """Managed routes reject prompt templates; OpenAI-owned routes preserve them."""
+        client, forwarded = witness_backend_client
+        prompt = {
+            "id": "pmpt_sdk_provider_policy",
+            "version": "2",
+            "variables": {"name": "Ada"},
+        }
+
+        with pytest.raises(BadRequestError) as exc_info:
+            client.responses.create(
+                model=VLLM_MODEL,
+                input="This managed request must not reach inference.",
+                prompt=prompt,
+                store=False,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400
+        assert error.body == {
+            "code": "invalid_request_error",
+            "message": (
+                "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)"
+            ),
+            "param": None,
+            "type": "invalid_request_error",
+        }
+
+        response = client.responses.create(
+            model="gpt-5",
+            input="Use the OpenAI-owned prompt template.",
+            prompt=prompt,
+            store=False,
+        )
+        assert response.status == "completed"
+
+        stream = client.responses.create(
+            model="gpt-5",
+            input="Stream the OpenAI-owned prompt template.",
+            prompt=prompt,
+            store=False,
+            stream=True,
+        )
+        events = list(stream)
+        assert [event.type for event in events] == [
+            "response.created",
+            "response.completed",
+        ]
+        assert events[-1].response.status == "completed"
+
+        prompt_creates = [
+            body for body in forwarded if body.get("prompt") is not None
+        ]
+        assert len(prompt_creates) == 2
+        assert {body.get("stream", False) for body in prompt_creates} == {
+            False,
+            True,
+        }
+        assert all(body["model"] == "gpt-5" for body in prompt_creates)
+        assert all(body["prompt"] == prompt for body in prompt_creates)
 
     @pytest.mark.critical_vllm
     @requires_real_inference
@@ -2781,9 +4436,9 @@ class TestOpenAIResponsesVLLM:
         assert response.incomplete_details is not None
         assert response.incomplete_details.reason == "max_output_tokens"
 
-    def test_streaming_through_irr(self, irr_streaming_client):
+    def test_streaming_through_irr(self, openai_client):
         """Stream a Responses request through a terminal IRR step."""
-        stream = irr_streaming_client.responses.create(
+        stream = openai_client.responses.create(
             model=VLLM_MODEL,
             input="Say exactly: STREAM-OK /no_think",
             temperature=0,
@@ -2803,41 +4458,162 @@ class TestOpenAIResponsesVLLM:
 class TestResponsesReasoningVLLM:
     """Reasoning-dialect translation exercised through the OpenAI SDK."""
 
-    def test_reasoning_summary_request_is_rejected(self, reasoning_client):
+    @pytest.mark.parametrize("preferred_field", [True, False], ids=["preferred", "legacy"])
+    def test_streaming_reasoning_sdk_events_and_stored_continuation(
+        self, reasoning_capture_client, preferred_field,
+    ):
+        """The SDK consumes raw reasoning events and persisted reasoning-only output."""
+        client, forwarded = reasoning_capture_client
+        ChatCaptureHandler.stream_deltas = [
+            {
+                "reasoning": "I picked " if preferred_field else "",
+                "reasoning_content": "ignored" if preferred_field else "I picked ",
+            },
+            {"reasoning_content": "42."},
+        ]
+        with client.responses.stream(model=CHAT_TRANSLATION_MODEL, input="Pick a number.", store=True) as stream:
+            events = list(stream)
+            final = stream.get_final_response()
+        deltas = [event for event in events if event.type == "response.reasoning_text.delta"]
+        assert "".join(event.delta for event in deltas) == "I picked 42."
+        assert all(event.content_index == 0 and event.output_index == 0 for event in deltas)
+        assert final.status == "completed"
+        assert len(final.output) == 1
+        item = final.output[0]
+        assert item.type == "reasoning" and item.summary == []
+        assert item.content[0].type == "reasoning_text"
+        assert item.content[0].text == "I picked 42."
+        assert all(event.item_id == item.id for event in deltas)
+        done = next(event for event in events if event.type == "response.reasoning_text.done")
+        assert done.text == item.content[0].text
+        stored = client.responses.retrieve(final.id)
+        assert stored.output[0].model_dump() == item.model_dump()
+        client.responses.create(model=CHAT_TRANSLATION_MODEL, previous_response_id=final.id, input="Which number?", store=False)
+        assert forwarded[-1]["messages"][1] == {
+            "role": "assistant", "content": None, "reasoning": "I picked 42.",
+        }
+
+    @pytest.mark.parametrize("with_tool_call", [False, True], ids=["answer", "answer-then-tool"])
+    def test_late_reasoning_stays_with_its_stored_assistant_turn(
+        self, reasoning_capture_client, with_tool_call,
+    ):
+        client, forwarded = reasoning_capture_client
+        ChatCaptureHandler.stream_deltas = [{"content": "Earlier answer."}]
+        with client.responses.stream(model=CHAT_TRANSLATION_MODEL, input="First turn.", store=True) as stream:
+            list(stream)
+            first = stream.get_final_response()
+        ChatCaptureHandler.stream_deltas = [{"content": "Done."}, {"reasoning": "I picked 42."}]
+        if with_tool_call:
+            ChatCaptureHandler.stream_deltas.append({"tool_calls": [{
+                "index": 0, "id": "call_lookup", "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }]})
+        with client.responses.stream(
+            model=CHAT_TRANSLATION_MODEL, previous_response_id=first.id, input="Pick a number.", store=True,
+        ) as stream:
+            list(stream)
+            second = stream.get_final_response()
+        expected_types = ["message", "reasoning"] + (["function_call"] if with_tool_call else [])
+        assert [item.type for item in second.output] == expected_types
+        stored = client.responses.retrieve(second.id)
+        # The stream helper adds SDK-only `parsed=None` to text content.
+        assert [item.model_dump(exclude_none=True) for item in stored.output] == [
+            item.model_dump(exclude_none=True) for item in second.output
+        ]
+        continuation = [{"role": "user", "content": "Which number?"}]
+        if with_tool_call:
+            continuation.insert(0, {"type": "function_call_output", "call_id": "call_lookup", "output": "42"})
+        client.responses.create(
+            model=CHAT_TRANSLATION_MODEL, previous_response_id=second.id, input=continuation, store=False,
+        )
+        messages = forwarded[-1]["messages"]
+        assert messages[1] == {"role": "assistant", "content": "Earlier answer."}
+        assert messages[3] == {"role": "assistant", "content": "Done.", "reasoning": "I picked 42."}
+        if with_tool_call:
+            assert messages[4]["tool_calls"][0]["id"] == "call_lookup"
+            assert "reasoning" not in messages[4]
+            assert messages[5]["role"] == "tool"
+        assert messages[-1] == {"role": "user", "content": "Which number?"}
+        # Rehydrating the reordered history must preserve the service's stored
+        # client-facing output, including its original streamed item order.
+        assert client.responses.retrieve(second.id).output == stored.output
+
+    @pytest.mark.parametrize("bad_delta", [
+        {"reasoning": {"invalid": "provider-private-data"}},
+        {"reasoning": "x" * 65536},
+    ], ids=["malformed", "over-budget"])
+    def test_streaming_reasoning_failure_has_no_completed_items(self, reasoning_capture_client, bad_delta):
+        client, _ = reasoning_capture_client
+        ChatCaptureHandler.stream_deltas = [{"reasoning": "valid prefix"}, bad_delta]
+        events = list(client.responses.create(
+            model=CHAT_TRANSLATION_MODEL, input="Think.", stream=True, store=False,
+        ))
+        assert events[-1].type == "response.failed"
+        assert events[-1].response.output == []
+        assert not any(event.type == "response.output_item.done" for event in events)
+        assert not any(event.type == "response.reasoning_text.done" for event in events)
+        assert "provider-private-data" not in events[-1].model_dump_json()
+        deltas = [event.delta for event in events if event.type == "response.reasoning_text.delta"]
+        assert deltas == ["valid prefix"]
+
+    @requires_real_inference
+    def test_live_streaming_reasoning_translation(self, reasoning_client):
+        """Exercise the dialect against the configured live vLLM endpoint."""
+        with reasoning_client.responses.stream(
+            model=CHAT_TRANSLATION_MODEL, input="What is 17 times 23? Think before answering.",
+            max_output_tokens=1024, store=True,
+        ) as stream:
+            events = list(stream)
+        terminal_event = events[-1]
+        assert terminal_event.type in {"response.completed", "response.incomplete"}, terminal_event.type
+        final = terminal_event.response
+        assert final.status in {"completed", "incomplete"}
+        deltas = [event for event in events if event.type == "response.reasoning_text.delta"]
+        assert deltas, "the configured reasoning model must emit raw reasoning"
+        item = next(item for item in final.output if item.type == "reasoning")
+        assert item.summary == []
+        assert item.content[0].text == "".join(event.delta for event in deltas)
+        assert all(event.item_id == item.id for event in deltas)
+        stored = reasoning_client.responses.retrieve(final.id)
+        assert stored.output[0].model_dump() == final.output[0].model_dump()
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_reasoning_summary_request_is_rejected(self, reasoning_client, streaming):
         """vLLM has no safe-summary contract, so a summary request is a 400."""
         with pytest.raises(BadRequestError) as exc_info:
             reasoning_client.responses.create(
-                model=VLLM_MODEL,
+                model=CHAT_TRANSLATION_MODEL,
                 input="What is 2+2?",
                 reasoning={"summary": "auto"},
+                stream=streaming,
                 store=False,
                 max_output_tokens=64,
             )
-        assert exc_info.value.status_code == 400
+        assert exc_info.value.status_code == 400, "reasoning summary request must return 400"
 
     def test_non_object_reasoning_is_rejected(self, reasoning_client):
         """A proxy-owned `reasoning` field that is neither object nor null is a 400."""
         response = httpx.post(
             f"{str(reasoning_client.base_url).rstrip('/')}/responses",
-            headers={"Authorization": "Bearer test"},
+            headers={"Authorization": "Bearer test", **TRUSTED_OWNER_HEADERS},
             json={
-                "model": VLLM_MODEL,
+                "model": CHAT_TRANSLATION_MODEL,
                 "input": "What is 2+2?",
                 "reasoning": True,
                 "store": False,
             },
             timeout=30,
         )
-        assert response.status_code == 400
+        assert response.status_code == 400, "non-object reasoning must return 400"
         error = response.json()["error"]
-        assert error["type"] == "invalid_request_error"
+        assert error["type"] == "invalid_request_error", "error envelope type must be invalid_request_error"
 
     def test_reasoning_dialect_promotes_raw_reasoning_to_an_item(
         self, reasoning_client,
     ):
         """A thinking response yields a reasoning item, never a leaked summary."""
         response = reasoning_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input="What is 2+2? Think briefly, then answer.",
             reasoning={"effort": "low"},
             temperature=0,
@@ -2864,7 +4640,7 @@ class TestResponsesReasoningVLLM:
             assert item.content[0].text
 
         continuation = reasoning_client.responses.create(
-            model=VLLM_MODEL, previous_response_id=response.id,
+            model=CHAT_TRANSLATION_MODEL, previous_response_id=response.id,
             input="Now give the answer briefly.",
             temperature=0, store=False, max_output_tokens=128,
         )
@@ -2879,7 +4655,7 @@ class TestResponsesReasoningVLLM:
 
         before = len(forwarded)
         response = client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input=[
                 {"role": "user", "content": "Pick a number and remember it."},
                 {
@@ -2924,12 +4700,12 @@ class TestResponsesReasoningVLLM:
     def test_reasoning_only_stored_continuation(self, reasoning_capture_client):
         client, forwarded = reasoning_capture_client
         first = client.responses.create(
-            model=VLLM_MODEL, input="Pick a number.", store=True, stream=False,
+            model=CHAT_TRANSLATION_MODEL, input="Pick a number.", store=True, stream=False,
         )
         assert len(first.output) == 1
         assert first.output[0].type == "reasoning"
         client.responses.create(
-            model=VLLM_MODEL, previous_response_id=first.id,
+            model=CHAT_TRANSLATION_MODEL, previous_response_id=first.id,
             input="Now answer.", store=False, stream=False,
         )
         assert len(forwarded) == 2
@@ -2938,6 +4714,29 @@ class TestResponsesReasoningVLLM:
             {"role": "assistant", "content": None, "reasoning": "I picked 42."},
             {"role": "user", "content": "Now answer."},
         ]
+
+    @pytest.mark.parametrize("reasoning_capture_client", ["agentic"], indirect=True)
+    @pytest.mark.parametrize("late", [False, True], ids=["reasoning-first", "reasoning-late"])
+    def test_agentic_stored_reasoning_is_replayed_once(self, reasoning_capture_client, late):
+        client, forwarded = reasoning_capture_client
+        thought = "x" * 40_000
+        deltas = [{"reasoning": thought}, {"content": "Answer"}]
+        ChatCaptureHandler.stream_deltas = list(reversed(deltas)) if late else deltas
+        with client.responses.stream(model=CHAT_TRANSLATION_MODEL, input="Question", store=True) as stream:
+            list(stream)
+            first = stream.get_final_response()
+        assert first.status == "completed"
+        # The client-facing output keeps its announced order.
+        stored = client.responses.retrieve(first.id)
+        assert [item.type for item in stored.output] == (
+            ["message", "reasoning"] if late else ["reasoning", "message"]
+        )
+        client.responses.create(
+            model=CHAT_TRANSLATION_MODEL, previous_response_id=first.id, input="Continue", store=False,
+        )
+        # The forwarded history carries the reasoning exactly once, attached to its answer.
+        assistants = [item for item in forwarded[-1]["messages"] if item["role"] == "assistant"]
+        assert assistants == [{"role": "assistant", "content": "Answer", "reasoning": thought}]
 
     @pytest.mark.parametrize("item", [
         {"type": "reasoning", "encrypted_content": "opaque", "summary": []},
@@ -2949,7 +4748,7 @@ class TestResponsesReasoningVLLM:
         client, forwarded = reasoning_capture_client
         with pytest.raises(BadRequestError, match="reasoning input item"):
             client.responses.create(
-                model=VLLM_MODEL,
+                model=CHAT_TRANSLATION_MODEL,
                 input=[item, {"role": "user", "content": "Continue."}],
                 store=False, stream=False,
             )
@@ -2966,7 +4765,7 @@ class TestResponsesReasoningVLLM:
         client, forwarded = reasoning_capture_client
         with pytest.raises(BadRequestError, match="a reasoning dialect must be configured"):
             client.responses.create(
-                model=VLLM_MODEL,
+                model=CHAT_TRANSLATION_MODEL,
                 input=[{
                     "type": "reasoning",
                     "content": [{"type": "reasoning_text", "text": "I picked 42."}],
@@ -2978,6 +4777,24 @@ class TestResponsesReasoningVLLM:
 
 class TestResponsesCompactionVLLM:
     """Live coverage for automatic context-management compaction."""
+
+    def test_prompt_template_is_rejected_by_combined_request_filter(
+        self, compact_client
+    ):
+        with pytest.raises(BadRequestError) as exc_info:
+            compact_client.responses.create(
+                model=VLLM_MODEL,
+                input="This prompt reference must not reach inference.",
+                prompt={"id": "pmpt_compact_rejected"},
+                store=False,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400
+        assert error.type == "invalid_request_error"
+        assert error.body["message"] == (
+            "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)"
+        )
 
     def test_invalid_compaction_threshold_is_rejected(self, compact_client):
         with pytest.raises(BadRequestError) as exc_info:
@@ -2992,8 +4809,112 @@ class TestResponsesCompactionVLLM:
                 ],
                 store=False,
             )
-        assert exc_info.value.status_code == 400
-        assert "compact_threshold" in str(exc_info.value)
+        assert exc_info.value.status_code == 400, "invalid compaction threshold must return 400"
+        assert "compact_threshold" in str(exc_info.value), "error must name the compact_threshold field"
+
+    def test_explicit_compact_rejects_malformed_input_content(self, compact_client):
+        """Issue #1403: a message item whose ``content`` is wrong-typed must fail
+        with 400 before any summarization callout, not be silently formatted into
+        empty text and compacted/stored anyway.
+
+        ``extra_body`` injects the malformed field verbatim so the request body
+        carries ``content: 123``, which the typed ``input`` parameter would not
+        let a caller express.
+        """
+        before = len(CompactionHandler.requests)
+        with pytest.raises(BadRequestError) as exc_info:
+            compact_client.responses.compact(
+                model=VLLM_MODEL,
+                extra_body={"input": [{"role": "user", "content": 123}]},
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "malformed content must return 400"
+        assert error.type == "invalid_request_error"
+        assert "content" in str(error), "error must name the offending field"
+        assert len(CompactionHandler.requests) == before, (
+            "a rejected malformed-content request must never reach the summarizer"
+        )
+
+    def test_explicit_compact_rejects_non_text_input_before_callout(self, compact_client):
+        """Issue #1252: compaction must not silently discard image content."""
+        before = len(CompactionHandler.requests)
+        with pytest.raises(BadRequestError) as exc_info:
+            compact_client.responses.compact(
+                model=VLLM_MODEL,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_image",
+                                "image_url": "data:image/png;base64,iVBORw0KGgo=",
+                                "detail": "auto",
+                            }
+                        ],
+                    }
+                ],
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "non-text compaction source must return 400"
+        assert error.type == "invalid_request_error", (
+            "non-text rejection must use invalid_request_error"
+        )
+        assert "non-text" in str(error), "error must explain the non-text rejection"
+        assert "input_image" in str(error), "error must name the offending input_image part"
+        assert len(CompactionHandler.requests) == before, (
+            "rejected non-text content must never reach the summarizer"
+        )
+
+    def test_explicit_compact_rejects_unrenderable_compaction_before_callout(
+        self, compact_client
+    ):
+        """Compaction must not discard opaque prior compaction state."""
+        before = len(CompactionHandler.requests)
+        with pytest.raises(BadRequestError) as exc_info:
+            compact_client.responses.compact(
+                model=VLLM_MODEL,
+                extra_body={
+                    "input": [
+                        {
+                            "type": "compaction",
+                            "encrypted_content": "provider-opaque-state",
+                        }
+                    ]
+                },
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "unrenderable compaction state must return 400"
+        assert error.type == "invalid_request_error", (
+            "unrenderable compaction rejection must use invalid_request_error"
+        )
+        assert "compaction" in str(error), "error must name the offending compaction item"
+        assert "cannot be represented" in str(error), (
+            "error must explain why the compaction item cannot be replaced"
+        )
+        assert len(CompactionHandler.requests) == before, (
+            "rejected opaque compaction state must never reach the summarizer"
+        )
+
+    def test_explicit_compact_valid_input_makes_one_callout(self, compact_client):
+        """Control for the #1403 rejection: a well-typed inline input compacts
+        with exactly one summarization callout and returns a compaction object."""
+        before = len(CompactionHandler.requests)
+        result = compact_client.responses.compact(
+            model=VLLM_MODEL,
+            input=[
+                {"role": "user", "content": "Explain TCP vs UDP."},
+                {"role": "assistant", "content": "TCP is reliable; UDP is not."},
+            ],
+        )
+
+        assert result.id, "a successful compact returns an identified compaction"
+        assert result.object == "response.compaction"
+        assert len(CompactionHandler.requests) == before + 1, (
+            "a valid explicit compact must make exactly one summarization callout"
+        )
 
     def test_below_threshold_skips_compaction(self, compact_client):
         first = compact_client.responses.create(
@@ -3078,6 +4999,78 @@ class TestResponsesCompactionVLLM:
         assert "Repeat the persistent marker" in conversation
 
 
+class _Chat404BackendHandler(BaseHTTPRequestHandler):
+    """Chat Completions backend stub that always returns 404.
+
+    Replaces the pre-convergence ``test_backend_error_is_sdk_compatible``, which
+    relied on live vLLM 404ing an unknown model — a path the full-flow binding
+    router no longer reaches (an unknown model routes to the native Responses
+    backend, not the Chat backend). Sending ``CHAT_TRANSLATION_MODEL`` at this
+    stub instead proves a Chat backend error still surfaces to the SDK.
+    """
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+        body = json.dumps(
+            {"error": {"message": "model not found", "type": "not_found_error"}}
+        ).encode()
+        self.send_response(404)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+@pytest.fixture()
+def backend_error_client(tmp_path_factory, request):
+    """Full-flow proxy whose Chat Completions backend always returns 404."""
+    backend_port = _free_port()
+    server = HTTPServer(("127.0.0.1", backend_port), _Chat404BackendHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("responses-backend-error")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=f"127.0.0.1:{backend_port}",
+    )
+    binary = _find_binary()
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield _make_openai_client(port, default_headers=TRUSTED_OWNER_HEADERS)
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        server.shutdown()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Backend-error Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
 class TestResponsesToChatCompletionsVLLM:
     """Live SDK coverage for Chat Completions SSE translation."""
 
@@ -3086,34 +5079,262 @@ class TestResponsesToChatCompletionsVLLM:
     # pipeline, not native Responses passthrough, so it measures the contract
     # owned by the translation filter.
 
-    def test_prompt_template_is_rejected_before_chat_backend(
-        self, chat_streaming_client
-    ):
-        with pytest.raises(BadRequestError) as exc_info:
-            chat_streaming_client.responses.create(
-                model=VLLM_MODEL,
-                input="This prompt reference must not reach vLLM.",
-                prompt={"id": "pmpt_sdk_rejected"},
+    def test_shared_controls_reach_chat_backend(self, reasoning_capture_client):
+        """The SDK request's provider controls survive the checked-in pipeline."""
+        client, forwarded = reasoning_capture_client
+
+        response = client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "hello",
+                            "prompt_cache_breakpoint": {"mode": "explicit"},
+                        },
+                        {"type": "input_text", "text": "world"},
+                    ],
+                }
+            ],
+            store=False,
+            extra_body={
+                "safety_identifier": "tenant-user",
+                "user": "legacy-user",
+                "prompt_cache_key": "cache-key",
+                "prompt_cache_retention": "24h",
+                "prompt_cache_options": {"ttl": "30m", "mode": "explicit"},
+                "text": {"format": {"type": "text"}, "verbosity": "high"},
+            },
+        )
+
+        assert response.status == "completed"
+        assert (
+            response.safety_identifier == "tenant-user"
+        ), "safety_identifier echoed back"
+        assert response.prompt_cache_key == "cache-key", "prompt_cache_key echoed back"
+        assert response.text.verbosity == "high", "text.verbosity echoed back"
+        assert len(forwarded) == 1, forwarded
+        chat = forwarded[0]
+        assert chat["messages"][0]["content"] == [
+            {
+                "type": "text",
+                "text": "hello",
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+            },
+            {"type": "text", "text": "world"},
+        ], "explicit cache breakpoint must survive content conversion"
+        assert (
+            chat["safety_identifier"] == "tenant-user"
+        ), "safety_identifier must reach the Chat backend"
+        assert chat["user"] == "legacy-user", "user must reach the Chat backend"
+        assert (
+            chat["prompt_cache_key"] == "cache-key"
+        ), "prompt_cache_key must reach the Chat backend"
+        assert (
+            chat["prompt_cache_retention"] == "24h"
+        ), "prompt_cache_retention must reach the Chat backend"
+        assert chat["prompt_cache_options"] == {
+            "ttl": "30m",
+            "mode": "explicit",
+        }, "prompt_cache_options must reach the Chat backend"
+        assert chat["verbosity"] == "high", "text.verbosity must map to Chat verbosity"
+
+    def test_multiple_choice_finite_response_fails_closed(self, reasoning_capture_client):
+        """Issue #1141: a finite multi-choice Chat completion must fail closed.
+
+        A Responses resource has no faithful representation for independent
+        Chat alternatives, so a completion carrying two valid choices must be
+        withheld rather than translated into a ``completed`` response that
+        silently drops every choice after the first.
+        """
+        client, forwarded = reasoning_capture_client
+        ChatCaptureHandler.finite_choices = [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "first alternative"},
+            },
+            {
+                "index": 1,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "second alternative"},
+            },
+        ]
+
+        # An `APIError` means the proxy withheld the translated body. A
+        # successful create would mean only the first choice survived.
+        with pytest.raises(openai.APIError):
+            client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input="Pick an alternative.",
                 store=False,
             )
 
-        error = exc_info.value
-        assert error.status_code == 400
-        assert error.type == "invalid_request_error"
-        assert error.param is None
-        assert error.body == {
-            "message": (
-                "Responses `prompt` has no Chat Completions representation: "
-                "got object, this adapter supports only `prompt` null"
+        assert len(forwarded) == 1, forwarded
+        # The status code is asserted over raw HTTP because the failure fires
+        # after response headers; Pingora may reset the connection rather
+        # than emit a status once bytes are committed.
+        base_url = str(client.base_url).rstrip("/")
+        try:
+            raw = httpx.post(
+                f"{base_url}/responses",
+                json={
+                    "model": CHAT_TRANSLATION_MODEL,
+                    "input": "Pick an alternative.",
+                    "store": False,
+                },
+                headers=TRUSTED_OWNER_HEADERS,
+                timeout=10.0,
+            )
+        except httpx.HTTPError:
+            pass  # A reset connection is the committed-bytes form of fail-closed.
+        else:
+            assert raw.status_code >= 500, (
+                "a multi-choice completion must not be released as a success: "
+                f"got {raw.status_code} with body {raw.text!r}"
+            )
+
+    def test_moderation_is_rejected_before_chat_backend(self, reasoning_capture_client):
+        client, forwarded = reasoning_capture_client
+
+        with pytest.raises(BadRequestError) as exc_info:
+            client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input="hello",
+                store=False,
+                extra_body={"moderation": {"model": "omni-moderation-latest"}},
+            )
+
+        assert (
+            exc_info.value.status_code == 400
+        ), "moderation must be rejected with 400"
+        assert "`moderation` has no Chat Completions representation" in str(
+            exc_info.value
+        ), "rejection must explain moderation is unrepresentable"
+        assert (
+            not forwarded
+        ), "rejected moderation request must not reach the Chat backend"
+
+    def test_streaming_moderation_is_rejected(self, chat_streaming_client):
+        with pytest.raises(BadRequestError) as exc_info:
+            chat_streaming_client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input="hello",
+                stream=True,
+                store=False,
+                extra_body={"moderation": {"model": "omni-moderation-latest"}},
+            )
+
+        assert (
+            exc_info.value.status_code == 400
+        ), "streaming moderation must be rejected with 400"
+        assert "`moderation` has no Chat Completions representation" in str(
+            exc_info.value
+        ), "rejection must explain moderation is unrepresentable"
+
+    def test_function_call_output_text_reaches_chat_backend(
+        self, reasoning_capture_client
+    ):
+        """The SDK path lowers text parts to tool text in a real Chat request."""
+        client, forwarded = reasoning_capture_client
+        for output, expected in [
+            ("plain result", "plain result"),
+            (
+                [
+                    {"type": "input_text", "text": "first "},
+                    {"type": "input_text", "text": "result"},
+                ],
+                "first result",
             ),
-            "type": "invalid_request_error",
-            "param": None,
-            "code": "invalid_request_error",
-        }
+        ]:
+            response = client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input=[
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "lookup",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": output,
+                    },
+                ],
+                store=False,
+            )
+            assert response.status == "completed"
+            assert forwarded[-1]["messages"][1] == {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": expected,
+            }
+
+        assert len(forwarded) == 2
+
+    def test_function_call_output_unsupported_shapes_stop_before_backend(
+        self, reasoning_capture_client
+    ):
+        """Valid multimodal and invalid scalar outputs cannot become tool text."""
+        client, forwarded = reasoning_capture_client
+        for output, reason in [
+            (
+                [{"type": "input_image", "image_url": "data:image/png;base64,AA=="}],
+                "input_image",
+            ),
+            # Inline file_data skips openai_file_resolve (which would 401 on
+            # full-flow without the ogx_files credential) and still reaches the
+            # translator's input_file rejection, so the scalar cases below run.
+            (
+                [{"type": "input_file", "file_data": "data:application/pdf;base64,JVBERi0="}],
+                "input_file",
+            ),
+            (42, "must be a string or array of input_text parts"),
+            ({"result": 42}, "must be a string or array of input_text parts"),
+            (True, "must be a string or array of input_text parts"),
+            (None, "must be a string or array of input_text parts"),
+        ]:
+            with pytest.raises(BadRequestError) as exc_info:
+                client.responses.create(
+                    model=CHAT_TRANSLATION_MODEL,
+                    input=[
+                        {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "lookup",
+                            "arguments": "{}",
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_1",
+                            "output": output,
+                        },
+                    ],
+                    store=False,
+                )
+            assert exc_info.value.status_code == 400, "unsupported output must return 400"
+            assert reason in str(exc_info.value), "error message must name the unsupported field"
+            assert not forwarded, "unsupported output must not reach the Chat backend"
+
+    def test_malformed_tools_stop_before_chat_backend(self, reasoning_capture_client):
+        client, forwarded = reasoning_capture_client
+        for tools in ([42], "not-an-array"):
+            with pytest.raises(BadRequestError) as exc_info:
+                client.responses.create(
+                    model=CHAT_TRANSLATION_MODEL,
+                    input="hello",
+                    tools=tools,
+                    store=False,
+                )
+            assert exc_info.value.status_code == 400
+            assert not forwarded, "malformed tools must not reach the Chat backend"
 
     def test_finite_response_round_trip(self, chat_streaming_client):
         response = chat_streaming_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input="Say exactly: CHAT-FINITE-OK /no_think",
             temperature=0,
             store=True,
@@ -3133,7 +5354,7 @@ class TestResponsesToChatCompletionsVLLM:
 
     def test_input_items_pagination_and_delete(self, chat_streaming_client):
         response = chat_streaming_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input=[
                 {
                     "type": "message",
@@ -3172,7 +5393,7 @@ class TestResponsesToChatCompletionsVLLM:
 
     def test_generation_parameters_round_trip(self, chat_streaming_client):
         response = chat_streaming_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input="Say exactly: CHAT-PARAMS-OK /no_think",
             temperature=0,
             top_p=1,
@@ -3195,7 +5416,7 @@ class TestResponsesToChatCompletionsVLLM:
     @requires_vllm_compat
     def test_structured_output_round_trip(self, chat_streaming_client):
         response = chat_streaming_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input="Return the marker CHAT-JSON-1357. /no_think",
             temperature=0,
             text={
@@ -3249,7 +5470,7 @@ class TestResponsesToChatCompletionsVLLM:
             "strict": True,
         }
         response = chat_streaming_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input="Return the marker CHAT-JSON-TOOLS-2468. /no_think",
             temperature=0,
             tools=[tool],
@@ -3295,7 +5516,7 @@ class TestResponsesToChatCompletionsVLLM:
             "strict": True,
         }
         first = chat_streaming_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input="Call get_weather for Paris. /no_think",
             temperature=0,
             tools=[tool],
@@ -3309,7 +5530,7 @@ class TestResponsesToChatCompletionsVLLM:
         assert json.loads(calls[0].arguments)["city"]
 
         second = chat_streaming_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             previous_response_id=first.id,
             input=[
                 {
@@ -3347,7 +5568,7 @@ class TestResponsesToChatCompletionsVLLM:
 
     def test_streaming_response_round_trip(self, chat_streaming_client):
         stream = chat_streaming_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input="Say exactly: CHAT-STREAM-OK /no_think",
             temperature=0,
             store=True,
@@ -3382,7 +5603,7 @@ class TestResponsesToChatCompletionsVLLM:
     @requires_vllm_compat
     def test_streaming_incomplete_round_trip(self, chat_streaming_client):
         stream = chat_streaming_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input="Write a long explanation of network proxies. /no_think",
             store=False,
             stream=True,
@@ -3395,15 +5616,19 @@ class TestResponsesToChatCompletionsVLLM:
         assert terminal.status == "incomplete"
         assert terminal.incomplete_details.reason == "max_output_tokens"
 
-    @requires_vllm_compat
-    def test_backend_error_is_sdk_compatible(self, chat_streaming_client):
+    def test_backend_error_is_sdk_compatible(self, backend_error_client):
+        """A Chat backend 404 surfaces through the translation layer as a
+        status-preserving ``NotFoundError`` so backend error propagation stays
+        covered after the convergence onto full-flow-agentic.yaml."""
         with pytest.raises(NotFoundError) as exc_info:
-            chat_streaming_client.responses.create(
-                model="model-that-does-not-exist",
+            backend_error_client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
                 input="This request must fail.",
                 store=False,
             )
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, (
+            "a Chat backend 404 must surface as a 404 to the SDK"
+        )
 
     @requires_vllm_compat
     def test_web_search_streams_terminal_round_as_one_logical_response(
@@ -3413,7 +5638,7 @@ class TestResponsesToChatCompletionsVLLM:
 
         A streaming Responses request is translated to Chat Completions,
         the returned private ``web_search`` tool call is restored to a
-        canonical ``web_search_call``, ``openai_web_search`` dispatches the
+        canonical ``web_search_call``, ``openai_web_search_dispatch`` dispatches the
         query, and inference resumes — all exposed to the client as ONE
         logical Responses SSE lifecycle. The terminal event carries the
         completed web-search item and the final assistant message.
@@ -3421,16 +5646,21 @@ class TestResponsesToChatCompletionsVLLM:
         BraveSearchHandler.reset()
 
         stream = web_search_chat_streaming_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input=(
                 "You MUST call the web_search tool to look up the latest "
                 "Praxis Proxy release, then answer. Do not answer directly. "
                 "/no_think"
             ),
             tools=[{"type": "web_search"}],
+            tool_choice={"type": "web_search"},
+            max_tool_calls=1,
             store=False,
             stream=True,
             max_output_tokens=512,
+            # full-flow binds the Brave provider secret from this per-user header
+            # via callout_credentials; the mock search server ignores its value.
+            extra_headers={"x-user-brave-key": "controlled-test-only"},
         )
 
         event_types = []
@@ -3483,6 +5713,183 @@ class TestResponsesToChatCompletionsVLLM:
             f"message; got: {output_types}"
         )
 
+    def test_web_search_unsupported_user_location_is_rejected(
+        self, web_search_chat_streaming_client,
+    ):
+        """Unsupported ``user_location`` fields fail closed, never silently dropped (#1548).
+
+        The Brave-backed provider accepts only an ISO ``country``; a ``city`` it
+        cannot honor must be rejected with a 400 at round 0, before any inference
+        round or provider callout. The canonical web-search state preserves the
+        full ``user_location``, so dropping unsupported fields would change
+        location-sensitive search semantics without telling the caller. No
+        ``@requires_vllm_compat`` marker: the preflight short-circuits before the
+        model, so this contract holds in both live and simulator modes.
+        """
+        BraveSearchHandler.reset()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            web_search_chat_streaming_client.responses.create(
+                model=VLLM_MODEL,
+                input="Find a good cafe near me.",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "user_location": {"type": "approximate", "city": "Paris"},
+                    }
+                ],
+                store=False,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "unsupported user_location must fail closed with 400"
+        assert error.type == "invalid_request_error"
+        assert error.body["code"] == "unsupported_parameter"
+        assert "city" in error.body["message"], (
+            f"rejection must name the unsupported field; got: {error.body['message']}"
+        )
+        # The request is rejected before the provider is ever contacted.
+        assert BraveSearchHandler.request_count == 0, (
+            "preflight must reject before any provider callout; "
+            f"got {BraveSearchHandler.request_count} dispatches"
+        )
+
+    def test_web_search_reachable_via_allowed_tools_is_rejected(
+        self, web_search_chat_streaming_client,
+    ):
+        """A web-search tool excluded by ``allowed_tools`` but reachable via another
+        continuation tool is still preflighted (#1548).
+
+        ``allowed_tools`` names only ``file_search``, so web search is not callable
+        on round 0. But a file-search continuation resets ``tool_choice`` to
+        ``"auto"`` while retaining the declared web-search tool, making it reachable
+        on a later round — after the round-0 preflight would normally be skipped.
+        The preflight must therefore reject the unsupported ``city`` up front rather
+        than let it be silently dropped once web search runs. No
+        ``@requires_vllm_compat`` marker: the rejection is at round 0.
+        """
+        BraveSearchHandler.reset()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            web_search_chat_streaming_client.responses.create(
+                model=VLLM_MODEL,
+                input="Find a good cafe near me.",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "user_location": {"type": "approximate", "city": "Paris"},
+                    }
+                ],
+                tool_choice={
+                    "type": "allowed_tools",
+                    "mode": "auto",
+                    "tools": [{"type": "file_search"}],
+                },
+                store=False,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "a reachable unsupported location must fail closed with 400"
+        assert error.type == "invalid_request_error"
+        assert error.body["code"] == "unsupported_parameter"
+        assert "city" in error.body["message"], (
+            f"rejection must name the unsupported field; got: {error.body['message']}"
+        )
+        assert BraveSearchHandler.request_count == 0, (
+            "preflight must reject before any provider callout; "
+            f"got {BraveSearchHandler.request_count} dispatches"
+        )
+
+    def test_web_search_unrepresentable_country_is_rejected(
+        self, web_search_chat_streaming_client,
+    ):
+        """A supported ``country`` the provider cannot encode fails closed (#1548).
+
+        Brave carries the country in the ``X-Loc-Country`` request header. A value
+        with a control character passes the field-support check but cannot be
+        encoded as a header, so it would be silently dropped at dispatch. The
+        preflight rejects it with a 400 ``invalid_value`` instead, before any
+        provider callout. No ``@requires_vllm_compat`` marker: the rejection is at
+        round 0.
+        """
+        BraveSearchHandler.reset()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            web_search_chat_streaming_client.responses.create(
+                model=VLLM_MODEL,
+                input="Find a good cafe near me.",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "user_location": {"type": "approximate", "country": "FR\n"},
+                    }
+                ],
+                store=False,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "an unrepresentable country must fail closed with 400"
+        assert error.type == "invalid_request_error"
+        assert error.body["code"] == "invalid_value"
+        assert "country" in error.body["message"], (
+            f"rejection must name the offending field; got: {error.body['message']}"
+        )
+        assert BraveSearchHandler.request_count == 0, (
+            "preflight must reject before any provider callout; "
+            f"got {BraveSearchHandler.request_count} dispatches"
+        )
+
+    def test_web_search_reachable_via_server_tool_search_is_rejected(
+        self, web_search_chat_streaming_client,
+    ):
+        """A web-search tool reachable via a server-executed ``tool_search``
+        continuation is still preflighted (#1548).
+
+        ``tools`` declares a server-executed ``tool_search`` (hosted MCP connector
+        discovery); ``allowed_tools`` names it with a bare ``{"type":"tool_search"}``
+        selector that carries no ``execution``. The declaration is authoritative: that
+        hosted discovery continuation resets ``tool_choice`` to ``"auto"`` while
+        retaining the declared web-search tool, making it reachable on a later round —
+        after the round-0 preflight would normally be skipped. The preflight must
+        therefore reject the unsupported ``city`` up front. A client-executed
+        ``tool_search`` (the default) returns to the API client instead and never
+        makes web search reachable; that negative case is covered by the Rust unit
+        tests, which assert ``Continue`` without a model round. No
+        ``@requires_vllm_compat`` marker: the rejection is at round 0.
+        """
+        BraveSearchHandler.reset()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            web_search_chat_streaming_client.responses.create(
+                model=VLLM_MODEL,
+                input="Find a good cafe near me.",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "user_location": {"type": "approximate", "city": "Paris"},
+                    },
+                    {"type": "tool_search", "execution": "server"},
+                ],
+                tool_choice={
+                    "type": "allowed_tools",
+                    "mode": "auto",
+                    "tools": [{"type": "tool_search"}],
+                },
+                store=False,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "a reachable unsupported location must fail closed with 400"
+        assert error.type == "invalid_request_error"
+        assert error.body["code"] == "unsupported_parameter"
+        assert "city" in error.body["message"], (
+            f"rejection must name the unsupported field; got: {error.body['message']}"
+        )
+        assert BraveSearchHandler.request_count == 0, (
+            "preflight must reject before any provider callout; "
+            f"got {BraveSearchHandler.request_count} dispatches"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Agentic Loop Fixtures
@@ -3512,12 +5919,40 @@ def search_server():
 
 
 @pytest.fixture(scope="session")
-def agentic_proxy(tmp_path_factory, request, mcp_server, search_server):
+def nemo_guardrails_server():
+    """Start a deterministic passing NeMo mock for guarded SDK tool tests."""
+    NemoGuardrailsHandler.reset()
+    port = _free_port()
+    server = ThreadingHTTPServer(("127.0.0.1", port), NemoGuardrailsHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield port
+    server.shutdown()
+
+
+@pytest.fixture(scope="session")
+def agentic_proxy(
+    tmp_path_factory,
+    request,
+    mcp_server,
+    search_server,
+    nemo_guardrails_server,
+    compaction_server,
+):
     """Start a Praxis proxy with the native Responses agentic loop."""
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("agentic-responses")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_agentic_config(port, db_path, mcp_server, search_server)
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=_vllm_endpoint(),
+        mcp_endpoint=f"http://127.0.0.1:{mcp_server}/mcp",
+        nemo_port=nemo_guardrails_server,
+        # Route the openai_responses_compact summarization callout at the
+        # deterministic mock so the budgeted explicit-compact test is stable.
+        compact_inference_port=compaction_server,
+    )
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -3554,11 +5989,135 @@ def agentic_proxy(tmp_path_factory, request, mcp_server, search_server):
 def agentic_client(agentic_proxy):
     """Return an OpenAI client pointed at the agentic Praxis proxy."""
     proxy_port, _, _ = agentic_proxy
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{proxy_port}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
+    return _make_openai_client(
+        proxy_port,
+        default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
+    )
+
+
+# Operator metadata-admission policy injected under the resolver (#1724):
+# protected mode with per-connector tool policies.
+_PROTECTED_ADMISSION_BLOCK = (
+    "        tool_admission:\n"
+    "          mode: protected\n"
+)
+
+
+@pytest.fixture(scope="session")
+def admission_proxy(
+    tmp_path_factory, request, mcp_server, search_server, nemo_guardrails_server
+):
+    """Start a Praxis proxy with protected MCP metadata admission (#1724)."""
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("admission-responses")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=_vllm_endpoint(),
+        nemo_port=nemo_guardrails_server,
+        tool_admission=_PROTECTED_ADMISSION_BLOCK,
+        require_connector=False,
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port, mcp_server, search_server
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Admission Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def admission_client(admission_proxy):
+    """Return an OpenAI client pointed at the protected-admission proxy."""
+    proxy_port, _, _ = admission_proxy
+    return _make_openai_client(proxy_port, default_headers=TRUSTED_OWNER_HEADERS)
+
+
+@pytest.fixture(scope="session")
+def mcp_approval_floor_proxy(
+    tmp_path_factory, request, mcp_server, search_server, nemo_guardrails_server
+):
+    """Agentic proxy with the operator approval floor (minimum_approval: always).
+
+    Same pipeline as ``agentic_proxy`` with ``openai_mcp_dispatch.minimum_approval``
+    set to ``always`` so every MCP call requires approval regardless of the
+    client's per-tool ``require_approval`` (issue #1723).
+    """
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("mcp-approval-floor")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=_vllm_endpoint(),
+        mcp_endpoint=f"http://127.0.0.1:{mcp_server}/mcp",
+        nemo_port=nemo_guardrails_server,
+        mcp_minimum_approval="always",
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port, mcp_server, search_server
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== MCP approval-floor Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def mcp_approval_floor_client(mcp_approval_floor_proxy):
+    """Return an OpenAI client pointed at the approval-floor Praxis proxy."""
+    proxy_port, _, _ = mcp_approval_floor_proxy
+    return _make_openai_client(
+        proxy_port,
+        default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
     )
 
 
@@ -3569,18 +6128,20 @@ def translated_agentic_proxy(
     mcp_server,
     search_server,
     backend_endpoint,
+    nemo_guardrails_server,
 ):
     """Start the agentic loop through Responses-to-Chat translation."""
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("translated-agentic-responses")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_agentic_config(
+    config_path = _write_full_flow_config(
         port,
         db_path,
-        mcp_server,
-        search_server,
-        translate_to_chat=True,
         backend_endpoint=backend_endpoint,
+        search_port=search_server,
+        mcp_endpoint=f"http://127.0.0.1:{mcp_server}/mcp",
+        chat_translation_model=VLLM_MODEL,
+        nemo_port=nemo_guardrails_server,
     )
     binary = _find_binary()
 
@@ -3616,16 +6177,78 @@ def translated_agentic_proxy(
 @pytest.fixture(scope="session")
 def translated_agentic_client(translated_agentic_proxy):
     """Return an SDK client using translated agentic inference."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{translated_agentic_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
+    return _make_openai_client(
+        translated_agentic_proxy,
+        default_headers={
+            **TRUSTED_OWNER_HEADERS,
+            **TRUSTED_MCP_HEADERS,
+            # full-flow binds the Brave provider secret from this per-user header
+            # via callout_credentials; the mock search server ignores its value.
+            "x-user-brave-key": "controlled-test-only",
+        },
     )
 
 
+@pytest.fixture()
+def oversized_call_id_client(tmp_path_factory, request, mcp_server, search_server):
+    """Run the agentic loop against a backend scripting an oversized MCP id."""
+    OversizedCallIdBackendHandler.request_count = 0
+    backend_port = _free_port()
+    backend = HTTPServer(("127.0.0.1", backend_port), OversizedCallIdBackendHandler)
+    thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    thread.start()
+
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("oversized-mcp-call-id")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=f"127.0.0.1:{backend_port}",
+        mcp_endpoint=f"http://127.0.0.1:{mcp_server}/mcp",
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield (
+            _make_openai_client(
+                port,
+                default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
+            ),
+            mcp_server,
+        )
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        backend.shutdown()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Oversized call id Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
 @pytest.fixture(scope="session")
-def live_tavily_client(tmp_path_factory, request, backend_endpoint):
+def live_tavily_client(
+    tmp_path_factory, request, backend_endpoint, nemo_guardrails_server
+):
     """Run one credentialed Tavily search through the translated vLLM loop."""
     if VLLM_TEST_BACKEND != "live":
         pytest.skip("credentialed Tavily search requires the live backend")
@@ -3639,26 +6262,20 @@ def live_tavily_client(tmp_path_factory, request, backend_endpoint):
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("live-tavily-responses")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_agentic_config(
+    config_path = _write_full_flow_config(
         port,
         db_path,
-        0,
-        0,
-        translate_to_chat=True,
         backend_endpoint=backend_endpoint,
-        real_web_search=True,
+        chat_translation_model=VLLM_MODEL,
+        web_search_provider="tavily",
+        nemo_port=nemo_guardrails_server,
     )
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
     log_file = open(log_path, "w")
     started = False
-    client = OpenAI(
-        base_url=f"http://127.0.0.1:{port}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
-    )
+    client = _make_openai_client(port, default_headers=TRUSTED_OWNER_HEADERS)
     proc = subprocess.Popen(
         [binary, "-c", config_path],
         stdout=log_file,
@@ -3812,6 +6429,159 @@ class TestClientToolCompatVLLM:
         # Request phase echo: the client sees its original ``custom`` tool back.
         assert any(t.type == "custom" for t in response.tools), response.tools
 
+    def test_shell_tool_round_trip_lowers_and_restores(
+        self, client_tool_compat_client
+    ):
+        """A local ``shell`` tool is lowered to a private ``function`` vLLM
+        accepts; the returned call is restored to a schema-complete
+        ``shell_call`` with its parsed action moved into the result."""
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the shell tool with the command: echo ok. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=[{"type": "shell", "environment": {"type": "local"}}],
+            tool_choice={"type": "shell"},
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status == "completed", response
+        shell_calls = [item for item in response.output if item.type == "shell_call"]
+        assert len(shell_calls) >= 1, (
+            "compat filter must restore the function_call to a shell_call; "
+            f"got output types: {[i.type for i in response.output]}"
+        )
+        call = shell_calls[0]
+        assert call.call_id, call
+        assert call.action is not None, call
+        assert call.action.commands, (
+            "restored shell action must include commands: "
+            f"{call.action}"
+        )
+        assert all(command for command in call.action.commands), (
+            "every restored shell command must be non-empty: "
+            f"{call.action}"
+        )
+        assert (
+            call.action.timeout_ms is None or call.action.timeout_ms >= 0
+        ), call.action
+        assert (
+            call.action.max_output_length is None
+            or call.action.max_output_length >= 0
+        ), call.action
+        assert call.environment is not None, (
+            "restored shell call must include its environment: "
+            f"{call}"
+        )
+        assert call.environment.type == "local", (
+            "restored shell call must identify a local environment: "
+            f"{call.environment}"
+        )
+        assert all(item.type != "function_call" for item in response.output), (
+            f"lowered function must not leak: {[i.type for i in response.output]}"
+        )
+        assert any(t.type == "shell" for t in response.tools), response.tools
+
+    def test_tool_search_round_trip_lowers_and_restores(
+        self, client_tool_compat_client
+    ):
+        """A client-executed ``tool_search`` declaration is lowered to a private
+        ``function`` and its restored call preserves client ownership and parsed
+        arguments through the OpenAI SDK."""
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call tool_search for client tools. Do not answer "
+                "directly. /no_think"
+            ),
+            tools=[{"type": "tool_search"}],
+            tool_choice="required",
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status == "completed", response
+        search_calls = [
+            item for item in response.output if item.type == "tool_search_call"
+        ]
+        assert len(search_calls) >= 1, (
+            "compat filter must restore the function_call to a tool_search_call; "
+            f"got output types: {[i.type for i in response.output]}"
+        )
+        call = search_calls[0]
+        assert call.call_id, call
+        assert call.execution == "client", call
+        assert call.arguments is not None, call
+        assert all(item.type != "function_call" for item in response.output), (
+            f"lowered function must not leak: {[i.type for i in response.output]}"
+        )
+        assert any(t.type == "tool_search" for t in response.tools), response.tools
+
+    def test_mcp_namespace_group_name_with_delimiter_is_accepted(
+        self, client_tool_compat_client
+    ):
+        """A ``namespace`` group whose name carries the ``__`` flattening
+        delimiter lowers rather than failing closed.
+
+        Codex names an MCP tool namespace ``mcp__{server}``, so the ``__`` the
+        compat filter uses to delimit its flattened
+        ``agentic_ns__{namespace}__{member}`` wire names appears inside the group
+        name itself. Reserving the delimiter rejected every Codex session that
+        attaches an MCP server with HTTP 400 before any upstream call; the
+        ambiguous pair now takes the hashed wire-name branch instead.
+
+        Asserts only filter-guaranteed, model-independent invariants: whether the
+        small CI model actually calls the member is model-dependent, so the test
+        does not require a live tool call.
+        """
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input="Read the hosts file. /no_think",
+            tools=[
+                {
+                    "type": "namespace",
+                    "name": "mcp__codex_tui",
+                    "description": "Codex MCP tools.",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "read_file",
+                            "description": "Read a file from the workspace.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"],
+                                "additionalProperties": False,
+                            },
+                        }
+                    ],
+                }
+            ],
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        # Reaching a terminal response at all is the regression guard: pre-fix the
+        # compat filter rejected the group name with HTTP 400 (raised by the SDK as
+        # BadRequestError) before any upstream call.
+        assert response.status == "completed", response
+        # No private flattened wire name may leak to the client.
+        leaked = [
+            name
+            for name in (getattr(item, "name", None) for item in response.output)
+            if isinstance(name, str) and name.startswith("agentic_ns__")
+        ]
+        assert not leaked, f"lowered namespace wire name leaked: {leaked}"
+        # Request-phase echo: the client sees its original namespace tool back with
+        # the group name intact, delimiter and all.
+        echoed = [getattr(t, "name", None) for t in response.tools]
+        assert "mcp__codex_tui" in echoed, response.tools
+
     def test_single_round_declared_and_discovered_tools_lower_without_leaking(
         self, client_tool_compat_client
     ):
@@ -3943,9 +6713,14 @@ class TestClientToolCompatVLLM:
         )
 
         event_types = []
+        added_items = []
         final_response = None
         for event in stream:
             event_types.append(event.type)
+            if event.type == "response.output_item.added":
+                if event.item.type == "custom_tool_call":
+                    ResponseCustomToolCall.model_validate(event.item.model_dump())
+                added_items.append(event.item)
             if event.type == "response.completed":
                 final_response = event.response
 
@@ -3968,6 +6743,17 @@ class TestClientToolCompatVLLM:
         )
         assert custom_calls[0].name == "apply_patch"
         assert isinstance(custom_calls[0].input, str)
+        custom_added_items = [
+            item for item in added_items if item.type == "custom_tool_call"
+        ]
+        assert custom_added_items, (
+            "stream must announce the restored call with a custom_tool_call "
+            f"output_item.added frame; got: {[item.type for item in added_items]}"
+        )
+        assert all(item.input == "" for item in custom_added_items), (
+            "each restored custom_tool_call added frame must start with an empty "
+            f"input: {[item.model_dump() for item in custom_added_items]}"
+        )
         # No un-restored private function_call item may leak to the client.
         assert "function_call" not in output_types, (
             f"lowered function must not leak on the stream: {output_types}"
@@ -3977,11 +6763,85 @@ class TestClientToolCompatVLLM:
             final_response.tools
         )
 
+    @requires_real_inference
+    def test_custom_tool_history_survives_native_responses_continuation(
+        self, client_tool_compat_client
+    ):
+        """#1764: a stored ``custom_tool_call`` and its re-entered
+        ``custom_tool_call_output`` must survive replay on a native function-only
+        Responses continuation, lowering to a correlated ``function_call`` /
+        ``function_call_output`` pair for the backend without dropping the prior
+        client-tool execution context or leaking the private lowered name.
+
+        The turn-1 ``custom_tool_call`` lives only in persisted history, so the
+        continuation exercises the stored replay path (not re-entry alone). Before
+        the fix the stored call was dropped before adapter lowering, leaving the
+        re-entered output orphaned; the continuation must now still complete and
+        correlate to the caller's turn.
+        """
+        first = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the apply_patch tool. Do not answer directly. "
+                "/no_think"
+            ),
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                }
+            ],
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            temperature=0,
+            store=True,
+            max_output_tokens=256,
+        )
+
+        assert first.status == "completed", first
+        custom_calls = [
+            item for item in first.output if item.type == "custom_tool_call"
+        ]
+        assert len(custom_calls) >= 1, (
+            f"first turn must produce a custom_tool_call; got: {[i.type for i in first.output]}"
+        )
+        call_id = custom_calls[0].call_id
+
+        second = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=[
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": call_id,
+                    "output": "Applied the patch successfully.",
+                }
+            ],
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                }
+            ],
+            previous_response_id=first.id,
+            temperature=0,
+            store=True,
+            max_output_tokens=256,
+        )
+
+        assert second.status == "completed", second
+        assert second.previous_response_id == first.id, second.previous_response_id
+        assert all(
+            item.type not in ("function_call", "function_call_output")
+            for item in second.output
+        ), f"lowered names must not leak on continuation: {[i.type for i in second.output]}"
+        assert any(t.type == "custom" for t in second.tools), second.tools
+
 
 class TestClientToolCompatChatVLLM:
     """Issue #1206: rich Codex client tools reach a function-only **Chat
     Completions** backend by composing ``openai_client_tool_compat`` with
-    ``responses_to_chat_completions`` in one iterative-router step.
+    ``openai_responses_to_chat_completions`` in one iterative-router step.
 
     Unlike :class:`TestClientToolCompatVLLM` (native Responses backend), here the
     backend only ever sees ``POST /v1/chat/completions`` with plain ``function``
@@ -4002,7 +6862,7 @@ class TestClientToolCompatChatVLLM:
         backend accepts; the translated ``function_call`` is restored to a
         ``custom_tool_call`` with the original ``custom`` tool echoed back."""
         response = client_tool_compat_chat_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input=(
                 "You MUST call the apply_patch tool. Do not answer directly. "
                 "/no_think"
@@ -4047,7 +6907,7 @@ class TestClientToolCompatChatVLLM:
         lifecycle and restored LIVE to a ``custom_tool_call`` by
         ``openai_stream_events`` — one coherent SSE lifecycle, no leaked name."""
         stream = client_tool_compat_chat_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input=(
                 "You MUST call the apply_patch tool. Do not answer directly. "
                 "/no_think"
@@ -4111,7 +6971,7 @@ class TestClientToolCompatChatVLLM:
         into a Chat ``role: tool`` message, so the correlated second turn completes
         without leaking the private lowered name."""
         first = client_tool_compat_chat_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input=(
                 "You MUST call the apply_patch tool. Do not answer directly. "
                 "/no_think"
@@ -4139,7 +6999,7 @@ class TestClientToolCompatChatVLLM:
         call_id = custom_calls[0].call_id
 
         second = client_tool_compat_chat_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input=[
                 {
                     "type": "custom_tool_call_output",
@@ -4171,19 +7031,345 @@ class TestClientToolCompatChatVLLM:
         assert any(t.type == "custom" for t in second.tools), second.tools
 
 
+@pytest.fixture(scope="session")
+def mcp_invalid_args_backend():
+    """Start the deterministic schema-invalid MCP backend for the session."""
+    port = _free_port()
+    server = HTTPServer(("127.0.0.1", port), McpInvalidArgsBackendHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield port
+    server.shutdown()
+
+
+@pytest.fixture(scope="session")
+def mcp_invalid_args_proxy(
+    tmp_path_factory, request, mcp_server, nemo_guardrails_server, mcp_invalid_args_backend
+):
+    """Start the full-flow agentic proxy against the deterministic backend.
+
+    This drives MCP argument validation through the real OpenAI client without a
+    live model: the backend scripts one schema-invalid tool call and a recovery
+    message, so the outcome is deterministic in every lane (issue #1125).
+    """
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("mcp-invalid-args-responses")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=f"127.0.0.1:{mcp_invalid_args_backend}",
+        mcp_endpoint=f"http://127.0.0.1:{mcp_server}/mcp",
+        nemo_port=nemo_guardrails_server,
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== MCP invalid-args Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def mcp_invalid_args_client(mcp_invalid_args_proxy):
+    """Return an OpenAI client pointed at the deterministic MCP proxy."""
+    proxy_port = mcp_invalid_args_proxy
+    return _make_openai_client(
+        proxy_port,
+        default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
+    )
+
+
+@qualification_profile("supporting")
+def test_mcp_schema_invalid_arguments_rejected_without_outbound_call(
+    mcp_invalid_args_client,
+):
+    """Schema-invalid MCP arguments are rejected at the gateway (issue #1125).
+
+    The backend emits a ``get_weather`` call whose ``city`` argument is a number,
+    violating the tool's advertised ``inputSchema``. The gateway must reject it
+    with an actionable, value-free tool error, make zero outbound ``tools/call``,
+    and let the loop recover to a model message.
+    """
+    tools = [
+        {
+            "type": "mcp",
+            "server_label": "weather",
+            "connector_id": "trusted-mcp",
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never",
+        }
+    ]
+    calls_before = MCPHandler.tool_call_count()
+
+    response = mcp_invalid_args_client.responses.create(
+        model=VLLM_MODEL,
+        input="What is the weather in Paris?",
+        tools=tools,
+        store=True,
+        max_output_tokens=512,
+    )
+
+    # Zero outbound tools/call: the violation is caught before dispatch.
+    assert MCPHandler.tool_call_count() == calls_before, (
+        "schema-invalid arguments must not reach the upstream MCP server"
+    )
+
+    mcp_calls = [item for item in response.output if item.type == "mcp_call"]
+    assert len(mcp_calls) == 1, (
+        "the rejected call should surface exactly one mcp_call; got "
+        f"{[item.type for item in response.output]}"
+    )
+    rejected = mcp_calls[0]
+    # The gateway returns a structured mcp_call error; the SDK exposes it as an
+    # McpToolExecutionError (`.content`). Fall back to str for older SDK lanes.
+    error_text = getattr(rejected.error, "content", None)
+    if error_text is None:
+        error_text = rejected.error if isinstance(rejected.error, str) else str(rejected.error or "")
+    assert "tool call arguments do not match the tool input schema" in error_text, (
+        f"the mcp_call must carry the actionable schema error: {rejected.error!r}"
+    )
+    assert not rejected.output, "a rejected call produces no tool output"
+    # The offending value is masked out of the client-visible result.
+    assert "42" not in error_text, (
+        f"the offending value must not be echoed to the client: {rejected.error!r}"
+    )
+    # The loop re-enters inference and resumes to a model message.
+    assert any(item.type == "message" for item in response.output), (
+        "the loop should resume to a model message after the rejection; got "
+        f"{[item.type for item in response.output]}"
+    )
+
+
 class TestAgenticLoopVLLM:
     """Agentic-loop integration tests against the selected backend."""
+
+    def test_mcp_connector_only_rejects_direct_url_before_callout(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #1672: raw client URLs cannot bypass operator connectors."""
+        _, mcp_port, _ = agentic_proxy
+        requests_before = MCPHandler.request_count()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            agentic_client.responses.create(
+                model=VLLM_MODEL,
+                input="What is the weather in Paris? /no_think",
+                tools=[
+                    {
+                        "type": "mcp",
+                        "server_label": "weather",
+                        "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                        "allowed_tools": ["get_weather"],
+                        "require_approval": "never",
+                    }
+                ],
+                store=False,
+                max_output_tokens=128,
+            )
+
+        assert exc_info.value.status_code == 400, exc_info.value
+        assert exc_info.value.body["message"] == (
+            "Direct MCP server URLs are disabled by your administrator. "
+            "Use an administrator-configured connector_id instead."
+        )
+        assert MCPHandler.request_count() == requests_before, (
+            "connector-only rejection must happen before any MCP request"
+        )
+
+    def test_mcp_connector_executes_through_operator_configured_connector(
+        self, agentic_client,
+    ):
+        """Issue #1672: connector_id traffic carries trusted MCP identity."""
+        MCPHandler.authorization_headers.clear()
+        MCPHandler.assertion_headers.clear()
+        requests_before = MCPHandler.request_count()
+        calls_before = MCPHandler.tool_call_count()
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "connector_id": "trusted-mcp",
+                    "allowed_tools": ["get_weather"],
+                    "require_approval": "never",
+                }
+            ],
+            store=False,
+            max_output_tokens=512,
+        )
+
+        assert response.status in ("completed", "incomplete"), response
+        assert any(item.type == "mcp_call" for item in response.output), (
+            f"connector-backed MCP execution must surface its result: "
+            f"{[item.type for item in response.output]}"
+        )
+        assert MCPHandler.request_count() > requests_before
+        assert MCPHandler.tool_call_count() > calls_before
+        assert set(MCPHandler.authorization_headers) == {
+            f"Bearer {TRUSTED_MCP_HEADERS['x-user-mcp-key']}"
+        }
+        assert set(MCPHandler.assertion_headers) == {
+            TRUSTED_MCP_HEADERS["x-mcp-authorized"]
+        }
+
+    def test_protected_mode_excludes_untrusted_direct_mcp_tool(
+        self, admission_client, admission_proxy,
+    ):
+        """Protected metadata admission excludes a client-selected direct MCP
+        target before inference (#1724).
+
+        The direct ``server_url`` is untrusted, so in protected mode its tools
+        never reach the model and the untrusted server is never dispatched: the
+        response carries no ``mcp_call`` and the mock records no tool call.
+        """
+        _, mcp_port, _ = admission_proxy
+        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
+        calls_before = MCPHandler.tool_call_count()
+
+        response = admission_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "Call get_weather for Paris if a weather tool is available; "
+                "otherwise just answer directly. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "server_url": mcp_url,
+                    "allowed_tools": ["get_weather"],
+                    "require_approval": "never",
+                }
+            ],
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status in ("completed", "incomplete"), (
+            f"request should proceed with the tool excluded; got: {response.status}"
+        )
+        output_types = [item.type for item in response.output]
+        assert "mcp_call" not in output_types, (
+            "an untrusted direct target's tool must not execute in protected "
+            f"mode; got: {output_types}"
+        )
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the untrusted direct target must never be dispatched in protected mode"
+        )
+
+    def test_retained_budget_allows_default_store_for_plain_text(self, agentic_client):
+        """The default Store path persists a bounded plain text response."""
+        response = agentic_client.responses.create(model=VLLM_MODEL, input="Hello")
+        stored = agentic_client.responses.retrieve(response.id)
+        assert stored.id == response.id, "the bounded response must be retrievable"
+
+    def test_retained_budget_allows_text_message_array(self, agentic_client):
+        """The usual SDK message-array form stays available with a budget."""
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=[{"role": "user", "content": "Reply briefly: Hello."}],
+            store=False,
+        )
+        assert response.status == "completed", response
+
+    def test_retained_budget_allows_buffered_chat_translation(
+        self, translated_agentic_client
+    ):
+        """A normal SDK create still works through the bounded Chat adapter."""
+        response = translated_agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input="Reply briefly to this greeting: Hello.",
+            stream=False,
+            store=False,
+        )
+        assert response.status == "completed", response
+        assert response.object == "response", response
+
+    def test_retained_budget_restores_previous_plain_response(self, agentic_client):
+        """A stored text turn can be resumed with a request-wide budget."""
+        first = agentic_client.responses.create(model=VLLM_MODEL, input="Say hello briefly")
+        second = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say goodbye briefly",
+            previous_response_id=first.id,
+            store=False,
+        )
+        assert second.id != first.id
+        assert second.previous_response_id == first.id
+
+    def test_retained_budget_appends_plain_conversation(self, agentic_client):
+        """Two budgeted text turns persist and replay through Conversations."""
+        conversation = agentic_client.conversations.create()
+        try:
+            first = agentic_client.responses.create(
+                model=VLLM_MODEL,
+                input="Say hello briefly",
+                conversation=conversation.id,
+                store=False,
+            )
+            second = agentic_client.responses.create(
+                model=VLLM_MODEL,
+                input="Say goodbye briefly",
+                conversation=conversation.id,
+                store=False,
+            )
+            assert first.status == "completed"
+            assert second.status == "completed"
+            items = agentic_client.conversations.items.list(conversation.id, order="asc")
+            assert len(items.data) >= 4, "both input and output turns must be appended"
+        finally:
+            agentic_client.conversations.delete(conversation.id)
+
+    def test_retained_budget_explicit_compact(self, agentic_client):
+        """The SDK can compact inline input and retrieve the bounded result."""
+        compacted = agentic_client.responses.compact(
+            model=VLLM_MODEL,
+            input="Summarize this short exchange.",
+        )
+        assert compacted.object == "response.compaction", compacted
+        assert compacted.output, compacted
+        retrieved = agentic_client.responses.retrieve(compacted.id)
+        assert retrieved.id == compacted.id
 
     def test_mcp_approval_round_trip_executes_once(
         self, agentic_client, agentic_proxy,
     ):
         """An SDK approval response resumes and executes the MCP call once."""
-        _, mcp_port, _ = agentic_proxy
         tools = [
             {
                 "type": "mcp",
                 "server_label": "weather",
-                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "connector_id": "trusted-mcp",
                 "allowed_tools": ["get_weather"],
                 "require_approval": "always",
             }
@@ -4247,6 +7433,101 @@ class TestAgenticLoopVLLM:
         )
 
     @requires_vllm_compat
+    def test_mcp_approval_read_only_selector_gates_over_never_name(
+        self, agentic_client,
+    ):
+        """Issue #1398 (SDK path): always.read_only wins over never.tool_names.
+
+        ``get_weather`` is annotated read-only. The policy names it in
+        ``never.tool_names`` but also selects it via ``always.read_only=true``.
+        ``always`` precedence must gate the call with an approval request; before
+        the fix the ignored read_only selector left only the never name-match and
+        the tool executed automatically.
+        """
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "connector_id": "trusted-mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": {
+                    "always": {"read_only": True},
+                    "never": {"tool_names": ["get_weather"]},
+                },
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        approval_requests = [
+            item for item in response.output
+            if item.type == "mcp_approval_request"
+        ]
+        assert len(approval_requests) == 1, (
+            "always.read_only must gate the read-only tool even though "
+            "never.tool_names names it; "
+            f"got: {[item.type for item in response.output]}"
+        )
+        assert approval_requests[0].name == "get_weather"
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the gated call must not execute while approval is pending"
+        )
+
+    @requires_vllm_compat
+    def test_mcp_approval_read_only_selector_auto_executes(
+        self, agentic_client,
+    ):
+        """Issue #1398 (SDK path): never.read_only exempts a read-only tool.
+
+        ``get_weather`` is annotated read-only and matched by
+        ``never.read_only=true``, so it executes automatically with no approval
+        request -- proving the discovered readOnlyHint drives the exemption
+        through the OpenAI client.
+        """
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "connector_id": "trusted-mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": {"never": {"read_only": True}},
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        output_types = [item.type for item in response.output]
+        assert not any(t == "mcp_approval_request" for t in output_types), (
+            f"never.read_only must auto-execute the read-only tool; got: {output_types}"
+        )
+        assert MCPHandler.tool_call_count() == calls_before + 1, (
+            "the read-only tool must execute automatically under never.read_only"
+        )
+        assert "mcp_call" in output_types, (
+            f"auto-executed response should contain the MCP result; got: {output_types}"
+        )
+
+    @requires_vllm_compat
     def test_mcp_approval_resume_streams_without_index_error(
         self, agentic_client, agentic_proxy,
     ):
@@ -4269,12 +7550,11 @@ class TestAgenticLoopVLLM:
         surface that raised the regression. Reaching ``get_final_response()``
         without an exception is itself the primary assertion.
         """
-        _, mcp_port, _ = agentic_proxy
         tools = [
             {
                 "type": "mcp",
                 "server_label": "weather",
-                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "connector_id": "trusted-mcp",
                 "allowed_tools": ["get_weather"],
                 "require_approval": "always",
             }
@@ -4390,8 +7670,6 @@ class TestAgenticLoopVLLM:
         accumulated output contains the full execution trace:
         function_call, mcp_call, and the final message.
         """
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         response = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -4403,7 +7681,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
@@ -4449,8 +7727,6 @@ class TestAgenticLoopVLLM:
         on the model -- the same reliability profile as
         ``test_mcp_tool_auto_executes_and_returns``.
         """
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         response = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -4462,7 +7738,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather_map"],
                     "require_approval": "never",
                 }
@@ -4500,7 +7776,6 @@ class TestAgenticLoopVLLM:
         agentic_client,
         agentic_proxy,
     ):
-        _, mcp_port, _ = agentic_proxy
         MCPHandler.authorization_headers.clear()
 
         response = agentic_client.responses.create(
@@ -4512,7 +7787,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "always",
                 }
@@ -4534,16 +7809,67 @@ class TestAgenticLoopVLLM:
             response.output
         )
 
-    def test_mcp_authorization_is_bearer_and_not_forwarded_to_model(
+    @qualification_profile("supporting")
+    def test_mcp_oversized_call_id_fails_closed_before_dispatch(
         self,
-        agentic_client,
-        agentic_proxy,
+        oversized_call_id_client,
     ):
-        _, mcp_port, _ = agentic_proxy
-        token = "sdk-mcp-secret-789"
-        MCPHandler.authorization_headers.clear()
+        """Issue #1400: an escaping MCP call id fails closed before dispatch.
 
-        response = agentic_client.responses.create(
+        The provider-emitted correlation id is at the raw-byte bound, but JSON
+        escaping expands its fallback beyond the retained reservation, so the
+        round is rejected with a 502 before any approval is persisted and
+        before the MCP tool executes.
+        """
+        client, _ = oversized_call_id_client
+        calls_before = MCPHandler.tool_call_count()
+
+        with pytest.raises(openai.InternalServerError) as exc_info:
+            client.responses.create(
+                model=VLLM_MODEL,
+                input=(
+                    "You MUST call get_weather for Paris. Do not answer directly. /no_think"
+                ),
+                tools=[
+                    {
+                        "type": "mcp",
+                        "server_label": "weather",
+                        "connector_id": "trusted-mcp",
+                        "allowed_tools": ["get_weather"],
+                        "require_approval": "always",
+                    }
+                ],
+                store=True,
+                max_output_tokens=256,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 502, (
+            "an oversized correlation id must fail closed as a server error"
+        )
+        assert error.body["code"] == "server_error"
+        assert "call_id" in error.body["message"], error.body["message"]
+        assert OversizedCallIdBackendHandler.request_count == 1, (
+            "exactly one inference round must run before the round is rejected"
+        )
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the MCP tool must not execute when the correlation id is rejected"
+        )
+
+    def test_operator_floor_forces_approval_over_client_never(
+        self,
+        mcp_approval_floor_client,
+    ):
+        """Operator ``minimum_approval: always`` must force an approval exchange
+        even when the client sends ``require_approval: "never"`` (issue #1723).
+
+        The MCP server must receive zero ``tools/call`` because the floor stops
+        dispatch and returns an ``mcp_approval_request`` instead.
+        """
+        MCPHandler.authorization_headers.clear()
+        calls_before = MCPHandler.tool_call_count()
+
+        response = mcp_approval_floor_client.responses.create(
             model=VLLM_MODEL,
             input=(
                 "You MUST call get_weather for Paris. Do not answer directly. /no_think"
@@ -4552,10 +7878,10 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
-                    "authorization": token,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
-                    "require_approval": "always",
+                    # The client opts out of approval; the operator floor overrides.
+                    "require_approval": "never",
                 }
             ],
             # Approval round trips need durable state to resume, so the proxy
@@ -4564,20 +7890,27 @@ class TestAgenticLoopVLLM:
             max_output_tokens=256,
         )
 
-        assert any(item.type == "mcp_approval_request" for item in response.output), (
+        approvals = [
+            item for item in response.output if item.type == "mcp_approval_request"
+        ]
+        assert len(approvals) == 1, response.output
+        assert approvals[0].name == "get_weather"
+        assert approvals[0].server_label == "weather"
+        assert not any(item.type == "mcp_call" for item in response.output), (
             response.output
         )
-        assert MCPHandler.authorization_headers
-        assert set(MCPHandler.authorization_headers) == {f"Bearer {token}"}
-        assert token not in json.dumps(response.model_dump(), default=str)
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the operator floor must stop dispatch before the MCP server is called"
+        )
 
-    def test_authorization_in_mcp_headers_is_stripped(
+    def test_mcp_connector_identity_is_bearer_and_not_exposed_in_response(
         self,
         agentic_client,
         agentic_proxy,
     ):
-        _, mcp_port, _ = agentic_proxy
+        token = "sdk-mcp-secret-789"
         MCPHandler.authorization_headers.clear()
+        MCPHandler.assertion_headers.clear()
 
         response = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -4588,7 +7921,46 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                    "connector_id": "trusted-mcp",
+                    "allowed_tools": ["get_weather"],
+                    "require_approval": "always",
+                }
+            ],
+            # Approval round trips need durable state to resume, so the proxy
+            # requires store=true; store=false is rejected before emit.
+            store=True,
+            max_output_tokens=256,
+            extra_headers={"x-user-mcp-key": token},
+        )
+
+        assert any(item.type == "mcp_approval_request" for item in response.output), (
+            response.output
+        )
+        assert MCPHandler.authorization_headers
+        assert set(MCPHandler.authorization_headers) == {f"Bearer {token}"}
+        assert set(MCPHandler.assertion_headers) == {
+            TRUSTED_MCP_HEADERS["x-mcp-authorized"]
+        }
+        assert token not in json.dumps(response.model_dump(), default=str)
+
+    def test_authorization_in_mcp_headers_is_stripped_in_favor_of_connector_identity(
+        self,
+        agentic_client,
+        agentic_proxy,
+    ):
+        MCPHandler.authorization_headers.clear()
+        MCPHandler.assertion_headers.clear()
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call get_weather for Paris. Do not answer directly. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "connector_id": "trusted-mcp",
                     "headers": {"Authorization": "Bearer must-be-stripped"},
                     "allowed_tools": ["get_weather"],
                     "require_approval": "always",
@@ -4604,7 +7976,12 @@ class TestAgenticLoopVLLM:
             response.output
         )
         assert MCPHandler.authorization_headers
-        assert set(MCPHandler.authorization_headers) == {None}
+        assert set(MCPHandler.authorization_headers) == {
+            f"Bearer {TRUSTED_MCP_HEADERS['x-user-mcp-key']}"
+        }
+        assert set(MCPHandler.assertion_headers) == {
+            TRUSTED_MCP_HEADERS["x-mcp-authorized"]
+        }
 
     def test_web_search_executes_and_returns_result(
         self,
@@ -4613,7 +7990,7 @@ class TestAgenticLoopVLLM:
         request_count = len(BraveSearchHandler.request_paths)
         recorded_request_count = len(SimulatorBackendHandler.recorded_requests)
         response = translated_agentic_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input=(
                 "You MUST use web search, then report the result title and "
                 "URL. /no_think"
@@ -4651,6 +8028,169 @@ class TestAgenticLoopVLLM:
                 tool_name="web_search",
             )
 
+    def test_web_search_provider_failure_returns_failed_status(
+        self,
+        translated_agentic_client,
+    ):
+        try:
+            request_count = len(BraveSearchHandler.request_paths)
+            BraveSearchHandler.response_code = 503
+            response = translated_agentic_client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input=(
+                    "You MUST use web search, then report the result title and "
+                    "URL. /no_think"
+                ),
+                tools=[
+                    {
+                        "type": "web_search",
+                        "search_context_size": "low",
+                    }
+                ],
+                tool_choice=(
+                    "auto"
+                    if VLLM_TEST_BACKEND == "simulator"
+                    else {"type": "web_search"}
+                ),
+                store=False,
+                max_output_tokens=2048,
+            )
+
+            web_search_calls = [
+                item for item in response.output if item.type == "web_search_call"
+            ]
+            assert len(web_search_calls) == 1, response.output
+            assert web_search_calls[0].status == "failed"
+            assert len(BraveSearchHandler.request_paths) > request_count
+        finally:
+            BraveSearchHandler.reset()
+
+    @requires_simulator
+    def test_web_search_partial_provider_failure_keeps_successful_results(
+        self,
+        translated_agentic_client,
+    ):
+        try:
+            request_count = len(BraveSearchHandler.request_paths)
+            BraveSearchHandler.successful_requests_remaining = 1
+            SimulatorBackendHandler.web_search_queries = [
+                "first Praxis Proxy release",
+                "second Praxis Proxy release",
+            ]
+            response = translated_agentic_client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input=(
+                    "You MUST use web search for both questions, then report "
+                    "each result title and URL. /no_think"
+                ),
+                tools=[
+                    {
+                        "type": "web_search",
+                        "search_context_size": "low",
+                    }
+                ],
+                tool_choice=(
+                    "auto"
+                    if VLLM_TEST_BACKEND == "simulator"
+                    else {"type": "web_search"}
+                ),
+                include=["web_search_call.action.sources"],
+                store=False,
+                max_output_tokens=2048,
+            )
+
+            web_search_calls = [
+                item for item in response.output if item.type == "web_search_call"
+            ]
+            assert len(web_search_calls) == 2, response.output
+            assert [call.status for call in web_search_calls] == [
+                "completed",
+                "failed",
+            ]
+            assert len(BraveSearchHandler.request_paths) == request_count + 2
+
+            completed_call = web_search_calls[0].model_dump()
+            sources = completed_call.get("action", {}).get("sources", [])
+            assert any(
+                source.get("url") == "https://example.com/mock"
+                for source in sources
+            )
+
+            messages = [
+                item.model_dump()
+                for item in response.output
+                if item.type == "message"
+            ]
+            assert messages
+            assert "Mock Search Result" in json.dumps(messages)
+        finally:
+            BraveSearchHandler.reset()
+            SimulatorBackendHandler.web_search_queries = []
+
+    @requires_simulator
+    def test_web_search_multi_query_round_trip_preserves_queries(
+        self,
+        translated_agentic_client,
+    ):
+        try:
+            request_count = len(BraveSearchHandler.request_paths)
+            SimulatorBackendHandler.web_search_queries = [
+                "first Praxis Proxy release",
+                "second Praxis Proxy release",
+            ]
+            SimulatorBackendHandler.web_search_multi_query_call = True
+            response = translated_agentic_client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input=(
+                    "You MUST use web search for both questions, then report "
+                    "each result title and URL. /no_think"
+                ),
+                tools=[
+                    {
+                        "type": "web_search",
+                        "search_context_size": "low",
+                    }
+                ],
+                tool_choice=(
+                    "auto"
+                    if VLLM_TEST_BACKEND == "simulator"
+                    else {"type": "web_search"}
+                ),
+                include=["web_search_call.action.sources"],
+                store=False,
+                max_output_tokens=2048,
+            )
+
+            web_search_calls = [
+                item for item in response.output if item.type == "web_search_call"
+            ]
+            assert len(web_search_calls) == 1, response.output
+            assert web_search_calls[0].status == "completed"
+            assert len(BraveSearchHandler.request_paths) == request_count + 2
+
+            completed_call = web_search_calls[0].model_dump()
+            assert completed_call.get("action", {}).get("queries") == [
+                "first Praxis Proxy release",
+                "second Praxis Proxy release",
+            ]
+            sources = completed_call.get("action", {}).get("sources", [])
+            assert any(
+                source.get("url") == "https://example.com/mock"
+                for source in sources
+            )
+
+            messages = [
+                item.model_dump()
+                for item in response.output
+                if item.type == "message"
+            ]
+            assert messages
+            assert "Mock Search Result" in json.dumps(messages)
+        finally:
+            BraveSearchHandler.reset()
+            SimulatorBackendHandler.web_search_queries = []
+            SimulatorBackendHandler.web_search_multi_query_call = False
+
     @requires_real_inference
     def test_live_tavily_web_search_returns_real_sources(
         self,
@@ -4658,7 +8198,7 @@ class TestAgenticLoopVLLM:
     ):
         """A real Tavily call executes inside the vLLM agentic loop."""
         response = live_tavily_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input=(
                 "Use web search exactly once to find the official Rust "
                 "programming language website, then report its URL. /no_think"
@@ -4695,14 +8235,19 @@ class TestAgenticLoopVLLM:
     ):
         request_count = len(BraveSearchHandler.request_paths)
         stream = translated_agentic_client.responses.create(
-            model=VLLM_MODEL,
-            input=("You MUST use web search, then report the result title. /no_think"),
+            model=CHAT_TRANSLATION_MODEL,
+            input=(
+                "Use web search to find the latest Praxis Proxy release, "
+                "then report the result title. /no_think"
+            ),
             tools=[
                 {
                     "type": "web_search",
                     "search_context_size": "low",
                 }
             ],
+            tool_choice={"type": "web_search"},
+            max_tool_calls=1,
             store=False,
             stream=True,
             max_output_tokens=512,
@@ -4728,8 +8273,6 @@ class TestAgenticLoopVLLM:
         agentic_proxy,
     ):
         """Two MCP calls emitted in one model round both complete."""
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         response = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -4742,7 +8285,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "utilities",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather", "get_time"],
                     "require_approval": "never",
                 }
@@ -4771,12 +8314,11 @@ class TestAgenticLoopVLLM:
         The pre-fix dispatcher rejected any ``mcp_approval_response`` batch
         with more than one item, so this whole flow returned a 400.
         """
-        _, mcp_port, _ = agentic_proxy
         tools = [
             {
                 "type": "mcp",
                 "server_label": "utilities",
-                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "connector_id": "trusted-mcp",
                 "allowed_tools": ["get_weather", "get_time"],
                 "require_approval": "always",
             }
@@ -4849,12 +8391,11 @@ class TestAgenticLoopVLLM:
         The denied call must not reach the MCP server; only the approved
         ``get_weather`` produces an ``mcp_call`` in the resumed response.
         """
-        _, mcp_port, _ = agentic_proxy
         tools = [
             {
                 "type": "mcp",
                 "server_label": "utilities",
-                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "connector_id": "trusted-mcp",
                 "allowed_tools": ["get_weather", "get_time"],
                 "require_approval": "always",
             }
@@ -4933,8 +8474,6 @@ class TestAgenticLoopVLLM:
         response.completed carries the same execution trace the buffered
         test observes: function_call, mcp_call, and the final message.
         """
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         stream = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -4946,7 +8485,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
@@ -5029,8 +8568,6 @@ class TestAgenticLoopVLLM:
         rounds), before the resumed model output, with an id and output index
         that agree with the terminal snapshot.
         """
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         stream = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -5042,7 +8579,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
@@ -5213,8 +8750,6 @@ class TestAgenticLoopVLLM:
         Tool *selection* still depends on the model, but the discovery item is
         emitted from the proxy's own resolution and is model-independent.
         """
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         response = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -5226,7 +8761,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
@@ -5293,8 +8828,6 @@ class TestAgenticLoopVLLM:
         numbers that agree with the terminal snapshot. This is what turns an
         opaque terminal listing into discovery progress the client can render.
         """
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         stream = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -5306,7 +8839,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
@@ -5462,7 +8995,7 @@ class TestAgenticLoopVLLM:
         output index that agree with the terminal snapshot.
         """
         stream = translated_agentic_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input=(
                 "Search the web for the latest Rust release, then answer. "
                 "You MUST use the web search tool. Do not answer directly. "
@@ -5698,8 +9231,6 @@ class TestAgenticLoopVLLM:
         a present, positive, internally consistent summed usage -- against a
         real backend.
         """
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         response = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -5711,7 +9242,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
@@ -5738,8 +9269,6 @@ class TestAgenticLoopVLLM:
         buffered and streaming expose equivalent accumulated terminal output
         and usage.
         """
-        _, mcp_port, _ = agentic_proxy
-        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
 
         stream = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -5751,7 +9280,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
@@ -5807,6 +9336,90 @@ def _retrieve_with_retry(client, response_id, attempts=15, delay=0.4):
     )
 
 
+def _collect_replay_with_retry(
+    client, response_id, *, starting_after=None, attempts=15, delay=0.4
+):
+    """Replay a stored streaming response's event log via ``GET ?stream=true``.
+
+    The replay event log is flushed as the proxy finishes serving the streamed
+    response body; a replay issued the instant the create-stream iterator
+    returns can race that write and briefly see the "no replayable event
+    stream" 400. Retry a bounded number of times, treating only that specific
+    400 as "not flushed yet" and re-raising every other error immediately.
+    """
+    from openai import BadRequestError
+
+    kwargs: dict[str, Any] = {"stream": True}
+    if starting_after is not None:
+        kwargs["starting_after"] = starting_after
+
+    last_exc = None
+    for _ in range(attempts):
+        try:
+            return _collect_stream(client.responses.retrieve(response_id, **kwargs))
+        except BadRequestError as exc:
+            if "replayable" not in str(exc).lower():
+                raise
+            last_exc = exc
+            time.sleep(delay)
+    raise AssertionError(
+        f"response {response_id} not replayable after {attempts} attempts: "
+        f"{last_exc}"
+    )
+
+
+@pytest.fixture(scope="session")
+def streaming_mcp_failure_client(
+    tmp_path_factory, request, backend_endpoint, nemo_guardrails_server
+):
+    """Start a full-flow proxy whose configured MCP connector is unreachable."""
+    proxy_port = _free_port()
+    dead_mcp_port = _free_port()
+    db_dir = tmp_path_factory.mktemp("streaming-mcp-failure")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        proxy_port,
+        db_path,
+        backend_endpoint=backend_endpoint,
+        mcp_endpoint=f"http://127.0.0.1:{dead_mcp_port}/mcp",
+        nemo_port=nemo_guardrails_server,
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    client = _make_openai_client(
+        proxy_port,
+        default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
+    )
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(proxy_port, proc, log_path)
+        started = True
+        yield client
+    finally:
+        client.close()
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Streaming MCP failure Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
 class TestStreamingMcpDiscoveryFailureVLLM:
     """Issue #320: a streaming Responses request whose MCP ``tools/list``
     discovery fails at runtime must surface to the official OpenAI SDK as a
@@ -5815,8 +9428,8 @@ class TestStreamingMcpDiscoveryFailureVLLM:
     stream -- and, when ``store`` is effective, the failed resource must be
     retrievable via the SDK.
 
-    The failure is triggered with an MCP ``server_url`` pointing at a dead
-    loopback port. The agentic config enables
+    The failure is triggered through the operator-configured connector when
+    its URL points at a dead loopback port. The agentic config enables
     ``insecure_options.allow_private_upstreams``, so the loopback MCP callout
     passes SSRF validation and the refused connection is classified as a
     genuine *runtime* discovery failure (-> 200 SSE lifecycle) rather than a
@@ -5830,19 +9443,16 @@ class TestStreamingMcpDiscoveryFailureVLLM:
     """
 
     def test_streaming_discovery_failure_surfaces_failed_lifecycle(
-        self, agentic_client, agentic_proxy,
+        self, streaming_mcp_failure_client,
     ):
-        dead_port = _free_port()
-        mcp_url = f"http://127.0.0.1:{dead_port}/mcp"
-
-        stream = agentic_client.responses.create(
+        stream = streaming_mcp_failure_client.responses.create(
             model=VLLM_MODEL,
             input="What is the weather in Paris? /no_think",
             tools=[
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": mcp_url,
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     "require_approval": "never",
                 }
@@ -5850,6 +9460,8 @@ class TestStreamingMcpDiscoveryFailureVLLM:
             store=True,
             stream=True,
             max_output_tokens=128,
+            instructions="Be concise",
+            metadata={"trace": "sdk-mcp-failure"},
         )
 
         event_types = []
@@ -5875,6 +9487,14 @@ class TestStreamingMcpDiscoveryFailureVLLM:
         assert failed_response["error"]["code"] == "server_error", (
             failed_response
         )
+        assert failed_response["instructions"] == "Be concise", (
+            "streamed failure response must echo the request instructions; "
+            f"got: {failed_response}"
+        )
+        assert failed_response["metadata"] == {"trace": "sdk-mcp-failure"}, (
+            "streamed failure response must echo the request metadata; "
+            f"got: {failed_response}"
+        )
 
         mcp_items = [
             item
@@ -5894,10 +9514,18 @@ class TestStreamingMcpDiscoveryFailureVLLM:
         # store=True -> the failed resource is persisted and retrievable
         # through the SDK, echoing the same failed status and error.
         assert response_id, "response.created must carry an id for retrieval"
-        retrieved = _retrieve_with_retry(agentic_client, response_id)
+        retrieved = _retrieve_with_retry(streaming_mcp_failure_client, response_id)
         rd = retrieved.model_dump()
         assert rd["status"] == "failed", rd
         assert rd["error"]["code"] == "server_error", rd
+        assert rd["instructions"] == "Be concise", (
+            "retrieved failure response must echo the request instructions; "
+            f"got: {rd}"
+        )
+        assert rd["metadata"] == {"trace": "sdk-mcp-failure"}, (
+            "retrieved failure response must echo the request metadata; "
+            f"got: {rd}"
+        )
         assert any(
             it.get("type") == "mcp_list_tools" for it in rd.get("output", [])
         ), rd
@@ -5907,99 +9535,19 @@ class TestStreamingMcpDiscoveryFailureVLLM:
 # File search: dedicated proxy config, fixtures, and tests
 # ---------------------------------------------------------------------------
 
-FILE_SEARCH_CONFIG_TEMPLATE = """\
-listeners:
-  - name: ai-gateway
-    address: "127.0.0.1:{praxis_port}"
-    filter_chains: [file-search-pipeline]
-
-filter_chains:
-  - name: file-search-pipeline
-    filters:
-      - filter: openai_responses_format
-      - filter: openai_responses_validate
-      - filter: openai_tool_parse
-      - filter: iterative_request_router
-        initial_step: inference
-        max_iterations: 8
-        # Generous deadlines: file-search inference runs on CPU-only vLLM under
-        # heavy CI load (postgres + vLLM + OGX co-located), which can exceed a
-        # 60s step budget. Matches the agentic config's IRR timeouts.
-        timeout_ms: 300000
-        step_timeout_ms: 300000
-        max_response_bytes: 67108864
-        max_state_bytes: 136314880
-        steps:
-          - name: inference
-            filters:
-              # Request-phase dispatcher: at request-body EOS on each IRR
-              # re-entry it executes the file_search_call items the loop owner
-              # assigned in the prior response, reconciling each in place. It
-              # never parses the response and never drives the IRR transition
-              # (#1046).
-              - filter: openai_file_search_callout
-                vector_store_url: http://{ogx_endpoint}
-                outbound_chain:
-                  name: vector-store-outbound
-                  filters:
-                    - filter: headers
-                      request_set:
-                        - name: X-Vector-Store-Client
-                          value: praxis-ai-gateway
-                timeout_ms: 30000
-                max_response_bytes: 10485760
-                max_total_response_bytes: 67108864
-                max_state_bytes: 136314880
-                on_failure: closed
-                forward_headers:
-                  - authorization
-              # Sole loop owner: parses each model response, records file-search
-              # assignments for the dispatcher, and publishes the single
-              # continuation signal (action=loop|done).
-              - filter: openai_agentic_loop
-                max_infer_iters: 7
-              - filter: openai_responses_proxy
-                name: inference
-              - filter: headers
-                request_set:
-                  - name: Content-Type
-                    value: application/json
-              - filter: router
-                routes:
-                  - path_prefix: "/"
-                    cluster: "inference"
-              - filter: load_balancer
-                clusters:
-                  - name: "inference"
-                    read_timeout_ms: 300000
-                    endpoints:
-                      - "{vllm_endpoint}"
-            on_result:
-              - filter: openai_agentic_loop
-                key: action
-                value: loop
-                next: inference
-              - default: true
-                done: true
-
-insecure_options:
-  allow_private_endpoints: true
-  # Central SSRF gate for the vector-store callout: permits the loopback OGX
-  # endpoint's resolved address at connect time.
-  allow_private_upstreams: true
-"""
-
 
 class VectorStoreWitnessHandler(BaseHTTPRequestHandler):
     """Recording shim between the file-search callout and OGX.
 
     Captures the request headers of every vector-store request the callout
     forwards, then proxies transparently to OGX so the search still runs and
-    the full pipeline completes. Tests assert the configured ``outbound_chain``
-    actually ran by checking the marker header it injects
-    (``X-Vector-Store-Client``) is present on every captured request — proving
-    the callout dispatched through the ``FilteredSubrequestExecutor`` outbound
-    chain rather than reaching OGX by some other path (or not at all).
+    the full pipeline completes. Tests assert the full-flow ``outbound_chain``
+    actually ran by checking the re-projected owner identity
+    (``x-tenant-id``/``x-user-id`` from ``project_state_owner_headers``) and the
+    ``Authorization`` injected from the ``ogx_files`` credential are present on
+    every captured request — proving the callout dispatched through the
+    ``FilteredSubrequestExecutor`` outbound chain rather than reaching OGX by
+    some other path (or not at all).
     """
 
     captured_headers: ClassVar[list[dict[str, str]]] = []
@@ -6046,18 +9594,6 @@ class VectorStoreWitnessHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._forward()
-
-
-def _write_file_search_config(
-    praxis_port: int, backend_endpoint: str, ogx_endpoint: str | None = None
-) -> str:
-    config = FILE_SEARCH_CONFIG_TEMPLATE.format(
-        praxis_port=praxis_port,
-        ogx_endpoint=ogx_endpoint or _ogx_endpoint(),
-        vllm_endpoint=backend_endpoint,
-    )
-    path = _persist_config(config)
-    return path
 
 
 @pytest.fixture(scope="session")
@@ -6146,8 +9682,10 @@ def file_search_backend(backend_endpoint):
 
 
 @pytest.fixture(scope="session")
-def file_search_proxy(tmp_path_factory, request, file_search_backend):
-    """Start a Praxis proxy with the file-search-callout pipeline.
+def file_search_proxy(
+    tmp_path_factory, request, file_search_backend, nemo_guardrails_server
+):
+    """Start a Praxis proxy with the file-search-dispatch pipeline.
 
     The vector-store callout is pointed at an in-process recording shim
     (:class:`VectorStoreWitnessHandler`) that forwards transparently to OGX, so
@@ -6161,15 +9699,18 @@ def file_search_proxy(tmp_path_factory, request, file_search_backend):
     shim_thread.start()
 
     port = _free_port()
-    config_path = _write_file_search_config(
+    db_dir = tmp_path_factory.mktemp("file-search")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
         port,
-        file_search_backend,
-        ogx_endpoint=f"127.0.0.1:{shim_port}",
+        db_path,
+        backend_endpoint=file_search_backend,
+        vector_store_endpoint=f"127.0.0.1:{shim_port}",
+        nemo_port=nemo_guardrails_server,
     )
     binary = _find_binary()
 
-    log_dir = tmp_path_factory.mktemp("file-search")
-    log_path = str(log_dir / "praxis.log")
+    log_path = str(db_dir / "praxis.log")
     log_file = open(log_path, "w")
     started = False
 
@@ -6204,11 +9745,9 @@ def file_search_proxy(tmp_path_factory, request, file_search_backend):
 @pytest.fixture(scope="session")
 def file_search_client(file_search_proxy):
     """Return an OpenAI client pointed at the file-search Praxis proxy."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{file_search_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
+    return _make_openai_client(
+        file_search_proxy,
+        default_headers={**TRUSTED_OWNER_HEADERS, "x-user-ogx-key": "Bearer test"},
     )
 
 
@@ -6263,6 +9802,10 @@ class TestFileSearchVLLM:
             assert item.status in ("completed", "incomplete"), (
                 f"file_search_call status should be terminal; got: {item.status}"
             )
+            assert item.id, "the translated file_search_call must retain a public id"
+            assert "call_id" not in item.model_dump(), (
+                "the private function call_id must not reach the OpenAI client"
+            )
 
         decoded_results = [
             result
@@ -6281,18 +9824,31 @@ class TestFileSearchVLLM:
         # Prove the callout actually dispatched the vector-store search through
         # the configured FilteredSubrequestExecutor outbound chain — not merely
         # that a file_search_call item surfaced. The recording shim in front of
-        # OGX captured each forwarded request; every one must carry the marker
-        # header the inline outbound_chain injects, which only the executor path
-        # can add.
+        # OGX captured each forwarded request; every one must carry the trusted
+        # owner identity the full-flow outbound chain re-projects
+        # (project_state_owner_headers) plus the Authorization injected from the
+        # ogx_files credential, which only the executor path can add.
         captured = VectorStoreWitnessHandler.captured_headers
         assert captured, (
             "the file-search callout must forward at least one vector-store "
             "request through the outbound chain to OGX"
         )
         for headers in captured:
-            assert headers.get("x-vector-store-client") == "praxis-ai-gateway", (
-                "every vector-store request must carry the outbound_chain marker "
-                f"header, proving the callout ran; got headers: {headers}"
+            assert headers.get("x-tenant-id") == TRUSTED_OWNER_HEADERS[
+                "x-auth-tenant"
+            ], (
+                "every vector-store request must carry the re-projected tenant "
+                f"identity, proving the outbound chain ran; got headers: {headers}"
+            )
+            assert headers.get("x-user-id") == TRUSTED_OWNER_HEADERS[
+                "x-auth-user"
+            ], (
+                "every vector-store request must carry the re-projected subject "
+                f"identity, proving the outbound chain ran; got headers: {headers}"
+            )
+            assert headers.get("authorization") == "Bearer test", (
+                "every vector-store request must carry the Authorization injected "
+                f"from the ogx_files credential; got headers: {headers}"
             )
 
 
@@ -6300,63 +9856,25 @@ class TestFileSearchVLLM:
 # File search via Chat Completions translation (issue #296)
 # ---------------------------------------------------------------------------
 
-FILE_SEARCH_CHAT_CONFIG_PATH = (
-    "examples/configs/openai/responses/file-search-chat-completions.yaml"
-)
-
-
-def _write_file_search_chat_config(
-    praxis_port: int, backend_endpoint: str
-) -> str:
-    """Patch the shipped file-search-chat-completions example for testing.
-
-    Exercises the real example config (per repo test requirements) while
-    retargeting the vector-store callout at OGX and the model backend at the
-    selected /v1/chat/completions endpoint.
-
-    IRR / callout / backend read deadlines are widened to match
-    FILE_SEARCH_CONFIG_TEMPLATE: CPU-only vLLM plus OGX is slower when
-    the postgres store job co-locates those containers, and a 60s step
-    budget can expire before vLLM returns.
-    """
-    with open(FILE_SEARCH_CHAT_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:8001", _ogx_endpoint())
-    config = config.replace(
-        '                  - name: "chat-completions-backend"\n'
-        "                    endpoints:\n"
-        '                      - "127.0.0.1:3001"',
-        f'                  - name: "chat-completions-backend"\n'
-        f"                    read_timeout_ms: 300000\n"
-        f"                    endpoints:\n"
-        f'                      - "{backend_endpoint}"',
-    )
-    config = config.replace("timeout_ms: 120000", "timeout_ms: 300000")
-    config = config.replace("step_timeout_ms: 60000", "step_timeout_ms: 300000")
-    config = config.replace("timeout_ms: 5000", "timeout_ms: 30000")
-    if f'- "{backend_endpoint}"' not in config:
-        raise RuntimeError(
-            "file-search-chat-completions.yaml cluster block did not match; "
-            "Chat backend endpoint was not patched"
-        )
-
-    path = _persist_config(config)
-    return path
-
-
 @pytest.fixture(scope="session")
 def file_search_chat_proxy(
-    tmp_path_factory, request, backend_endpoint
+    tmp_path_factory, request, backend_endpoint, nemo_guardrails_server
 ):
     """Start a Praxis proxy with the file-search Chat Completions pipeline."""
     port = _free_port()
-    config_path = _write_file_search_chat_config(port, backend_endpoint)
+    db_dir = tmp_path_factory.mktemp("file-search-chat")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=backend_endpoint,
+        vector_store_endpoint=_ogx_endpoint(),
+        chat_translation_model=VLLM_MODEL,
+        nemo_port=nemo_guardrails_server,
+    )
     binary = _find_binary()
 
-    log_dir = tmp_path_factory.mktemp("file-search-chat")
-    log_path = str(log_dir / "praxis.log")
+    log_path = str(db_dir / "praxis.log")
     log_file = open(log_path, "w")
     started = False
 
@@ -6389,11 +9907,9 @@ def file_search_chat_proxy(
 @pytest.fixture(scope="session")
 def file_search_chat_client(file_search_chat_proxy):
     """Return an OpenAI client pointed at the file-search chat proxy."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{file_search_chat_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
+    return _make_openai_client(
+        file_search_chat_proxy,
+        default_headers={**TRUSTED_OWNER_HEADERS, "x-user-ogx-key": "Bearer test"},
     )
 
 
@@ -6401,7 +9917,7 @@ class TestFileSearchChatCompletionsVLLM:
     """Issue #296: hosted file_search against a Chat Completions backend.
 
     Unlike TestFileSearchVLLM (which proxies vLLM's native /v1/responses),
-    this drives responses_to_chat_completions: the native file_search tool
+    this drives openai_responses_to_chat_completions: the native file_search tool
     is synthesized into a private chat `function`, vLLM's
     /v1/chat/completions emits the call, the proxy runs the OGX vector-store
     search, and drives one more finite inference round -- without ever
@@ -6414,7 +9930,7 @@ class TestFileSearchChatCompletionsVLLM:
         store_id, marker = vector_store
         recorded_request_count = len(SimulatorBackendHandler.recorded_requests)
         response = file_search_chat_client.responses.create(
-            model=VLLM_MODEL,
+            model=CHAT_TRANSLATION_MODEL,
             input=(
                 "You MUST use the file_search tool to find the Praxis marker "
                 "in the indexed report. Do not answer from memory. /no_think"
@@ -6435,9 +9951,9 @@ class TestFileSearchChatCompletionsVLLM:
         )
 
         # The backend-lowered private function must not leak into the echoed
-        # request declarations. openai_file_search_callout rewrites
+        # request declarations. openai_file_search_dispatch rewrites
         # request_body.tools into {"type":"function","name":"file_search"} for the
-        # Chat backend, but responses_to_chat_completions must echo the hosted
+        # Chat backend, but openai_responses_to_chat_completions must echo the hosted
         # tool the client sent, derived from the preserved ResponsesState.tools.
         dumped = response.model_dump()
         echoed_tools = dumped.get("tools") or []
@@ -6499,6 +10015,10 @@ class TestFileSearchChatCompletionsVLLM:
             f"contain the indexed marker {marker!r}; got: {payload}"
         )
         if VLLM_TEST_BACKEND == "simulator":
+            # The Chat shim scripts this ID; native Responses generates its own.
+            assert any(
+                item.id == "fc_call_simulator_file_search" for item in file_search_items
+            ), "the scripted Chat function call's public id must be preserved"
             _assert_simulator_auto_tool_round(
                 recorded_request_count,
                 tool_name="file_search",
@@ -6509,57 +10029,24 @@ class TestFileSearchChatCompletionsVLLM:
 # Streaming hosted file search (issue #313)
 # ---------------------------------------------------------------------------
 
-FILE_SEARCH_STREAMING_CONFIG_PATH = (
-    "examples/configs/openai/responses/file-search-streaming.yaml"
-)
-
-
-def _write_file_search_streaming_config(
-    praxis_port: int, backend_endpoint: str
-) -> str:
-    """Patch the shipped file-search-streaming example for testing.
-
-    Exercises the real #313 streaming example config (per repo test
-    requirements) while retargeting the vector-store callout at OGX and the
-    model backend at vLLM's native /v1/responses endpoint. The shipped
-    example ships tight deadlines suited to a fast provider; CPU-only vLLM
-    under co-located CI load (postgres + vLLM + OGX) needs the wider budgets
-    already used by the agentic and non-streaming file-search fixtures.
-    """
-    with open(FILE_SEARCH_STREAMING_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:8001", _ogx_endpoint())
-    # Retarget the model backend and give it a generous read timeout, matching
-    # _write_agentic_config. This is also the only occurrence of :3001.
-    config = config.replace(
-        '- "127.0.0.1:3001"',
-        f'- "{backend_endpoint}"\n'
-        "                    read_timeout_ms: 300000",
-    )
-    # Widen the IRR and callout deadlines for slow CPU inference/search.
-    config = config.replace("timeout_ms: 120000", "timeout_ms: 300000")
-    config = config.replace("step_timeout_ms: 60000", "step_timeout_ms: 300000")
-    config = config.replace("timeout_ms: 5000", "timeout_ms: 30000")
-
-    path = _persist_config(config)
-    return path
-
-
 @pytest.fixture(scope="session")
 def file_search_streaming_proxy(
-    tmp_path_factory, request, file_search_backend
+    tmp_path_factory, request, file_search_backend, nemo_guardrails_server
 ):
-    """Start a Praxis proxy with the streaming file-search-callout pipeline."""
+    """Start a Praxis proxy with the streaming file-search-dispatch pipeline."""
     port = _free_port()
-    config_path = _write_file_search_streaming_config(
-        port, file_search_backend
+    db_dir = tmp_path_factory.mktemp("file-search-streaming")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=file_search_backend,
+        vector_store_endpoint=_ogx_endpoint(),
+        nemo_port=nemo_guardrails_server,
     )
     binary = _find_binary()
 
-    log_dir = tmp_path_factory.mktemp("file-search-streaming")
-    log_path = str(log_dir / "praxis.log")
+    log_path = str(db_dir / "praxis.log")
     log_file = open(log_path, "w")
     started = False
 
@@ -6592,11 +10079,9 @@ def file_search_streaming_proxy(
 @pytest.fixture(scope="session")
 def file_search_streaming_client(file_search_streaming_proxy):
     """Return an OpenAI client pointed at the streaming file-search proxy."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{file_search_streaming_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
+    return _make_openai_client(
+        file_search_streaming_proxy,
+        default_headers={**TRUSTED_OWNER_HEADERS, "x-user-ogx-key": "Bearer test"},
     )
 
 
@@ -6604,11 +10089,12 @@ def _drain_response_stream(stream):
     """Consume a Responses SSE stream.
 
     Returns the ordered event types, every output item announced via
-    output_item.added/.done, and the terminal response status.
+    output_item.added/.done, and the terminal response status and output.
     """
     event_types = []
     output_items = []
     terminal_status = None
+    terminal_output = []
     for event in stream:
         event_types.append(event.type)
         if event.type in (
@@ -6618,14 +10104,15 @@ def _drain_response_stream(stream):
             output_items.append(event.item)
         if event.type in ("response.completed", "response.incomplete"):
             terminal_status = event.response.status
-    return event_types, output_items, terminal_status
+            terminal_output = event.response.output
+    return event_types, output_items, terminal_status, terminal_output
 
 
 class TestFileSearchStreamingVLLM:
     """Issue #313: streaming hosted file_search (stream=True).
 
     Unlike TestFileSearchVLLM (buffered), this drives the #313 streaming
-    example config: openai_stream_events(logical_stream) + openai_file_search_callout
+    example config: openai_stream_events(logical_stream) + openai_file_search_dispatch
     + openai_responses_proxy (streaming transport auto-derived from
     stream=True). vLLM emits a private
     function_call(name=file_search), which the callout suppresses and replaces
@@ -6661,7 +10148,7 @@ class TestFileSearchStreamingVLLM:
             max_output_tokens=2048,
         )
 
-        event_types, output_items, terminal_status = _drain_response_stream(
+        event_types, output_items, terminal_status, terminal_output = _drain_response_stream(
             stream
         )
 
@@ -6685,6 +10172,14 @@ class TestFileSearchStreamingVLLM:
             "a hosted file_search_call item must be announced on the stream; "
             f"got event types: {event_types}"
         )
+        announced_ids = {item.id for item in file_search_items}
+        terminal_ids = {
+            item.id for item in terminal_output if item.type == "file_search_call"
+        }
+        assert terminal_ids == announced_ids, (
+            "the terminal output must retain each announced file-search ID; "
+            f"announced={announced_ids}, terminal={terminal_ids}"
+        )
         for item in file_search_items:
             assert item.status in ("searching", "completed", "incomplete"), (
                 "file_search_call status should be a known lifecycle state; "
@@ -6706,7 +10201,7 @@ class TestFileSearchStreamingVLLM:
             max_output_tokens=512,
         )
 
-        event_types, output_items, _status = _drain_response_stream(stream)
+        event_types, output_items, _status, _terminal_output = _drain_response_stream(stream)
 
         # The #756/#313 logical stream unifies the search round and the
         # terminal re-inference round into ONE client-visible envelope.
@@ -7257,7 +10752,7 @@ def test_invalid_model_raises_not_found_error(openai_client):
             input="Hello",
         )
 
-    assert exc_info.value.status_code == 404
+    assert exc_info.value.status_code == 404, "unknown model must return 404"
 
 
 @pytest.mark.xfail(
@@ -7274,8 +10769,8 @@ def test_invalid_max_tool_calls_raises_bad_request(openai_client):
             max_tool_calls=0,
         )
 
-    assert exc_info.value.status_code == 400
-    assert "max_tool_calls" in str(exc_info.value).lower()
+    assert exc_info.value.status_code == 400, "max_tool_calls=0 must return 400"
+    assert "max_tool_calls" in str(exc_info.value).lower(), "error must name max_tool_calls"
 
 
 @requires_vllm_compat
@@ -7288,8 +10783,8 @@ def test_invalid_temperature_raises_bad_request(openai_client):
             temperature=-1.0,
         )
 
-    assert exc_info.value.status_code == 400
-    assert "temperature" in str(exc_info.value).lower()
+    assert exc_info.value.status_code == 400, "invalid temperature must return 400"
+    assert "temperature" in str(exc_info.value).lower(), "error must name temperature"
 
 
 @requires_vllm_compat
@@ -7309,15 +10804,15 @@ def test_invalid_tool_choice_raises_bad_request(openai_client):
             tool_choice="invalid_choice",
         )
 
-    assert exc_info.value.status_code == 400
-    assert "tool_choice" in str(exc_info.value).lower()
+    assert exc_info.value.status_code == 400, "invalid tool_choice must return 400"
+    assert "tool_choice" in str(exc_info.value).lower(), "error must name tool_choice"
 
 
 def test_null_tool_choice_succeeds_sdk(chat_streaming_client):
     """Verify null is omitted upstream and normalized to auto for the client."""
     request_start = len(SimulatorBackendHandler.recorded_requests)
     response = chat_streaming_client.responses.create(
-        model=VLLM_MODEL,
+        model=CHAT_TRANSLATION_MODEL,
         input="Hello",
         tools=[
             {
@@ -7351,6 +10846,43 @@ def test_null_tool_choice_succeeds_sdk(chat_streaming_client):
         ]
 
 
+@pytest.mark.skipif(
+    VLLM_TEST_BACKEND != "simulator",
+    reason="the service-tier provider response is deterministically scripted",
+)
+def test_streaming_service_tier_snapshot_uses_provider_value(chat_streaming_client):
+    """Opening and terminal snapshots agree on the provider service tier."""
+    request_start = len(SimulatorBackendHandler.recorded_requests)
+    events = list(
+        chat_streaming_client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="STREAM-SERVICE-TIER-1549",
+            service_tier="auto",
+            store=False,
+            stream=True,
+        )
+    )
+
+    snapshots = [
+        event.response
+        for event in events
+        if event.type in {"response.created", "response.in_progress", "response.completed"}
+    ]
+    event_types = [event.type for event in events]
+    assert event_types.count("response.created") == 1, event_types
+    assert event_types.count("response.in_progress") == 1, event_types
+    assert len(snapshots) == 3, event_types
+    assert all(response.service_tier == "scale" for response in snapshots)
+
+    recorded = [
+        body
+        for path, body in SimulatorBackendHandler.recorded_requests[request_start:]
+        if path.rstrip("/").endswith("/v1/chat/completions")
+    ]
+    assert len(recorded) == 1, recorded
+    assert recorded[0]["service_tier"] == "auto", recorded[0]
+
+
 @pytest.mark.parametrize(
     "choice_case,tool_choice,with_tools",
     [
@@ -7377,7 +10909,7 @@ def test_valid_tool_choice_variants_raw_http(
 ):
     """Verify translated tool_choice variants in buffered and streaming modes."""
     body = {
-        "model": VLLM_MODEL,
+        "model": CHAT_TRANSLATION_MODEL,
         "input": "Hello",
         "stream": stream,
     }
@@ -7394,7 +10926,7 @@ def test_valid_tool_choice_variants_raw_http(
 
     raw = httpx.post(
         f"{str(chat_streaming_client.base_url).rstrip('/')}/responses",
-        headers={"Authorization": "Bearer test"},
+        headers={"Authorization": "Bearer test", **TRUSTED_OWNER_HEADERS},
         json=body,
         timeout=30,
     )
@@ -7435,9 +10967,9 @@ def test_malformed_tool_choice_variants_raw_http(
     """Verify malformed tool_choice variants return 400 over raw HTTP in buffered and streaming modes."""
     raw = httpx.post(
         f"{str(chat_streaming_client.base_url).rstrip('/')}/responses",
-        headers={"Authorization": "Bearer test"},
+        headers={"Authorization": "Bearer test", **TRUSTED_OWNER_HEADERS},
         json={
-            "model": VLLM_MODEL,
+            "model": CHAT_TRANSLATION_MODEL,
             "input": "Hello",
             "tools": [
                 {
@@ -7451,25 +10983,31 @@ def test_malformed_tool_choice_variants_raw_http(
         },
         timeout=30,
     )
-    assert raw.status_code == 400
-    assert "tool_choice" in raw.text.lower() or "invalid" in raw.text.lower()
+    assert raw.status_code == 400, "malformed tool_choice must return 400"
+    assert (
+        "tool_choice" in raw.text.lower() or "invalid" in raw.text.lower()
+    ), "error must identify the invalid tool_choice"
 
 
 # ---------------------------------------------------------------------------
 # openai_file_resolve outbound-chain (fully stubbed upstreams; no vLLM/OGX)
 # ---------------------------------------------------------------------------
 
-FILE_RESOLVE_CONFIG_PATH = "examples/configs/openai/responses/file-resolve.yaml"
 _FILE_RESOLVE_CONTENT = b"Hello, world!"
 _FILE_RESOLVE_B64 = "SGVsbG8sIHdvcmxkIQ=="  # base64("Hello, world!")
 _FILE_RESOLVE_ID = "test-file-123"
+# The filename carries a .pdf extension so the full-flow ``openai_doc_extract``
+# filter (absent from the retired isolated config) classifies the resolved
+# content as a non-text-safe MIME and skips it (on_unsupported: continue),
+# leaving the inlined ``file_data`` base64 intact for the assertions below. A
+# text extension would make doc_extract rewrite the part into input_text.
 _FILE_RESOLVE_METADATA = json.dumps(
     {
         "id": _FILE_RESOLVE_ID,
         "object": "file",
         "bytes": len(_FILE_RESOLVE_CONTENT),
         "created_at": 1750000000,
-        "filename": "test.txt",
+        "filename": "test.pdf",
         "purpose": "user_data",
     }
 ).encode()
@@ -7510,22 +11048,34 @@ _FILE_RESOLVE_STUB_RESPONSE = {
 class _FilesApiStubHandler(BaseHTTPRequestHandler):
     """Files API stub for `file_id` callouts.
 
-    Answers metadata and content only when the outbound chain stamped
-    ``x-file-callout: file-resolve`` on the callout, so a resolved file proves
-    the bound outbound pipeline executed.
+    Answers metadata and content only when the full-flow outbound chain
+    re-projected the trusted owner identity onto the callout
+    (``x-tenant-id``/``x-user-id`` via project_state_owner_headers) AND injected
+    the ``ogx_files`` credential (``Authorization: Bearer test``), so a resolved
+    file proves both the bound outbound pipeline executed and the credential was
+    injected. Captures the re-projected identity and credential of every callout
+    for the assertions below.
     """
 
-    callout_headers: ClassVar[list[str | None]] = []
+    callout_headers: ClassVar[list[dict[str, str | None]]] = []
 
     def do_GET(self):
-        header = self.headers.get("x-file-callout")
-        type(self).callout_headers.append(header)
-        if header != "file-resolve":
+        identity = {
+            "x-tenant-id": self.headers.get("x-tenant-id"),
+            "x-user-id": self.headers.get("x-user-id"),
+            "authorization": self.headers.get("Authorization"),
+        }
+        type(self).callout_headers.append(identity)
+        if (
+            identity["x-tenant-id"] != TRUSTED_OWNER_HEADERS["x-auth-tenant"]
+            or identity["x-user-id"] != TRUSTED_OWNER_HEADERS["x-auth-user"]
+            or identity["authorization"] != "Bearer test"
+        ):
             self.send_response(403)
             self.end_headers()
             return
         if self.path == f"/v1/files/{_FILE_RESOLVE_ID}/content":
-            body, ctype = _FILE_RESOLVE_CONTENT, "text/plain"
+            body, ctype = _FILE_RESOLVE_CONTENT, "application/pdf"
         elif self.path == f"/v1/files/{_FILE_RESOLVE_ID}":
             body, ctype = _FILE_RESOLVE_METADATA, "application/json"
         else:
@@ -7545,17 +11095,41 @@ class _FilesApiStubHandler(BaseHTTPRequestHandler):
 class _FileUrlStubHandler(BaseHTTPRequestHandler):
     """Client-controlled `file_url` stub.
 
-    Serves content only when the outbound-chain header is ABSENT, proving the
-    credentialed outbound chain never runs for client-supplied URLs.
+    Serves content only when the re-projected owner identity is ABSENT, proving
+    the credentialed outbound chain never runs for client-supplied URLs (the
+    credential-free resolver downloads with an empty header map). Serves an
+    ``application/pdf`` content type so the full-flow ``openai_doc_extract``
+    filter leaves the inlined data URI intact for the assertions below.
     """
 
+    requests: ClassVar[int] = 0
+
     def do_GET(self):
-        if self.headers.get("x-file-callout") is not None:
+        type(self).requests += 1
+        # The credential-free resolver downloads client-supplied file_url targets
+        # with an EMPTY header map. Reject if the re-projected owner identity
+        # (x-tenant-id/x-user-id) OR any credential (the ogx_files Authorization
+        # or the raw x-user-ogx-key secret) leaks onto this request, so a
+        # regression that routes file_url through the credentialed outbound chain
+        # fails here instead of silently serving content.
+        leaked = [
+            name
+            for name in (
+                "x-auth-tenant",
+                "x-auth-user",
+                "x-tenant-id",
+                "x-user-id",
+                "authorization",
+                "x-user-ogx-key",
+            )
+            if self.headers.get(name) is not None
+        ]
+        if leaked:
             self.send_response(403)
             self.end_headers()
             return
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", "application/pdf")
         self.send_header("Content-Length", str(len(_FILE_RESOLVE_CONTENT)))
         self.end_headers()
         self.wfile.write(_FILE_RESOLVE_CONTENT)
@@ -7587,64 +11161,48 @@ class _FileResolveBackendHandler(BaseHTTPRequestHandler):
         pass
 
 
-def _write_file_resolve_config(
-    praxis_port: int,
-    files_port: int,
-    backend_port: int,
-    default_port: int,
-    file_url_port: int,
-) -> str:
-    """Patch the shipped file-resolve example for stubbed upstreams."""
-    with open(FILE_RESOLVE_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    # files_api_url and the files-api cluster endpoint both use :9999.
-    config = config.replace("127.0.0.1:9999", f"127.0.0.1:{files_port}")
-    config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
-    config = config.replace("127.0.0.1:3002", f"127.0.0.1:{default_port}")
-    # Allow the loopback file_url stub so the client-URL branch resolves
-    # without traversing the credentialed outbound chain.
-    config = config.replace(
-        "        file_url: resolve",
-        "        file_url: resolve\n"
-        "        allowed_file_url_origins:\n"
-        f'          - "http://127.0.0.1:{file_url_port}"',
-    )
-
-    return _persist_config(config)
-
-
 @pytest.fixture()
 def file_resolve_stub_env(tmp_path_factory, request):
     """Function-scoped file-resolve proxy with fully stubbed upstreams.
 
     Needs only the compiled binary — no vLLM and no OGX — so it exercises the
-    ``openai_file_resolve`` outbound-chain flow through the OpenAI SDK. Yields
+    full-flow ``openai_file_resolve`` outbound-chain flow through the OpenAI SDK.
+    The files stub stands in for both the ``files_api_url`` callout target and
+    the files-api cluster (full-flow shares :9999), and the inference stub stands
+    in for the native Responses backend. Yields
     ``(client, files_stub, backend, file_url)``.
     """
     _FilesApiStubHandler.callout_headers = []
+    _FileUrlStubHandler.requests = 0
     _FileResolveBackendHandler.captured = []
 
-    files_port = _free_port()
-    backend_port = _free_port()
-    default_port = _free_port()
-    file_url_port = _free_port()
-
-    servers = [
-        HTTPServer(("127.0.0.1", files_port), _FilesApiStubHandler),
-        HTTPServer(("127.0.0.1", backend_port), _FileResolveBackendHandler),
-        HTTPServer(("127.0.0.1", file_url_port), _FileUrlStubHandler),
-    ]
-    for server in servers:
+    servers = []
+    for handler in (
+        _FilesApiStubHandler,
+        _FileResolveBackendHandler,
+        _FileUrlStubHandler,
+    ):
+        # Keep each ephemeral port bound instead of probing and releasing it.
+        server = HTTPServer(("127.0.0.1", 0), handler)
+        request.addfinalizer(server.server_close)
         threading.Thread(target=server.serve_forever, daemon=True).start()
+        request.addfinalizer(server.shutdown)
+        servers.append(server)
+    files_port, backend_port, file_url_port = (
+        server.server_port for server in servers
+    )
 
     port = _free_port()
-    log_dir = tmp_path_factory.mktemp("file-resolve-stub")
-    log_path = str(log_dir / "praxis.log")
+    db_dir = tmp_path_factory.mktemp("file-resolve-stub")
+    db_path = str(db_dir / "responses.db")
+    log_path = str(db_dir / "praxis.log")
     log_file = open(log_path, "w")
-    config_path = _write_file_resolve_config(
-        port, files_port, backend_port, default_port, file_url_port
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=f"127.0.0.1:{backend_port}",
+        ogx_endpoint=f"127.0.0.1:{files_port}",
+        file_url_origin=f"http://127.0.0.1:{file_url_port}",
     )
     started = False
     proc = subprocess.Popen(
@@ -7655,10 +11213,12 @@ def file_resolve_stub_env(tmp_path_factory, request):
     try:
         _wait_for_proxy(port, proc, log_path)
         started = True
-        client = OpenAI(
-            base_url=f"http://127.0.0.1:{port}/v1",
-            api_key="test",
-            max_retries=0,
+        client = _make_openai_client(
+            port,
+            default_headers={
+                **TRUSTED_OWNER_HEADERS,
+                "x-user-ogx-key": "Bearer test",
+            },
             timeout=60,
         )
         yield (
@@ -7675,8 +11235,6 @@ def file_resolve_stub_env(tmp_path_factory, request):
             proc.kill()
             proc.wait()
         log_file.close()
-        for server in servers:
-            server.shutdown()
         if not started or request.session.testsfailed > 0:
             with open(log_path) as f:
                 print(
@@ -7696,11 +11254,12 @@ class TestFileResolveOutboundChain:
         ``example_config_outbound_chain_runs_for_file_id_not_file_url``.
 
         One request carries both a ``file_id`` and a client ``file_url``. The
-        Files API stub answers only when the outbound chain stamped
-        ``x-file-callout``; the ``file_url`` stub answers only when it did not.
-        A single completed response with both parts inlined therefore proves the
-        credentialed outbound chain ran for the ``file_id`` callout but never for
-        the client-controlled ``file_url`` download.
+        Files API stub answers only when the outbound chain re-projected the
+        owner identity (``x-tenant-id``/``x-user-id``); the ``file_url`` stub
+        answers only when it did not. A single completed response with both parts
+        inlined therefore proves the credentialed outbound chain ran for the
+        ``file_id`` callout but never for the client-controlled ``file_url``
+        download.
         """
         client, files_stub, backend, file_url = file_resolve_stub_env
 
@@ -7730,52 +11289,124 @@ class TestFileResolveOutboundChain:
 
         # file_url inlined as a data URI (the outbound chain did NOT run for it).
         assert content[1]["file_data"] == (
-            f"data:text/plain;base64,{_FILE_RESOLVE_B64}"
+            f"data:application/pdf;base64,{_FILE_RESOLVE_B64}"
         ), content
 
-        # Every Files API callout carried the outbound-chain marker header.
+        # Every Files API callout carried the re-projected owner identity and the
+        # injected ogx_files credential, proving the credentialed outbound chain
+        # ran for the file_id callout.
         assert files_stub.callout_headers, "Files API stub should receive callouts"
-        assert all(h == "file-resolve" for h in files_stub.callout_headers), (
-            files_stub.callout_headers
+        assert all(
+            h["x-tenant-id"] == TRUSTED_OWNER_HEADERS["x-auth-tenant"]
+            and h["x-user-id"] == TRUSTED_OWNER_HEADERS["x-auth-user"]
+            and h["authorization"] == "Bearer test"
+            for h in files_stub.callout_headers
+        ), files_stub.callout_headers
+
+    def test_repeated_file_references_reuse_source_specific_cache(
+        self, file_resolve_stub_env
+    ):
+        client, files_stub, backend, file_url = file_resolve_stub_env
+
+        response = client.responses.create(
+            model="gpt-4.1",
+            input=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_file", "file_id": _FILE_RESOLVE_ID},
+                        {"type": "input_file", "file_id": _FILE_RESOLVE_ID},
+                        {"type": "input_file", "file_url": file_url},
+                        {"type": "input_file", "file_url": file_url},
+                    ],
+                }
+            ],
+            store=False,
         )
+
+        assert response.status == "completed", "file resolution should complete"
+        assert len(backend.captured) == 1, "one Responses request should reach the backend"
+        content = backend.captured[0]["input"][0]["content"]
+        assert [part["file_data"] for part in content] == [
+            _FILE_RESOLVE_B64,
+            _FILE_RESOLVE_B64,
+            f"data:application/pdf;base64,{_FILE_RESOLVE_B64}",
+            f"data:application/pdf;base64,{_FILE_RESOLVE_B64}",
+        ], "repeated file IDs and URLs should inline in input order"
+        assert len(files_stub.callout_headers) == 2, (
+            "one metadata and one content fetch should serve both file_id parts"
+        )
+        assert _FileUrlStubHandler.requests == 1, (
+            "repeated file_url parts should share one fetch"
+        )
+
+    def test_file_url_rejects_cloud_metadata(self, file_resolve_stub_env):
+        """Private-origin opt-ins must not grant access to metadata services."""
+        client, _, backend, _ = file_resolve_stub_env
+        path_secret = "PATH_BEARER_SECRET"
+
+        with pytest.raises(PermissionDeniedError) as exc_info:
+            client.responses.create(
+                model="gpt-4.1",
+                input=[
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_file",
+                                "file_url": (
+                                    "http://169.254.169.254/"
+                                    f"{path_secret}/latest/meta-data/"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 403, "metadata file URLs should return 403"
+        assert "blocked by security policy" in str(
+            exc_info.value
+        ), "metadata file URLs should report the security-policy rejection"
+        assert path_secret not in str(
+            exc_info.value
+        ), "credential-bearing URL paths must not appear in client errors"
+        assert backend.captured == [], "blocked metadata requests must not reach the backend"
 
 
 # ---------------------------------------------------------------------------
 # Model rewrite on Chat Completions
 # ---------------------------------------------------------------------------
 
-MODEL_REWRITE_CONFIG_PATH = "examples/configs/openai/responses/model-rewrite.yaml"
-
 # The client-facing name the alias table maps onto the real backend model.
-# Matches the shipped example's "codex-*" wildcard alias.
+# Matches the full-flow native Chat ingress policy's "codex-*" wildcard alias
+# (instance B), which rewrites it to the backend model on POST
+# /v1/chat/completions before binding the direct passthrough cluster.
 MODEL_REWRITE_CLIENT_MODEL = "codex-mini-2026-06-24"
-
-
-def _write_model_rewrite_config(praxis_port: int, backend_endpoint: str) -> str:
-    """Patch the shipped model-rewrite example for the selected backend.
-
-    Substituting the backend model name for the example's `llama-3.3-70b`
-    updates the alias target, the `default_model`, and the router's
-    `x-praxis-ai-effective-model` match in one pass, so the rewritten model
-    is both what the backend receives and what selects the cluster. All
-    three example clusters point at the one backend under test.
-    """
-    with open(MODEL_REWRITE_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    for placeholder in ("127.0.0.1:3001", "127.0.0.1:3002", "127.0.0.1:3003"):
-        config = config.replace(placeholder, backend_endpoint)
-    config = config.replace("llama-3.3-70b", VLLM_MODEL)
-
-    return _persist_config(config)
 
 
 @pytest.fixture(scope="session")
 def model_rewrite_proxy(tmp_path_factory, request, backend_endpoint):
-    """Start a Praxis proxy with the shipped model-rewrite pipeline."""
+    """Start the unified full-flow gateway for native Chat model rewrite.
+
+    The native Chat ingress model policy (full-flow instance B) rewrites the
+    client-facing ``codex-*`` alias and the default model to the backend model
+    before the request leaves the proxy, then binds POST /v1/chat/completions to
+    a direct passthrough cluster. ``chat_rewrite_model`` retargets that policy at
+    the model the live Chat backend serves so the rewrite is accepted.
+    """
     port = _free_port()
-    config_path = _write_model_rewrite_config(port, backend_endpoint)
+    db_dir = tmp_path_factory.mktemp("model-rewrite-db")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=backend_endpoint,
+        chat_rewrite_model=VLLM_MODEL,
+    )
     binary = _find_binary()
 
     log_dir = tmp_path_factory.mktemp("model-rewrite")
@@ -7812,11 +11443,8 @@ def model_rewrite_proxy(tmp_path_factory, request, backend_endpoint):
 @pytest.fixture(scope="session")
 def model_rewrite_client(model_rewrite_proxy):
     """Return an OpenAI client pointed at the model-rewrite proxy."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{model_rewrite_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
+    return _make_openai_client(
+        model_rewrite_proxy, default_headers=TRUSTED_OWNER_HEADERS
     )
 
 
@@ -7876,11 +11504,55 @@ class TestModelRewriteChatCompletionsVLLM:
                 "messages": [{"role": "user", "content": "Say hi."}],
                 "max_tokens": 16,
             },
+            headers=TRUSTED_OWNER_HEADERS,
             timeout=300.0,
         )
 
         assert response.status_code == 200, response.text
         assert response.json()["model"] == VLLM_MODEL, response.text
+
+
+# ---------------------------------------------------------------------------
+# Time to first token: native Chat Completions model label
+# ---------------------------------------------------------------------------
+
+
+@requires_real_inference
+def test_native_chat_completions_ttft_labeled_by_request_model(ttft_proxy):
+    """A streamed native chat completion labels TTFT with its request model.
+
+    Drives ``openai_chat_completions_request`` through the OpenAI client: the
+    filter reads the model from the native ``POST /v1/chat/completions`` body and
+    publishes the fact ``time_to_first_token`` records as the
+    ``praxis_ai_ttft_seconds`` model label. Without the request filter the sample
+    would fall back to ``unknown``.
+    """
+    praxis_port, metrics_port = ttft_proxy
+    client = _make_openai_client(praxis_port)
+
+    stream = client.chat.completions.create(
+        model=VLLM_MODEL,
+        messages=[{"role": "user", "content": "Say hello in one word."}],
+        max_tokens=16,
+        stream=True,
+    )
+    chunks = list(stream)
+    assert chunks, "native chat completion should stream at least one chunk"
+
+    # The histogram is recorded as the first SSE chunk is relayed on the response
+    # path; retry briefly so the scrape never races the recorder's render.
+    deadline = time.monotonic() + 10
+    metrics_text = ""
+    while time.monotonic() < deadline:
+        metrics_text = _scrape_metrics(metrics_port)
+        if _has_ttft_sample_for_model(metrics_text, VLLM_MODEL):
+            break
+        time.sleep(0.2)
+
+    assert _has_ttft_sample_for_model(metrics_text, VLLM_MODEL), (
+        "praxis_ai_ttft_seconds must carry a sample labeled with the request "
+        f"model {VLLM_MODEL!r}; got:\n{metrics_text}"
+    )
 
 
 if __name__ == "__main__":

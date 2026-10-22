@@ -1,6 +1,6 @@
 version: 1
 id: messages/malformed-tool-arguments
-description: Malformed Chat Completions tool arguments convert to an Anthropic API error envelope instead of a fabricated tool_use.
+description: Malformed Chat Completions tool arguments become an HTTP 500 Anthropic API error instead of a fabricated tool_use.
 protocol: anthropic_messages
 example_config: anthropic/messages-to-openai.yaml
 upstream_authority: 127.0.0.1:8000
@@ -14,6 +14,8 @@ turns:
       headers:
         content-type:
           - application/json
+        x-request-id:
+          - req_malformed_tool
       body:
         kind: json
         value:
@@ -24,7 +26,7 @@ turns:
             - role: user
               content: Use the weather tool.
     expect:
-      client_status: 200
+      client_status: 500
       client_body_kind: json
       upstream_path: /v1/chat/completions
       upstream_body_kind: json

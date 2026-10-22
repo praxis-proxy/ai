@@ -2,6 +2,10 @@
 // Copyright (c) 2026 Praxis Contributors
 
 #![allow(unreachable_pub, reason = "migration: visibility will be tightened")]
+// The praxis 0.7.5 subrequest connector type graph is deep enough that
+// auto-trait (`Send`/`Sync`) resolution for subrequest-driven filter futures
+// exceeds the default recursion limit.
+#![recursion_limit = "256"]
 
 //! AI provider API types and persistence for Praxis.
 //!
@@ -11,19 +15,24 @@
 
 pub mod anthropic;
 pub mod azure;
+pub mod bedrock;
 mod callout_credentials;
 pub mod callout_headers;
 mod callout_identity;
 pub mod callout_policy;
 pub mod callout_target;
 pub mod classifier;
+pub mod credential_source;
 pub mod hash;
+#[cfg(all(test, feature = "openai-responses"))]
+mod history_allocation_tests;
 pub mod http_hop;
 pub mod json_body;
 #[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_client;
 pub mod openai;
 pub mod operation;
+pub mod operation_classifier;
 mod project_state_owner_headers;
 pub mod promotion;
 #[cfg(feature = "store")]
@@ -35,6 +44,9 @@ pub mod subrequest;
 pub mod token_cache;
 pub mod vertex;
 pub(crate) mod web_search;
+
+/// Request metadata carrying the client model ID across a provider target rewrite.
+pub const MODEL_PROVIDER_CLIENT_MODEL_METADATA: &str = "model_to_provider.client_model";
 
 pub use callout_credentials::{CalloutCredentials, CalloutCredentialsFilter};
 pub use praxis_ai_store::{StateOwner, StateOwnerError};
@@ -115,6 +127,7 @@ pub(crate) mod test_utils {
             cluster: None,
             current_filter_id: None,
             downstream_tls: false,
+            hedge_policy: None,
             extensions: RequestExtensions::default(),
             executed_filter_indices: Vec::new(),
             executed_branch_filters: Vec::new(),
@@ -167,7 +180,7 @@ pub(crate) mod test_utils {
     }
 
     /// Build a stable owner for tests that previously supplied only a tenant.
-    #[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
+    #[cfg(any(feature = "store-sqlite", feature = "_store-postgres"))]
     #[cfg_attr(
         not(feature = "store-sqlite"),
         allow(
@@ -205,11 +218,15 @@ pub(crate) mod test_utils {
         );
         praxis_filter::register_filters!(
             @register registry,
-            http "openai_responses_format" => crate::openai::ResponsesFormatFilter::from_config
+            http "ai_operation" => crate::operation_classifier::AiOperationFilter::from_config
         );
         praxis_filter::register_filters!(
             @register registry,
-            http "openai_response_store" => crate::openai::ResponseStoreFilter::from_config
+            http "openai_responses_request" => crate::openai::OpenaiResponsesRequestFilter::from_config
+        );
+        praxis_filter::register_filters!(
+            @register registry,
+            http "openai_responses_store" => crate::openai::ResponseStoreFilter::from_config
         );
         praxis_filter::register_filters!(
             @register registry,
@@ -217,7 +234,7 @@ pub(crate) mod test_utils {
         );
         praxis_filter::register_filters!(
             @register registry,
-            http "openai_stream_events" => crate::openai::OpenaiStreamEventsFilter::from_config
+            http "openai_stream_events" => crate::openai::StreamEventsFilter::from_config
         );
         registry
     }

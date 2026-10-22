@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Guard provider trait, result types, and provider implementations
-//! for external AI guardrails.
+//! Result types and the `NeMo` provider for external AI guardrails.
 
 pub(super) mod nemo;
 
 use std::{fmt, sync::Arc, time::Instant};
 
-use async_trait::async_trait;
-use praxis_filter::{FilterError, SubrequestRuntime};
+use praxis_filter::SubrequestRuntime;
 
 // -----------------------------------------------------------------------------
 // GuardPhase
@@ -44,6 +42,16 @@ impl fmt::Display for GuardPhase {
 // GuardResult
 // -----------------------------------------------------------------------------
 
+/// One rewritten chat message produced by a `modified` provider verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageRedaction {
+    /// Index into the extracted `messages` array (request) or
+    /// `choices[].message` array (response).
+    pub index: usize,
+    /// Provider-rewritten text for this message.
+    pub modified_text: String,
+}
+
 /// Normalized verdict from an external guardrail provider evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuardResult {
@@ -55,12 +63,9 @@ pub enum GuardResult {
         reason: String,
     },
     /// Content contains sensitive data — forward with masked text.
-    ///
-    /// `modified_text` is populated from `NeMo` but not applied to the request
-    /// or response body until redaction support lands in `#49`.
     Redact {
-        /// Provider-rewritten text with sensitive data masked.
-        modified_text: String,
+        /// Per-message replacements to apply to the buffered body.
+        replacements: Vec<MessageRedaction>,
         /// Human-readable redaction reason from the provider.
         reason: String,
     },
@@ -75,6 +80,14 @@ impl GuardResult {
             Self::Pass => "passed",
             Self::Block { .. } => "blocked",
             Self::Redact { .. } => "redacted",
+        }
+    }
+
+    /// Build a `modified` verdict that rewrites a single extracted message.
+    pub fn redact_message(index: usize, modified_text: String, reason: String) -> Self {
+        Self::Redact {
+            replacements: vec![MessageRedaction { index, modified_text }],
+            reason,
         }
     }
 }
@@ -97,34 +110,6 @@ pub(crate) struct GuardCalloutRuntime<'a> {
 }
 
 // -----------------------------------------------------------------------------
-// GuardProvider trait
-// -----------------------------------------------------------------------------
-
-/// Trait every external guard provider must implement.
-///
-/// The provider receives pre-extracted messages from the filter
-/// (the filter handles bytes → JSON parsing and message extraction).
-///
-/// Each provider is responsible for:
-/// 1. Building the provider-specific HTTP payload
-/// 2. Calling the external service
-/// 3. Mapping the response to [`GuardResult`]
-///
-/// On failure (network error, timeout, bad response), return
-/// `Err(FilterError)`. The pipeline's per-filter `failure_mode`
-/// (open/closed) handles what happens next.
-#[async_trait]
-pub trait GuardProvider: Send + Sync {
-    /// Evaluate the extracted messages against the external guard service.
-    async fn evaluate(
-        &self,
-        messages: Vec<serde_json::Value>,
-        phase: GuardPhase,
-        runtime: &GuardCalloutRuntime<'_>,
-    ) -> Result<GuardResult, FilterError>;
-}
-
-// -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
@@ -143,11 +128,7 @@ mod tests {
         assert_eq!(GuardResult::Pass.status_label(), "passed");
         assert_eq!(GuardResult::Block { reason: "test".into() }.status_label(), "blocked");
         assert_eq!(
-            GuardResult::Redact {
-                modified_text: "***".into(),
-                reason: "pii".into()
-            }
-            .status_label(),
+            GuardResult::redact_message(0, "***".into(), "pii".into()).status_label(),
             "redacted"
         );
     }

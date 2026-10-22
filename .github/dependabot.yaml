@@ -14,6 +14,16 @@ updates:
     schedule:
       interval: "weekly"
 
+  - package-ecosystem: "docker"
+    directory: "/vllm"
+    schedule:
+      interval: "weekly"
+    labels:
+      - docker
+      - dependencies
+    commit-message:
+      prefix: "chore(vllm)"
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

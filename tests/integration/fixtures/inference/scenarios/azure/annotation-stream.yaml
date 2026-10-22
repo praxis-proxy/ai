@@ -1,0 +1,31 @@
+version: 1
+id: azure/annotation-stream
+description: Preserve Chat streaming payload and usage while removing Azure annotations.
+protocol: openai_chat_completions
+example_config: azure/chat-completions-to-openai-fixture.yaml
+upstream_authority: 127.0.0.1:3000
+features:
+  - azure.chat.response.annotation_stream
+turns:
+  - name: usage-and-annotations
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: user
+              content: Hi
+          stream: true
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

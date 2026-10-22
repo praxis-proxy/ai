@@ -1,0 +1,85 @@
+# Token Rate Limiting -- Soft Over-Quota Enforcement (ai#1241)
+#
+# Per-rule `enforcement` chooses what happens when the algorithm denies a
+# reservation because the token budget is exhausted:
+#
+#   hard   (default)  → 429 + X-RateLimit-*-Tokens response headers
+#   soft              → forward the request and annotate it for downstream
+#                       handling (deprioritize, degrade, meter-only, etc.)
+#
+# Soft requires an `over_quota:` annotation surface. Static headers are
+# always set; optional `include_remaining` / `include_used` add dynamic
+# quota metadata from the backend denial snapshot (`remaining`, and
+# `limit - remaining` for used).
+#
+# Soft over-quota forwards are not reserved or reconciled: the window is
+# not charged for that traffic (annotate only). Protective denials
+# (invalid key, key/reservation capacity) still 429 even under soft.
+#
+# Graduated S1 tiers (see token-rate-limit-soft-tiers.yaml) still annotate
+# *admitted* traffic below capacity. Soft here covers the path *above*
+# capacity that would otherwise be a hard 429.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy --features token-rate-limit-filter -- \
+#     -c examples/configs/token-rate-limit-soft-enforcement.yaml
+#
+# Supported token_count provider values:
+#   openai | anthropic | google | bedrock | azure
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path: "/v1/chat/completions"
+            cluster: backend
+
+      - filter: token_rate_limit
+        rules:
+          # Soft: over-quota requests continue with annotation.
+          - name: team-soft
+            match:
+              headers:
+                x-app-id: soft
+            algorithm: sliding_window
+            window: 1h
+            capacity: 100000
+            reserved_tokens: 500
+            enforcement: soft
+            over_quota:
+              headers:
+                X-Over-Quota: "true"
+                X-Token-Priority: low
+              include_remaining: true
+              include_used: true
+
+          # Hard (default): exhausted budget → 429.
+          - name: team-hard
+            match:
+              headers:
+                x-app-id: hard
+            algorithm: sliding_window
+            window: 1h
+            capacity: 50000
+            reserved_tokens: 200
+
+      - filter: token_count
+        provider: openai
+
+      - filter: access_log
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true

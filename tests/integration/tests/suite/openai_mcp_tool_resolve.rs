@@ -11,6 +11,15 @@ use praxis_test_utils::{
 };
 
 // =============================================================================
+// Constants
+// =============================================================================
+
+/// Controlled loopback address used for runtime connection-failure tests.
+/// Their configs explicitly opt into private upstreams so the requests pass
+/// address validation without contacting an external service.
+const CONTROLLED_MCP_FAILURE_HOST: &str = "127.0.0.1";
+
+// =============================================================================
 // Pass-Through (no MCP tools)
 // =============================================================================
 
@@ -135,12 +144,12 @@ fn mcp_unreachable_server_returns_502() {
     let proxy_port = free_port();
     let dead_port = free_port();
 
-    let yaml = resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500);
+    let yaml = with_private_upstreams(resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"dead","server_url":"http://192.0.2.1:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"dead","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -153,12 +162,12 @@ fn streaming_mcp_unreachable_server_emits_failed_event() {
     let proxy_port = free_port();
     let dead_port = free_port();
 
-    let yaml = resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500);
+    let yaml = with_private_upstreams(resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","stream":true,"tools":[{{"type":"mcp","server_label":"dead","server_url":"http://192.0.2.1:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","stream":true,"tools":[{{"type":"mcp","server_label":"dead","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -181,7 +190,7 @@ fn streaming_mcp_unreachable_server_emits_failed_event() {
         "failed MCP output item should identify the server: {response_body}"
     );
     // The lifecycle snapshots echo the requested model. In the shipped pipeline
-    // the format filter promotes it to `openai_responses_format.model` metadata,
+    // the classifier promotes it to `openai_responses_request.model` metadata,
     // so this exercises the metadata branch (not the ResponsesState fallback the
     // unit tests cover).
     assert!(
@@ -198,7 +207,7 @@ fn streaming_mcp_unreachable_server_emits_failed_event() {
 // mcp_tool_resolve). A streaming `tools/list` runtime failure is emitted as a
 // 200 SSE lifecycle; because it is a `TerminalResponse` (not a `Reject`), the
 // response phase runs `openai_stream_events` (which accumulates the terminal
-// `response.failed`) and `openai_response_store` (which persists it) so a caller
+// `response.failed`) and `openai_responses_store` (which persists it) so a caller
 // can later retrieve the failed response -- all without contacting the backend.
 // =============================================================================
 
@@ -292,15 +301,12 @@ fn run_streaming_mcp_failure_with_yaml(
     let dead_port = free_port();
     let db = TempSqlite::new(test_name);
 
-    let yaml = build_yaml(proxy_port, backend.port(), db.url(), 500);
+    let yaml = with_private_upstreams(build_yaml(proxy_port, backend.port(), db.url(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): guaranteed unreachable, so the
-    // discovery attempt reaches runtime I/O and fails (a runtime failure), not a
-    // local request-policy failure like SSRF.
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","stream":true{extra_fields},"tools":[{{"type":"mcp","server_label":"weather","server_url":"http://192.0.2.1:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","stream":true{extra_fields},"tools":[{{"type":"mcp","server_label":"weather","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
     assert_eq!(
@@ -481,7 +487,7 @@ async fn streaming_list_failure_persists_when_stream_events_after_resolve() {
 /// Regression for a persistence gap in the store-without-validate/rehydrate
 /// configuration: when no filter builds a `ResponsesState` before the resolver,
 /// the terminal-failure build must CREATE the state (not just mutate an existing
-/// one) so `openai_response_store` has a `response_object` to persist. With a
+/// one) so `openai_responses_store` has a `response_object` to persist. With a
 /// `get_mut`-only write this GET would 404 despite `store` defaulting to enabled;
 /// `get_or_insert_with` makes the failed response retrievable regardless of which
 /// upstream filters ran.
@@ -742,12 +748,12 @@ fn authorization_with_unreachable_server_returns_502() {
     let proxy_port = free_port();
     let dead_port = free_port();
 
-    let yaml = resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500);
+    let yaml = with_private_upstreams(resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"auth","server_url":"http://192.0.2.1:{dead_port}/mcp","authorization":"tok_secret","headers":{{"x-custom":"val"}},"allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"auth","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","authorization":"tok_secret","headers":{{"x-custom":"val"}},"allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -768,12 +774,12 @@ fn mcp_tool_names_filter_object_accepted() {
     let proxy_port = free_port();
     let dead_port = free_port();
 
-    let yaml = resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500);
+    let yaml = with_private_upstreams(resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"srv","server_url":"http://192.0.2.1:{dead_port}/mcp","allowed_tools":{{"tool_names":["get_weather"]}}}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"srv","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":{{"tool_names":["get_weather"]}}}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -953,6 +959,106 @@ fn changed_direct_url_does_not_reuse_unbound_cached_tools() {
         new_mcp.method_count("tools/list"),
         new_list_calls,
         "A → B → B with identical tool names should reuse B's private listing"
+    );
+}
+
+#[test]
+fn protected_mode_rejects_a_restored_cached_direct_listing() {
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("delete_docs").with_annotations(serde_json::json!({
+            "readOnlyHint": true
+        }))],
+        ..McpMockConfig::default()
+    });
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let backend_response = r#"{"id":"resp_previous","created_at":1000,"model":"gpt-4.1","status":"completed","output":[{"type":"mcp_list_tools","server_label":"docs","tools":[{"name":"delete_docs","annotations":{"readOnlyHint":true}}]}]}"#;
+    let backend = StatefulCapturingBackend::new(vec![(200, backend_response.to_owned()); 3]).start_with_shutdown();
+    let db = TempSqlite::new("mcp_protected_restored_cache");
+
+    // Save a directly discovered listing while admission is advisory, then
+    // prove the previous_response_id path actually reuses that stored listing.
+    let proxy_port = free_port();
+    let yaml = resolve_yaml_store_stream_events_after_resolve(proxy_port, backend.port(), db.url(), 500);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let mut proxy = start_proxy(&config);
+    let first_body = format!(
+        r#"{{"model":"gpt-4.1","input":"first","tools":[{{"type":"mcp","server_label":"docs","server_url":"{mcp_url}","allowed_tools":["delete_docs"]}}]}}"#
+    );
+    let first = http_send(proxy.addr(), &json_post("/v1/responses", &first_body));
+    assert_eq!(
+        parse_status(&first),
+        200,
+        "initial discovery should succeed: {}",
+        parse_body(&first)
+    );
+    let first_list_calls = mcp.method_count("tools/list");
+    assert_eq!(
+        first_list_calls, 1,
+        "initial discovery should contact the MCP server once"
+    );
+    let first_inference: serde_json::Value = serde_json::from_str(&backend.requests()[0].body).unwrap();
+    assert!(
+        first_inference["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "docs__delete_docs")),
+        "advisory mode should send the discovered tool to inference"
+    );
+
+    let continuation_body = format!(
+        r#"{{"model":"gpt-4.1","input":"continue","previous_response_id":"resp_previous","tools":[{{"type":"mcp","server_label":"docs","server_url":"{mcp_url}","allowed_tools":["delete_docs"]}}]}}"#
+    );
+    let cached_continuation = http_send(proxy.addr(), &json_post("/v1/responses", &continuation_body));
+    assert_eq!(
+        parse_status(&cached_continuation),
+        200,
+        "advisory continuation should restore successfully: {}",
+        parse_body(&cached_continuation)
+    );
+    assert_eq!(
+        mcp.method_count("tools/list"),
+        first_list_calls,
+        "the restored advisory request should reuse its persisted listing"
+    );
+    let cached_inference: serde_json::Value = serde_json::from_str(&backend.requests()[1].body).unwrap();
+    assert!(
+        cached_inference["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "docs__delete_docs")),
+        "the restored listing should be present in the advisory inference request"
+    );
+    proxy
+        .shutdown()
+        .expect("advisory proxy should stop before reopening its store");
+
+    // A new pipeline represents the operator tightening admission after the
+    // cached listing was written. The old readOnlyHint must not grant trust to
+    // this client-selected target on a restored request.
+    let protected_proxy_port = free_port();
+    let protected_yaml =
+        resolve_yaml_store_stream_events_after_resolve(protected_proxy_port, backend.port(), db.url(), 500).replacen(
+            "      - filter: openai_mcp_tool_resolve\n",
+            "      - filter: openai_mcp_tool_resolve\n        tool_admission:\n          mode: protected\n",
+            1,
+        );
+    let protected_config = Config::from_yaml(&protected_yaml).unwrap();
+    let protected_proxy = start_proxy(&protected_config);
+    let protected_continuation = http_send(protected_proxy.addr(), &json_post("/v1/responses", &continuation_body));
+    assert_eq!(
+        parse_status(&protected_continuation),
+        200,
+        "protected continuation should proceed without the untrusted tool: {}",
+        parse_body(&protected_continuation)
+    );
+    assert_eq!(
+        mcp.method_count("tools/list"),
+        first_list_calls,
+        "protected admission should exclude the restored direct target without dialing it"
+    );
+    let protected_inference: serde_json::Value = serde_json::from_str(&backend.requests()[2].body).unwrap();
+    assert_eq!(
+        protected_inference["tools"].as_array().map_or(0, Vec::len),
+        0,
+        "a prior cached listing and its readOnlyHint must not bypass current protected admission"
     );
 }
 
@@ -1191,6 +1297,191 @@ fn connector_resolves_to_mock_mcp_server() {
     assert!(
         mcp_server.method_count("tools/list") >= 1,
         "should have called tools/list on the resolved MCP server"
+    );
+}
+
+// =============================================================================
+// Operator metadata admission (#1724)
+// =============================================================================
+
+/// A `read_only` connector admits only tools its gateway classifies read-only,
+/// while preserving schema fidelity and tool identity. Exercised through the
+/// assembled pipeline so admission runs before definitions reach the model.
+#[test]
+fn protected_read_only_connector_admits_only_read_only_tools() {
+    let mcp_config = McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("read_docs")
+                .with_description("Read documents")
+                .with_annotations(serde_json::json!({"readOnlyHint": true})),
+            McpToolFixture::new("delete_docs").with_annotations(serde_json::json!({"readOnlyHint": false})),
+        ],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let connectors = format!(
+        "        tool_admission:\n          mode: protected\n        connectors:\n          - id: gw\n            server_url: {mcp_url}\n            tool_policy: read_only"
+    );
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), &connectors);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body =
+        r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"docs","connector_id":"gw"}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "admission should succeed: {}",
+        parse_body(&raw)
+    );
+
+    let echoed = parse_body(&raw);
+    let parsed: serde_json::Value = serde_json::from_str(&echoed).unwrap();
+    let tools = parsed["tools"].as_array().expect("tools should be an array");
+    assert_eq!(tools.len(), 1, "only the read-only tool is admitted: {echoed}");
+    assert_eq!(tools[0]["name"], "docs__read_docs", "tool identity preserved");
+    assert_eq!(
+        tools[0]["description"], "Read documents",
+        "admitted tool keeps its legitimate description"
+    );
+    assert!(
+        !echoed.contains("delete_docs"),
+        "the writable tool must be excluded before inference: {echoed}"
+    );
+}
+
+/// A connector configured with `tool_policy: deny` is excluded without dialing:
+/// the gateway receives zero network calls and no tool reaches the model.
+#[test]
+fn protected_deny_excludes_connector_without_contact() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("read_docs").with_annotations(serde_json::json!({"readOnlyHint": true}))],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let connectors = format!(
+        "        tool_admission:\n          mode: protected\n        connectors:\n          - id: gw\n            server_url: {mcp_url}\n            tool_policy: deny"
+    );
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), &connectors);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body =
+        r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"docs","connector_id":"gw"}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "request proceeds with the connector excluded: {}",
+        parse_body(&raw)
+    );
+
+    let echoed = parse_body(&raw);
+    let parsed: serde_json::Value = serde_json::from_str(&echoed).unwrap();
+    let tool_count = parsed["tools"].as_array().map_or(0, Vec::len);
+    assert_eq!(tool_count, 0, "a denied connector exposes no tools: {echoed}");
+    assert!(!echoed.contains("read_docs"), "no tool reaches the model: {echoed}");
+    assert_eq!(
+        mcp_server.method_count("tools/list"),
+        0,
+        "a denied connector must never be dialed"
+    );
+}
+
+/// In protected mode a client-selected direct `server_url` is untrusted: its
+/// advertised `readOnlyHint: true` cannot admit a destructive tool. The
+/// definition never reaches the model.
+#[test]
+fn protected_mode_excludes_untrusted_direct_server_tools() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("delete_all").with_annotations(serde_json::json!({"readOnlyHint": true}))],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let admission = "        tool_admission:\n          mode: protected";
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), admission);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"evil","server_url":"{mcp_url}"}}]}}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "request proceeds with the tool excluded: {}",
+        parse_body(&raw)
+    );
+
+    let echoed = parse_body(&raw);
+    assert!(
+        !echoed.contains("delete_all"),
+        "an untrusted server's readOnlyHint lie must not admit a destructive tool: {echoed}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&echoed).unwrap();
+    let tool_count = parsed["tools"].as_array().map_or(0, Vec::len);
+    assert_eq!(
+        tool_count, 0,
+        "no untrusted tools reach the model in protected mode: {echoed}"
+    );
+}
+
+/// A `defer_loading: true` direct `server_url` is still a client-selected
+/// untrusted target: protected mode must exclude it before it reaches the
+/// backend, and must not dial it (#1724 — deferred-passthrough bypass).
+#[test]
+fn protected_mode_excludes_untrusted_deferred_direct_target() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("delete_all")],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let admission = "        tool_admission:\n          mode: protected";
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), admission);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"evil","server_url":"{mcp_url}","defer_loading":true}}]}}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "request proceeds with the tool excluded: {}",
+        parse_body(&raw)
+    );
+
+    let echoed = parse_body(&raw);
+    assert!(
+        !echoed.contains("delete_all") && !echoed.contains("defer_loading"),
+        "a deferred untrusted direct MCP entry must be stripped, not passed through: {echoed}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&echoed).unwrap();
+    let tool_count = parsed["tools"].as_array().map_or(0, Vec::len);
+    assert_eq!(tool_count, 0, "no untrusted tools reach the model: {echoed}");
+    assert_eq!(
+        mcp_server.method_count("tools/list"),
+        0,
+        "an untrusted deferred target must never be dialed in protected mode"
     );
 }
 
@@ -1463,6 +1754,84 @@ fn deferred_connector_without_tool_search_rejected() {
 }
 
 #[test]
+fn require_connector_rejects_direct_url_before_any_callout() {
+    let connector_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("tool_a")],
+        ..McpMockConfig::default()
+    };
+    let connector_server = start_mcp_mock_server_with_config(connector_config);
+    let direct_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("tool_b")],
+        ..McpMockConfig::default()
+    };
+    let direct_server = start_mcp_mock_server_with_config(direct_config);
+    let backend_guard = start_backend_with_shutdown("inference");
+    let proxy_port = free_port();
+
+    let connector_url = format!("http://127.0.0.1:{}/mcp", connector_server.port());
+    let connectors = format!(
+        "        require_connector: true\n        connectors:\n          - id: trusted\n            server_url: {connector_url}"
+    );
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), &connectors);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let direct_url = format!("http://127.0.0.1:{}/mcp", direct_server.port());
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"direct","server_url":"{direct_url}"}}]}}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+
+    assert_eq!(parse_status(&raw), 400, "direct server_url should be rejected");
+    let response_body = parse_body(&raw);
+    assert!(
+        response_body.contains("Use an administrator-configured connector_id instead."),
+        "response: {response_body}"
+    );
+    for server in [&connector_server, &direct_server] {
+        for method in ["initialize", "tools/list"] {
+            assert_eq!(
+                server.method_count(method),
+                0,
+                "no MCP call should reach a server for method {method}"
+            );
+        }
+    }
+}
+
+#[test]
+fn require_connector_still_resolves_configured_connector() {
+    let mcp_config = McpMockConfig {
+        tools: vec![McpToolFixture::new("tool_a")],
+        ..McpMockConfig::default()
+    };
+    let mcp_server = start_mcp_mock_server_with_config(mcp_config);
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_server.port());
+    let connectors = format!(
+        "        require_connector: true\n        connectors:\n          - id: trusted\n            server_url: {mcp_url}"
+    );
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), &connectors);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"s","connector_id":"trusted","allowed_tools":["tool_a"]}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "configured connector should still resolve: {raw}"
+    );
+    assert!(
+        mcp_server.method_count("tools/list") >= 1,
+        "configured connector should receive tools/list"
+    );
+}
+
+#[test]
 fn direct_url_alongside_connector_both_resolved() {
     let mcp_config_a = McpMockConfig {
         tools: vec![McpToolFixture::new("tool_a")],
@@ -1511,14 +1880,27 @@ fn resolve_yaml(proxy_port: u16, backend_port: u16) -> String {
     resolve_yaml_with_timeout(proxy_port, backend_port, 5000)
 }
 
+/// Enable loopback MCP targets for tests that deliberately exercise transport
+/// failures after address-policy validation.
+fn with_private_upstreams(yaml: String) -> String {
+    if yaml.contains("  allow_private_upstreams: true") {
+        return yaml;
+    }
+    yaml.replacen(
+        "insecure_options:\n",
+        "insecure_options:\n  allow_private_upstreams: true\n",
+        1,
+    )
+}
+
 /// Pipeline mirroring the relevant shipped `full-flow-agentic.yaml` ordering for
-/// store retrieval: `openai_response_store` runs pre-IRR, before
+/// store retrieval: `openai_responses_store` runs pre-IRR, before
 /// `openai_mcp_tool_resolve`. `openai_stream_events` is intentionally absent
 /// here -- it is IRR-only (it fails closed outside an `iterative_request_router`),
 /// and in the shipped `full-flow-agentic.yaml` it lives inside the IRR that follows the
 /// resolver, so the resolver's pre-IRR short-circuit never reaches it. The
 /// resolver self-delivers the 200 SSE failure lifecycle and writes
-/// `ResponsesState.response_object` directly, so `openai_response_store` persists
+/// `ResponsesState.response_object` directly, so `openai_responses_store` persists
 /// the synthesized failure without any stream_events involvement.
 fn resolve_yaml_full_flow_store(proxy_port: u16, backend_port: u16, db_url: &str, timeout_ms: u64) -> String {
     format!(
@@ -1533,14 +1915,22 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: test
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
-      - filter: openai_responses_validate
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
       - filter: openai_tool_parse
       - filter: state_owner
         mode: single_tenant
         tenant_id: default
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "{db_url}"
         responses_table: openai_responses
@@ -1588,14 +1978,22 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: test
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
-      - filter: openai_responses_validate
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
       - filter: openai_tool_parse
       - filter: state_owner
         mode: single_tenant
         tenant_id: default
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "{db_url}"
         responses_table: openai_responses
@@ -1620,13 +2018,13 @@ insecure_options:
     )
 }
 
-/// Minimal store pipeline with `openai_response_store` + `openai_mcp_tool_resolve`
-/// but WITHOUT `openai_responses_validate`/`openai_responses_rehydrate` (and no
+/// Minimal store pipeline with `openai_responses_store` + `openai_mcp_tool_resolve`
+/// but WITHOUT `openai_responses_request`/`openai_responses_rehydrate` (and no
 /// `openai_stream_events`). Nothing builds a `ResponsesState` before the resolver,
 /// so persistence depends entirely on the resolver *creating* the state when it
 /// writes the terminal snapshot (`get_or_insert_with`, not `get_mut`). The store
 /// still triggers streaming persistence -- its gating reads only
-/// `openai_responses_format.*` metadata, which `openai_responses_format`
+/// `openai_responses_request.*` metadata, which `openai_responses_request`
 /// (always first) supplies -- and `build_record_from_state` reads only
 /// `response_object`, so a default state carrying just that field suffices.
 fn resolve_yaml_store_no_validate_rehydrate(
@@ -1647,13 +2045,15 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: test
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
       - filter: openai_tool_parse
       - filter: state_owner
         mode: single_tenant
         tenant_id: default
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "{db_url}"
         responses_table: openai_responses
@@ -1685,7 +2085,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1715,7 +2117,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1746,7 +2150,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1776,7 +2182,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1807,7 +2215,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
@@ -1843,7 +2253,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve

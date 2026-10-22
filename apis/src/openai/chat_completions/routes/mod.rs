@@ -100,7 +100,7 @@ macro_rules! chat_completions_operations {
                             request_body: request_body_shape!($body),
                         },
                         spec_path: $path,
-                        #[cfg(feature = "openai-conversations")]
+                        #[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
                         owned_contract: None,
                     },
                 },
@@ -185,6 +185,21 @@ pub(crate) fn match_route<'a>(method: &str, path: &'a str) -> Option<MatchedChat
     })
 }
 
+/// Whether a matched operation head is the Chat Completions create call.
+///
+/// Consumers that act only on the inference-bearing request — such as the format
+/// producer that publishes the model fact — use this to distinguish
+/// `createChatCompletion` from the other operations that share the
+/// `openai_chat_completions` protocol (list, get, update, delete, messages).
+/// Matching the registry entry rather than a bare string keeps the check tied to
+/// the pinned operation ID.
+pub(crate) fn is_create_chat_completion(protocol: ApplicationProtocol, operation_id: &str) -> bool {
+    protocol == APPLICATION_PROTOCOL
+        && OPERATION_SPECS.iter().any(|spec| {
+            spec.operation == ChatCompletionsOperation::CreateChatCompletion && spec.operation_id() == operation_id
+        })
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, reason = "tests")]
@@ -246,6 +261,34 @@ mod tests {
             ChatCompletionsOperation::GetChatCompletionMessages
         );
         assert_eq!(matched.params.get("completion_id"), Some("chatcmpl_abc123"));
+    }
+
+    #[test]
+    fn is_create_chat_completion_matches_only_the_create_operation() {
+        let create = match_route("POST", "/v1/chat/completions").unwrap();
+        assert!(
+            is_create_chat_completion(create.spec.application_protocol(), create.spec.operation_id()),
+            "createChatCompletion head should be recognized"
+        );
+
+        for spec in OPERATION_SPECS {
+            if spec.operation == ChatCompletionsOperation::CreateChatCompletion {
+                continue;
+            }
+            assert!(
+                !is_create_chat_completion(spec.application_protocol(), spec.operation_id()),
+                "{:?} must not be treated as the create operation",
+                spec.operation
+            );
+        }
+    }
+
+    #[test]
+    fn is_create_chat_completion_rejects_a_foreign_protocol() {
+        assert!(
+            !is_create_chat_completion(ApplicationProtocol::new("openai_responses"), "createChatCompletion"),
+            "a matching operation ID under another protocol must not match"
+        );
     }
 
     #[test]

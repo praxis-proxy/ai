@@ -19,7 +19,10 @@ use dashmap::{DashMap, mapref::entry::Entry};
 use crate::{
     owner::StateOwner,
     traits::{PersistedStateBackend, ResponseStore},
-    types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
+    types::{
+        BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
+        ResponseEventRecord, ResponseRecord, StoreError,
+    },
 };
 
 /// Thread-safe registry of named persisted-state backends.
@@ -70,6 +73,31 @@ impl OwnerScopedStore {
         self.store.get_response(&self.owner, id).await
     }
 
+    /// Fetch a response within a caller-supplied payload ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's read or size error.
+    pub async fn get_response_bounded(&self, id: &str, max_bytes: usize) -> Result<Option<ResponseRecord>, StoreError> {
+        self.store.get_response_bounded(&self.owner, id, max_bytes).await
+    }
+
+    /// Fetch a response after measuring its retained payload against a charge allowance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] when the measured record exceeds
+    /// `max_charge_bytes`, or the backend's read error.
+    pub async fn get_response_budgeted(
+        &self,
+        id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ResponseRecord>>, StoreError> {
+        self.store
+            .get_response_budgeted(&self.owner, id, max_charge_bytes)
+            .await
+    }
+
     /// Delete a response visible to this owner.
     ///
     /// # Errors
@@ -89,6 +117,35 @@ impl OwnerScopedStore {
         // ResponseStore read-only view. Upcast to disambiguate.
         let store: &dyn ResponseStore = self.store.as_ref();
         store.get_conversation(&self.owner, id).await
+    }
+
+    /// Fetch a conversation within a caller-supplied payload ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's read or size error.
+    pub async fn get_conversation_bounded(
+        &self,
+        id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        let store: &dyn ResponseStore = self.store.as_ref();
+        store.get_conversation_bounded(&self.owner, id, max_bytes).await
+    }
+
+    /// Fetch reconstructed history after measuring it against a charge allowance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] when the measured history exceeds
+    /// `max_charge_bytes`, or the backend's read error.
+    pub async fn get_conversation_budgeted(
+        &self,
+        id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ConversationRecord>>, StoreError> {
+        let store: &dyn ResponseStore = self.store.as_ref();
+        store.get_conversation_budgeted(&self.owner, id, max_charge_bytes).await
     }
 
     /// Persist a response only when its immutable owner matches this handle.
@@ -121,6 +178,23 @@ impl OwnerScopedStore {
             .await
     }
 
+    /// Atomically insert this owner's response and approvals without replacing
+    /// an existing response with the same ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when owner validation or the backend write fails.
+    pub async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        self.require_matching_owner(&record.owner)?;
+        self.store
+            .persist_response_with_pending_approvals_if_absent(record, pending_approvals)
+            .await
+    }
+
     /// Retrieve pending approvals issued to this owner.
     ///
     /// # Errors
@@ -133,6 +207,21 @@ impl OwnerScopedStore {
     ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
         self.store
             .get_pending_approvals(&self.owner, response_id, approval_ids)
+            .await
+    }
+
+    /// Size matching pending approvals before fetching their payload columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend query fails.
+    pub async fn pending_approval_payload_bytes(
+        &self,
+        response_id: &str,
+        approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        self.store
+            .pending_approval_payload_bytes(&self.owner, response_id, approval_ids)
             .await
     }
 
@@ -150,6 +239,46 @@ impl OwnerScopedStore {
         self.store
             .consume_approvals(&self.owner, response_id, approval_ids, consumed_at)
             .await
+    }
+
+    /// Append normalized SSE events to a response's durable log, scoped to this
+    /// owner. Each record must carry this handle's owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-input error for an owner mismatch or the backend
+    /// error from persistence.
+    pub async fn append_events(&self, response_id: &str, events: &[ResponseEventRecord]) -> Result<(), StoreError> {
+        for event in events {
+            self.require_matching_owner(&event.owner)?;
+        }
+        self.store.append_events(&self.owner, response_id, events).await
+    }
+
+    /// List a response's event-log rows with `sequence_number > after`, scoped to
+    /// this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend query fails.
+    pub async fn list_events_after(
+        &self,
+        response_id: &str,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+        self.store
+            .list_events_after(&self.owner, response_id, after, limit)
+            .await
+    }
+
+    /// Summarize a response's event log for the replay gate, scoped to this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend query fails.
+    pub async fn event_log_status(&self, response_id: &str) -> Result<EventLogStatus, StoreError> {
+        self.store.event_log_status(&self.owner, response_id).await
     }
 
     /// Persist a conversation only when its immutable owner matches this handle.
@@ -248,6 +377,20 @@ impl OwnerScopedStore {
             .await
     }
 
+    /// Read complete ordered history from an owner-scoped snapshot. SQL
+    /// backends decode item rows incrementally, without loading the retired cache
+    /// unless the conversation has only legacy cache data.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when reading or decoding the history fails.
+    pub async fn conversation_history(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, StoreError> {
+        self.store.conversation_history(&self.owner, conversation_id).await
+    }
+
     /// Return the subset of `item_ids` already present for this owner.
     ///
     /// # Errors
@@ -313,7 +456,7 @@ impl OwnerScopedStore {
         self.store.max_item_position(&self.owner, conversation_id).await
     }
 
-    /// Atomically insert items and rebuild this owner's message cache.
+    /// Atomically insert items and invalidate this owner's retired message cache.
     ///
     /// # Errors
     ///
@@ -332,7 +475,26 @@ impl OwnerScopedStore {
             .await
     }
 
-    /// Atomically delete an item and rebuild this owner's message cache.
+    /// Append items only if the new write and any legacy-prefix migration fit the budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an owner mismatch, budget overflow, or backend error.
+    pub async fn create_items_and_sync_messages_bounded(
+        &self,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_append_charge_bytes: usize,
+    ) -> Result<(), StoreError> {
+        for item in items {
+            self.require_matching_owner(&item.owner)?;
+        }
+        self.store
+            .create_items_and_sync_messages_bounded(&self.owner, conversation_id, items, max_append_charge_bytes)
+            .await
+    }
+
+    /// Atomically delete an item and invalidate this owner's retired message cache.
     ///
     /// # Errors
     ///

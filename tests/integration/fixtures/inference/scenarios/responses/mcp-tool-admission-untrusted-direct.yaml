@@ -1,0 +1,44 @@
+version: 1
+id: responses/mcp-tool-admission-untrusted-direct
+description: Protected mode excludes an untrusted direct MCP target's tools before inference; a client function tool passes through unchanged.
+protocol: openai_responses
+example_config: openai/responses/mcp-tool-admission.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.native.mcp_admission_untrusted_excluded
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: What is 2 plus 2?
+          store: false
+          stream: false
+          tools:
+            - type: function
+              name: calc
+              description: Evaluate an arithmetic expression.
+              parameters:
+                type: object
+                properties:
+                  expr:
+                    type: string
+                required:
+                  - expr
+            - type: mcp
+              server_label: untrusted
+              server_url: https://untrusted.example/mcp
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/responses
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "scenario_id": "messages/upstream-error-unknown-type",
+  "protocol": "anthropic_messages",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-unknown-error-type-model",
+    "source_id": "controlled-upstream-500-unknown-error-type"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {}
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 64,
+              "messages": [
+                {
+                  "content": "What is 2+2? Reply with just the number.",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-unknown-error-type-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 500,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "message": "upstream failure with an unknown error type",
+                "type": "api_error"
+              },
+              "request_id": null,
+              "type": "error"
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_completion_tokens": 64,
+              "messages": [
+                {
+                  "content": "What is 2+2? Reply with just the number.",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-unknown-error-type-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 500,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "type": "error",
+              "error": {
+                "message": "upstream failure with an unknown error type",
+                "type": "future_error"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

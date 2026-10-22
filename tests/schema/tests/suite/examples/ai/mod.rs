@@ -5,4 +5,6 @@
 
 mod intelligent_route;
 mod model_to_header;
+mod model_to_provider;
+#[cfg(feature = "openai-responses")]
 mod openai_responses_proxy;

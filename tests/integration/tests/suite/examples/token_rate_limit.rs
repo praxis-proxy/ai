@@ -5,11 +5,13 @@
 //!
 //! Covers the agreed M1/M2/M6 core of the token rate limiting proposal
 //! (`00121_token-rate-limiting.md` in `praxis-proxy/enhancements`, epic
-//! `ai#121`): reservation-based admission, 429 rejection with
-//! token-denominated headers, and reconciliation against actual
-//! provider-reported usage (`token_count`'s typed `token.*` metadata,
-//! weighted per M4, falling back to `token.total`) once the
-//! response completes.
+//! `ai#121` / `ai#128`): reservation-based admission, in-memory
+//! `token_bucket` exhaustion, 429 rejection with token-denominated
+//! headers (`Retry-After`, `X-RateLimit-*-Tokens`), hierarchical
+//! org/team/user quotas, M5 bucket keys (header/model/IP), and
+//! reconciliation against actual provider-reported usage
+//! (`token_count`'s typed `token.*` metadata, weighted per M4, falling
+//! back to `token.total`) once the response completes.
 //!
 //! `mixed_algorithm_rules_valkey_backend_isolates_budgets_across_gateway_replicas`
 //! additionally covers `ai#789`/`praxis#551`'s per-rule algorithm choice
@@ -22,9 +24,12 @@ use std::collections::HashMap;
 
 #[cfg(feature = "basic-auth-filter")]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+#[cfg(feature = "basic-auth-filter")]
+use praxis_test_utils::build_pipeline;
 use praxis_test_utils::{
-    Backend, StatefulCapturingBackend, example_config_path, free_port, http_send, json_post, load_example_config,
-    parse_body, parse_header, parse_status, patch_yaml, start_proxy,
+    Backend, BackendGuard, PraxisProcess, ProxyGuard, StatefulCapturingBackend, allow_loopback_endpoints,
+    example_config_path, free_port, http_send, json_post, load_example_config, parse_body, parse_header, parse_status,
+    patch_yaml, start_proxy,
 };
 
 /// Build a `POST` request carrying extra headers beyond the standard
@@ -86,6 +91,73 @@ fn token_rate_limit_config(
     praxis_core::config::Config::from_yaml(&patched).expect("config should parse")
 }
 
+/// Build the shipped example with an intentionally unreachable shared backend
+/// so failure policy is tested through the real proxy binary and not only by
+/// calling the filter directly.
+fn unavailable_backend_token_rate_limit_config(
+    proxy_port: u16,
+    backend_port: u16,
+    on_failure: &str,
+) -> praxis_core::config::Config {
+    let path = example_config_path("token-rate-limit.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let backend = format!(
+        "        backend:\n          kind: valkey\n          url: redis://127.0.0.1:1\n          on_failure: {on_failure}\n          operation_timeout: 20ms\n"
+    );
+    let anchor = "        key: global\n";
+    assert!(
+        yaml.contains(anchor),
+        "token-rate-limit.yaml must contain the backend insertion anchor"
+    );
+    let yaml = yaml.replacen(anchor, &format!("{anchor}{backend}"), 1);
+    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend_port)]));
+    praxis_core::config::Config::from_yaml(&patched).expect("config should parse")
+}
+
+#[test]
+fn sentinel_example_config_is_loadable_without_live_discovery() {
+    // Configuration construction must validate the topology and timeout
+    // contract without contacting Sentinel. Live discovery/failover belongs
+    // to the credentialed Redis/Valkey matrix rather than this parser test.
+    let config = load_example_config("token-rate-limit-sentinel.yaml", free_port(), HashMap::new());
+    assert_eq!(config.filter_chains.len(), 1, "the Sentinel example has one pipeline");
+}
+
+#[test]
+fn closed_backend_failure_does_not_invoke_upstream() {
+    let backend = StatefulCapturingBackend::new(vec![(200, PLAIN_TEXT_BODY.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let config = unavailable_backend_token_rate_limit_config(proxy_port, backend.port(), "closed");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&raw),
+        503,
+        "closed backend failure must reject before upstream"
+    );
+    assert!(
+        backend.requests().is_empty(),
+        "closed backend failure must not invoke upstream"
+    );
+}
+
+#[test]
+fn open_backend_failure_invokes_upstream_once_without_quota_confirmation() {
+    let backend = StatefulCapturingBackend::new(vec![(200, PLAIN_TEXT_BODY.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let config = unavailable_backend_token_rate_limit_config(proxy_port, backend.port(), "open");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(parse_status(&raw), 200, "open backend failure should forward once");
+    assert_eq!(
+        backend.requests().len(),
+        1,
+        "open backend failure must invoke upstream exactly once"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Admission and headers
 // -----------------------------------------------------------------------------
@@ -125,17 +197,30 @@ fn rejects_with_429_and_retry_after_when_estimate_budget_exhausted() {
         429,
         "second request should be rejected, only 10 of 50 tokens remain after the first request spent 40"
     );
+    assert_rate_limit_headers_on_429(&second);
+}
+
+/// Assert the epic #121 / M6 denial header contract on a 429 response.
+///
+/// Epic wording uses `X-RateLimit-Reset`; the filter emits the
+/// token-denominated `X-RateLimit-Reset-Tokens` name (seconds until
+/// enough budget refills for another estimate), matching unit coverage.
+fn assert_rate_limit_headers_on_429(raw: &str) {
     assert!(
-        parse_header(&second, "retry-after").is_some(),
+        parse_header(raw, "retry-after").is_some(),
         "429 should carry a Retry-After header"
     );
     assert!(
-        parse_header(&second, "x-ratelimit-limit-tokens").is_some(),
+        parse_header(raw, "x-ratelimit-limit-tokens").is_some(),
         "429 should carry the token-suffixed limit header"
     );
     assert!(
-        parse_header(&second, "x-ratelimit-remaining-tokens").is_some(),
+        parse_header(raw, "x-ratelimit-remaining-tokens").is_some(),
         "429 should carry the token-suffixed remaining header"
+    );
+    assert!(
+        parse_header(raw, "x-ratelimit-reset-tokens").is_some(),
+        "429 should carry the token-suffixed reset header"
     );
 }
 
@@ -235,6 +320,79 @@ fn example_config_token_rate_limit() {
     assert_eq!(parse_body(&raw), PLAIN_TEXT_BODY, "body should pass through unchanged");
 }
 
+/// Read the example's basic-auth password from the shipped YAML so the
+/// test source does not carry a password literal.
+#[cfg(feature = "basic-auth-filter")]
+fn password_from_example(filename: &str) -> String {
+    let path = example_config_path(filename);
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
+    yaml.lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("password:")
+                .map(|value| value.trim().trim_matches('"').to_owned())
+        })
+        .unwrap_or_else(|| panic!("{filename} has no password field"))
+}
+
+/// Loads the shipped hierarchy example and checks both admission and a
+/// missing gateway header. The provider is contacted only after all three
+/// levels accept.
+#[test]
+#[cfg(feature = "basic-auth-filter")]
+fn example_config_token_rate_limit_hierarchy() {
+    let backend = StatefulCapturingBackend::new(vec![(200, PLAIN_TEXT_BODY.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let password = password_from_example("token-rate-limit-hierarchy.yaml");
+    let config = load_example_config(
+        "token-rate-limit-hierarchy.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3000", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let missing_org = http_send(
+        proxy.addr(),
+        &basic_auth_json_post(
+            "/v1/chat/completions",
+            "{}",
+            "subject-a",
+            &password,
+            &[("x-team-id", "engineering")],
+        ),
+    );
+    assert_eq!(
+        parse_status(&missing_org),
+        401,
+        "a missing org header is rejected before any hold"
+    );
+    assert!(
+        backend.requests().is_empty(),
+        "a missing hierarchy identity must not contact the provider"
+    );
+
+    let admitted = http_send(
+        proxy.addr(),
+        &basic_auth_json_post(
+            "/v1/chat/completions",
+            "{}",
+            "subject-a",
+            &password,
+            &[("x-org-id", "acme"), ("x-team-id", "engineering")],
+        ),
+    );
+    assert_eq!(
+        parse_status(&admitted),
+        200,
+        "the shipped hierarchy example should admit"
+    );
+    assert_eq!(
+        backend.requests().len(),
+        1,
+        "the provider receives the admitted request"
+    );
+}
+
 /// Smoke-tests the real `token-rate-limit-mixed-algorithms.yaml` example
 /// file itself (ai#789/praxis#551), distinct from
 /// `mixed_algorithm_rules_valkey_backend_isolates_budgets_across_gateway_replicas`
@@ -274,6 +432,274 @@ fn example_config_token_rate_limit_mixed_algorithms() {
         parse_status(&beta),
         200,
         "team-beta's token_bucket rule should admit a request within its budget"
+    );
+}
+
+/// Load a shipped key-dimension example with a 10-token budget and prove two
+/// key values isolate (admit A, admit B, deny A again with M6 headers).
+///
+/// Returns the proxy and backend guards so callers can keep exercising the
+/// same process (trailing 400 / IP edge cases).
+fn isolate_keys(example: &str, header: &str, a: &str, b: &str) -> (ProxyGuard, BackendGuard) {
+    let backend = Backend::fixed(PLAIN_TEXT_BODY)
+        .header("content-type", "text/plain")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let path = example_config_path(example);
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let yaml = yaml
+        .replace("capacity: 100000", "capacity: 10")
+        .replace("reserved_tokens: 500", "reserved_tokens: 10");
+    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend.port())]));
+    let config =
+        praxis_core::config::Config::from_yaml(&patched).unwrap_or_else(|e| panic!("{example} should parse: {e}"));
+    let proxy = start_proxy(&config);
+
+    let first = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[(header, a)]),
+    );
+    assert_eq!(
+        parse_status(&first),
+        200,
+        "first request for key {a:?} via {header} should be admitted"
+    );
+
+    let other = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[(header, b)]),
+    );
+    assert_eq!(parse_status(&other), 200, "key {b:?} must not share {a:?}'s bucket");
+
+    let again = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[(header, a)]),
+    );
+    assert_eq!(
+        parse_status(&again),
+        429,
+        "second request for key {a:?} should exhaust its own 10-token bucket"
+    );
+    assert_rate_limit_headers_on_429(&again);
+    (proxy, backend)
+}
+
+/// Per-header bucket keys (ai#123 / ai#129): two tenants isolate; missing
+/// `x-tenant-id` is 400.
+#[test]
+fn header_bucket_keys_isolate_tenants() {
+    let (proxy, _backend) = isolate_keys("token-rate-limit-header-keys.yaml", "x-tenant-id", "alpha", "beta");
+    let missing = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&missing),
+        400,
+        "a missing key header must fail closed with 400, not fall through to the global bucket"
+    );
+}
+
+/// Per-model bucket keys (ai#123): body `model` selects the budget via
+/// `model_to_header` ahead of `token_rate_limit`; a conflicting client
+/// `X-Model` cannot override it. Missing model identity is 400.
+#[test]
+fn model_bucket_keys_isolate_models() {
+    let backend = Backend::fixed(PLAIN_TEXT_BODY)
+        .header("content-type", "text/plain")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let path = example_config_path("token-rate-limit-model-keys.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let yaml = yaml
+        .replace("capacity: 100000", "capacity: 10")
+        .replace("reserved_tokens: 500", "reserved_tokens: 10");
+    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend.port())]));
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("model-key example should parse");
+    let proxy = start_proxy(&config);
+
+    // Conflicting X-Model must not select a different bucket than body model.
+    let gpt = http_send(
+        proxy.addr(),
+        &json_post_with_headers(
+            "/v1/chat/completions",
+            r#"{"model":"gpt-4"}"#,
+            &[("X-Model", "llama-3")],
+        ),
+    );
+    assert_eq!(
+        parse_status(&gpt),
+        200,
+        "first gpt-4 body-model request should be admitted despite conflicting X-Model"
+    );
+
+    let llama = http_send(
+        proxy.addr(),
+        &json_post("/v1/chat/completions", r#"{"model":"llama-3"}"#),
+    );
+    assert_eq!(
+        parse_status(&llama),
+        200,
+        "llama-3 body model must not share gpt-4's bucket"
+    );
+
+    let gpt_again = http_send(proxy.addr(), &json_post("/v1/chat/completions", r#"{"model":"gpt-4"}"#));
+    assert_eq!(
+        parse_status(&gpt_again),
+        429,
+        "second gpt-4 body-model request should exhaust its own 10-token bucket"
+    );
+    assert_rate_limit_headers_on_429(&gpt_again);
+
+    // Spoofed header alone (empty body) must not mint a fresh budget after
+    // model_to_header strips client X-Model with no body model to promote.
+    let spoofed = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("X-Model", "gpt-4")]),
+    );
+    assert_eq!(
+        parse_status(&spoofed),
+        400,
+        "client X-Model without a body model must fail closed after the promote/strip step"
+    );
+
+    let missing = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&missing),
+        400,
+        "a missing model identity must fail closed with 400"
+    );
+}
+
+/// Per-IP bucket keys (ai#123): two `X-Forwarded-For` clients isolate, and
+/// the example's documented edge cases hold (TCP-peer fallback, unparseable
+/// XFF → 400, `ipv6_prefix: 64` shares a /64).
+#[test]
+fn ip_bucket_keys_isolate_forwarded_clients() {
+    let (proxy, _backend) = isolate_keys(
+        "token-rate-limit-ip-keys.yaml",
+        "X-Forwarded-For",
+        "203.0.113.10",
+        "203.0.113.11",
+    );
+
+    let peer = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&peer),
+        200,
+        "a missing X-Forwarded-For must fall back to the TCP peer bucket"
+    );
+    let peer_again = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&peer_again),
+        429,
+        "a second request with no XFF must exhaust the shared TCP peer bucket"
+    );
+
+    // Unusable XFF must not hop-skip or fall back to the peer bucket.
+    let bad = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("X-Forwarded-For", "not-an-ip")]),
+    );
+    assert_eq!(
+        parse_status(&bad),
+        400,
+        "an unparseable X-Forwarded-For hop must fail closed with 400"
+    );
+
+    // Example sets ipv6_prefix: 64; prove same-/64 sharing vs other-/64 isolation.
+    let v6_a = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("X-Forwarded-For", "2001:db8:1:1::1")]),
+    );
+    assert_eq!(
+        parse_status(&v6_a),
+        200,
+        "first address in 2001:db8:1:1::/64 should be admitted"
+    );
+    let v6_same_prefix = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("X-Forwarded-For", "2001:db8:1:1::2")]),
+    );
+    assert_eq!(
+        parse_status(&v6_same_prefix),
+        429,
+        "a second address in the same /64 must share the ipv6_prefix: 64 bucket"
+    );
+    let v6_other_prefix = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("X-Forwarded-For", "2001:db8:1:2::1")]),
+    );
+    assert_eq!(
+        parse_status(&v6_other_prefix),
+        200,
+        "an address in a different /64 must get its own bucket"
+    );
+}
+
+/// In-memory `token_bucket` enforcement (epic #121 / ai#789): admit once
+/// at capacity, then 429 with the M6 header contract. Distinct from the
+/// Valkey cross-replica mixed-algorithm test and the mixed-algorithms
+/// example smoke (admit-only).
+#[test]
+fn token_bucket_exhaustion_returns_429_with_rate_limit_headers() {
+    let backend = StatefulCapturingBackend::new(vec![(200, PLAIN_TEXT_BODY.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let yaml = format!(
+        "listeners:\n\
+         \x20 - name: default\n\
+         \x20   address: \"0.0.0.0:8080\"\n\
+         \x20   filter_chains:\n\
+         \x20     - main\n\
+         filter_chains:\n\
+         \x20 - name: main\n\
+         \x20   filters:\n\
+         \x20     - filter: router\n\
+         \x20       routes:\n\
+         \x20         - path: \"/v1/chat/completions\"\n\
+         \x20           cluster: backend\n\
+         \x20     - filter: token_rate_limit\n\
+         \x20       rules:\n\
+         \x20         - name: bucket\n\
+         \x20           algorithm: token_bucket\n\
+         \x20           capacity: 40\n\
+         \x20           refill_rate: 0.001\n\
+         \x20           reserved_tokens: 40\n\
+         \x20     - filter: token_count\n\
+         \x20       provider: openai\n\
+         \x20     - filter: access_log\n\
+         \x20     - filter: load_balancer\n\
+         \x20       clusters:\n\
+         \x20         - name: backend\n\
+         \x20           endpoints:\n\
+         \x20             - \"127.0.0.1:3000\"\n\
+         insecure_options:\n\
+         \x20 allow_private_endpoints: true\n"
+    );
+    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend.port())]));
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("token_bucket config should parse");
+    let proxy = start_proxy(&config);
+
+    let first = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&first),
+        200,
+        "first token_bucket reservation should be admitted"
+    );
+
+    let second = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&second),
+        429,
+        "exhausted in-memory token_bucket must reject before the provider"
+    );
+    assert_rate_limit_headers_on_429(&second);
+    assert_eq!(
+        parse_header(&second, "x-ratelimit-limit-tokens").as_deref(),
+        Some("40"),
+        "limit header should report the token_bucket capacity"
+    );
+    assert_eq!(
+        backend.requests().len(),
+        1,
+        "token_bucket rejection must not contact the provider"
     );
 }
 
@@ -465,6 +891,11 @@ fn basic_auth_json_post(
 
 /// Derive test-only credentials from runtime-only identifiers. The values
 /// never appear in diagnostics or source as hard-coded password literals.
+///
+/// The `{pid:x}-{port:x}` shape can collide with YAML scientific notation:
+/// pid `0x1e` and port `0x400` render as `1e-400`, a valid float literal that
+/// underflows to `0.0`. Any config consumer must therefore quote the value so
+/// it parses as a string rather than a number (see `authenticated_quota_config`).
 #[cfg(feature = "basic-auth-filter")]
 fn test_credential(nonce: u16) -> String {
     format!("{:x}-{:x}", std::process::id(), nonce)
@@ -503,9 +934,9 @@ fn authenticated_quota_config(
          \x20       strip_authorization: true\n\
          \x20       credentials:\n\
          \x20         - username: subject-a\n\
-         \x20           password: {subject_a_credential}\n\
+         \x20           password: \"{subject_a_credential}\"\n\
          \x20         - username: subject-b\n\
-         \x20           password: {subject_b_credential}\n\
+         \x20           password: \"{subject_b_credential}\"\n\
          \x20     - filter: token_rate_limit\n\
          {key_line}{backend_block}\
          \x20       rules:\n\
@@ -723,6 +1154,36 @@ fn global_key_remains_the_default_with_basic_auth() {
     );
 }
 
+/// Regression for the intermittent `token_rate_limit` Valkey job failure
+/// ("basic_auth: invalid type: floating point 0.0, expected a string").
+///
+/// `test_credential` produces `{pid:x}-{port:x}` values; some combinations
+/// (pid `0x1e` → `1e`, port `0x400` → `400`) form `1e-400`, which YAML resolves
+/// as scientific notation that underflows to `0.0`. Left unquoted in the config,
+/// the `password: Option<String>` field then fails to deserialize and
+/// `build_pipeline` panics. `authenticated_quota_config` now quotes the value,
+/// so such credentials stay strings through pipeline construction.
+#[test]
+#[cfg(feature = "basic-auth-filter")]
+fn sci_notation_shaped_credentials_stay_strings_in_config() {
+    let proxy_port = free_port();
+    let backend_port = free_port();
+    // `1e-400` underflows to 0.0; `2e-300` is a representable tiny float. Both
+    // parse as non-string YAML scalars unless quoted, yet must survive config
+    // parsing and pipeline construction unchanged.
+    let config = praxis_core::config::Config::from_yaml(&authenticated_quota_config(
+        proxy_port,
+        backend_port,
+        None,
+        None,
+        ("1e-400", "2e-300"),
+    ))
+    .expect("scientific-notation-shaped credentials must parse as strings");
+    // `build_pipeline` is the exact step that panicked in CI once the password
+    // resolved to a float; it must now build the basic_auth filter cleanly.
+    let _pipeline = build_pipeline(&config);
+}
+
 // -----------------------------------------------------------------------------
 // S1: Graduated soft-limit tiers (inject action)
 // -----------------------------------------------------------------------------
@@ -786,5 +1247,649 @@ fn example_config_token_rate_limit_soft_tiers() {
             .to_ascii_lowercase()
             .contains("x-token-hour-tier:"),
         "team-beta's upstream request should carry the inject tier header"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Soft over-quota enforcement (ai#1241)
+// -----------------------------------------------------------------------------
+
+/// Smoke-tests `token-rate-limit-soft-enforcement.yaml` through a spawned
+/// `praxis-ai` binary: soft forwards over-quota traffic with annotation;
+/// hard still returns 429.
+#[test]
+fn example_config_token_rate_limit_soft_enforcement() {
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, PLAIN_TEXT_BODY.to_owned()),
+        (200, PLAIN_TEXT_BODY.to_owned()),
+        (200, PLAIN_TEXT_BODY.to_owned()),
+    ])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+
+    let path = example_config_path("token-rate-limit-soft-enforcement.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    // Shrink budgets so two reservations exhaust each rule.
+    let yaml = yaml
+        .replace("capacity: 100000", "capacity: 100")
+        .replace("reserved_tokens: 500", "reserved_tokens: 60")
+        .replace("capacity: 50000", "capacity: 100")
+        .replace("reserved_tokens: 200", "reserved_tokens: 60");
+    let patched = patch_yaml(
+        &allow_loopback_endpoints(&yaml),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3000", backend.port())]),
+    );
+    let _proxy = PraxisProcess::spawn(&patched, &proxy_addr);
+
+    let soft_first = http_send(
+        &proxy_addr,
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "soft")]),
+    );
+    assert_eq!(parse_status(&soft_first), 200, "soft first request should be admitted");
+    let soft_second = http_send(
+        &proxy_addr,
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "soft")]),
+    );
+    assert_eq!(
+        parse_status(&soft_second),
+        200,
+        "soft over-quota must forward instead of 429"
+    );
+    let soft_upstream = backend.requests()[1].headers.to_ascii_lowercase();
+    assert!(
+        soft_upstream.contains("x-over-quota:"),
+        "soft over-quota should annotate upstream request"
+    );
+    assert!(
+        soft_upstream.contains("x-ratelimit-remaining-tokens:"),
+        "soft over-quota should include remaining metadata"
+    );
+    assert!(
+        soft_upstream.contains("x-token-quota-used:"),
+        "soft over-quota should include used metadata"
+    );
+    assert!(
+        soft_upstream.contains("x-ratelimit-remaining-tokens: 40"),
+        "denial-time remaining after a 60-token reservation of 100: {soft_upstream}"
+    );
+    assert!(
+        soft_upstream.contains("x-token-quota-used: 60"),
+        "denial-time used after a 60-token reservation of 100: {soft_upstream}"
+    );
+
+    let hard_first = http_send(
+        &proxy_addr,
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "hard")]),
+    );
+    assert_eq!(parse_status(&hard_first), 200, "hard first request should be admitted");
+    let hard_second = http_send(
+        &proxy_addr,
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "hard")]),
+    );
+    assert_eq!(
+        parse_status(&hard_second),
+        429,
+        "hard over-quota must still reject with 429"
+    );
+    assert_eq!(
+        backend.requests().len(),
+        3,
+        "hard rejection must not contact the provider"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Hierarchy quota tests (issue #125)
+// -----------------------------------------------------------------------------
+
+/// Build a pipeline with basic_auth + token_rate_limit hierarchy.
+#[cfg(feature = "basic-auth-filter")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "integration test builder for hierarchy scenarios"
+)]
+fn hierarchy_quota_config(
+    proxy_port: u16,
+    backend_port: u16,
+    org_capacity: u64,
+    team_capacity: u64,
+    user_capacity: u64,
+    rule_capacity: u64,
+    estimate: u64,
+    subject_credentials: (&str, &str),
+) -> String {
+    let (subject_a_credential, subject_b_credential) = subject_credentials;
+    format!(
+        "listeners:\n\
+         \x20 - name: default\n\
+         \x20   address: \"127.0.0.1:{proxy_port}\"\n\
+         \x20   filter_chains: [main]\n\
+         filter_chains:\n\
+         \x20 - name: main\n\
+         \x20   filters:\n\
+         \x20     - filter: basic_auth\n\
+         \x20       strip_authorization: true\n\
+         \x20       credentials:\n\
+         \x20         - username: subject-a\n\
+         \x20           password: \"{subject_a_credential}\"\n\
+         \x20         - username: subject-b\n\
+         \x20           password: \"{subject_b_credential}\"\n\
+         \x20     - filter: token_rate_limit\n\
+         \x20       hierarchy:\n\
+         \x20         - level: org\n\
+         \x20           identity_header: x-org-id\n\
+         \x20           algorithm: sliding_window\n\
+         \x20           window: 1h\n\
+         \x20           capacity: {org_capacity}\n\
+         \x20         - level: team\n\
+         \x20           identity_header: x-team-id\n\
+         \x20           algorithm: sliding_window\n\
+         \x20           window: 1h\n\
+         \x20           capacity: {team_capacity}\n\
+         \x20         - level: user\n\
+         \x20           identity: authenticated_subject\n\
+         \x20           algorithm: sliding_window\n\
+         \x20           window: 1h\n\
+         \x20           capacity: {user_capacity}\n\
+         \x20       rules:\n\
+         \x20         - name: main-rule\n\
+         \x20           algorithm: sliding_window\n\
+         \x20           window: 1h\n\
+         \x20           capacity: {rule_capacity}\n\
+         \x20           reserved_tokens: {estimate}\n\
+         \x20     - filter: router\n\
+         \x20       routes:\n\
+         \x20         - path: \"/v1/chat/completions\"\n\
+         \x20           cluster: backend\n\
+         \x20     - filter: token_count\n\
+         \x20       provider: openai\n\
+         \x20     - filter: access_log\n\
+         \x20     - filter: load_balancer\n\
+         \x20       clusters:\n\
+         \x20         - name: backend\n\
+         \x20           endpoints:\n\
+         \x20             - \"127.0.0.1:{backend_port}\"\n\
+         insecure_options:\n\
+         \x20 allow_private_endpoints: true\n"
+    )
+}
+
+#[test]
+#[cfg(feature = "basic-auth-filter")]
+fn hierarchy_all_three_levels_admit() {
+    let backend = StatefulCapturingBackend::new(vec![(200, OPENAI_LOW_USAGE_JSON.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let cred_a = test_credential(proxy_port);
+    let cred_b = test_credential(backend.port());
+    let config = praxis_core::config::Config::from_yaml(&hierarchy_quota_config(
+        proxy_port,
+        backend.port(),
+        5_000,
+        2_000,
+        500,
+        10_000_000,
+        500,
+        (&cred_a, &cred_b),
+    ))
+    .expect("config should parse");
+    let proxy = start_proxy(&config);
+    let request = basic_auth_json_post(
+        "/v1/chat/completions",
+        "{}",
+        "subject-a",
+        &cred_a,
+        &[("x-org-id", "acme"), ("x-team-id", "engineering")],
+    );
+
+    let first = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&first), 200, "all hierarchy levels should admit");
+    assert_eq!(
+        backend.requests().len(),
+        1,
+        "the provider should receive the admitted request"
+    );
+
+    // Actual usage is 10, so the user budget has 490 left. The next
+    // estimate of 500 is denied by the user. Org and team still have room.
+    // Without the hierarchy, the rule capacity of 10000000 would admit it.
+    let second = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&second), 429, "user budget should deny the second request");
+    assert_eq!(
+        parse_header(&second, "x-ratelimit-limit-tokens").as_deref(),
+        Some("500"),
+        "the user budget is the one that denies"
+    );
+}
+
+#[test]
+#[cfg(feature = "basic-auth-filter")]
+fn hierarchy_org_denies_while_team_and_user_have_room() {
+    let backend = StatefulCapturingBackend::new(vec![(200, PLAIN_TEXT_BODY.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let cred_a = test_credential(proxy_port);
+    let cred_b = test_credential(backend.port());
+    // Estimate 40 fits the org capacity of 50 once. The next request is
+    // denied by org while team and user still have room. A fixed estimate
+    // larger than a level is rejected at load, so this uses exhaustion.
+    let config = praxis_core::config::Config::from_yaml(&hierarchy_quota_config(
+        proxy_port,
+        backend.port(),
+        50,
+        10_000,
+        10_000,
+        10_000_000,
+        40,
+        (&cred_a, &cred_b),
+    ))
+    .expect("config should parse");
+    let proxy = start_proxy(&config);
+    let request = basic_auth_json_post(
+        "/v1/chat/completions",
+        "{}",
+        "subject-a",
+        &cred_a,
+        &[("x-org-id", "acme"), ("x-team-id", "engineering")],
+    );
+
+    let first = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&first), 200, "the first estimate fits the org budget");
+
+    let second = http_send(proxy.addr(), &request);
+    assert_eq!(
+        parse_status(&second),
+        429,
+        "org remaining (10) is below the estimate (40)"
+    );
+    assert_rate_limit_headers_on_429(&second);
+    assert_eq!(
+        parse_header(&second, "x-ratelimit-limit-tokens").as_deref(),
+        Some("50"),
+        "the org budget is the one that denies"
+    );
+    assert_eq!(
+        backend.requests().len(),
+        1,
+        "the denied request should not reach the provider"
+    );
+}
+
+#[test]
+#[cfg(feature = "basic-auth-filter")]
+fn hierarchy_team_denies_releases_org_reservation() {
+    let backend = StatefulCapturingBackend::new(vec![(200, PLAIN_TEXT_BODY.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let cred_a = test_credential(proxy_port);
+    let cred_b = test_credential(backend.port());
+    let config = praxis_core::config::Config::from_yaml(&hierarchy_quota_config(
+        proxy_port,
+        backend.port(),
+        100,
+        50,
+        10_000,
+        10_000_000,
+        40,
+        (&cred_a, &cred_b),
+    ))
+    .expect("config should parse");
+    let proxy = start_proxy(&config);
+    let request = basic_auth_json_post(
+        "/v1/chat/completions",
+        "{}",
+        "subject-a",
+        &cred_a,
+        &[("x-org-id", "acme"), ("x-team-id", "engineering")],
+    );
+
+    let first = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&first), 200, "the first estimate fits the team budget");
+
+    let second = http_send(proxy.addr(), &request);
+    assert_eq!(
+        parse_status(&second),
+        429,
+        "team remaining (10) is below the estimate (40)"
+    );
+    assert_eq!(
+        parse_header(&second, "x-ratelimit-limit-tokens").as_deref(),
+        Some("50"),
+        "team capacity is the denying budget"
+    );
+
+    // A leaked org hold of 40 would leave 20, so this request would be
+    // denied by org (limit 100) before the team check.
+    let third = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&third), 429, "team budget still denies the next request");
+    assert_eq!(
+        parse_header(&third, "x-ratelimit-limit-tokens").as_deref(),
+        Some("50"),
+        "org hold was released, so the team budget is still the one that denies"
+    );
+    assert_eq!(
+        backend.requests().len(),
+        1,
+        "the denied requests should not reach the provider"
+    );
+}
+
+#[test]
+#[cfg(feature = "basic-auth-filter")]
+fn hierarchy_user_denies_releases_org_and_team() {
+    let backend = StatefulCapturingBackend::new(vec![(200, PLAIN_TEXT_BODY.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let cred_a = test_credential(proxy_port);
+    let cred_b = test_credential(backend.port());
+    let config = praxis_core::config::Config::from_yaml(&hierarchy_quota_config(
+        proxy_port,
+        backend.port(),
+        100,
+        100,
+        50,
+        10_000_000,
+        40,
+        (&cred_a, &cred_b),
+    ))
+    .expect("config should parse");
+    let proxy = start_proxy(&config);
+    let request = basic_auth_json_post(
+        "/v1/chat/completions",
+        "{}",
+        "subject-a",
+        &cred_a,
+        &[("x-org-id", "acme"), ("x-team-id", "engineering")],
+    );
+
+    let first = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&first), 200, "the first estimate fits the user budget");
+
+    let second = http_send(proxy.addr(), &request);
+    assert_eq!(
+        parse_status(&second),
+        429,
+        "user remaining (10) is below the estimate (40)"
+    );
+    assert_eq!(
+        parse_header(&second, "x-ratelimit-limit-tokens").as_deref(),
+        Some("50"),
+        "user capacity is the denying budget"
+    );
+
+    // Leaked org and team holds of 40 would leave 20 each, so the next
+    // request would be denied by org (limit 100) before the user check.
+    let third = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&third), 429, "user budget still denies the next request");
+    assert_eq!(
+        parse_header(&third, "x-ratelimit-limit-tokens").as_deref(),
+        Some("50"),
+        "org and team holds were released, so the user budget is still the one that denies"
+    );
+    assert_eq!(
+        backend.requests().len(),
+        1,
+        "the denied requests should not reach the provider"
+    );
+}
+
+#[test]
+#[cfg(feature = "basic-auth-filter")]
+fn hierarchy_missing_org_header_returns_401_no_charges() {
+    let backend = StatefulCapturingBackend::new(vec![(200, PLAIN_TEXT_BODY.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let cred_a = test_credential(proxy_port);
+    let cred_b = test_credential(backend.port());
+    let config = praxis_core::config::Config::from_yaml(&hierarchy_quota_config(
+        proxy_port,
+        backend.port(),
+        5_000_000,
+        1_000_000,
+        100_000,
+        10_000_000,
+        500,
+        (&cred_a, &cred_b),
+    ))
+    .expect("config should parse");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &basic_auth_json_post(
+            "/v1/chat/completions",
+            "{}",
+            "subject-a",
+            &cred_a,
+            &[("x-team-id", "engineering")],
+        ),
+    );
+    assert_eq!(parse_status(&raw), 401, "missing x-org-id should return 401");
+    assert_eq!(
+        backend.requests().len(),
+        0,
+        "provider should not be contacted when hierarchy identity is missing"
+    );
+}
+
+#[test]
+#[cfg(feature = "basic-auth-filter")]
+fn hierarchy_missing_team_header_returns_401_no_charges() {
+    let backend = StatefulCapturingBackend::new(vec![(200, PLAIN_TEXT_BODY.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let cred_a = test_credential(proxy_port);
+    let cred_b = test_credential(backend.port());
+    let config = praxis_core::config::Config::from_yaml(&hierarchy_quota_config(
+        proxy_port,
+        backend.port(),
+        5_000_000,
+        1_000_000,
+        100_000,
+        10_000_000,
+        500,
+        (&cred_a, &cred_b),
+    ))
+    .expect("config should parse");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &basic_auth_json_post(
+            "/v1/chat/completions",
+            "{}",
+            "subject-a",
+            &cred_a,
+            &[("x-org-id", "acme")],
+        ),
+    );
+    assert_eq!(parse_status(&raw), 401, "missing x-team-id should return 401");
+    assert_eq!(
+        backend.requests().len(),
+        0,
+        "provider should not be contacted when hierarchy identity is missing"
+    );
+}
+
+#[test]
+#[cfg(feature = "basic-auth-filter")]
+fn hierarchy_missing_subject_returns_401_no_charges() {
+    let backend = StatefulCapturingBackend::new(vec![(200, PLAIN_TEXT_BODY.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let cred_a = test_credential(proxy_port);
+    let cred_b = test_credential(backend.port());
+    let config = praxis_core::config::Config::from_yaml(&hierarchy_quota_config(
+        proxy_port,
+        backend.port(),
+        5_000_000,
+        1_000_000,
+        100_000,
+        10_000_000,
+        500,
+        (&cred_a, &cred_b),
+    ))
+    .expect("config should parse");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_headers(
+            "/v1/chat/completions",
+            "{}",
+            &[("x-org-id", "acme"), ("x-team-id", "engineering")],
+        ),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        401,
+        "missing authenticated subject (no basic_auth) should return 401"
+    );
+    assert_eq!(
+        backend.requests().len(),
+        0,
+        "provider should not be contacted when hierarchy identity is missing"
+    );
+}
+
+#[test]
+#[cfg(feature = "basic-auth-filter")]
+fn hierarchy_reconciliation_applies_actual_to_all_levels() {
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, OPENAI_LOW_USAGE_JSON.to_owned()),
+        (200, OPENAI_LOW_USAGE_JSON.to_owned()),
+    ])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let cred_a = test_credential(proxy_port);
+    let cred_b = test_credential(backend.port());
+    let config = praxis_core::config::Config::from_yaml(&hierarchy_quota_config(
+        proxy_port,
+        backend.port(),
+        50,
+        50,
+        50,
+        10_000_000,
+        40,
+        (&cred_a, &cred_b),
+    ))
+    .expect("config should parse");
+    let proxy = start_proxy(&config);
+
+    let first = http_send(
+        proxy.addr(),
+        &basic_auth_json_post(
+            "/v1/chat/completions",
+            "{}",
+            "subject-a",
+            &cred_a,
+            &[("x-org-id", "acme"), ("x-team-id", "engineering")],
+        ),
+    );
+    assert_eq!(parse_status(&first), 200, "first request should be admitted");
+
+    let second = http_send(
+        proxy.addr(),
+        &basic_auth_json_post(
+            "/v1/chat/completions",
+            "{}",
+            "subject-a",
+            &cred_a,
+            &[("x-org-id", "acme"), ("x-team-id", "engineering")],
+        ),
+    );
+    assert_eq!(
+        parse_status(&second),
+        200,
+        "reconciliation should have freed capacity at all hierarchy levels (actual 10 < estimate 40)"
+    );
+    assert_eq!(
+        backend.requests().len(),
+        2,
+        "both admitted requests should reach the provider"
+    );
+}
+
+/// When all three hierarchy levels admit but the per-rule budget denies,
+/// the hierarchy reservations must be rolled back.  This exercises the
+/// `admit_estimated` rollback path (hierarchy reserves → rule
+/// denies → `rollback_hierarchy_sync` fires).
+#[test]
+#[cfg(feature = "basic-auth-filter")]
+fn hierarchy_rule_deny_rolls_back_hierarchy_reservations() {
+    // Backend returns actual usage of 10 tokens. After the first 200
+    // request, reconciliation refunds estimate−actual = 60−10 = 50
+    // from the rule budget, leaving ~50 remaining (< estimate 60).
+    // Only that admitted request may reach the provider.
+    let backend = StatefulCapturingBackend::new(vec![(200, OPENAI_LOW_USAGE_JSON.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let cred_a = test_credential(proxy_port);
+    let cred_b = test_credential(backend.port());
+    let config = praxis_core::config::Config::from_yaml(&hierarchy_quota_config(
+        proxy_port,
+        backend.port(),
+        100, // org: room for one estimate; a leaked second hold would exhaust it
+        100, // team: same
+        100, // user: same
+        60,  // rule: first admit drains it after reconcile
+        60,  // estimate = reserved_tokens
+        (&cred_a, &cred_b),
+    ))
+    .expect("config should parse");
+    let proxy = start_proxy(&config);
+
+    // First request: admitted at all levels (rule: 60 ≥ 60).
+    let first = http_send(
+        proxy.addr(),
+        &basic_auth_json_post(
+            "/v1/chat/completions",
+            "{}",
+            "subject-a",
+            &cred_a,
+            &[("x-org-id", "acme"), ("x-team-id", "engineering")],
+        ),
+    );
+    assert_eq!(parse_status(&first), 200, "first request should be admitted");
+
+    // Second request: hierarchy levels have plenty of room, but the
+    // per-rule budget is exhausted (~50 remaining < 60 estimate).
+    // This triggers the admit_estimated rollback path:
+    //   hierarchy reserves at org/team/user → rule denies →
+    //   rollback_hierarchy_sync refunds the hierarchy reservations.
+    let second = http_send(
+        proxy.addr(),
+        &basic_auth_json_post(
+            "/v1/chat/completions",
+            "{}",
+            "subject-a",
+            &cred_a,
+            &[("x-org-id", "acme"), ("x-team-id", "engineering")],
+        ),
+    );
+    assert_eq!(parse_status(&second), 429, "rule budget is exhausted");
+    assert_eq!(
+        parse_header(&second, "x-ratelimit-limit-tokens").as_deref(),
+        Some("60"),
+        "the rule, not a hierarchy level, denies the second request"
+    );
+
+    // The second request reserved 60 on each hierarchy level and then
+    // rolled it back. A leaked hold would leave org at 30, so this
+    // request would be denied by org (limit 100) instead of the rule.
+    let third = http_send(
+        proxy.addr(),
+        &basic_auth_json_post(
+            "/v1/chat/completions",
+            "{}",
+            "subject-a",
+            &cred_a,
+            &[("x-org-id", "acme"), ("x-team-id", "engineering")],
+        ),
+    );
+    assert_eq!(parse_status(&third), 429, "rule budget is still exhausted");
+    assert_eq!(
+        parse_header(&third, "x-ratelimit-limit-tokens").as_deref(),
+        Some("60"),
+        "hierarchy holds from the denied request were released"
+    );
+    assert_eq!(
+        backend.requests().len(),
+        1,
+        "only the admitted request should reach the provider"
     );
 }

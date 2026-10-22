@@ -282,9 +282,9 @@ shape itself is the regression target.
 
 - Should replay fixtures grow a first-class SSE response format, or should SSE
   stay covered only by stream parser tests for now?
-- Should `anthropic_validate` remain envelope-only, or should Praxis validate a
-  small set of transformation-owned invariants before converting to OpenAI Chat
-  Completions?
+- Should `anthropic_messages_request` remain envelope-only, or should Praxis
+  validate a small set of transformation-owned invariants before converting to
+  OpenAI Chat Completions?
 - How much should committed fixtures reflect Claude Code-specific tool names
   versus public Anthropic tool names?
 - What sanitization workflow should we use for large local tool results so the

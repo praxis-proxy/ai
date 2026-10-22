@@ -1,0 +1,139 @@
+{
+  "version": 1,
+  "scenario_id": "azure/annotation-stream",
+  "protocol": "openai_chat_completions",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-azure-model",
+    "source_id": "controlled-azure-annotation-stream"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "chatcmpl-azure": "chatcmpl-recorded-0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "usage-and-annotations",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "synthetic-azure-model",
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "Hi"
+                }
+              ],
+              "stream": true
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-azure-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-azure-model\",\"object\":\"chat.completion.chunk\",\"provider_data\":{\"source\":\"azure\"}}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-azure-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":1,\"total_tokens\":2}}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": true
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "Hi"
+                }
+              ],
+              "stream": true
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"content_filter_results\":{\"hate\":{\"filtered\":false}},\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-azure-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"content_filter_results\":{\"hate\":{\"filtered\":false}},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-azure-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"content_filter_results\":{},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-azure-model\",\"object\":\"chat.completion.chunk\",\"provider_data\":{\"source\":\"azure\"}}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"content_filter_results\":{},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-azure-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":1,\"total_tokens\":2}}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": true
+          }
+        }
+      }
+    }
+  ]
+}

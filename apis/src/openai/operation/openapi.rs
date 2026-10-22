@@ -6,6 +6,11 @@
 //! Split from the runtime operation metadata so builds that only classify
 //! operations do not compile `utoipa`.
 
+#![expect(
+    clippy::allow_attributes,
+    reason = "parameter contracts used when conversations feature is enabled"
+)]
+
 use std::borrow::{Borrow, Cow};
 
 use utoipa::openapi::{
@@ -78,6 +83,7 @@ pub(crate) use schema_binding;
 
 /// Location of one operation parameter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code, reason = "parameter contracts used when conversations feature is enabled")]
 pub(crate) enum ParameterLocation {
     /// Parameter embedded in the request path.
     Path,
@@ -87,6 +93,7 @@ pub(crate) enum ParameterLocation {
 
 /// `OpenAPI` metadata for one operation parameter.
 #[derive(Clone, Copy)]
+#[allow(dead_code, reason = "parameter contracts used when conversations feature is enabled")]
 pub(crate) struct ParameterSpec {
     /// Parameter name.
     pub(crate) name: &'static str,
@@ -100,6 +107,7 @@ pub(crate) struct ParameterSpec {
     schema: fn() -> RefOr<Schema>,
 }
 
+#[allow(dead_code, reason = "parameter contracts used when conversations feature is enabled")]
 impl ParameterSpec {
     /// Declare one parameter backed by a concrete Rust schema type.
     pub(crate) const fn new(
@@ -389,13 +397,13 @@ mod tests {
         assert!(!PROXIED_UPLOAD.owns_contract());
         assert!(PROXIED_UPLOAD.owned_contract().is_none());
         assert!(
-            PROXIED_UPLOAD.has_request_body(),
+            PROXIED_UPLOAD.request_body().is_present(),
             "a proxied multipart upload must report its body without owning a contract"
         );
         assert!(PROXIED_UPLOAD.request_body().is_required());
         assert_eq!(PROXIED_UPLOAD.request_body().as_str(), "multipart");
 
-        assert!(!PROXIED_GET.has_request_body());
+        assert!(!PROXIED_GET.request_body().is_present());
         assert!(!PROXIED_GET.request_body().is_required());
     }
 
@@ -409,7 +417,7 @@ mod tests {
 
     #[test]
     fn owned_contract_operations_still_report_their_body() {
-        assert!(FILE_OPERATION.has_request_body());
+        assert!(FILE_OPERATION.request_body().is_present());
         assert!(FILE_OPERATION.owned_contract().is_some());
     }
 

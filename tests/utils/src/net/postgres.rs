@@ -215,12 +215,45 @@ impl Drop for PostgresCertAuthGuard {
 /// container startup fails, or `PostgreSQL` does not become ready within
 /// the timeout.
 pub fn start_postgres_cert_auth() -> PostgresCertAuthGuard {
+    start_postgres_tls(TcpAuth::Certificate)
+}
+
+/// Start a TLS-enabled `PostgreSQL` container that deliberately requests
+/// `SCRAM-SHA-256` password authentication.
+///
+/// The returned guard exposes the same CA and client identity as
+/// [`start_postgres_cert_auth`], but the server ignores that identity for
+/// authentication and selects SCRAM instead. This is the negative peer used
+/// to prove that a certificate-only `SQLx` build refuses an unexpected password
+/// challenge rather than silently falling back to password authentication.
+///
+/// # Panics
+///
+/// Panics if no container engine is available, certificate generation or
+/// container startup fails, or `PostgreSQL` does not become ready within the
+/// timeout.
+pub fn start_postgres_scram_auth_tls() -> PostgresCertAuthGuard {
+    start_postgres_tls(TcpAuth::ScramSha256)
+}
+
+/// Authentication rule selected by the TLS test server.
+#[derive(Clone, Copy)]
+enum TcpAuth {
+    /// Authenticate the client certificate Common Name as the database role.
+    Certificate,
+    /// Ignore the client identity and request a SCRAM password exchange.
+    ScramSha256,
+}
+
+/// Start a TLS-enabled `PostgreSQL` container with `auth` as its only TCP
+/// authentication rule.
+fn start_postgres_tls(auth: TcpAuth) -> PostgresCertAuthGuard {
     let engine = detect_container_engine();
     let port = free_port();
     let certs = CertMaterial::generate();
     let cert_dir = certs.write_client_files();
 
-    let container_id = run_cert_auth_container(&engine, port, &certs);
+    let container_id = run_tls_container(&engine, port, &certs, auth);
     let guard = PostgresCertAuthGuard {
         cert_dir,
         container_id,
@@ -395,10 +428,17 @@ hostssl all   all   0.0.0.0/0     cert
 hostssl all   all   ::/0          cert
 ";
 
+/// `pg_hba.conf` for a TLS peer that unexpectedly selects SCRAM.
+const SCRAM_AUTH_PG_HBA: &str = "\
+local   all   all                 trust
+hostssl all   all   0.0.0.0/0     scram-sha-256
+hostssl all   all   ::/0          scram-sha-256
+";
+
 /// Shell wrapper (run as root inside the container) that materializes the
 /// certificate files with the ownership and permissions `PostgreSQL`
 /// requires, then hands off to the stock image entrypoint with SSL on.
-const CERT_AUTH_ENTRYPOINT: &str = "\
+const TLS_ENTRYPOINT: &str = "\
 set -e
 d=/etc/praxis-pg
 mkdir -p \"$d\"
@@ -422,19 +462,32 @@ exec docker-entrypoint.sh postgres \
     clippy::too_many_lines,
     reason = "single `docker run` argument vector for the cert-auth container"
 )]
-fn run_cert_auth_container(engine: &str, port: u16, certs: &CertMaterial) -> String {
-    let output = Command::new(engine)
-        .args([
-            "run",
-            "-d",
-            "--rm",
-            "-e",
-            &format!("POSTGRES_USER={PG_USER}"),
-            "-e",
-            &format!("POSTGRES_DB={PG_DATABASE}"),
+fn run_tls_container(engine: &str, port: u16, certs: &CertMaterial, auth: TcpAuth) -> String {
+    let mut command = Command::new(engine);
+    command.args([
+        "run",
+        "-d",
+        "--rm",
+        "-e",
+        &format!("POSTGRES_USER={PG_USER}"),
+        "-e",
+        &format!("POSTGRES_DB={PG_DATABASE}"),
+    ]);
+    match auth {
+        TcpAuth::Certificate => {
             // No password: the client authenticates with a certificate.
-            "-e",
-            "POSTGRES_HOST_AUTH_METHOD=trust",
+            command.args(["-e", "POSTGRES_HOST_AUTH_METHOD=trust"]);
+        },
+        TcpAuth::ScramSha256 => {
+            command.args(["-e", &format!("POSTGRES_PASSWORD={PG_PASSWORD}")]);
+        },
+    }
+    let hba = match auth {
+        TcpAuth::Certificate => CERT_AUTH_PG_HBA,
+        TcpAuth::ScramSha256 => SCRAM_AUTH_PG_HBA,
+    };
+    let output = command
+        .args([
             "-e",
             &format!("PG_CA_CERT={}", certs.ca_cert_pem),
             "-e",
@@ -442,14 +495,14 @@ fn run_cert_auth_container(engine: &str, port: u16, certs: &CertMaterial) -> Str
             "-e",
             &format!("PG_SERVER_KEY={}", certs.server_key_pem),
             "-e",
-            &format!("PG_HBA={CERT_AUTH_PG_HBA}"),
+            &format!("PG_HBA={hba}"),
             "-p",
             &format!("{port}:5432"),
             "--entrypoint",
             "/bin/sh",
             PG_IMAGE,
             "-c",
-            CERT_AUTH_ENTRYPOINT,
+            TLS_ENTRYPOINT,
         ])
         .output()
         .expect("failed to execute container engine");

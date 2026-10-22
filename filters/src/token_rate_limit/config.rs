@@ -3,7 +3,7 @@
 
 //! Deserialized YAML configuration for the `token_rate_limit` filter.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use serde::Deserialize;
 
@@ -20,17 +20,17 @@ use serde::Deserialize;
 /// which is off by default and activates the `experimental` marker.
 /// This filter delivers the agreed M1/M2/M6/M7 milestone scope, but its
 /// parent proposal is not yet `accepted` and open questions remain
-/// (HA/clustered-Valkey failure modes, and the relationship to
+/// (HA/clustered Redis/Valkey failure modes, and the relationship to
 /// Kuadrant's `TokenRateLimitPolicy` -- see `ai#127`). The
 /// configuration surface may change between releases.
 ///
 /// Mirrors the `rules:`/`match:` shape from the `00121_token-rate-limiting`
 /// proposal in `praxis-proxy/enhancements`, scoped to this milestone's
 /// static header-value matchers, per-rule algorithm choice, configurable
-/// estimation strategies (M3, see [`EstimationConfig`]), and M4
-/// token-type weights (`default_weights` / per-rule `weights`). CEL
-/// matchers and soft-limit tiers are still out of scope (see the module
-/// doc comment) -- upstream itself defers those.
+/// estimation strategies (M3, see [`EstimationConfig`]), M4
+/// token-type weights (`default_weights` / per-rule `weights`), graduated
+/// soft-limit tiers (S1), and per-rule soft over-quota enforcement
+/// (`ai#1241`). CEL matchers remain deferred (see the module doc comment).
 ///
 /// Assumes request identity has already been resolved upstream (this
 /// filter doesn't authenticate callers) -- a catch-all rule (no
@@ -40,13 +40,20 @@ use serde::Deserialize;
 /// the pipeline. Tracked as follow-on integration work in `grid#101`.
 ///
 /// Observability is group-level by rule, never by user. Metrics carry only
-/// bounded `rule`, `algorithm`, `backend`, `result`, and `capacity` labels;
+/// bounded `rule`, `algorithm`, `backend`, `error`, `result`, `capacity`,
+/// `phase`, and `outcome` labels;
 /// accounting logs and optional OpenTelemetry spans likewise omit raw
 /// subject and bucket-key values. The Prometheus contract is:
 ///
-/// - `praxis_trl_requests_total{rule,result}` (`admitted` or `denied`): budget decisions only. Requests rejected before
-///   a decision are counted by `praxis_trl_unauthenticated_total` (401, no trusted subject) and
-///   `praxis_trl_backend_errors_total` (503, fail closed) instead.
+/// - `praxis_trl_requests_total{rule,result}` (`admitted`, `denied`, or `soft_over_quota`): budget decisions only. Soft
+///   over-quota forwards are **not** reserved or reconciled (meter-only path does not debit the window). Requests
+///   rejected before a decision are counted by `praxis_trl_unauthenticated_total` (401, no trusted subject) and
+///   `praxis_trl_backend_errors_total` (503, fail closed) instead. Hierarchy decisions use the same metrics with `rule`
+///   set to `hierarchy:org`, `hierarchy:team`, or `hierarchy:user`. A configured rule must not use those names.
+///
+/// Accounting log field `outcome` on hard denials is one of: `budget_exhausted` (window/bucket capacity),
+/// `key_capacity` (per-rule distinct-key cap), `invalid_key`, or `reservation_capacity`. Soft over-quota forwards
+/// also use `budget_exhausted`. Admitted reservations use `reserved`.
 ///
 /// - `praxis_trl_unauthenticated_total{rule}`
 ///
@@ -62,10 +69,28 @@ use serde::Deserialize;
 ///
 /// - `praxis_trl_soft_tier_activations_total{rule,capacity}`
 ///
-/// - `praxis_trl_backend_errors_total{rule,backend}`: failed reservations (the 503 path) and reconciliations abandoned
-///   after their retries.
+/// - `praxis_trl_backend_errors_total{rule,backend,error}`: failed reservations (the 503 path), failed reconciliation
+///   enqueues, and reconciliations abandoned after their retries. `error` is one of `unavailable`, `unconfirmed`,
+///   `invalid_response`, or `configuration_mismatch`.
 ///
-/// - `praxis_trl_backend_reconciliation_total{rule,backend,result}`: reconciliations completed by a Valkey worker.
+/// - `praxis_trl_sentinel_discovery_total{phase,result}`: bounded
+///   Sentinel primary-discovery attempts. `phase` is `initial` or
+///   `rediscovery`; `result` is `success`, `failure`, or `stale` when
+///   generation fencing discards a result. This metric is emitted only for
+///   Sentinel topologies.
+///
+/// - `praxis_trl_sentinel_failover_total{outcome}`: generation-fenced
+///   recovery after a cached connection invalidation. `outcome` is
+///   `recovered` when a writable connection is returned or `failed` when the
+///   bounded discovery deadline is exhausted. `recovered` does not prove that
+///   Sentinel promoted a replica; it records proxy-side recovery only.
+///
+/// - `praxis_trl_fail_open_admissions_total{rule,backend,outcome}`: explicit `backend.on_failure: open` admissions,
+///   with `outcome` equal to `bypassed` when no mutation was dispatched or `unconfirmed` when a dispatched operation
+///   may have committed. No reservation handle is created for either outcome.
+///
+/// - `praxis_trl_backend_reconciliation_total{rule,backend,result}`: reconciliations completed by the shared-backend
+///   worker.
 ///
 /// - `praxis_trl_budget_remaining{rule,algorithm}`
 ///
@@ -76,21 +101,68 @@ use serde::Deserialize;
 /// Every previous `praxis_ai_token_rate_limit_*` name has moved to this
 /// prefix; no compatibility aliases are emitted.
 ///
-/// `budget_remaining` is the sum of the latest calculated remaining
-/// balances for the rule's retained keys, and `active_keys` is how many
-/// balances contribute. Window aging and refill are evaluated lazily during
-/// normal backend operations, so both are snapshots rather than
-/// continuously refreshed values. Like all Prometheus gauges they are f64
-/// and saturate at the largest exactly representable integer (2^53 - 1).
+/// `budget_remaining` is the remaining budget for the key of the most recent
+/// admission decision on this replica (admitted or denied), and
+/// `active_keys` is how many keys the backend currently retains. Both are
+/// snapshots taken as decisions happen, not continuously refreshed values.
+/// Like all Prometheus gauges they are f64 and saturate at the largest
+/// exactly representable integer (2^53 - 1).
 ///
 /// Gauge scope depends on the backend. With the `memory` backend every
 /// gauge describes this process only, so aggregate replicas with `sum`.
-/// With the `valkey` backend every replica exports the rule-wide value it
-/// last observed from the shared store, so aggregate replicas with `max`;
-/// a replica that stops seeing traffic for a rule keeps exporting its last
-/// observation until it does. Valkey applies expiry incrementally on each
-/// admission, so its counts can briefly include entries that have just
-/// expired.
+/// With a shared `redis`/`valkey` backend, `reservations_active` is scoped to the
+/// namespace and algorithm, so summing it over rules double-counts;
+/// aggregate with `max` across replicas and rules. `active_keys` is scoped
+/// per rule, so aggregate with `max` across replicas for each rule.
+/// Each replica exports the value it last observed from the shared store.
+/// `budget_remaining` stays per replica and per
+/// last decision on either backend: it describes whichever key that
+/// replica decided last, so `max` or `sum` across replicas says little
+/// beyond "some key had this much left". A replica that stops seeing
+/// traffic for a rule keeps exporting its last observation until it does.
+///
+/// The shared `redis`/`valkey` backend requires Valkey or Redis 7.0+
+/// (`PEXPIRE NX`/`GT` is used). Both selectors use the same backend path and
+/// are treated as equal qualification targets. The backend keeps
+/// sliding-window usage in 60 fixed sub-windows per window (one per
+/// second for windows under a minute); usage leaves the window up to one
+/// sub-window late, never early. Changing a window's length changes its
+/// sub-window width and so starts that window's usage from zero. On the
+/// sliding window, concurrent admissions on one key are not serialised,
+/// so they can overshoot the budget by their combined estimates for one
+/// round trip. A dispatched mutation is never replayed; asynchronous
+/// replication may still lose an acknowledged write during failover.
+///
+#[rustfmt::skip]
+/// The initial release gate is symmetric against official Redis 8.10.2
+/// (`redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0`)
+/// and Red Hat Valkey 8.0.11 (`registry.access.redhat.com/rhel10/valkey-8@sha256:5929be16ac020c4851d8dc1f5ead6d48c6da066a9a74349711186925ebd553b9`). These are symmetric qualification targets, not a claim that every deployment has passed; support requires both complete product lanes.
+/// The shared token bucket, by contrast, serialises admissions per key
+/// through an optimistic transaction: one key admits at most about one
+/// request per two Redis/Valkey round trips across the whole fleet, and
+/// contention shows up first as added latency, up to `backend.operation_timeout`
+/// (default 500 ms), then as 503s. Use a non-`global` `key` for high-throughput
+/// token-bucket rules so the load spreads over many buckets.
+///
+/// During a rolling upgrade from the earlier scripted shared backend,
+/// replicas on the old and new versions keep separate state, so for one
+/// window (and until old token buckets have drained) combined admissions
+/// can reach about twice the budget. All shared-backend timestamps come from
+/// the proxy replicas' clocks, not the datastore's: skew between replicas can
+/// under-count usage at window edges by up to the skew, and a replica
+/// whose clock runs fast trims other replicas' live reservations and keys
+/// from the caps early.
+///
+/// Sentinel HA keeps admission and reconciliation on the discovered writable
+/// primary. Healthy operations reuse the cached data connection and do not
+/// query Sentinel. Discovery and connection replacement are bounded and
+/// coalesced; a dispatched operation whose reply is lost is never replayed.
+/// Replication remains asynchronous: an acknowledged write can be lost before
+/// promotion, and a partitioned old primary can accept writes later discarded.
+/// This backend does not provide RPO=0 or strong consistency. Production
+/// deployments should use at least three Sentinels, durable primary/replica
+/// persistence, suitable `min-replicas-to-write` and
+/// `min-replicas-max-lag`, and monitor `SENTINEL CKQUORUM`.
 ///
 /// Admissions, denials, reconciliations, and backend failures also emit
 /// structured records on the `praxis_ai::token_rate_limit::accounting`
@@ -112,20 +184,48 @@ pub(super) struct TokenRateLimitConfig {
     /// a catch-all budget instead.
     pub rules: Vec<RuleConfig>,
 
-    /// Trusted request identity used to partition each rule's budget.
-    /// The default preserves the historical single global bucket.
+    /// How this filter partitions each matched rule's token budget.
+    ///
+    /// Accepts a scalar (`global`, `authenticated_subject`, `ip`,
+    /// `model`), a list of dimensions (composite keys), a single
+    /// dimension mapping (`header: x-tenant-id`), or a full spec with
+    /// `dimensions` and `missing`. Defaults to one shared global bucket.
+    ///
+    /// Composite dimension *order does not matter*: compiled dimensions
+    /// are sorted into a canonical order so reordering a list cannot
+    /// silently reset live budgets.
+    ///
+    /// `ip` and `model` are as caller-controlled as `header` when they
+    /// come from a forwarding header or a client-supplied model string.
+    /// Pair them with `max_keys` so one client cannot fill the table.
     #[serde(default)]
-    pub key: KeySource,
+    pub key: KeySpec,
+
+    /// Soft cap on distinct budget keys retained at once, **per rule**.
+    ///
+    /// Bounds cardinality from per-header, per-IP, and composite
+    /// keying. Defaults to [`super::MAX_KEYS`]. A new distinct key past
+    /// this cap is denied (429, accounting outcome `key_capacity`)
+    /// rather than growing without bound.
+    ///
+    /// In-process ledgers enforce the cap per rule. The shared backend enforces it
+    /// against the per-rule retained-key set (`{namespace}:v2:keys:{rule_hash}`,
+    /// or the token-bucket equivalent).
+    /// Idle in-process keys are reaped by ledger cleanup, which walks a
+    /// bounded number of entries per request (including busy ones) so a
+    /// single in-window key cannot pin the table at this cap.
+    #[serde(default = "default_max_keys")]
+    pub max_keys: usize,
 
     /// Where every rule's admission state lives: in-process (default,
-    /// one budget per gateway instance) or a shared Valkey backend (one
+    /// one budget per gateway instance) or a shared Redis/Valkey backend (one
     /// budget shared across every gateway instance/replica). One
     /// backend for the whole filter, not per rule -- rules already
-    /// share Valkey key-space isolation via `namespace`/rule-name
+    /// share Redis/Valkey key-space isolation via `namespace`/rule-name
     /// hashing, so per-rule backend selection bought no isolation
-    /// benefit, only a separate Valkey connection per rule pointed at
+    /// benefit, only a separate shared-backend connection per rule pointed at
     /// the same URL. Revisit if a real deployment ever needs to mix
-    /// in-process and Valkey rules in one filter instance.
+    /// in-process and Redis/Valkey rules in one filter instance.
     #[serde(default)]
     pub backend: BackendConfig,
 
@@ -135,18 +235,562 @@ pub(super) struct TokenRateLimitConfig {
     /// reserves the estimation/`reserved_tokens` cost unweighted.
     #[serde(default)]
     pub default_weights: super::weights::TokenTypeWeightsConfig,
+
+    /// Optional three-level hierarchy enforcing independent org, team,
+    /// and user budgets on each request. Exactly three levels in
+    /// `[org, team, user]` order are required when present; each level
+    /// reuses the existing algorithm/capacity fields from [`RuleAlgorithm`].
+    /// Org and team set `identity_header`. The user level sets
+    /// `identity: authenticated_subject`. Exactly one of those fields is
+    /// present.
+    ///
+    /// A configured hierarchy applies to every request that reaches the
+    /// filter. The rule list must include a catch-all (a rule with no
+    /// `match`), and every rule must have `reserved_tokens` or
+    /// `estimation.fallback_estimate`, so a request cannot skip the three
+    /// budgets by missing a matcher or a body field. A fixed estimate
+    /// (`reserved_tokens` or `strategy: fixed`) must fit in every level's
+    /// capacity.
+    ///
+    /// An org, team, or user denial is always 429. A rule's
+    /// `enforcement: soft` does not apply to those three levels. Soft
+    /// still applies to the matched rule after the three levels accept.
+    #[serde(default)]
+    pub hierarchy: Option<Vec<HierarchyLevelConfig>>,
 }
 
-/// Trusted source used to partition a rule's token budget.
+/// Hierarchy quota level tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum HierarchyLevel {
+    /// Organization-level quota.
+    Org,
+    /// Team-level quota.
+    Team,
+    /// User-level quota.
+    User,
+}
+
+/// Where one hierarchy level reads its identity. Exactly one variant is
+/// set. `identity_header` and `identity` cannot both be present, and a
+/// typo such as `authenicated_subject` fails while the config is parsed.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum HierarchyIdentitySource {
+    /// Request header carrying the org or team id.
+    IdentityHeader(String),
+    /// Authenticated subject for the user level.
+    Identity(HierarchySubjectSource),
+}
+
+/// The only accepted `identity` value on a hierarchy level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum HierarchySubjectSource {
+    /// [`praxis_filter::AuthenticatedIdentity::subject_id`].
+    AuthenticatedSubject,
+}
+
+/// One hierarchy level's configuration. Org and team levels use
+/// `identity_header` (a request header carrying the org/team ID);
+/// the user level uses `identity: authenticated_subject`.
+///
+/// **Deployment note:** org and team header values must be set by a
+/// trusted upstream component (an ingress or an identity filter) that
+/// strips any client-supplied value and writes its own. This filter
+/// hashes the header it receives. It has no org or team claim on
+/// [`praxis_filter::AuthenticatedIdentity`] to compare that header
+/// against. An authenticated client that can still set the header can
+/// choose another org or team bucket and can fill `max_keys`.
+// `deny_unknown_fields` omitted because `#[serde(flatten)]` on the
+// algorithm and identity enums is incompatible with it (same reason as
+// `RuleConfig`).
+#[derive(Debug, Deserialize)]
+pub(super) struct HierarchyLevelConfig {
+    /// Which hierarchy level this entry configures.
+    pub level: HierarchyLevel,
+
+    /// Exactly one identity source: `identity_header` or `identity`.
+    #[serde(flatten)]
+    pub identity: HierarchyIdentitySource,
+
+    /// Algorithm choice and parameters for this level's budget.
+    #[serde(flatten)]
+    pub algorithm: RuleAlgorithm,
+
+    /// How long a hierarchy reservation is tracked before expiry.
+    #[serde(default)]
+    pub reservation_timeout: Option<String>,
+}
+
+/// Serde default for [`TokenRateLimitConfig::max_keys`].
+fn default_max_keys() -> usize {
+    super::MAX_KEYS
+}
+
+/// Policy applied when a key dimension cannot be resolved from the request.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum KeySource {
-    /// Every request matching a rule shares that rule's budget.
+pub(super) enum MissingKeyPolicy {
+    /// Fail closed: reject the request before provider contact.
     #[default]
-    Global,
+    Reject,
+    /// Drop the unresolved dimension. If nothing remains, use the global
+    /// bucket (`__fallback__`) -- the #129 "header absent" behaviour.
+    Fallback,
+}
 
-    /// Partition the rule by Praxis's verified request subject.
+/// One dimension of a token-budget key (proposal M5 / ai#123).
+///
+/// Composite keys are an ordered list of these. A lone `Global` dimension
+/// preserves the historical single-bucket-per-rule behaviour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum KeyDimension {
+    /// Shared bucket for every request matching the rule.
+    Global,
+    /// Verified [`praxis_filter::AuthenticatedIdentity`] subject.
     AuthenticatedSubject,
+    /// Downstream TCP peer address, or an optional forwarding header.
+    ///
+    /// When `header` is set, the right-most hop after `trusted_hops`
+    /// trusted proxies is used (appending LBs put client-controlled
+    /// values on the left). A missing header falls back to the TCP peer
+    /// so health checks and in-cluster clients are not `missing_ip`.
+    /// A present but unusable header is fail-closed.
+    ///
+    /// The selected address is hashed, so distinct IPs (or models, via
+    /// [`Self::Model`]) can fill `max_keys` the same way a caller-controlled
+    /// header can. Pair high-cardinality dimensions with a tighter cap.
+    Ip {
+        /// Forwarding header (e.g. `x-forwarded-for`). Blank names are
+        /// rejected at compile time.
+        header: Option<String>,
+        /// Trusted proxy hops to skip from the right of the header.
+        /// `0` (default) selects the right-most hop.
+        trusted_hops: u32,
+        /// Optional IPv6 prefix length (1–128). When set, IPv6 addresses
+        /// are masked to this prefix before hashing so a client holding
+        /// a `/64` cannot rotate host bits for a fresh budget. IPv4 is
+        /// unchanged. Unset keeps the historical `/128` (full address).
+        ipv6_prefix: Option<u8>,
+    },
+    /// Model identity from `header` (default `x-model`), then the JSON
+    /// body `model` field when the request is already buffered for
+    /// estimation. Preferring the header keeps `key: model` from forcing
+    /// `StreamBuffer` on every request.
+    ///
+    /// Model strings are caller-controlled; bound cardinality with
+    /// `max_keys`.
+    Model {
+        /// Header consulted before the body `model` field.
+        header: Option<String>,
+    },
+    /// Arbitrary request header value. As trusted as whoever set the
+    /// header -- pair with an upstream auth filter, do not key on a
+    /// caller-controlled identity header.
+    Header {
+        /// Header name (case-insensitive HTTP name).
+        name: String,
+        /// Overrides the spec-level [`KeySpec::missing`] for this header.
+        missing: Option<MissingKeyPolicy>,
+    },
+}
+
+/// Filter-level budget key configuration.
+///
+/// YAML shapes (all equivalent for a single subject key):
+///
+/// ```yaml
+/// key: authenticated_subject
+/// key:
+///   - authenticated_subject
+/// key:
+///   missing: reject
+///   dimensions:
+///     - type: authenticated_subject
+/// ```
+///
+/// Other dimension shapes:
+///
+/// ```yaml
+/// key: ip
+/// key:
+///   ip:
+///     header: x-forwarded-for
+///     trusted_hops: 1          # skip the last appending proxy
+///     ipv6_prefix: 64          # optional; IPv4 unchanged
+/// key:
+///   model:
+///     header: x-model          # omit to keep the default
+/// key:
+///   header: x-tenant-id
+///   missing: fallback
+/// key:
+///   - type: header
+///     name: x-api-key
+///     missing: reject
+/// ```
+///
+/// Composite example (subject + model + tenant header). List order is
+/// canonicalized at compile time; reordering does not reset budgets:
+///
+/// ```yaml
+/// key:
+///   - authenticated_subject
+///   - model
+///   - header: x-tenant-id
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct KeySpec {
+    /// Ordered dimensions joined into one opaque backend key.
+    pub dimensions: Vec<KeyDimension>,
+    /// Default missing-dimension policy. Per-header `missing:` overrides
+    /// this for that header only.
+    pub missing: MissingKeyPolicy,
+}
+
+impl Default for KeySpec {
+    fn default() -> Self {
+        Self {
+            dimensions: vec![KeyDimension::Global],
+            missing: MissingKeyPolicy::Reject,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for KeySpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = KeySpecDe::deserialize(deserializer)?;
+        Ok(wire.into_spec())
+    }
+}
+
+/// Wire form for [`KeySpec`]: scalar, list, single dimension map, or full spec.
+///
+/// Mapping variants that carry a sibling `missing:` are listed *before*
+/// [`KeySpecDe::Dimension`] so `{ header: x-tenant-id, missing: fallback }`
+/// is not swallowed by a header-only shortcut that would ignore `missing`.
+/// Each of those mappings uses `deny_unknown_fields` so
+/// `{ type: ip, header: x-forwarded-for }` still falls through to the
+/// tagged dimension parser instead of being misread as a header key.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum KeySpecDe {
+    /// `key: authenticated_subject`
+    Scalar(NamedDimension),
+    /// `key: [authenticated_subject, model]`
+    List(Vec<KeyDimensionDe>),
+    /// `key: { missing, dimensions }`
+    Spec(KeySpecMapping),
+    /// `key: { header: x-tenant-id }` or `{ header: x-tenant-id, missing: fallback }`
+    HeaderKey(HeaderKeyMapping),
+    /// `key: { model: {} }` or `{ model: { header: x-model }, missing: fallback }`
+    ModelKey(ModelKeyMapping),
+    /// `key: { ip: {} }` or `{ ip: { header: x-forwarded-for }, missing: fallback }`
+    IpKey(IpKeyMapping),
+    /// `key: { header: x-tenant-id }` (no sibling fields) or `{ type: ip, header: ... }`
+    Dimension(KeyDimensionDe),
+}
+
+/// Single-header spec that may set the spec-level missing policy.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeaderKeyMapping {
+    /// Header name or name+missing spec.
+    header: HeaderRef,
+    /// Spec-level missing policy (per-header `missing` still wins).
+    #[serde(default)]
+    missing: MissingKeyPolicy,
+}
+
+/// Single-model spec that may set the spec-level missing policy.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelKeyMapping {
+    /// Optional model header override.
+    model: ModelRef,
+    /// Spec-level missing policy.
+    #[serde(default)]
+    missing: MissingKeyPolicy,
+}
+
+/// Single-IP spec that may set the spec-level missing policy.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IpKeyMapping {
+    /// Optional forwarding-header override.
+    ip: IpRef,
+    /// Spec-level missing policy.
+    #[serde(default)]
+    missing: MissingKeyPolicy,
+}
+
+/// Mapping form of [`KeySpec`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeySpecMapping {
+    /// Dimension list; empty is rejected at compile time.
+    #[serde(default)]
+    dimensions: Vec<KeyDimensionDe>,
+    /// Default missing-dimension policy.
+    #[serde(default)]
+    missing: MissingKeyPolicy,
+}
+
+impl KeySpecDe {
+    /// Convert the wire form into a [`KeySpec`].
+    fn into_spec(self) -> KeySpec {
+        match self {
+            Self::Scalar(name) => named_spec(name),
+            Self::List(items) => KeySpec {
+                dimensions: decode_dimensions(items),
+                missing: MissingKeyPolicy::Reject,
+            },
+            Self::Spec(spec) => KeySpec {
+                dimensions: decode_dimensions(spec.dimensions),
+                missing: spec.missing,
+            },
+            Self::HeaderKey(map) => KeySpec {
+                dimensions: vec![header_dimension(map.header)],
+                missing: map.missing,
+            },
+            Self::ModelKey(map) => KeySpec {
+                dimensions: vec![KeyDimension::Model {
+                    header: map.model.header,
+                }],
+                missing: map.missing,
+            },
+            Self::IpKey(map) => KeySpec {
+                dimensions: vec![ip_dimension(map.ip)],
+                missing: map.missing,
+            },
+            Self::Dimension(item) => KeySpec {
+                dimensions: vec![item.into_dimension()],
+                missing: MissingKeyPolicy::Reject,
+            },
+        }
+    }
+}
+
+/// Closed set of scalar dimension names. Enumerated so unknown strings
+/// fail at parse time (see `docs/developing/type-design.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NamedDimension {
+    /// Shared bucket for every matching request.
+    Global,
+    /// Verified authenticated subject.
+    AuthenticatedSubject,
+    /// Client IP (peer address; no forwarding header).
+    Ip,
+    /// Model identity from the default `x-model` header, then the body.
+    Model,
+}
+
+impl NamedDimension {
+    /// Convert a scalar name into its dimension (no header overrides).
+    fn into_dimension(self) -> KeyDimension {
+        match self {
+            Self::Global => KeyDimension::Global,
+            Self::AuthenticatedSubject => KeyDimension::AuthenticatedSubject,
+            Self::Ip => ip_dimension(IpRef::default()),
+            Self::Model => KeyDimension::Model { header: None },
+        }
+    }
+}
+
+/// One-dimension spec from a scalar name.
+fn named_spec(name: NamedDimension) -> KeySpec {
+    KeySpec {
+        dimensions: vec![name.into_dimension()],
+        missing: MissingKeyPolicy::Reject,
+    }
+}
+
+/// Decode a list of wire dimensions.
+fn decode_dimensions(items: Vec<KeyDimensionDe>) -> Vec<KeyDimension> {
+    items.into_iter().map(KeyDimensionDe::into_dimension).collect()
+}
+
+/// Wire form for one [`KeyDimension`].
+///
+/// Struct variants use `deny_unknown_fields` so a list item like
+/// `{ ip: {}, header: x-forwarded-for }` cannot silently parse as a
+/// header dimension, and `{ header: x-tenant-id, missing: fallback }`
+/// cannot drop `missing`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum KeyDimensionDe {
+    /// Scalar name (`global`, `authenticated_subject`, `ip`, `model`).
+    Name(NamedDimension),
+    /// Internally tagged `{ type: ..., ... }`.
+    Tagged(TaggedDimension),
+    /// `{ header: x-tenant-id }` or `{ header: x-tenant-id, missing: fallback }`.
+    HeaderShortcut(HeaderShortcutMapping),
+    /// `{ model: {} }` or `{ model: { header } }`.
+    ModelShortcut(ModelShortcutMapping),
+    /// `{ ip: {} }` or `{ ip: { header, trusted_hops, ipv6_prefix } }`.
+    IpShortcut(IpShortcutMapping),
+}
+
+/// List-item `{ header: NAME, missing?: ... }`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeaderShortcutMapping {
+    /// Header name or name+missing spec.
+    header: HeaderRef,
+    /// Optional per-header missing policy (sibling of `header:`).
+    #[serde(default)]
+    missing: Option<MissingKeyPolicy>,
+}
+
+/// List-item `{ model: { header?: ... } }`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelShortcutMapping {
+    /// Optional model header override.
+    model: ModelRef,
+}
+
+/// List-item `{ ip: { header?, trusted_hops?, ipv6_prefix? } }`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IpShortcutMapping {
+    /// Optional forwarding-header override.
+    ip: IpRef,
+}
+
+/// Header shortcut value: a name, or a name plus missing policy.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HeaderRef {
+    /// `header: x-tenant-id`
+    Name(String),
+    /// `header: { name: x-tenant-id, missing: fallback }`
+    Spec {
+        /// Header to read.
+        name: String,
+        /// Optional per-header missing policy.
+        #[serde(default)]
+        missing: Option<MissingKeyPolicy>,
+    },
+}
+
+/// `{ model: {} }` or `{ model: { header: x-model } }`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelRef {
+    /// Header consulted when the body has no `model` field.
+    #[serde(default)]
+    header: Option<String>,
+}
+
+/// `{ ip: {} }` or `{ ip: { header: x-forwarded-for, trusted_hops: 1 } }`.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IpRef {
+    /// Forwarding header, when set.
+    #[serde(default)]
+    header: Option<String>,
+    /// Trusted hops skipped from the right. Default `0` (right-most).
+    #[serde(default)]
+    trusted_hops: u32,
+    /// Optional IPv6 prefix mask applied before hashing.
+    #[serde(default)]
+    ipv6_prefix: Option<u8>,
+}
+
+/// Internally tagged dimension (`type: ...`).
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum TaggedDimension {
+    /// Shared bucket for every matching request.
+    Global,
+    /// Verified authenticated subject.
+    AuthenticatedSubject,
+    /// Client IP.
+    Ip {
+        /// Optional forwarding header.
+        #[serde(default)]
+        header: Option<String>,
+        /// Trusted hops skipped from the right.
+        #[serde(default)]
+        trusted_hops: u32,
+        /// Optional IPv6 prefix mask.
+        #[serde(default)]
+        ipv6_prefix: Option<u8>,
+    },
+    /// Model identity.
+    Model {
+        /// Optional model header override.
+        #[serde(default)]
+        header: Option<String>,
+    },
+    /// Named request header.
+    Header {
+        /// Header to read.
+        name: String,
+        /// Optional per-header missing policy.
+        #[serde(default)]
+        missing: Option<MissingKeyPolicy>,
+    },
+}
+
+impl KeyDimensionDe {
+    /// Convert the wire form into a [`KeyDimension`].
+    fn into_dimension(self) -> KeyDimension {
+        match self {
+            Self::Name(name) => name.into_dimension(),
+            Self::HeaderShortcut(HeaderShortcutMapping { header, missing }) => {
+                header_dimension_with_missing(header, missing)
+            },
+            Self::ModelShortcut(ModelShortcutMapping { model }) => KeyDimension::Model { header: model.header },
+            Self::IpShortcut(IpShortcutMapping { ip }) => ip_dimension(ip),
+            Self::Tagged(tagged) => match tagged {
+                TaggedDimension::Global => KeyDimension::Global,
+                TaggedDimension::AuthenticatedSubject => KeyDimension::AuthenticatedSubject,
+                TaggedDimension::Ip {
+                    header,
+                    trusted_hops,
+                    ipv6_prefix,
+                } => ip_dimension(IpRef {
+                    header,
+                    trusted_hops,
+                    ipv6_prefix,
+                }),
+                TaggedDimension::Model { header } => KeyDimension::Model { header },
+                TaggedDimension::Header { name, missing } => KeyDimension::Header { name, missing },
+            },
+        }
+    }
+}
+
+/// Convert a header shortcut into a [`KeyDimension`].
+fn header_dimension(header: HeaderRef) -> KeyDimension {
+    header_dimension_with_missing(header, None)
+}
+
+/// Convert a header shortcut, applying an optional sibling `missing:`.
+fn header_dimension_with_missing(header: HeaderRef, sibling_missing: Option<MissingKeyPolicy>) -> KeyDimension {
+    match header {
+        HeaderRef::Name(name) => KeyDimension::Header {
+            name,
+            missing: sibling_missing,
+        },
+        HeaderRef::Spec { name, missing } => KeyDimension::Header {
+            name,
+            missing: missing.or(sibling_missing),
+        },
+    }
+}
+
+/// Convert an IP mapping into a [`KeyDimension`].
+fn ip_dimension(ip: IpRef) -> KeyDimension {
+    KeyDimension::Ip {
+        header: ip.header,
+        trusted_hops: ip.trusted_hops,
+        ipv6_prefix: ip.ipv6_prefix,
+    }
 }
 
 /// One `rules:` entry: an optional match condition, an algorithm choice
@@ -165,11 +809,11 @@ pub(super) enum KeySource {
 // flattened enum's own error path instead of this struct's.
 #[derive(Debug, Deserialize)]
 pub(super) struct RuleConfig {
-    /// Human-readable rule identifier, folded into Valkey key
+    /// Human-readable rule identifier, folded into shared-backend key
     /// namespacing so distinct rules sharing one backend never collide.
     ///
-    /// Renaming a live `valkey`-backed rule is therefore not a
-    /// no-op for operators: it changes the Valkey key hash, so the old
+    /// Renaming a live shared-backend rule is therefore not a
+    /// no-op for operators: it changes the datastore key hash, so the old
     /// name's tracked budget is orphaned (left to expire on its own TTL)
     /// and the new name starts with a fresh budget. There's no
     /// migration/rename path today -- routine config hygiene (e.g.
@@ -247,6 +891,66 @@ pub(super) struct RuleConfig {
     /// the algorithm's `capacity`.
     #[serde(default)]
     pub tiers: Option<Vec<TierConfig>>,
+
+    /// What happens when the algorithm denies a reservation because the
+    /// token budget is exhausted (`ai#1241`). Defaults to [`EnforcementMode::Hard`]
+    /// (429). Soft forwards with [`over_quota`](Self::over_quota) annotation.
+    #[serde(default)]
+    pub enforcement: EnforcementMode,
+
+    /// Request-header annotation applied when [`enforcement`](Self::enforcement)
+    /// is [`EnforcementMode::Soft`] and the algorithm denies the reservation
+    /// for budget exhaustion. Required for `soft` (at least one static header
+    /// and/or `include_remaining` / `include_used`). Rejected for `hard`.
+    #[serde(default)]
+    pub over_quota: Option<OverQuotaConfig>,
+}
+
+/// Per-rule action when the admission algorithm denies a reservation.
+///
+/// Distinct from graduated S1 `tiers` (which annotate admitted traffic
+/// below capacity): this chooses hard 429 vs soft annotate when the
+/// request is *over* the algorithm's token budget.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum EnforcementMode {
+    /// Reject with 429 and token-denominated rate-limit response headers.
+    #[default]
+    Hard,
+    /// Forward the request and annotate it for downstream handling (`ai#1241`).
+    Soft,
+}
+
+/// Annotation surface for soft over-quota forwarding.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OverQuotaConfig {
+    /// Static headers set on the upstream request when over quota.
+    /// Required to be non-empty unless `include_remaining` or
+    /// `include_used` is true.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+
+    /// When true, also set the remaining-quota header from the backend
+    /// snapshot at denial time (tokens still available in the window /
+    /// bucket — often `0` when the estimate no longer fits).
+    #[serde(default)]
+    pub include_remaining: bool,
+
+    /// When true, also set a used-quota header as `limit - remaining`
+    /// from the same denial-time backend snapshot.
+    #[serde(default)]
+    pub include_used: bool,
+
+    /// Header name for remaining tokens when `include_remaining` is true.
+    /// Defaults to `X-RateLimit-Remaining-Tokens`.
+    #[serde(default)]
+    pub remaining_header: Option<String>,
+
+    /// Header name for used tokens when `include_used` is true.
+    /// Defaults to `X-Token-Quota-Used`.
+    #[serde(default)]
+    pub used_header: Option<String>,
 }
 
 /// One graduated enforcement tier (proposal S1).
@@ -330,24 +1034,307 @@ impl RuleAlgorithm {
 pub(super) const DEFAULT_RESERVATION_TIMEOUT: &str = "30s";
 
 /// Backend selection and connection details.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Deserialize)]
+#[serde(try_from = "RawBackendConfig")]
 pub(super) struct BackendConfig {
     /// Which backend implementation to use.
     #[serde(default)]
     pub kind: BackendKind,
 
-    /// Backend connection URL. Supports one `${ENV_VAR}` reference, so
-    /// credentials/hostnames don't need to be committed to config.
-    /// Required when `kind: valkey`, ignored otherwise.
+    /// Standalone URL or Sentinel topology. The two input forms are mutually
+    /// exclusive and network backends require one; ignored for `kind: memory`.
+    /// TLS is derived from the endpoint scheme, so `rediss://`/`valkeys://`
+    /// enable Sentinel TLS without a second boolean that can disagree.
     #[serde(default)]
-    pub url: Option<String>,
+    pub topology: Option<BackendTopology>,
 
-    /// Key namespace prefix, so multiple filter rules or deployments can
-    /// share one Valkey instance without colliding. Ignored for
-    /// `kind: memory`. Defaults to `"praxis:token_rate_limit"` when unset.
+    /// Validated namespace; operator guidance lives on [`RawBackendConfig`].
     #[serde(default)]
     pub namespace: Option<String>,
+
+    /// Validated failure policy; operator guidance lives on [`RawBackendConfig`].
+    #[serde(default)]
+    pub on_failure: BackendOnFailure,
+
+    /// Maximum time to establish a standalone or discovered-primary data
+    /// connection. Defaults to 500ms.
+    #[serde(default)]
+    pub connect_timeout: Duration,
+
+    /// Maximum time to wait for one datastore response or transaction-pool
+    /// permit. Defaults to 500ms.
+    #[serde(default)]
+    pub operation_timeout: Duration,
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            kind: BackendKind::default(),
+            topology: None,
+            namespace: None,
+            on_failure: BackendOnFailure::default(),
+            connect_timeout: Duration::from_millis(500),
+            operation_timeout: Duration::from_millis(500),
+        }
+    }
+}
+
+/// Mutually exclusive backend connection topologies.
+pub(super) enum BackendTopology {
+    /// One standalone Redis/Valkey endpoint.
+    Standalone(String),
+    /// A Sentinel-monitored writable primary.
+    Sentinel(Box<SentinelConfig>),
+}
+
+impl std::fmt::Debug for BackendTopology {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // URLs can contain userinfo or other credential-bearing values.
+            Self::Standalone(_) => f.debug_tuple("Standalone").field(&"<redacted>").finish(),
+            Self::Sentinel(config) => f.debug_tuple("Sentinel").field(config).finish(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Raw flat backend fields converted into [`BackendConfig`].
+struct RawBackendConfig {
+    /// Backend implementation selector.
+    #[serde(default)]
+    kind: BackendKind,
+    /// Standalone Redis/Valkey URL. Exactly one of `url` or `sentinel` is
+    /// required for `kind: redis` or `kind: valkey`; they are mutually exclusive.
+    /// Ignored for `kind: memory`. Use `rediss://` or `valkeys://` for verified
+    /// TLS and `${ENV_VAR}` substitution for credentials supplied at deployment.
+    #[serde(default)]
+    url: Option<String>,
+    /// Sentinel topology with ordered endpoints and separate Sentinel/data
+    /// credentials. Exactly one of `url` or `sentinel` is required for
+    /// `kind: redis` or `kind: valkey`; they are mutually exclusive. Ignored for
+    /// `kind: memory`. TLS is derived from the endpoint scheme: `rediss://` or
+    /// `valkeys://` enables verified TLS without a separate boolean.
+    #[serde(default)]
+    sentinel: Option<RawSentinelConfig>,
+    /// Key namespace prefix, so multiple filter rules or deployments can
+    /// share one Redis/Valkey instance without colliding. The namespace is
+    /// configured once for the whole filter, not per rule, so changing it
+    /// starts a fresh accounting generation and fresh budgets for every rule
+    /// in that filter. Ignored for `kind: memory`. Defaults to
+    /// `"praxis:token_rate_limit"` when unset.
+    ///
+    /// The shared backend permanently records a schema-versioned fingerprint for each
+    /// namespace/rule/algorithm identity. Replicas with a different window,
+    /// capacity, refill rate, reservation timeout, state bound, or compiled
+    /// budget-key policy fail closed with 503 before mutating shared state.
+    /// The compatibility markers use
+    /// `{namespace}:v2:sw:rule:{hash}:accounting-config` for sliding windows
+    /// and `{namespace}:v2:tb:rule:{hash}:accounting-config` for token
+    /// buckets. The fingerprint also includes the compiled estimation
+    /// strategy and effective token-type weights, but never request-derived
+    /// values such as one request's `max_tokens`. On first use, the backend
+    /// scans the namespace for unmarked `v2` keys before claiming a persistent
+    /// generation marker; the scan is bounded and fails closed rather than
+    /// adopting a partial result. Pre-marker state fails closed and leaves a
+    /// persistent `{namespace}:v2:accounting-generation` tombstone that
+    /// requires a new namespace generation rather than being silently
+    /// adopted. This protects against quota state surviving an expiring
+    /// per-rule retained-key index. The first bootstrap must run with
+    /// pre-marker writers quiesced because those writers do not participate in
+    /// the scan/claim protocol.
+    ///
+    /// To make an intentional semantic change, quiesce the old generation,
+    /// cut every writer over to a new namespace generation, and only then
+    /// retire the complete old namespace. Do not delete only a compatibility
+    /// marker: doing so can bind a new configuration to incompatible residual
+    /// quota state. Avoid serving traffic from both generations during the
+    /// cutover because their budgets are independent. Changing configuration
+    /// in place is deliberately rejected.
+    #[serde(default)]
+    namespace: Option<String>,
+    /// Expected shared-backend failure behavior. `closed` is the safe default:
+    /// return 503 without calling upstream. `open` explicitly waives enforcement
+    /// during dependency outages: call upstream once without a reservation
+    /// handle. Configuration mismatches always fail closed. This policy is
+    /// separate from the pipeline-level `failure_mode` setting.
+    #[serde(default)]
+    on_failure: BackendOnFailure,
+    /// Maximum data-node connection time as a duration string; defaults to 500ms.
+    #[serde(default)]
+    connect_timeout: Option<String>,
+    /// Maximum datastore operation time as a duration string; defaults to 500ms.
+    #[serde(default)]
+    operation_timeout: Option<String>,
+}
+
+impl std::fmt::Debug for RawBackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawBackendConfig")
+            .field("kind", &self.kind)
+            .field("url", &self.url.as_ref().map(|_| "<redacted>"))
+            .field("sentinel", &self.sentinel)
+            .field("namespace", &self.namespace)
+            .field("on_failure", &self.on_failure)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("operation_timeout", &self.operation_timeout)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Raw Sentinel fields converted into [`SentinelConfig`].
+struct RawSentinelConfig {
+    /// Ordered Sentinel endpoints (1..=16). Three independent endpoints are
+    /// recommended operationally; one is accepted for local development.
+    /// Use a consistent plain (`redis://`/`valkey://`) or verified TLS
+    /// (`rediss://`/`valkeys://`) scheme, including after `${ENV_VAR}` expansion.
+    endpoints: Vec<String>,
+    /// Monitored primary service name.
+    service_name: String,
+    /// Optional Sentinel ACL username.
+    #[serde(default)]
+    sentinel_username: Option<String>,
+    /// Optional Sentinel ACL password, preferably supplied via `${ENV_VAR}`.
+    #[serde(default)]
+    sentinel_password: Option<String>,
+    /// Optional data-node ACL username.
+    #[serde(default)]
+    redis_username: Option<String>,
+    /// Optional data-node ACL password, preferably supplied via `${ENV_VAR}`.
+    #[serde(default)]
+    redis_password: Option<String>,
+    /// Maximum Sentinel discovery time as a duration string; defaults to 5s.
+    #[serde(default)]
+    discovery_timeout: Option<String>,
+}
+
+impl std::fmt::Debug for RawSentinelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawSentinelConfig")
+            // Raw endpoints may contain inline credentials or secret expansion.
+            .field("endpoints", &"<redacted>")
+            .field("service_name", &self.service_name)
+            .field("sentinel_username", &self.sentinel_username)
+            .field(
+                "sentinel_password",
+                &self.sentinel_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("redis_username", &self.redis_username)
+            .field("redis_password", &self.redis_password.as_ref().map(|_| "<redacted>"))
+            .field("discovery_timeout", &self.discovery_timeout)
+            .finish()
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "parse-time conversion validates the complete backend topology"
+)]
+impl TryFrom<RawBackendConfig> for BackendConfig {
+    type Error = String;
+
+    fn try_from(raw: RawBackendConfig) -> Result<Self, Self::Error> {
+        let topology = match (raw.url, raw.sentinel) {
+            (Some(url), None) => Some(BackendTopology::Standalone(url)),
+            (None, Some(sentinel)) => Some(BackendTopology::Sentinel(Box::new(SentinelConfig {
+                endpoints: sentinel.endpoints,
+                service_name: sentinel.service_name,
+                sentinel_username: sentinel.sentinel_username,
+                sentinel_password: sentinel.sentinel_password,
+                redis_username: sentinel.redis_username,
+                redis_password: sentinel.redis_password,
+                discovery_timeout: super::parse_backend_timeout(
+                    sentinel.discovery_timeout.as_deref(),
+                    "discovery_timeout",
+                    Duration::from_secs(5),
+                )
+                .map_err(|error| error.to_string())?,
+            }))),
+            (Some(_), Some(_)) => {
+                return Err("token_rate_limit: backend.url and backend.sentinel are mutually exclusive".into());
+            },
+            (None, None) => None,
+        };
+        if matches!(raw.kind, BackendKind::Redis | BackendKind::Valkey) && topology.is_none() {
+            return Err(
+                "token_rate_limit: backend.url or backend.sentinel is required for backend.kind: redis/valkey".into(),
+            );
+        }
+        Ok(Self {
+            kind: raw.kind,
+            topology,
+            namespace: raw.namespace,
+            on_failure: raw.on_failure,
+            connect_timeout: super::parse_backend_timeout(
+                raw.connect_timeout.as_deref(),
+                "connect_timeout",
+                Duration::from_millis(500),
+            )
+            .map_err(|error| error.to_string())?,
+            operation_timeout: super::parse_backend_timeout(
+                raw.operation_timeout.as_deref(),
+                "operation_timeout",
+                Duration::from_millis(500),
+            )
+            .map_err(|error| error.to_string())?,
+        })
+    }
+}
+
+/// Validated inputs for native redis-rs Sentinel discovery.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SentinelConfig {
+    /// Ordered Sentinel endpoints. Three independent endpoints are
+    /// recommended operationally; one is accepted for local development.
+    pub endpoints: Vec<String>,
+    /// The monitored writable-primary service name.
+    pub service_name: String,
+    /// Optional Sentinel ACL username.
+    #[serde(default)]
+    pub sentinel_username: Option<String>,
+    /// Optional Sentinel ACL password, preferably supplied via `${ENV_VAR}`.
+    #[serde(default)]
+    pub sentinel_password: Option<String>,
+    /// Optional data-node ACL username.
+    #[serde(default)]
+    pub redis_username: Option<String>,
+    /// Optional data-node ACL password, preferably supplied via `${ENV_VAR}`.
+    #[serde(default)]
+    pub redis_password: Option<String>,
+    /// Overall Sentinel discovery and convergence bound.
+    pub discovery_timeout: Duration,
+}
+
+impl std::fmt::Debug for SentinelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SentinelConfig")
+            .field("endpoints", &"<redacted>")
+            .field("service_name", &self.service_name)
+            .field("sentinel_username", &self.sentinel_username)
+            .field(
+                "sentinel_password",
+                &self.sentinel_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("redis_username", &self.redis_username)
+            .field("redis_password", &self.redis_password.as_ref().map(|_| "<redacted>"))
+            .field("discovery_timeout", &self.discovery_timeout)
+            .finish()
+    }
+}
+
+/// Behavior when a shared-backend reservation cannot be confirmed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum BackendOnFailure {
+    /// Return 503 and never invoke upstream.
+    #[default]
+    Closed,
+    /// Invoke upstream once without a reservation handle.
+    Open,
 }
 
 /// Which state backend a `token_rate_limit` rule uses.
@@ -358,6 +1345,10 @@ pub(super) enum BackendKind {
     /// across gateway instances/replicas.
     #[default]
     Memory,
+
+    /// Redis-backed shared state. Redis and Valkey use the same wire
+    /// protocol and native client path.
+    Redis,
 
     /// Valkey-backed shared state: one budget shared across every gateway
     /// instance pointed at the same `namespace`.
@@ -400,10 +1391,12 @@ pub(super) struct EstimationConfig {
     #[serde(default)]
     pub multiplier: Option<f64>,
 
-    /// Token count to use when `max_tokens` is absent from the request.
-    /// Required for `fixed`; optional for body-dependent strategies
-    /// (if unset and the strategy can't extract a value, the request is
-    /// admitted without a reservation).
+    /// Token count to use when `max_tokens` is absent from the request,
+    /// or when `max_tokens` / `max_completion_tokens` is zero. Required
+    /// for `fixed`; optional for body-dependent strategies. If unset and
+    /// the body has no token count, the request is admitted without a
+    /// reservation. A zero count with no fallback is kept, and a zero
+    /// estimate is rejected, so the request is not forwarded unmetered.
     #[serde(default)]
     pub fallback_estimate: Option<u64>,
 
@@ -429,6 +1422,7 @@ pub(super) struct EstimationConfig {
     clippy::panic,
     clippy::indexing_slicing,
     clippy::match_wildcard_for_single_variants,
+    clippy::too_many_lines,
     reason = "tests intentionally fail fast on impossible fixture states"
 )]
 mod tests {
@@ -436,6 +1430,155 @@ mod tests {
 
     fn parse(yaml: &str) -> Result<TokenRateLimitConfig, serde_yaml::Error> {
         serde_yaml::from_str(yaml)
+    }
+
+    /// One catch-all sliding-window rule, so tests can focus on `key:`.
+    fn key_yaml(key: &str) -> String {
+        format!(
+            "{key}\nrules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 1000\n    \
+             reserved_tokens: 50\n"
+        )
+    }
+
+    fn assert_debug_redacts(value: &dyn std::fmt::Debug, secrets: &[&str]) {
+        for rendered in [format!("{value:?}"), format!("{value:#?}")] {
+            for secret in secrets {
+                assert!(
+                    !rendered.contains(secret),
+                    "Debug output must not contain credential values"
+                );
+            }
+            assert!(rendered.contains("<redacted>"), "Debug must identify masked values");
+        }
+    }
+
+    #[test]
+    fn debug_redaction_failure_does_not_echo_credentials() {
+        let marker = "intentionally-sensitive-negative-marker";
+        let failure = std::panic::catch_unwind(|| assert_debug_redacts(&marker, &[marker]))
+            .expect_err("an unredacted value must fail the assertion");
+        let message = failure
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| failure.downcast_ref::<&str>().copied())
+            .expect("the assertion must panic with a text diagnostic");
+        assert!(
+            !message.contains(marker),
+            "the failure diagnostic must not echo credential values"
+        );
+    }
+
+    fn backend_config_yaml(backend: &str) -> String {
+        let indented = backend.lines().map(|line| format!("  {line}\n")).collect::<String>();
+        key_yaml(&format!("backend:\n{indented}"))
+    }
+
+    #[test]
+    fn sentinel_config_debug_redacts_credentials_at_each_boundary() {
+        let yaml = "kind: redis
+namespace: visible-namespace
+connect_timeout: 200ms
+operation_timeout: 300ms
+sentinel:
+  endpoints: [redis://inline-user:inline-secret@sentinel.invalid:26379]
+  service_name: visible-primary
+  sentinel_username: sentinel-acl
+  sentinel_password: sentinel-secret
+  redis_username: data-acl
+  redis_password: data-secret
+  discovery_timeout: 2s
+";
+        let secrets = ["inline-user", "inline-secret", "sentinel-secret", "data-secret"];
+        let raw: RawBackendConfig = serde_yaml::from_str(yaml).unwrap();
+        let raw_sentinel = raw.sentinel.as_ref().unwrap();
+        assert_debug_redacts(raw_sentinel, &secrets);
+        assert_debug_redacts(&raw, &secrets);
+        let raw_debug = format!("{raw_sentinel:?}");
+        for visible in ["visible-primary", "sentinel-acl", "data-acl", "2s"] {
+            assert!(
+                raw_debug.contains(visible),
+                "non-secret diagnostics must preserve {visible}"
+            );
+        }
+
+        let backend = BackendConfig::try_from(raw).unwrap();
+        let topology = backend.topology.as_ref().unwrap();
+        let BackendTopology::Sentinel(sentinel) = topology else {
+            panic!("fixture must select Sentinel")
+        };
+        assert_debug_redacts(sentinel, &secrets);
+        assert_debug_redacts(topology, &secrets);
+        assert_debug_redacts(&backend, &secrets);
+        assert!(
+            sentinel.sentinel_password.as_deref() == Some("sentinel-secret"),
+            "formatting must leave the Sentinel credential unchanged"
+        );
+        assert!(
+            sentinel.redis_password.as_deref() == Some("data-secret"),
+            "formatting must leave the data credential unchanged"
+        );
+        assert!(
+            sentinel.endpoints == ["redis://inline-user:inline-secret@sentinel.invalid:26379"],
+            "formatting must leave endpoint values unchanged"
+        );
+        let parsed_debug = format!("{sentinel:?}");
+        for visible in ["visible-primary", "sentinel-acl", "data-acl", "2s"] {
+            assert!(
+                parsed_debug.contains(visible),
+                "non-secret diagnostics must preserve {visible}"
+            );
+        }
+        let config = parse(&backend_config_yaml(yaml)).unwrap();
+        assert_debug_redacts(&config, &secrets);
+        assert!(format!("{config:?}").contains("visible-namespace"));
+    }
+
+    #[test]
+    fn standalone_config_debug_redacts_urls_at_each_boundary() {
+        let yaml = "kind: valkey\nurl: rediss://standalone-user:standalone-secret@primary.invalid:6379\n";
+        let secrets = ["standalone-user", "standalone-secret"];
+        let raw: RawBackendConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_debug_redacts(&raw, &secrets);
+        let backend = BackendConfig::try_from(raw).unwrap();
+        assert_debug_redacts(&backend, &secrets);
+        let topology = backend.topology.as_ref().unwrap();
+        assert_debug_redacts(topology, &secrets);
+        let BackendTopology::Standalone(url) = topology else {
+            panic!("fixture must select standalone")
+        };
+        assert!(
+            url == "rediss://standalone-user:standalone-secret@primary.invalid:6379",
+            "formatting must leave the standalone URL unchanged"
+        );
+        let config = parse(&backend_config_yaml(yaml)).unwrap();
+        assert_debug_redacts(&config, &secrets);
+    }
+
+    #[test]
+    fn backend_config_debug_preserves_absent_credentials() {
+        let raw: RawBackendConfig = serde_yaml::from_str("kind: memory").unwrap();
+        let rendered = format!("{raw:?}");
+        assert!(rendered.contains("url: None"));
+        assert!(rendered.contains("sentinel: None"));
+        let yaml =
+            "kind: redis\nsentinel:\n  endpoints: [redis://sentinel.invalid:26379]\n  service_name: visible-primary\n";
+        let raw: RawBackendConfig = serde_yaml::from_str(yaml).unwrap();
+        let raw_sentinel = raw.sentinel.as_ref().unwrap();
+        let rendered = format!("{raw_sentinel:?}");
+        assert!(rendered.contains("sentinel_password: None"));
+        assert!(rendered.contains("redis_password: None"));
+        let backend = BackendConfig::try_from(raw).unwrap();
+        let rendered = format!("{backend:?}");
+        assert!(rendered.contains("sentinel_password: None"));
+        assert!(rendered.contains("redis_password: None"));
+    }
+
+    fn ip_dim(header: Option<&str>) -> KeyDimension {
+        KeyDimension::Ip {
+            header: header.map(str::to_owned),
+            trusted_hops: 0,
+            ipv6_prefix: None,
+        }
     }
 
     #[test]
@@ -454,17 +1597,110 @@ mod tests {
             RuleAlgorithm::SlidingWindow { capacity: 1000, .. }
         ));
         assert_eq!(rule.reserved_tokens, Some(50));
-        assert_eq!(cfg.key, KeySource::Global);
+        assert_eq!(cfg.key, KeySpec::default());
     }
 
     #[test]
     fn parses_authenticated_subject_key_source() {
-        let cfg = parse(
-            "key: authenticated_subject\nrules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 1000\n    reserved_tokens: 50\n",
-        )
-        .unwrap();
+        let cfg = parse(&key_yaml("key: authenticated_subject")).unwrap();
+        assert_eq!(cfg.key.dimensions, vec![KeyDimension::AuthenticatedSubject]);
+        assert_eq!(cfg.key.missing, MissingKeyPolicy::Reject);
+    }
 
-        assert_eq!(cfg.key, KeySource::AuthenticatedSubject);
+    #[test]
+    fn parses_a_composite_subject_model_and_header_list() {
+        let cfg = parse(&key_yaml(
+            "key:\n  - authenticated_subject\n  - model\n  - header: x-tenant-id",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.key.dimensions,
+            vec![
+                KeyDimension::AuthenticatedSubject,
+                KeyDimension::Model { header: None },
+                KeyDimension::Header {
+                    name: "x-tenant-id".into(),
+                    missing: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_tagged_dimensions_with_per_header_missing_override() {
+        let cfg = parse(&key_yaml(
+            "key:\n  missing: fallback\n  dimensions:\n    - type: header\n      name: x-api-key\n      missing: reject\n    - type: ip\n      header: x-forwarded-for",
+        ))
+        .unwrap();
+        assert_eq!(cfg.key.missing, MissingKeyPolicy::Fallback);
+        assert_eq!(
+            cfg.key.dimensions,
+            vec![
+                KeyDimension::Header {
+                    name: "x-api-key".into(),
+                    missing: Some(MissingKeyPolicy::Reject),
+                },
+                ip_dim(Some("x-forwarded-for")),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_header_mapping_with_spec_level_missing_fallback() {
+        let cfg = parse(&key_yaml("key:\n  header: x-tenant-id\n  missing: fallback")).unwrap();
+        assert_eq!(cfg.key.missing, MissingKeyPolicy::Fallback);
+        assert_eq!(
+            cfg.key.dimensions,
+            vec![KeyDimension::Header {
+                name: "x-tenant-id".into(),
+                missing: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_tagged_ip_with_forwarding_header() {
+        let cfg = parse(&key_yaml("key:\n  type: ip\n  header: x-forwarded-for")).unwrap();
+        assert_eq!(cfg.key.dimensions, vec![ip_dim(Some("x-forwarded-for"))]);
+        assert_eq!(cfg.key.missing, MissingKeyPolicy::Reject);
+    }
+
+    #[test]
+    fn list_item_header_honours_sibling_missing() {
+        let cfg = parse(&key_yaml("key:\n  - header: x-tenant-id\n    missing: fallback")).unwrap();
+        assert_eq!(
+            cfg.key.dimensions,
+            vec![KeyDimension::Header {
+                name: "x-tenant-id".into(),
+                missing: Some(MissingKeyPolicy::Fallback),
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_shortcut_list_item_with_extra_keys() {
+        let err = parse(&key_yaml("key:\n  - ip: {}\n    header: x-forwarded-for")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field") || msg.contains("did not match"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parses_ip_trusted_hops_and_ipv6_prefix() {
+        let cfg = parse(&key_yaml(
+            "key:\n  ip:\n    header: x-forwarded-for\n    trusted_hops: 1\n    ipv6_prefix: 64",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.key.dimensions,
+            vec![KeyDimension::Ip {
+                header: Some("x-forwarded-for".into()),
+                trusted_hops: 1,
+                ipv6_prefix: Some(64),
+            }]
+        );
     }
 
     #[test]
@@ -652,5 +1888,217 @@ mod tests {
             cfg.rules[0].weights,
             super::super::weights::TokenTypeWeightsConfig::default()
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Hierarchy config parsing
+    // -------------------------------------------------------------------------
+
+    fn hierarchy_cfg(hierarchy_yaml: &str) -> String {
+        format!(
+            "rules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 100000\n    reserved_tokens: 500\n{hierarchy_yaml}"
+        )
+    }
+
+    fn valid_hierarchy_cfg() -> String {
+        hierarchy_cfg(
+            "hierarchy:\n\
+             \x20 - level: org\n\
+             \x20   identity_header: x-org-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 5000000\n\
+             \x20 - level: team\n\
+             \x20   identity_header: x-team-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 1000000\n\
+             \x20 - level: user\n\
+             \x20   identity: authenticated_subject\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 100000\n",
+        )
+    }
+
+    #[test]
+    fn parses_valid_hierarchy() {
+        let cfg = parse(&valid_hierarchy_cfg()).unwrap();
+        let hierarchy = cfg.hierarchy.as_ref().expect("hierarchy should be present");
+        assert_eq!(hierarchy.len(), 3);
+        assert_eq!(hierarchy[0].level, HierarchyLevel::Org);
+        assert_eq!(
+            hierarchy[0].identity,
+            HierarchyIdentitySource::IdentityHeader("x-org-id".to_owned())
+        );
+        assert_eq!(hierarchy[1].level, HierarchyLevel::Team);
+        assert_eq!(
+            hierarchy[1].identity,
+            HierarchyIdentitySource::IdentityHeader("x-team-id".to_owned())
+        );
+        assert_eq!(hierarchy[2].level, HierarchyLevel::User);
+        assert_eq!(
+            hierarchy[2].identity,
+            HierarchyIdentitySource::Identity(HierarchySubjectSource::AuthenticatedSubject)
+        );
+    }
+
+    #[test]
+    fn rejects_hierarchy_identity_with_both_sources() {
+        let yaml = hierarchy_cfg(
+            "hierarchy:\n\
+             \x20 - level: org\n\
+             \x20   identity_header: x-org-id\n\
+             \x20   identity: authenticated_subject\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 5000000\n",
+        );
+        assert!(parse(&yaml).is_err(), "both identity sources must fail at parse time");
+    }
+
+    #[test]
+    fn rejects_hierarchy_identity_with_neither_source() {
+        let yaml = hierarchy_cfg(
+            "hierarchy:\n\
+             \x20 - level: org\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 5000000\n",
+        );
+        assert!(
+            parse(&yaml).is_err(),
+            "a missing identity source must fail at parse time"
+        );
+    }
+
+    #[test]
+    fn rejects_hierarchy_identity_typo() {
+        let yaml = hierarchy_cfg(
+            "hierarchy:\n\
+             \x20 - level: user\n\
+             \x20   identity: authenicated_subject\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 100000\n",
+        );
+        assert!(parse(&yaml).is_err(), "an identity typo must fail at parse time");
+    }
+
+    #[test]
+    fn hierarchy_absent_parses_as_none() {
+        let cfg = parse(
+            "rules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 1000\n    \
+             reserved_tokens: 50\n",
+        )
+        .unwrap();
+        assert!(cfg.hierarchy.is_none());
+    }
+
+    #[test]
+    fn rejects_hierarchy_with_wrong_level_order() {
+        let yaml = hierarchy_cfg(
+            "hierarchy:\n\
+             \x20 - level: team\n\
+             \x20   identity_header: x-team-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 1000000\n\
+             \x20 - level: org\n\
+             \x20   identity_header: x-org-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 5000000\n\
+             \x20 - level: user\n\
+             \x20   identity: authenticated_subject\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 100000\n",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert!(
+            cfg.hierarchy.is_some(),
+            "serde parse succeeds; validation is in from_config"
+        );
+    }
+
+    #[test]
+    fn rejects_hierarchy_with_fewer_than_three_levels() {
+        let yaml = hierarchy_cfg(
+            "hierarchy:\n\
+             \x20 - level: org\n\
+             \x20   identity_header: x-org-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 5000000\n\
+             \x20 - level: team\n\
+             \x20   identity_header: x-team-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 1000000\n",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(
+            cfg.hierarchy.as_ref().unwrap().len(),
+            2,
+            "serde accepts it; from_config rejects"
+        );
+    }
+
+    #[test]
+    fn rejects_hierarchy_with_more_than_three_levels() {
+        let yaml = hierarchy_cfg(
+            "hierarchy:\n\
+             \x20 - level: org\n\
+             \x20   identity_header: x-org-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 5000000\n\
+             \x20 - level: team\n\
+             \x20   identity_header: x-team-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 1000000\n\
+             \x20 - level: user\n\
+             \x20   identity: authenticated_subject\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 100000\n\
+             \x20 - level: org\n\
+             \x20   identity_header: x-other\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 50000\n",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert_eq!(
+            cfg.hierarchy.as_ref().unwrap().len(),
+            4,
+            "serde accepts it; from_config rejects"
+        );
+    }
+
+    #[test]
+    fn rejects_hierarchy_with_duplicate_levels() {
+        let yaml = hierarchy_cfg(
+            "hierarchy:\n\
+             \x20 - level: org\n\
+             \x20   identity_header: x-org-id\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 5000000\n\
+             \x20 - level: org\n\
+             \x20   identity_header: x-org-id2\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 1000000\n\
+             \x20 - level: user\n\
+             \x20   identity: authenticated_subject\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 100000\n",
+        );
+        let cfg = parse(&yaml).unwrap();
+        assert!(cfg.hierarchy.is_some(), "serde accepts it; from_config validates order");
     }
 }

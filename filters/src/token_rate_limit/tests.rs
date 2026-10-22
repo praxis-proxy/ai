@@ -7,7 +7,7 @@ use std::future::Future;
 
 use praxis_filter::{FilterAction, HttpFilter};
 
-use super::TokenRateLimitFilter;
+use super::{META_FAIL_OPEN, META_RESERVATION_ID, TokenRateLimitFilter};
 use crate::token_usage::{
     META_TOKEN_CACHE_READ, META_TOKEN_CACHE_WRITE, META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_REASONING,
     META_TOKEN_STATUS, META_TOKEN_TOTAL, TOKEN_STATUS_OVERFLOW,
@@ -77,7 +77,7 @@ fn subject_bucket_keys_are_stable_distinct_and_opaque() {
     assert_eq!(first, repeated);
     assert_ne!(first, second);
     assert!(!first.contains("application-a"));
-    assert_eq!(first.len(), "subject:v1:".len() + 43);
+    assert_eq!(first, "subject:v1:0wfYjuGrt6TOMloboGk1H_QGJBDgt-0kQ-OyQ3qjy34");
 }
 
 #[tokio::test]
@@ -93,6 +93,400 @@ async fn authenticated_subject_keying_fails_closed_without_identity() {
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401));
+}
+
+#[test]
+fn from_config_accepts_header_ip_model_and_composite_keys() {
+    for top_level in [
+        "key: ip",
+        "key: model",
+        "key:\n  - header: x-tenant-id",
+        "key:\n  - authenticated_subject\n  - model",
+        "key:\n  missing: fallback\n  dimensions:\n    - type: header\n      name: x-api-key",
+        "max_keys: 16\nkey:\n  - header: x-tenant-id",
+        "key:\n  header: x-tenant-id\n  missing: fallback",
+        "key: global",
+    ] {
+        let yaml = single_rule_yaml_with(
+            top_level,
+            "algorithm: sliding_window\nwindow: 1h\ncapacity: 100000\nreserved_tokens: 500",
+        );
+        assert!(
+            TokenRateLimitFilter::from_config(&yaml).is_ok(),
+            "config should parse:\n{top_level}"
+        );
+    }
+}
+
+#[test]
+fn from_config_rejects_empty_key_dimensions_and_zero_max_keys() {
+    let empty = single_rule_yaml_with(
+        "key:\n  dimensions: []",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&empty).err().expect("should error");
+    assert!(err.to_string().contains("must not be empty"), "got: {err}");
+
+    let zero = single_rule_yaml_with(
+        "max_keys: 0",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&zero).err().expect("should error");
+    assert!(err.to_string().contains("max_keys"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_invalid_key_combinations() {
+    let mixed = single_rule_yaml_with(
+        "key:\n  - global\n  - ip",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&mixed).err().expect("should error");
+    assert!(err.to_string().contains("cannot be combined"), "got: {err}");
+
+    let dup = single_rule_yaml_with(
+        "key:\n  - model\n  - model",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&dup).err().expect("should error");
+    assert!(err.to_string().contains("duplicate"), "got: {err}");
+
+    let empty_header = single_rule_yaml_with(
+        "key:\n  - header: \"\"",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&empty_header)
+        .err()
+        .expect("should error");
+    assert!(err.to_string().contains("header name"), "got: {err}");
+
+    let blank_ip = single_rule_yaml_with(
+        "key:\n  ip:\n    header: \"  \"",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&blank_ip)
+        .err()
+        .expect("should error");
+    assert!(err.to_string().contains("invalid ip header name"), "got: {err}");
+}
+
+#[tokio::test]
+async fn header_keys_give_each_value_its_own_bucket() {
+    let yaml = single_rule_yaml_with(
+        "key:\n  - header: x-tenant-id",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let alpha_req = make_request_with_header("x-tenant-id", "alpha");
+    let mut alpha_ctx = crate::test_utils::make_filter_context(&alpha_req);
+    assert!(matches!(
+        filter.on_request(&mut alpha_ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let beta_req = make_request_with_header("x-tenant-id", "beta");
+    let mut beta_ctx = crate::test_utils::make_filter_context(&beta_req);
+    assert!(
+        matches!(filter.on_request(&mut beta_ctx).await.unwrap(), FilterAction::Continue),
+        "a different header value must not share alpha's exhausted-looking 10-token bucket"
+    );
+
+    let alpha_again_req = make_request_with_header("x-tenant-id", "alpha");
+    let mut alpha_again_ctx = crate::test_utils::make_filter_context(&alpha_again_req);
+    assert!(
+        matches!(
+            filter.on_request(&mut alpha_again_ctx).await.unwrap(),
+            FilterAction::Reject(rejection) if rejection.status == 429
+        ),
+        "the same tenant must hit its own exhausted bucket"
+    );
+}
+
+#[tokio::test]
+async fn missing_header_rejects_by_default_and_can_fall_back() {
+    let reject_yaml = single_rule_yaml_with(
+        "key:\n  - header: x-tenant-id",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let filter = TokenRateLimitFilter::from_config(&reject_yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 400
+    ));
+
+    let fallback_yaml = single_rule_yaml_with(
+        "key:\n  missing: fallback\n  dimensions:\n    - type: header\n      name: x-tenant-id",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&fallback_yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut first = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut first).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut second = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(
+            filter.on_request(&mut second).await.unwrap(),
+            FilterAction::Reject(rejection) if rejection.status == 429
+        ),
+        "header-absent fallback must share the global bucket"
+    );
+}
+
+#[tokio::test]
+async fn ip_keys_partition_by_client_address() {
+    let yaml = single_rule_yaml_with(
+        "key: ip",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    let mut alice = crate::test_utils::make_filter_context(&req);
+    alice.client_addr = Some("203.0.113.10".parse().unwrap());
+    assert!(matches!(
+        filter.on_request(&mut alice).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut bob = crate::test_utils::make_filter_context(&req);
+    bob.client_addr = Some("203.0.113.11".parse().unwrap());
+    assert!(matches!(
+        filter.on_request(&mut bob).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut alice_again = crate::test_utils::make_filter_context(&req);
+    alice_again.client_addr = Some("203.0.113.10".parse().unwrap());
+    assert!(matches!(
+        filter.on_request(&mut alice_again).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 429
+    ));
+}
+
+#[tokio::test]
+async fn missing_ip_rejects_when_client_addr_is_absent() {
+    let yaml = single_rule_yaml_with(
+        "key: ip",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 400
+    ));
+}
+
+#[tokio::test]
+async fn model_keys_prefer_header_and_isolate_models() {
+    let yaml = single_rule_yaml_with(
+        "key: model",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let gpt_req = make_request_with_header("x-model", "gpt-4");
+    let mut gpt = crate::test_utils::make_filter_context(&gpt_req);
+    assert!(matches!(
+        filter.on_request(&mut gpt).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let llama_req = make_request_with_header("x-model", "llama-3");
+    let mut llama = crate::test_utils::make_filter_context(&llama_req);
+    assert!(matches!(
+        filter.on_request(&mut llama).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut gpt_again = crate::test_utils::make_filter_context(&gpt_req);
+    assert!(matches!(
+        filter.on_request(&mut gpt_again).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 429
+    ));
+}
+
+#[tokio::test]
+async fn missing_model_rejects_when_body_and_header_are_absent() {
+    let yaml = single_rule_yaml_with(
+        "key: model",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 400
+    ));
+}
+
+#[tokio::test]
+async fn header_mapping_with_missing_fallback_shares_the_global_bucket() {
+    let yaml = single_rule_yaml_with(
+        "key:\n  header: x-tenant-id\n  missing: fallback",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut first = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut first).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut second = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(
+            filter.on_request(&mut second).await.unwrap(),
+            FilterAction::Reject(rejection) if rejection.status == 429
+        ),
+        "{{ header, missing: fallback }} must not ignore missing and must share the global bucket"
+    );
+}
+
+#[tokio::test]
+async fn composite_header_and_model_are_isolated_from_header_only() {
+    let yaml = single_rule_yaml_with(
+        "key:\n  - header: x-tenant-id\n  - model",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = make_request_with_header("x-tenant-id", "acme");
+
+    let mut gpt = crate::test_utils::make_filter_context(&req);
+    let mut gpt_body = Some(bytes::Bytes::from(r#"{"model":"gpt-4"}"#));
+    assert!(matches!(
+        filter.on_request_body(&mut gpt, &mut gpt_body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut llama = crate::test_utils::make_filter_context(&req);
+    let mut llama_body = Some(bytes::Bytes::from(r#"{"model":"llama-3"}"#));
+    assert!(
+        matches!(
+            filter.on_request_body(&mut llama, &mut llama_body, true).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "same tenant on a different model must not share the gpt-4 bucket"
+    );
+}
+
+#[tokio::test]
+async fn whitespace_header_is_treated_as_missing() {
+    let yaml = single_rule_yaml_with(
+        "key:\n  - header: x-tenant-id",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = make_request_with_header("x-tenant-id", "   ");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 400
+    ));
+}
+
+#[tokio::test]
+async fn max_keys_denies_a_new_distinct_key_once_the_cap_is_hit() {
+    assert_max_keys_cap("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 1").await;
+}
+
+#[tokio::test]
+async fn max_keys_denies_a_new_distinct_key_once_the_cap_is_hit_token_bucket() {
+    assert_max_keys_cap("algorithm: token_bucket\ncapacity: 1000\nrefill_rate: 1\nreserved_tokens: 1").await;
+}
+
+async fn assert_max_keys_cap(algorithm_body: &str) {
+    let yaml = single_rule_yaml_with("max_keys: 1\nkey:\n  - header: x-tenant-id", algorithm_body);
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let first_req = make_request_with_header("x-tenant-id", "alpha");
+    let mut first = crate::test_utils::make_filter_context(&first_req);
+    assert!(
+        matches!(filter.on_request(&mut first).await.unwrap(), FilterAction::Continue),
+        "first distinct key must be admitted"
+    );
+
+    let second_req = make_request_with_header("x-tenant-id", "beta");
+    let mut second = crate::test_utils::make_filter_context(&second_req);
+    assert!(
+        matches!(
+            filter.on_request(&mut second).await.unwrap(),
+            FilterAction::Reject(rejection) if rejection.status == 429
+        ),
+        "a second distinct header key must be denied once max_keys is exhausted"
+    );
+
+    let mut alpha_again = crate::test_utils::make_filter_context(&first_req);
+    assert!(
+        matches!(
+            filter.on_request(&mut alpha_again).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "the original key must still be admitted after a different key is 429'd (cap on distinct keys, not requests)"
+    );
+}
+
+#[tokio::test]
+async fn max_keys_is_enforced_per_rule_not_across_rules() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "max_keys: 1\n\
+         key:\n\
+         \x20 - header: x-tenant-id\n\
+         rules:\n\
+         \x20 - name: team-alpha\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: alpha\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000\n\
+         \x20   reserved_tokens: 1\n\
+         \x20 - name: team-beta\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: beta\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000\n\
+         \x20   reserved_tokens: 1\n",
+    )
+    .unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let mut alpha_one = make_request_with_header("x-tenant-id", "one");
+    alpha_one.headers.insert("x-app-id", "alpha".parse().unwrap());
+    let mut ctx = crate::test_utils::make_filter_context(&alpha_one);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut alpha_two = make_request_with_header("x-tenant-id", "two");
+    alpha_two.headers.insert("x-app-id", "alpha".parse().unwrap());
+    let mut ctx = crate::test_utils::make_filter_context(&alpha_two);
+    assert!(
+        matches!(
+            filter.on_request(&mut ctx).await.unwrap(),
+            FilterAction::Reject(rejection) if rejection.status == 429
+        ),
+        "alpha's own max_keys cap must deny a second tenant"
+    );
+
+    let mut beta_one = make_request_with_header("x-tenant-id", "one");
+    beta_one.headers.insert("x-app-id", "beta".parse().unwrap());
+    let mut ctx = crate::test_utils::make_filter_context(&beta_one);
+    assert!(
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
+        "beta must have its own max_keys budget, independent of alpha"
+    );
 }
 
 #[test]
@@ -136,7 +530,7 @@ fn from_config_rejects_zero_capacity() {
 /// so this rejection has to come from the shared gate, not either
 /// algorithm's downstream validation, to protect both.
 #[test]
-fn from_config_rejects_capacity_above_the_lua_safe_integer_bound() {
+fn from_config_rejects_capacity_above_the_f64_safe_integer_bound() {
     let over_bound = super::token_bucket_ledger::MAX_F64_SAFE_INTEGER + 1;
 
     let sliding_window = single_rule_yaml(&format!(
@@ -184,7 +578,7 @@ fn from_config_rejects_unknown_field() {
     );
     assert!(
         TokenRateLimitFilter::from_config(&yaml).is_err(),
-        "composite/CEL bucket keys are still deliberately unsupported, config should reject the unknown field"
+        "unknown rule-level field 'bucket_key' must still be rejected; keys are configured at filter level"
     );
 }
 
@@ -227,13 +621,94 @@ fn from_config_rejects_valkey_backend_without_url() {
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
-    assert!(err.to_string().contains("backend.url is required"), "got: {err}");
+    assert!(
+        err.to_string().contains("backend.url or backend.sentinel is required"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn from_config_accepts_valkey_backend_with_url() {
     let yaml = single_rule_yaml_with(
         "backend:\n  kind: valkey\n  url: redis://127.0.0.1:6399",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_accepts_redis_backend_with_the_same_native_sentinel_path() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: redis\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_accepts_native_sentinel_backend_without_discovery_at_startup() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    discovery_timeout: 2s",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_rejects_mixed_standalone_and_sentinel_topology() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  url: redis://127.0.0.1:6379\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("topologies must be exclusive")
+    };
+    assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_a_missing_network_topology_during_parsing() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("network backends must declare a topology")
+    };
+    assert!(
+        err.to_string().contains("backend.url or backend.sentinel is required"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn from_config_rejects_insecure_tls_configuration() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    tls_insecure: true",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("insecure TLS configuration must be rejected")
+    };
+    assert!(err.to_string().contains("tls_insecure"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_the_removed_sentinel_tls_flag() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: redis\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    tls: true",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("the removed Sentinel TLS flag must be rejected")
+    };
+    assert!(err.to_string().contains("unknown field `tls`"), "got: {err}");
+}
+
+#[test]
+fn from_config_accepts_a_valkeys_tls_sentinel_endpoint() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [valkeys://127.0.0.1:26379]\n    service_name: mymaster",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
     assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
@@ -601,35 +1076,39 @@ async fn reconcile_is_a_noop_without_prior_admission_metadata() {
     ));
 }
 
-/// Missing `META_ESTIMATE` must skip settlement rather than treat the
-/// estimate as 0 (which would debit `actual - 0` on top of the original
-/// reservation and over-charge the window).
+/// Missing `META_RESERVATION_ID` must skip settlement: without the id
+/// there is nothing to settle, so the reservation stands at its estimate.
 #[tokio::test]
-async fn missing_meta_estimate_skips_reconciliation_instead_of_settling_at_zero() {
-    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 500");
+async fn missing_reservation_id_skips_reconciliation() {
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 400");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-    ctx.filter_metadata.remove(super::META_ESTIMATE);
+    assert!(
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
+        "the first 400-token request fits"
+    );
+    ctx.filter_metadata.remove(META_RESERVATION_ID);
     ctx.set_metadata(META_TOKEN_TOTAL, "200");
     let mut body = None;
-    assert!(matches!(
-        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(
+        matches!(
+            filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+            FilterAction::Continue
+        ),
+        "a skipped settlement still lets the response through"
+    );
 
-    // Reservation of 500 still stands (no bogus +200 overage). A second
-    // 500-token admit fits remaining capacity; it would not if settlement
-    // had charged 700.
     let mut second = crate::test_utils::make_filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut second).await.unwrap(), FilterAction::Continue),
-        "skipping reconcile must leave the original 500-token reservation, not 700"
+        "400 + 400 fits in 1000"
+    );
+    let mut third = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut third).await.unwrap(), FilterAction::Reject(_)),
+        "the unsettled 400 still counts; settling it at 200 would have let a third 400 in"
     );
 }
 
@@ -716,18 +1195,31 @@ fn debug_format_lists_configured_rule_names() {
     let cfg: super::config::TokenRateLimitConfig =
         praxis_filter::parse_filter_config("token_rate_limit", &yaml).unwrap();
     let backend = super::build_backend_resource(&cfg.backend).unwrap();
+    let key_spec = super::compile_key_spec(cfg.key).unwrap();
+    let key_fingerprint = key_spec.config_fingerprint();
     let rules = cfg
         .rules
         .into_iter()
-        .map(|rule| super::compile_rule(rule, &backend, super::TokenWeights::UNITY))
+        .map(|rule| {
+            super::compile_rule(
+                rule,
+                &backend,
+                super::TokenWeights::UNITY,
+                super::MAX_KEYS,
+                &key_fingerprint,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let needs_body = rules.iter().any(|r| r.estimation.needs_body());
     let filter = TokenRateLimitFilter {
         rules,
         needs_body,
-        key_source: cfg.key,
+        key_spec,
         epoch: std::time::Instant::now(),
+        valkey_clock: false,
+        hierarchy: None,
+        on_failure: super::config::BackendOnFailure::Closed,
     };
     let debug = format!("{filter:?}");
     assert!(debug.contains("default"), "got: {debug}");
@@ -962,7 +1454,7 @@ fn from_config_rejects_non_finite_or_negative_default_weights_from_yaml() {
 }
 
 #[test]
-fn from_config_rejects_a_refill_rate_that_would_overflow_the_valkey_reserve_scripts_pexpire_ttl() {
+fn from_config_rejects_a_refill_rate_that_would_overflow_the_valkey_pexpire_ttl() {
     // capacity / refill_rate = 1e11 seconds -- a config typo away from
     // plausible (e.g. an extra zero on refill_rate against a large
     // capacity meant for a generous burst rule), not a contrived extreme.
@@ -1094,18 +1586,105 @@ async fn assert_denied(filter: &dyn HttpFilter, req: &praxis_filter::Request, wh
     );
 }
 
-/// Poll `filter.on_request` for `req` up to `attempts` times, sleeping
-/// briefly between each, until it's admitted. Used to await an
-/// asynchronous (background-worker) Valkey reconciliation without a
-/// fixed, flaky sleep.
-async fn poll_until_admitted(filter: &dyn HttpFilter, req: &praxis_filter::Request, attempts: u32) -> bool {
+/// Assert `req` is rejected with one exact HTTP status.
+async fn assert_rejected_with_status(
+    filter: &dyn HttpFilter,
+    req: &praxis_filter::Request,
+    expected_status: u16,
+    why: &str,
+) {
+    match request_action(filter, req).await {
+        FilterAction::Reject(rejection) => assert_eq!(rejection.status, expected_status, "{why}"),
+        other => panic!("{why}: expected status {expected_status}, got {other:?}"),
+    }
+}
+
+/// Run one body-dependent request with a request-derived `max_tokens` value.
+async fn request_with_max_tokens_action(
+    filter: &dyn HttpFilter,
+    req: &praxis_filter::Request,
+    max_tokens: u64,
+) -> FilterAction {
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(bytes::Bytes::from(format!(r#"{{"max_tokens":{max_tokens}}}"#)));
+    filter.on_request_body(&mut ctx, &mut body, true).await.unwrap()
+}
+
+/// Poll a body-dependent request up to `attempts` times, sleeping briefly
+/// between each, until it is admitted. Used to await asynchronous
+/// background-worker Valkey reconciliation without a fixed, flaky sleep.
+async fn poll_until_admitted_with_max_tokens(
+    filter: &dyn HttpFilter,
+    req: &praxis_filter::Request,
+    max_tokens: u64,
+    attempts: u32,
+) -> bool {
     for _ in 0..attempts {
-        if matches!(request_action(filter, req).await, FilterAction::Continue) {
+        if matches!(
+            request_with_max_tokens_action(filter, req, max_tokens).await,
+            FilterAction::Continue
+        ) {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     false
+}
+
+fn valkey_header_key_yaml(algorithm_body: &str, url: &str, namespace: &str) -> serde_yaml::Value {
+    single_rule_yaml_with(
+        &format!(
+            "max_keys: 1\nkey:\n  - header: x-tenant-id\nbackend:\n  kind: valkey\n  url: {url}\n  namespace: \
+             {namespace}"
+        ),
+        algorithm_body,
+    )
+}
+
+async fn assert_valkey_max_keys_cap(algorithm_body: &str) {
+    let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!(
+        "praxis-test-max-keys-{}-{}",
+        std::process::id(),
+        algorithm_body
+            .lines()
+            .next()
+            .unwrap_or("rule")
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>()
+    );
+    let yaml = valkey_header_key_yaml(algorithm_body, &url, &namespace);
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let alpha = make_request_with_header("x-tenant-id", "alpha");
+    let beta = make_request_with_header("x-tenant-id", "beta");
+    assert_admitted(&*filter, &alpha, "first distinct Valkey key must be admitted").await;
+    assert_denied(
+        &*filter,
+        &beta,
+        "a second distinct Valkey key must be denied once max_keys is exhausted",
+    )
+    .await;
+    assert_admitted(
+        &*filter,
+        &alpha,
+        "the original Valkey key must still be admitted after a different key is 429'd",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn valkey_max_keys_denies_a_new_distinct_key_sliding_window() {
+    assert_valkey_max_keys_cap("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 1").await;
+}
+
+#[tokio::test]
+async fn valkey_max_keys_denies_a_new_distinct_key_token_bucket() {
+    assert_valkey_max_keys_cap("algorithm: token_bucket\ncapacity: 1000\nrefill_rate: 1\nreserved_tokens: 1").await;
 }
 
 #[tokio::test]
@@ -1141,6 +1720,170 @@ async fn valkey_budget_exhausted_on_one_instance_is_denied_on_another() {
 }
 
 #[tokio::test]
+async fn valkey_sliding_window_config_skew_fails_closed_with_503() {
+    let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!("praxis-test-sw-config-skew-{}", std::process::id());
+    let owner = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: sliding_window\nwindow: 10s\ncapacity: 5\nreserved_tokens: 5\nreservation_timeout: 5s",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let mismatched = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: sliding_window\nwindow: 1s\ncapacity: 5\nreserved_tokens: 1\nreservation_timeout: 1s",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    assert_admitted(
+        owner.as_ref(),
+        &req,
+        "the first writer registers and consumes its budget",
+    )
+    .await;
+    assert_rejected_with_status(
+        mismatched.as_ref(),
+        &req,
+        503,
+        "a different window for the same shared rule must fail closed",
+    )
+    .await;
+    assert_rejected_with_status(
+        owner.as_ref(),
+        &req,
+        429,
+        "the rejected writer must not erase or reinterpret the original reservation",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn valkey_key_policy_skew_fails_closed_with_503() {
+    let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!("praxis-test-key-policy-skew-{}", std::process::id());
+    let owner = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 5\nreserved_tokens: 5",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let keyed = TokenRateLimitFilter::from_config(&single_rule_yaml_with(
+        &format!("key: model\nbackend:\n  kind: valkey\n  url: {url}\n  namespace: {namespace}"),
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 5\nreserved_tokens: 1",
+    ))
+    .unwrap();
+    let req = make_request_with_header("x-model", "gpt-test");
+
+    assert_admitted(
+        owner.as_ref(),
+        &req,
+        "the global-key writer registers the shared accounting generation",
+    )
+    .await;
+    assert_rejected_with_status(
+        keyed.as_ref(),
+        &req,
+        503,
+        "a different budget-key policy must fail closed before sharing state",
+    )
+    .await;
+    assert_rejected_with_status(
+        owner.as_ref(),
+        &req,
+        429,
+        "the rejected key-policy writer must not change the original budget",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn valkey_unmarked_v2_state_fails_closed_with_503() {
+    let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!("praxis-test-unmarked-v2-{}", std::process::id());
+    let rule_hash = super::valkey::key_hash(&[b"default"]);
+    let state_index = format!("{namespace}:v2:keys:{rule_hash}");
+    let connection = super::valkey::ValkeyConnection::new(url.clone()).unwrap();
+    let mut pipe = redis::pipe();
+    pipe.cmd("ZADD")
+        .arg(&state_index)
+        .arg(9_999_999_999_u64)
+        .arg("legacy-key")
+        .ignore();
+    pipe.cmd("PEXPIRE").arg(&state_index).arg(60_000).ignore();
+    let _: () = Box::pin(connection.pipeline(&pipe)).await.unwrap();
+
+    let filter = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 5\nreserved_tokens: 1",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    assert_rejected_with_status(
+        filter.as_ref(),
+        &req,
+        503,
+        "a new writer must not claim pre-marker v2 quota state",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn valkey_unmarked_v2_quota_state_without_index_fails_closed_with_503() {
+    let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!("praxis-test-unmarked-counter-{}", std::process::id());
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let key_id = super::valkey::key_hash(&[namespace.as_bytes(), b"default", b"legacy-key"]);
+    let usage_key = format!("{namespace}:v2:{key_id}:u60000:{}", now_ms / 60_000);
+    let marker_key = format!(
+        "{namespace}:v2:sw:rule:{}:accounting-config",
+        super::valkey::key_hash(&[b"default"])
+    );
+    let connection = super::valkey::ValkeyConnection::new(url.clone()).unwrap();
+    let mut pipe = redis::pipe();
+    pipe.cmd("SET").arg(marker_key).arg("v3:legacy-test").ignore();
+    pipe.cmd("SET").arg(&usage_key).arg(5).arg("PX").arg(600_000).ignore();
+    let () = Box::pin(connection.pipeline(&pipe)).await.unwrap();
+
+    let filter = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 5\nreserved_tokens: 1",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    assert_rejected_with_status(
+        filter.as_ref(),
+        &req,
+        503,
+        "unmarked physical quota state without its index must fail closed",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn valkey_worker_reconciles_usage_off_the_response_path() {
     let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
         tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
@@ -1148,7 +1891,7 @@ async fn valkey_worker_reconciles_usage_off_the_response_path() {
     };
     let namespace = format!("praxis-test-valkey-worker-{}", std::process::id());
     let yaml = single_rule_valkey_yaml(
-        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 50",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 50",
         &url,
         &namespace,
     );
@@ -1156,7 +1899,9 @@ async fn valkey_worker_reconciles_usage_off_the_response_path() {
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    let action = filter.on_request(&mut ctx).await.unwrap();
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(bytes::Bytes::from_static(br#"{"max_tokens":50}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     ctx.set_metadata(META_TOKEN_TOTAL, "10"); // actual usage far below the 50-token estimate
 
@@ -1173,13 +1918,13 @@ async fn valkey_worker_reconciles_usage_off_the_response_path() {
     // estimate - 10 actual); before that, 50 (still-active reservation)
     // + 85 would exceed capacity and be denied.
     let yaml_probe = single_rule_valkey_yaml(
-        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 85",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 50",
         &url,
         &namespace,
     );
     let probe_filter = TokenRateLimitFilter::from_config(&yaml_probe).unwrap();
 
-    let settled = poll_until_admitted(probe_filter.as_ref(), &req, 40).await;
+    let settled = poll_until_admitted_with_max_tokens(probe_filter.as_ref(), &req, 85, 40).await;
     assert!(
         settled,
         "worker-based reconciliation should eventually release the unused reservation into the shared Valkey budget"
@@ -1207,6 +1952,61 @@ async fn valkey_failure_fails_closed() {
         },
         other => panic!("unreachable Valkey backend must not admit the request, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn valkey_failure_open_forwards_once_without_a_reservation_handle() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  url: redis://127.0.0.1:1\n  on_failure: open\n  operation_timeout: 20ms",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        ctx.get_metadata(META_RESERVATION_ID).is_none(),
+        "open mode must not fabricate a reservation ID"
+    );
+    assert_eq!(ctx.get_metadata(META_FAIL_OPEN), Some("bypassed"));
+
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+    assert!(
+        ctx.get_metadata(META_FAIL_OPEN).is_none(),
+        "fail-open marker must not leak across exchanges"
+    );
+}
+
+#[test]
+fn from_config_rejects_an_unbounded_backend_timeout() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  url: redis://127.0.0.1:6379\n  operation_timeout: 61s",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("timeout must remain bounded")
+    };
+    assert!(err.to_string().contains("must not exceed 60s"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_a_zero_backend_timeout() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    discovery_timeout: 0ms",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("timeout must be positive")
+    };
+    assert!(
+        err.to_string().contains("backend.discovery_timeout") && err.to_string().contains("duration must be positive"),
+        "got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -1240,6 +2040,49 @@ async fn valkey_token_bucket_budget_exhausted_on_one_instance_is_denied_on_anoth
 }
 
 #[tokio::test]
+async fn valkey_token_bucket_config_skew_fails_closed_with_503() {
+    let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!("praxis-test-tb-config-skew-{}", std::process::id());
+    let owner = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: token_bucket\ncapacity: 10\nrefill_rate: 0.001\nreserved_tokens: 10\nreservation_timeout: 5s",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let mismatched = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: token_bucket\ncapacity: 10\nrefill_rate: 10\nreserved_tokens: 1\nreservation_timeout: 5s",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    assert_admitted(
+        owner.as_ref(),
+        &req,
+        "the first writer registers and depletes its bucket",
+    )
+    .await;
+    assert_rejected_with_status(
+        mismatched.as_ref(),
+        &req,
+        503,
+        "a different refill rate for the same shared rule must fail closed",
+    )
+    .await;
+    assert_rejected_with_status(
+        owner.as_ref(),
+        &req,
+        429,
+        "the rejected writer must not refill or reset the original bucket",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn valkey_token_bucket_failure_fails_closed() {
     // The token-bucket analog of `valkey_failure_fails_closed`: an
     // unreachable Valkey backend must not silently admit token-bucket
@@ -1262,6 +2105,23 @@ async fn valkey_token_bucket_failure_fails_closed() {
 }
 
 #[tokio::test]
+async fn valkey_token_bucket_failure_open_forwards_without_reconciliation_metadata() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: redis\n  url: redis://127.0.0.1:1\n  on_failure: open\n  operation_timeout: 20ms",
+        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 1\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(ctx.get_metadata(META_RESERVATION_ID).is_none());
+    assert_eq!(ctx.get_metadata(META_FAIL_OPEN), Some("bypassed"));
+}
+
+#[tokio::test]
 async fn valkey_token_bucket_worker_reconciles_usage_off_the_response_path() {
     // Token-bucket analog of `valkey_worker_reconciles_usage_off_the_response_path`:
     // reconciliation is enqueued onto the background worker, not awaited
@@ -1272,7 +2132,7 @@ async fn valkey_token_bucket_worker_reconciles_usage_off_the_response_path() {
     };
     let namespace = format!("praxis-test-tb-worker-{}", std::process::id());
     let yaml = single_rule_valkey_yaml(
-        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 0.0001\nreserved_tokens: 50",
+        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 0.0001\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 50",
         &url,
         &namespace,
     );
@@ -1280,7 +2140,9 @@ async fn valkey_token_bucket_worker_reconciles_usage_off_the_response_path() {
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    let action = filter.on_request(&mut ctx).await.unwrap();
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(bytes::Bytes::from_static(br#"{"max_tokens":50}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     ctx.set_metadata(META_TOKEN_TOTAL, "10"); // actual usage far below the 50-token estimate
 
@@ -1293,13 +2155,13 @@ async fn valkey_token_bucket_worker_reconciles_usage_off_the_response_path() {
     // (50 estimate - 10 actual); before that, 50 (still-reserved) + 85
     // would exceed capacity and be denied.
     let yaml_probe = single_rule_valkey_yaml(
-        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 0.0001\nreserved_tokens: 85",
+        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 0.0001\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 50",
         &url,
         &namespace,
     );
     let probe_filter = TokenRateLimitFilter::from_config(&yaml_probe).unwrap();
 
-    let settled = poll_until_admitted(probe_filter.as_ref(), &req, 40).await;
+    let settled = poll_until_admitted_with_max_tokens(probe_filter.as_ref(), &req, 85, 40).await;
     assert!(
         settled,
         "worker-based reconciliation should eventually credit into the shared bucket"
@@ -1527,6 +2389,28 @@ async fn max_tokens_strategy_extracts_from_body_and_reserves() {
     assert_eq!(
         estimate_meta, "500",
         "estimate metadata should reflect extracted max_tokens"
+    );
+}
+
+#[tokio::test]
+async fn max_tokens_zero_without_fallback_is_rejected() {
+    let yaml =
+        single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 0, "messages": []}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Reject(rejection) if rejection.status == 429),
+        "a zero max_tokens with no fallback must not be forwarded unmetered"
+    );
+    assert!(
+        ctx.get_metadata("token_rate_limit.reservation_id").is_none(),
+        "a rejected zero estimate stores no reservation"
     );
 }
 
@@ -2931,22 +3815,39 @@ struct CapturedRecord {
     fields: std::collections::BTreeMap<&'static str, String>,
 }
 
-/// A `tracing` layer that records spans and events for assertions.
+/// A `tracing` capture whose storage is private to one test thread.
 ///
-/// Install it with [`TracingCapture::install`] and keep the returned
-/// guard alive for the duration of the scenario; it is a thread-local
-/// default, so drive the code under test on the current thread.
+/// The subscriber is installed once for the test binary, while this value is
+/// selected through a thread-local sink. Tracing callsite interest is cached
+/// process-wide, so installing a scoped subscriber per test can race with
+/// another test and cause an event to be permanently skipped.
 #[derive(Debug, Clone, Default)]
 struct TracingCapture {
     events: std::sync::Arc<std::sync::Mutex<Vec<CapturedRecord>>>,
     spans: std::sync::Arc<std::sync::Mutex<Vec<(u64, CapturedRecord)>>>,
 }
 
+thread_local! {
+    static ACTIVE_CAPTURE: std::cell::RefCell<Option<TracingCapture>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Process-wide always-interested layer; per-test routing happens through
+/// [`ACTIVE_CAPTURE`] rather than through a scoped dispatcher.
+#[derive(Debug, Default)]
+struct GlobalTracingCapture;
+
 impl TracingCapture {
-    /// Make this capture the default subscriber for the current thread.
-    fn install(&self) -> tracing::subscriber::DefaultGuard {
+    /// Select this capture for the current test thread.
+    fn install(&self) -> TracingCaptureGuard {
         use tracing_subscriber::layer::SubscriberExt as _;
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            tracing::subscriber::set_global_default(tracing_subscriber::registry().with(GlobalTracingCapture))
+                .expect("token-rate-limit tracing capture must own the test subscriber");
+        });
+        ACTIVE_CAPTURE.with(|active| TracingCaptureGuard {
+            previous: active.replace(Some(self.clone())),
+        })
     }
 
     /// Every event recorded so far, oldest first.
@@ -2963,6 +3864,19 @@ impl TracingCapture {
             .iter()
             .map(|(_, record)| record.clone())
             .collect()
+    }
+}
+
+/// Restores any prior capture when a test exits, including by unwinding.
+struct TracingCaptureGuard {
+    previous: Option<TracingCapture>,
+}
+
+impl Drop for TracingCaptureGuard {
+    fn drop(&mut self) {
+        ACTIVE_CAPTURE.with(|active| {
+            drop(active.replace(self.previous.take()));
+        });
     }
 }
 
@@ -2992,25 +3906,35 @@ impl tracing::field::Visit for FieldText {
     }
 }
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TracingCapture {
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for GlobalTracingCapture {
+    fn register_callsite(&self, _metadata: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::always()
+    }
+
     fn on_new_span(
         &self,
         attrs: &tracing::span::Attributes<'_>,
         id: &tracing::span::Id,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        let mut fields = FieldText::default();
-        attrs.record(&mut fields);
-        let metadata = attrs.metadata();
-        self.spans.lock().expect("capture lock").push((
-            id.into_u64(),
-            CapturedRecord {
-                name: metadata.name(),
-                target: metadata.target().to_owned(),
-                level: *metadata.level(),
-                fields: fields.0,
-            },
-        ));
+        ACTIVE_CAPTURE.with(|active| {
+            let active = active.borrow();
+            let Some(capture) = active.as_ref() else {
+                return;
+            };
+            let mut fields = FieldText::default();
+            attrs.record(&mut fields);
+            let metadata = attrs.metadata();
+            capture.spans.lock().expect("capture lock").push((
+                id.into_u64(),
+                CapturedRecord {
+                    name: metadata.name(),
+                    target: metadata.target().to_owned(),
+                    level: *metadata.level(),
+                    fields: fields.0,
+                },
+            ));
+        });
     }
 
     fn on_record(
@@ -3019,23 +3943,35 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TracingCapture {
         values: &tracing::span::Record<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        let mut fields = FieldText::default();
-        values.record(&mut fields);
-        let mut spans = self.spans.lock().expect("capture lock");
-        if let Some((_, record)) = spans.iter_mut().find(|(span_id, _)| *span_id == id.into_u64()) {
-            record.fields.extend(fields.0);
-        }
+        ACTIVE_CAPTURE.with(|active| {
+            let active = active.borrow();
+            let Some(capture) = active.as_ref() else {
+                return;
+            };
+            let mut fields = FieldText::default();
+            values.record(&mut fields);
+            let mut spans = capture.spans.lock().expect("capture lock");
+            if let Some((_, record)) = spans.iter_mut().find(|(span_id, _)| *span_id == id.into_u64()) {
+                record.fields.extend(fields.0);
+            }
+        });
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
-        let mut fields = FieldText::default();
-        event.record(&mut fields);
-        let metadata = event.metadata();
-        self.events.lock().expect("capture lock").push(CapturedRecord {
-            name: "event",
-            target: metadata.target().to_owned(),
-            level: *metadata.level(),
-            fields: fields.0,
+        ACTIVE_CAPTURE.with(|active| {
+            let active = active.borrow();
+            let Some(capture) = active.as_ref() else {
+                return;
+            };
+            let mut fields = FieldText::default();
+            event.record(&mut fields);
+            let metadata = event.metadata();
+            capture.events.lock().expect("capture lock").push(CapturedRecord {
+                name: "event",
+                target: metadata.target().to_owned(),
+                level: *metadata.level(),
+                fields: fields.0,
+            });
         });
     }
 }
@@ -3176,8 +4112,8 @@ fn metrics_carry_the_values_of_an_admission_a_denial_and_a_reconciliation() {
             "praxis_trl_budget_remaining",
             &[rule, ("algorithm", "sliding_window")]
         ),
-        Some(60.0),
-        "40 settled tokens leave 60 of 100"
+        Some(40.0),
+        "the last decision (the denial) saw 40 of 100 left"
     );
     assert_eq!(
         gauge_value(&snapshot, "praxis_trl_reservations_active", &[rule]),
@@ -3232,6 +4168,7 @@ const ACCOUNTING_FIELDS: &[&str] = &[
     "message",
     "phase",
     "rule",
+    "level",
     "algorithm",
     "backend",
     "result",
@@ -3394,4 +4331,888 @@ async fn the_decision_span_distinguishes_an_identity_miss_from_a_budget_denial()
         None,
         "a rejected request never reports usage"
     );
+}
+
+// -----------------------------------------------------------------------------
+// Soft over-quota enforcement (ai#1241)
+// -----------------------------------------------------------------------------
+
+fn soft_enforcement_yaml(extra_over_quota: &str) -> serde_yaml::Value {
+    let yaml = format!(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100\n\
+         \x20   reserved_tokens: 60\n\
+         \x20   enforcement: soft\n\
+         \x20   over_quota:\n\
+         \x20     headers:\n\
+         \x20       X-Over-Quota: \"true\"\n\
+         {extra_over_quota}"
+    );
+    serde_yaml::from_str(&yaml).unwrap()
+}
+
+#[test]
+fn soft_enforcement_requires_over_quota() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60\nenforcement: soft",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("requires over_quota"), "got: {err}");
+}
+
+#[test]
+fn hard_enforcement_rejects_over_quota_block() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60\n\
+         over_quota:\n  headers:\n    X-Over-Quota: \"true\"",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(
+        err.to_string().contains("rejected when enforcement is hard")
+            || err.to_string().contains("only valid for soft"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn soft_over_quota_rejects_empty_annotation_surface() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60\n\
+         enforcement: soft\nover_quota: {}",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(
+        err.to_string().contains("at least one header") || err.to_string().contains("include_remaining"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn unknown_enforcement_variant_is_rejected() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60\nenforcement: lenient",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("unknown variant"), "got: {err}");
+}
+
+#[tokio::test]
+async fn soft_enforcement_still_rejects_key_capacity() {
+    let yaml = single_rule_yaml_with(
+        "max_keys: 1\nkey:\n  - header: x-tenant-id",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 1\n\
+         enforcement: soft\nover_quota:\n  headers:\n    X-Over-Quota: \"true\"",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let first_req = make_request_with_header("x-tenant-id", "alpha");
+    let mut first = crate::test_utils::make_filter_context(&first_req);
+    assert!(
+        matches!(filter.on_request(&mut first).await.unwrap(), FilterAction::Continue),
+        "first distinct key must be admitted under a soft rule"
+    );
+
+    let second_req = make_request_with_header("x-tenant-id", "beta");
+    let mut second = crate::test_utils::make_filter_context(&second_req);
+    let action = filter.on_request(&mut second).await.unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 429),
+        "KeyCapacity must stay 429 under soft, got {action:?}"
+    );
+    assert!(
+        !second
+            .request_headers_to_set
+            .iter()
+            .any(|(name, _)| name.as_str() == "x-over-quota"),
+        "protective denial must not inject over-quota annotation"
+    );
+}
+
+#[tokio::test]
+async fn soft_enforcement_forwards_and_annotates_when_over_quota() {
+    let yaml = soft_enforcement_yaml(
+        "      include_remaining: true\n\
+         \x20     include_used: true\n",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut first_ctx).await.unwrap(), FilterAction::Continue),
+        "first request must be admitted before quota is exceeded"
+    );
+
+    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let second = filter.on_request(&mut second_ctx).await.unwrap();
+    assert!(
+        matches!(second, FilterAction::Continue),
+        "soft enforcement must forward over-quota requests"
+    );
+
+    let over_quota = second_ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-over-quota");
+    assert_eq!(
+        over_quota.expect("over-quota header").1.to_str().unwrap(),
+        "true",
+        "over-quota annotation must be true"
+    );
+
+    let remaining = second_ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-ratelimit-remaining-tokens");
+    let remaining_val: u64 = remaining
+        .expect("include_remaining")
+        .1
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("remaining is decimal");
+    assert_eq!(
+        remaining_val, 40,
+        "denied soft path must report the key's denial-time remaining balance (100 - 60)"
+    );
+
+    let used = second_ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-token-quota-used");
+    let used_val: u64 = used
+        .expect("include_used")
+        .1
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("used is decimal");
+    assert_eq!(
+        used_val,
+        100 - remaining_val,
+        "denied soft path reports used = limit - remaining"
+    );
+    assert!(
+        !second_ctx
+            .filter_metadata
+            .contains_key("token_rate_limit.reservation_id"),
+        "soft over-quota must not stash a reservation for reconciliation"
+    );
+}
+
+#[tokio::test]
+async fn hard_enforcement_still_rejects_when_over_quota() {
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut first_ctx).await.unwrap(), FilterAction::Continue),
+        "first request must be admitted before quota is exceeded"
+    );
+
+    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let second = filter.on_request(&mut second_ctx).await.unwrap();
+    assert!(
+        matches!(second, FilterAction::Reject(_)),
+        "default hard enforcement must still 429 when over quota"
+    );
+}
+
+#[tokio::test]
+async fn soft_enforcement_strips_spoofed_over_quota_headers() {
+    let yaml = soft_enforcement_yaml("");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = make_request_with_header("x-over-quota", "spoofed");
+
+    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut first_ctx).await.unwrap(), FilterAction::Continue),
+        "first request must be admitted"
+    );
+    assert!(
+        first_ctx
+            .request_headers_to_remove
+            .iter()
+            .any(|name| name.as_str() == "x-over-quota"),
+        "admitted path must strip client-supplied over-quota headers"
+    );
+
+    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(
+            filter.on_request(&mut second_ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "soft enforcement must forward the second request"
+    );
+    assert!(
+        second_ctx
+            .request_headers_to_remove
+            .iter()
+            .any(|name| name.as_str() == "x-over-quota"),
+        "client-supplied over-quota header must be stripped before inject"
+    );
+}
+
+#[tokio::test]
+async fn soft_enforcement_strips_spoofed_headers_when_estimate_is_unavailable() {
+    // Fallback-free body strategy can return Continue before reserve; spoof
+    // headers must still be stripped at match time.
+    let yaml = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100\n\
+         \x20   enforcement: soft\n\
+         \x20   estimation:\n\
+         \x20     strategy: max_tokens\n\
+         \x20   over_quota:\n\
+         \x20     headers:\n\
+         \x20       X-Over-Quota: \"true\"\n",
+    )
+    .unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = make_request_with_header("x-over-quota", "spoofed");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"messages": []}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "request must continue when the estimate is unavailable"
+    );
+    assert!(
+        ctx.get_metadata("token_rate_limit.reservation_id").is_none(),
+        "no reservation when estimate is unavailable"
+    );
+    assert!(
+        ctx.request_headers_to_remove
+            .iter()
+            .any(|name| name.as_str() == "x-over-quota"),
+        "missing-estimate Continue must still strip spoofable over_quota headers"
+    );
+}
+
+#[test]
+fn over_quota_rejects_remaining_header_without_include_flag() {
+    let yaml = soft_enforcement_yaml("      remaining_header: X-Custom-Remaining\n");
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("include_remaining"), "got: {err}");
+}
+
+#[test]
+fn over_quota_rejects_used_header_without_include_flag() {
+    let yaml = soft_enforcement_yaml("      used_header: X-Custom-Used\n");
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("include_used"), "got: {err}");
+}
+
+#[test]
+fn over_quota_rejects_identical_remaining_and_used_header_names() {
+    let yaml = soft_enforcement_yaml(
+        "      include_remaining: true\n\
+         \x20     include_used: true\n\
+         \x20     remaining_header: X-Quota\n\
+         \x20     used_header: X-Quota\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(
+        err.to_string().contains("remaining_header and used_header must differ"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn over_quota_rejects_static_header_colliding_with_remaining_name() {
+    let yaml = soft_enforcement_yaml(
+        "      include_remaining: true\n\
+         \x20     remaining_header: X-Over-Quota\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("duplicate over_quota header"), "got: {err}");
+}
+
+#[test]
+fn over_quota_rejects_collision_with_inject_tier_header() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60\n\
+         enforcement: soft\n\
+         over_quota:\n  headers:\n    X-Tier: \"over\"\n\
+         tiers:\n\
+         \x20 - capacity: 50\n\
+         \x20   action:\n\
+         \x20     type: inject\n\
+         \x20     headers:\n\
+         \x20       X-Tier: warn\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(
+        err.to_string().contains("collides with an S1 inject-tier header"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn soft_enforcement_rejects_deny_tier() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60\n\
+         enforcement: soft\n\
+         over_quota:\n  headers:\n    X-Over-Quota: \"true\"\n\
+         tiers:\n\
+         \x20 - capacity: 100\n\
+         \x20   action:\n\
+         \x20     type: deny\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("deny tiers are incompatible"), "got: {err}");
+}
+
+// -----------------------------------------------------------------------------
+// Hierarchy config validation (from_config)
+// -----------------------------------------------------------------------------
+
+fn hierarchy_yaml(hierarchy_block: &str) -> serde_yaml::Value {
+    let yaml = format!(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   reserved_tokens: 500\n\
+         {hierarchy_block}"
+    );
+    serde_yaml::from_str(&yaml).unwrap()
+}
+
+fn valid_hierarchy_block() -> String {
+    "hierarchy:\n\
+     \x20 - level: org\n\
+     \x20   identity_header: x-org-id\n\
+     \x20   algorithm: sliding_window\n\
+     \x20   window: 1h\n\
+     \x20   capacity: 5000000\n\
+     \x20 - level: team\n\
+     \x20   identity_header: x-team-id\n\
+     \x20   algorithm: sliding_window\n\
+     \x20   window: 1h\n\
+     \x20   capacity: 1000000\n\
+     \x20 - level: user\n\
+     \x20   identity: authenticated_subject\n\
+     \x20   algorithm: sliding_window\n\
+     \x20   window: 1h\n\
+     \x20   capacity: 100000\n"
+        .to_owned()
+}
+
+#[test]
+fn from_config_parses_valid_hierarchy() {
+    let yaml = hierarchy_yaml(&valid_hierarchy_block());
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_rejects_hierarchy_with_wrong_level_order() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject wrong order");
+    assert!(err.to_string().contains("must be"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_with_fewer_than_three_levels() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject 2 levels");
+    assert!(err.to_string().contains("exactly 3 levels"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_with_more_than_three_levels() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-other\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 50000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject 4 levels");
+    assert!(err.to_string().contains("exactly 3 levels"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_with_duplicate_levels() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org2\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject duplicates");
+    assert!(
+        err.to_string().contains("must be") || err.to_string().contains("duplicate"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn from_config_rejects_hierarchy_org_level_with_identity_instead_of_identity_header() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject org with identity");
+    assert!(err.to_string().contains("identity_header"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_user_level_with_identity_header_instead_of_identity() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity_header: x-user-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject user with identity_header");
+    assert!(
+        err.to_string().contains("identity: authenticated_subject"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn from_config_rejects_hierarchy_without_a_catch_all_rule() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: scoped\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: alpha\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   reserved_tokens: 500\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("hierarchy without a catch-all rule should be rejected");
+    assert!(err.to_string().contains("catch-all"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_when_a_rule_can_skip_estimation() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   estimation:\n\
+         \x20     strategy: max_tokens\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("hierarchy with a skippable estimate should be rejected");
+    assert!(err.to_string().contains("fallback_estimate"), "got: {err}");
+}
+
+// -----------------------------------------------------------------------------
+// Hierarchy identity-miss 401 tests
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn hierarchy_missing_org_header_returns_401() {
+    let yaml = hierarchy_yaml(&valid_hierarchy_block());
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-team-id"),
+        http::HeaderValue::from_static("team-a"),
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401),
+        "missing org header should return 401, got: {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn hierarchy_blank_org_header_returns_401() {
+    let yaml = hierarchy_yaml(&valid_hierarchy_block());
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-org-id"),
+        http::HeaderValue::from_static("   "),
+    );
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-team-id"),
+        http::HeaderValue::from_static("team-a"),
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401),
+        "blank org header should return 401, got: {action:?}"
+    );
+}
+
+#[test]
+fn hierarchy_missing_org_header_records_unauthenticated_metric() {
+    let snapshot = metrics_emitted_by(async {
+        let yaml = hierarchy_yaml(&valid_hierarchy_block());
+        let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+        let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        req.headers.insert(
+            http::header::HeaderName::from_static("x-team-id"),
+            http::HeaderValue::from_static("team-a"),
+        );
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401),
+            "missing org header should return 401, got: {action:?}"
+        );
+    });
+    assert_eq!(
+        counter_value(
+            &snapshot,
+            "praxis_trl_unauthenticated_total",
+            &[("rule", "hierarchy:org")]
+        ),
+        Some(1),
+        "a missing org identity is counted on the hierarchy:org rule label"
+    );
+}
+
+#[tokio::test]
+async fn hierarchy_missing_team_header_returns_401() {
+    let yaml = hierarchy_yaml(&valid_hierarchy_block());
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-org-id"),
+        http::HeaderValue::from_static("org-a"),
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401),
+        "missing team header should return 401, got: {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn hierarchy_missing_subject_returns_401() {
+    let yaml = hierarchy_yaml(&valid_hierarchy_block());
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-org-id"),
+        http::HeaderValue::from_static("org-a"),
+    );
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-team-id"),
+        http::HeaderValue::from_static("team-a"),
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401),
+        "missing authenticated subject should return 401, got: {action:?}"
+    );
+}
+
+#[test]
+fn from_config_rejects_hierarchy_with_a_zero_fallback_estimate() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   estimation:\n\
+         \x20     strategy: max_tokens\n\
+         \x20     fallback_estimate: 0\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("a zero fallback estimate should be rejected when hierarchy is configured");
+    assert!(err.to_string().contains("fallback_estimate > 0"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_when_reserved_tokens_exceed_level_capacity() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   reserved_tokens: 500\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 300\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("a fixed estimate larger than a hierarchy capacity should be rejected");
+    assert!(err.to_string().contains("exceeds hierarchy org capacity"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_when_fixed_multiplier_exceeds_level_capacity() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   estimation:\n\
+         \x20     strategy: fixed\n\
+         \x20     fallback_estimate: 300\n\
+         \x20     multiplier: 2\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 500\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("a multiplied fixed estimate larger than a hierarchy capacity should be rejected");
+    assert!(err.to_string().contains("exceeds hierarchy org capacity"), "got: {err}");
+}
+
+#[test]
+fn extract_max_tokens_uses_fallback_for_zero_and_keeps_zero_without_one() {
+    let probe = super::BodyProbe {
+        max_tokens: Some(0),
+        max_completion_tokens: None,
+        model: None,
+    };
+    assert_eq!(super::extract_max_tokens(Some(&probe), Some(40)), Some(40));
+    assert_eq!(super::extract_max_tokens(Some(&probe), None), Some(0));
+    // `max_tokens: 0` is the chosen field, so `max_completion_tokens` is not used.
+    let completion = super::BodyProbe {
+        max_tokens: Some(0),
+        max_completion_tokens: Some(12),
+        model: None,
+    };
+    assert_eq!(super::extract_max_tokens(Some(&completion), Some(40)), Some(40));
+    assert_eq!(super::extract_max_tokens(Some(&completion), None), Some(0));
+}
+
+#[test]
+fn from_config_rejects_a_rule_named_like_a_hierarchy_level() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: hierarchy:user\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   reserved_tokens: 500\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("a rule named hierarchy:user should be rejected");
+    assert!(err.to_string().contains("reserved for hierarchy"), "got: {err}");
 }

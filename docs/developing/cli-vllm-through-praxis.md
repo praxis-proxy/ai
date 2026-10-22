@@ -1,14 +1,18 @@
-# Run Codex or Claude Code through Praxis and vLLM
+# Run Codex, Claude Code, or OpenCode through Praxis and vLLM
 
 This guide runs a real coding client through a local Praxis gateway while vLLM
 provides inference. The supported paths are:
 
 ```text
-Codex       -> Praxis /v1/responses -> vLLM /v1/responses (native)
-Codex       -> Praxis /v1/responses -> vLLM /v1/chat/completions (translated)
-Claude Code -> Praxis /v1/messages  -> vLLM /v1/messages (native)
-Claude Code -> Praxis /v1/messages  -> vLLM /v1/chat/completions (translated)
+Codex       -> Praxis /v1/responses        -> vLLM /v1/responses (native)
+Codex       -> Praxis /v1/responses        -> vLLM /v1/chat/completions (translated)
+Claude Code -> Praxis /v1/messages         -> vLLM /v1/messages (native)
+Claude Code -> Praxis /v1/messages         -> vLLM /v1/chat/completions (translated)
+OpenCode    -> Praxis /v1/chat/completions -> vLLM /v1/chat/completions (native)
 ```
+
+One gateway can serve all three clients over their native paths at once; see
+[Serving all three clients from one gateway](#serving-all-three-clients-from-one-gateway).
 
 Use the native paths when vLLM exposes the corresponding Responses or
 Anthropic-compatible API. For Codex, Praxis keeps `/v1/responses` end to end
@@ -22,7 +26,10 @@ translated path for a backend that only exposes OpenAI Chat Completions.
 In GitHub Actions, open **vLLM Dev Endpoint**, choose **Run workflow**, and keep
 the defaults for Qwen3-8B. The workflow provisions a temporary GPU, publishes a
 Cloudflare URL in the run summary, and tears everything down at the requested
-deadline or when the run is cancelled.
+deadline or when the run is cancelled. Its defaults already serve Qwen3-8B with
+`--reasoning-parser qwen3` and thinking off, which is what the coding clients
+below expect; change the `reasoning_parser` and `enable_thinking` inputs only
+for a different model or when you specifically want visible reasoning.
 
 Record the two summary values:
 
@@ -47,7 +54,8 @@ vllm serve Qwen/Qwen3-8B \
   --max-model-len 32768 \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
-  --reasoning-parser deepseek_r1 \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking":false}' \
   --gpu-memory-utilization 0.97 \
   --enforce-eager \
   --api-key "$VLLM_API_KEY"
@@ -73,18 +81,48 @@ docker run --rm --name vllm \
   --max-model-len 32768 \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
-  --reasoning-parser deepseek_r1 \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking":false}' \
   --gpu-memory-utilization 0.97 \
   --enforce-eager
 ```
 
 With Podman, replace `--gpus all` with `--device nvidia.com/gpu=all` and leave
 the rest unchanged. Pin a released tag rather than `latest` for reproducible
-behavior; the on-demand GPU endpoint workflow uses `v0.29.0-cu129`. The first
+behavior; the on-demand GPU endpoint workflow uses `v0.32.0-cu129`. The first
 run downloads a multi-gigabyte image plus the model weights, and the Hugging
 Face cache mount keeps the weights for later runs.
 
 Use `VLLM_URL=http://127.0.0.1:8000` for either local server.
+
+### Reasoning flags matter for Claude Code
+
+The two reasoning-related flags above are deliberate for this setup and are the
+main difference from the flags CI serves:
+
+- `--reasoning-parser qwen3` matches the served model family. The parser name
+  selects how vLLM splits a `<think>` block out of the completion into
+  `reasoning_content`; a parser written for a different family can leave that
+  text in the assistant message instead.
+- `--default-chat-template-kwargs '{"enable_thinking":false}'` turns Qwen3's
+  thinking off at the chat-template level, so the model does not emit a
+  `<think>` block for the agentic turns Claude Code drives in the first place.
+
+Serving Qwen3-8B with `--reasoning-parser deepseek_r1` and thinking left on
+made Claude Code's plan mode loop endlessly, emitting reasoning text into the
+rendered plan instead of a finished one. Switching to the two flags above
+resolved it. They were verified together, so change them as a pair; if you need
+visible reasoning for other work, expect agentic clients to degrade.
+
+A nightly GPU regression guards this pairing. The
+`vllm-gpu-claude-acceptance` job drives a read-only planning turn through the
+native Anthropic path and fails if the run exhausts its turn budget instead of
+answering, or if a `<think>` delimiter reaches the user-visible text. The
+scenario is pinned in `[claude_code.launch.planning]` of
+`tests/integration/fixtures/claude-code-cli/pin.toml`; reverting either flag
+above is expected to turn it red. It is a headless approximation of the turn
+that broke, not interactive plan mode, which the CLI does not expose to
+`claude -p`.
 
 The 32,768-token window is intentional for Claude Code auto mode. Its
 client-initiated safety classifier reserves 2,112 output tokens independently
@@ -99,7 +137,7 @@ beside a working prompt, so section 4 also sets `CLAUDE_CODE_MAX_OUTPUT_TOKENS`.
 
 ## 2. Point a Praxis example at vLLM
 
-Choose one example and copy it outside `examples/`:
+Choose one example for your client and copy it outside `examples/`:
 
 ```console
 # Codex, native Responses API (preferred for vLLM)
@@ -108,12 +146,70 @@ cp examples/configs/openai/responses/client-tool-compat.yaml praxis-vllm.yaml
 # Codex, translated to Chat Completions
 cp examples/configs/openai/responses/codex-http-chat-translation.yaml praxis-vllm.yaml
 
-# Claude Code, native Anthropic API (preferred for vLLM)
+# Claude Code, native Anthropic API (preferred for vLLM), or OpenCode
 cp examples/configs/anthropic/messages-native-vllm.yaml praxis-vllm.yaml
 
 # Claude Code, translated to Chat Completions
 cp examples/configs/anthropic/messages-to-openai-vllm.yaml praxis-vllm.yaml
 ```
+
+OpenCode was tested with the
+[native Claude configuration](../../examples/configs/anthropic/messages-native-vllm.yaml).
+It declares an explicit `/v1/chat/completions` route that forwards to vLLM
+without body translation, and Anthropic validation is scoped to `/v1/messages`.
+The same gateway can serve both Claude Code and OpenCode, provided vLLM
+supports their respective endpoints.
+
+### Serving all three clients from one gateway
+
+One proxy process can serve all three CLIs over their native paths at once.
+There is no example config for this, because it is the two native examples
+above placed in one file: the Claude Code and OpenCode chain from
+`anthropic/messages-native-vllm.yaml` and the Codex chain from
+`openai/responses/client-tool-compat.yaml`, behind two listeners, pointed at
+the same vLLM server and sharing one `GATEWAY_AUTH_PASSWORD`.
+
+```yaml
+listeners:
+  # Claude Code (/v1/messages) and OpenCode (/v1/chat/completions).
+  - name: messages-chat-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [claude-and-opencode]
+
+  # Codex (/v1/responses).
+  - name: responses-gateway
+    address: "127.0.0.1:8081"
+    filter_chains: [codex-responses]
+
+filter_chains:
+  - name: claude-and-opencode
+    filters: # ... from anthropic/messages-native-vllm.yaml
+  - name: codex-responses
+    # Prefix with the same basic_auth filter the chain above uses, so one
+    # shared credential gates both listeners. Give this chain's cluster its
+    # own name; the endpoint is the same vLLM server.
+    filters: # ... from openai/responses/client-tool-compat.yaml
+```
+
+Keep Codex on a listener of its own. Its rich client tools need
+`openai_client_tool_compat`, which needs `openai_stream_events`, which fails
+closed outside an `iterative_request_router` step. The IRR is a terminal filter
+that cannot share a chain with a top-level `load_balancer`, so everything on
+that listener would have to route through it — and the IRR buffers a
+sub-request response unless a filter selects streaming, which the native
+`/v1/messages` and `/v1/chat/completions` paths do not. Routing them through it
+would hold each turn's SSE until the turn finished, so Claude Code and OpenCode
+would render nothing until completion. Because every CLI configures its own
+base URL, the second port costs one line of client config.
+
+Point Claude Code and OpenCode at `http://127.0.0.1:8080` and Codex at
+`http://127.0.0.1:8081/v1`, then follow sections 3 to 5 unchanged with two
+exceptions: Codex now sits behind `basic_auth` and must present the shared
+Basic credential rather than a Bearer key — see
+[Codex behind the gateway's Basic auth](#codex-behind-the-gateways-basic-auth) —
+and from the container image the store needs the same absolute `database_url`
+as the native Codex example, see
+[the writable database path note](#the-native-codex-example-needs-a-writable-database-path).
 
 The native Codex example uses `127.0.0.1:3001` as its fixture backend; change
 that endpoint to `127.0.0.1:8000` for the local vLLM server. The other examples
@@ -164,15 +260,14 @@ export PRAXIS_PID=$!
 
 Praxis listens at `http://127.0.0.1:8080`.
 
-### Run Praxis from the official container image
+### Run Praxis from a container image
 
-Released images are published to
-[`ghcr.io/praxis-proxy/ai`](https://ghcr.io/praxis-proxy/ai). The `latest` tag
-tracks the most recent release; substitute a version tag such as `0.4` to pin
-one:
+The published image leaves experimental Responses and the agentic loop out.
+Build an image with an explicit opt-in for the examples in this guide:
 
 ```console
-docker pull ghcr.io/praxis-proxy/ai:latest
+docker build -f Containerfile -t praxis-ai-responses \
+  --build-arg PRAXIS_AI_FEATURES=full,openai-all,store-sqlite .
 ```
 
 The image entrypoint is `praxis-ai`, its working directory is `/etc/praxis`,
@@ -193,10 +288,10 @@ docker run -d --rm --name praxis-vllm \
   --network host \
   -e VLLM_API_KEY -e GATEWAY_AUTH_PASSWORD \
   -v "$PWD/praxis-vllm.yaml:/etc/praxis/praxis.yaml:ro,z" \
-  ghcr.io/praxis-proxy/ai:latest -c /etc/praxis/praxis.yaml
+  praxis-ai-responses -c /etc/praxis/praxis.yaml
 ```
 
-Praxis listens at `http://127.0.0.1:8080`, and sections 3 and 4 apply
+Praxis listens at `http://127.0.0.1:8080`, and sections 3 through 5 apply
 unchanged. Docker's `--network host` is Linux-only.
 
 To publish a port instead of sharing the host network stack, make three edits
@@ -220,7 +315,7 @@ docker run -d --rm --name praxis-vllm \
   --add-host=host.docker.internal:host-gateway \
   -e VLLM_API_KEY -e GATEWAY_AUTH_PASSWORD \
   -v "$PWD/praxis-vllm.yaml:/etc/praxis/praxis.yaml:ro,z" \
-  ghcr.io/praxis-proxy/ai:latest -c /etc/praxis/praxis.yaml
+  praxis-ai-responses -c /etc/praxis/praxis.yaml
 ```
 
 With Podman, both commands work unchanged. Podman also resolves
@@ -244,60 +339,45 @@ The admin endpoint must bind loopback unless
 container with
 `docker exec praxis-vllm wget -qO- http://127.0.0.1:9901/healthy` (or directly
 from the host under `--network host`). When finished, replace the `kill` in
-section 4 with `docker rm -f praxis-vllm`.
+the cleanup section with `docker rm -f praxis-vllm`.
 
-#### The native Codex example needs a rebuilt image
+#### The native Codex example needs a writable database path
 
-The published image is built with `PRAXIS_AI_FEATURES=full`, and `full` does
-not include `store-sqlite` (it selects `store-postgres` as the store backend).
-`client-tool-compat.yaml` — the preferred native Codex example — therefore
-cannot run on the stock image; `--validate` rejects it up front:
+The custom image above includes `openai-all,store-sqlite`, so
+`client-tool-compat.yaml` — the preferred native Codex example — is available. The other three
+configurations in this section have no store filter and need no change at all.
 
-```text
-invalid configuration: openai_response_store: backend 'sqlite' is unavailable; rebuild with the 'store-sqlite' feature
-```
-
-The other three examples in this section have no store filter and run on the
-published image unchanged. For the native Codex path, build the image locally
-with SQLite compiled in:
-
-```console
-docker build -f Containerfile \
-  --build-arg PRAXIS_AI_FEATURES=full,store-sqlite \
-  -t praxis-ai:sqlite .
-```
-
-Then give the store a writable path. The image's `/etc/praxis` working
-directory is root-owned while the process runs as `praxis`, so the example's
-relative `sqlite://responses.db?mode=rwc` cannot be created: the proxy starts,
-and the first `/v1/responses` request fails with HTTP 500 and
-`unable to open database file`. Point `database_url` at a mounted directory the
-container user can write instead:
+The one edit the store example does need is an absolute `database_url`. The
+image's `/etc/praxis` working directory is root-owned while the process runs as
+`praxis` (UID 100), so the example's relative `sqlite://responses.db?mode=rwc`
+cannot be created: the proxy starts, and the first `/v1/responses` request
+fails with HTTP 500 and `unable to open database file`. Point `database_url` at
+`/var/lib/praxis`, the writable state directory owned by the container user:
 
 ```yaml
-- filter: openai_response_store
+- filter: openai_responses_store
   backend: sqlite
-  database_url: "sqlite:///data/responses.db?mode=rwc"
+  database_url: "sqlite:///var/lib/praxis/responses.db?mode=rwc"
 ```
 
 ```console
-mkdir -m 0777 -p "$PWD/praxis-responses"
 docker run -d --rm --name praxis-vllm \
   --network host \
+  -e VLLM_API_KEY -e GATEWAY_AUTH_PASSWORD \
   -v "$PWD/praxis-vllm.yaml:/etc/praxis/praxis.yaml:ro,z" \
-  -v "$PWD/praxis-responses:/data:z" \
-  praxis-ai:sqlite -c /etc/praxis/praxis.yaml
+  praxis-ai-responses -c /etc/praxis/praxis.yaml
 ```
 
-The permissive mode is what lets UID 100 create the database in a host
-directory owned by your user; a directory `chown`ed to UID 100 works too.
-Podman can use a named volume instead, with the `:U` suffix asking it to chown
-the volume to the container user: `-v praxis-responses:/data:U`.
+The database then lives in the container's writable layer and disappears with
+`--rm`, which is usually what a CLI test loop wants. To keep responses across
+restarts, mount a volume at `/var/lib/praxis`: `-v praxis-state:/var/lib/praxis`
+with Podman adds `:U` to chown it to the container user, and a host directory
+needs `chown 100:100` (or `-m 0777`) before the first run.
 
-The published image can also serve this example with `backend: postgres`,
-`allow_private_database_url: true`, and a reachable PostgreSQL instance — see
-`examples/configs/openai/responses/response-store-postgres-mtls.yaml` — but for
-a single-developer CLI loop the locally built SQLite image is less setup.
+The stock image rejects these experimental filters at startup. A custom image
+can also serve this example with PostgreSQL by selecting `store-postgres`
+instead of `store-sqlite`; see
+`examples/configs/openai/responses/response-store-postgres-mtls.yaml`.
 
 ## 3. Connect Codex
 
@@ -333,6 +413,40 @@ If you selected the translated Codex example instead, set
 Chat Completions, injects `VLLM_API_KEY`, and streams the translated response
 back.
 
+### Codex behind the gateway's Basic auth
+
+The native Codex example has no `basic_auth` filter, so the client credential
+above *is* the backend credential. Put Codex behind a gateway that
+authenticates clients — as the Claude examples do, and as the
+[all-in-one gateway](#serving-all-three-clients-from-one-gateway) does — and it
+must present the Basic credential instead. Codex builds its provider headers
+from `http_headers` and `env_http_headers` independently of `env_key`, and
+applies the `env_key` bearer by *appending* `Authorization` rather than
+replacing it, so setting both sends two `Authorization` headers. Omit `env_key`
+entirely and carry the credential in `env_http_headers`:
+
+```console
+export PRAXIS_GATEWAY_AUTH="Basic $(printf 'gateway:%s' "$GATEWAY_AUTH_PASSWORD" | base64)"
+```
+
+```toml
+[model_providers.praxis]
+name = "Local Praxis"
+base_url = "http://127.0.0.1:8081/v1"
+wire_api = "responses"
+env_http_headers = { Authorization = "PRAXIS_GATEWAY_AUTH" }
+```
+
+With no `env_key`, no `experimental_bearer_token`, and `requires_openai_auth`
+left at its default, Codex resolves an unauthenticated provider and contributes
+no auth headers of its own. The isolated `CODEX_HOME` is load-bearing rather
+than merely tidy here: a logged-in Codex home would supply ambient credentials
+that this provider would otherwise inherit.
+
+`basic_auth` then verifies the client credential and strips it, and
+`credential_injection` supplies `VLLM_API_KEY` toward vLLM — the same
+three-credential separation the Claude examples use.
+
 ## 4. Connect Claude Code
 
 The Claude examples authenticate the client with Basic auth and independently
@@ -361,6 +475,23 @@ claude --model "$VLLM_MODEL"
 `GATEWAY_AUTH_PASSWORD` and `VLLM_API_KEY` must be present in the environment of
 the Praxis process. The other variables configure Claude Code.
 
+The translated `messages-to-openai-vllm.yaml` route enables
+`allow_lossy_features: [prompt_caching, extended_thinking]`, so you do **not**
+need to disable Anthropic thinking or prompt caching in Claude Code. Chat
+Completions cannot represent either feature, so Praxis strips the wire markers an
+unmodified client sends and reports the loss (a `WARN` log, the
+`praxis_anthropic_messages_to_chat_completions_degraded_total` counter, and an
+`x-degraded-features` response header) instead of rejecting the request.
+
+To see the strict behavior instead — a 400 when either feature appears — use the
+`messages-to-openai.yaml` route (empty allowlist) and disable both features in
+Claude Code:
+
+```console
+export CLAUDE_CODE_DISABLE_THINKING=1
+export DISABLE_PROMPT_CACHING=1
+```
+
 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` is required for a 32,768-token server. Claude
 Code does not know the served model's real window, so it sends the default
 `max_tokens` for the Anthropic model name it believes it is calling — around
@@ -380,6 +511,349 @@ Claude Code's `auto` permission mode; the classifier still consumes model
 inference and is not an on-device check. Do not set it to `1` for this setup.
 See [Anthropic's auto-mode classifier documentation](https://code.claude.com/docs/en/auto-mode-classifier-billing).
 
+## 5. Connect OpenCode
+
+OpenCode 1.x and 2.x need different setups. Check your version with
+`opencode --version`: 1.x prints a bare version such as `1.18.35`, and 2.x
+prints `opencode v2.1.2`. The two majors ship as different npm packages
+(`opencode-ai` for 1.x, `@opencode/cli` for 2.x), and the 1.x plugin does not
+load in 2.x.
+
+Both use the native Claude configuration from section 2. It forwards OpenCode's
+`/v1/chat/completions` requests to vLLM and authenticates clients with Basic
+auth using username `gateway` and password from `GATEWAY_AUTH_PASSWORD`.
+Nothing changes on the Praxis side between the two majors.
+
+### OpenCode 1.x
+
+These steps are verified against OpenCode 1.19.3.
+
+Add this configuration to
+`~/.config/opencode/opencode.jsonc`, merging the `plugin` and `provider`
+entries with any existing settings:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["./praxis-auth.ts"],
+  "provider": {
+    "praxis": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Praxis",
+      "options": { "baseURL": "http://127.0.0.1:8080/v1" },
+      "models": {
+        "qwen3-8b": {
+          "name": "Qwen3 8B",
+          "limit": { "context": 32768, "output": 8192 }
+        }
+      }
+    }
+  }
+}
+```
+
+Replace `qwen3-8b` with the exact served name in `VLLM_MODEL` and adjust the
+limits to match your vLLM server. For a remote Praxis gateway, replace the
+`baseURL` with its HTTPS address, keeping the `/v1` suffix. Use HTTP only for
+a loopback gateway. Export the same URL from your shell so the plugin can
+verify the destination independently of project configuration:
+
+```console
+export PRAXIS_BASE_URL="https://gateway.example.com/v1"
+```
+
+For the local `http://127.0.0.1:8080/v1` example, no URL export is needed.
+
+Create `~/.config/opencode/praxis-auth.ts`:
+
+```typescript
+export default async () => ({
+  config: async (config) => {
+    const options = config.provider.praxis.options
+    const trustedURL = process.env.PRAXIS_BASE_URL ?? "http://127.0.0.1:8080/v1"
+    if (options.baseURL !== trustedURL) {
+      throw new Error("Praxis baseURL does not match the trusted gateway")
+    }
+    const password = process.env.GATEWAY_AUTH_PASSWORD
+    if (!password) throw new Error("GATEWAY_AUTH_PASSWORD is required for Praxis")
+    const token = Buffer.from(`gateway:${password}`).toString("base64")
+    options.headers = { ...options.headers, Authorization: `Basic ${token}` }
+  },
+})
+```
+
+The plugin checks the merged provider URL before attaching Basic auth with
+username `gateway`. Set `PRAXIS_BASE_URL` only to a gateway you trust; it must
+exactly match `baseURL`, including any trailing slash.
+
+> **The guard withholds the credential; it does not stop the request.**
+> Verified against OpenCode 1.19.3: when the `config` hook throws — a
+> `baseURL` mismatch, or an unset `GATEWAY_AUTH_PASSWORD` — OpenCode logs
+> `plugin config hook failed` and **continues**, sending the turn with no
+> `Authorization` header. It exits `0` and the event stream ends in
+> `step_finish`, so the run looks successful. The error is only visible if you
+> passed `--print-logs`.
+>
+> Against a real Praxis gateway the unauthenticated request is rejected with
+> `401`, so the turn does fail — but it fails as a gateway error rather than as
+> a plugin error. Treat the destination check as defence in depth, not as an
+> enforcing control, and read a sudden `401` as a possible plugin failure.
+
+Launch OpenCode from the shell where `GATEWAY_AUTH_PASSWORD` was exported in
+section 2. It must match the password in the Praxis process environment;
+OpenCode does not need `VLLM_API_KEY`:
+
+```console
+opencode --model "praxis/$VLLM_MODEL"
+```
+
+Quit and restart OpenCode after changing its configuration or plugin. You can
+also select the configured model with `/models`.
+
+#### Headless invocation
+
+`opencode run` drives a single turn non-interactively, which is what CI and
+scripts want:
+
+```console
+opencode run --model "praxis/$VLLM_MODEL" --format json -- "Summarize README.md"
+```
+
+The prompt is a **positional argument**. There is no `-p` prompt flag: on `run`,
+`-p`/`--password` is the OpenCode *server* Basic-auth password, so copying the
+`claude -p "..."` habit silently passes your prompt as a password. Use `--` to
+separate the prompt from the flags.
+
+`--format json` emits raw JSON events, one per line, instead of formatted
+output. A successful turn emits `step_start`, one or more `text` events
+(assistant text is at `part.text`), then `step_finish`; a failed turn emits an
+`error` event carrying `statusCode` and the resolved request URL. `--print-logs`
+and `--log-level DEBUG` are global flags (not `run` flags) and send diagnostics
+to stderr — use them to confirm which `baseURL` the provider actually resolved,
+and to surface plugin failures, which are otherwise silent.
+
+**Redirect stdin from `/dev/null`.** If stdin stays open, `opencode run` blocks
+indefinitely after logging `init` — before it issues a single request — even
+though the prompt was supplied as an argument. In a script or CI job that
+presents as a hang with no output and no network activity.
+
+#### Alternative: per-model headers without a plugin
+
+The plugin above exists because `provider.<id>.options` has no `headers` key —
+it accepts only `apiKey`, `baseURL`, `enterpriseUrl`, `setCacheKey`, `timeout`,
+`headerTimeout`, and `chunkTimeout`. But a **per-model** `headers` map is part
+of the published schema, so the gateway credential can be attached declaratively
+and the plugin skipped entirely:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "praxis": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Praxis",
+      "options": { "baseURL": "http://127.0.0.1:8080/v1" },
+      "models": {
+        "qwen3-8b": {
+          "name": "Qwen3 8B",
+          "limit": { "context": 32768, "output": 8192 },
+          "headers": { "Authorization": "Basic <base64 of gateway:password>" }
+        }
+      }
+    }
+  }
+}
+```
+
+Pair it with `opencode --pure`, which runs without external plugins. The model
+object rejects unknown keys, so a misspelling is a hard startup error rather
+than a silently ignored setting.
+
+**Prefer the plugin for interactive use.** It reads the password from the
+environment at runtime and refuses to attach the credential if a project-level
+config has repointed `baseURL` at another host. The `headers` map does neither:
+it bakes a base64 credential into a file on disk and will send it wherever
+`baseURL` happens to point. Use it for CI and ephemeral credentials, not for a
+developer's `~/.config`.
+
+### OpenCode 2.x
+
+These steps are verified against OpenCode 2.1.2. For the upstream changes, see
+the [OpenCode V1 migration guide](https://opencode.ai/v2/docs/migrate-v1/).
+
+Add this configuration to `~/.config/opencode/opencode.jsonc`, merging the
+`providers` entry with any existing settings. 2.x renames `provider` to
+`providers`, `npm` to `package` (with an `aisdk:` prefix), and moves
+`options.baseURL` to `settings.baseURL`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "praxis": {
+      "package": "aisdk:@ai-sdk/openai-compatible",
+      "name": "Praxis",
+      "settings": { "baseURL": "http://127.0.0.1:8080/v1" },
+      "models": {
+        "qwen3-8b": {
+          "name": "Qwen3 8B",
+          "limit": { "context": 32768, "output": 8192 }
+        }
+      }
+    }
+  }
+}
+```
+
+Replace `qwen3-8b` with the exact served name in `VLLM_MODEL` and adjust the
+limits to match your vLLM server. For a remote Praxis gateway, replace the
+`baseURL` with its HTTPS address, keeping the `/v1` suffix, and export the same
+URL so the plugin can verify the destination:
+
+```console
+export PRAXIS_BASE_URL="https://gateway.example.com/v1"
+```
+
+For the local `http://127.0.0.1:8080/v1` example, no URL export is needed.
+
+> **2.x ignores unknown configuration keys.** OpenCode 1.x rejected a
+> misspelled key at startup. 2.1.2 ignores it without any message, so a typo
+> such as `setting` instead of `settings` drops the `baseURL`. Copy the keys
+> exactly.
+
+Create `~/.config/opencode/plugins/praxis-auth.ts`. OpenCode 2.x loads every
+plugin in that directory automatically, so the configuration needs no
+`plugins` entry:
+
+```typescript
+import { Plugin } from "@opencode/plugin"
+
+export default Plugin.define({
+  id: "praxis-auth",
+  async setup(ctx) {
+    await ctx.session.hook(
+      "model.request",
+      (event) => {
+        const trustedURL = process.env.PRAXIS_BASE_URL ?? "http://127.0.0.1:8080/v1"
+        if (event.baseURL !== trustedURL) {
+          throw new Error("Praxis baseURL does not match the trusted gateway")
+        }
+        const password = process.env.GATEWAY_AUTH_PASSWORD
+        if (!password) throw new Error("GATEWAY_AUTH_PASSWORD is required for Praxis")
+        const token = Buffer.from(`gateway:${password}`).toString("base64")
+        event.headers.Authorization = `Basic ${token}`
+      },
+      { providerID: "praxis" },
+    )
+  },
+})
+```
+
+The plugin runs before every model request to the `praxis` provider. It
+checks the resolved `baseURL` against `PRAXIS_BASE_URL`, then attaches Basic
+auth with username `gateway`. Set `PRAXIS_BASE_URL` only to a gateway you
+trust. It must exactly match `baseURL`, including any trailing slash.
+
+> **The guard now blocks the request, but a plugin that fails to load still
+> fails open.** Verified against OpenCode 2.1.2:
+>
+> - If the hook throws (a `baseURL` mismatch or an unset
+>   `GATEWAY_AUTH_PASSWORD`), OpenCode does **not** send the request. It emits
+>   an `error` event carrying the plugin's message and exits `1`. This is
+>   stricter than 1.x, where the turn went out without credentials.
+> - If the plugin fails to **load** (a syntax error, a 1.x-style plugin, or a
+>   `plugins` entry that points at a file rather than a directory), OpenCode
+>   logs `failed to load plugin` at WARN and **continues**, sending every turn
+>   with no `Authorization` header and exiting `0`. The message only appears
+>   with `--print-logs`.
+> - If you change the `providerID` in the plugin so it no longer matches the
+>   provider, the hook never runs and nothing is logged.
+>
+> Against a real Praxis gateway an unauthenticated turn is rejected with
+> `401`. Read a sudden `401` as a possible plugin load failure.
+
+Launch OpenCode from the shell where `GATEWAY_AUTH_PASSWORD` was exported in
+section 2. OpenCode does not need `VLLM_API_KEY`:
+
+```console
+opencode --model "praxis/$VLLM_MODEL"
+```
+
+#### Headless invocation (2.x)
+
+```console
+opencode run --standalone --model "praxis/$VLLM_MODEL" --format json "Summarize README.md" < /dev/null
+```
+
+The 2.x command line differs from 1.x in ways that fail quietly:
+
+- **Pass `--standalone` in scripts.** Without it, `opencode run` connects to a
+  shared background server (`opencode serve --service`) and starts one if none
+  is running. That server keeps running after `run` exits. `--standalone` runs
+  a private server that exits with the command.
+- **Do not put `--` before the prompt.** In 2.1.2, `opencode run -- "hello"`
+  sends `hello hello`, so the prompt is duplicated. Pass the prompt as the
+  final argument with no separator.
+- `-p` is not a flag on `run` in 2.x. `opencode run -p "..."` prints the help
+  text and exits `1`.
+- There is no `--pure` flag. To run without the plugin, remove it from
+  `~/.config/opencode/plugins/`.
+- **Redirect stdin from `/dev/null`.** As in 1.x, `opencode run` hangs with no
+  output and no network activity while stdin stays open.
+
+`--format json` emits one JSON event per line. A plain text turn emits only
+`text` events (assistant text is at `part.text`). A turn that calls a tool
+emits `step_start`, `tool_use`, `step_finish`, then `text`. A failed turn emits
+an `error` event with `error.type` and `error.message`. A gateway `401`
+appears as `error.type` `provider.auth` with `error.status` `401`. Use
+`--print-logs --log-level warn` to see plugin load failures. `ERROR` hides
+them, because they are logged at WARN.
+
+2.x renames some built-in tools: `bash` is now `shell` and `task` is now
+`subagent`. Use the new names when a prompt asks for a tool by name.
+
+#### Alternative: provider headers without a plugin (2.x)
+
+2.x accepts a `headers` map at the provider level, and `{env:NAME}`
+substitution works inside it. You can attach the gateway credential with no
+plugin and keep it out of the file:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "praxis": {
+      "package": "aisdk:@ai-sdk/openai-compatible",
+      "name": "Praxis",
+      "settings": { "baseURL": "http://127.0.0.1:8080/v1" },
+      "headers": { "Authorization": "Basic {env:PRAXIS_GATEWAY_BASIC_TOKEN}" },
+      "models": {
+        "qwen3-8b": {
+          "name": "Qwen3 8B",
+          "limit": { "context": 32768, "output": 8192 }
+        }
+      }
+    }
+  }
+}
+```
+
+Export the Basic token, which is the base64 encoding of `gateway:<password>`:
+
+```console
+export PRAXIS_GATEWAY_BASIC_TOKEN="$(printf 'gateway:%s' "$GATEWAY_AUTH_PASSWORD" | base64)"
+```
+
+If the variable is unset, OpenCode substitutes an empty string and the gateway
+answers `401`. Do not install the plugin alongside this configuration.
+
+**The plugin is still the better choice for interactive use.** It refuses to
+send anything when a project-level config has pointed `baseURL` at another
+host. The `headers` map has no such check and sends the token wherever
+`baseURL` points.
+
+## Cleanup
+
 When finished, stop local Praxis and cancel the on-demand endpoint workflow:
 
 ```console
@@ -388,9 +862,73 @@ kill "$PRAXIS_PID"
 
 ## Troubleshooting
 
-- `401` from Praxis on the Claude path: verify the Basic authorization header.
+- `401` from Praxis on the Claude or OpenCode path: verify the Basic
+  authorization header and that the client's `GATEWAY_AUTH_PASSWORD` matches
+  the gateway's password.
+- `opencode run` hangs after logging `init` and nothing reaches Praxis: stdin
+  is still open. Redirect it from `/dev/null`. This is not a network problem —
+  OpenCode needs no egress beyond Praxis itself, and completes normally in a
+  loopback-only network namespace.
+- OpenCode sends requests with no `Authorization` header and the gateway
+  answers `401`, with no plugin error in the default output: the
+  `praxis-auth.ts` `config` hook threw and was swallowed, so no auth was
+  attached. The turn fails, but the `401` reads like an ordinary gateway
+  rejection rather than a plugin failure. Re-run with `--print-logs` and look
+  for `plugin config hook failed`. Usual causes are an unset
+  `GATEWAY_AUTH_PASSWORD` or a `PRAXIS_BASE_URL` that does not exactly match
+  the merged `baseURL`.
+- OpenCode reaches api.openai.com instead of Praxis, or asks for
+  `OPENAI_API_KEY`: the provider `options` were not applied, which upstream has
+  reported for both the bundled adapter and sub-sessions. Confirm the resolved
+  `baseURL` with `--print-logs --log-level DEBUG` and pin a known-good version.
+- OpenCode 2.x sends requests with no `Authorization` header and exits `0`: the
+  plugin did not load. Re-run with `--print-logs --log-level warn` and look for
+  `failed to load plugin`. Common causes: a 1.x-style plugin, a syntax error,
+  or a `plugins` entry that points at a file rather than a directory. Leaving
+  the plugin in `~/.config/opencode/plugins/` with no `plugins` entry avoids
+  the last one.
+- OpenCode 2.x exits `1` with `Praxis baseURL does not match the trusted
+  gateway` or `GATEWAY_AUTH_PASSWORD is required for Praxis`, and nothing
+  reaches Praxis: the plugin's guard refused the request. Fix
+  `PRAXIS_BASE_URL` or export the password.
+- OpenCode 2.x processes keep running after `opencode run` exits: the run
+  started the shared background server. Pass `--standalone`, or stop the
+  server with `opencode service stop`.
 - `401` from vLLM: `VLLM_API_KEY` does not match the key passed to vLLM.
+- `401` from Praxis on a Codex path gated by `basic_auth`: `env_key` is
+  probably still set alongside `env_http_headers`. Codex appends the `env_key`
+  bearer rather than replacing the configured header, so the request carries
+  two `Authorization` headers and `basic_auth` does not see the Basic one it
+  expects. Remove `env_key` from the provider block. A stale logged-in
+  `CODEX_HOME` can do the same thing; use the `mktemp -d` home from section 3.
 - Model not found: use the exact slash-free served name, normally `qwen3-8b`.
+- `400` with `request body is not JSON` on a request that has no body, such as
+  `GET /v1/models`, logged as
+  `request body rejected by filter filter="openai_responses_format"`: a
+  Responses classifier is running unconditioned on every request the listener
+  accepts, and an empty body classifies as non-JSON, which `on_invalid: reject`
+  turns into a 400 before routing. Both Codex examples in section 2 lead with
+  the head-driven `openai_responses_request` instead, which releases any
+  operation it does not recognize without reading a body. A config derived from
+  an older copy needs the same swap: drop the leading `openai_responses_format`
+  and let `openai_responses_request` carry the `on_invalid` and `headers` that
+  classifier used to carry.
+  Do not reach for `on_invalid: continue` instead: it clears the probe but also
+  forwards genuinely malformed Responses bodies to vLLM rather than rejecting
+  them at the gateway.
+- RFC 9457 `application/problem+json` where an OpenAI client expects
+  `{"error": {...}}`: the chain is missing `ai_operation`. The body
+  classifiers each resolve one protocol — `openai_responses_request` covers
+  Responses, and `anthropic_messages_request` installs its formatter only on
+  the Anthropic Messages surface — so neither owns the protocol decision for
+  the Chat Completions traffic a coding client also sends, and the
+  request reaches core's error path with no formatter installed. `ai_operation`
+  classifies from the request head and installs the matching formatter for
+  every OpenAI and Anthropic protocol; put it directly after `basic_auth`, as
+  the Codex examples and the native Claude Code and OpenCode example do.
+  This bites OpenCode hardest: it is the one client whose traffic
+  (`/v1/chat/completions`) shares a listener with another protocol, so a config
+  derived from an older copy sends it problem details its SDK cannot parse.
 - `400` with `maximum context length is 32768 tokens` and a requested output
   count near 21,000: Claude Code's default output budget does not fit the
   window. Set `CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192` as shown in section 4.
@@ -404,6 +942,20 @@ kill "$PRAXIS_PID"
   `--strict-mcp-config` to drop globally configured MCP servers, disable
   unneeded plugins with `/plugin`, and prefer a working directory whose
   `CLAUDE.md` is small or absent.
+- Claude Code never finishes a turn — plan mode keeps looping, or reasoning
+  text appears in the answer or the rendered plan: the server may be emitting
+  thinking that the client is not meant to see, which can desynchronize the
+  agentic loop. Serve Qwen3 with
+  `--reasoning-parser qwen3` and
+  `--default-chat-template-kwargs '{"enable_thinking":false}'` as shown in
+  section 1, and restart vLLM; the reasoning parser is a server flag, so
+  nothing on the Praxis or client side changes it. On the on-demand endpoint,
+  check the `reasoning_parser` and `enable_thinking` inputs of the run.
+- Auto mode fails with `Error: You are not in plan mode. To enter plan mode,
+  call the EnterPlanMode tool first.`: treat this as a symptom, not a root
+  cause. It can be a plain Claude Code plan-state failure, or reasoning text
+  bleeding into the response and desynchronizing the agentic loop. Check whether
+  reasoning text is also present before applying the Qwen3 settings above.
 - TLS or connection failure: use only the tunnel hostname in the endpoint and
   `tls.sni`; do not include `https://` in Praxis's `endpoints` entry.
 - Connection refused on 8080 from another machine, while vLLM on 8000 answers:
@@ -414,7 +966,12 @@ kill "$PRAXIS_PID"
   the host firewall; a loopback-only listener refuses the connection
   immediately, whereas a blocked port usually hangs or reports no route. Binding
   to `0.0.0.0` exposes the gateway to the network, so keep the authentication
-  filter in place.
+  filter in place and terminate TLS in front of it — the shared Basic password
+  is otherwise readable on the wire. A second listener, such as the Codex one
+  in the
+  [all-in-one gateway](#serving-all-three-clients-from-one-gateway), needs the
+  same treatment plus its own `-p 8081:8081` under the published-port container
+  path.
 - Claude startup probes may call `/v1/messages/count_tokens`. Native vLLM
   supports it; the translated Chat path can return 404 and Claude degrades
   gracefully.

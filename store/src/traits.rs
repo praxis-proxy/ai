@@ -8,7 +8,10 @@ use async_trait::async_trait;
 
 use crate::{
     owner::StateOwner,
-    types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
+    types::{
+        BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
+        ResponseEventRecord, ResponseRecord, StoreError,
+    },
 };
 
 // -----------------------------------------------------------------------------
@@ -51,6 +54,44 @@ pub trait ResponseStore: Send + Sync {
     /// Returns [`StoreError`] if the database operation fails.
     async fn get_response(&self, owner: &StateOwner, id: &str) -> Result<Option<ResponseRecord>, StoreError>;
 
+    /// Fetch a response only when its encoded and decoded JSON columns fit
+    /// `max_bytes`. Implementations must avoid loading oversized columns into
+    /// the caller process; unsupported backends fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] for an oversized record, or
+    /// [`StoreError::Unavailable`] when the backend has no bounded read.
+    async fn get_response_bounded(
+        &self,
+        _owner: &StateOwner,
+        _id: &str,
+        _max_bytes: usize,
+    ) -> Result<Option<ResponseRecord>, StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement bounded response reads".to_owned(),
+        ))
+    }
+
+    /// Fetch a response admitted against a retained-payload allowance.
+    /// Implementations must inspect JSON structure before constructing Value
+    /// trees and return the exact charge that was admitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] if the measured record exceeds
+    /// `max_charge_bytes`, or [`StoreError::Unavailable`] if unsupported.
+    async fn get_response_budgeted(
+        &self,
+        _owner: &StateOwner,
+        _id: &str,
+        _max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ResponseRecord>>, StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement budgeted response reads".to_owned(),
+        ))
+    }
+
     /// Delete a response by ID, scoped to an exact owner.
     ///
     /// Returns `true` if a record was deleted, `false` if no
@@ -58,7 +99,11 @@ pub trait ResponseStore: Send + Sync {
     ///
     /// Any server-owned pending approvals issued by the deleted response are
     /// removed in the same transaction, so deleting a response leaves no
-    /// consumable approval behind and retains no sensitive tool arguments.
+    /// consumable approval behind and retains no sensitive tool arguments. The
+    /// response's durable SSE event log (see [`append_events`]) is removed in the
+    /// same transaction as well, so a deleted response leaves nothing replayable.
+    ///
+    /// [`append_events`]: ResponseStore::append_events
     ///
     /// # Errors
     ///
@@ -78,6 +123,43 @@ pub trait ResponseStore: Send + Sync {
         owner: &StateOwner,
         conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError>;
+
+    /// Fetch a conversation only when its JSON columns fit `max_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] for an oversized record, or
+    /// [`StoreError::Unavailable`] when the backend has no bounded read.
+    async fn get_conversation_bounded(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement bounded conversation reads".to_owned(),
+        ))
+    }
+
+    /// Fetch a reconstructed conversation admitted against a retained-payload
+    /// allowance. Implementations inspect every source JSON payload before
+    /// constructing Value trees and return the charge measured for the returned
+    /// record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] if the measured history exceeds
+    /// `max_charge_bytes`, or [`StoreError::Unavailable`] if unsupported.
+    async fn get_conversation_budgeted(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ConversationRecord>>, StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement budgeted conversation reads".to_owned(),
+        ))
+    }
 
     /// Record server-owned pending MCP approvals emitted by the proxy.
     ///
@@ -148,6 +230,20 @@ pub trait ResponseStore: Send + Sync {
         Ok(())
     }
 
+    /// Insert a response and its approvals atomically only when its ID is
+    /// unused. A later budget failure may roll back this exchange's row, so
+    /// replacing a prior response is unsafe. Backends without an atomic
+    /// implementation fail closed.
+    async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        _record: &ResponseRecord,
+        _pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement atomic insert-if-absent persistence".to_owned(),
+        ))
+    }
+
     /// Fetch the server-owned pending approvals matching `approval_ids` that
     /// were issued by `response_id`.
     ///
@@ -178,6 +274,21 @@ pub trait ResponseStore: Send + Sync {
         response_id: &str,
         approval_ids: &[&str],
     ) -> Result<Vec<PendingApprovalRecord>, StoreError>;
+
+    /// Return matching approval payload bytes without materializing the rows.
+    /// Unknown backends fail aggregate admission closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend cannot measure the payload.
+    async fn pending_approval_payload_bytes(
+        &self,
+        _owner: &StateOwner,
+        _response_id: &str,
+        _approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        Ok(usize::MAX)
+    }
 
     /// Atomically claim single-use consumption of a batch of pending approvals
     /// issued by `response_id`.
@@ -217,6 +328,64 @@ pub trait ResponseStore: Send + Sync {
         approval_ids: &[&str],
         consumed_at: i64,
     ) -> Result<Option<usize>, StoreError>;
+
+    /// Append normalized SSE events to a response's durable event log.
+    ///
+    /// Called from the proxy **output** path at the terminal seam of a streamed
+    /// response: `openai_responses_store` holds the sequence-stamped events in
+    /// request scope, upserts the parent record, then flushes them here in one
+    /// batch before releasing the terminal frame. This builds the log that
+    /// `GET /v1/responses/{id}?stream=true` replays.
+    ///
+    /// Writes are insert-if-absent on `(response_id, sequence_number)` and gated
+    /// on the parent response existing under the exact same owner, so a re-released
+    /// batch never double-writes and events can never attach to a response the
+    /// caller does not own. Rows for a response that does not exist (or is owned by
+    /// someone else) are silently dropped. The write serializes against
+    /// `delete_response` so a concurrent delete cannot leave orphaned event rows.
+    ///
+    /// Idempotency means the caller may safely retry the batch; ordering across
+    /// batches is defined solely by `sequence_number`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the database operation fails.
+    async fn append_events(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        events: &[ResponseEventRecord],
+    ) -> Result<(), StoreError>;
+
+    /// List event-log rows for a response with `sequence_number > after`.
+    ///
+    /// Returns at most `limit` rows ordered by `sequence_number` ascending,
+    /// scoped to the exact owner. `after == None` starts from the beginning of the
+    /// log; `after == Some(n)` resumes strictly after sequence `n`. Paging the
+    /// replay one bounded page at a time keeps the whole log out of memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the database operation fails.
+    async fn list_events_after(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError>;
+
+    /// Summarize a response's event log for the pre-stream replay gate.
+    ///
+    /// Returns an [`EventLogStatus`] in one indexed query, distinguishing "no
+    /// log" (legacy or non-streamed record) from "incomplete log" (rows but no
+    /// terminal event) from "replayable" (`has_terminal == true`). Scoped to the
+    /// exact owner: another owner's log is invisible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the database operation fails.
+    async fn event_log_status(&self, owner: &StateOwner, response_id: &str) -> Result<EventLogStatus, StoreError>;
 }
 
 // -----------------------------------------------------------------------------
@@ -230,17 +399,23 @@ pub trait ResponseStore: Send + Sync {
 /// is exact-owner- and conversation-scoped.
 #[async_trait]
 pub trait ConversationItemStore: Send + Sync {
-    /// Insert or update a conversation message cache.
+    /// Insert or update a conversation record.
+    ///
+    /// An existing authoritative legacy prefix must remain unchanged. Use
+    /// [`Self::update_conversation_metadata`] for metadata-only updates rather
+    /// than upserting a stale record with an empty cache.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] if the database operation fails.
+    /// Returns [`StoreError`] if the database operation fails or the upsert
+    /// would replace a preserved legacy prefix.
     async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError>;
 
-    /// Update only the denormalized message cache for a conversation.
+    /// Update only the legacy message cache for a conversation.
     ///
     /// Returns `true` if a record was updated, `false` if no matching
-    /// conversation existed for this owner.
+    /// conversation existed for this owner or the write would replace an
+    /// authoritative legacy prefix. An identical prefix may be written again.
     ///
     /// # Errors
     ///
@@ -277,11 +452,16 @@ pub trait ConversationItemStore: Send + Sync {
         metadata: &serde_json::Value,
     ) -> Result<bool, StoreError>;
 
-    /// Replace the denormalized message cache only when it still equals
+    /// Replace the legacy message cache only when it still equals
     /// `expected_messages`.
     ///
+    /// Retained for cache-only compatibility; incremental item mutations no
+    /// longer use this operation. It must not replace an authoritative legacy
+    /// prefix, even when the expected value matches.
+    ///
     /// Returns `true` when the compare-and-swap succeeds and `false` after a
-    /// concurrent cache update or when the conversation does not exist.
+    /// concurrent cache update, when the conversation does not exist, or when
+    /// the replacement would change a preserved legacy prefix.
     ///
     /// # Errors
     ///
@@ -432,22 +612,42 @@ pub trait ConversationItemStore: Send + Sync {
     /// or a database operation fails.
     async fn max_item_position(&self, owner: &StateOwner, conversation_id: &str) -> Result<i64, StoreError>;
 
-    /// Atomically insert items and rebuild the conversation message cache.
+    /// Read complete ordered history from a consistent owner-scoped snapshot.
     ///
-    /// Within a single database transaction this method:
-    /// 1. Reads the current maximum item position.
-    /// 2. Assigns sequential positions starting from `max + 1`.
-    /// 3. Inserts the items.
-    /// 4. Rebuilds the `messages` cache from **all** items.
-    /// 5. Updates the conversation row.
+    /// Implementations must read item rows and any preserved legacy prefix from
+    /// the same snapshot. Cache-only stores may return their complete array;
+    /// adapters must forward this method to the backing store rather than read
+    /// the retired cache. There is no default because the cache alone cannot
+    /// reconstruct item-backed history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if reading or decoding the history fails.
+    async fn conversation_history(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, StoreError>;
+
+    /// Atomically insert items and invalidate the retired message cache.
+    ///
+    /// Within a single database transaction this method assigns positions from
+    /// `max + 1`, inserts the items and clears the cache without decoding existing
+    /// item payloads. A first append preserves cache-only legacy history as an
+    /// explicit prefix in the existing JSON column instead of discarding it.
     ///
     /// The `position` field in each input record is **ignored**; positions
     /// are assigned within the transaction to prevent collisions.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] if the items table is not configured
-    /// or a database operation fails.
+    /// Returns [`StoreError::NotFound`] if the conversation does not exist in
+    /// the owner's scope when the transaction begins. No items are committed.
+    /// Other [`StoreError`] values may indicate an unavailable table, a failed
+    /// database operation, or a cache-only row with an unsupported history
+    /// shape. Rejected malformed history is left intact. Repair requires
+    /// verified replacement history and an owner-scoped compare-and-swap of the
+    /// exact observed value; it is never an automatic empty-history fallback.
     async fn create_items_and_sync_messages(
         &self,
         owner: &StateOwner,
@@ -455,20 +655,41 @@ pub trait ConversationItemStore: Send + Sync {
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError>;
 
-    /// Atomically delete an item and rebuild the conversation message cache.
+    /// Append items under a bounded retained-payload allowance. Backends charge
+    /// the new items and bound any legacy-prefix read/copy required by this
+    /// append. Existing item rows are not reread or charged a second time; the
+    /// cache is invalidated incrementally.
     ///
-    /// Within a single database transaction this method:
-    /// 1. Deletes the item row.
-    /// 2. Rebuilds the `messages` cache from all remaining items.
-    /// 3. Updates the conversation row.
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] when this append's work would
+    /// exceed the allowance, or [`StoreError::Unavailable`] when the backend
+    /// has no bounded append.
+    async fn create_items_and_sync_messages_bounded(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _items: &[ConversationItemRecord],
+        _max_append_charge_bytes: usize,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement bounded conversation appends".to_owned(),
+        ))
+    }
+
+    /// Atomically delete an item and invalidate the retired message cache.
+    ///
+    /// The parent-row check and cache invalidation share the item transaction.
+    /// No remaining item payloads are decoded or rewritten.
     ///
     /// Returns `true` if the item was deleted, `false` if it did not
     /// exist.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] if the items table is not configured
-    /// or a database operation fails.
+    /// Returns [`StoreError::NotFound`] if the conversation does not exist
+    /// in the owner's scope when the transaction begins. The item is preserved.
+    /// Other [`StoreError`] values indicate an unavailable table or failed write.
     async fn delete_item_and_sync_messages(
         &self,
         owner: &StateOwner,
@@ -491,3 +712,112 @@ pub trait ConversationItemStore: Send + Sync {
 pub trait PersistedStateBackend: ResponseStore + ConversationItemStore {}
 
 impl<T: ResponseStore + ConversationItemStore> PersistedStateBackend for T {}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test setup uses explicit failure messages")]
+mod tests {
+    use super::{ResponseStore, StateOwner, StoreError};
+    use crate::types::{
+        ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord, ResponseRecord,
+    };
+
+    /// A backend that implements no bounded conversation read, so it exercises the
+    /// `ResponseStore::get_conversation_bounded` default.
+    struct NoBoundedReads;
+
+    #[async_trait::async_trait]
+    impl ResponseStore for NoBoundedReads {
+        async fn upsert_response(&self, _record: &ResponseRecord) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get_response(&self, _owner: &StateOwner, _id: &str) -> Result<Option<ResponseRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn delete_response(&self, _owner: &StateOwner, _id: &str) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn get_conversation(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+        ) -> Result<Option<ConversationRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn record_pending_approvals(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _records: &[PendingApprovalRecord],
+            _created_at: i64,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get_pending_approvals(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _approval_ids: &[&str],
+        ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn consume_approvals(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _approval_ids: &[&str],
+            _consumed_at: i64,
+        ) -> Result<Option<usize>, StoreError> {
+            Ok(None)
+        }
+
+        async fn append_events(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _events: &[ResponseEventRecord],
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn list_events_after(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _after: Option<u64>,
+            _limit: u32,
+        ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn event_log_status(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+        ) -> Result<EventLogStatus, StoreError> {
+            Ok(EventLogStatus::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_bounded_conversation_read_is_unavailable() {
+        // A backend that does not override `get_conversation_bounded` must surface
+        // `Unavailable` rather than silently returning an incomplete history, so a
+        // caller like `rehydrate` fails loudly instead of dropping items.
+        let backend = NoBoundedReads;
+        let owner = StateOwner::from_trusted_parts("t", "i", "s").expect("owner");
+        let err = backend
+            .get_conversation_bounded(&owner, "conv", 1_024)
+            .await
+            .expect_err("a backend without a bounded read must surface an error");
+        assert!(
+            matches!(err, StoreError::Unavailable(_)),
+            "the default bounded read must be Unavailable, got {err:?}"
+        );
+    }
+}

@@ -101,7 +101,7 @@ listeners:
 filter_chains:
   - name: transform
     filters:
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
       - filter: anthropic_messages_to_chat_completions
         max_body_bytes: 1048576
@@ -148,6 +148,8 @@ insecure_options:
         .env("HOME", workspace.path())
         .env("CLAUDE_CONFIG_DIR", workspace.path().join(".claude"))
         .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("CLAUDE_CODE_DISABLE_THINKING", "1")
+        .env("DISABLE_PROMPT_CACHING", "1")
         .env("DISABLE_TELEMETRY", "1")
         .env("DISABLE_UPDATE_CHECK", "1")
         .env("ANTHROPIC_BASE_URL", format!("http://{}", proxy.addr()))

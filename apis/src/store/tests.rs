@@ -12,9 +12,9 @@ use super::{
     PersistedStateBackend, PgTlsConfig, PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry,
     SqliteResponseStore, SslMode, StoreCompressionConfig, StoreError,
 };
-use crate::openai::{
-    include::IncludeFields,
-    responses::store::{ListParams, Order, list_input_items},
+use crate::{
+    openai::include::IncludeFields,
+    service::responses::{ListParams, Order, list_input_items},
 };
 
 /// Default issuing-response scope for pending-approval tests that do not
@@ -732,6 +732,44 @@ async fn record_and_get_pending_approval_round_trips_fields() {
         fetched,
         vec![record],
         "the fetched pending record must round-trip every field"
+    );
+}
+
+#[tokio::test]
+async fn pending_approval_payload_size_is_measured_without_fetching_columns() {
+    let store = make_store().await;
+    let record = make_pending("call_abc");
+    store
+        .upsert_response(&make_response_record(RESP, "tenant_a", 1000))
+        .await
+        .expect("issuing response should be stored");
+    store
+        .record_pending_approvals(
+            &crate::test_utils::test_owner("tenant_a"),
+            RESP,
+            std::slice::from_ref(&record),
+            1000,
+        )
+        .await
+        .expect("record should succeed");
+
+    let bytes = store
+        .pending_approval_payload_bytes(
+            &crate::test_utils::test_owner("tenant_a"),
+            RESP,
+            &["call_abc", "missing"],
+        )
+        .await
+        .expect("size query should succeed");
+    let expected = record.approval_id.len()
+        + record.server_label.len()
+        + record.tool_name.len()
+        + record.arguments.len()
+        + record.target_fingerprint.len();
+
+    assert_eq!(
+        bytes, expected,
+        "missing approval IDs must contribute zero bytes to the payload total"
     );
 }
 
@@ -2309,7 +2347,13 @@ async fn create_items_and_sync_messages_assigns_positions() {
             .expect("get should succeed")
             .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
-    assert_eq!(messages.len(), 2, "messages cache should have 2 items");
+    assert!(messages.is_empty(), "retired cache stays empty");
+    let history = store
+        .conversation_history(&crate::test_utils::test_owner("tenant_a"), &conv_record.conversation_id)
+        .await
+        .expect("history read")
+        .expect("parent");
+    assert_eq!(history.len(), 2, "history includes both items");
 }
 
 #[tokio::test]
@@ -2354,17 +2398,19 @@ async fn create_items_and_sync_messages_continues_from_max_position() {
             .expect("get should succeed")
             .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
-    assert_eq!(messages.len(), 3, "messages cache should include all 3 items");
+    assert!(messages.is_empty(), "retired cache stays empty");
+    let history = store
+        .conversation_history(&crate::test_utils::test_owner("tenant_a"), &conv_record.conversation_id)
+        .await
+        .expect("history read")
+        .expect("parent");
+    assert_eq!(history.len(), 3, "history includes all items");
 }
 
 #[tokio::test]
-async fn create_items_and_sync_messages_empty_batch_is_noop() {
+async fn create_items_and_sync_messages_empty_batch_requires_parent() {
     let store = make_store_with_items().await;
-    let empty: [ConversationItemRecord; 0] = [];
-    store
-        .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", &empty)
-        .await
-        .expect("empty batch should succeed");
+    assert_empty_batch_requires_parent(&store).await;
 }
 
 #[tokio::test]
@@ -2377,10 +2423,7 @@ async fn create_items_and_sync_messages_missing_conversation_errors() {
         .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_gone", &items)
         .await
         .expect_err("create against a missing conversation should error");
-    assert!(
-        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(&err, StoreError::NotFound), "unexpected error: {err:?}");
 
     // The transaction must roll back — no orphaned items may persist.
     let fetched = store
@@ -2433,7 +2476,13 @@ async fn delete_item_and_sync_messages_updates_cache() {
             .expect("get should succeed")
             .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
-    assert_eq!(messages.len(), 1, "messages cache should reflect deletion");
+    assert!(messages.is_empty(), "retired cache stays empty");
+    let history = store
+        .conversation_history(&crate::test_utils::test_owner("tenant_a"), &conv_record.conversation_id)
+        .await
+        .expect("history read")
+        .expect("parent");
+    assert_eq!(history.len(), 1, "history reflects deletion");
 }
 
 #[tokio::test]
@@ -2482,10 +2531,7 @@ async fn delete_item_and_sync_messages_missing_conversation_errors() {
         .delete_item_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_a")
         .await
         .expect_err("delete-item sync against a missing conversation should error");
-    assert!(
-        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(&err, StoreError::NotFound), "unexpected error: {err:?}");
 
     // The transaction must roll back — the item deletion must not persist.
     let remaining = store
@@ -2830,6 +2876,67 @@ async fn sqlite_rejects_table_with_non_text_affinity_key() {
     assert!(msg.contains("database recreation required"), "{msg}");
 }
 
+#[tokio::test]
+async fn sqlite_validates_conversation_messages_text_affinity() {
+    use sqlx::AssertSqlSafe;
+    for (declared_type, accepted) in [
+        ("TEXT", true),
+        ("VARCHAR(255)", true),
+        ("CLOB", true),
+        ("INTEGER", false),
+        ("BLOB", false),
+        ("JSONB", false),
+        ("INTTEXT", false),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("messages.db").display());
+        let options = url
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .expect("URL")
+            .create_if_missing(true);
+        let pool = sqlx::SqlitePool::connect_with(options).await.expect("pool");
+        let ddl = format!(
+            "CREATE TABLE typed_conversations (conversation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, \
+             owner_issuer TEXT NOT NULL, owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, \
+             metadata TEXT NOT NULL, messages {declared_type} NOT NULL)"
+        );
+        sqlx::query(AssertSqlSafe(ddl.as_str()))
+            .execute(&pool)
+            .await
+            .expect("custom schema");
+        pool.close().await;
+        let result = SqliteResponseStore::new(&url, "typed_responses", "typed_conversations", None, None, None).await;
+        if accepted {
+            assert!(result.is_ok(), "TEXT-affinity type {declared_type} must work");
+        } else {
+            let err = result.err().expect("incompatible type rejected").to_string();
+            assert!(err.contains("typed_conversations.messages"), "{err}");
+            assert!(
+                err.contains(declared_type) && err.contains("expected TEXT affinity"),
+                "{err}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn pg_rejects_jsonb_conversation_messages_at_startup() {
+    let fixture = PgSchemaFixture::new("jsonb_messages");
+    let ddl = format!(
+        "CREATE TABLE {} (conversation_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, \
+         owner_issuer TEXT NOT NULL, owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, \
+         metadata TEXT NOT NULL, messages JSONB NOT NULL)",
+        fixture.conversations
+    );
+    let err = fixture.expect_rejected(&[ddl], &[]).await;
+    assert!(err.contains("schema validation failed"), "{err}");
+    assert!(
+        err.contains("messages") && err.contains("jsonb") && err.contains("expected TEXT"),
+        "{err}"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Schema Version
 // -----------------------------------------------------------------------------
@@ -2854,7 +2961,7 @@ async fn sqlite_stamps_schema_version_on_fresh_db() {
         .fetch_one(&pool)
         .await
         .expect("version row should exist");
-    assert_eq!(version, 4, "fresh store should stamp version 4");
+    assert_eq!(version, 5, "fresh store should stamp version 5");
 }
 
 #[tokio::test]
@@ -2957,15 +3064,17 @@ async fn sqlite_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
     );
 
     // Apply the documented operator migrations: CAST the responses payload
-    // columns to BLOB storage class and stamp the current schema version. This
-    // fixture has no items table, so v3 -> v4 requires only the version stamp.
+    // columns to BLOB storage class and stamp the current schema version. Later
+    // schema versions only add tables (e.g. the v5 replay event log), which the
+    // idempotent startup DDL creates, so migrating this fixture requires only the
+    // version stamp.
     let pool = sqlx::SqlitePool::connect_with(options)
         .await
         .expect("pool should connect");
     for stmt in [
         "UPDATE mr SET response_object = CAST(response_object AS BLOB), \
          input = CAST(input AS BLOB), messages = CAST(messages AS BLOB)",
-        "UPDATE mr_schema_version SET version = 4",
+        "UPDATE mr_schema_version SET version = 5",
     ] {
         sqlx::query(stmt)
             .execute(&pool)
@@ -2977,7 +3086,7 @@ async fn sqlite_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
     // After migration the store starts and the legacy row reads back intact.
     let store = SqliteResponseStore::new(&url, "mr", "mc", None, None, None)
         .await
-        .expect("store should start on a migrated version-4 database");
+        .expect("store should start on a migrated version-5 database");
 
     let owner = crate::test_utils::test_owner("tenant_a");
     let fetched = store
@@ -3132,7 +3241,13 @@ async fn concurrent_create_items_and_sync_messages_assigns_distinct_positions() 
             .expect("get should succeed")
             .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
-    assert_eq!(messages.len(), 2, "messages cache should include both items");
+    assert!(messages.is_empty(), "retired cache stays empty");
+    let history = store
+        .conversation_history(&crate::test_utils::test_owner("tenant_a"), &conv_record.conversation_id)
+        .await
+        .expect("history read")
+        .expect("parent");
+    assert_eq!(history.len(), 2, "history includes both concurrent writes");
 }
 
 // -----------------------------------------------------------------------------
@@ -3721,14 +3836,14 @@ async fn pg_v2_text_schema_migrates_to_v4_bytea_preserving_rows() {
              ALTER COLUMN messages TYPE BYTEA USING convert_to(messages, 'UTF8')",
             fx.responses
         ),
-        format!("UPDATE {} SET version = 4", fx.version),
+        format!("UPDATE {} SET version = 5", fx.version),
     ];
-    let migrated_v4: Vec<String> = legacy_v2.into_iter().chain(migrate).collect();
+    let migrated_v5: Vec<String> = legacy_v2.into_iter().chain(migrate).collect();
 
-    let result = fx.init(&migrated_v4, &[]).await;
+    let result = fx.init(&migrated_v5, &[]).await;
     assert!(
         result.is_ok(),
-        "store should start on a migrated version-4 database: {:?}",
+        "store should start on a migrated version-5 database: {:?}",
         result.err()
     );
 }
@@ -4035,6 +4150,15 @@ async fn pg_response_id_collision_cannot_transfer_ownership() {
 #[ignore]
 async fn postgres_passes_shared_ownership_contract() {
     ownership_contract(&make_pg_store_with_items().await).await;
+}
+
+/// The `PostgreSQL` backend satisfies the shared persisted-state contract suite,
+/// including the replay event-log contract. Mirrors
+/// [`sqlite_backend_satisfies_the_store_contract`] for the live PG backend.
+#[tokio::test]
+#[ignore]
+async fn postgres_backend_satisfies_the_store_contract() {
+    praxis_ai_store::contract_tests::run_contract_suite(&make_pg_store_with_items().await).await;
 }
 
 #[tokio::test]
@@ -4801,7 +4925,60 @@ async fn pg_create_items_and_sync_messages_assigns_positions() {
             .expect("get should succeed")
             .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
-    assert_eq!(messages.len(), 2, "messages cache should have 2 items");
+    assert!(messages.is_empty(), "retired cache stays empty");
+    let history = store
+        .conversation_history(&crate::test_utils::test_owner("tenant_a"), &conv_record.conversation_id)
+        .await
+        .expect("history read")
+        .expect("parent");
+    assert_eq!(history.len(), 2, "history includes both items");
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_bounded_message_rebuild_rejects_before_fetch_and_rolls_back() {
+    let store = make_pg_store_with_items().await;
+    let owner = crate::test_utils::test_owner("tenant_a");
+    let conversation_id = "conv_bounded_sync";
+    let conv = ConversationRecord {
+        conversation_id: conversation_id.to_owned(),
+        owner: owner.clone(),
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([]),
+    };
+    store.upsert_conversation(&conv).await.expect("upsert should succeed");
+
+    let item = make_conversation_item("item_a", "tenant_a", conversation_id, 0);
+    let rejected = store
+        .create_items_and_sync_messages_bounded(&owner, conversation_id, std::slice::from_ref(&item), 1)
+        .await;
+    assert!(matches!(rejected, Err(StoreError::PayloadTooLarge)));
+    let items = store
+        .list_conversation_items(&owner, conversation_id, None, 10, true)
+        .await
+        .expect("list after rollback should succeed");
+    assert!(items.is_empty(), "over-budget insertion must roll back");
+
+    store
+        .create_items_and_sync_messages_bounded(&owner, conversation_id, &[item], 1 << 20)
+        .await
+        .expect("fitting rebuild should succeed");
+    let conversation = ConversationItemStore::get_conversation(&store, &owner, conversation_id)
+        .await
+        .expect("get should succeed")
+        .expect("conversation should exist");
+    let messages = conversation.messages.as_array().expect("messages should be an array");
+    assert!(
+        messages.is_empty(),
+        "retired cache stays empty after the fitting rebuild"
+    );
+    let history = store
+        .conversation_history(&owner, conversation_id)
+        .await
+        .expect("history read")
+        .expect("parent");
+    assert_eq!(history.len(), 1, "history includes the fitting item");
 }
 
 // -----------------------------------------------------------------------------
@@ -4854,7 +5031,20 @@ async fn pg_delete_item_and_sync_messages_updates_cache() {
             .expect("get should succeed")
             .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
-    assert_eq!(messages.len(), 1, "messages cache should reflect deletion");
+    assert!(messages.is_empty(), "retired cache stays empty");
+    let history = store
+        .conversation_history(&crate::test_utils::test_owner("tenant_a"), &conv_record.conversation_id)
+        .await
+        .expect("history read")
+        .expect("parent");
+    assert_eq!(history.len(), 1, "history reflects deletion");
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_create_items_and_sync_messages_empty_batch_requires_parent() {
+    let store = make_pg_store_with_items().await;
+    assert_empty_batch_requires_parent(&store).await;
 }
 
 #[tokio::test]
@@ -4868,10 +5058,7 @@ async fn pg_create_items_and_sync_messages_missing_conversation_errors() {
         .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_missing", &items)
         .await
         .expect_err("create against a missing conversation should error");
-    assert!(
-        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(&err, StoreError::NotFound), "unexpected error: {err:?}");
 
     // The transaction must roll back — no orphaned items may persist.
     let fetched = store
@@ -4915,10 +5102,7 @@ async fn pg_delete_item_and_sync_messages_missing_conversation_errors() {
         .delete_item_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_del_missing", "item_a")
         .await
         .expect_err("delete-item sync against a missing conversation should error");
-    assert!(
-        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(&err, StoreError::NotFound), "unexpected error: {err:?}");
 
     // The transaction must roll back — the item deletion must not persist.
     let remaining = store
@@ -5202,6 +5386,71 @@ async fn seed_pending(store: &dyn ResponseStore, tenant_id: &str, response_id: &
         .expect("seeding pending approvals should succeed");
 }
 
+async fn assert_empty_batch_requires_parent(store: &impl ConversationItemStore) {
+    let owner = crate::test_utils::test_owner("tenant_a");
+    let empty: [ConversationItemRecord; 0] = [];
+    let err = store
+        .create_items_and_sync_messages(&owner, "conv_empty", &empty)
+        .await
+        .expect_err("an empty batch must not bypass a missing parent");
+    assert!(matches!(err, StoreError::NotFound), "unexpected error: {err:?}");
+
+    let conversation = ConversationRecord {
+        conversation_id: "conv_empty".to_owned(),
+        owner,
+        created_at: 1000,
+        metadata: json!({}),
+        messages: json!([{"role": "user", "content": "preserve cached history"}]),
+    };
+    store
+        .upsert_conversation(&conversation)
+        .await
+        .expect("upsert should succeed");
+    store
+        .create_items_and_sync_messages(&conversation.owner, &conversation.conversation_id, &empty)
+        .await
+        .expect("an empty batch for an existing parent should succeed");
+
+    for other_owner in [
+        crate::test_utils::test_owner("tenant_b"),
+        crate::StateOwner::from_trusted_parts(
+            conversation.owner.tenant_id(),
+            conversation.owner.issuer(),
+            "another_subject",
+        )
+        .expect("owner should be valid"),
+    ] {
+        let err = store
+            .create_items_and_sync_messages(&other_owner, &conversation.conversation_id, &empty)
+            .await
+            .expect_err("an empty batch must not bypass parent ownership");
+        assert!(matches!(err, StoreError::NotFound), "unexpected error: {err:?}");
+    }
+
+    let fetched = store
+        .get_conversation(&conversation.owner, &conversation.conversation_id)
+        .await
+        .expect("get should succeed")
+        .expect("conversation should still exist");
+    assert_eq!(
+        fetched.messages, conversation.messages,
+        "empty batches must leave the cache untouched"
+    );
+
+    assert!(
+        store
+            .delete_conversation(&conversation.owner, &conversation.conversation_id)
+            .await
+            .expect("delete should succeed"),
+        "the parent should be deleted"
+    );
+    let err = store
+        .create_items_and_sync_messages(&conversation.owner, &conversation.conversation_id, &empty)
+        .await
+        .expect_err("an empty batch must fail after the parent is deleted");
+    assert!(matches!(err, StoreError::NotFound), "unexpected error: {err:?}");
+}
+
 fn make_response_record(id: &str, tenant_id: &str, created_at: i64) -> ResponseRecord {
     ResponseRecord {
         id: id.to_owned(),
@@ -5229,4 +5478,49 @@ async fn sqlite_backend_satisfies_the_store_contract() {
     .await
     .expect("store creation should succeed");
     praxis_ai_store::contract_tests::run_contract_suite(&store).await;
+}
+
+/// Opening an existing database never converts cache-only conversation history.
+#[tokio::test]
+async fn sqlite_legacy_history_is_preserved_without_startup_conversion() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let url = format!("sqlite://{}?mode=rwc", dir.path().join("legacy.db").display());
+    let owner = crate::test_utils::test_owner("legacy");
+    let messages = json!([{"role": "user", "content": "old history"}]);
+    let store = SqliteResponseStore::new(&url, "responses", "conversations", Some("items"), None, None)
+        .await
+        .expect("store");
+    store
+        .upsert_conversation(&ConversationRecord {
+            owner: owner.clone(),
+            conversation_id: "legacy".into(),
+            created_at: 1,
+            metadata: json!({}),
+            messages: messages.clone(),
+        })
+        .await
+        .expect("legacy conversation");
+    drop(store);
+    let reopened = SqliteResponseStore::new(&url, "responses", "conversations", Some("items"), None, None)
+        .await
+        .expect("reopened store");
+    assert_eq!(
+        ConversationItemStore::get_conversation(&reopened, &owner, "legacy")
+            .await
+            .expect("raw read")
+            .expect("conversation")
+            .messages,
+        messages,
+        "startup preserves the raw legacy cache"
+    );
+    assert_eq!(
+        reopened.max_item_position(&owner, "legacy").await.expect("no new rows"),
+        0,
+        "startup creates no synthetic item rows"
+    );
+    assert_eq!(
+        reopened.conversation_history(&owner, "legacy").await.expect("history"),
+        Some(messages.as_array().expect("array").clone()),
+        "cache-only history remains readable after reopening"
+    );
 }

@@ -588,7 +588,6 @@ impl OperationScope {
     }
 }
 
-
 /// Return `count / total` as a percentage.
 pub(super) fn percent(count: usize, total: usize) -> f64 {
     if total == 0 {

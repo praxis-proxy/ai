@@ -1,0 +1,173 @@
+version: 1
+id: openai_legacy/anthropic-json-sse-error
+description: OpenAI Chat Completions request, Anthropic Messages provider, and OpenAI JSON/SSE response conversion.
+protocol: openai_chat_completions
+example_config: openai-selected-provider-legacy-fixture.yaml
+upstream_authority: 127.0.0.1:8001
+features:
+  - external_model.anthropic.request.text
+  - external_model.anthropic.response.json
+  - external_model.anthropic.response.sse
+  - external_model.anthropic.response.cached_usage
+  - external_model.anthropic.response.null_cache_usage
+  - external_model.anthropic.response.context_window
+  - external_model.anthropic.error
+turns:
+  - name: json
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 16
+          messages:
+            - role: user
+              content: Say hello.
+          stream: false
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/messages
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: stream
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 16
+          messages:
+            - role: user
+              content: Stream hello.
+          stream: true
+          stream_options:
+            include_usage: true
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /v1/messages
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events:
+        - message_start
+        - content_block_start
+        - content_block_delta
+        - content_block_stop
+        - message_delta
+        - message_stop
+      upstream_sse_repeatable_events:
+        - content_block_delta
+  - name: provider-error
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 16
+          messages:
+            - role: user
+              content: One more hello.
+          stream: false
+    expect:
+      client_status: 429
+      client_body_kind: json
+      upstream_path: /v1/messages
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: context-window-json
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 16
+          messages:
+            - role: user
+              content: Keep answering until the context window is exhausted.
+          stream: false
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/messages
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: context-window-stream
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 16
+          messages:
+            - role: user
+              content: Stream until the context window is exhausted.
+          stream: true
+          stream_options:
+            include_usage: true
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /v1/messages
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events:
+        - message_start
+        - content_block_start
+        - content_block_delta
+        - content_block_stop
+        - message_delta
+        - message_stop
+      upstream_sse_repeatable_events:
+        - content_block_delta
+  - name: null-cache-json
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 16
+          messages:
+            - role: user
+              content: Say hello with null cache counters.
+          stream: false
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/messages
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

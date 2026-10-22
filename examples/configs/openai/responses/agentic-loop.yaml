@@ -1,17 +1,28 @@
 # Agentic Loop Controller
-# Requires `--features openai-mcp-tools,store-sqlite` because these filters are opt-in.
+# Requires `--features openai-agentic-loop,openai-mcp-tools,store-sqlite` because these filters are opt-in.
 #
 # Demonstrates the openai_agentic_loop filter with iterative_request_router
 # for step-based model-tool-model looping in the Responses API.
 #
 # The iterative_request_router (IRR) repeatedly runs one inference step.
 # Three request-phase dispatchers execute the loop owner's assigned calls:
-# `openai_web_search` runs web searches against an external provider,
+# `openai_web_search_dispatch` runs web searches against an external provider,
 # `openai_mcp_dispatch` runs MCP calls against the server URL supplied in the
-# request, and `openai_file_search_callout` runs hosted file searches against
+# request, and `openai_file_search_dispatch` runs hosted file searches against
 # the vector store. Each dispatches results back to the model via the loop.
 # Client-side function calls resolve to no dispatcher and are returned to the
 # client without looping.
+#
+# The retained-payload guardrail accepts buffered text, file, and image inputs
+# with or without Store persistence, finite Responses-to-Chat translation,
+# bounded previous_response_id or conversation restore, and conversation
+# append-back, and explicit POST /v1/responses/compact with bounded Store and
+# summarization callouts. File resolution and document extraction reserve their
+# expanded content when those filters are configured in the request path.
+# MCP and hosted-tool requests reserve discovery, dispatch, and result
+# headroom before adding their payloads to the request. See the
+# retained-payload budget guide for each filter's responsibility:
+# docs/architecture/responses-retained-payload.md
 #
 # Configured `connector_id` values can be combined with `defer_loading: true`
 # and a `tool_search` tool so discovery waits for a later `tool_search_call`.
@@ -30,15 +41,15 @@
 #   Filters listed first in the YAML run last in the response phase.
 #
 # Pipeline ordering (pre-IRR, runs once):
-#   1. openai_responses_format — classifies body, promotes metadata
-#   2. openai_responses_validate — validates parameters, generates IDs
-#   3. openai_response_store — registers the store backend
+#   1. openai_responses_request (facts) — classifies body, promotes metadata
+#   2. openai_responses_request — validates parameters, generates IDs
+#   3. openai_responses_store — registers the store backend
 #   4. openai_responses_rehydrate — loads previous_response_id context
 #
 # IRR inference filter chain (canonical #1046 order):
 #   Request phase (forward):
-#     openai_stream_events → openai_web_search → openai_mcp_dispatch
-#       → openai_file_search_callout → openai_agentic_loop
+#     openai_stream_events → openai_web_search_dispatch → openai_mcp_dispatch
+#       → openai_file_search_dispatch → openai_agentic_loop
 #       → openai_responses_proxy → router → load_balancer
 #   Response phase (reverse):
 #     load_balancer → router → openai_responses_proxy → openai_agentic_loop
@@ -58,12 +69,15 @@
 #
 # Config knobs:
 #   max_infer_iters: application-level iteration cap (default 10)
+#   max_retained_bytes: request-wide retained-payload cap (default 64 MiB;
+#                       valid range 4 KiB through 256 MiB). The smallest
+#                       reachable loop cap applies to the listener.
 #   max_iterations:  infrastructure-level safety cap on IRR. It must be
 #                    at least max_infer_iters + 1 (initial inference plus
 #                    the allowed MCP-backed inference continuations).
 #
 # Streaming:
-#   With stream=true, each inference round is streamed through the same
+#   Each streaming inference round is composed through the same
 #   downstream Responses SSE lifecycle. Intermediate response lifecycle
 #   events are normalized by openai_stream_events while MCP and web-search
 #   transitions resume inference after each upstream stream completes.
@@ -72,7 +86,7 @@
 #
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
-#     -d '{"model":"gpt-4.1","input":"Hello"}'
+#     -d '{"model":"gpt-4.1","input":"Hello","store":false}'
 #
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
@@ -143,7 +157,7 @@
 #     }'
 #
 # Build:
-#   cargo build -p praxis-ai-proxy --features openai-mcp-tools,store-sqlite
+#   cargo build -p praxis-ai-proxy --features openai-agentic-loop,openai-mcp-tools,store-sqlite
 
 listeners:
   - name: ai-gateway
@@ -153,28 +167,58 @@ listeners:
 filter_chains:
   - name: agentic-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      - filter: openai_responses_request
+        initialize_state: false
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
+        conditions:
+          - unless:
+              path_prefix: "/v1/conversations"
 
-      - filter: openai_responses_validate
+      # If client model aliases are needed, place
+      # openai_responses_model_rewrite here, before this filter. Its parsed
+      # body and replacement model are charged to max_retained_bytes.
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
 
       - filter: openai_tool_parse
 
-      - filter: state_owner
-        mode: single_tenant
-        tenant_id: default
-
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
 
+      # Response hooks run in reverse: append the conversation turn before
+      # Store can persist a successful response from the same exchange.
+      - filter: openai_conversations
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        conversations_table: openai_conversations
+        items_table: openai_conversation_items
+
       - filter: openai_responses_rehydrate
+
+      - filter: openai_responses_compact
+        allow_pre_security_callout: true
+        inference_url: "http://127.0.0.1:3001/v1/chat/completions"
+        allow_private_inference_url: true
+        default_model: gpt-4.1
 
       - filter: openai_mcp_tool_resolve
         connectors:
@@ -184,6 +228,8 @@ filter_chains:
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 11
+        # Bound core's buffered response before AI response filters run.
+        max_response_bytes: 8388608
         max_stream_response_bytes: 67108864
         # The IRR's 30s default is too short for production model streams.
         # Allow six minutes total for time-to-first-byte and logical streaming
@@ -217,9 +263,10 @@ filter_chains:
 
               # Request-phase dispatcher: runs first on re-entry to execute
               # web_search_call assignments prepared by the loop owner.
-              - filter: openai_web_search
+              - filter: openai_web_search_dispatch
                 provider: brave
-                api_key: ${WEB_SEARCH_API_KEY}
+                api_key:
+                  env_var: WEB_SEARCH_API_KEY
                 max_calls_per_round: 32
                 # Each provider callout executes through this outbound chain; the
                 # filtered-subrequest executor enforces destination authority,
@@ -262,14 +309,14 @@ filter_chains:
               # ResponsesState.accumulated_output. It never parses the response
               # body and never decides whether another round runs, so it is inert
               # unless the model emits a hosted file_search_call.
-              - filter: openai_file_search_callout
+              - filter: openai_file_search_dispatch
                 vector_store_url: http://127.0.0.1:8001
-                # Every vector-store sub-request runs through this chain. It
-                # must be inline ({ name, filters }): this filter runs inside an
-                # iterative_request_router step, whose pipeline is built with an
-                # empty named-chain map, so a top-level filter_chains reference
-                # cannot resolve here. The destination comes from
-                # vector_store_url, so the chain never selects an upstream.
+                # Every vector-store sub-request runs through this chain. It may
+                # be inline ({ name, filters }) or a named top-level
+                # filter_chains reference; the chain-aware production builder
+                # resolves both forms inside iterative_request_router steps. The
+                # destination comes from vector_store_url, so the chain never
+                # selects an upstream.
                 outbound_chain:
                   name: vector-store-outbound
                   filters:
@@ -285,6 +332,7 @@ filter_chains:
                   - authorization
               - filter: openai_agentic_loop
                 max_infer_iters: 10
+                max_retained_bytes: 67108864
               # Selects typed streaming automatically when the effective
               # outbound body carries `"stream": true`; otherwise buffers.
               - filter: openai_responses_proxy
@@ -305,7 +353,7 @@ filter_chains:
               # openai_agentic_loop is the sole loop authority (issue #1046): it
               # parses each model response, records assignments for the
               # request-phase dispatchers (web_search, mcp_dispatch,
-              # file_search_callout), and publishes the single continuation
+              # file_search_dispatch), and publishes the single continuation
               # signal. The IRR transitions only on the owner's action, never on
               # a dispatcher's.
               - filter: openai_agentic_loop

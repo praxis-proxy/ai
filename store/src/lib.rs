@@ -5,8 +5,8 @@
 //!
 //! SQL-free and transport-free: the persistence traits, record types, the owner
 //! identity, a unified backend registry, and an in-memory backend. This crate
-//! is a first-party workspace implementation detail with no external API and no
-//! semver promise.
+//! is an unpublished (`publish = false`), first-party workspace implementation
+//! detail with no external API and no semver promise.
 
 mod backend_config;
 #[cfg(feature = "compression")]
@@ -14,9 +14,10 @@ pub mod compression;
 mod factory;
 mod owner;
 mod registry;
+mod retained_payload;
+mod size;
 mod traits;
 mod types;
-pub mod url_security;
 
 #[cfg(feature = "test-support")]
 pub mod memory;
@@ -35,5 +36,12 @@ pub use factory::{
 };
 pub use owner::{StateOwner, StateOwnerError, validate_component};
 pub use registry::{OwnerScopedStore, StoreRegistry};
+pub use retained_payload::{
+    RETAINED_JSON_BYTE_MULTIPLIER, RETAINED_JSON_NODE_BYTES, json_payload_charge, json_values_charge, retained_charge,
+};
+pub use size::json_values_fit;
 pub use traits::{ConversationItemStore, PersistedStateBackend, ResponseStore};
-pub use types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError};
+pub use types::{
+    BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
+    ResponseEventRecord, ResponseRecord, StoreError,
+};

@@ -10,9 +10,23 @@ cargo run -p praxis-ai-proxy --features openai-all,store-sqlite -- \
 curl http://localhost:8080/
 ```
 
+The command explicitly enables experimental Responses and agentic loops. They
+are absent from default builds; see [Cargo features](../docs/features.md#cargo-features).
+
 Configs use local ports (`3000`, `3001`, ...) for
 upstreams — start a real backend or stub on those ports
 before sending requests.
+
+## Flow visualizers
+
+Some configs ship a companion **flow visualizer** — a single, self-contained
+HTML file that diagrams how a request moves through the pipeline. Open
+[full-flow-agentic.visualizer.html](configs/openai/responses/full-flow-agentic.visualizer.html)
+in a browser (no server or network needed) to explore the two-path topology
+of `full-flow-agentic.yaml`: direct-OpenAI passthrough vs. managed providers,
+with the agentic iterative_request_router loop. See
+[docs/developing/flow-visualizers.md](../docs/developing/flow-visualizers.md)
+for how these are authored and regenerated.
 
 ## Configs
 
@@ -27,14 +41,18 @@ before sending requests.
 | [aws-sigv4.yaml](configs/aws-sigv4.yaml) | Signs outbound requests to an AWS service (Bedrock, in this example) using Signature Version 4. Credentials are static, sourced from environment variables — see the module docs on Sigv4SignFilter for the planned OIDC/default-credential-chain follow-up |
 | [azure-ad.yaml](configs/azure-ad.yaml) | Acquires an Entra ID bearer token via the client-credentials grant and injects "Authorization: Bearer <token>" on every proxied request to Azure OpenAI |
 | [credential-injection.yaml](configs/credential-injection.yaml) | Injects per-cluster API credentials into upstream requests and strips client-provided credentials to prevent forwarding |
+| [external-metering-file-key.yaml](configs/external-metering-file-key.yaml) | Same pre-request balance check and post-response usage reporting as external-metering.yaml, but the internal bearer credential used to authenticate the metering callouts is read from a file rather than embedded in the config or image |
 | [external-metering.yaml](configs/external-metering.yaml) | Pre-request balance check and post-response token usage reporting against an external metering service |
-| [gcp-adc.yaml](configs/gcp-adc.yaml) | Acquires an OAuth2 access token from the GCE/GKE metadata server (source: adc or metadata) and injects "Authorization: Bearer <token>" on every proxied request to Vertex AI |
+| [file-descriptor-limits.yaml](configs/file-descriptor-limits.yaml) | Size and protect the descriptor budget of a metered gateway: pin the process limit, shed requests with 503 before descriptors run out, cap concurrent requests and metering callouts, and close idle keep-alive clients and pooled upstream connections so they cannot pin descriptors |
+| [gcp-adc.yaml](configs/gcp-adc.yaml) | Acquires an OAuth2 access token from the GCE/GKE metadata server or a service-account key file and injects "Authorization: Bearer <token>" on every proxied request to Vertex AI |
 | [identity-header-guard.yaml](configs/identity-header-guard.yaml) | Captures identity headers matching a prefix into filter metadata and strips them before forwarding upstream |
+| [inflight-tracking.yaml](configs/inflight-tracking.yaml) | Tracks live request counts and summed token reservations per model in an in-memory InFlightRegistry |
 | [intelligent-route-all-capabilities.yaml](configs/intelligent-route-all-capabilities.yaml) | Demonstrates every candidate capability and selection input handled by intelligent_route today |
 | [intelligent-route-inference.yaml](configs/intelligent-route-inference.yaml) | Routes requests to different upstream clusters based on the inference model name carried in a configured request header.  The header value is set by the `model_to_header` filter, which promotes the JSON body's `model` field and strips any client-supplied copy of the header so routing cannot be spoofed from the wire |
 | [intelligent-route-management-skip.yaml](configs/intelligent-route-management-skip.yaml) | Demonstrates the `intelligent_route` management-path skip list: management and discovery endpoints (model listing, subscriptions, API-key management, health) bypass model resolution entirely, while inference paths are still resolved by model and fail closed on an unknown model |
 | [intelligent-route-mcp.yaml](configs/intelligent-route-mcp.yaml) | Routes MCP `tools/call` requests to the cluster that owns the requested tool, using the `mcp.name` metadata set by the `mcp` filter |
 | [intelligent-route-overlay.yaml](configs/intelligent-route-overlay.yaml) | Routes requests using a routing overlay file (`routing-overlay.json`) instead of inline YAML candidates.  The overlay is rendered by the operator into a Kubernetes ConfigMap and projected as a volume mount |
+| [intelligent-route-projected-credentials.yaml](configs/intelligent-route-projected-credentials.yaml) | Starts with an empty credential table and injects a provider credential that is resolved on demand from a projected Kubernetes Secret mount |
 | [json-rpc-routing.yaml](configs/json-rpc-routing.yaml) | Routes JSON-RPC 2.0 requests to different backends based on the "method" field in the JSON request body |
 | [lakera-guard.yaml](configs/lakera-guard.yaml) | Screens every request body through Lakera Guard for content moderation before forwarding to the upstream |
 | [llmd-ext-proc-routing.yaml](configs/llmd-ext-proc-routing.yaml) | A real llm-d EPP or test processor returns the trusted x-gateway-destination-endpoint header |
@@ -42,15 +60,26 @@ before sending requests.
 | [mcp-classifier-routing.yaml](configs/mcp-classifier-routing.yaml) | Routes MCP requests by body-derived method and tool name |
 | [mcp-stateless-broker.yaml](configs/mcp-stateless-broker.yaml) | Configurable stateless MCP broker using the final MCP 2026-07-28 stateless profile |
 | [model-to-header-routing.yaml](configs/model-to-header-routing.yaml) | Routes LLM API requests to different backends based on the "model" field in the JSON request body |
+| [model-to-header-trust-existing.yaml](configs/model-to-header-trust-existing.yaml) | Routes on a model header that a trusted hop in front of Praxis has already set, skipping the filter entirely when the header is present |
+| [model-to-provider.yaml](configs/model-to-provider.yaml) | Map a stable public model ID to an existing upstream cluster and target model |
 | [nemo-guardrails-response.yaml](configs/nemo-guardrails-response.yaml) | Evaluates upstream responses against a NeMo Guardrails service |
 | [nemo-guardrails.yaml](configs/nemo-guardrails.yaml) | Evaluates incoming requests against a NeMo Guardrails service |
+| [openai-selected-provider-legacy-fixture.yaml](configs/openai-selected-provider-legacy-fixture.yaml) | Controlled inference-fixture replay for OpenAI Chat Completions to an Anthropic Messages provider |
+| [openai-selected-provider-legacy-translation.yaml](configs/openai-selected-provider-legacy-translation.yaml) | OpenAI Chat Completions clients reach the overlay-selected Anthropic Messages or OpenAI-compatible provider and receive translated Anthropic JSON/SSE or unchanged OpenAI-compatible responses. `intelligent_route` binds the trusted provider profile to each request before response and SSE processing |
 | [project-state-owner-headers.yaml](configs/project-state-owner-headers.yaml) | Demonstrates the production boundary used when an external authenticator injects separate tenant and subject headers. `state_owner` consumes those assertions into an immutable internal owner and strips the inbound copies. `project_state_owner_headers` then recreates destination-specific headers from that normalized context |
 | [prompt-enrichment.yaml](configs/prompt-enrichment.yaml) | Injects system messages into OpenAI-compatible chat completion requests before forwarding to the upstream provider |
 | [provider-route.yaml](configs/provider-route.yaml) | This listener requires downstream mTLS. `peer_identity_trust` authenticates and authorizes the edge gateway before AI-owned x-ai-routing-* fields can influence provider-local routing |
 | [stream-usage-inject.yaml](configs/stream-usage-inject.yaml) | Ensures every streaming OpenAI Chat Completions request carries stream_options.include_usage = true so the upstream response includes token usage in the final SSE event |
 | [time-to-first-token.yaml](configs/time-to-first-token.yaml) | Measures the elapsed time from request receipt to the first non-empty SSE body chunk and records a praxis_ai_ttft_seconds Prometheus histogram labeled by model |
+| [token-ceiling.yaml](configs/token-ceiling.yaml) | Place token_ceiling after any request translation or prompt enrichment so it evaluates the final provider-bound JSON body |
 | [token-counting.yaml](configs/token-counting.yaml) | Extracts token usage from AI inference responses (streaming and non-streaming) and makes counts available to downstream filters via filter metadata as token.input, token.output, and token.total |
+| [token-rate-limit-header-keys.yaml](configs/token-rate-limit-header-keys.yaml) | Extends token-rate-limit.yaml with M5 header dimensions (ai#123 / ai#129): each distinct `x-tenant-id` value gets its own token budget under the same catch-all rule |
+| [token-rate-limit-hierarchy.yaml](configs/token-rate-limit-hierarchy.yaml) | Optional org, then team, then user budgets on one token_rate_limit admission (ai#125) |
+| [token-rate-limit-ip-keys.yaml](configs/token-rate-limit-ip-keys.yaml) | Honor X-Forwarded-For for the IP budget only when a trusted proxy sanitizes it and direct access is blocked; otherwise omit `header` to key on the TCP peer |
 | [token-rate-limit-mixed-algorithms.yaml](configs/token-rate-limit-mixed-algorithms.yaml) | Extends token-rate-limit.yaml with per-rule algorithm choice (ai#789 / praxis#551): each rule in `rules:` independently picks sliding_window or token_bucket, matched by a static header value. team-alpha gets an exact trailing-window budget; team-beta gets a continuously-refilling bucket |
+| [token-rate-limit-model-keys.yaml](configs/token-rate-limit-model-keys.yaml) | Extends token-rate-limit.yaml with M5 model dimensions (ai#123): each distinct model identity gets its own token budget under the same catch-all rule |
+| [token-rate-limit-sentinel.yaml](configs/token-rate-limit-sentinel.yaml) | Sentinel HA example for either official Redis or Red Hat Valkey |
+| [token-rate-limit-soft-enforcement.yaml](configs/token-rate-limit-soft-enforcement.yaml) | Per-rule `enforcement` chooses what happens when the algorithm denies a reservation because the token budget is exhausted |
 | [token-rate-limit-soft-tiers.yaml](configs/token-rate-limit-soft-tiers.yaml) | Extends token-rate-limit.yaml with graduated enforcement tiers (proposal S1, ai#881) |
 | [token-rate-limit.yaml](configs/token-rate-limit.yaml) | Reserves an estimated token cost at admission time and reconciles that reservation against actual provider-reported usage once the response completes |
 | [token-usage-headers.yaml](configs/token-usage-headers.yaml) | Inject Praxis-Token-Input, Praxis-Token-Output, and Praxis-Token-Total headers into downstream responses when token counts are available in filter metadata |
@@ -60,20 +89,30 @@ before sending requests.
 
 | File | Description |
 | ------ | ------------- |
-| [full-flow-agentic.yaml](configs/anthropic/full-flow-agentic.yaml) | A single Anthropic Messages gateway that runs the server-owned web-search loop through Praxis core's iterative_request_router (IRR) and serves BOTH streaming and buffered clients from one pipeline. `anthropic_web_search` selects the transport per request from the client's `stream` flag (`terminal_streaming: true`) |
+| [full-flow-agentic.yaml](configs/anthropic/full-flow-agentic.yaml) | A single Anthropic Messages gateway that runs the server-owned web-search loop through Praxis core's iterative_request_router (IRR), serves BOTH streaming and buffered clients from one pipeline, and adapts to BOTH backend wire formats from one config |
 | [messages-native-vllm.yaml](configs/anthropic/messages-native-vllm.yaml) | Routes native Anthropic Messages API traffic (`/v1/messages` and `/v1/messages/count_tokens`) to a vLLM backend that natively serves the Anthropic Messages API, WITHOUT any request or response body translation |
 | [messages-protocol.yaml](configs/anthropic/messages-protocol.yaml) | Routes Anthropic Messages API requests to a native `/v1/messages` backend |
+| [messages-to-openai-degrade-fixture.yaml](configs/anthropic/messages-to-openai-degrade-fixture.yaml) | Fixture-only variant of `messages-to-openai.yaml` that opts prompt caching and extended thinking into operator-approved degradation |
 | [messages-to-openai-vllm.yaml](configs/anthropic/messages-to-openai-vllm.yaml) | Translates native Anthropic Messages API traffic into OpenAI Chat Completions for a vLLM backend that serves `/v1/chat/completions`, with the same three-boundary credential isolation as the native passthrough config |
 | [messages-to-openai.yaml](configs/anthropic/messages-to-openai.yaml) | Transforms Anthropic Messages API requests and responses for Chat Completions-compatible inference backends |
 | [request-validate.yaml](configs/anthropic/request-validate.yaml) | Rejects empty, malformed, or non-object JSON request bodies |
 | [unified-gateway.yaml](configs/anthropic/unified-gateway.yaml) | Routes traffic by classifier-promoted headers so a single listener handles Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses requests |
+| [web-search-file-key.yaml](configs/anthropic/web-search-file-key.yaml) | A minimal Anthropic Messages web-search gateway that sources the shared Brave provider key from a projected FILE instead of an environment variable |
 | [web-search-scoped-credentials.yaml](configs/anthropic/web-search-scoped-credentials.yaml) | A scoped-credentials variant of full-flow-agentic.yaml |
+| [web-search-tavily-scoped-credentials.yaml](configs/anthropic/web-search-tavily-scoped-credentials.yaml) | A scoped-credentials variant of full-flow-agentic.yaml, over Tavily |
 
 ### Azure
 
 | File | Description |
 | ------ | ------------- |
+| [chat-completions-to-openai-fixture.yaml](configs/azure/chat-completions-to-openai-fixture.yaml) | Proxies Chat Completions requests to a local Azure replay backend at 127.0.0.1:3000 |
 | [chat-completions-to-openai.yaml](configs/azure/chat-completions-to-openai.yaml) | Proxies standard Chat Completions requests to an Azure OpenAI deployment |
+
+### Bedrock
+
+| File | Description |
+| ------ | ------------- |
+| [chat-completions-to-converse.yaml](configs/bedrock/chat-completions-to-converse.yaml) | Accepts OpenAI Chat Completions requests and transparently forwards them to AWS Bedrock Converse, translating both the request and response bodies on the fly |
 
 ### Inference
 
@@ -88,39 +127,44 @@ before sending requests.
 | [conversations-postgres-mtls.yaml](configs/openai/conversations/conversations-postgres-mtls.yaml) | Local /v1/conversations endpoints backed by PostgreSQL over a TLS-verified connection that authenticates with a client certificate instead of a password |
 | [conversations.yaml](configs/openai/conversations/conversations.yaml) | Local /v1/conversations endpoints for conversation lifecycle, backed by the ConversationItemStore |
 | [embeddings-routing.yaml](configs/openai/embeddings/embeddings-routing.yaml) | Routes OpenAI Embeddings API requests to a dedicated Embeddings API backend |
-| [operation-classifier.yaml](configs/openai/operation-classifier.yaml) | Identifies supported OpenAI operations from the request head — method, normalized path, and protocol headers — and publishes the result so a pipeline can branch on a proxy-owned fact instead of a path prefix |
+| [operation-classifier.yaml](configs/openai/operation-classifier.yaml) | Identifies supported AI operations from the request head — method, normalized path, and protocol headers — and publishes the result so a pipeline can branch on a proxy-owned fact instead of a path prefix |
 | [prompts-routing.yaml](configs/openai/prompts/prompts-routing.yaml) | Routes OpenAI Prompts API requests to a dedicated Prompts API backend |
 | [agentic-loop-deferred-mcp-fixture.yaml](configs/openai/responses/agentic-loop-deferred-mcp-fixture.yaml) | Minimal agentic-loop pipeline that sanitizes deferred MCP connectors on the first inference round. `defer_loading: true` skips `tools/list`, so replay never opens an independent MCP callout |
 | [agentic-loop-fixture.yaml](configs/openai/responses/agentic-loop-fixture.yaml) | Minimal agentic loop pipeline for inference fixture replay |
+| [agentic-loop-guardrails.yaml](configs/openai/responses/agentic-loop-guardrails.yaml) | Screens each newly produced local tool result before it can enter the next inference request |
 | [agentic-loop.yaml](configs/openai/responses/agentic-loop.yaml) | Demonstrates the openai_agentic_loop filter with iterative_request_router for step-based model-tool-model looping in the Responses API |
 | [body-size-limits.yaml](configs/openai/responses/body-size-limits.yaml) | Demonstrates how raw request body size is enforced across a chain of OpenAI Responses filters that each buffer the request body |
-| [client-tool-compat-chat-completions.yaml](configs/openai/responses/client-tool-compat-chat-completions.yaml) | Lets a rich Codex-style Responses client (POST /v1/responses with custom, namespace, local shell, and client-executed tool_search tools) reach a function-only Chat Completions backend (POST /v1/chat/completions) by composing openai_client_tool_compat with responses_to_chat_completions in one iterative-router step (GitHub issue #1206) |
+| [budget-overflow-streaming.yaml](configs/openai/responses/budget-overflow-streaming.yaml) | Demonstrates the terminal-failure contract when an upstream Responses SSE stream overflows the request-wide retained-payload budget AFTER the client stream is already committed |
+| [client-tool-compat-chat-completions.yaml](configs/openai/responses/client-tool-compat-chat-completions.yaml) | Lets a rich Codex-style Responses client (POST /v1/responses with custom, namespace, local shell, and client-executed tool_search tools) reach a function-only Chat Completions backend (POST /v1/chat/completions) by composing openai_client_tool_compat with openai_responses_to_chat_completions in one iterative-router step (GitHub issue #1206) |
 | [client-tool-compat.yaml](configs/openai/responses/client-tool-compat.yaml) | Lets a rich Codex-style Responses client talk to a function-only Responses backend (for example vLLM at POST /v1/responses) without routing through /v1/chat/completions and without executing client-owned tools in Praxis |
 | [codex-http-chat-translation.yaml](configs/openai/responses/codex-http-chat-translation.yaml) | Release-acceptance configuration for GitHub issue #870. A Codex client speaks the OpenAI Responses API over HTTP while Praxis selects a Chat Completions-only provider, translates both request and streaming response, rewrites the provider path, and replaces the client credential |
 | [compact.yaml](configs/openai/responses/compact.yaml) | Demonstrates compaction after rehydrate, file resolve, and document extract so rewritten current-turn content survives history replacement |
 | [doc-extract.yaml](configs/openai/responses/doc-extract.yaml) | Converts `input_file` content parts to `input_text` for inference backends that do not natively support `input_file` (e.g. vLLM, llm-d) |
 | [file-resolve.yaml](configs/openai/responses/file-resolve.yaml) | Resolves `file_id` and `file_url` references in Responses API input by fetching file metadata and content, then inlining base64 content as `file_data` or `image_url` before forwarding |
-| [file-search-callout.yaml](configs/openai/responses/file-search-callout.yaml) | Demonstrates hosted `file_search` execution under the unified agentic loop (#1046). `openai_agentic_loop` is the sole loop owner: it parses each model response, records the `file_search_call` items it sees as assignments, and publishes the single continuation signal (`action=loop|done`). `openai_file_search_callout` is a pure request-phase dispatcher: at request- body EOS on each IRR re-entry it executes the assigned calls against the vector store and reconciles each item in place, then the owner prepares the next inference request |
 | [file-search-chat-completions-fixture.yaml](configs/openai/responses/file-search-chat-completions-fixture.yaml) | Single-upstream fixture configuration for recording the private Chat Completions function representation of a Responses file_search tool |
 | [file-search-chat-completions.yaml](configs/openai/responses/file-search-chat-completions.yaml) | Accepts finite OpenAI Responses requests with hosted file search while targeting a backend that only implements /v1/chat/completions |
+| [file-search-dispatch.yaml](configs/openai/responses/file-search-dispatch.yaml) | Demonstrates hosted `file_search` execution under the unified agentic loop (#1046). `openai_agentic_loop` is the sole loop owner: it parses each model response, records the `file_search_call` items it sees as assignments, and publishes the single continuation signal (`action=loop|done`). `openai_file_search_dispatch` is a pure request-phase dispatcher: at request- body EOS on each IRR re-entry it executes the assigned calls against the vector store and reconciles each item in place, then the owner prepares the next inference request |
 | [file-search-streaming.yaml](configs/openai/responses/file-search-streaming.yaml) | Demonstrates streaming hosted file_search through the iterative_request_router |
 | [format-routing.yaml](configs/openai/responses/format-routing.yaml) | Routes AI API traffic by request-head operation identity and body format |
 | [full-flow-agentic.yaml](configs/openai/responses/full-flow-agentic.yaml) | Runs the complete Responses API pipeline through an agentic iterative_request_router that executes hosted file_search, web_search, and MCP tool calls in a model-tool-model loop, persisting both buffered and streaming (`stream: true`) responses |
 | [http-passthrough.yaml](configs/openai/responses/http-passthrough.yaml) | The strict-HTTP acceptance test for pinned Codex CLI for GitHub issue #870 drives the proxy over `POST /v1/responses` and any other Responses API paths the client may probe |
 | [irr-terminal-streaming.yaml](configs/openai/responses/irr-terminal-streaming.yaml) | Demonstrates a single-step iterative_request_router pipeline that exposes a native OpenAI Responses SSE body incrementally. `openai_responses_proxy` always advertises the streaming capability and selects Praxis's typed streaming transport automatically for an effective `"stream": true` request; there is no operator opt-in |
+| [mcp-approval-floor.yaml](configs/openai/responses/mcp-approval-floor.yaml) | Demonstrates the openai_mcp_dispatch operator approval floor on a complete persisted agentic Responses pipeline |
 | [mcp-dispatch.yaml](configs/openai/responses/mcp-dispatch.yaml) | Demonstrates the `openai_mcp_dispatch` filter configuration |
 | [mcp-outbound-chain.yaml](configs/openai/responses/mcp-outbound-chain.yaml) | Demonstrates binding an operator `outbound_chain` onto the outbound MCP callout made by `openai_mcp_tool_resolve` (the `tools/list` discovery request) |
 | [mcp-streaming.yaml](configs/openai/responses/mcp-streaming.yaml) | Demonstrates MCP tool calls over the filtered-subrequest transport with SSE streaming support |
+| [mcp-tool-admission.yaml](configs/openai/responses/mcp-tool-admission.yaml) | Demonstrates operator-owned metadata admission and read-only enforcement for the `openai_mcp_tool_resolve` filter (issue #1724) |
 | [mcp-tool-resolve.yaml](configs/openai/responses/mcp-tool-resolve.yaml) | Demonstrates the `openai_mcp_tool_resolve` filter, which resolves MCP tool entries in the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server |
 | [model-rewrite.yaml](configs/openai/responses/model-rewrite.yaml) | Rewrites or injects the top-level `model` field in Responses API and Chat Completions request bodies before forwarding to the inference backend |
 | [rehydrate-fixture.yaml](configs/openai/responses/rehydrate-fixture.yaml) | Minimal native OpenAI Responses pipeline that stores a first turn, rehydrates a stored `previous_response_id` into the outbound `input` history, and proxies to a native /v1/responses backend |
 | [rehydrate.yaml](configs/openai/responses/rehydrate.yaml) | Validates `previous_response_id` by fetching the stored response, confirming its status is completed, and promoting the ID to filter metadata |
 | [request-validate.yaml](configs/openai/responses/request-validate.yaml) | Validates Responses API JSON and enriches request metadata |
 | [response-store-postgres-mtls.yaml](configs/openai/responses/response-store-postgres-mtls.yaml) | Persists non-streaming Responses API responses to PostgreSQL over a TLS-verified connection that authenticates with a client certificate instead of a password |
-| [response-store.yaml](configs/openai/responses/response-store.yaml) | Persists non-streaming Responses API responses to a database and serves stored data via GET endpoints and handles DELETE /v1/responses/{id} locally |
+| [response-store.yaml](configs/openai/responses/response-store.yaml) | Persists streaming and non-streaming Responses API responses to a database, serves stored data via GET endpoints, and handles DELETE /v1/responses/{id} locally |
 | [responses-proxy.yaml](configs/openai/responses/responses-proxy.yaml) | Proxies OpenAI Responses API requests to a native /v1/responses backend |
 | [responses-routing.yaml](configs/openai/responses/responses-routing.yaml) | Routes Responses API traffic by detected mode |
-| [responses-to-chat-completions-reasoning.yaml](configs/openai/responses/responses-to-chat-completions-reasoning.yaml) | Same pipeline as responses-to-chat-completions.yaml, but targets a vLLM backend that returns raw reasoning in choices[].message.reasoning |
+| [responses-to-chat-completions-reasoning-agentic.yaml](configs/openai/responses/responses-to-chat-completions-reasoning-agentic.yaml) | Exercises stored reasoning and previous_response_id replay through the agentic loop, where the output collector records each round into the stored history |
+| [responses-to-chat-completions-reasoning.yaml](configs/openai/responses/responses-to-chat-completions-reasoning.yaml) | Translates finite and streaming vLLM reasoning into Responses reasoning output items, including storage and replay on continuation |
 | [responses-to-chat-completions.yaml](configs/openai/responses/responses-to-chat-completions.yaml) | Accepts OpenAI Responses create requests, including finite stored continuations, while targeting a backend that only implements /v1/chat/completions |
 | [state-ownership.yaml](configs/openai/responses/state-ownership.yaml) | Provider-neutral owner isolation for persisted OpenAI Responses and Conversations |
 | [stream-events.yaml](configs/openai/responses/stream-events.yaml) | Demonstrates the `openai_stream_events` filter, which composes the current iterative-request-router (IRR) execution into one logical Responses SSE stream: it parses each backend SSE chunk, accumulates state (response object, output items, tool calls, usage) into ResponsesState, normalizes the per-round lifecycle, and preserves parser state through stream completion |
@@ -129,8 +173,9 @@ before sending requests.
 | [vllm-agentic-api.yaml](configs/openai/responses/vllm-agentic-api.yaml) | vLLM Agentic API: https://github.com/vllm-project/agentic-api |
 | [web-search-chat-completions-fixture.yaml](configs/openai/responses/web-search-chat-completions-fixture.yaml) | Single-upstream fixture configuration for recording the private Chat Completions function representation of a Responses web_search tool |
 | [web-search-chat-completions.yaml](configs/openai/responses/web-search-chat-completions.yaml) | Accepts OpenAI Responses requests with hosted web search while targeting a backend that only implements /v1/chat/completions |
+| [web-search-file-key.yaml](configs/openai/responses/web-search-file-key.yaml) | A variant of web-search-chat-completions.yaml that sources the shared Brave provider key from a projected FILE instead of an environment variable |
 | [web-search-scoped-credentials.yaml](configs/openai/responses/web-search-scoped-credentials.yaml) | A scoped-credentials variant of web-search-chat-completions.yaml |
-| [web-search.yaml](configs/openai/responses/web-search.yaml) | Demonstrates the `openai_web_search` filter configuration |
+| [web-search.yaml](configs/openai/responses/web-search.yaml) | Demonstrates the `openai_web_search_dispatch` filter configuration |
 
 ### Payload Processing
 
@@ -143,3 +188,4 @@ before sending requests.
 | File | Description |
 | ------ | ------------- |
 | [chat-completions-to-gemini.yaml](configs/vertex/chat-completions-to-gemini.yaml) | Transforms OpenAI Chat Completions requests into Vertex AI Gemini generateContent format and translates responses back |
+| [messages-to-anthropic.yaml](configs/vertex/messages-to-anthropic.yaml) | Translates Anthropic Messages requests into Vertex AI rawPredict form and Vertex responses back to the Anthropic dialect after model_to_provider selects an upstream and resolves its exact target model |

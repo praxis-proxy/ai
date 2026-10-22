@@ -116,7 +116,14 @@ mod tests {
             selection_tier: None,
             site: Arc::from("site"),
             stable_id: Arc::from(cluster),
+            provider_profile: None,
         }
+    }
+
+    fn weighted_candidate(cluster: &str, group: Option<u32>, admission: AdmissionState, weight: u32) -> RouteCandidate {
+        let mut candidate = candidate(cluster, group, admission);
+        candidate.traffic_weight = Some(weight);
+        candidate
     }
 
     #[test]
@@ -158,6 +165,28 @@ mod tests {
             PickerPolicy::RoundRobin,
         );
         assert_eq!(selected.map(|(candidate, _)| &*candidate.cluster), Some("fallback"));
+    }
+
+    #[test]
+    fn weighted_selection_falls_through_an_unavailable_group() {
+        let candidates = vec![
+            weighted_candidate("existing", Some(0), AdmissionState::ExistingOnly, 100),
+            weighted_candidate("fallback", Some(1), AdmissionState::NewAndExisting, 7),
+        ];
+        let groups = group_index::build(&candidates).unwrap();
+
+        let selected = select_candidate(
+            &candidates,
+            &groups,
+            CapabilityKind::InferenceModel,
+            "model",
+            PickerPolicy::WeightedRandom,
+        );
+
+        assert_eq!(
+            selected.map(|(candidate, group)| (&*candidate.cluster, group)),
+            Some(("fallback", Some(1)))
+        );
     }
 
     #[test]

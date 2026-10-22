@@ -134,7 +134,6 @@ pub(crate) struct ExtractionAccounting {
     remaining_total_text_bytes: usize,
 }
 
-
 /// Parsed data-URI components.
 pub(crate) struct DataUri<'a> {
     /// MIME type from the data URI header.

@@ -1,8 +1,9 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Deserialized YAML configuration types for the external metering filter.
 
+use praxis_ai_apis::credential_source::CredentialSource;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
@@ -26,6 +27,7 @@ const DEFAULT_SOURCE: &str = "ai-gateway";
 /// timeout_seconds: 5
 /// feature_key: "inference-tokens"
 /// source: "ai-gateway"
+/// provider: "openai"
 /// fail_open: true
 /// identity_header_prefix: "x-tenant-"
 /// identity_metadata_namespace: "identity"
@@ -40,7 +42,8 @@ pub(super) struct ExternalMeteringConfig {
 
     /// Allow the metering endpoint to resolve to non-public addresses
     /// (loopback, private, link-local). Defaults to `false`, so callouts
-    /// are rejected before connecting unless the operator opts in.
+    /// are rejected before connecting unless the operator opts in. Cloud
+    /// metadata, unspecified, and multicast addresses remain blocked.
     #[serde(default)]
     pub allow_private_endpoint: bool,
 
@@ -56,6 +59,10 @@ pub(super) struct ExternalMeteringConfig {
     #[serde(default = "default_source")]
     pub source: String,
 
+    /// Static provider name attributed to emitted `CloudEvents`.
+    #[serde(default)]
+    pub provider: Option<String>,
+
     /// When `true` (default), requests proceed if the metering service
     /// is unavailable. When `false`, requests are rejected with 503.
     #[serde(default = "default_true")]
@@ -63,7 +70,8 @@ pub(super) struct ExternalMeteringConfig {
 
     /// Prefix for tenant identity headers to capture and strip.
     /// Expected headers: `{prefix}username`, `{prefix}group`,
-    /// `{prefix}subscription`, `{prefix}model`.
+    /// `{prefix}subscription`, `{prefix}model`, `{prefix}organization-id`,
+    /// `{prefix}cost-center`.
     #[serde(default = "default_identity_header_prefix")]
     pub identity_header_prefix: String,
 
@@ -82,6 +90,15 @@ pub(super) struct ExternalMeteringConfig {
     /// Fallback model name when no identity model header is present.
     #[serde(default)]
     pub default_model: Option<String>,
+
+    /// Optional internal bearer token for authenticating metering callouts
+    /// (the balance check and the usage report). One of `value | env_var |
+    /// file`, read through the shared [`CredentialSource`] core: bounded reads,
+    /// restart-free file rotation (ideal for a Kubernetes projected Secret),
+    /// and fail-closed publication. When omitted, callouts are sent
+    /// unauthenticated (unchanged behavior).
+    #[serde(default)]
+    pub internal_auth_token: Option<CredentialSource>,
 }
 
 /// Validate config at construction time.

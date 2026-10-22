@@ -8,14 +8,18 @@
 //! here at their original paths. This module keeps the SQL backends and the
 //! transport-bound registry wrapper.
 
-// The SQL backends moved to the praxis-ai-store-backends crate (#1260). They are
-// re-exported below at their original `crate::store::*` paths so the
-// conversations and responses filters keep compiling unchanged. The transitional
-// dependency on praxis-ai-store-backends is removed once #1259b and #1262 take
-// those filters off concrete-store construction.
+mod discovery;
+pub mod plan;
+
+// The SQL backends live in the praxis-ai-store-backends crate (#1260). The
+// concrete stores, the `to_pg_ssl_mode` helper, and the provisioning factory are
+// re-exported below at their original `crate::store::*` paths for the
+// serving-runtime provisioning bridge and the crate's store test suites. The
+// responses and conversations filters reach the backend URL, TLS, and table
+// identifier helpers directly from praxis-ai-store-backends.
 
 #[cfg(test)]
-#[cfg(all(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(all(feature = "_store-postgres", feature = "store-sqlite"))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
     clippy::unwrap_used,
@@ -30,29 +34,24 @@ mod tests;
 use std::sync::Arc;
 
 use praxis_ai_store::StoreRegistry;
-// Pool tuning, TLS mode, and compression config live in the SQL-free contract
-// crate, re-exported here at their old paths.
-pub use praxis_ai_store::{CompressionAlgorithm, PoolConfig, SslMode, StoreCompressionConfig};
 // The persistence contracts moved to praxis-ai-store; re-exported at their old
 // paths so existing `crate::store::*` references keep compiling. OwnerScopedStore
 // keeps its former name here.
 pub use praxis_ai_store::{
-    ConversationItemRecord, ConversationItemStore, ConversationRecord, OwnerScopedStore as OwnerScopedResponseStore,
-    PendingApprovalRecord, PersistedStateBackend, ResponseRecord, ResponseStore, StoreError,
+    BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
+    OwnerScopedStore as OwnerScopedResponseStore, PendingApprovalRecord, PersistedStateBackend, ResponseEventRecord,
+    ResponseRecord, ResponseStore, StoreError, json_payload_charge, json_values_charge, json_values_fit,
 };
+// TLS mode and compression config live in the SQL-free contract crate,
+// re-exported here at their old paths.
+pub use praxis_ai_store::{CompressionAlgorithm, SslMode, StoreCompressionConfig};
 #[cfg(feature = "store-sqlite")]
 pub use praxis_ai_store_backends::SqliteResponseStore;
-#[cfg(feature = "store-postgres")]
-pub(crate) use praxis_ai_store_backends::postgres_url;
-#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
+#[cfg(any(feature = "store-sqlite", feature = "_store-postgres"))]
 pub use praxis_ai_store_backends::store_backend_factories;
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 pub use praxis_ai_store_backends::to_pg_ssl_mode;
-#[cfg(feature = "store-postgres")]
-pub(crate) use praxis_ai_store_backends::validate_postgres_table_identifiers;
-#[cfg(all(feature = "store-postgres", feature = "openai-conversations"))]
-pub(crate) use praxis_ai_store_backends::validate_postgres_table_set_identifiers;
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 pub use praxis_ai_store_backends::{PgTlsConfig, PostgresResponseStore};
 
 use crate::StateOwner;
@@ -146,7 +145,7 @@ pub use crate::openai::responses::DEFAULT_STORE_NAME;
 
 /// Filter type that configures the response store. The serving runtime scans
 /// filter chains for this type to provision the backends the store filter reads.
-pub const RESPONSE_STORE_FILTER_NAME: &str = "openai_response_store";
+pub const RESPONSE_STORE_FILTER_NAME: &str = "openai_responses_store";
 
 /// Filter type that configures the conversations store. The serving runtime
 /// scans filter chains for this type to provision the conversations backend the

@@ -1,0 +1,261 @@
+{
+  "version": 1,
+  "scenario_id": "responses/client-tool-compat-stream-shell-order",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-compat-model",
+    "source_id": "responses/client-tool-compat-stream-shell-order"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "call_lookup": "call_recorded_0002",
+      "call_sh1": "call_recorded_0001",
+      "resp_shell_order_0001": "resp_recorded_0003"
+    }
+  },
+  "turns": [
+    {
+      "name": "deferred-shell-opening-precedes-function",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "Inspect the environment and look up data.",
+              "model": "synthetic-compat-model",
+              "parallel_tool_calls": true,
+              "store": false,
+              "stream": true,
+              "tools": [
+                {
+                  "environment": {
+                    "type": "local"
+                  },
+                  "type": "shell"
+                },
+                {
+                  "name": "lookup",
+                  "parameters": {
+                    "additionalProperties": false,
+                    "properties": {},
+                    "required": [],
+                    "type": "object"
+                  },
+                  "strict": true,
+                  "type": "function"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": "response.output_item.added",
+                "data": "{\"item\":{\"action\":{\"commands\":[\"pwd\"],\"max_output_length\":null,\"timeout_ms\":null},\"call_id\":\"call_recorded_0001\",\"environment\":{\"type\":\"local\"},\"id\":\"sh_sh1\",\"status\":\"completed\",\"type\":\"shell_call\"},\"output_index\":0,\"sequence_number\":0,\"type\":\"response.output_item.added\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_item.added",
+                "data": "{\"item\":{\"arguments\":\"\",\"call_id\":\"call_recorded_0002\",\"id\":\"fc_lookup\",\"name\":\"lookup\",\"status\":\"in_progress\",\"type\":\"function_call\"},\"output_index\":1,\"sequence_number\":1,\"type\":\"response.output_item.added\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.function_call_arguments.delta",
+                "data": "{\"delta\":\"{}\",\"item_id\":\"fc_lookup\",\"output_index\":1,\"sequence_number\":2,\"type\":\"response.function_call_arguments.delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.function_call_arguments.done",
+                "data": "{\"arguments\":\"{}\",\"item_id\":\"fc_lookup\",\"name\":\"lookup\",\"output_index\":1,\"sequence_number\":3,\"type\":\"response.function_call_arguments.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_item.done",
+                "data": "{\"item\":{\"arguments\":\"{}\",\"call_id\":\"call_recorded_0002\",\"id\":\"fc_lookup\",\"name\":\"lookup\",\"status\":\"completed\",\"type\":\"function_call\"},\"output_index\":1,\"sequence_number\":4,\"type\":\"response.output_item.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_item.done",
+                "data": "{\"item\":{\"action\":{\"commands\":[\"pwd\"],\"max_output_length\":null,\"timeout_ms\":null},\"call_id\":\"call_recorded_0001\",\"environment\":{\"type\":\"local\"},\"id\":\"sh_sh1\",\"status\":\"completed\",\"type\":\"shell_call\"},\"output_index\":0,\"sequence_number\":5,\"type\":\"response.output_item.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.completed",
+                "data": "{\"response\":{\"id\":\"resp_recorded_0003\",\"object\":\"response\",\"output\":[{\"action\":{\"commands\":[\"pwd\"],\"max_output_length\":null,\"timeout_ms\":null},\"call_id\":\"call_recorded_0001\",\"environment\":{\"type\":\"local\"},\"id\":\"sh_sh1\",\"status\":\"completed\",\"type\":\"shell_call\"},{\"arguments\":\"{}\",\"call_id\":\"call_recorded_0002\",\"id\":\"fc_lookup\",\"name\":\"lookup\",\"status\":\"completed\",\"type\":\"function_call\"}],\"parallel_tool_calls\":true,\"status\":\"completed\",\"tool_choice\":\"auto\",\"tools\":[{\"environment\":{\"type\":\"local\"},\"type\":\"shell\"},{\"name\":\"lookup\",\"parameters\":{\"additionalProperties\":false,\"properties\":{},\"required\":[],\"type\":\"object\"},\"strict\":true,\"type\":\"function\"}],\"usage\":{\"input_tokens\":24,\"input_tokens_details\":{\"cache_write_tokens\":0,\"cached_tokens\":0},\"output_tokens\":18,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":42}},\"sequence_number\":6,\"type\":\"response.completed\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": true
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": [
+                {
+                  "content": "Inspect the environment and look up data.",
+                  "role": "user",
+                  "type": "message"
+                }
+              ],
+              "model": "synthetic-compat-model",
+              "parallel_tool_calls": true,
+              "store": false,
+              "stream": true,
+              "tools": [
+                {
+                  "description": "Run one or more commands in the caller-provided local shell environment. The caller executes the commands and returns their outputs.",
+                  "name": "shell",
+                  "parameters": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "commands": {
+                        "description": "Commands to execute in order.",
+                        "items": {
+                          "type": "string"
+                        },
+                        "minItems": 1,
+                        "type": "array"
+                      },
+                      "max_output_length": {
+                        "description": "Optional maximum captured output length.",
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "timeout_ms": {
+                        "description": "Optional timeout in milliseconds.",
+                        "minimum": 0,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "commands"
+                    ],
+                    "type": "object"
+                  },
+                  "strict": false,
+                  "type": "function"
+                },
+                {
+                  "name": "lookup",
+                  "parameters": {
+                    "additionalProperties": false,
+                    "properties": {},
+                    "required": [],
+                    "type": "object"
+                  },
+                  "strict": true,
+                  "type": "function"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": "response.output_item.added",
+                "data": "{\"item\":{\"arguments\":\"\",\"call_id\":\"call_recorded_0001\",\"id\":\"fc_sh1\",\"name\":\"shell\",\"status\":\"in_progress\",\"type\":\"function_call\"},\"output_index\":0,\"sequence_number\":0,\"type\":\"response.output_item.added\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_item.added",
+                "data": "{\"item\":{\"arguments\":\"\",\"call_id\":\"call_recorded_0002\",\"id\":\"fc_lookup\",\"name\":\"lookup\",\"status\":\"in_progress\",\"type\":\"function_call\"},\"output_index\":1,\"sequence_number\":1,\"type\":\"response.output_item.added\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.function_call_arguments.delta",
+                "data": "{\"delta\":\"{}\",\"item_id\":\"fc_lookup\",\"output_index\":1,\"sequence_number\":2,\"type\":\"response.function_call_arguments.delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.function_call_arguments.done",
+                "data": "{\"arguments\":\"{}\",\"item_id\":\"fc_lookup\",\"name\":\"lookup\",\"output_index\":1,\"sequence_number\":3,\"type\":\"response.function_call_arguments.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_item.done",
+                "data": "{\"item\":{\"arguments\":\"{}\",\"call_id\":\"call_recorded_0002\",\"id\":\"fc_lookup\",\"name\":\"lookup\",\"status\":\"completed\",\"type\":\"function_call\"},\"output_index\":1,\"sequence_number\":4,\"type\":\"response.output_item.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.function_call_arguments.delta",
+                "data": "{\"delta\":\"{\\\"commands\\\":[\\\"pwd\\\"]}\",\"item_id\":\"fc_sh1\",\"output_index\":0,\"sequence_number\":5,\"type\":\"response.function_call_arguments.delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.function_call_arguments.done",
+                "data": "{\"arguments\":\"{\\\"commands\\\":[\\\"pwd\\\"]}\",\"item_id\":\"fc_sh1\",\"name\":\"shell\",\"output_index\":0,\"sequence_number\":6,\"type\":\"response.function_call_arguments.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_item.done",
+                "data": "{\"item\":{\"arguments\":\"{\\\"commands\\\":[\\\"pwd\\\"]}\",\"call_id\":\"call_recorded_0001\",\"id\":\"fc_sh1\",\"name\":\"shell\",\"status\":\"completed\",\"type\":\"function_call\"},\"output_index\":0,\"sequence_number\":7,\"type\":\"response.output_item.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.completed",
+                "data": "{\"response\":{\"id\":\"resp_recorded_0003\",\"object\":\"response\",\"output\":[{\"arguments\":\"{\\\"commands\\\":[\\\"pwd\\\"]}\",\"call_id\":\"call_recorded_0001\",\"id\":\"fc_sh1\",\"name\":\"shell\",\"status\":\"completed\",\"type\":\"function_call\"},{\"arguments\":\"{}\",\"call_id\":\"call_recorded_0002\",\"id\":\"fc_lookup\",\"name\":\"lookup\",\"status\":\"completed\",\"type\":\"function_call\"}],\"parallel_tool_calls\":true,\"status\":\"completed\",\"tool_choice\":\"auto\",\"tools\":[{\"description\":\"Run one or more commands in the caller-provided local shell environment. The caller executes the commands and returns their outputs.\",\"name\":\"shell\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"commands\":{\"description\":\"Commands to execute in order.\",\"items\":{\"type\":\"string\"},\"minItems\":1,\"type\":\"array\"},\"max_output_length\":{\"description\":\"Optional maximum captured output length.\",\"minimum\":0,\"type\":\"integer\"},\"timeout_ms\":{\"description\":\"Optional timeout in milliseconds.\",\"minimum\":0,\"type\":\"integer\"}},\"required\":[\"commands\"],\"type\":\"object\"},\"strict\":false,\"type\":\"function\"},{\"name\":\"lookup\",\"parameters\":{\"additionalProperties\":false,\"properties\":{},\"required\":[],\"type\":\"object\"},\"strict\":true,\"type\":\"function\"}],\"usage\":{\"input_tokens\":24,\"input_tokens_details\":{\"cache_write_tokens\":0,\"cached_tokens\":0},\"output_tokens\":18,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":42}},\"sequence_number\":8,\"type\":\"response.completed\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": true
+          }
+        }
+      }
+    }
+  ]
+}

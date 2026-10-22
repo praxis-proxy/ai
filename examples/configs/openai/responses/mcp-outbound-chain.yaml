@@ -53,7 +53,10 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
-      - filter: openai_responses_format
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      - filter: openai_responses_request
         on_invalid: continue
         headers:
           format: x-praxis-ai-format

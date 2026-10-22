@@ -9,12 +9,15 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+store-all = ["praxis-ai-apis/store-all"]
+
 [lints]
 workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }
-praxis-ai-apis = { workspace = true, features = ["store-all"] }
+praxis-ai-apis = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true, features = ["postgres", "sqlite", "tls-native-tls"] }
 tempfile = { workspace = true }
@@ -23,4 +26,10 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 [[bench]]
 name = "compression"
 path = "store/compression.rs"
+harness = false
+required-features = ["store-all"]
+
+[[bench]]
+name = "gemini_translation"
+path = "gemini/translation.rs"
 harness = false

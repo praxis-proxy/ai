@@ -1,0 +1,229 @@
+{
+  "version": 1,
+  "scenario_id": "responses/chat-reasoning-stream",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-chat-model",
+    "source_id": "controlled-responses-reasoning-stream"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "msg_resp_5c502086fdb66fa4bdf1000000000000": "msg_recorded_0003",
+      "resp_5c502086fdb66fa4bdf1000000000000": "resp_recorded_0001",
+      "rs_resp_5c502086fdb66fa4bdf1000000000000_chatcmpl_reasoning_stream": "rs_recorded_0002"
+    }
+  },
+  "turns": [
+    {
+      "name": "reasoning",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "What is 2+2?",
+              "model": "synthetic-chat-model",
+              "reasoning": {
+                "effort": "low"
+              },
+              "store": false,
+              "stream": true
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": "response.created",
+                "data": "{\"response\":{\"background\":false,\"completed_at\":null,\"created_at\":0,\"error\":null,\"frequency_penalty\":0.0,\"id\":\"resp_recorded_0001\",\"incomplete_details\":null,\"input\":\"What is 2+2?\",\"instructions\":null,\"max_output_tokens\":null,\"max_tool_calls\":null,\"metadata\":{},\"model\":\"synthetic-chat-model\",\"object\":\"response\",\"output\":[],\"parallel_tool_calls\":true,\"presence_penalty\":0.0,\"previous_response_id\":null,\"prompt_cache_key\":null,\"reasoning\":{\"effort\":\"low\",\"summary\":null},\"safety_identifier\":null,\"service_tier\":\"default\",\"status\":\"in_progress\",\"store\":false,\"temperature\":1.0,\"text\":{\"format\":{\"type\":\"text\"}},\"tool_choice\":\"auto\",\"tools\":[],\"top_logprobs\":0,\"top_p\":1.0,\"truncation\":\"disabled\",\"usage\":null},\"sequence_number\":0,\"type\":\"response.created\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.in_progress",
+                "data": "{\"response\":{\"background\":false,\"completed_at\":null,\"created_at\":0,\"error\":null,\"frequency_penalty\":0.0,\"id\":\"resp_recorded_0001\",\"incomplete_details\":null,\"input\":\"What is 2+2?\",\"instructions\":null,\"max_output_tokens\":null,\"max_tool_calls\":null,\"metadata\":{},\"model\":\"synthetic-chat-model\",\"object\":\"response\",\"output\":[],\"parallel_tool_calls\":true,\"presence_penalty\":0.0,\"previous_response_id\":null,\"prompt_cache_key\":null,\"reasoning\":{\"effort\":\"low\",\"summary\":null},\"safety_identifier\":null,\"service_tier\":\"default\",\"status\":\"in_progress\",\"store\":false,\"temperature\":1.0,\"text\":{\"format\":{\"type\":\"text\"}},\"tool_choice\":\"auto\",\"tools\":[],\"top_logprobs\":0,\"top_p\":1.0,\"truncation\":\"disabled\",\"usage\":null},\"sequence_number\":1,\"type\":\"response.in_progress\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_item.added",
+                "data": "{\"item\":{\"content\":[],\"id\":\"rs_recorded_0002\",\"status\":\"in_progress\",\"summary\":[],\"type\":\"reasoning\"},\"output_index\":0,\"sequence_number\":2,\"type\":\"response.output_item.added\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.content_part.added",
+                "data": "{\"content_index\":0,\"item_id\":\"rs_recorded_0002\",\"output_index\":0,\"part\":{\"text\":\"\",\"type\":\"reasoning_text\"},\"sequence_number\":3,\"type\":\"response.content_part.added\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.reasoning_text.delta",
+                "data": "{\"content_index\":0,\"delta\":\"2 plus \",\"item_id\":\"rs_recorded_0002\",\"output_index\":0,\"sequence_number\":4,\"type\":\"response.reasoning_text.delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.reasoning_text.delta",
+                "data": "{\"content_index\":0,\"delta\":\"2 is 4.\",\"item_id\":\"rs_recorded_0002\",\"output_index\":0,\"sequence_number\":5,\"type\":\"response.reasoning_text.delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_item.added",
+                "data": "{\"item\":{\"content\":[],\"id\":\"msg_recorded_0003\",\"role\":\"assistant\",\"status\":\"in_progress\",\"type\":\"message\"},\"output_index\":1,\"sequence_number\":6,\"type\":\"response.output_item.added\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.content_part.added",
+                "data": "{\"content_index\":0,\"item_id\":\"msg_recorded_0003\",\"output_index\":1,\"part\":{\"annotations\":[],\"logprobs\":[],\"text\":\"\",\"type\":\"output_text\"},\"sequence_number\":7,\"type\":\"response.content_part.added\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_text.delta",
+                "data": "{\"content_index\":0,\"delta\":\"4\",\"item_id\":\"msg_recorded_0003\",\"logprobs\":[],\"output_index\":1,\"sequence_number\":8,\"type\":\"response.output_text.delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.reasoning_text.done",
+                "data": "{\"content_index\":0,\"item_id\":\"rs_recorded_0002\",\"output_index\":0,\"sequence_number\":9,\"text\":\"2 plus 2 is 4.\",\"type\":\"response.reasoning_text.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.content_part.done",
+                "data": "{\"content_index\":0,\"item_id\":\"rs_recorded_0002\",\"output_index\":0,\"part\":{\"text\":\"2 plus 2 is 4.\",\"type\":\"reasoning_text\"},\"sequence_number\":10,\"type\":\"response.content_part.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_item.done",
+                "data": "{\"item\":{\"content\":[{\"text\":\"2 plus 2 is 4.\",\"type\":\"reasoning_text\"}],\"id\":\"rs_recorded_0002\",\"status\":\"completed\",\"summary\":[],\"type\":\"reasoning\"},\"output_index\":0,\"sequence_number\":11,\"type\":\"response.output_item.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_text.done",
+                "data": "{\"content_index\":0,\"item_id\":\"msg_recorded_0003\",\"logprobs\":[],\"output_index\":1,\"sequence_number\":12,\"text\":\"4\",\"type\":\"response.output_text.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.content_part.done",
+                "data": "{\"content_index\":0,\"item_id\":\"msg_recorded_0003\",\"output_index\":1,\"part\":{\"annotations\":[],\"logprobs\":[],\"text\":\"4\",\"type\":\"output_text\"},\"sequence_number\":13,\"type\":\"response.content_part.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_item.done",
+                "data": "{\"item\":{\"content\":[{\"annotations\":[],\"logprobs\":[],\"text\":\"4\",\"type\":\"output_text\"}],\"id\":\"msg_recorded_0003\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"},\"output_index\":1,\"sequence_number\":14,\"type\":\"response.output_item.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.completed",
+                "data": "{\"response\":{\"background\":false,\"completed_at\":0,\"created_at\":0,\"error\":null,\"frequency_penalty\":0.0,\"id\":\"resp_recorded_0001\",\"incomplete_details\":null,\"input\":\"What is 2+2?\",\"instructions\":null,\"max_output_tokens\":null,\"max_tool_calls\":null,\"metadata\":{},\"model\":\"synthetic-chat-model\",\"object\":\"response\",\"output\":[{\"content\":[{\"text\":\"2 plus 2 is 4.\",\"type\":\"reasoning_text\"}],\"id\":\"rs_recorded_0002\",\"status\":\"completed\",\"summary\":[],\"type\":\"reasoning\"},{\"content\":[{\"annotations\":[],\"logprobs\":[],\"text\":\"4\",\"type\":\"output_text\"}],\"id\":\"msg_recorded_0003\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"parallel_tool_calls\":true,\"presence_penalty\":0.0,\"previous_response_id\":null,\"prompt_cache_key\":null,\"reasoning\":{\"effort\":\"low\",\"summary\":null},\"safety_identifier\":null,\"service_tier\":\"default\",\"status\":\"completed\",\"store\":false,\"temperature\":1.0,\"text\":{\"format\":{\"type\":\"text\"}},\"tool_choice\":\"auto\",\"tools\":[],\"top_logprobs\":0,\"top_p\":1.0,\"truncation\":\"disabled\",\"usage\":{\"input_tokens\":8,\"input_tokens_details\":{\"cache_write_tokens\":0,\"cached_tokens\":0},\"output_tokens\":10,\"output_tokens_details\":{\"reasoning_tokens\":9},\"total_tokens\":18}},\"sequence_number\":15,\"type\":\"response.completed\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": false
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "messages": [
+                {
+                  "content": "What is 2+2?",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-chat-model",
+              "reasoning_effort": "low",
+              "stream": true,
+              "stream_options": {
+                "include_usage": true
+              }
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"reasoning\":\"2 plus \"},\"index\":0}],\"id\":\"chatcmpl_reasoning_stream\",\"model\":\"synthetic-chat-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"reasoning\":null,\"reasoning_content\":\"2 is 4.\"},\"index\":0}],\"id\":\"chatcmpl_reasoning_stream\",\"model\":\"synthetic-chat-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"4\"},\"index\":0}],\"id\":\"chatcmpl_reasoning_stream\",\"model\":\"synthetic-chat-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}]}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[],\"usage\":{\"completion_tokens\":10,\"completion_tokens_details\":{\"reasoning_tokens\":9},\"prompt_tokens\":8,\"total_tokens\":18}}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": true
+          }
+        }
+      }
+    }
+  ]
+}

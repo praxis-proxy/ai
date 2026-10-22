@@ -1,11 +1,12 @@
 version: 1
 id: messages/malformed-success
-description: Malformed Chat Completions success converted to an Anthropic API error envelope.
+description: Malformed Chat Completions success becomes an HTTP 500 Anthropic API error.
 protocol: anthropic_messages
 example_config: anthropic/messages-to-openai.yaml
 upstream_authority: 127.0.0.1:8000
 features:
   - messages.error.malformed_success
+  - messages.error.malformed_success_status
 turns:
   - name: initial
     request:
@@ -14,6 +15,8 @@ turns:
       headers:
         content-type:
           - application/json
+        x-request-id:
+          - req_malformed
       body:
         kind: json
         value:
@@ -24,7 +27,7 @@ turns:
             - role: user
               content: What is 2+2? Reply with just the number.
     expect:
-      client_status: 200
+      client_status: 500
       client_body_kind: json
       upstream_path: /v1/chat/completions
       upstream_body_kind: json

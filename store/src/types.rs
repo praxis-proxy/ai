@@ -44,16 +44,24 @@ pub struct ResponseRecord {
     pub messages: serde_json::Value,
 }
 
+/// A Store record admitted against the caller's retained-payload allowance.
+#[derive(Clone, Debug)]
+pub struct BudgetedRecord<T> {
+    /// Decoded record.
+    pub record: T,
+    /// Byte-and-structure allowance measured before JSON tree construction.
+    pub charge_bytes: usize,
+}
+
 // -----------------------------------------------------------------------------
 // ConversationRecord
 // -----------------------------------------------------------------------------
 
 /// A stored conversation record.
 ///
-/// Holds the conversation object and accumulated messages for a
-/// conversation ID. The `messages` field is used by the rehydrate
-/// filter for multi-turn context; `metadata` and `created_at` are
-/// exposed via the `/v1/conversations` API.
+/// Holds conversation metadata and the legacy message cache. Item rows are the
+/// history source of truth when present; use `conversation_history` for replay.
+/// `metadata` and `created_at` are exposed via the `/v1/conversations` API.
 #[derive(Clone, Debug)]
 pub struct ConversationRecord {
     /// Conversation ID (e.g., `"conv_abc123"`).
@@ -71,7 +79,9 @@ pub struct ConversationRecord {
     /// User-defined metadata as JSON (up to 16 key-value pairs).
     pub metadata: serde_json::Value,
 
-    /// Accumulated conversation messages as JSON.
+    /// Retired cache or preserved legacy prefix. Item-backed histories clear
+    /// stale arrays; a `legacy_messages` prefix remains authoritative alongside
+    /// ordered item rows. Use the history read boundary for replay.
     pub messages: serde_json::Value,
 }
 
@@ -142,6 +152,82 @@ pub struct PendingApprovalRecord {
 }
 
 // -----------------------------------------------------------------------------
+// ResponseEventRecord
+// -----------------------------------------------------------------------------
+
+/// A single normalized SSE event captured from a stored streaming response.
+///
+/// The durable event log lets a completed, `stream: true` response be replayed
+/// verbatim through `GET /v1/responses/{id}?stream=true`. Each record is one
+/// outbound SSE event, stamped with the client-visible `sequence_number` from
+/// `openai_stream_events`. The events are buffered in request scope and flushed
+/// as one batch at the terminal seam, after the parent record is stored and
+/// before the terminal frame is released. The `(response_id, sequence_number)`
+/// pair is the primary key; the owner triple gates every access to the parent
+/// response, exactly like [`PendingApprovalRecord`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResponseEventRecord {
+    /// Parent response ID (e.g., `"resp_abc123"`).
+    pub response_id: String,
+
+    /// Immutable owner inherited from the parent response.
+    pub owner: StateOwner,
+
+    /// Client-visible logical stream sequence number (monotonic, contiguous).
+    pub sequence_number: u64,
+
+    /// Wire event name (e.g., `"response.output_text.delta"`), equal to the
+    /// payload's `type`.
+    pub event_type: String,
+
+    /// The fully-normalized event's `data` payload as raw JSON bytes, exactly as
+    /// delivered to the client. Held and replayed verbatim — never parsed into a
+    /// [`serde_json::Value`] — so replay reproduces the original bytes without a
+    /// parse/serialize round trip and without retaining a value tree per event.
+    pub payload: Vec<u8>,
+
+    /// True iff this is a terminal event (`completed`/`incomplete`/`failed`/
+    /// `error`). A replayable log always ends with exactly one terminal event.
+    pub terminal: bool,
+
+    /// Unix timestamp when the event was persisted.
+    pub created_at: i64,
+}
+
+// -----------------------------------------------------------------------------
+// EventLogStatus
+// -----------------------------------------------------------------------------
+
+/// Cheap pre-stream gate describing a response's event log.
+///
+/// The three variants are mutually exclusive and each carries only the data
+/// that state needs, so states no backend should produce (a terminal event
+/// with no maximum sequence, or a terminal event with no rows) cannot be
+/// represented. Only [`EventLogStatus::Replayable`] may be served as a
+/// complete SSE replay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EventLogStatus {
+    /// No event rows exist (legacy or non-streamed record).
+    #[default]
+    Absent,
+
+    /// Rows exist but no terminal event was recorded (a stream that aborted
+    /// before its terminal event). Carries the highest stored
+    /// `sequence_number`.
+    Incomplete {
+        /// Highest stored `sequence_number`.
+        max_sequence: u64,
+    },
+
+    /// The log reached a terminal event and can be replayed in full. Carries
+    /// the highest stored `sequence_number` (the terminal event's).
+    Replayable {
+        /// Highest stored `sequence_number`.
+        max_sequence: u64,
+    },
+}
+
+// -----------------------------------------------------------------------------
 // StoreError
 // -----------------------------------------------------------------------------
 
@@ -150,7 +236,11 @@ pub struct PendingApprovalRecord {
 /// Variants carry `String` payloads (not typed inner errors) to
 /// avoid coupling the trait to any specific database driver.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum StoreError {
+    /// No resource exists in the authorized owner scope.
+    NotFound,
+
     /// Database connection or query failure.
     Database(String),
 
@@ -162,15 +252,20 @@ pub enum StoreError {
 
     /// Store not initialized or unavailable.
     Unavailable(String),
+
+    /// A bounded read would materialize more payload than its caller permits.
+    PayloadTooLarge,
 }
 
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NotFound => write!(f, "resource not found"),
             Self::Database(msg) => write!(f, "database error: {msg}"),
             Self::InvalidInput(msg) => write!(f, "invalid input: {msg}"),
             Self::Serialization(msg) => write!(f, "serialization error: {msg}"),
             Self::Unavailable(msg) => write!(f, "store unavailable: {msg}"),
+            Self::PayloadTooLarge => write!(f, "stored payload exceeds request limit"),
         }
     }
 }

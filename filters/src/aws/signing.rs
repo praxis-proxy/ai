@@ -581,6 +581,11 @@ mod tests {
 
     #[test]
     fn key_derivation_chains_raw_tags_not_hex() {
+        if std::env::var_os("PRAXIS_TEST_FIPS_PROVIDER").is_some() {
+            // This test may be scheduled before the dedicated provider test;
+            // initialize the configured provider before the first HMAC call.
+            praxis_tls::provider::install();
+        }
         // Re-derive step by step with the RFC 2104 primitive to show that
         // each stage keys the next with its 32 raw bytes.
         let scope = SigningScope {
@@ -1008,6 +1013,12 @@ mod tests {
     #[expect(clippy::too_many_lines, reason = "two scopes, each checked for key and signature")]
     fn derives_the_same_key_and_signature_as_aws_sigv4() {
         use aws_sigv4::sign::v4;
+
+        if std::env::var_os("PRAXIS_TEST_FIPS_PROVIDER").is_some() {
+            // Tests run concurrently, so do not depend on another test to
+            // install the provider before this test's first HMAC call.
+            praxis_tls::provider::install();
+        }
         for scope in [
             SigningScope {
                 region: "us-east-1",

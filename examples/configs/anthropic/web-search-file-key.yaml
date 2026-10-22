@@ -1,0 +1,73 @@
+# Anthropic Messages Web Search with a File-Sourced Provider Key
+#
+# A minimal Anthropic Messages web-search gateway that sources the shared Brave
+# provider key from a projected FILE instead of an environment variable. The
+# `file:` source suits a Kubernetes projected Secret mounted at a fixed path:
+#
+#   * Restart-free rotation: the key is watched and re-read when the projected
+#     file changes, so rotating the Secret does not require restarting the proxy.
+#   * Fail-closed: an unreadable, empty, oversized, or non-UTF-8 file fails the
+#     pipeline build at startup (never a silent unauthenticated callout), and a
+#     post-startup removal publishes no key so the callout fails closed.
+#
+# Unlike web-search-scoped-credentials.yaml, there is no per-user credential:
+# every provider callout uses the shared file-sourced `api_key`, so this is the
+# simplest config that actually sends a file-sourced key on the wire.
+#
+#   curl -N http://127.0.0.1:8080/v1/messages \
+#     -H 'content-type: application/json' \
+#     -d '{"model":"openai/gpt-oss-20b","max_tokens":1024,"stream":true,"messages":[{"role":"user","content":"Use web search to look up potato, then summarize in one sentence."}],"tools":[{"name":"WebSearch","description":"Search the web","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}]}'
+
+listeners:
+  - name: anthropic-web-search-file-key
+    address: "127.0.0.1:8080"
+    filter_chains: [web-search-file-key]
+
+filter_chains:
+  - name: web-search-file-key
+    filters:
+      - filter: anthropic_messages_request
+        on_invalid: reject
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 6
+        timeout_ms: 90000
+        steps:
+          - name: inference
+            filters:
+              - filter: anthropic_web_search
+                provider: brave
+                # Source the shared provider key from a projected file. A
+                # Kubernetes projected Secret mounted here is watched and re-read
+                # on rotation (restart-free); an unreadable file fails closed.
+                api_key:
+                  file: /var/run/secrets/web-search/api-key
+                default_context_size: medium
+                timeout_ms: 10000
+                # Each Brave provider callout executes through this outbound
+                # chain; the filtered-subrequest executor enforces destination
+                # authority, DNS/SSRF, TLS/SNI, and Host centrally.
+                outbound_chain:
+                  name: anthropic-web-search-outbound
+                  filters:
+                    - filter: request_id
+              - filter: anthropic_messages_protocol
+                default_version: "2023-06-01"
+              - filter: router
+                routes:
+                  - path_prefix: "/v1/messages"
+                    cluster: messages-backend
+              - filter: load_balancer
+                clusters:
+                  - name: messages-backend
+                    endpoints: ["127.0.0.1:8000"]
+            on_result:
+              - filter: anthropic_web_search
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

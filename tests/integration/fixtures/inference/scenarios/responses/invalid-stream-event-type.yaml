@@ -1,0 +1,30 @@
+version: 1
+id: responses/invalid-stream-event-type
+description: Reject decoded CR/LF in an upstream event discriminator before SSE header emission.
+protocol: openai_responses
+example_config: openai/responses/irr-terminal-streaming.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.streaming.invalid_event_type
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type: [application/json]
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Reply briefly.
+          store: false
+          stream: true
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /v1/responses
+      upstream_body_kind: json
+      client_sse_events:
+        - error
+      upstream_sse_events: []

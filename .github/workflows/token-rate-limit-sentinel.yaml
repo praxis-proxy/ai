@@ -1,0 +1,136 @@
+name: Token Rate Limit Sentinel Fixture Smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/token-rate-limit-sentinel.yaml"
+      - "filters/src/token_rate_limit/**"
+      - "tests/integration/fixtures/token_rate_limit/**"
+      - "tests/integration/tests/suite/examples/**"
+      - "examples/configs/token-rate-limit*.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - ".github/workflows/token-rate-limit-sentinel.yaml"
+      - "filters/src/token_rate_limit/**"
+      - "tests/integration/fixtures/token_rate_limit/**"
+      - "tests/integration/tests/suite/examples/**"
+      - "examples/configs/token-rate-limit*.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+jobs:
+  sentinel:
+    name: Sentinel fixture smoke (${{ matrix.product }})
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - product: redis
+            image: docker.io/library/redis:8.10.2-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
+          - product: valkey
+            # Credential-free protocol smoke, not Red Hat image qualification.
+            # The exact Red Hat release target is qualified separately.
+            image: ghcr.io/valkey-io/valkey@sha256:4436c94fc34ce4af0354b9379d433a1f258998fb955f995c89822f98c14a8cab
+
+    env:
+      SENTINEL_PRODUCT: ${{ matrix.product }}
+      SENTINEL_IMAGE: ${{ matrix.image }}
+      SENTINEL_DEAD_ENDPOINT: redis://127.0.0.1:1
+      CONTAINER_ENGINE: docker
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+
+      - name: Check fixture signal and failure cleanup
+        run: python3 tests/integration/fixtures/token_rate_limit/test_sentinel_fixture.py
+
+      - name: Record CI qualification scope
+        run: |
+          {
+            echo "This credential-free PR lane exercises the pinned Redis or upstream Valkey image."
+            echo "Upstream Valkey smoke does not qualify the Red Hat Valkey release image."
+            echo "Red Hat qualification must be recorded separately against the exact reviewed source and image pin."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pull immutable qualification image
+        run: |
+          "$CONTAINER_ENGINE" pull "$SENTINEL_IMAGE"
+
+      - name: Record resolved Redis client
+        run: cargo tree --locked --package redis
+
+      - name: Build the proxy binary (compile gate)
+        run: cargo build -p praxis-ai-proxy --bin praxis-ai --features basic-auth-filter,token-rate-limit-filter
+
+      - name: Run token-rate-limit unit suite
+        run: cargo test -p praxis-ai-filters --features token-rate-limit-filter token_rate_limit --lib
+
+      - name: Run standalone contracts on the pinned product
+        run: |
+          tests/integration/fixtures/token_rate_limit/start-sentinel-topology.sh \
+            --product "$SENTINEL_PRODUCT" --image "$SENTINEL_IMAGE" \
+            --env-file "$RUNNER_TEMP/standalone.env" -- \
+            bash tests/integration/fixtures/token_rate_limit/run-standalone-contracts.sh
+
+      - name: Run Sentinel fixture integration
+        run: make test-token-rate-limit-sentinel-integration \
+          SENTINEL_PRODUCT="$SENTINEL_PRODUCT" \
+          SENTINEL_IMAGE="$SENTINEL_IMAGE" \
+          SENTINEL_ENV_FILE="$RUNNER_TEMP/sentinel.env" \
+          SENTINEL_DEAD_ENDPOINT="$SENTINEL_DEAD_ENDPOINT"
+
+      - name: Run Sentinel fixture with planned failover on a warm connection
+        env:
+          SENTINEL_FAILOVER_BEFORE_COMMAND: "1"
+        run: make test-token-rate-limit-sentinel-integration \
+          SENTINEL_PRODUCT="$SENTINEL_PRODUCT" \
+          SENTINEL_IMAGE="$SENTINEL_IMAGE" \
+          SENTINEL_ENV_FILE="$RUNNER_TEMP/sentinel.env" \
+          SENTINEL_DEAD_ENDPOINT="$SENTINEL_DEAD_ENDPOINT" \
+          SENTINEL_FAILOVER_BEFORE_COMMAND="$SENTINEL_FAILOVER_BEFORE_COMMAND"
+
+      - name: Run closed-mode NOREPLICAS health test
+        env:
+          SENTINEL_REPLICATION_HEALTH_TEST: "1"
+          SENTINEL_ON_FAILURE: closed
+          SENTINEL_TEST_FILTER: sentinel_health_noreplicas_failure
+        run: make test-token-rate-limit-sentinel-integration \
+          SENTINEL_PRODUCT="$SENTINEL_PRODUCT" \
+          SENTINEL_IMAGE="$SENTINEL_IMAGE" \
+          SENTINEL_ENV_FILE="$RUNNER_TEMP/sentinel.env" \
+          SENTINEL_REPLICATION_HEALTH_TEST="$SENTINEL_REPLICATION_HEALTH_TEST" \
+          SENTINEL_ON_FAILURE="$SENTINEL_ON_FAILURE" \
+          SENTINEL_TEST_FILTER="$SENTINEL_TEST_FILTER"
+
+      - name: Run open-mode NOREPLICAS health test
+        env:
+          SENTINEL_REPLICATION_HEALTH_TEST: "1"
+          SENTINEL_ON_FAILURE: open
+          SENTINEL_TEST_FILTER: sentinel_health_noreplicas_failure
+        run: make test-token-rate-limit-sentinel-integration \
+          SENTINEL_PRODUCT="$SENTINEL_PRODUCT" \
+          SENTINEL_IMAGE="$SENTINEL_IMAGE" \
+          SENTINEL_ENV_FILE="$RUNNER_TEMP/sentinel.env" \
+          SENTINEL_REPLICATION_HEALTH_TEST="$SENTINEL_REPLICATION_HEALTH_TEST" \
+          SENTINEL_ON_FAILURE="$SENTINEL_ON_FAILURE" \
+          SENTINEL_TEST_FILTER="$SENTINEL_TEST_FILTER"

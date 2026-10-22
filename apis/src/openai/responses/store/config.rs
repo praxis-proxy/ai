@@ -3,18 +3,44 @@
 
 //! Configuration types for the response store filter.
 
+use std::num::{NonZeroU32, NonZeroU64};
+
 use percent_encoding::percent_decode_str;
-use praxis_ai_store::{PoolConfig, SslMode, validate_table_identifier};
+use praxis_ai_store::{PoolConfig, SslMode, StoreCompressionConfig, validate_table_identifier};
+#[cfg(feature = "_store-postgres")]
+use praxis_ai_store_backends::{PgTlsConfig, postgres_url, validate_postgres_table_identifiers};
 use praxis_filter::{FilterError, has_dot_dot_traversal};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
-use crate::store::StoreCompressionConfig;
-#[cfg(feature = "store-postgres")]
-use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_identifiers};
-
 /// Filter name used in SSRF validation error messages.
-const FILTER_NAME: &str = "openai_response_store";
+const FILTER_NAME: &str = "openai_responses_store";
+
+/// Default cap on the number of SSE events retained in a streamed response's
+/// replay log.
+pub(crate) const DEFAULT_MAX_EVENT_COUNT: NonZeroU32 = match NonZeroU32::new(10_000) {
+    Some(count) => count,
+    // 10_000 is non-zero, so this arm is unreachable.
+    None => NonZeroU32::MIN,
+};
+
+/// Default cap (16 MiB) on the total payload bytes retained in a streamed
+/// response's replay log.
+pub(crate) const DEFAULT_MAX_EVENT_BYTES: NonZeroU64 = match NonZeroU64::new(16 * 1024 * 1024) {
+    Some(bytes) => bytes,
+    // 16 MiB is non-zero, so this arm is unreachable.
+    None => NonZeroU64::MIN,
+};
+
+/// Serde default for [`ResponseStoreConfig::max_event_count`].
+const fn default_max_event_count() -> NonZeroU32 {
+    DEFAULT_MAX_EVENT_COUNT
+}
+
+/// Serde default for [`ResponseStoreConfig::max_event_bytes`].
+const fn default_max_event_bytes() -> NonZeroU64 {
+    DEFAULT_MAX_EVENT_BYTES
+}
 
 // -----------------------------------------------------------------------------
 // StorageBackend
@@ -113,8 +139,9 @@ pub(crate) struct ResponseStoreConfig {
     ///
     /// By default, DNS names, localhost, loopback, private,
     /// link-local, cloud metadata, unspecified, and Unix socket
-    /// targets are rejected. This opt-in is intended for local
-    /// development and tests.
+    /// targets are rejected. This opt-in is intended for local development
+    /// and tests; cloud metadata, unspecified, and multicast addresses remain
+    /// blocked when it is enabled.
     #[serde(default)]
     pub allow_private_database_url: bool,
 
@@ -132,9 +159,24 @@ pub(crate) struct ResponseStoreConfig {
     /// uncompressed records readable.
     #[serde(default)]
     pub compression: Option<StoreCompressionConfig>,
+
+    /// Maximum number of SSE events retained in a streamed response's replay
+    /// log (`GET /v1/responses/{id}?stream=true`).
+    ///
+    /// A stream that exceeds this stops event capture for that response, so its
+    /// terminal event is never recorded and the response becomes non-replayable.
+    /// The live client stream and the plain JSON record are unaffected.
+    #[serde(default = "default_max_event_count")]
+    pub max_event_count: NonZeroU32,
+
+    /// Maximum total payload bytes retained in a streamed response's replay log.
+    ///
+    /// Same over-budget behavior as `max_event_count`.
+    #[serde(default = "default_max_event_bytes")]
+    pub max_event_bytes: NonZeroU64,
 }
 
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 impl ResponseStoreConfig {
     /// Borrow the `PostgreSQL` TLS settings as a [`PgTlsConfig`].
     pub(crate) fn tls_config(&self) -> PgTlsConfig<'_> {
@@ -178,7 +220,7 @@ pub(crate) fn validate_config(cfg: &ResponseStoreConfig) -> Result<(), FilterErr
             reject_postgres_fields(cfg)?;
         },
         StorageBackend::Postgres => {
-            #[cfg(feature = "store-postgres")]
+            #[cfg(feature = "_store-postgres")]
             validate_postgres_config(cfg, database_url)?;
         },
     }
@@ -187,7 +229,7 @@ pub(crate) fn validate_config(cfg: &ResponseStoreConfig) -> Result<(), FilterErr
 
 /// Reject a configured backend that was not compiled into this binary.
 #[cfg_attr(
-    all(feature = "store-postgres", feature = "store-sqlite"),
+    all(feature = "_store-postgres", feature = "store-sqlite"),
     expect(clippy::unnecessary_wraps, reason = "other feature sets reject unavailable backends")
 )]
 fn validate_backend_available(backend: StorageBackend) -> Result<(), FilterError> {
@@ -199,18 +241,19 @@ fn validate_backend_available(backend: StorageBackend) -> Result<(), FilterError
         .into()),
         #[cfg(feature = "store-sqlite")]
         StorageBackend::Sqlite => Ok(()),
-        #[cfg(not(feature = "store-postgres"))]
+        #[cfg(not(feature = "_store-postgres"))]
         StorageBackend::Postgres => Err(format!(
-            "{FILTER_NAME}: backend 'postgres' is unavailable; rebuild with the 'store-postgres' feature"
+            "{FILTER_NAME}: backend 'postgres' is unavailable; rebuild with the 'store-postgres' or \
+             'store-postgres-cert-auth' feature"
         )
         .into()),
-        #[cfg(feature = "store-postgres")]
+        #[cfg(feature = "_store-postgres")]
         StorageBackend::Postgres => Ok(()),
     }
 }
 
 /// Validate configuration that is specific to the `PostgreSQL` backend.
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 fn validate_postgres_config(cfg: &ResponseStoreConfig, database_url: &str) -> Result<(), FilterError> {
     postgres_url::validate_postgres_database_url(FILTER_NAME, database_url, cfg.allow_private_database_url)?;
     validate_postgres_table_identifiers(&cfg.responses_table, &cfg.conversations_table)
@@ -237,7 +280,7 @@ fn validate_sqlite_database_url(database_url: &str) -> Result<(), FilterError> {
 }
 
 /// Validate `PostgreSQL` TLS options.
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 fn validate_postgres_ssl_config(cfg: &ResponseStoreConfig, database_url: &str) -> Result<(), FilterError> {
     cfg.tls_config().validate(FILTER_NAME, database_url)
 }
@@ -298,7 +341,7 @@ fn sqlite_file_path(database_url: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-#[cfg(any(not(feature = "store-postgres"), not(feature = "store-sqlite")))]
+#[cfg(any(not(feature = "_store-postgres"), not(feature = "store-sqlite")))]
 #[expect(clippy::allow_attributes, reason = "test-only panic assertions")]
 #[allow(clippy::expect_used, reason = "tests")]
 mod backend_availability_tests {
@@ -322,7 +365,7 @@ mod backend_availability_tests {
         assert!(error.to_string().contains("'store-sqlite' feature"), "{error}");
     }
 
-    #[cfg(not(feature = "store-postgres"))]
+    #[cfg(not(feature = "_store-postgres"))]
     #[test]
     fn from_config_rejects_postgres_when_backend_is_not_compiled() {
         let yaml = serde_yaml::from_str(
@@ -337,6 +380,10 @@ mod backend_availability_tests {
             .err()
             .expect("unavailable PostgreSQL backend must fail during construction");
 
-        assert!(error.to_string().contains("'store-postgres' feature"), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("'store-postgres'") && message.contains("'store-postgres-cert-auth'"),
+            "{error}"
+        );
     }
 }

@@ -7,10 +7,10 @@ use std::{collections::HashMap, time::Duration};
 
 use futures::{SinkExt as _, StreamExt as _};
 use praxis_test_utils::{
-    Backend, CapturedWsMessage, StatefulCapturingBackend, TempSqlite, WsBackendEvent, WsServerAction,
-    example_config_path, free_port, http_send, json_post as raw_json_post, parse_body, parse_header, parse_status,
-    patch_yaml, start_backend_with_shutdown, start_echo_backend, start_proxy, start_scripted_websocket_backend,
-    start_stateful_backend,
+    Backend, CapturedWsMessage, McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, WsBackendEvent,
+    WsServerAction, example_config_path, free_port, http_send, json_post as raw_json_post, parse_body, parse_header,
+    parse_status, patch_yaml, start_backend_with_shutdown, start_echo_backend, start_mcp_mock_server_with_config,
+    start_proxy, start_scripted_websocket_backend, start_stateful_backend,
 };
 use serde_json::{Value, json};
 use tokio_tungstenite::{
@@ -79,6 +79,15 @@ fn json_post(path: &str, body: &str) -> String {
     authenticated_request(&raw_json_post(path, body))
 }
 
+/// Build an authenticated JSON request with the full per-user MCP context.
+fn json_post_with_mcp_context(path: &str, body: &str, credential: &str, assertion: &str) -> String {
+    json_post(path, body).replacen(
+        "\r\n\r\n",
+        &format!("\r\nx-user-mcp-key: {credential}\r\nx-mcp-authorized: {assertion}\r\n\r\n"),
+        1,
+    )
+}
+
 /// Send an authenticated GET and return `(status, body)`.
 fn http_get(addr: &str, path: &str, host: Option<&str>) -> (u16, String) {
     let host = host.unwrap_or("localhost");
@@ -104,7 +113,7 @@ fn load_full_flow_config_with_db(
     let patched = patch_yaml(
         &yaml
             .replace("sqlite://responses.db?mode=rwc", db.url())
-            .replace("${WEB_SEARCH_API_KEY}", "test-key"),
+            .replace("env_var: WEB_SEARCH_API_KEY", "value: test-key"),
         proxy_port,
         port_map,
     );
@@ -123,7 +132,7 @@ fn load_full_flow_agentic_config(
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let yaml = yaml
         .replace("sqlite://responses.db?mode=rwc", db.url())
-        .replace("${WEB_SEARCH_API_KEY}", "test-key");
+        .replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(&yaml, proxy_port, port_map);
     let config = praxis_core::config::Config::from_yaml(&patched)
         .unwrap_or_else(|e| panic!("parse full-flow-agentic.yaml: {e}"));
@@ -151,8 +160,8 @@ fn full_flow_validates_before_parsing_tools() {
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let validate = yaml
-        .find("      - filter: openai_responses_validate")
-        .expect("full-flow config should validate managed requests");
+        .find("      - filter: openai_responses_request")
+        .expect("full-flow config should process managed create requests");
     let tool_parse = yaml
         .find("      - filter: openai_tool_parse")
         .expect("full-flow config should parse tools for managed requests");
@@ -175,7 +184,7 @@ async fn full_flow_resolves_rehydrated_files_before_proxy() {
     let patched = patch_yaml(
         &yaml
             .replace("sqlite://responses.db?mode=rwc", db.url())
-            .replace("${WEB_SEARCH_API_KEY}", "test-key"),
+            .replace("env_var: WEB_SEARCH_API_KEY", "value: test-key"),
         proxy_port,
         &HashMap::from([
             ("127.0.0.1:9999", files_api_port),
@@ -264,7 +273,7 @@ fn full_flow_openai_provider_passes_conversations_through() {
         .expect("example config should exist");
     let yaml = route_conversations_to_openai(&yaml)
         .replace("sqlite://responses.db?mode=rwc", db.url())
-        .replace("${WEB_SEARCH_API_KEY}", "test-key");
+        .replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", backend.port())]));
     let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
     let proxy = start_proxy(&config);
@@ -485,17 +494,143 @@ fn full_flow_managed_chat_backend_translates_after_binding() {
     );
 }
 
+/// Native Chat Completions ingress reaches the direct Chat backend raw. A
+/// `POST /v1/chat/completions` body is bound by the EXACT-path route to
+/// `chat-ingress-backend` (application_provider direct) and dispatched through
+/// the direct-services terminal branch — no Responses translation, no IRR. The
+/// native model-rewrite instance (B) rewrites the body `model` via its
+/// `codex-*` alias before the bind, so the backend receives the Chat-shaped body
+/// verbatim with the rewritten target and the client gets the backend response
+/// unchanged. This is the witness the shared gateway goal depends on: a Chat
+/// request must land on the Chat backend, not fall through to the Responses path.
 #[test]
-fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
-    let backend_guard = start_backend_with_shutdown("inference-backend");
+fn full_flow_native_chat_ingress_reaches_chat_backend_raw() {
+    let chat_response = json!({
+        "id": "chatcmpl_native",
+        "object": "chat.completion",
+        "created": 1000,
+        "model": "llama-3.3-70b",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "pong"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
     let proxy_port = free_port();
-    let db = TempSqlite::new("full_flow_chat_body_404");
+    let db = TempSqlite::new("full_flow_native_chat_ingress");
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let proxy = start_proxy(&config);
 
-    let config = load_full_flow_config_with_db(
-        proxy_port,
-        &db,
-        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/chat/completions",
+            r#"{"model":"codex-mini","messages":[{"role":"user","content":"ping"}]}"#,
+        ),
     );
+
+    assert_eq!(parse_status(&raw), 200, "native chat ingress should complete: {raw}");
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("client response should be JSON");
+    assert_eq!(
+        response, chat_response,
+        "direct chat passthrough must return the backend response verbatim"
+    );
+
+    let requests = backend.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "native chat ingress makes exactly one backend request"
+    );
+    assert_eq!(
+        requests[0].uri, "/v1/chat/completions",
+        "native chat ingress must reach the Chat backend path unchanged"
+    );
+    let forwarded: Value = serde_json::from_str(&requests[0].body).expect("backend request should be JSON");
+    assert!(
+        forwarded.get("messages").is_some(),
+        "the raw Chat body must pass through without Responses translation"
+    );
+    assert!(
+        forwarded.get("input").is_none(),
+        "no Responses translation runs on the native Chat path"
+    );
+    assert_eq!(
+        forwarded["model"], "llama-3.3-70b",
+        "native model-rewrite (instance B) must retarget the codex-* alias before the bind"
+    );
+}
+
+/// The identity model-rewrite (instance A) is semantically unchanged end to end.
+/// A `vllm-chat` Responses create matches the identity alias `vllm-chat ->
+/// vllm-chat`: the rewrite marks the body mutated and re-serializes it, but the
+/// model VALUE is preserved. The witness confirms the backend still receives
+/// `model: vllm-chat` after Responses->Chat translation — the identity rewrite
+/// neither drops nor rewrites the model the deployment advertises.
+#[test]
+fn full_flow_identity_model_rewrite_preserves_model_value() {
+    let chat_response = json!({
+        "id": "chatcmpl_identity",
+        "object": "chat.completion",
+        "created": 1000,
+        "model": "vllm-chat",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_identity_rewrite");
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"vllm-chat","input":"hello","store":false}"#,
+        ),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "identity-aliased request should complete: {raw}"
+    );
+
+    let requests = backend.requests();
+    assert_eq!(requests.len(), 1, "single-pass IRR should make one inference request");
+    assert_eq!(requests[0].uri, "/v1/chat/completions");
+    let translated: Value = serde_json::from_str(&requests[0].body).expect("backend request should be JSON");
+    assert_eq!(
+        translated["model"], "vllm-chat",
+        "the identity alias must preserve the advertised model value end to end"
+    );
+}
+
+#[test]
+fn full_flow_chat_completions_body_on_responses_path_is_treated_as_responses() {
+    // #1602: a matched `POST /v1/responses` keeps the application protocol and
+    // operation ID published by `ai_operation`, regardless of body shape. A
+    // Chat Completions-shaped body is therefore still classified
+    // `openai_responses`, so it routes by model through the Responses catch-all
+    // to the shared inference backend instead of missing the format-constrained
+    // route (the pre-#1602 404).
+    let backend = StatefulCapturingBackend::new(vec![(
+        200,
+        r#"{"id":"resp_chat_body","created_at":1000,"model":"gpt-4","object":"response","status":"completed","output":[]}"#
+            .to_owned(),
+    )])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_chat_body_as_responses");
+
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
     let proxy = start_proxy(&config);
 
     let raw = http_send(
@@ -506,34 +641,43 @@ fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
         ),
     );
 
-    // The bypass carrier's `unless` gate is a positive allow-list of one
-    // format: a Chat Completions body is not classified openai_responses, so it
-    // runs the carrier and hits the bypass route-miss (no WebSocket Upgrade
-    // header on POST /v1/responses) rather than reaching the IRR.
     assert_eq!(
         parse_status(&raw),
-        404,
-        "a Chat Completions body must not match the format-constrained route"
+        200,
+        "a Chat Completions body on /v1/responses must be treated as Responses and reach the backend: {raw}"
+    );
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("backend response should be valid JSON");
+    assert_eq!(
+        response["id"], "resp_chat_body",
+        "the body must route by model to the shared inference backend, not miss the route"
+    );
+    let requests = backend.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the matched Responses operation must reach the backend once"
     );
 }
 
 #[test]
-fn full_flow_anthropic_messages_body_on_responses_path_does_not_reach_backend() {
-    let backend_guard = start_backend_with_shutdown("inference-backend");
+fn full_flow_anthropic_messages_body_on_responses_path_is_treated_as_responses() {
+    // #1602: body shape does not override operation identity. An Anthropic
+    // Messages-shaped body on `POST /v1/responses` is still the matched
+    // Responses create, so it routes by model through the catch-all to the
+    // shared inference backend rather than falling off the format-constrained
+    // route.
+    let backend = StatefulCapturingBackend::new(vec![(
+        200,
+        r#"{"id":"resp_anthropic_body","created_at":1000,"model":"claude-3-5-sonnet","object":"response","status":"completed","output":[]}"#
+            .to_owned(),
+    )])
+    .start_with_shutdown();
     let proxy_port = free_port();
-    let db = TempSqlite::new("full_flow_anthropic_body_404");
+    let db = TempSqlite::new("full_flow_anthropic_body_as_responses");
 
-    let config = load_full_flow_config_with_db(
-        proxy_port,
-        &db,
-        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
-    );
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
     let proxy = start_proxy(&config);
 
-    // An Anthropic Messages body posted to /v1/responses is classified
-    // anthropic_messages, not openai_responses. The same allow-list gate that
-    // rejects a Chat Completions body must reject this one — the catch-all is
-    // structural (allow only openai_responses), not a per-format reject rule.
     let raw = http_send(
         proxy.addr(),
         &json_post(
@@ -544,15 +688,26 @@ fn full_flow_anthropic_messages_body_on_responses_path_does_not_reach_backend() 
 
     assert_eq!(
         parse_status(&raw),
-        404,
-        "an Anthropic Messages body must not match the format-constrained route"
+        200,
+        "an Anthropic Messages body on /v1/responses must be treated as Responses and reach the backend: {raw}"
+    );
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("backend response should be valid JSON");
+    assert_eq!(
+        response["id"], "resp_anthropic_body",
+        "the body must route by model to the shared inference backend, not miss the route"
+    );
+    let requests = backend.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the matched Responses operation must reach the backend once"
     );
 }
 
 /// Streaming persistence and retrieval, end to end. A `stream: true` create
 /// request routes through the IRR, where openai_stream_events accumulates the
 /// native Responses SSE lifecycle into `ResponsesState.response_object`. The
-/// pre-IRR openai_response_store then persists that accumulated object on the
+/// pre-IRR openai_responses_store then persists that accumulated object on the
 /// response path, so the streamed resource is retrievable via
 /// `GET /v1/responses/{id}`. Without the in-IRR accumulator the object stays
 /// null and persistence is silently skipped (the store logs "response_object is
@@ -643,6 +798,258 @@ fn full_flow_streaming_response_is_persisted_and_retrievable() {
     drop(proxy);
 }
 
+/// A completed stream updates the local Conversation even with `store:false`.
+/// A later turn must rehydrate those items from the same on-disk store.
+#[test]
+fn full_flow_streaming_conversation_updates_history() {
+    let stream = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_conversation_stream\",",
+        "\"created_at\":1000,\"model\":\"gpt-4.1\",\"object\":\"response\",",
+        "\"status\":\"in_progress\",\"output\":[]}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_conversation_stream\",",
+        "\"created_at\":1000,\"model\":\"gpt-4.1\",\"object\":\"response\",",
+        "\"status\":\"completed\",\"output\":[{\"type\":\"message\",",
+        "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Sure\"}]}]}}\n\n",
+    );
+    let terminal_start = stream.find("event: response.completed").expect("terminal frame");
+    let (created_chunk, terminal_chunk) = stream.split_at(terminal_start);
+    let backend_guard = Backend::chunked(vec![created_chunk.to_owned(), terminal_chunk.to_owned()])
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_streaming_conversation");
+    let proxy = start_proxy(&load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    ));
+
+    let created_raw = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
+    assert_eq!(
+        parse_status(&created_raw),
+        200,
+        "conversation creation failed: {created_raw}"
+    );
+    let created: Value = serde_json::from_str(&parse_body(&created_raw)).expect("conversation JSON");
+    let conversation_id = created["id"].as_str().expect("conversation id");
+
+    let first = json!({
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": "streamed question"}],
+        "conversation": conversation_id,
+        "stream": true,
+        "store": false,
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &first.to_string()));
+    assert_eq!(parse_status(&raw), 200, "streamed turn failed: {raw}");
+    assert!(parse_body(&raw).contains("event: response.completed"));
+
+    let (status, items_body) = http_get(
+        proxy.addr(),
+        &format!("/v1/conversations/{conversation_id}/items?order=asc"),
+        None,
+    );
+    assert_eq!(status, 200, "item list failed: {items_body}");
+    let listed: Value = serde_json::from_str(&items_body).expect("item list JSON");
+    let items = listed["data"].as_array().expect("item array");
+    assert_eq!(items.len(), 2, "streamed input and output must be appended once");
+    assert_eq!(items[0]["content"][0]["text"], "streamed question");
+    assert_eq!(items[1]["content"][0]["text"], "Sure");
+
+    drop(proxy);
+    drop(backend_guard);
+    let stored_sse = stream.replace("resp_conversation_stream", "resp_conversation_store");
+    let terminal_start = stored_sse.find("event: response.completed").expect("terminal frame");
+    let (created_chunk, terminal_chunk) = stored_sse.split_at(terminal_start);
+    let stored_backend = Backend::chunked(vec![created_chunk.to_owned(), terminal_chunk.to_owned()])
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy = start_proxy(&load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([("127.0.0.1:3001", stored_backend.port())]),
+    ));
+
+    let stored_turn = json!({
+        "model": "gpt-4.1",
+        "input": "stored question",
+        "conversation": conversation_id,
+        "stream": true,
+        "store": true,
+    });
+    let stored_raw = http_send(proxy.addr(), &json_post("/v1/responses", &stored_turn.to_string()));
+    assert_eq!(parse_status(&stored_raw), 200, "stored stream failed: {stored_raw}");
+    let stored_stream = parse_body(&stored_raw);
+    assert!(
+        stored_stream.contains("event: response.completed"),
+        "stored stream lacked completion: {stored_stream}"
+    );
+    let (status, stored_body) = http_get(proxy.addr(), "/v1/responses/resp_conversation_store", None);
+    assert_eq!(status, 200, "stored stream should be retrievable: {stored_body}");
+    let (status, replay_body) = http_get(proxy.addr(), "/v1/responses/resp_conversation_store?stream=true", None);
+    assert_eq!(status, 200, "stored stream should be replayable: {replay_body}");
+    assert!(replay_body.contains("event: response.completed"));
+
+    let (status, items_body) = http_get(
+        proxy.addr(),
+        &format!("/v1/conversations/{conversation_id}/items?order=asc"),
+        None,
+    );
+    assert_eq!(status, 200, "second item list failed: {items_body}");
+    let listed: Value = serde_json::from_str(&items_body).expect("item list JSON");
+    let items = listed["data"].as_array().expect("item array");
+    assert_eq!(items.len(), 4, "both streamed turns must append once");
+    assert_eq!(items[2]["content"][0]["text"], "stored question");
+    assert_eq!(items[3]["content"][0]["text"], "Sure");
+
+    drop(proxy);
+    drop(stored_backend);
+    let echo_backend = start_echo_backend();
+    let proxy = start_proxy(&load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([("127.0.0.1:3001", echo_backend.port())]),
+    ));
+    let second = json!({
+        "model": "gpt-4.1",
+        "input": "next question",
+        "conversation": conversation_id,
+        "store": false,
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &second.to_string()));
+    assert_eq!(parse_status(&raw), 200, "next turn failed: {raw}");
+    let outbound: Value = serde_json::from_str(&parse_body(&raw)).expect("echoed request JSON");
+    assert!(
+        outbound.get("conversation").is_none(),
+        "local selector must be stripped"
+    );
+    let input = outbound["input"].as_array().expect("rehydrated input array");
+    let input_text = serde_json::to_string(input).expect("input serialization");
+    assert!(
+        input_text.contains("streamed question"),
+        "missing streamed input: {input_text}"
+    );
+    assert!(input_text.contains("Sure"), "missing streamed output: {input_text}");
+    assert!(input_text.contains("next question"), "missing next input: {input_text}");
+}
+
+/// A tool-limit completion arrives as a local IRR chunk before the empty EOS.
+/// Its terminal must still commit the streamed turn to the Conversation.
+#[test]
+fn full_flow_local_stream_completion_updates_conversation() {
+    let search_call = json!({
+        "type": "web_search_call",
+        "id": "ws_conversation_local",
+        "status": "completed",
+        "action": {"type": "search", "query": "weather"},
+    });
+    let created = json!({
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {
+            "id": "resp_conversation_local",
+            "created_at": 1000,
+            "model": "gpt-4.1",
+            "object": "response",
+            "status": "in_progress",
+            "output": [],
+        },
+    });
+    let completed = json!({
+        "type": "response.completed",
+        "sequence_number": 1,
+        "response": {
+            "id": "resp_conversation_local",
+            "created_at": 1000,
+            "model": "gpt-4.1",
+            "object": "response",
+            "status": "completed",
+            "output": [search_call],
+        },
+    });
+    let backend = Backend::chunked(vec![
+        format!("event: response.created\ndata: {created}\n\n"),
+        format!("event: response.completed\ndata: {completed}\n\n"),
+    ])
+    .header("content-type", "text/event-stream")
+    .start_with_shutdown();
+    // The full-flow config screens new local tool results through NeMo before
+    // model re-entry. With `max_tool_calls: 0` the web_search result resolves as
+    // `failed`, which is still a model-facing output and is therefore checked, so
+    // the guardrail phase needs a reachable endpoint that approves it.
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"ok"}"#.to_owned())])
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_local_stream_conversation");
+    let proxy = start_proxy(&load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([("127.0.0.1:3001", backend.port()), ("127.0.0.1:3003", nemo.port())]),
+    ));
+
+    let created_raw = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
+    assert_eq!(
+        parse_status(&created_raw),
+        200,
+        "conversation creation failed: {created_raw}"
+    );
+    let created: Value = serde_json::from_str(&parse_body(&created_raw)).expect("conversation JSON");
+    let conversation_id = created["id"].as_str().expect("conversation id");
+    let turn = json!({
+        "model": "gpt-4.1",
+        "input": "search the weather",
+        "conversation": conversation_id,
+        "stream": true,
+        "store": false,
+        "max_tool_calls": 0,
+        "tools": [{"type": "web_search_preview"}],
+    });
+    let request =
+        json_post("/v1/responses", &turn.to_string()).replacen("\r\n\r\n", "\r\nx-user-brave-key: test-key\r\n\r\n", 1);
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&raw), 200, "local completion failed: {raw}");
+    assert!(
+        parse_body(&raw).contains("event: response.completed"),
+        "missing local terminal: {raw}"
+    );
+
+    let (status, items_body) = http_get(
+        proxy.addr(),
+        &format!("/v1/conversations/{conversation_id}/items?order=asc"),
+        None,
+    );
+    assert_eq!(status, 200, "item list failed: {items_body}");
+    let listed: Value = serde_json::from_str(&items_body).expect("item list JSON");
+    let items = listed["data"].as_array().expect("item array");
+    assert_eq!(
+        items.len(),
+        2,
+        "local terminal and EOS must append exactly once: {items_body}"
+    );
+    assert_eq!(items[0]["content"][0]["text"], "search the weather");
+    assert_eq!(items[1]["type"], "web_search_call");
+
+    // The guardrail phase must actually screen the failed web-search result
+    // before it re-enters the model; a test that never asserts the NeMo call
+    // would still pass if that phase were removed.
+    let nemo_requests = nemo.requests();
+    assert_eq!(
+        nemo_requests.len(),
+        1,
+        "NeMo must screen the failed web-search result exactly once",
+    );
+    let screened = &nemo_requests[0];
+    assert_eq!(screened.method, "POST", "guardrail callout must POST to NeMo");
+    assert_eq!(screened.uri, "/v1/checks", "guardrail callout must target /v1/checks");
+    assert!(
+        screened.body.contains("max_tool_calls was exhausted"),
+        "NeMo request must carry the failed web-search result: {}",
+        screened.body,
+    );
+}
+
 /// A chunked non-streaming Responses body must remain buffered until the
 /// response store sees EOS. `openai_conversations` is composed in this example
 /// but append-back is unarmed without a conversation request; it must not
@@ -651,7 +1058,8 @@ fn full_flow_streaming_response_is_persisted_and_retrievable() {
 fn full_flow_chunked_response_is_persisted_and_retrievable() {
     let response = FIRST_RESPONSE_JSON;
     let split_at = response.len() / 2;
-    let backend_guard = Backend::chunked(vec![response[..split_at].to_owned(), response[split_at..].to_owned()])
+    let (first_chunk, second_chunk) = response.split_at(split_at);
+    let backend_guard = Backend::chunked(vec![first_chunk.to_owned(), second_chunk.to_owned()])
         .header("content-type", "application/json")
         .start_with_shutdown();
     let proxy_port = free_port();
@@ -694,7 +1102,7 @@ async fn full_flow_previous_response_id_rebuilds_body_with_history() {
     let db = TempSqlite::new("full_flow_prev");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
-    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
+    let yaml = yaml.replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
@@ -775,7 +1183,7 @@ async fn full_flow_previous_response_id_restored_in_client_response() {
     let db = TempSqlite::new("full_flow_prev_restore");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
-    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
+    let yaml = yaml.replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
@@ -849,7 +1257,7 @@ async fn full_flow_previous_response_id_restored_in_streaming_response() {
     let db = TempSqlite::new("full_flow_prev_restore_stream");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
-    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
+    let yaml = yaml.replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
@@ -936,7 +1344,7 @@ async fn full_flow_encoded_response_passes_through_untouched() {
     let db = TempSqlite::new("full_flow_encoded_passthrough");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
-    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
+    let yaml = yaml.replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
@@ -1019,7 +1427,7 @@ async fn full_flow_response_with_validators_drops_stale_validator_on_rewrite() {
     let db = TempSqlite::new("full_flow_validators_passthrough");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
-    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
+    let yaml = yaml.replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(
         &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
         proxy_port,
@@ -1417,6 +1825,121 @@ fn full_flow_agentic_single_pass_completes() {
 }
 
 #[test]
+fn full_flow_agentic_web_search_result_passes_guardrail_before_reentry() {
+    let first_model_response = json!({
+        "id": "resp_web_search",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_full_flow",
+            "status": "completed",
+            "action": {"type": "search", "query": "Praxis proxy"}
+        }],
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+    });
+    let final_model_response = json!({
+        "id": "resp_web_search_final",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "id": "msg_web_search_final",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Praxis is a proxy.", "annotations": []}]
+        }],
+        "usage": {"input_tokens": 20, "output_tokens": 7, "total_tokens": 27}
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first_model_response.to_string()),
+        (200, final_model_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let search = StatefulCapturingBackend::new(vec![(
+        200,
+        json!({
+            "web": {"results": [{
+                "title": "Praxis proxy",
+                "url": "https://praxis-proxy.github.io/",
+                "description": "A secure programmable proxy."
+            }]}
+        })
+        .to_string(),
+    )])
+    .start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"safe"}"#.to_owned())])
+        .start_with_shutdown();
+
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_agentic_web_search_guardrail");
+    let path = example_config_path("openai/responses/full-flow-agentic.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db.url()).replace(
+        "env_var: WEB_SEARCH_API_KEY",
+        &format!(
+            "value: test-key\n                base_url: http://127.0.0.1:{}",
+            search.port()
+        ),
+    );
+    let patched = patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model.port()), ("127.0.0.1:3003", nemo.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let request = json!({
+        "model": "gpt-4.1",
+        "input": "Search for Praxis proxy",
+        "tools": [{"type": "web_search_preview"}]
+    });
+    let request = json_post("/v1/responses", &request.to_string()).replacen(
+        "Content-Type: application/json",
+        "x-user-brave-key: test-key\r\nContent-Type: application/json",
+        1,
+    );
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(parse_status(&raw), 200, "web-search round trip failed: {raw}");
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    assert_eq!(response["id"], "resp_web_search_final");
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "a passing web-search result should reach inference round two"
+    );
+    let second_input = serde_json::from_str::<Value>(&model.requests()[1].body).expect("second inference JSON");
+    assert!(
+        second_input["input"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| {
+                item["type"] == "function_call_output"
+                    && item["output"]
+                        .as_str()
+                        .is_some_and(|output| output.contains("praxis-proxy.github.io"))
+            })),
+        "the checked web-search result should reach inference round two: {second_input:#}"
+    );
+
+    let search_requests = search.requests();
+    assert_eq!(search_requests.len(), 1, "the web-search dispatcher should run once");
+    assert_eq!(
+        nemo.requests().len(),
+        1,
+        "NeMo should check the new web-search result once"
+    );
+    let check: Value = serde_json::from_str(&nemo.requests()[0].body).expect("NeMo request JSON");
+    assert!(
+        check["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("praxis-proxy.github.io")),
+        "NeMo should receive the newly produced web-search result: {check:#}"
+    );
+}
+
+#[test]
 fn full_flow_agentic_file_search_round_trip() {
     let first_model_response = json!({
         "id": "resp_search",
@@ -1462,10 +1985,16 @@ fn full_flow_agentic_file_search_round_trip() {
         }]
     });
     let search = StatefulCapturingBackend::new(vec![(200, search_response.to_string())]).start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"safe"}"#.to_owned())])
+        .start_with_shutdown();
     let proxy_port = free_port();
     let (config, _db) = load_full_flow_agentic_config(
         proxy_port,
-        &HashMap::from([("127.0.0.1:3001", model.port()), ("127.0.0.1:3002", search.port())]),
+        &HashMap::from([
+            ("127.0.0.1:3001", model.port()),
+            ("127.0.0.1:3002", search.port()),
+            ("127.0.0.1:3003", nemo.port()),
+        ]),
     );
     let proxy = start_proxy(&config);
 
@@ -1487,6 +2016,23 @@ fn full_flow_agentic_file_search_round_trip() {
     assert_eq!(response["output"][0]["type"], "file_search_call");
     assert_eq!(response["output"][0]["status"], "completed");
     assert_eq!(response["output"][1]["type"], "message");
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "a passing file-search result should reach inference round two"
+    );
+
+    let checks = nemo.requests();
+    assert_eq!(checks.len(), 1, "the local file-search result should be checked once");
+    assert_eq!(checks[0].uri, "/v1/checks");
+    let check: Value = serde_json::from_str(&checks[0].body).expect("NeMo request should contain JSON");
+    assert_eq!(check["messages"][0]["role"], "user");
+    assert!(
+        check["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Q4 revenue was $42 million")),
+        "NeMo should receive the newly produced file-search result: {check:#}"
+    );
 
     for request in model.requests() {
         let headers = request.headers.to_lowercase();
@@ -1585,6 +2131,32 @@ fn full_flow_agentic_non_responses_path_bypasses_irr() {
     );
 }
 
+/// Flatten every filter the gateway listener composes, in the listener's
+/// declared chain order, into one owned sequence. The full-flow config expresses
+/// its pipeline as three named chains (`ingress-and-binding`, `managed-responses`,
+/// `managed-execution`) so the shared managed-provider gate is inherited once at
+/// the chain level (praxis #1280). Tests that reason about the whole pipeline —
+/// filter presence, relative order across the binding boundary — must see that
+/// composed view rather than a single chain.
+fn flatten_listener_pipeline(config: &serde_yaml::Value) -> Vec<serde_yaml::Value> {
+    let chains = config["filter_chains"]
+        .as_sequence()
+        .expect("config should declare filter_chains");
+    config["listeners"][0]["filter_chains"]
+        .as_sequence()
+        .expect("listener should declare filter_chains")
+        .iter()
+        .flat_map(|name| {
+            let name = name.as_str().expect("chain name should be a string");
+            let chain = chains
+                .iter()
+                .find(|chain| chain["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("listener references unknown chain '{name}'"));
+            chain["filters"].as_sequence().cloned().unwrap_or_default()
+        })
+        .collect()
+}
+
 #[test]
 fn full_flow_agentic_irr_step_contains_all_hosted_tool_dispatchers() {
     // The agentic IRR must execute every hosted tool the loop owner can
@@ -1594,9 +2166,8 @@ fn full_flow_agentic_irr_step_contains_all_hosted_tool_dispatchers() {
     let path = example_config_path("openai/responses/full-flow-agentic.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("config should be valid YAML");
-    let irr = config["filter_chains"][0]["filters"]
-        .as_sequence()
-        .expect("filter chain should contain filters")
+    let pipeline = flatten_listener_pipeline(&config);
+    let irr = pipeline
         .iter()
         .find(|filter| filter["filter"].as_str() == Some("iterative_request_router"))
         .expect("config should contain an iterative_request_router");
@@ -1608,9 +2179,9 @@ fn full_flow_agentic_irr_step_contains_all_hosted_tool_dispatchers() {
         .collect();
 
     for dispatcher in [
-        "openai_web_search",
+        "openai_web_search_dispatch",
         "openai_mcp_dispatch",
-        "openai_file_search_callout",
+        "openai_file_search_dispatch",
         "openai_agentic_loop",
     ] {
         assert!(
@@ -1625,9 +2196,7 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
     let path = example_config_path("openai/responses/full-flow-agentic.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("config should be valid YAML");
-    let outer_filters = config["filter_chains"][0]["filters"]
-        .as_sequence()
-        .expect("outer filter chain should contain filters");
+    let outer_filters = flatten_listener_pipeline(&config);
     let credentials_index = outer_filters
         .iter()
         .position(|filter| filter["filter"].as_str() == Some("callout_credentials"))
@@ -1682,8 +2251,8 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
         .as_sequence()
         .expect("IRR inference step should contain filters")
         .iter()
-        .find(|filter| filter["filter"].as_str() == Some("openai_web_search"))
-        .expect("IRR inference step should contain openai_web_search");
+        .find(|filter| filter["filter"].as_str() == Some("openai_web_search_dispatch"))
+        .expect("IRR inference step should contain openai_web_search_dispatch");
     assert_eq!(
         web_search["user_credential"].as_str(),
         Some("brave_search"),
@@ -1704,8 +2273,8 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
         .as_sequence()
         .expect("IRR inference step should contain filters")
         .iter()
-        .find(|filter| filter["filter"].as_str() == Some("openai_file_search_callout"))
-        .expect("IRR inference step should contain openai_file_search_callout");
+        .find(|filter| filter["filter"].as_str() == Some("openai_file_search_dispatch"))
+        .expect("IRR inference step should contain openai_file_search_dispatch");
     assert_eq!(file_search["user_credential"].as_str(), Some("ogx_files"));
 
     let mcp_resolve = outer_filters
@@ -1714,6 +2283,7 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
         .expect("outer chain should contain openai_mcp_tool_resolve");
     assert_eq!(mcp_resolve["user_credential"].as_str(), Some("mcp_gateway"));
     assert_eq!(mcp_resolve["authorization_assertion"].as_str(), Some("mcp_gateway"));
+    assert_eq!(mcp_resolve["require_connector"].as_bool(), Some(true));
     let mcp_dispatch = outer_filters[irr_index]["steps"][0]["filters"]
         .as_sequence()
         .expect("IRR inference step should contain filters")
@@ -1722,6 +2292,154 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
         .expect("IRR inference step should contain openai_mcp_dispatch");
     assert_eq!(mcp_dispatch["user_credential"].as_str(), Some("mcp_gateway"));
     assert_eq!(mcp_dispatch["authorization_assertion"].as_str(), Some("mcp_gateway"));
+}
+
+#[test]
+fn full_flow_mcp_connector_only_assertion_reaches_discovery_and_call() {
+    let model = StatefulCapturingBackend::new(vec![
+        (
+            200,
+            json!({
+                "id": "resp_mcp_call",
+                "created_at": 1000,
+                "model": "gpt-4.1",
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "type": "function_call",
+                    "id": "fc_mcp_call",
+                    "call_id": "call_mcp_weather",
+                    "name": "weather__get_weather",
+                    "arguments": r#"{"location":"SF"}"#,
+                    "status": "completed"
+                }]
+            })
+            .to_string(),
+        ),
+        (
+            200,
+            json!({
+                "id": "resp_mcp_final",
+                "created_at": 2000,
+                "model": "gpt-4.1",
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "The weather in SF is 72F."}]
+                }]
+            })
+            .to_string(),
+        ),
+    ])
+    .start_with_shutdown();
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+    let direct = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+    let nemo = start_backend_with_shutdown(r#"{"status":"passed","content":"safe"}"#);
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_mcp_connector_only");
+    let config = load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([
+            ("127.0.0.1:3001", model.port()),
+            ("127.0.0.1:8001", mcp.port()),
+            ("127.0.0.1:3003", nemo.port()),
+        ]),
+    );
+    let proxy = start_proxy(&config);
+
+    let request = json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "connector_id": "trusted-mcp",
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_mcp_context(
+            "/v1/responses",
+            &request.to_string(),
+            "integration-mcp-key",
+            "Bearer integration-mcp-assertion",
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "connector round trip should succeed: {raw}");
+
+    let requests = mcp.received_requests();
+    let assertion_values: Vec<&str> = ["initialize", "tools/list", "tools/call"]
+        .into_iter()
+        .map(|method| {
+            let request = requests
+                .iter()
+                .find(|request| request.json_rpc_method.as_deref() == Some(method))
+                .unwrap_or_else(|| panic!("configured connector should receive {method}"));
+            let authorization = request
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .map(|(_, value)| value.as_str());
+            assert_eq!(
+                authorization,
+                Some("Bearer integration-mcp-key"),
+                "{method} should carry the caller's bearer credential"
+            );
+            request
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("x-mcp-authorized"))
+                .map(|(_, value)| value.as_str())
+                .unwrap_or_else(|| panic!("{method} should carry x-mcp-authorized"))
+        })
+        .collect();
+    assert_eq!(assertion_values[0], "Bearer integration-mcp-assertion");
+    assert!(
+        assertion_values.windows(2).all(|values| values[0] == values[1]),
+        "discovery and execution must observe the same assertion: {assertion_values:?}"
+    );
+    assert_eq!(mcp.tool_call_count("get_weather"), 1);
+
+    let direct_request = json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather in SF?",
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", direct.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_mcp_context(
+            "/v1/responses",
+            &direct_request.to_string(),
+            "integration-mcp-key",
+            "Bearer integration-mcp-assertion",
+        ),
+    );
+    assert_eq!(parse_status(&raw), 400, "direct server_url must be rejected: {raw}");
+    assert!(
+        parse_body(&raw).contains("Use an administrator-configured connector_id instead."),
+        "direct server_url rejection should be bounded and client-visible"
+    );
+    assert!(
+        direct.received_requests().is_empty(),
+        "a rejected direct destination must receive no HTTP request at all"
+    );
 }
 
 #[test]
@@ -1782,10 +2500,16 @@ fn full_flow_agentic_connection_nominated_header_not_forwarded() {
         }]
     });
     let search = StatefulCapturingBackend::new(vec![(200, search_response.to_string())]).start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"safe"}"#.to_owned())])
+        .start_with_shutdown();
     let proxy_port = free_port();
     let (config, _db) = load_full_flow_agentic_config(
         proxy_port,
-        &HashMap::from([("127.0.0.1:3001", model.port()), ("127.0.0.1:3002", search.port())]),
+        &HashMap::from([
+            ("127.0.0.1:3001", model.port()),
+            ("127.0.0.1:3002", search.port()),
+            ("127.0.0.1:3003", nemo.port()),
+        ]),
     );
     let proxy = start_proxy(&config);
 
@@ -1802,6 +2526,16 @@ fn full_flow_agentic_connection_nominated_header_not_forwarded() {
     let raw = http_send(proxy.addr(), &request);
 
     assert_eq!(parse_status(&raw), 200, "round trip should succeed: {raw}");
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "the checked result should re-enter inference"
+    );
+    assert_eq!(
+        nemo.requests().len(),
+        1,
+        "NeMo should check the file-search result once"
+    );
     let search_requests = search.requests();
     let search_callouts: Vec<_> = search_requests.iter().filter(|r| r.method == "POST").collect();
     assert_eq!(search_callouts.len(), 1, "expected one vector store callout");
@@ -1890,7 +2624,7 @@ fn ws_full_flow_config(
         .expect("example config should exist");
     let yaml = yaml
         .replace("sqlite://responses.db?mode=rwc", db.url())
-        .replace("${WEB_SEARCH_API_KEY}", "test-key");
+        .replace("env_var: WEB_SEARCH_API_KEY", "value: test-key");
     let patched = patch_yaml(&yaml, proxy_port, ports);
     let config = praxis_core::config::Config::from_yaml(&patched).expect("full-flow config should parse");
     (config, db)

@@ -1,12 +1,13 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! External metering filter: pre-request balance checks and post-response
 //! token usage reporting via [`CloudEvents`] to an external metering service.
 //!
 //! Reads token counts from [`filter_metadata`] keys set by the `token_count`
-//! filter (`token.input`, `token.output`, `token.total`, and the prompt cache
-//! breakdown `token.cache_read` / `token.cache_write`). The metering filter
+//! filter (`token.input`, `token.output`, `token.total`, the prompt cache
+//! breakdown `token.cache_read` / `token.cache_write`, and the reasoning
+//! breakdown `token.reasoning`). The metering filter
 //! must be declared *before* `token_count` in the YAML filter chain so that
 //! response hooks (which run in reverse order) execute after token extraction.
 //!
@@ -23,6 +24,7 @@ mod config;
     clippy::indexing_slicing,
     clippy::needless_raw_strings,
     clippy::needless_raw_string_hashes,
+    clippy::panic,
     reason = "tests"
 )]
 mod tests;
@@ -35,7 +37,9 @@ use http::header::HeaderName;
 use metrics::counter;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use praxis_ai_apis::{
+    MODEL_PROVIDER_CLIENT_MODEL_METADATA,
     callout_target::AddressPolicy,
+    credential_source::{self, CredentialSource, DiagnosticContext, SecretHandle, WatchHandle},
     subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
 };
 use praxis_filter::{
@@ -43,8 +47,15 @@ use praxis_filter::{
 };
 use serde::Deserialize;
 use tracing::{debug, trace, warn};
+use zeroize::Zeroizing;
 
 use self::config::{ExternalMeteringConfig, validate_config};
+// Import the token metadata keys from `token_count`, their sole writer, so this
+// reader can never drift to a stale literal and silently meter zero tokens.
+use crate::token_usage::{
+    META_TOKEN_CACHE_READ, META_TOKEN_CACHE_WRITE, META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_REASONING,
+    META_TOKEN_TOTAL,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -65,23 +76,6 @@ pub(crate) const META_METERING_MODEL: &str = "metering.model";
 
 /// Metadata key for the tenant username resolved by external metering.
 pub(crate) const META_METERING_USERNAME: &str = "metering.username";
-
-/// Well-known `filter_metadata` key for input tokens (set by `token_count`).
-const META_TOKEN_INPUT: &str = "token.input";
-
-/// Well-known `filter_metadata` key for output tokens (set by `token_count`).
-const META_TOKEN_OUTPUT: &str = "token.output";
-
-/// Well-known `filter_metadata` key for total tokens (set by `token_count`).
-const META_TOKEN_TOTAL: &str = "token.total";
-
-/// Well-known `filter_metadata` key for prompt cache reads (set by
-/// `token_count`). A breakdown of [`META_TOKEN_INPUT`], not an addition to it.
-const META_TOKEN_CACHE_READ: &str = "token.cache_read";
-
-/// Well-known `filter_metadata` key for prompt cache writes (set by
-/// `token_count`). A breakdown of [`META_TOKEN_INPUT`], not an addition to it.
-const META_TOKEN_CACHE_WRITE: &str = "token.cache_write";
 
 /// Counter incremented whenever a usage or error event fails to reach the
 /// metering service (transport failure or non-2xx acknowledgement).
@@ -138,6 +132,15 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// headers. A higher tier always wins, so forged client headers can
 /// never override verified claims, and identity headers plus client
 /// credentials are always stripped before the request is forwarded.
+/// Both event types carry `data.organization_id` and `data.cost_center`
+/// from `{prefix}organization-id` and `{prefix}cost-center`. When absent,
+/// those fields are empty strings rather than invented defaults.
+///
+/// When no `{prefix}model` identity header names the model and
+/// `model_to_provider` mapped the request, balance checks and usage events use
+/// the client-facing model ID it recorded rather than the provider target.
+/// That filter buffers the request body, so its body pass completes before
+/// this filter's request hook runs the balance check.
 ///
 /// # YAML
 ///
@@ -147,6 +150,7 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// timeout_seconds: 5
 /// feature_key: "inference-tokens"
 /// source: "ai-gateway"
+/// provider: "openai"
 /// fail_open: true
 /// identity_header_prefix: "x-tenant-"
 /// identity_metadata_namespace: "identity"
@@ -157,6 +161,17 @@ pub struct ExternalMeteringFilter {
     /// Connect-time policy for the metering endpoint. Rejects non-public
     /// addresses unless the operator sets `allow_private_endpoint`.
     address_policy: AddressPolicy,
+
+    /// Published handle to the internal metering credential, or `None` when no
+    /// `internal_auth_token` is configured (callouts stay unauthenticated). The
+    /// handle's payload is the pre-assembled `Authorization` header value; a
+    /// `None` payload (post-startup rotation gap) fails the callout closed.
+    auth_token: Option<SecretHandle>,
+
+    /// Retains the file watcher (when the token is `file`-sourced) for the
+    /// filter's lifetime so rotation keeps publishing; dropping it stops the
+    /// watcher. `None` for `value`/`env_var` sources and when no token is set.
+    _auth_watch: Option<WatchHandle>,
 
     /// Model name reported when neither the identity header nor the request
     /// body reveals one.
@@ -182,6 +197,11 @@ pub struct ExternalMeteringFilter {
 
     /// Base URL of the external metering service.
     metering_url: String,
+
+    /// Static provider name for emitted events. Takes precedence over the
+    /// routed cluster name; the only source of provider attribution on the
+    /// ext-proc data path, where `ctx.cluster_name()` is always `None`.
+    provider: Option<String>,
 
     /// `CloudEvents` `source` attribute for emitted events.
     source: String,
@@ -230,8 +250,12 @@ impl ExternalMeteringFilter {
         let cfg: ExternalMeteringConfig = parse_filter_config("external_metering", config)?;
         validate_config(&cfg)?;
 
+        let (auth_token, auth_watch) = build_auth_token(cfg.internal_auth_token.as_ref())?;
+
         Ok(Self {
             address_policy: AddressPolicy::from_allow_private(cfg.allow_private_endpoint),
+            auth_token,
+            _auth_watch: auth_watch,
             default_model: cfg.default_model,
             default_username: cfg.default_username,
             fail_open: cfg.fail_open,
@@ -239,6 +263,7 @@ impl ExternalMeteringFilter {
             identity_header_prefix: cfg.identity_header_prefix.to_ascii_lowercase(),
             identity_metadata_namespace: cfg.identity_metadata_namespace,
             metering_url: cfg.metering_url,
+            provider: cfg.provider,
             source: cfg.source,
             subrequest_client,
             timeout: Duration::from_secs(cfg.timeout_seconds),
@@ -254,23 +279,37 @@ impl ExternalMeteringFilter {
     /// as a denial.
     async fn check_balance(&self, state: &MeteringState) -> FilterAction {
         let url = build_balance_url(&self.metering_url, &state.username, &self.feature_key, &state.model);
-        let request = SubRequest {
-            method: http::Method::GET,
-            uri: http::Uri::default(),
-            headers: http::HeaderMap::new(),
-            body: Bytes::new(),
+        // Resolve the internal-auth header (fail closed if a configured token
+        // is unavailable) before dialing the metering service.
+        let headers = match self.balance_callout_headers(self.auth_header()) {
+            Ok(headers) => headers,
+            Err(action) => return action,
         };
 
-        let result = subrequest::execute_url(
-            &self.subrequest_client,
-            &url,
-            request,
-            MAX_CALLOUT_RESPONSE_BYTES,
-            self.timeout,
-            self.address_policy,
-        )
-        .await;
+        // The metering service URL is operator-configured, so it resolves
+        // through the shared DNS cache.
+        let result = self
+            .subrequest_client
+            .execute_url(
+                &url,
+                balance_probe_request(headers),
+                subrequest::address_policy_hook(self.address_policy),
+                subrequest::UrlResolutionPolicy::OperatorCached,
+                self.timeout,
+                MAX_CALLOUT_RESPONSE_BYTES,
+                None,
+            )
+            .await
+            .map_err(subrequest::map_url_error);
 
+        self.interpret_balance(result)
+    }
+
+    /// Interpret the balance callout transport result into a filter action.
+    ///
+    /// A `2xx` response is a real decision (`hasAccess`); any other status or a
+    /// transport error means the service is misbehaving, handled by `fail_open`.
+    fn interpret_balance(&self, result: Result<SubResponse, SubRequestError>) -> FilterAction {
         match result {
             Ok(resp) if is_success(resp.status) => parse_balance_result(&resp.body, self.fail_open),
             Ok(resp) => {
@@ -294,11 +333,34 @@ impl ExternalMeteringFilter {
         }
     }
 
+    /// Resolve the internal-auth state for an outgoing metering callout from the
+    /// live credential handle.
+    fn auth_header(&self) -> AuthOutcome {
+        let Some(handle) = self.auth_token.as_ref() else {
+            return AuthOutcome::Unauthenticated;
+        };
+        let snapshot = handle.current();
+        auth_outcome_from_payload(snapshot.payload.as_deref().map(String::as_str))
+    }
+
+    /// Resolve the balance callout headers, or the fail-closed action when a
+    /// configured token is currently unavailable — never dial unauthenticated.
+    /// The token gap is treated as a callout failure, so `fail_open` decides.
+    fn balance_callout_headers(&self, outcome: AuthOutcome) -> Result<http::HeaderMap, FilterAction> {
+        authed_headers(outcome).ok_or_else(|| {
+            warn!("internal metering auth token unavailable; balance check failing closed");
+            self.on_metering_unavailable()
+        })
+    }
+
     /// Resolve the model to report: the captured model, else the
     /// body/header metadata, else the configured default.
     fn resolve_report_model(&self, ctx: &HttpFilterContext<'_>, state: &MeteringState) -> String {
         if !state.model.is_empty() {
             return state.model.clone();
+        }
+        if let Some(model) = ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA) {
+            return model.to_owned();
         }
         if let Some(model) = ctx.filter_metadata.get(META_METERING_MODEL) {
             return model.clone();
@@ -306,16 +368,24 @@ impl ExternalMeteringFilter {
         self.default_model.clone().unwrap_or_default()
     }
 
+    /// Resolve the provider to attribute usage to: the static config value,
+    /// else the routed cluster name, else empty.
+    fn resolve_provider<'a>(&'a self, ctx: &'a HttpFilterContext<'_>) -> &'a str {
+        self.provider
+            .as_deref()
+            .or_else(|| ctx.cluster_name())
+            .unwrap_or_default()
+    }
+
     /// Emit the terminal usage or error event for a completed request.
     fn report(&self, ctx: &HttpFilterContext<'_>, mut state: MeteringState) {
         state.model = self.resolve_report_model(ctx, &state);
 
         let request_id = ctx.id_generator.generate(ctx.time_source);
-        let provider = ctx.cluster_name().unwrap_or_default().to_owned();
         let event_ctx = EventContext {
             duration_ms: u64::try_from(state.request_start.elapsed().as_millis()).unwrap_or(u64::MAX),
             event_id: &request_id,
-            provider: &provider,
+            provider: self.resolve_provider(ctx),
             source: &self.source,
             state: &state,
         };
@@ -326,11 +396,19 @@ impl ExternalMeteringFilter {
             build_usage_event(&event_ctx, &TokenCounts::read(ctx))
         };
 
+        // Resolve the callout credential on the filter (not in the spawned
+        // task) so a rotation gap fails the report closed rather than sending
+        // it unauthenticated.
+        let Some(headers) = report_callout_headers(self.auth_header()) else {
+            return;
+        };
+
         spawn_usage_report(
             self.subrequest_client.clone(),
             &self.metering_url,
             self.timeout,
             self.address_policy,
+            headers,
             &event,
         );
     }
@@ -344,6 +422,11 @@ impl HttpFilter for ExternalMeteringFilter {
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let mut state = capture_identity(ctx, &self.identity_header_prefix, &self.identity_metadata_namespace);
+        if state.model.is_empty()
+            && let Some(model) = ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
+        {
+            state.model = model.to_owned();
+        }
 
         if state.username.is_empty() {
             let Some(fallback) = self.default_username.as_ref() else {
@@ -454,6 +537,9 @@ impl HttpFilter for ExternalMeteringFilter {
 /// Identity and timing state captured during the request phase and consumed
 /// during the response phase.
 struct MeteringState {
+    /// Cost center allocated for billing.
+    cost_center: String,
+
     /// Tenant group, falling back to the subscription when absent.
     group: String,
 
@@ -462,6 +548,9 @@ struct MeteringState {
 
     /// Model attributed to this request.
     model: String,
+
+    /// Billing organization identifier.
+    organization_id: String,
 
     /// Start of the request, used to derive the reported duration.
     request_start: std::time::Instant,
@@ -495,6 +584,9 @@ struct TokenCounts {
 
     /// Prompt tokens written to the provider's cache; a subset of `input`.
     cache_write: u64,
+
+    /// Reasoning/thinking tokens; a subset of `output`.
+    reasoning: u64,
 }
 
 impl TokenCounts {
@@ -506,6 +598,7 @@ impl TokenCounts {
             total: read_token_meta(ctx, META_TOKEN_TOTAL),
             cache_read: read_token_meta(ctx, META_TOKEN_CACHE_READ),
             cache_write: read_token_meta(ctx, META_TOKEN_CACHE_WRITE),
+            reasoning: read_token_meta(ctx, META_TOKEN_REASONING),
         }
     }
 }
@@ -562,14 +655,150 @@ fn capture_identity(ctx: &mut HttpFilterContext<'_>, prefix: &str, identity_name
     }
 
     MeteringState {
+        cost_center: identity.cost_center,
         group: identity.group,
         is_error: false,
         model: identity.model,
+        organization_id: identity.organization_id,
         request_start: std::time::Instant::now(),
         response_status: 0,
         subscription: identity.subscription,
         user_agent,
         username: identity.username,
+    }
+}
+
+
+/// Tenant identity as carried on the request headers.
+#[derive(Default)]
+struct Identity {
+    /// Value of `{prefix}cost-center`.
+    cost_center: String,
+
+    /// Value of `{prefix}group`.
+    group: String,
+
+    /// Value of `{prefix}model`.
+    model: String,
+
+    /// Value of `{prefix}organization-id`.
+    organization_id: String,
+
+    /// Value of `{prefix}subscription`.
+    subscription: String,
+
+    /// Value of `{prefix}username`.
+    username: String,
+}
+
+/// Resolve tenant identity from the highest-trust source available.
+///
+/// Three tiers, most trusted first:
+///
+/// 1. Unnamespaced `{prefix}*` metadata keys, written by an authentication filter from verified credentials (e.g. JWT
+///    claims or a validated API key). When any of these are present, every lower tier is ignored entirely so a client
+///    cannot spoof the remaining fields via forged headers alongside valid credentials.
+/// 2. Namespaced `{namespace}.{prefix}*` metadata keys, written by the `identity_header_guard` filter from captured
+///    request headers.
+/// 3. Raw `{prefix}*` request headers, set by a trusted upstream auth layer when neither metadata tier is populated.
+///
+/// Identity headers are always marked for removal so tenant identity
+/// never leaks to the upstream provider, regardless of which tier
+/// supplied the identity.
+fn read_identity_headers(ctx: &mut HttpFilterContext<'_>, prefix: &str, identity_namespace: &str) -> Identity {
+    let mut identity = Identity::default();
+    read_metadata_identity(ctx, prefix, "", &mut identity);
+
+    // Any verified field blocks the lower tiers entirely: an auth filter
+    // may map only some claims (e.g. group without username), and a
+    // partially verified identity must not be extended by forgeable
+    // sources.
+    let has_verified_identity = !(identity.username.is_empty()
+        && identity.group.is_empty()
+        && identity.subscription.is_empty()
+        && identity.model.is_empty()
+        && identity.organization_id.is_empty()
+        && identity.cost_center.is_empty());
+
+    if !has_verified_identity {
+        read_metadata_identity(ctx, prefix, &format!("{identity_namespace}."), &mut identity);
+    }
+
+    let has_metadata_identity = has_verified_identity || !identity.username.is_empty();
+    if has_metadata_identity {
+        strip_identity_headers(ctx, prefix);
+    } else {
+        read_header_identity(ctx, prefix, &mut identity);
+    }
+
+    identity
+}
+
+/// Read the `{namespace}{prefix}*` identity keys from `filter_metadata`,
+/// overwriting only the fields the namespace carries.
+fn read_metadata_identity(ctx: &HttpFilterContext<'_>, prefix_lower: &str, namespace: &str, identity: &mut Identity) {
+    if let Some(val) = ctx.filter_metadata.get(&format!("{namespace}{prefix_lower}group")) {
+        identity.group.clone_from(val);
+    }
+    if let Some(val) = ctx.filter_metadata.get(&format!("{namespace}{prefix_lower}model")) {
+        identity.model.clone_from(val);
+    }
+    if let Some(val) = ctx
+        .filter_metadata
+        .get(&format!("{namespace}{prefix_lower}cost-center"))
+    {
+        identity.cost_center.clone_from(val);
+    }
+    if let Some(val) = ctx
+        .filter_metadata
+        .get(&format!("{namespace}{prefix_lower}organization-id"))
+    {
+        identity.organization_id.clone_from(val);
+    }
+    if let Some(val) = ctx
+        .filter_metadata
+        .get(&format!("{namespace}{prefix_lower}subscription"))
+    {
+        identity.subscription.clone_from(val);
+    }
+    if let Some(val) = ctx.filter_metadata.get(&format!("{namespace}{prefix_lower}username")) {
+        identity.username.clone_from(val);
+    }
+}
+
+/// Read identity from raw `{prefix}*` request headers, marking each one
+/// for removal.
+///
+/// [`HeaderName::as_str`] already returns the lowercased name, so the
+/// pre-lowercased prefix compares directly without per-header allocation.
+fn read_header_identity(ctx: &mut HttpFilterContext<'_>, prefix_lower: &str, identity: &mut Identity) {
+    for (key, value) in &ctx.request.headers {
+        let Some(suffix) = key.as_str().strip_prefix(prefix_lower) else {
+            continue;
+        };
+        let val = value.to_str().unwrap_or_default();
+
+        match suffix {
+            "cost-center" if identity.cost_center.is_empty() => val.clone_into(&mut identity.cost_center),
+            "group" if identity.group.is_empty() => val.clone_into(&mut identity.group),
+            "model" if identity.model.is_empty() => val.clone_into(&mut identity.model),
+            "organization-id" if identity.organization_id.is_empty() => val.clone_into(&mut identity.organization_id),
+            "subscription" if identity.subscription.is_empty() => val.clone_into(&mut identity.subscription),
+            "username" if identity.username.is_empty() => val.clone_into(&mut identity.username),
+            _ => {},
+        }
+
+        ctx.request_headers_to_remove.push(key.clone());
+    }
+}
+
+/// Mark every `{prefix}*` header for removal without reading it, so
+/// unused identity headers still never reach the upstream provider.
+fn strip_identity_headers(ctx: &mut HttpFilterContext<'_>, prefix_lower: &str) {
+    for (key, _) in &ctx.request.headers {
+        if key.as_str().starts_with(prefix_lower) {
+            ctx.request_headers_to_remove.push(key.clone());
+        }
     }
 }
 
@@ -649,16 +878,21 @@ fn reject_unavailable() -> FilterAction {
 /// Deliver an event without blocking the response.
 ///
 /// Metering is an observer: a slow or failing metering service must never add
-/// latency to, or fail, a request the upstream already answered.
+/// latency to, or fail, a request the upstream already answered. `headers`
+/// carries the resolved internal-auth header (empty when unauthenticated),
+/// assembled on the filter before spawning so a credential gap already failed
+/// the report closed by this point.
 #[expect(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "sequential request setup plus the explicit address-policy transport input"
+    reason = "sequential fire-and-forget callout setup with explicit transport inputs and the resolved auth headers; bundling them would only hide the callout's dependencies"
 )]
 fn spawn_usage_report(
     client: SubRequestClient,
     metering_url: &str,
     timeout: Duration,
     address_policy: AddressPolicy,
+    mut headers: http::HeaderMap,
     event: &serde_json::Value,
 ) {
     let url = format!("{}/api/v1/events", metering_url.trim_end_matches('/'));
@@ -671,12 +905,12 @@ fn spawn_usage_report(
         },
     };
 
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+
     tokio::spawn(async move {
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            http::HeaderValue::from_static("application/json"),
-        );
         let request = SubRequest {
             method: http::Method::POST,
             uri: http::Uri::default(),
@@ -684,16 +918,21 @@ fn spawn_usage_report(
             body: Bytes::from(body),
         };
 
+        // The metering service URL is operator-configured, so it resolves
+        // through the shared DNS cache.
         report_delivery(
-            subrequest::execute_url(
-                &client,
-                &url,
-                request,
-                MAX_CALLOUT_RESPONSE_BYTES,
-                timeout,
-                address_policy,
-            )
-            .await,
+            client
+                .execute_url(
+                    &url,
+                    request,
+                    subrequest::address_policy_hook(address_policy),
+                    subrequest::UrlResolutionPolicy::OperatorCached,
+                    timeout,
+                    MAX_CALLOUT_RESPONSE_BYTES,
+                    None,
+                )
+                .await
+                .map_err(subrequest::map_url_error),
         );
     });
 }
@@ -724,8 +963,113 @@ fn is_success(status: u16) -> bool {
 }
 
 // -----------------------------------------------------------------------------
+// Internal Auth Token (issue #1721)
+// -----------------------------------------------------------------------------
+
+/// Build the metering callout credential from the configured source.
+///
+/// Returns `(None, None)` when no `internal_auth_token` is configured. Otherwise
+/// publishes a [`SecretHandle`] whose payload is the pre-assembled
+/// `Authorization` header value, plus the file watcher (for a `file` source) the
+/// caller must retain so rotation keeps publishing. An invalid initial token —
+/// empty, oversized, or one that cannot form a legal header value — rejects
+/// construction (fail loud at startup).
+fn build_auth_token(
+    source: Option<&CredentialSource>,
+) -> Result<(Option<SecretHandle>, Option<WatchHandle>), FilterError> {
+    let Some(source) = source else {
+        return Ok((None, None));
+    };
+    let ctx = DiagnosticContext {
+        owner: "external_metering",
+        reference: None,
+    };
+    let transform = |token: &str| -> Result<Zeroizing<String>, FilterError> {
+        let header = format!("Bearer {token}");
+        http::HeaderValue::from_str(&header).map_err(|e| {
+            FilterError::from(format!(
+                "external_metering: invalid internal_auth_token header value: {e}"
+            ))
+        })?;
+        Ok(Zeroizing::new(header))
+    };
+    let (handle, watch) = credential_source::build_one(ctx, source, transform)?;
+    Ok((Some(handle), watch))
+}
+
+/// Resolved internal-auth state for a single metering callout.
+enum AuthOutcome {
+    /// No token configured; send the callout unauthenticated (legacy behavior).
+    Unauthenticated,
+    /// A valid token is available; attach this `Authorization` header value.
+    Header(http::HeaderValue),
+    /// A token is configured but currently unavailable (a post-startup rotation
+    /// gap or an unusable published value); the callout must fail closed and
+    /// never dial unauthenticated.
+    Unavailable,
+}
+
+/// Map a published credential payload to a callout auth outcome.
+///
+/// `None` (a post-startup rotation gap) and a payload that cannot form a legal
+/// header value both fail closed. A usable value yields a sensitive
+/// `Authorization` header so the secret is never logged.
+fn auth_outcome_from_payload(payload: Option<&str>) -> AuthOutcome {
+    let Some(value) = payload else {
+        return AuthOutcome::Unavailable;
+    };
+    match http::HeaderValue::from_str(value) {
+        Ok(mut header) => {
+            header.set_sensitive(true);
+            AuthOutcome::Header(header)
+        },
+        Err(_) => AuthOutcome::Unavailable,
+    }
+}
+
+/// Assemble the outgoing callout headers for an auth outcome.
+///
+/// `Some(headers)` carries the (possibly empty) header map to send; `None` means
+/// fail closed — a configured token is unavailable, so the callout must not be
+/// sent unauthenticated.
+fn authed_headers(outcome: AuthOutcome) -> Option<http::HeaderMap> {
+    let mut headers = http::HeaderMap::new();
+    match outcome {
+        AuthOutcome::Unauthenticated => Some(headers),
+        AuthOutcome::Header(value) => {
+            headers.insert(http::header::AUTHORIZATION, value);
+            Some(headers)
+        },
+        AuthOutcome::Unavailable => None,
+    }
+}
+
+/// Resolve the usage-report callout headers, or `None` to drop the report (fail
+/// closed) when a configured token is unavailable, counting the drop so the
+/// skipped billing event stays visible on a dashboard.
+fn report_callout_headers(outcome: AuthOutcome) -> Option<http::HeaderMap> {
+    let headers = authed_headers(outcome);
+    if headers.is_none() {
+        counter!(METRIC_REPORT_FAILURES).increment(1);
+        warn!("internal metering auth token unavailable; dropping usage report");
+    }
+    headers
+}
+
+// -----------------------------------------------------------------------------
 // URL Construction
 // -----------------------------------------------------------------------------
+
+/// A bodiless GET sub-request for the entitlement balance probe, carrying the
+/// resolved internal-auth headers (empty when no token is configured).
+fn balance_probe_request(headers: http::HeaderMap) -> SubRequest {
+    SubRequest {
+        method: http::Method::GET,
+        uri: http::Uri::default(),
+        headers,
+        body: Bytes::new(),
+    }
+}
 
 /// Build the entitlement balance check URL for a tenant and model.
 fn build_balance_url(base_url: &str, customer_id: &str, feature_key: &str, model: &str) -> String {
@@ -751,6 +1095,7 @@ fn build_usage_event(ctx: &EventContext<'_>, tokens: &TokenCounts) -> serde_json
         data.insert("total_tokens".to_owned(), tokens.total.into());
         data.insert("cached_input_tokens".to_owned(), tokens.cache_read.into());
         data.insert("cache_creation_tokens".to_owned(), tokens.cache_write.into());
+        data.insert("reasoning_tokens".to_owned(), tokens.reasoning.into());
     }
 
     event
@@ -784,6 +1129,8 @@ fn build_envelope(ctx: &EventContext<'_>, event_type: &str) -> serde_json::Value
             "user": state.username,
             "group": state.group,
             "subscription": state.subscription,
+            "organization_id": state.organization_id,
+            "cost_center": state.cost_center,
             "provider": ctx.provider,
             "model": state.model,
             "duration_ms": ctx.duration_ms,

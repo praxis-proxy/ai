@@ -3,9 +3,11 @@
 
 //! Optional payload compression for the responses store.
 
+use std::borrow::Cow;
+
 use serde::Deserialize;
 
-use crate::{ResponseRecord, StoreError};
+use crate::{ResponseRecord, StoreError, json_payload_charge};
 
 /// zstd frame magic number (little-endian `0xFD2FB528`).
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -111,6 +113,40 @@ impl StoreCompressionConfig {
         .await
     }
 
+    /// Encode a batch of raw JSON payloads into their stored binary form.
+    ///
+    /// Used by the durable event log, whose rows store each SSE event's `data`
+    /// payload verbatim as raw JSON bytes. Unlike value-based encoding
+    /// there is nothing to serialize: with `algorithm: none` each payload is
+    /// stored as-is, and with `algorithm: zstd` it is compressed into a raw zstd
+    /// frame. Reads go back through [`decode_bytes`]. The whole batch shares one
+    /// blocking hop so appending many small events does not spawn a worker per
+    /// event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Serialization`] if a payload exceeds the size limit
+    /// or zstd compression fails.
+    pub async fn encode_byte_values<'a>(&self, values: &[&'a [u8]]) -> Result<Vec<Cow<'a, [u8]>>, StoreError> {
+        // With `algorithm: none` (the default) the stored form is the payload
+        // itself, so borrow each one — the bind reads it directly with no copy.
+        // Only zstd needs owned output, allocated on that branch alone.
+        if self.algorithm == CompressionAlgorithm::None {
+            return Ok(values.iter().map(|value| Cow::Borrowed(*value)).collect());
+        }
+
+        let owned: Vec<Vec<u8>> = values.iter().map(|value| value.to_vec()).collect();
+        let config = self.clone();
+        let frames = run_blocking(move || {
+            owned
+                .into_iter()
+                .map(|json| config.encode_json(json))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .await?;
+        Ok(frames.into_iter().map(Cow::Owned).collect())
+    }
+
     /// Apply the configured codec to an owned JSON buffer.
     fn encode_json(&self, json: Vec<u8>) -> Result<Vec<u8>, StoreError> {
         match self.algorithm {
@@ -164,6 +200,78 @@ pub async fn run_blocking<T: Send + 'static>(
 /// JSON.
 pub fn decode(stored: &[u8]) -> Result<serde_json::Value, StoreError> {
     if stored.starts_with(&ZSTD_MAGIC) {
+        let json = decompress_zstd(stored)?;
+        serde_json::from_slice(&json).map_err(|e| StoreError::Serialization(e.to_string()))
+    } else {
+        serde_json::from_slice(stored).map_err(|e| StoreError::Serialization(e.to_string()))
+    }
+}
+
+/// Decode a stored event-log payload back into its raw JSON bytes.
+///
+/// Like [`decode`] the format is auto-detected — a zstd frame is decompressed,
+/// anything else is returned as-is — but the bytes are handed back verbatim
+/// rather than parsed into a [`serde_json::Value`]. The durable event log stores
+/// each event's `data` payload byte-for-byte and replays it without a
+/// parse/serialize round trip, so a decode that normalized key order would break
+/// verbatim replay.
+///
+/// Takes ownership of `stored` so an uncompressed row (the common case) is
+/// returned by move with no copy; only a zstd frame allocates, for its
+/// decompressed output.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Serialization`] if a zstd frame is corrupt or its
+/// decompressed payload exceeds the size limit.
+pub fn decode_bytes(stored: Vec<u8>) -> Result<Vec<u8>, StoreError> {
+    if stored.starts_with(&ZSTD_MAGIC) {
+        decompress_zstd(&stored)
+    } else {
+        Ok(stored)
+    }
+}
+
+/// Decompress a raw zstd frame, bounding the output at [`MAX_DECOMPRESSED_SIZE`].
+///
+/// # Errors
+///
+/// Returns [`StoreError::Serialization`] if the frame is corrupt or its
+/// decompressed payload exceeds the size limit.
+fn decompress_zstd(frame: &[u8]) -> Result<Vec<u8>, StoreError> {
+    use std::io::Read as _;
+
+    let decoder = zstd::Decoder::new(frame).map_err(|e| StoreError::Serialization(format!("zstd decompress: {e}")))?;
+    // Read one byte past the cap so a payload sitting exactly at the limit is
+    // accepted while anything larger is rejected.
+    let mut json = Vec::new();
+    decoder
+        .take(MAX_DECOMPRESSED_SIZE + 1)
+        .read_to_end(&mut json)
+        .map_err(|e| StoreError::Serialization(format!("zstd decompress: {e}")))?;
+    if json.len() as u64 > MAX_DECOMPRESSED_SIZE {
+        return Err(StoreError::Serialization(
+            "zstd decompress: decompressed payload exceeds size limit".to_owned(),
+        ));
+    }
+    Ok(json)
+}
+
+/// Decode one stored JSON column without allocating beyond `max_bytes` of
+/// serialized payload. Returns the decoded byte count for aggregate reads.
+/// A compressed frame must also fit the remaining decoded allowance, so an
+/// aggregate read may conservatively reject a record whose separate encoded
+/// and decoded totals each fit the overall limit.
+///
+/// # Errors
+///
+/// Returns [`StoreError::PayloadTooLarge`] when either representation exceeds
+/// the caller's limit.
+pub fn decode_bounded(stored: &[u8], max_bytes: usize) -> Result<(serde_json::Value, usize), StoreError> {
+    if stored.len() > max_bytes {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    if stored.starts_with(&ZSTD_MAGIC) {
         use std::io::Read as _;
 
         let decoder =
@@ -171,19 +279,74 @@ pub fn decode(stored: &[u8]) -> Result<serde_json::Value, StoreError> {
         // Read one byte past the cap so a payload sitting exactly at the limit is
         // accepted while anything larger is rejected.
         let mut json = Vec::new();
+        let cap = (max_bytes as u64).min(MAX_DECOMPRESSED_SIZE);
         decoder
-            .take(MAX_DECOMPRESSED_SIZE + 1)
+            .take(cap + 1)
             .read_to_end(&mut json)
             .map_err(|e| StoreError::Serialization(format!("zstd decompress: {e}")))?;
-        if json.len() as u64 > MAX_DECOMPRESSED_SIZE {
-            return Err(StoreError::Serialization(
-                "zstd decompress: decompressed payload exceeds size limit".to_owned(),
-            ));
+        if json.len() as u64 > cap {
+            return Err(StoreError::PayloadTooLarge);
         }
-        serde_json::from_slice(&json).map_err(|e| StoreError::Serialization(e.to_string()))
+        let len = json.len();
+        let value = serde_json::from_slice(&json).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        Ok((value, len))
     } else {
-        serde_json::from_slice(stored).map_err(|e| StoreError::Serialization(e.to_string()))
+        let value = serde_json::from_slice(stored).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        Ok((value, stored.len()))
     }
+}
+
+/// Decode a stored JSON column after checking its byte-and-structure charge.
+/// The raw bytes are scanned before `serde_json::Value` construction. Compressed
+/// payloads are decompressed only up to the largest byte payload that could fit
+/// the supplied charge.
+///
+/// # Errors
+///
+/// Returns [`StoreError::PayloadTooLarge`] when the charge is over budget and
+/// [`StoreError::Serialization`] for invalid stored JSON or compression data.
+pub fn decode_budgeted(stored: &[u8], max_charge_bytes: usize) -> Result<(serde_json::Value, usize), StoreError> {
+    let max_json_bytes = max_charge_bytes / crate::RETAINED_JSON_BYTE_MULTIPLIER;
+    let json = if stored.starts_with(&ZSTD_MAGIC) {
+        if stored.len() > max_charge_bytes {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        decompress_zstd_bounded(stored, max_json_bytes)?
+    } else {
+        if stored.len() > max_json_bytes {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        // The uncompressed store format is borrowed through the scan and parse,
+        // avoiding a copy of the raw JSON column.
+        let charge = json_payload_charge(stored, max_charge_bytes)?;
+        let value = serde_json::from_slice(stored).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        return Ok((value, charge));
+    };
+    let charge = json_payload_charge(&json, max_charge_bytes)?;
+    let value = serde_json::from_slice(&json).map_err(|e| StoreError::Serialization(e.to_string()))?;
+    Ok((value, charge))
+}
+
+/// Decompress a zstd frame, stopping once the output would exceed `max_bytes`.
+///
+/// # Errors
+///
+/// Returns [`StoreError::PayloadTooLarge`] when the decompressed size passes
+/// `max_bytes` and [`StoreError::Serialization`] on malformed compression data.
+fn decompress_zstd_bounded(frame: &[u8], max_bytes: usize) -> Result<Vec<u8>, StoreError> {
+    use std::io::Read as _;
+
+    let decoder = zstd::Decoder::new(frame).map_err(|e| StoreError::Serialization(format!("zstd decompress: {e}")))?;
+    let limit = u64::try_from(max_bytes).unwrap_or(u64::MAX).min(MAX_DECOMPRESSED_SIZE);
+    let mut json = Vec::new();
+    decoder
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut json)
+        .map_err(|e| StoreError::Serialization(format!("zstd decompress: {e}")))?;
+    if u64::try_from(json.len()).unwrap_or(u64::MAX) > limit {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    Ok(json)
 }
 
 // -----------------------------------------------------------------------------
@@ -321,6 +484,49 @@ mod tests {
         assert!(decode(&corrupt).is_err());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn encode_byte_values_none_stores_payloads_verbatim() {
+        let cfg = StoreCompressionConfig::default();
+        let payloads = [
+            br#"{"type":"a","sequence_number":0}"#.as_slice(),
+            br#"{"type":"b","sequence_number":1}"#.as_slice(),
+        ];
+        let encoded = cfg.encode_byte_values(&payloads).await.unwrap();
+        assert_eq!(encoded.len(), payloads.len());
+        for (raw, stored) in payloads.iter().zip(&encoded) {
+            assert!(
+                matches!(stored, Cow::Borrowed(_)),
+                "none must borrow, not copy the payload"
+            );
+            assert!(!stored.starts_with(&ZSTD_MAGIC), "none must not compress");
+            assert_eq!(stored.as_ref(), *raw, "payload stored byte-for-byte");
+            assert_eq!(decode_bytes(stored.to_vec()).unwrap(), raw.to_vec());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn encode_byte_values_zstd_roundtrips_through_decode_bytes() {
+        let cfg = zstd_config();
+        let raw = br#"{"type":"response.output_text.delta","sequence_number":7,"delta":"hello"}"#.as_slice();
+        let encoded = cfg.encode_byte_values(&[raw]).await.unwrap();
+        let stored = encoded.first().expect("one payload encoded");
+        assert!(stored.starts_with(&ZSTD_MAGIC), "expected zstd frame: {stored:?}");
+        assert!(matches!(stored, Cow::Owned(_)), "zstd must own the compressed frame");
+        assert_eq!(
+            decode_bytes(stored.to_vec()).unwrap(),
+            raw.to_vec(),
+            "raw JSON bytes survive the zstd round trip verbatim"
+        );
+    }
+
+    #[test]
+    fn decode_bytes_returns_raw_json_without_magic() {
+        // An uncompressed row is handed back byte-for-byte, key order intact, so
+        // replay never reorders the original event.
+        let raw = br#"{"b":2,"a":1}"#.as_slice();
+        assert_eq!(decode_bytes(raw.to_vec()).unwrap(), raw.to_vec());
+    }
+
     #[test]
     fn validate_accepts_none_without_level() {
         assert!(StoreCompressionConfig::default().validate().is_ok());
@@ -373,6 +579,49 @@ mod tests {
     fn deserialize_denies_unknown_fields() {
         let result: Result<StoreCompressionConfig, _> = serde_yaml::from_str("algorithm: zstd\nbogus: true\n");
         assert!(result.is_err(), "unknown fields should be rejected");
+    }
+
+    #[test]
+    fn bounded_decode_rejects_raw_and_compressed_expansion() {
+        let value = json!({"text": "x".repeat(16_384)});
+        let raw = serde_json::to_vec(&value).unwrap();
+        let compressed = zstd::bulk::compress(&raw, 3).unwrap();
+        assert!(
+            compressed.len() < 4_096,
+            "compressed fixture must fit under the byte limit"
+        );
+        assert!(
+            matches!(decode_bounded(&raw, 4_096), Err(StoreError::PayloadTooLarge)),
+            "raw payload over the byte limit must be rejected"
+        );
+        assert!(
+            matches!(decode_bounded(&compressed, 4_096), Err(StoreError::PayloadTooLarge)),
+            "compressed payload that expands over the byte limit must be rejected"
+        );
+        assert_eq!(
+            decode_bounded(&compressed, raw.len()).unwrap(),
+            (value, raw.len()),
+            "compressed payload at the exact decoded byte limit must be accepted"
+        );
+    }
+
+    #[test]
+    fn budgeted_decode_accounts_for_structure_in_raw_and_compressed_payloads() {
+        let value = json!({"text": "x".repeat(32)});
+        let raw = serde_json::to_vec(&value).unwrap();
+        let compressed = zstd::bulk::compress(&raw, 3).unwrap();
+        let charge = json_payload_charge(&raw, usize::MAX).unwrap();
+
+        assert_eq!(decode_budgeted(&raw, charge).unwrap(), (value.clone(), charge));
+        assert_eq!(decode_budgeted(&compressed, charge).unwrap(), (value, charge));
+        assert!(matches!(
+            decode_budgeted(&raw, charge - 1),
+            Err(StoreError::PayloadTooLarge)
+        ));
+        assert!(matches!(
+            decode_budgeted(&compressed, charge - 1),
+            Err(StoreError::PayloadTooLarge)
+        ));
     }
 
     // -------------------------------------------------------------------------

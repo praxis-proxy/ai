@@ -4,13 +4,13 @@
 //! Time-to-first-token (TTFT) measurement filter.
 //!
 //! Records the elapsed time from request receipt to the first non-empty
-//! SSE response body chunk as a Prometheus histogram labeled by model.
-//! The filter is transparent: response bodies and status codes pass
-//! through unchanged.
+//! SSE response body chunk as a Prometheus histogram labeled by `model` and
+//! `cluster`. The filter is transparent: response bodies and status codes
+//! pass through unchanged.
 //!
 //! # Metric
 //!
-//! `praxis_ai_ttft_seconds` — histogram with a `model` label.
+//! `praxis_ai_ttft_seconds` — histogram with `model` and `cluster` labels.
 //!
 //! # YAML
 //!
@@ -32,7 +32,7 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use metrics::histogram;
-use praxis_ai_apis::{is_event_stream_content_type, promotion::is_promotable_value};
+use praxis_ai_apis::is_event_stream_content_type;
 use praxis_filter::{
     BodyAccess, EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
@@ -52,10 +52,22 @@ const META_ACTIVE: &str = "time_to_first_token.active";
 /// a Prometheus histogram and deactivates for the remainder of the
 /// response.
 ///
-/// The histogram's `model` label is read from metadata set by an upstream format
-/// filter (`openai_responses_format`, `anthropic_messages_format`, or
-/// `anthropic_messages_to_chat_completions`). If no format filter runs before this filter,
-/// all TTFT samples are labeled `unknown`.
+/// The histogram's `model` label is read from metadata set by an upstream
+/// request fact filter: `openai_responses_request` (Responses create bodies),
+/// `openai_chat_completions_request` (native `POST /v1/chat/completions` bodies),
+/// `anthropic_messages_request`, `anthropic_messages_to_chat_completions`
+/// (Anthropic, including Anthropic-to-Chat translation), or the
+/// `model_to_header`-published `model_to_header.model` value. If none runs
+/// before this filter, all TTFT samples are labeled `unknown`.
+///
+/// The `cluster` label is the upstream cluster the request was routed to
+/// (`HttpFilterContext::cluster_name`), falling back to `unknown`.
+///
+/// Distinct `model` label values are capped at 1024 per process lifetime;
+/// values arriving after the cap are labeled `other` (see `llm_metrics`).
+///
+/// Chat traffic that originates as a Responses or Anthropic request and is
+/// translated downstream keeps the model its originating classifier promoted.
 ///
 /// # YAML
 ///
@@ -125,27 +137,14 @@ impl HttpFilter for TimeToFirstTokenFilter {
         }
 
         let ttft = ctx.request_start.elapsed().as_secs_f64();
-        let model = resolve_model(ctx);
+        let model = crate::llm_metrics::resolve_model(ctx);
+        let cluster = crate::llm_metrics::cluster(ctx);
 
-        histogram!(METRIC_TTFT_SECONDS, "model" => model).record(ttft);
+        histogram!(METRIC_TTFT_SECONDS, "model" => model, "cluster" => cluster).record(ttft);
         ctx.filter_metadata.remove(META_ACTIVE);
 
         debug!(ttft, "recorded time-to-first-token");
 
         Ok(FilterAction::Continue)
     }
-}
-
-/// Resolve the model label from format-filter metadata with fallback.
-///
-/// Values containing control characters or exceeding the promotion length
-/// cap are treated as unsafe and replaced with `"unknown"` to prevent
-/// malformed Prometheus labels or cardinality pressure.
-fn resolve_model(ctx: &HttpFilterContext<'_>) -> String {
-    ctx.get_metadata("openai_responses_format.model")
-        .or_else(|| ctx.get_metadata("anthropic_messages_format.model"))
-        .or_else(|| ctx.get_metadata("anthropic_messages_to_chat_completions.model"))
-        .filter(|v| is_promotable_value(v))
-        .unwrap_or("unknown")
-        .to_owned()
 }

@@ -10,10 +10,13 @@ use std::sync::Arc;
 use praxis_ai_store::{
     ConversationItemRecord, ConversationRecord, PersistedStateBackend, StoreError, StoreRegistry, memory::InMemoryStore,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
-use super::{ConversationsService, build_item_records, duplicate_item_id, validate_item_count};
-use crate::StateOwner;
+use super::{
+    build_item_records, default_item_status, duplicate_item_id, normalize_item, normalize_message_content,
+    validate_item_count, validate_output_item,
+};
+use crate::{StateOwner, store::OwnerScopedResponseStore};
 
 /// Build a validated owner for a fixed tenant and issuer.
 fn owner(subject: &str) -> StateOwner {
@@ -29,9 +32,9 @@ fn registry() -> StoreRegistry {
     reg
 }
 
-/// Bind a service to the default backend for `owner`.
-fn service(reg: &StoreRegistry, owner: &StateOwner) -> ConversationsService {
-    ConversationsService::new(reg.get_scoped("default", owner).unwrap())
+/// Bind a store handle to the default backend for `owner`.
+fn scoped_store(reg: &StoreRegistry, owner: &StateOwner) -> OwnerScopedResponseStore {
+    reg.get_scoped("default", owner).unwrap()
 }
 
 /// A conversation record owned by `owner`.
@@ -59,6 +62,188 @@ fn counter() -> impl FnMut() -> String {
 // -----------------------------------------------------------------------------
 
 #[test]
+fn assistant_output_text_normalizes_nullable_provider_fields() {
+    let normalized = normalize_message_content(
+        "assistant",
+        serde_json::json!([{
+            "type": "output_text",
+            "text": "hello",
+            "annotations": [],
+            "logprobs": null
+        }]),
+    )
+    .unwrap();
+
+    assert_eq!(
+        normalized[0]["annotations"],
+        serde_json::json!([]),
+        "annotations must remain an empty array"
+    );
+    assert_eq!(
+        normalized[0]["logprobs"],
+        serde_json::json!([]),
+        "null logprobs must normalize to an empty array"
+    );
+}
+
+#[test]
+fn function_output_nullable_qualifiers_normalize_and_validate() {
+    for (name, namespace) in [
+        (Value::Null, Value::Null),
+        (serde_json::json!("lookup"), Value::Null),
+        (Value::Null, serde_json::json!("weather")),
+        (serde_json::json!("lookup"), serde_json::json!("weather")),
+    ] {
+        let input = serde_json::json!({
+            "type": "function_call_output", "call_id": "call_1", "output": "done",
+            "name": name, "namespace": namespace,
+        });
+        crate::openai::conversations::item_schema::validate_input_item(&input).unwrap();
+        let (_, output) = normalize_item(input, &mut counter()).unwrap();
+        for (key, value) in [("name", name), ("namespace", namespace)] {
+            if value.is_null() {
+                assert!(output.get(key).is_none(), "null {key} must normalize to omission");
+            } else {
+                assert_eq!(output[key], value, "non-null {key} must be preserved");
+            }
+        }
+        validate_output_item(&output).unwrap();
+    }
+    let invalid = serde_json::json!({
+        "type": "function_call_output", "call_id": "call_1", "output": "done", "name": 42,
+    });
+    assert!(
+        normalize_item(invalid, &mut counter()).is_err(),
+        "non-null invalid qualifiers stay invalid"
+    );
+}
+
+#[test]
+fn function_output_nullable_call_id_normalizes_and_validates() {
+    let input = serde_json::json!({
+        "type": "function_call_output", "call_id": null, "output": "done",
+    });
+    assert!(
+        crate::openai::conversations::item_schema::validate_input_item(&input).is_ok(),
+        "null call_id is valid input"
+    );
+    let mut unnormalized = input.clone();
+    unnormalized["id"] = serde_json::json!("item_nullable");
+    unnormalized["status"] = serde_json::json!("completed");
+    assert!(
+        validate_output_item(&unnormalized).is_err(),
+        "null call_id is invalid output even with id and status"
+    );
+    unnormalized.as_object_mut().unwrap().remove("call_id");
+    assert!(
+        validate_output_item(&unnormalized).is_ok(),
+        "omitted call_id is valid output"
+    );
+    let (_, output) = normalize_item(input, &mut counter()).unwrap();
+    assert!(
+        output.get("call_id").is_none(),
+        "null call_id must normalize to omission"
+    );
+    assert!(
+        validate_output_item(&output).is_ok(),
+        "normalized output must satisfy the contract"
+    );
+    let invalid = serde_json::json!({
+        "type": "function_call_output", "call_id": 42, "output": "done",
+    });
+    assert!(
+        normalize_item(invalid, &mut counter()).is_err(),
+        "non-null invalid call_id must not be stripped"
+    );
+}
+
+#[test]
+fn legacy_mcp_error_normalizes_before_append_back_validation() {
+    for error in [
+        json!("legacy tool failure"),
+        json!({"type": "mcp_tool_execution_error", "content": "legacy tool failure"}),
+    ] {
+        let (_, output) = normalize_item(
+            json!({
+                "type": "mcp_call", "id": "mcp_legacy", "status": "failed",
+                "server_label": "weather", "name": "lookup", "arguments": "{}",
+                "error": error,
+            }),
+            &mut counter(),
+        )
+        .unwrap();
+        assert_eq!(
+            output["error"],
+            json!({"type": "mcp_tool_execution_error", "content": "legacy tool failure"}),
+            "legacy strings normalize and already structured errors retain their contract"
+        );
+        assert!(
+            validate_output_item(&output).is_ok(),
+            "append-back output must satisfy the current schema"
+        );
+    }
+    assert!(
+        normalize_item(
+            json!({
+                "type": "mcp_call", "id": "mcp_invalid", "status": "failed",
+                "server_label": "weather", "name": "lookup", "arguments": "{}", "error": 42,
+            }),
+            &mut counter(),
+        )
+        .is_err(),
+        "non-string invalid errors must not be repaired into valid output"
+    );
+}
+
+#[test]
+fn reasoning_item_with_null_status_normalizes_and_validates() {
+    // Backends such as vLLM emit `status: null` on reasoning output items;
+    // the status must be defaulted before it satisfies the item contract.
+    let mut map = serde_json::json!({
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": "\n\n"}],
+        "encrypted_content": null,
+        "status": null
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+
+    assert!(
+        validate_output_item(&Value::Object(map.clone())).is_err(),
+        "null reasoning status must fail output validation before normalization"
+    );
+
+    default_item_status(&mut map);
+
+    assert_eq!(
+        map["status"],
+        serde_json::json!("completed"),
+        "null status must default to completed"
+    );
+    assert!(
+        validate_output_item(&Value::Object(map)).is_ok(),
+        "defaulted reasoning status must satisfy the output contract"
+    );
+}
+
+#[test]
+fn default_item_status_preserves_existing_status() {
+    let mut map = serde_json::json!({"status": "in_progress"})
+        .as_object()
+        .unwrap()
+        .clone();
+    default_item_status(&mut map);
+    assert_eq!(
+        map["status"],
+        serde_json::json!("in_progress"),
+        "defaulting must preserve an explicit status"
+    );
+}
+
+#[test]
 fn build_item_records_generates_ids_for_items_without_them() {
     let o = owner("alice");
     let records = build_item_records(
@@ -76,6 +261,75 @@ fn build_item_records_generates_ids_for_items_without_them() {
     assert_eq!(records[0].owner, o);
     assert_eq!(records[0].position, 0);
     assert_eq!(records[0].item_data["id"], "item_1");
+}
+
+#[test]
+fn build_item_records_defaults_missing_tool_search_call_ids_to_null() {
+    for item in [
+        json!({"type": "tool_search_call", "execution": "server", "arguments": {}}),
+        json!({"type": "tool_search_output", "execution": "server", "tools": []}),
+    ] {
+        let records = build_item_records(&owner("alice"), "conv_1", 1000, 0, [item], counter()).unwrap();
+
+        assert_eq!(
+            records[0].item_data.get("call_id"),
+            Some(&Value::Null),
+            "stored tool-search items must contain an explicit null call_id"
+        );
+    }
+}
+
+#[test]
+fn build_item_records_preserves_supplied_tool_search_call_ids() {
+    for item_type in ["tool_search_call", "tool_search_output"] {
+        for call_id in [json!(null), json!("call_preserved")] {
+            let mut item = json!({"type": item_type, "execution": "server", "call_id": call_id});
+            if item_type == "tool_search_call" {
+                item["arguments"] = json!({});
+            } else {
+                item["tools"] = json!([]);
+            }
+            let records = build_item_records(&owner("alice"), "conv_1", 1000, 0, [item], counter()).unwrap();
+
+            assert_eq!(
+                records[0].item_data.get("call_id"),
+                Some(&call_id),
+                "normalization must preserve an explicit null or string call_id"
+            );
+        }
+    }
+}
+
+#[test]
+fn build_item_records_rejects_invalid_tool_search_and_missing_function_call_ids() {
+    for item in [
+        json!({"type": "tool_search_call", "execution": "server", "arguments": {}, "call_id": 17}),
+        json!({"type": "tool_search_output", "execution": "server", "tools": [], "call_id": 17}),
+        json!({"type": "function_call", "name": "lookup", "arguments": "{}"}),
+    ] {
+        let error = build_item_records(&owner("alice"), "conv_1", 1000, 0, [item], counter()).unwrap_err();
+
+        assert!(
+            matches!(error, StoreError::InvalidInput(_)),
+            "normalization must not repair invalid call IDs or relax other item types"
+        );
+    }
+}
+
+#[test]
+fn build_item_records_normalizes_easy_input_message_without_type() {
+    let records = build_item_records(
+        &owner("alice"),
+        "conv_1",
+        1000,
+        0,
+        [json!({"role": "user", "content": "hi"})],
+        counter(),
+    )
+    .unwrap();
+    assert_eq!(records[0].item_data["type"], "message");
+    assert_eq!(records[0].item_data["content"][0]["type"], "input_text");
+    assert_eq!(records[0].item_data["content"][0]["text"], "hi");
 }
 
 #[test]
@@ -154,7 +408,7 @@ fn validate_item_count_and_duplicate_detection() {
 async fn create_and_get_conversation_round_trip() {
     let reg = registry();
     let o = owner("alice");
-    let svc = service(&reg, &o);
+    let svc = scoped_store(&reg, &o);
 
     svc.upsert_conversation(&conversation(&o, "conv_1")).await.unwrap();
     let fetched = svc.get_conversation("conv_1").await.unwrap().unwrap();
@@ -166,7 +420,7 @@ async fn create_and_get_conversation_round_trip() {
 async fn update_metadata_and_delete() {
     let reg = registry();
     let o = owner("alice");
-    let svc = service(&reg, &o);
+    let svc = scoped_store(&reg, &o);
 
     svc.upsert_conversation(&conversation(&o, "conv_1")).await.unwrap();
     assert!(
@@ -186,7 +440,7 @@ async fn update_metadata_and_delete() {
 async fn create_items_list_get_delete_round_trip() {
     let reg = registry();
     let o = owner("alice");
-    let svc = service(&reg, &o);
+    let svc = scoped_store(&reg, &o);
 
     svc.upsert_conversation(&conversation(&o, "conv_1")).await.unwrap();
     let records = build_item_records(
@@ -199,20 +453,27 @@ async fn create_items_list_get_delete_round_trip() {
     )
     .unwrap();
 
-    assert!(svc.existing_item_ids("conv_1", &["item_a"]).await.unwrap().is_empty());
-    svc.create_items("conv_1", &records).await.unwrap();
+    assert!(
+        svc.get_existing_conversation_item_ids("conv_1", &["item_a"])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    svc.create_items_and_sync_messages("conv_1", &records).await.unwrap();
     assert_eq!(
-        svc.existing_item_ids("conv_1", &["item_a"]).await.unwrap(),
+        svc.get_existing_conversation_item_ids("conv_1", &["item_a"])
+            .await
+            .unwrap(),
         vec!["item_a".to_owned()]
     );
 
-    let listed = svc.list_items("conv_1", None, 10, true).await.unwrap();
+    let listed = svc.list_conversation_items("conv_1", None, 10, true).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].item_id, "item_a");
 
-    assert!(svc.get_item("conv_1", "item_a").await.unwrap().is_some());
-    assert!(svc.delete_item("conv_1", "item_a").await.unwrap());
-    assert!(svc.get_item("conv_1", "item_a").await.unwrap().is_none());
+    assert!(svc.get_conversation_item("conv_1", "item_a").await.unwrap().is_some());
+    assert!(svc.delete_item_and_sync_messages("conv_1", "item_a").await.unwrap());
+    assert!(svc.get_conversation_item("conv_1", "item_a").await.unwrap().is_none());
 }
 
 // -----------------------------------------------------------------------------
@@ -224,14 +485,20 @@ async fn get_conversation_is_owner_scoped() {
     let reg = registry();
     let alice = owner("alice");
     let bob = owner("bob");
-    service(&reg, &alice)
+    scoped_store(&reg, &alice)
         .upsert_conversation(&conversation(&alice, "conv_1"))
         .await
         .unwrap();
 
-    assert!(service(&reg, &bob).get_conversation("conv_1").await.unwrap().is_none());
     assert!(
-        service(&reg, &alice)
+        scoped_store(&reg, &bob)
+            .get_conversation("conv_1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        scoped_store(&reg, &alice)
             .get_conversation("conv_1")
             .await
             .unwrap()
@@ -244,7 +511,7 @@ async fn upsert_conversation_rejects_foreign_owner_record() {
     let reg = registry();
     let alice = owner("alice");
     let bob = owner("bob");
-    let svc = service(&reg, &alice);
+    let svc = scoped_store(&reg, &alice);
 
     // A record stamped with bob's owner cannot be written through alice's handle.
     let err = svc
@@ -255,13 +522,19 @@ async fn upsert_conversation_rejects_foreign_owner_record() {
 
     // Nothing was written under either owner.
     assert!(
-        service(&reg, &alice)
+        scoped_store(&reg, &alice)
             .get_conversation("conv_1")
             .await
             .unwrap()
             .is_none()
     );
-    assert!(service(&reg, &bob).get_conversation("conv_1").await.unwrap().is_none());
+    assert!(
+        scoped_store(&reg, &bob)
+            .get_conversation("conv_1")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -269,7 +542,7 @@ async fn create_items_rejects_foreign_owner_item() {
     let reg = registry();
     let alice = owner("alice");
     let bob = owner("bob");
-    let svc = service(&reg, &alice);
+    let svc = scoped_store(&reg, &alice);
     svc.upsert_conversation(&conversation(&alice, "conv_1")).await.unwrap();
 
     let foreign: Vec<ConversationItemRecord> = build_item_records(
@@ -281,9 +554,17 @@ async fn create_items_rejects_foreign_owner_item() {
         counter(),
     )
     .unwrap();
-    let err = svc.create_items("conv_1", &foreign).await.unwrap_err();
+    let err = svc
+        .create_items_and_sync_messages("conv_1", &foreign)
+        .await
+        .unwrap_err();
     assert!(matches!(err, StoreError::InvalidInput(_)));
-    assert!(svc.list_items("conv_1", None, 10, true).await.unwrap().is_empty());
+    assert!(
+        svc.list_conversation_items("conv_1", None, 10, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -291,7 +572,7 @@ async fn items_are_isolated_across_owners() {
     let reg = registry();
     let alice = owner("alice");
     let bob = owner("bob");
-    let alice_svc = service(&reg, &alice);
+    let alice_svc = scoped_store(&reg, &alice);
     alice_svc
         .upsert_conversation(&conversation(&alice, "conv_1"))
         .await
@@ -305,10 +586,25 @@ async fn items_are_isolated_across_owners() {
         counter(),
     )
     .unwrap();
-    alice_svc.create_items("conv_1", &records).await.unwrap();
+    alice_svc
+        .create_items_and_sync_messages("conv_1", &records)
+        .await
+        .unwrap();
 
-    let bob_svc = service(&reg, &bob);
+    let bob_svc = scoped_store(&reg, &bob);
     assert!(bob_svc.get_conversation("conv_1").await.unwrap().is_none());
-    assert!(bob_svc.list_items("conv_1", None, 10, true).await.unwrap().is_empty());
-    assert!(bob_svc.get_item("conv_1", "item_a").await.unwrap().is_none());
+    assert!(
+        bob_svc
+            .list_conversation_items("conv_1", None, 10, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        bob_svc
+            .get_conversation_item("conv_1", "item_a")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

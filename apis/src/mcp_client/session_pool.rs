@@ -218,6 +218,14 @@ impl PooledSession {
         self.close_with_timeout(remaining).await;
     }
 
+    /// Wait for the rmcp worker to release a budgeted call's transport before
+    /// its request-wide reservation can be settled. The worker itself bounds
+    /// session DELETE cleanup, while `close_with_timeout` can detach it.
+    pub(crate) async fn close_budgeted(mut self) {
+        let _claimed_before_idle_timeout = self.unpark();
+        drop(self.service.close().await);
+    }
+
     #[cfg(test)]
     pub(crate) fn mark_expired(&mut self) {
         self.last_used = Instant::now() - MAX_IDLE_AGE;

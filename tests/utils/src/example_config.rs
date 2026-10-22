@@ -3,7 +3,11 @@
 
 //! Test utilities for loading and patching example configuration files.
 
-use std::collections::HashMap;
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use praxis_core::config::Config;
 
@@ -56,17 +60,118 @@ pub fn load_example_config(filename: &str, listener_port: u16, port_map: HashMap
 /// assert!(yaml.contains("allow_private_endpoints: true"));
 /// ```
 pub fn allow_loopback_endpoints(yaml: &str) -> String {
-    if yaml.contains("allow_private_endpoints") {
+    ensure_insecure_option_bool(yaml, "allow_private_endpoints", true)
+}
+
+/// Whether the test process is running as UID 0.
+///
+/// `nix` is a `cfg(unix)` dependency of this crate; non-unix targets always
+/// report false so callers never need their own `#[cfg(unix)]` gates.
+#[cfg(unix)]
+pub fn harness_is_root() -> bool {
+    nix::unistd::Uid::effective().is_root()
+}
+
+/// Whether the test process is running as UID 0.
+#[cfg(not(unix))]
+pub fn harness_is_root() -> bool {
+    false
+}
+
+/// Set `insecure_options.allow_root: true` when the harness is root and the
+/// key is absent; otherwise return `yaml` unchanged.
+///
+/// Used by subprocess and reload helpers so UID-0 environments can start the
+/// product binary without rewriting every shipped example YAML.
+pub fn allow_root_for_test_harness(yaml: &str) -> Cow<'_, str> {
+    if !harness_is_root() {
+        return Cow::Borrowed(yaml);
+    }
+    Cow::Owned(ensure_insecure_option_bool(yaml, "allow_root", true))
+}
+
+/// Set `insecure_options.allow_root` on an in-memory [`Config`] when the
+/// harness is root.
+pub fn allow_root_on_config(config: &mut Config) {
+    if harness_is_root() {
+        config.insecure_options.allow_root = true;
+    }
+}
+
+/// Write `yaml` to `dir/praxis.yaml`, injecting `allow_root` when the harness
+/// is root.
+///
+/// Shared by [`crate::PraxisProcess`] and binary-spawn helpers so the
+/// read/patch/write sequence cannot drift.
+///
+/// # Panics
+///
+/// Panics if the file cannot be written.
+pub fn write_praxis_yaml_for_harness(dir: &Path, yaml: &str) -> PathBuf {
+    let path = dir.join("praxis.yaml");
+    std::fs::write(&path, allow_root_for_test_harness(yaml).as_ref()).expect("write harness config");
+    path
+}
+
+/// Return `source` when not root; otherwise copy a root-allowed YAML into
+/// `work_dir/praxis.yaml` so the caller's on-disk fixture stays locked down.
+///
+/// # Panics
+///
+/// Panics if the source cannot be read or the copy cannot be written.
+pub fn config_path_for_harness(source: &Path, work_dir: &Path) -> PathBuf {
+    if !harness_is_root() {
+        return source.to_path_buf();
+    }
+    let yaml = std::fs::read_to_string(source).expect("read harness config source");
+    write_praxis_yaml_for_harness(work_dir, &yaml)
+}
+
+/// Set `insecure_options.<key>` when absent, via the parsed mapping.
+///
+/// Textual `replacen` misses layouts such as `insecure_options: # comment`
+/// or inline mappings; parsing preserves existing entries and explicit values.
+///
+/// # Panics
+///
+/// Panics if `yaml` is not valid YAML or its document root is not a mapping,
+/// so callers see the original parse/diagnostic instead of a later
+/// `Config::from_yaml` failure after a silent text append.
+fn ensure_insecure_option_bool(yaml: &str, key: &str, value: bool) -> String {
+    if insecure_options_has_key(yaml, key) {
         return yaml.to_owned();
     }
-    if yaml.contains("\ninsecure_options:") || yaml.starts_with("insecure_options:") {
-        return yaml.replacen(
-            "insecure_options:\n",
-            "insecure_options:\n  allow_private_endpoints: true\n",
-            1,
-        );
+    let mut root: serde_yaml::Value =
+        serde_yaml::from_str(yaml).unwrap_or_else(|e| panic!("example config is not valid YAML: {e}"));
+    let root_map = root
+        .as_mapping_mut()
+        .unwrap_or_else(|| panic!("example config root must be a mapping"));
+    let opts_key = serde_yaml::Value::String("insecure_options".into());
+    let opts = root_map
+        .entry(opts_key)
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    if let serde_yaml::Value::Mapping(m) = opts {
+        m.insert(serde_yaml::Value::String(key.into()), serde_yaml::Value::Bool(value));
+    } else {
+        let mut m = serde_yaml::Mapping::new();
+        m.insert(serde_yaml::Value::String(key.into()), serde_yaml::Value::Bool(value));
+        *opts = serde_yaml::Value::Mapping(m);
     }
-    format!("{yaml}\ninsecure_options:\n  allow_private_endpoints: true\n")
+    serde_yaml::to_string(&root).unwrap_or_else(|e| panic!("serialize example config YAML: {e}"))
+}
+
+/// True when the parsed `insecure_options` mapping sets `key`.
+///
+/// String search is not used: a comment mentioning the key must not
+/// suppress the harness override.
+fn insecure_options_has_key(yaml: &str, key: &str) -> bool {
+    let Ok(serde_yaml::Value::Mapping(root)) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+        return false;
+    };
+    let Some(serde_yaml::Value::Mapping(opts)) = root.get(serde_yaml::Value::String("insecure_options".into())) else {
+        return false;
+    };
+    opts.contains_key(serde_yaml::Value::String(key.into()))
 }
 
 /// Resolve the absolute path to an example config file.
@@ -85,7 +190,14 @@ pub fn example_config_path(filename: &str) -> String {
 /// in a YAML string.
 ///
 /// Rewrites both `0.0.0.0:8080` and `127.0.0.1:8080` to the given
-/// `listener_port`, then applies every entry in `port_map`.
+/// `listener_port`, and applies every entry in `port_map`.
+///
+/// Rewriting is a single left-to-right pass, and an address only matches when
+/// its port is not followed by another digit. Both rules keep one replacement
+/// from corrupting another: a chain of plain `str::replace` calls rewrites
+/// text it has already produced, so patching `127.0.0.1:3001` over a listener
+/// already moved to `127.0.0.1:30011` would leave a trailing `1` welded to the
+/// substituted port.
 ///
 /// # Examples
 ///
@@ -96,14 +208,60 @@ pub fn example_config_path(filename: &str) -> String {
 /// let result = praxis_test_utils::patch_yaml(yaml, 9999, &HashMap::new());
 /// assert_eq!(result, "address: \"127.0.0.1:9999\"");
 /// ```
+///
+/// # Panics
+///
+/// Panics if `port_map` contains an empty address, which would match at every
+/// position without consuming any input.
 pub fn patch_yaml(yaml: &str, listener_port: u16, port_map: &HashMap<&str, u16>) -> String {
-    let mut result = yaml
-        .replace("0.0.0.0:8080", &format!("127.0.0.1:{listener_port}"))
-        .replace("127.0.0.1:8080", &format!("127.0.0.1:{listener_port}"));
-    for (original, port) in port_map {
-        result = result.replace(original, &format!("127.0.0.1:{port}"));
+    let rules = patch_rules(listener_port, port_map);
+
+    let mut result = String::with_capacity(yaml.len());
+    let mut rest = yaml;
+    'next: while !rest.is_empty() {
+        for (address, port) in &rules {
+            // A trailing digit means the needle matched a longer port, not
+            // this address.
+            if let Some(tail) = rest.strip_prefix(*address)
+                && !tail.starts_with(|next: char| next.is_ascii_digit())
+            {
+                result.push_str("127.0.0.1:");
+                result.push_str(&port.to_string());
+                rest = tail;
+                continue 'next;
+            }
+        }
+        let mut chars = rest.chars();
+        if let Some(head) = chars.next() {
+            result.push(head);
+        }
+        rest = chars.as_str();
     }
     result
+}
+
+/// The `(address, replacement port)` rules [`patch_yaml`] matches, in the
+/// order it tries them.
+///
+/// # Panics
+///
+/// Panics if `port_map` contains an empty address.
+fn patch_rules<'a>(listener_port: u16, port_map: &HashMap<&'a str, u16>) -> Vec<(&'a str, u16)> {
+    assert!(
+        port_map.keys().all(|address| !address.is_empty()),
+        "port_map addresses must not be empty"
+    );
+
+    // Longest needle first so a shorter address that prefixes another cannot
+    // claim the match; `port_map` wins ties, since it is caller-supplied.
+    let mut rules: Vec<(&str, u16)> = port_map.iter().map(|(address, port)| (*address, *port)).collect();
+    rules.sort_unstable_by_key(|(address, _)| std::cmp::Reverse(address.len()));
+    for listener in ["0.0.0.0:8080", "127.0.0.1:8080"] {
+        if !port_map.contains_key(listener) {
+            rules.push((listener, listener_port));
+        }
+    }
+    rules
 }
 
 // -----------------------------------------------------------------------------
@@ -143,6 +301,35 @@ mod tests {
         );
     }
 
+    /// Regression: a listener port that begins with an endpoint port used to
+    /// be rewritten a second time by that endpoint's replacement.
+    #[test]
+    fn patch_yaml_does_not_rewrite_a_listener_that_extends_an_endpoint() {
+        let map = HashMap::from([("127.0.0.1:3001", 26000_u16)]);
+        let yaml = "address: \"0.0.0.0:8080\"\nendpoint: \"127.0.0.1:3001\"";
+
+        let result = patch_yaml(yaml, 30011, &map);
+
+        assert_eq!(
+            result, "address: \"127.0.0.1:30011\"\nendpoint: \"127.0.0.1:26000\"",
+            "the listener keeps its own port and the endpoint is patched once"
+        );
+    }
+
+    /// The pass must not re-examine text it just produced.
+    #[test]
+    fn patch_yaml_does_not_rewrite_its_own_output() {
+        let map = HashMap::from([("127.0.0.1:3000", 3001_u16), ("127.0.0.1:3001", 4000_u16)]);
+        let yaml = "a: \"127.0.0.1:3000\"\nb: \"127.0.0.1:3001\"";
+
+        let result = patch_yaml(yaml, 8080, &map);
+
+        assert_eq!(
+            result, "a: \"127.0.0.1:3001\"\nb: \"127.0.0.1:4000\"",
+            "the port substituted for the first address must not be patched again"
+        );
+    }
+
     #[test]
     fn patch_yaml_leaves_unmatched_unchanged() {
         let yaml = "upstream: \"10.0.0.1:443\"";
@@ -150,10 +337,18 @@ mod tests {
         assert_eq!(result, yaml, "unmatched addresses should stay unchanged");
     }
 
+    /// An empty address matches everywhere without consuming input, so the
+    /// scan would append replacements forever; reject it up front.
+    #[test]
+    #[should_panic(expected = "port_map addresses must not be empty")]
+    fn patch_yaml_rejects_an_empty_address() {
+        patch_yaml("address: \"0.0.0.0:8080\"", 8080, &HashMap::from([("", 5555_u16)]));
+    }
+
     #[test]
     fn example_config_path_resolves() {
         let path = example_config_path("model-to-header-routing.yaml");
-        assert!(std::path::Path::new(&path).exists(), "expected {path} to exist");
+        assert!(Path::new(&path).exists(), "expected {path} to exist");
     }
 
     #[test]
@@ -167,5 +362,93 @@ mod tests {
             config.listeners[0].address, "127.0.0.1:19999",
             "listener address should be patched"
         );
+    }
+
+    #[test]
+    fn allow_loopback_inserts_private_endpoints_when_insecure_options_has_inline_comment() {
+        let yaml = "listeners: []\ninsecure_options: # test settings\n  allow_private_upstreams: true\n";
+        let patched = allow_loopback_endpoints(yaml);
+        assert!(
+            insecure_options_has_key(&patched, "allow_private_endpoints"),
+            "inline comment on insecure_options must not block allow_private_endpoints insert"
+        );
+        assert!(
+            insecure_options_has_key(&patched, "allow_private_upstreams"),
+            "existing insecure_options entries must be preserved"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "example config is not valid YAML")]
+    fn allow_loopback_panics_on_invalid_yaml_with_parse_diagnostic() {
+        let _ = allow_loopback_endpoints("listeners: [\n");
+    }
+
+    #[test]
+    #[should_panic(expected = "example config root must be a mapping")]
+    fn allow_loopback_panics_when_root_is_not_a_mapping() {
+        let _ = allow_loopback_endpoints("- just\n- a\n- list\n");
+    }
+
+    #[test]
+    fn allow_root_for_test_harness_is_a_noop_when_not_root() {
+        if harness_is_root() {
+            return;
+        }
+        let yaml = "listeners: []\n";
+        match allow_root_for_test_harness(yaml) {
+            Cow::Borrowed(borrowed) => assert_eq!(borrowed, yaml, "non-root must borrow the input"),
+            Cow::Owned(_) => panic!("non-root must not rewrite the YAML"),
+        }
+    }
+
+    #[test]
+    fn write_praxis_yaml_for_harness_writes_praxis_yaml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_praxis_yaml_for_harness(dir.path(), "listeners: []\n");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("praxis.yaml"),
+            "harness write helper must use praxis.yaml"
+        );
+        assert!(path.is_file(), "harness config file should exist");
+        let written = std::fs::read_to_string(&path).expect("read harness config");
+        if harness_is_root() {
+            assert!(
+                insecure_options_has_key(&written, "allow_root"),
+                "root branch must inject insecure_options.allow_root"
+            );
+            assert_eq!(
+                yaml_allow_root_flag(&written),
+                Some(true),
+                "root-patched YAML must set allow_root: true"
+            );
+        } else {
+            assert!(
+                !insecure_options_has_key(&written, "allow_root"),
+                "non-root write must leave the YAML unpatched"
+            );
+        }
+    }
+
+    /// The rewrite the root branch of [`allow_root_for_test_harness`] applies;
+    /// always covered even when the harness is not UID 0.
+    #[test]
+    fn root_branch_yaml_rewrite_sets_allow_root() {
+        let patched = ensure_insecure_option_bool("listeners: []\n", "allow_root", true);
+        assert!(
+            insecure_options_has_key(&patched, "allow_root"),
+            "root rewrite must insert allow_root"
+        );
+        assert_eq!(
+            yaml_allow_root_flag(&patched),
+            Some(true),
+            "rewritten YAML must set allow_root: true"
+        );
+    }
+
+    fn yaml_allow_root_flag(yaml: &str) -> Option<bool> {
+        let root: serde_yaml::Value = serde_yaml::from_str(yaml).ok()?;
+        root.get("insecure_options")?.get("allow_root")?.as_bool()
     }
 }

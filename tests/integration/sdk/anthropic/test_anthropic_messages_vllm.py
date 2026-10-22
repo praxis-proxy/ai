@@ -280,8 +280,14 @@ def test_named_tool_choice_stop_reason(live_clients, route):
     )
     calls = [block for block in first.content if block.type == "tool_use"]
     assert len(calls) == 1, first.model_dump_json()
-    if first.stop_reason == "end_turn":
-        pytest.xfail("pinned vLLM v0.29.0 maps a named tool call to end_turn")
+    # Both routes report `tool_use`, by different paths. Native: vLLM's engine
+    # reports `finish_reason="stop"` for a named (forced) call, so its Anthropic
+    # converter derives the stop reason from the produced tool_use blocks
+    # instead. Translated: vLLM's Chat Completions surface already normalizes a
+    # named call to `finish_reason="tool_calls"`, which Praxis maps to
+    # `tool_use`. Only the native route changed — the previously pinned v0.29.0
+    # converter mapped off the finish reason alone and returned `end_turn`, the
+    # case this assertion was conditionally xfailed for before the v0.32.0 pin.
     assert first.stop_reason == "tool_use", first.model_dump_json()
 
 

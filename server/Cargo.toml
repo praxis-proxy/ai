@@ -36,31 +36,43 @@ policy-engine = [
 # aws_sigv4_sign: AWS Signature V4 request signing.
 aws-sigv4-filter = ["praxis-ai-filters/aws-sigv4-filter"]
 # Opt-in OpenAI filter groups (see praxis-ai-apis for what each one contains).
-openai-responses = ["praxis-ai-filters/openai-responses"]
+openai-responses = ["experimental", "praxis-ai-filters/openai-responses"]
+# Experimental ephemeral agent orchestration; separate from Responses support.
+openai-agentic-loop = ["openai-responses", "experimental", "praxis-ai-filters/openai-agentic-loop"]
 openai-file-resolve-filter = ["openai-responses", "praxis-ai-filters/openai-file-resolve-filter"]
 # Response store support; installs the response store pipeline extension.
 store = ["openai-responses", "praxis-ai-filters/store"]
-store-postgres = ["store", "praxis-ai-filters/store-postgres"]
-store-sqlite = ["store", "praxis-ai-filters/store-sqlite"]
+# Internal marker for builds with a concrete store backend. This keeps server
+# lifecycle wiring independent of which backend profile selected it.
+_store-backend = []
+store-postgres = ["store", "_store-backend", "praxis-ai-filters/store-postgres"]
+store-postgres-cert-auth = ["store", "_store-backend", "praxis-ai-filters/store-postgres-cert-auth"]
+store-sqlite = ["store", "_store-backend", "praxis-ai-filters/store-sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
 openai-conversations = ["store", "praxis-ai-filters/openai-conversations"]
 openai-compact = ["store", "praxis-ai-filters/openai-compact"]
 openai-mcp-tools = ["store", "praxis-ai-filters/openai-mcp-tools"]
-# Every OpenAI group, without choosing a store backend.
-openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
-# Every non-experimental filter; equals the pre-feature-split capability.
-full = ["standard", "openai-all", "store-postgres"]
+# Every OpenAI group, including experimental capabilities, without a backend.
+openai-all = ["openai-agentic-loop", "openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
+# Every non-experimental filter. Experimental OpenAI groups stay opt-in.
+full = ["standard"]
 # Experimental: the generic http_callout filter (see praxis-ai-filters).
 http-callout-filter = ["praxis-ai-filters/http-callout-filter", "experimental"]
 # Experimental: the azure_ad (Entra ID) auth filter (see praxis-ai-filters).
 azure-ad-filter = ["praxis-ai-filters/azure-ad-filter", "experimental"]
 # Experimental: the gcp_adc (GCP ADC) auth filter (see praxis-ai-filters).
 gcp-adc-filter = ["praxis-ai-filters/gcp-adc-filter", "experimental"]
+# Experimental: the anthropic_messages_to_vertexai_anthropic (Anthropic Messages
+# to Vertex AI rawPredict) translation filter (see praxis-ai-filters).
+vertex-anthropic-filter = ["praxis-ai-filters/vertex-anthropic-filter", "experimental"]
 # Experimental: the released Praxis Basic Auth filter, which publishes
 # AuthenticatedIdentity for downstream filters.
 basic-auth-filter = ["praxis-filter/basic-auth-filter", "experimental"]
 # Experimental: the token_rate_limit filter (see praxis-ai-filters).
 token-rate-limit-filter = ["praxis-ai-filters/token-rate-limit-filter", "experimental"]
+token-ceiling-filter = ["praxis-ai-filters/token-ceiling-filter", "experimental"]
+# Experimental: the inflight_tracker filter (see praxis-ai-filters).
+inflight-tracker-filter = ["praxis-ai-filters/inflight-tracker-filter", "experimental"]
 # Marker feature activated transitively by any experimental feature.
 experimental = ["praxis-ai-filters/experimental"]
 opentelemetry = ["praxis-ai-filters/opentelemetry"]

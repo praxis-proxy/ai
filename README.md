@@ -4,6 +4,7 @@
 [![Coverage: ≥95%](https://img.shields.io/badge/Coverage-≥95%25-brightgreen.svg)](https://github.com/praxis-proxy/ai/actions/workflows/coverage.yaml)
 [![MSRV: 1.96](https://img.shields.io/badge/MSRV-1.96-brightgreen.svg)](https://blog.rust-lang.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fai.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fai?ref=badge_shield)
 
 **Praxis AI is an AI gateway built on
 [Praxis](https://github.com/praxis-proxy/praxis).** It brings provider-aware
@@ -25,22 +26,32 @@ backends and applies policy.
   [Anthropic](examples/configs/anthropic/messages-to-openai.yaml)
   and [Responses](examples/configs/openai/responses/codex-http-chat-translation.yaml)
   examples.
-- **Code harness support.** Run Codex through OpenAI Responses and Claude Code
-  through Anthropic Messages. The
-  [coding client guide](docs/developing/cli-vllm-through-praxis.md) shows both
-  clients reaching native vLLM endpoints or Chat Completions through translation.
+- **Reach managed cloud models.** Adapt OpenAI Chat Completions traffic to the
+  managed-provider wire formats of Azure OpenAI, AWS Bedrock Converse, and
+  Google Vertex AI Gemini — streaming included — and authenticate each upstream
+  with AWS SigV4, Entra ID, or Google ADC. See the
+  [Azure](examples/configs/azure/chat-completions-to-openai.yaml),
+  [Bedrock](examples/configs/bedrock/chat-completions-to-converse.yaml), and
+  [Vertex](examples/configs/vertex/chat-completions-to-gemini.yaml) examples.
+- **Code harness support.** Run Codex through OpenAI Responses, Claude Code
+  through Anthropic Messages, and OpenCode through Chat Completions. The
+  [coding client guide](docs/developing/cli-vllm-through-praxis.md) shows each
+  client reaching native vLLM endpoints or Chat Completions through translation.
 - **Manage OpenAI response state.** Persist and rehydrate Responses history,
   serve Conversations endpoints locally, and use PostgreSQL or SQLite for
-  storage. See the [response store guide](docs/architecture/response-store.md)
+  storage. Fully supports both OpenAI Python SDK 2.x and 3.x client versions. See the [response store guide](docs/architecture/response-store.md)
   and [Conversations example](examples/configs/openai/conversations/conversations.yaml).
 - **Connect tools and agents.** Run Responses tool loops with MCP, web search,
   and file search; route stateless MCP calls and A2A task follow-ups. See the
   [agentic Responses](examples/configs/openai/responses/full-flow-agentic.yaml),
   [MCP broker](examples/configs/mcp-stateless-broker.yaml), and
   [A2A routing](examples/configs/a2a-task-routing.yaml) examples.
-- **Apply policy and measure usage.** Inject upstream credentials, enrich
-  prompts, call external guardrails, expose token usage, and report metering
-  data. See the [feature overview](docs/features.md) for details.
+- **Apply policy and control cost.** Inject upstream credentials, enrich
+  prompts, call external guardrails, enforce token rate limits and ceilings,
+  expose token usage, and report metering data. See the
+  [token rate limit](examples/configs/token-rate-limit.yaml) and
+  [external metering](examples/configs/external-metering.yaml) examples, and the
+  [feature overview](docs/features.md) for the full list.
 - **Extend the pipeline** with custom Rust filters built on Praxis's
   `HttpFilter` interface.
 
@@ -75,9 +86,9 @@ make release
 ./target/release/praxis-ai
 ```
 
-`make release` builds the `full` feature set. A plain
-`cargo build -p praxis-ai-proxy` builds the smaller `standard` set, which
-leaves out the stateful OpenAI filter groups and their dependencies; see
+`make release` and `cargo build -p praxis-ai-proxy` build `full`, which excludes
+experimental Responses, Conversations, and the agentic loop. Opt in with
+`--features openai-all,store-sqlite` to run their examples; see
 [Cargo features](docs/features.md#cargo-features).
 
 Then check that it is running:
@@ -132,7 +143,7 @@ with a `-fips` suffix (for example `latest-fips`); see
 
 Contributions are welcome, from bug reports and documentation fixes to new
 filters and protocol support. Before opening a pull request, please read the
-[contributing guide](.github/CONTRIBUTING.md) and
+[contributing guide](CONTRIBUTING.md) and
 [development setup](docs/developing/getting-started.md).
 
 For larger changes, open a [feature request] and follow the
@@ -150,6 +161,18 @@ For larger changes, open a [feature request] and follow the
 [release documentation]: docs/release.md
 [security policy]: .github/SECURITY.md
 
+## Community
+
+Read [GOVERNANCE.md](GOVERNANCE.md) to see how our community works.
+
+Feel free to join our [discussion forums] to ask questions or share ideas.
+
+Or please join us in our Slack channel on [CNCF Slack]: [#praxis] channel
+
+[discussion forums]:https://github.com/praxis-proxy/praxis/discussions
+
 ## License
 
 Apache 2.0
+
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fai.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fai?ref=badge_large)

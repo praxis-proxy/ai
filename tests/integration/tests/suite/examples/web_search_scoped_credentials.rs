@@ -28,8 +28,8 @@ fn patched_yaml(listener_port: u16, model_port: u16, search_port: u16) -> String
     let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("example config should exist");
     let yaml = patch_yaml(&yaml, listener_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = yaml.replace(
-        "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+        "env_var: WEB_SEARCH_API_KEY",
+        &format!("value: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
     // The provider callout targets a loopback mock, so the executor's SSRF check
     // requires the operator opt-in on the outbound pipeline.
@@ -72,7 +72,7 @@ fn web_search_scoped_credentials_example_builds() {
 fn per_user_credential_arrives_at_provider_and_ingress_header_is_stripped() {
     // The core proof: a per-user credential captured in the outer chain is staged
     // into the in-IRR-step web-search callout, proving the ordering is correct
-    // (outer callout_credentials runs before the in-IRR-step openai_web_search
+    // (outer callout_credentials runs before the in-IRR-step openai_web_search_dispatch
     // reads the slot). The test passes at all only if ordering is correct; wrong
     // ordering would 401.
     let first_response = json!({

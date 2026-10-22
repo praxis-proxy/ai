@@ -21,8 +21,9 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, StatefulCapturingBackend, TempSqlite, build_pipeline, example_config_path, free_port, http_send,
-    json_post, parse_body, parse_header, parse_status, patch_yaml, start_proxy,
+    Backend, CapturedRequest, StatefulCapturingBackend, StatefulCapturingGuard, TempSqlite, build_pipeline,
+    example_config_path, free_port, http_send, json_post, parse_body, parse_header, parse_status, patch_yaml,
+    start_proxy, start_uri_echo_backend,
 };
 
 // -----------------------------------------------------------------------------
@@ -61,6 +62,36 @@ fn load_client_tool_compat_config_without_stream_owner(
     praxis_core::config::Config::from_yaml(&yaml).expect("parse client-tool-compat config without stream owner")
 }
 
+/// The backend requests that are not the harness readiness probe.
+///
+/// `start_proxy` waits for the listener by sending `GET /`, and the chain's
+/// catch-all route forwards every path it does not otherwise handle to the
+/// inference backend. That probe is therefore visible to the mock alongside the
+/// rounds under test, the same way `azure_translation` skips Pingora's
+/// health-check probe. It consumes no scripted response: the mock answers
+/// probes itself.
+///
+/// Only that one request is dropped, so a fail-closed assertion still catches
+/// anything that reached the backend by some other method or path.
+fn backend_requests(model: &StatefulCapturingGuard) -> Vec<CapturedRequest> {
+    model
+        .requests()
+        .into_iter()
+        .filter(|request| !(request.method == "GET" && request.uri == "/"))
+        .collect()
+}
+
+/// The backend requests that are inference rounds.
+///
+/// Narrower than [`backend_requests`]: round counting is about the POSTs the
+/// adapter issues, so anything else the chain forwards is not one.
+fn inference_requests(model: &StatefulCapturingGuard) -> Vec<CapturedRequest> {
+    backend_requests(model)
+        .into_iter()
+        .filter(|request| request.method == "POST")
+        .collect()
+}
+
 // -----------------------------------------------------------------------------
 // Pipeline build
 // -----------------------------------------------------------------------------
@@ -70,6 +101,76 @@ fn example_config_builds_pipeline() {
     let db = TempSqlite::new("client_tool_compat_build");
     let config = load_client_tool_compat_config(free_port(), 19951, db.url());
     let _pipeline = build_pipeline(&config);
+}
+
+// -----------------------------------------------------------------------------
+// Bodyless traffic a coding client also sends
+// -----------------------------------------------------------------------------
+
+#[test]
+fn bodyless_models_probe_reaches_the_backend() {
+    // `GET /v1/models` carries no body. The chain leads with
+    // `openai_responses_request`, which resolves the operation from the
+    // request head, so a path it does not recognize is released rather than
+    // rejected for carrying no JSON. A body-only classifier under
+    // `on_invalid: reject` would answer 400 "request body is not JSON" here.
+    let backend = start_uri_echo_backend();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("client_tool_compat_models_probe");
+    let config = load_client_tool_compat_config(proxy_port, backend.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        "GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "bodyless model-discovery probe should return 200: {raw}"
+    );
+    assert_eq!(
+        parse_body(&raw),
+        "/v1/models",
+        "model-discovery path must reach the backend unchanged"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Protocol ownership on the catch-all route
+// -----------------------------------------------------------------------------
+
+/// The chain classifies OpenAI operations from the request head.
+///
+/// `openai_responses_request` resolves Responses operations only, so the
+/// `POST /v1/chat/completions` a coding client also sends through this
+/// chain's catch-all route leaves it with no operation identity at all.
+/// `ai_operation` resolves one for every OpenAI operation, from the head
+/// alone, which is what the body classifier this chain used to lead with
+/// could only do after reading a body.
+///
+/// Pinned at the pipeline rather than on the wire, because the facts that
+/// ownership produces are internal: the published application protocol and
+/// operation ID, and the protocol-shaped error formatter keyed off them.
+/// Nothing on this chain's own routes exercises the formatter either — every
+/// route runs inside the `iterative_request_router` step, which answers an
+/// upstream transport failure with its own 502 rather than through the
+/// `fail_to_proxy` path that consults it. So the assertion is on chain
+/// composition: nothing else here classifies non-Responses OpenAI traffic,
+/// and removing the filter silently drops that.
+#[test]
+fn the_chain_owns_the_openai_protocol_decision() {
+    let db = TempSqlite::new("client_tool_compat_protocol_owner");
+    let config = load_client_tool_compat_config(free_port(), 19952, db.url());
+    let pipeline = build_pipeline(&config);
+
+    assert!(
+        pipeline.contains_filter("ai_operation"),
+        "the chain must keep a request-head operation classifier so the \
+         non-Responses traffic it forwards still resolves to an OpenAI \
+         protocol"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -118,7 +219,7 @@ fn custom_tool_round_trip_lowers_and_restores() {
 
     // Request phase: the backend saw a lowered private `function`, never a
     // `custom` tool.
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 1, "one inference round for a single client tool call");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
@@ -203,7 +304,7 @@ fn shell_tool_round_trip_lowers_and_restores() {
 
     // Request phase: the backend saw a private `function` named `shell`, never a
     // rich `shell`/`local_shell` tool.
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 1, "one inference round");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
@@ -310,7 +411,7 @@ fn namespace_tool_round_trip_lowers_and_restores() {
     assert_eq!(parse_status(&raw), 200, "namespace round trip should return 200: {raw}");
 
     // Request phase: the backend saw a flat private function name.
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 1, "one inference round");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
@@ -350,6 +451,105 @@ fn namespace_tool_round_trip_lowers_and_restores() {
     let echoed_tools = response["tools"].as_array().expect("echoed tools present");
     assert_eq!(
         echoed_tools[0]["type"], "namespace",
+        "the client sees its original namespace tool: {response}"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Round trip: a Codex MCP namespace whose group name carries the `__` delimiter
+// -----------------------------------------------------------------------------
+
+/// Codex names an MCP tool namespace `mcp__{server}`, so the `__` the adapter uses
+/// to delimit the flattened `agentic_ns__{namespace}__{member}` wire name appears
+/// inside the group name itself. Such a pair cannot take the verbatim wire name (it
+/// would re-split into a different namespace/member pair), so it is flattened
+/// through the hashed branch — and must not be rejected, which would break every
+/// Codex session that attaches an MCP server.
+#[test]
+fn codex_mcp_namespace_group_round_trips_through_the_hashed_wire_name() {
+    // The flat wire name for (`mcp__codex_tui`, `read_file`), pinned by the
+    // `namespace_member_name` unit tests in `praxis-ai-apis`.
+    const FLAT: &str = "agentic_ns__mcp__codex_tui__read_file___68857b231df97733";
+
+    let backend_response = serde_json::json!({
+        "id": "resp_mcp_ns",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_mcp1",
+            "call_id": "call_mcp1",
+            "name": FLAT,
+            "arguments": r#"{"path":"/etc/hosts"}"#,
+            "status": "completed"
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, backend_response.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("client_tool_compat_mcp_namespace");
+    let config = load_client_tool_compat_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Read the hosts file.",
+        "tools": [{
+            "type": "namespace",
+            "name": "mcp__codex_tui",
+            "description": "Codex MCP tools.",
+            "tools": [{
+                "type": "function",
+                "name": "read_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }]
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "an MCP-style namespace group name must not be rejected: {raw}"
+    );
+
+    // Request phase: the backend saw the hashed flat private function name.
+    let model_reqs = inference_requests(&model);
+    assert_eq!(model_reqs.len(), 1, "one inference round");
+    let backend_body: serde_json::Value =
+        serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
+    let backend_tools = backend_body["tools"]
+        .as_array()
+        .expect("backend request should carry lowered tools");
+    assert_eq!(
+        backend_tools[0]["type"], "function",
+        "the MCP namespace member lowered to a function"
+    );
+    assert_eq!(
+        backend_tools[0]["name"], FLAT,
+        "the delimiter-bearing group flattened through the hashed branch: {backend_body}"
+    );
+
+    // Response phase: the flat `function_call` restores to its namespaced form with
+    // the group name recovered verbatim, delimiter and all.
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("client response should be JSON");
+    let output = response["output"].as_array().expect("output array present");
+    assert_eq!(output.len(), 1, "one restored output item: {response}");
+    assert_eq!(output[0]["name"], "read_file", "restored member name");
+    assert_eq!(
+        output[0]["namespace"], "mcp__codex_tui",
+        "the group name is restored verbatim: {response}"
+    );
+    let echoed_tools = response["tools"].as_array().expect("echoed tools present");
+    assert_eq!(
+        echoed_tools[0]["name"], "mcp__codex_tui",
         "the client sees its original namespace tool: {response}"
     );
 }
@@ -411,7 +611,7 @@ fn namespace_custom_member_round_trip_lowers_and_restores() {
 
     // Request phase: the backend saw a flat private function name and no rich
     // custom or namespace tool.
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 1, "one inference round");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
@@ -502,7 +702,7 @@ fn tool_search_round_trip_lowers_and_restores() {
     );
 
     // Request phase: the backend saw a private `function` named `tool_search`.
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 1, "one inference round");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
@@ -634,7 +834,7 @@ fn discovered_tool_round_trip_becomes_callable() {
 
     // Request phase of turn 2: the backend must see the discovered `apply_patch`
     // tool declared as a private function so it can call it.
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 2, "two inference rounds");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[1].body).expect("turn 2 backend body is JSON");
@@ -721,7 +921,7 @@ fn all_client_tool_types_lower_to_functions() {
         "mixed rich-tool request should return 200: {raw}"
     );
 
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 1, "one inference round");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
@@ -794,7 +994,7 @@ fn streaming_rich_client_tool_without_stream_owner_fails_closed() {
         "the rejection names the missing streaming owner: {body}"
     );
     assert!(
-        model.requests().is_empty(),
+        backend_requests(&model).is_empty(),
         "the backend must never be contacted when the request fails closed"
     );
 }
@@ -844,7 +1044,7 @@ fn local_shell_declaration_fails_closed_before_upstream() {
         "the rejection names the unsupported tool: {body}"
     );
     assert!(
-        model.requests().is_empty(),
+        backend_requests(&model).is_empty(),
         "the backend must never be contacted when the request fails closed"
     );
 }
@@ -899,7 +1099,7 @@ fn native_function_tool_passes_through_unchanged() {
     assert_eq!(parse_status(&raw), 200, "native passthrough should return 200: {raw}");
 
     // The backend saw the plain function tool untouched.
-    let model_reqs = model.requests();
+    let model_reqs = inference_requests(&model);
     assert_eq!(model_reqs.len(), 1, "one inference round");
     let backend_body: serde_json::Value =
         serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
@@ -1130,5 +1330,679 @@ fn streaming_namespace_member_never_leaks_private_name() {
     assert!(
         body.contains("\"namespace\":\"utils\""),
         "the restored namespaced call re-adds its namespace: {body}"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Streaming: a deferred shell opening still precedes a later parallel function
+// -----------------------------------------------------------------------------
+
+/// Build the backend SSE body for a parallel shell + ordinary-function round where
+/// the upstream announces openings in order (`[0, 1]`) but the ordinary function at
+/// index 1 streams and completes its arguments *before* the shell at index 0.
+///
+/// A `shell` call cannot be announced as a schema-valid `shell_call` until its
+/// arguments are final, so Praxis suppresses the raw `output_item.added` at index 0
+/// and synthesizes the typed opening at `arguments.done` (#1159 Task 6). Because the
+/// shell's arguments arrive last, that synthesized opening would otherwise be emitted
+/// after index 1's opening, flipping the client-visible order to `[1, 0]` and
+/// tripping the OpenAI SDK streaming accumulator (#1767). Returned as either one
+/// coalesced chunk or one chunk per event.
+fn shell_opening_order_sse(coalesced: bool) -> Vec<String> {
+    // (event, data) pairs for each upstream SSE frame, in the order the backend emits
+    // them: both items open in index order (0 then 1), the ordinary function at index 1
+    // streams and completes first, then the shell at index 0 completes last. Raw-string
+    // data keeps the embedded JSON quotes unescaped and keeps this fixture off the stack
+    // (clippy::large_stack_frames).
+    let frames: [(&str, &str); 9] = [
+        (
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_sh1","call_id":"call_sh1","name":"shell","arguments":"","status":"in_progress"}}"#,
+        ),
+        (
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_lookup","call_id":"call_lookup","name":"lookup","arguments":"","status":"in_progress"}}"#,
+        ),
+        (
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_lookup","delta":"{}"}"#,
+        ),
+        (
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","output_index":1,"item_id":"fc_lookup","name":"lookup","arguments":"{}"}"#,
+        ),
+        (
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_lookup","call_id":"call_lookup","name":"lookup","arguments":"{}","status":"completed"}}"#,
+        ),
+        (
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_sh1","delta":"{\"commands\":[\"pwd\"]}"}"#,
+        ),
+        (
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_sh1","name":"shell","arguments":"{\"commands\":[\"pwd\"]}"}"#,
+        ),
+        (
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_sh1","call_id":"call_sh1","name":"shell","arguments":"{\"commands\":[\"pwd\"]}","status":"completed"}}"#,
+        ),
+        (
+            "response.completed",
+            r#"{"type":"response.completed","response":{"id":"resp_order","object":"response","status":"completed","output":[{"type":"function_call","id":"fc_sh1","call_id":"call_sh1","name":"shell","arguments":"{\"commands\":[\"pwd\"]}","status":"completed"},{"type":"function_call","id":"fc_lookup","call_id":"call_lookup","name":"lookup","arguments":"{}","status":"completed"}],"parallel_tool_calls":true,"tool_choice":"auto","tools":[]}}"#,
+        ),
+    ];
+    let rendered: Vec<String> = frames
+        .iter()
+        .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+        .collect();
+    if coalesced { vec![rendered.concat()] } else { rendered }
+}
+
+/// Drive the parallel shell + function round and assert the client-visible openings
+/// stay contiguous and ascending (`[0, 1]`), with the terminal output ordered
+/// `shell_call` then `function_call` (#1767). Parameterized over chunk framing so
+/// both a coalesced chunk and one-event-per-chunk delivery are covered.
+fn assert_shell_opening_order_preserved(coalesced: bool) {
+    let model = Backend::chunked(shell_opening_order_sse(coalesced))
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("client_tool_compat_stream_order");
+    let config = load_client_tool_compat_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Inspect the environment and look up data.",
+        "stream": true,
+        "parallel_tool_calls": true,
+        "tools": [
+            {"type": "shell", "environment": {"type": "local"}},
+            {
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": false},
+                "strict": true
+            }
+        ]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "streaming parallel shell order should return 200: {raw}"
+    );
+    let body = parse_body(&raw);
+
+    let events: Vec<serde_json::Value> = body
+        .split("\n\n")
+        .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).expect("each streamed data line is JSON"))
+        .collect();
+
+    // Exactly one terminal, no error frame.
+    assert_eq!(
+        events.iter().filter(|e| e["type"] == "response.completed").count(),
+        1,
+        "exactly one response.completed: {body}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["type"] == "response.failed" || e["type"] == "error"),
+        "no failure frame may appear: {body}"
+    );
+
+    // The regression: openings must be announced in ascending, contiguous index
+    // order even though the shell's opening is deferred until its arguments.done.
+    let openings: Vec<u64> = events
+        .iter()
+        .filter(|e| e["type"] == "response.output_item.added")
+        .map(|e| e["output_index"].as_u64().expect("added events carry an output_index"))
+        .collect();
+    assert_eq!(
+        openings,
+        vec![0, 1],
+        "the deferred shell opening must still precede the later function (SDK accumulator \
+         requires contiguous ascending openings): {body}"
+    );
+
+    // Reordering the deferred opening ahead of the staged events must not make
+    // sequence numbers run backwards: they are stamped in emission order (#1767).
+    let sequence_numbers: Vec<u64> = events.iter().filter_map(|e| e["sequence_number"].as_u64()).collect();
+    assert!(
+        sequence_numbers.windows(2).all(|pair| pair[0] < pair[1]),
+        "client sequence_numbers must increase monotonically in emission order: {sequence_numbers:?}"
+    );
+
+    // The terminal output stays ordered: shell_call at index 0, function_call at 1.
+    let completed = events
+        .iter()
+        .find(|e| e["type"] == "response.completed")
+        .expect("a response.completed frame");
+    assert_eq!(completed["response"]["output"][0]["type"], "shell_call", "{body}");
+    assert_eq!(completed["response"]["output"][1]["type"], "function_call", "{body}");
+}
+
+/// A deferred shell opening still precedes a later parallel function when each SSE
+/// event arrives in its own chunk (#1767).
+#[test]
+fn streaming_deferred_shell_opening_precedes_later_function_separate_chunks() {
+    assert_shell_opening_order_preserved(false);
+}
+
+/// A deferred shell opening still precedes a later parallel function when the whole
+/// round arrives coalesced into a single chunk (#1767).
+#[test]
+fn streaming_deferred_shell_opening_precedes_later_function_coalesced_chunk() {
+    assert_shell_opening_order_preserved(true);
+}
+
+/// Two deferred shell openings straddling an ordinary function (indices 0, 1, 2) where
+/// the function completes first and the shells complete in order: the earlier shell's
+/// fill must release the staged function opening even though the later shell is still
+/// pending, so openings stay `[0, 1, 2]` (#1767). A naive "flush only when no opening
+/// is pending" instead emits `[0, 2, 1]`.
+#[test]
+fn streaming_two_deferred_shell_openings_release_prefix_in_order() {
+    // Upstream opens 0 (shell), 1 (function), 2 (shell) in order; the function at
+    // index 1 completes first, then shell 0, then shell 2.
+    let frames: [(&str, &str); 13] = [
+        (
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_sh_a","call_id":"call_sh_a","name":"shell","arguments":"","status":"in_progress"}}"#,
+        ),
+        (
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_lookup","call_id":"call_lookup","name":"lookup","arguments":"","status":"in_progress"}}"#,
+        ),
+        (
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","id":"fc_sh_b","call_id":"call_sh_b","name":"shell","arguments":"","status":"in_progress"}}"#,
+        ),
+        (
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_lookup","delta":"{}"}"#,
+        ),
+        (
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","output_index":1,"item_id":"fc_lookup","name":"lookup","arguments":"{}"}"#,
+        ),
+        (
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_lookup","call_id":"call_lookup","name":"lookup","arguments":"{}","status":"completed"}}"#,
+        ),
+        (
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_sh_a","delta":"{\"commands\":[\"pwd\"]}"}"#,
+        ),
+        (
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_sh_a","name":"shell","arguments":"{\"commands\":[\"pwd\"]}"}"#,
+        ),
+        (
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_sh_a","call_id":"call_sh_a","name":"shell","arguments":"{\"commands\":[\"pwd\"]}","status":"completed"}}"#,
+        ),
+        (
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","output_index":2,"item_id":"fc_sh_b","delta":"{\"commands\":[\"ls\"]}"}"#,
+        ),
+        (
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","output_index":2,"item_id":"fc_sh_b","name":"shell","arguments":"{\"commands\":[\"ls\"]}"}"#,
+        ),
+        (
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","id":"fc_sh_b","call_id":"call_sh_b","name":"shell","arguments":"{\"commands\":[\"ls\"]}","status":"completed"}}"#,
+        ),
+        (
+            "response.completed",
+            r#"{"type":"response.completed","response":{"id":"resp_order","object":"response","status":"completed","output":[{"type":"function_call","id":"fc_sh_a","call_id":"call_sh_a","name":"shell","arguments":"{\"commands\":[\"pwd\"]}","status":"completed"},{"type":"function_call","id":"fc_lookup","call_id":"call_lookup","name":"lookup","arguments":"{}","status":"completed"},{"type":"function_call","id":"fc_sh_b","call_id":"call_sh_b","name":"shell","arguments":"{\"commands\":[\"ls\"]}","status":"completed"}],"parallel_tool_calls":true,"tool_choice":"auto","tools":[]}}"#,
+        ),
+    ];
+    let body_frames: Vec<String> = frames
+        .iter()
+        .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+        .collect();
+    let model = Backend::chunked(body_frames)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("client_tool_compat_stream_order_multi");
+    let config = load_client_tool_compat_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Inspect the environment twice and look up data.",
+        "stream": true,
+        "parallel_tool_calls": true,
+        "tools": [
+            {"type": "shell", "environment": {"type": "local"}},
+            {
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": false},
+                "strict": true
+            }
+        ]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "multi-shell parallel order should return 200: {raw}"
+    );
+    let body = parse_body(&raw);
+
+    let events: Vec<serde_json::Value> = body
+        .split("\n\n")
+        .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).expect("each streamed data line is JSON"))
+        .collect();
+
+    let openings: Vec<u64> = events
+        .iter()
+        .filter(|e| e["type"] == "response.output_item.added")
+        .map(|e| e["output_index"].as_u64().expect("added events carry an output_index"))
+        .collect();
+    assert_eq!(
+        openings,
+        vec![0, 1, 2],
+        "an earlier shell fill must release the staged function opening before the later \
+         shell opens, keeping openings ascending: {body}"
+    );
+
+    let sequence_numbers: Vec<u64> = events.iter().filter_map(|e| e["sequence_number"].as_u64()).collect();
+    assert!(
+        sequence_numbers.windows(2).all(|pair| pair[0] < pair[1]),
+        "client sequence_numbers must increase monotonically: {sequence_numbers:?}"
+    );
+
+    let completed = events
+        .iter()
+        .find(|e| e["type"] == "response.completed")
+        .expect("a response.completed frame");
+    let output_types: Vec<&str> = completed["response"]["output"]
+        .as_array()
+        .expect("terminal output array")
+        .iter()
+        .map(|item| item["type"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        output_types,
+        vec!["shell_call", "function_call", "shell_call"],
+        "terminal output keeps its index order: {body}"
+    );
+}
+
+/// Two adjacent deferred shell openings (indices 0, 1) with an ordinary item at index 2,
+/// where the later shell (index 1) completes before the earlier shell (index 0). The
+/// synthesized opening for index 1 is therefore staged *after* index 2's events, so a
+/// release in arrival order would emit openings `[0, 2, 1]`. Releasing in output-index
+/// order keeps them `[0, 1, 2]` (#1767).
+#[test]
+fn streaming_later_deferred_opening_releases_in_index_order() {
+    let frames: [(&str, &str); 13] = [
+        (
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_sh_a","call_id":"call_sh_a","name":"shell","arguments":"","status":"in_progress"}}"#,
+        ),
+        (
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_sh_b","call_id":"call_sh_b","name":"shell","arguments":"","status":"in_progress"}}"#,
+        ),
+        (
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","id":"fc_lookup","call_id":"call_lookup","name":"lookup","arguments":"","status":"in_progress"}}"#,
+        ),
+        (
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","output_index":2,"item_id":"fc_lookup","delta":"{}"}"#,
+        ),
+        (
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","output_index":2,"item_id":"fc_lookup","name":"lookup","arguments":"{}"}"#,
+        ),
+        (
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","id":"fc_lookup","call_id":"call_lookup","name":"lookup","arguments":"{}","status":"completed"}}"#,
+        ),
+        (
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_sh_b","delta":"{\"commands\":[\"ls\"]}"}"#,
+        ),
+        (
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","output_index":1,"item_id":"fc_sh_b","name":"shell","arguments":"{\"commands\":[\"ls\"]}"}"#,
+        ),
+        (
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_sh_b","call_id":"call_sh_b","name":"shell","arguments":"{\"commands\":[\"ls\"]}","status":"completed"}}"#,
+        ),
+        (
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_sh_a","delta":"{\"commands\":[\"pwd\"]}"}"#,
+        ),
+        (
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_sh_a","name":"shell","arguments":"{\"commands\":[\"pwd\"]}"}"#,
+        ),
+        (
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_sh_a","call_id":"call_sh_a","name":"shell","arguments":"{\"commands\":[\"pwd\"]}","status":"completed"}}"#,
+        ),
+        (
+            "response.completed",
+            r#"{"type":"response.completed","response":{"id":"resp_order","object":"response","status":"completed","output":[{"type":"function_call","id":"fc_sh_a","call_id":"call_sh_a","name":"shell","arguments":"{\"commands\":[\"pwd\"]}","status":"completed"},{"type":"function_call","id":"fc_sh_b","call_id":"call_sh_b","name":"shell","arguments":"{\"commands\":[\"ls\"]}","status":"completed"},{"type":"function_call","id":"fc_lookup","call_id":"call_lookup","name":"lookup","arguments":"{}","status":"completed"}],"parallel_tool_calls":true,"tool_choice":"auto","tools":[]}}"#,
+        ),
+    ];
+    let body_frames: Vec<String> = frames
+        .iter()
+        .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+        .collect();
+    let model = Backend::chunked(body_frames)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("client_tool_compat_stream_order_outoforder");
+    let config = load_client_tool_compat_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Inspect the environment twice and look up data.",
+        "stream": true,
+        "parallel_tool_calls": true,
+        "tools": [
+            {"type": "shell", "environment": {"type": "local"}},
+            {
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": false},
+                "strict": true
+            }
+        ]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "out-of-order shell completion should return 200: {raw}"
+    );
+    let body = parse_body(&raw);
+
+    let events: Vec<serde_json::Value> = body
+        .split("\n\n")
+        .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).expect("each streamed data line is JSON"))
+        .collect();
+
+    let openings: Vec<u64> = events
+        .iter()
+        .filter(|e| e["type"] == "response.output_item.added")
+        .map(|e| e["output_index"].as_u64().expect("added events carry an output_index"))
+        .collect();
+    assert_eq!(
+        openings,
+        vec![0, 1, 2],
+        "a later shell's synthesized opening, staged out of arrival order, must still be \
+         released in index order: {body}"
+    );
+
+    let sequence_numbers: Vec<u64> = events.iter().filter_map(|e| e["sequence_number"].as_u64()).collect();
+    assert!(
+        sequence_numbers.windows(2).all(|pair| pair[0] < pair[1]),
+        "client sequence_numbers must increase monotonically: {sequence_numbers:?}"
+    );
+
+    let completed = events
+        .iter()
+        .find(|e| e["type"] == "response.completed")
+        .expect("a response.completed frame");
+    let output_types: Vec<&str> = completed["response"]["output"]
+        .as_array()
+        .expect("terminal output array")
+        .iter()
+        .map(|item| item["type"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        output_types,
+        vec!["shell_call", "shell_call", "function_call"],
+        "terminal output keeps its index order: {body}"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Stored continuation: client-owned tool history survives replay (#1764)
+// -----------------------------------------------------------------------------
+
+/// A completed backend response object the store can persist and rehydrate.
+fn history_backend_response(id: &str, store: bool) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "error": null,
+        "incomplete_details": null,
+        "instructions": null,
+        "max_output_tokens": null,
+        "model": "gpt-4.1",
+        "output": [{
+            "type": "message",
+            "id": "msg_history",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Acknowledged", "annotations": [], "logprobs": []}]
+        }],
+        "parallel_tool_calls": true,
+        "previous_response_id": null,
+        "reasoning": null,
+        "store": store,
+        "temperature": 1.0,
+        "text": {"format": {"type": "text"}},
+        "tool_choice": "auto",
+        "tools": [],
+        "top_p": 1.0,
+        "truncation": "disabled",
+        "usage": {
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0}
+        },
+        "metadata": {}
+    })
+}
+
+/// Drive the two-request stored-continuation flow and return the backend request
+/// bodies for both rounds (`store: true` first request, then a `store: false`
+/// continuation keyed by `previous_response_id`).
+///
+/// `custom` selects between client-owned `custom_tool_call`/`custom_tool_call_output`
+/// history (the #1764 regression) and ordinary `function_call`/`function_call_output`
+/// history (the positive control). Either pair carries the same `call_history`
+/// `call_id` and `SENTINEL` output.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "stored continuation JSON values are bounded integration-test fixtures"
+)]
+fn stored_client_tool_continuation(custom: bool) -> (serde_json::Value, serde_json::Value) {
+    const SENTINEL: &str = "PRIOR_CLIENT_TOOL_RESULT_SENTINEL";
+
+    let model = StatefulCapturingBackend::new(vec![
+        (200, history_backend_response("resp_history_1", true).to_string()),
+        (200, history_backend_response("resp_history_2", false).to_string()),
+    ])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("client_tool_compat_stored_history");
+    let config = load_client_tool_compat_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let (tools, call, output) = if custom {
+        (
+            serde_json::json!([{"type": "custom", "name": "do_work"}]),
+            serde_json::json!({
+                "type": "custom_tool_call",
+                "call_id": "call_history",
+                "name": "do_work",
+                "input": "Prior invocation"
+            }),
+            serde_json::json!({
+                "type": "custom_tool_call_output",
+                "call_id": "call_history",
+                "output": SENTINEL
+            }),
+        )
+    } else {
+        (
+            serde_json::json!([{
+                "type": "function",
+                "name": "do_work",
+                "parameters": {"type": "object", "properties": {}},
+                "strict": false
+            }]),
+            serde_json::json!({
+                "type": "function_call",
+                "call_id": "call_history",
+                "name": "do_work",
+                "arguments": "{}"
+            }),
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call_history",
+                "output": SENTINEL
+            }),
+        )
+    };
+
+    // First request: a rich client-tool history is stored under resp_history_1.
+    let first = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": [
+            {"type": "message", "role": "user", "content": "Previous turn"},
+            call,
+            output
+        ],
+        "tools": tools,
+        "stream": false,
+        "store": true
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&first).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "valid initial rich history must succeed: {raw}"
+    );
+    let first_response: serde_json::Value =
+        serde_json::from_str(&parse_body(&raw)).expect("first response should be JSON");
+    let stored_id = first_response["id"].as_str().expect("first response carries an id");
+
+    // Second request: a stored continuation keyed by previous_response_id.
+    let second = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Continue from the prior result",
+        "tools": tools,
+        "previous_response_id": stored_id,
+        "stream": false,
+        "store": false
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&second).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "valid stored continuation must complete: {raw}"
+    );
+
+    let posts = inference_requests(&model);
+    assert_eq!(posts.len(), 2, "exactly two inference rounds: one per request");
+    for post in &posts {
+        assert_eq!(post.uri, "/v1/responses", "every round hits native /v1/responses");
+    }
+    let first_wire: serde_json::Value =
+        serde_json::from_str(&posts[0].body).expect("first backend body should be JSON");
+    let second_wire: serde_json::Value =
+        serde_json::from_str(&posts[1].body).expect("second backend body should be JSON");
+
+    // Control: the first round already lowers the client-owned pair to the
+    // function shape, so the result sentinel reaches the backend.
+    let first_items = first_wire["input"].as_array().expect("first backend input is an array");
+    assert!(
+        first_items
+            .iter()
+            .any(|item| item["type"] == "function_call_output" && item["output"] == SENTINEL),
+        "initial lowering must send the client-tool result to the backend: {first_wire}"
+    );
+
+    (second_wire, serde_json::json!(SENTINEL))
+}
+
+/// #1764 positive control: ordinary `function_call`/`function_call_output`
+/// history already survives stored replay and reaches the continuation backend.
+#[test]
+fn stored_function_tool_history_survives_continuation() {
+    let (second_wire, sentinel) = stored_client_tool_continuation(false);
+    let items = second_wire["input"]
+        .as_array()
+        .expect("second backend input is an array");
+    let call_pos = items
+        .iter()
+        .position(|item| item["type"] == "function_call" && item["call_id"] == "call_history");
+    let output_pos = items.iter().position(|item| {
+        item["type"] == "function_call_output" && item["call_id"] == "call_history" && item["output"] == sentinel
+    });
+    assert!(
+        call_pos.is_some() && output_pos.is_some() && call_pos < output_pos,
+        "the stored function call/output pair must replay in order: {second_wire}"
+    );
+}
+
+/// #1764 regression: a stored `custom_tool_call`/`custom_tool_call_output` pair
+/// must survive replay and be lowered to the function shape on the continuation
+/// backend request, instead of being silently dropped before adapter lowering.
+#[test]
+fn stored_custom_tool_history_survives_continuation() {
+    let (second_wire, sentinel) = stored_client_tool_continuation(true);
+    let items = second_wire["input"]
+        .as_array()
+        .expect("second backend input is an array");
+    assert!(
+        items
+            .iter()
+            .all(|item| item["type"] != "custom_tool_call" && item["type"] != "custom_tool_call_output"),
+        "no raw custom item may reach the function-only backend: {second_wire}"
+    );
+    let call_pos = items
+        .iter()
+        .position(|item| item["type"] == "function_call" && item["call_id"] == "call_history");
+    let output_pos = items.iter().position(|item| {
+        item["type"] == "function_call_output" && item["call_id"] == "call_history" && item["output"] == sentinel
+    });
+    assert!(
+        call_pos.is_some() && output_pos.is_some() && call_pos < output_pos,
+        "the stored custom call/output pair must replay and lower in order: {second_wire}"
     );
 }

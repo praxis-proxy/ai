@@ -1,0 +1,46 @@
+version: 1
+id: messages/degrade-features
+description: Operator-approved degradation strips allowlisted prompt-caching and extended-thinking markers so an unmodified client reaches the Chat Completions backend.
+protocol: anthropic_messages
+example_config: anthropic/messages-to-openai-degrade-fixture.yaml
+upstream_authority: 127.0.0.1:8000
+features:
+  - messages.request.degrade_prompt_caching
+  - messages.request.degrade_extended_thinking
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/messages
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          # `budget_tokens` must be < `max_tokens` per the Anthropic schema.
+          max_tokens: 2048
+          stream: false
+          thinking:
+            type: enabled
+            budget_tokens: 1024
+          system:
+            - type: text
+              text: Be brief.
+              cache_control:
+                type: ephemeral
+          messages:
+            - role: user
+              content:
+                - type: text
+                  text: What is 2+2? Reply with just the number.
+                  cache_control:
+                    type: ephemeral
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

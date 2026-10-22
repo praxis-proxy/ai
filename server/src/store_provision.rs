@@ -9,7 +9,7 @@
 //! pools bind to the runtime that opens them, so provisioning must run there, not
 //! on the config-watcher runtime a reload uses.
 
-#![cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#![cfg(feature = "_store-backend")]
 
 #[cfg(feature = "openai-conversations")]
 use std::collections::HashSet;
@@ -28,20 +28,18 @@ use pingora_core::{
     services::{ServiceReadyNotifier, background::BackgroundService},
 };
 #[cfg(feature = "openai-conversations")]
-use praxis_ai_apis::store::{
-    CONVERSATIONS_STORE_FILTER_NAME, CONVERSATIONS_STORE_NAME, conversations_store_ref_config,
-};
-use praxis_ai_apis::store::{
-    DEFAULT_STORE_NAME, RESPONSE_STORE_FILTER_NAME, ResponseStoreRegistry, store_backend_factories,
-};
-use praxis_ai_store::{BackendError, EffectiveConfigKey, StoreBackendFactory, StoreRegistry};
+use praxis_ai_apis::store::plan::{StoreRefLocation, coalesce_compatible_filter_refs, validate_cross_store_collisions};
+#[cfg(feature = "openai-conversations")]
+use praxis_ai_apis::store::{CONVERSATIONS_STORE_NAME, DEFAULT_STORE_NAME};
+use praxis_ai_apis::store::{ResponseStoreRegistry, plan, store_backend_factories};
+#[cfg(feature = "openai-conversations")]
+use praxis_ai_store::BackendError;
+use praxis_ai_store::{StoreBackendFactory, StoreRegistry};
 use praxis_ai_store_lifecycle::{BackendCache, BackendLease, ProvisionError, StoreRef};
 use praxis_core::config::{Config, FilterEntry};
 use praxis_filter::FilterPipeline;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tracing::{error, info};
-
-use crate::store_config::find_listener_store_configs;
 
 /// Poll interval while an old pipeline generation drains in-flight requests.
 const PIPELINE_DRAIN_POLL: Duration = Duration::from_millis(10);
@@ -116,6 +114,18 @@ struct ListenerStorePlan {
     registry: StoreRegistry,
     /// Store references to provision (one default store, so at most one).
     refs: Vec<StoreRef>,
+}
+
+impl AsRef<[StoreRef]> for ListenerStorePlan {
+    fn as_ref(&self) -> &[StoreRef] {
+        &self.refs
+    }
+}
+
+impl AsMut<[StoreRef]> for ListenerStorePlan {
+    fn as_mut(&mut self) -> &mut [StoreRef] {
+        &mut self.refs
+    }
 }
 
 /// Return whether `candidate` is the same filter-owned store configuration as
@@ -252,452 +262,6 @@ fn preserve_active_store_configs(
     Ok(())
 }
 
-/// Build the response-store reference from a response-store filter's config.
-///
-/// The `backend` field selects the factory. The rest is the inline config the
-/// factory parses. Returns `None` for a config missing a string `backend` or one
-/// that cannot map to JSON.
-fn response_store_ref(filter_config: &serde_yaml::Value) -> Option<StoreRef> {
-    let backend = filter_config.get("backend").and_then(serde_yaml::Value::as_str)?;
-    let mut config = serde_json::to_value(filter_config).ok()?;
-    config.as_object_mut()?.remove("backend");
-    normalize_sqlite_factory_config(backend, &mut config);
-    Some(StoreRef {
-        name: Arc::from(DEFAULT_STORE_NAME),
-        backend_id: Arc::from(backend),
-        config,
-    })
-}
-
-/// Build the conversations-store reference from a conversations filter's config.
-///
-/// The apis layer owns the table defaults and the generated (unused)
-/// responses-table name the combined backend requires. The store is registered
-/// under its own name; the lifecycle cache still shares one backend with the
-/// response store when their effective configs match.
-#[cfg(feature = "openai-conversations")]
-fn conversations_store_ref(filter_config: &serde_yaml::Value) -> Option<StoreRef> {
-    match conversations_store_ref_config(filter_config) {
-        Ok((backend_id, mut config)) => {
-            normalize_sqlite_factory_config(&backend_id, &mut config);
-            Some(StoreRef {
-                name: Arc::from(CONVERSATIONS_STORE_NAME),
-                backend_id: Arc::from(backend_id.as_str()),
-                config,
-            })
-        },
-        Err(e) => {
-            error!(error = %e, "conversations store config could not be prepared for provisioning");
-            None
-        },
-    }
-}
-
-/// Remove accepted no-op `PostgreSQL` fields before dispatching to `SQLite`.
-///
-/// The public filter configs accept explicit false/null defaults for backward
-/// compatibility, while the backend factory intentionally rejects fields that
-/// are not part of its SQLite schema. Preserve that strict factory boundary by
-/// removing only values that filter validation has already established as
-/// no-ops. Non-default values remain and still fail closed.
-fn normalize_sqlite_factory_config(backend_id: &str, config: &mut serde_json::Value) {
-    if backend_id != "sqlite" {
-        return;
-    }
-    let Some(config) = config.as_object_mut() else {
-        return;
-    };
-    for field in ["ssl_mode", "ssl_root_cert", "ssl_client_cert", "ssl_client_key"] {
-        if config.get(field).is_some_and(serde_json::Value::is_null) {
-            config.remove(field);
-        }
-    }
-    for field in ["require_certificate_authentication", "allow_private_database_url"] {
-        if config.get(field).and_then(serde_json::Value::as_bool) == Some(false) {
-            config.remove(field);
-        }
-    }
-}
-
-/// Return an effective key that compares connection, TLS, compression, and
-/// pool identity while deliberately ignoring the tables one filter uses.
-///
-/// Responses and Conversations expose different table-shaped configs even
-/// when they target the same combined backend. Replacing every table with the
-/// same valid sentinel lets the backend factory retain ownership of all other
-/// default normalization used by its real cache key.
-#[cfg(feature = "openai-conversations")]
-fn table_agnostic_effective_key(
-    factory: &dyn StoreBackendFactory,
-    store_ref: &StoreRef,
-) -> Result<EffectiveConfigKey, BackendError> {
-    let mut config = store_ref.config.clone();
-    let object = config
-        .as_object_mut()
-        .ok_or_else(|| BackendError::Config("store config must be an object".to_owned()))?;
-    object.insert(
-        "responses_table".to_owned(),
-        serde_json::Value::String("shared_responses".to_owned()),
-    );
-    object.insert(
-        "conversations_table".to_owned(),
-        serde_json::Value::String("shared_conversations".to_owned()),
-    );
-    object.insert(
-        "items_table".to_owned(),
-        serde_json::Value::String("shared_items".to_owned()),
-    );
-    factory.effective_key(&config)
-}
-
-/// Kind of SQL schema object created by a store configuration.
-#[cfg(feature = "openai-conversations")]
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum SqlObjectKind {
-    /// Main response-object table.
-    ResponsesTable,
-    /// Pending tool-approval table associated with a response table.
-    PendingApprovalsTable,
-    /// Schema-version table associated with a response table.
-    SchemaVersionTable,
-    /// Conversation metadata table.
-    ConversationsTable,
-    /// Tenant lookup index associated with a conversations table.
-    ConversationsTenantIndex,
-    /// Conversation-item table.
-    ItemsTable,
-    /// Conversation lookup index associated with an items table.
-    ItemsConversationIndex,
-    /// Position uniqueness index associated with an items table.
-    ItemsPositionIndex,
-}
-
-/// One table or generated index created by a store configuration.
-#[cfg(feature = "openai-conversations")]
-struct SqlObject {
-    /// Schema shape represented by this object.
-    kind: SqlObjectKind,
-    /// Human-readable config or generated-object owner for diagnostics.
-    owner: &'static str,
-    /// SQL namespace name compared case-insensitively.
-    name: String,
-}
-
-/// Inventory the schema objects created by one store configuration.
-#[cfg(feature = "openai-conversations")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the complete SQL object-name inventory must remain visible together"
-)]
-fn sql_objects(config: &serde_json::Value) -> Option<Vec<SqlObject>> {
-    let responses_table = config.get("responses_table")?.as_str()?;
-    let conversations_table = config.get("conversations_table")?.as_str()?;
-    let mut objects = vec![
-        SqlObject {
-            kind: SqlObjectKind::ResponsesTable,
-            owner: "responses_table",
-            name: responses_table.to_owned(),
-        },
-        SqlObject {
-            kind: SqlObjectKind::PendingApprovalsTable,
-            owner: "responses pending-approvals table",
-            name: format!("{responses_table}_pending_approvals"),
-        },
-        SqlObject {
-            kind: SqlObjectKind::SchemaVersionTable,
-            owner: "responses schema-version table",
-            name: format!("{responses_table}_schema_version"),
-        },
-        SqlObject {
-            kind: SqlObjectKind::ConversationsTable,
-            owner: "conversations_table",
-            name: conversations_table.to_owned(),
-        },
-        SqlObject {
-            kind: SqlObjectKind::ConversationsTenantIndex,
-            owner: "conversations tenant index",
-            name: format!("idx_{conversations_table}_tenant_id"),
-        },
-    ];
-    if let Some(items_table) = config.get("items_table").and_then(serde_json::Value::as_str) {
-        objects.extend([
-            SqlObject {
-                kind: SqlObjectKind::ItemsTable,
-                owner: "items_table",
-                name: items_table.to_owned(),
-            },
-            SqlObject {
-                kind: SqlObjectKind::ItemsConversationIndex,
-                owner: "items conversation index",
-                name: format!("idx_{items_table}_conversation"),
-            },
-            SqlObject {
-                kind: SqlObjectKind::ItemsPositionIndex,
-                owner: "items position index",
-                name: format!("idx_{items_table}_position"),
-            },
-        ]);
-    }
-    Some(objects)
-}
-
-/// Return the first incompatible object-name collision between two stores.
-///
-/// Equal kinds are compatible duplicate DDL, such as both filters creating the
-/// same conversations table. Reusing the name for a different kind is unsafe.
-#[cfg(feature = "openai-conversations")]
-fn cross_store_schema_name_collision(
-    response_ref: &StoreRef,
-    conversation_ref: &StoreRef,
-) -> Option<(&'static str, &'static str)> {
-    let response_objects = sql_objects(&response_ref.config)?;
-    let conversation_objects = sql_objects(&conversation_ref.config)?;
-    response_objects.iter().find_map(|response| {
-        conversation_objects.iter().find_map(|conversation| {
-            (response.kind != conversation.kind && response.name.eq_ignore_ascii_case(&conversation.name))
-                .then_some((response.owner, conversation.owner))
-        })
-    })
-}
-
-/// Return the first incompatible collision within one final schema inventory.
-#[cfg(feature = "openai-conversations")]
-fn schema_name_collision(objects: &[SqlObject]) -> Option<(&'static str, &'static str)> {
-    objects.iter().enumerate().find_map(|(index, first)| {
-        objects.iter().skip(index + 1).find_map(|second| {
-            (first.kind != second.kind && first.name.eq_ignore_ascii_case(&second.name))
-                .then_some((first.owner, second.owner))
-        })
-    })
-}
-
-/// Build an actionable SQL namespace-collision error.
-#[cfg(feature = "openai-conversations")]
-fn namespace_collision_error(store_ref: &StoreRef, first: &str, second: &str) -> ProvisionError {
-    ProvisionError::Backend {
-        name: Arc::clone(&store_ref.name),
-        source: BackendError::Config(format!(
-            "Store configurations target the same SQL namespace, but {first} collides with {second}; configure distinct responses_table, conversations_table, and items_table names"
-        )),
-    }
-}
-
-/// Build the combined table configuration when two filter references share all
-/// non-table backend identity and select the same conversations table.
-#[cfg(feature = "openai-conversations")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "coalescing validation is clearer as one transactional decision"
-)]
-fn combined_filter_config(
-    response_ref: &StoreRef,
-    conversation_ref: &StoreRef,
-    factories: &HashMap<&str, &dyn StoreBackendFactory>,
-) -> Result<Option<serde_json::Value>, ProvisionError> {
-    if response_ref.backend_id != conversation_ref.backend_id {
-        return Ok(None);
-    }
-    let Some(factory) = factories.get(response_ref.backend_id.as_ref()) else {
-        return Ok(None);
-    };
-    let sharing_key = |store_ref: &StoreRef| {
-        table_agnostic_effective_key(*factory, store_ref).map_err(|source| ProvisionError::Backend {
-            name: Arc::clone(&store_ref.name),
-            source,
-        })
-    };
-    let sharing_matches = sharing_key(response_ref)? == sharing_key(conversation_ref)?;
-    let response_table = response_ref.config.get("conversations_table");
-    let conversation_table = conversation_ref.config.get("conversations_table");
-    if sharing_matches && response_table == conversation_table {
-        let Some(items_table) = conversation_ref.config.get("items_table").cloned() else {
-            return Ok(None);
-        };
-        let mut combined = response_ref.config.clone();
-        let Some(object) = combined.as_object_mut() else {
-            return Ok(None);
-        };
-        object.insert("items_table".to_owned(), items_table);
-        if let Some(objects) = sql_objects(&combined)
-            && let Some((first, second)) = schema_name_collision(&objects)
-        {
-            return Err(namespace_collision_error(response_ref, first, second));
-        }
-        return Ok(Some(combined));
-    }
-    Ok(None)
-}
-
-/// Validate object-name compatibility across the final promoted store plan.
-#[cfg(feature = "openai-conversations")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "namespace resolution and pairwise object validation form one pass"
-)]
-fn validate_sql_namespace_collisions(
-    plans: &[ListenerStorePlan],
-    factories: &HashMap<&str, &dyn StoreBackendFactory>,
-) -> Result<(), ProvisionError> {
-    let refs: Vec<&StoreRef> = plans.iter().flat_map(|plan| &plan.refs).collect();
-    for (index, first) in refs.iter().enumerate() {
-        let Some(factory) = factories.get(first.backend_id.as_ref()) else {
-            continue;
-        };
-        let first_namespace = factory
-            .namespace_key(&first.config)
-            .map_err(|source| ProvisionError::Backend {
-                name: Arc::clone(&first.name),
-                source,
-            })?;
-        let Some(first_namespace) = first_namespace else {
-            continue;
-        };
-        for second in refs.iter().skip(index + 1) {
-            if first.backend_id != second.backend_id {
-                continue;
-            }
-            let second_namespace = factory
-                .namespace_key(&second.config)
-                .map_err(|source| ProvisionError::Backend {
-                    name: Arc::clone(&second.name),
-                    source,
-                })?;
-            if second_namespace.as_ref() == Some(&first_namespace)
-                && let Some((first_owner, second_owner)) = cross_store_schema_name_collision(first, second)
-            {
-                return Err(namespace_collision_error(first, first_owner, second_owner));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Location of one store reference within the server's listener plans.
-#[cfg(feature = "openai-conversations")]
-type StoreRefLocation = (usize, usize);
-
-/// One compatible Responses/Conversations pairing and its full backend key.
-#[cfg(feature = "openai-conversations")]
-struct CombinedCandidate {
-    /// Responses reference participating in the pairing.
-    response: StoreRefLocation,
-    /// Conversations reference participating in the pairing.
-    conversation: StoreRefLocation,
-    /// Factory id shared by both references.
-    backend_id: Arc<str>,
-    /// Factory-normalized key for the combined config.
-    effective: EffectiveConfigKey,
-    /// Complete table configuration accepted by the factory.
-    config: serde_json::Value,
-}
-
-/// Find every store reference with one registry name.
-#[cfg(feature = "openai-conversations")]
-fn named_store_refs<'a>(plans: &'a [ListenerStorePlan], name: &'a str) -> Vec<(StoreRefLocation, &'a StoreRef)> {
-    plans
-        .iter()
-        .enumerate()
-        .flat_map(|(plan_index, plan)| {
-            plan.refs.iter().enumerate().filter_map(move |(ref_index, store_ref)| {
-                (store_ref.name.as_ref() == name).then_some(((plan_index, ref_index), store_ref))
-            })
-        })
-        .collect()
-}
-
-/// Build all compatible combined configurations across the server plan.
-#[cfg(feature = "openai-conversations")]
-fn combined_candidates(
-    plans: &[ListenerStorePlan],
-    factories: &HashMap<&str, &dyn StoreBackendFactory>,
-) -> Result<Vec<CombinedCandidate>, ProvisionError> {
-    let response_refs = named_store_refs(plans, DEFAULT_STORE_NAME);
-    let conversation_refs = named_store_refs(plans, CONVERSATIONS_STORE_NAME);
-    let mut candidates = Vec::new();
-    for &(response, response_ref) in &response_refs {
-        for &(conversation, conversation_ref) in &conversation_refs {
-            let Some(config) = combined_filter_config(response_ref, conversation_ref, factories)? else {
-                continue;
-            };
-            let Some(factory) = factories.get(response_ref.backend_id.as_ref()) else {
-                continue;
-            };
-            let effective = factory
-                .effective_key(&config)
-                .map_err(|source| ProvisionError::Backend {
-                    name: Arc::clone(&response_ref.name),
-                    source,
-                })?;
-            candidates.push(CombinedCandidate {
-                response,
-                conversation,
-                backend_id: Arc::clone(&response_ref.backend_id),
-                effective,
-                config,
-            });
-        }
-    }
-    Ok(candidates)
-}
-
-/// Select the one combined config consistently implied for a reference.
-#[cfg(feature = "openai-conversations")]
-fn selected_candidate<'a>(
-    candidates: &'a [CombinedCandidate],
-    location: StoreRefLocation,
-    name: &str,
-) -> Option<&'a CombinedCandidate> {
-    let matches_ref = |candidate: &CombinedCandidate| match name {
-        DEFAULT_STORE_NAME => candidate.response == location,
-        CONVERSATIONS_STORE_NAME => candidate.conversation == location,
-        _ => false,
-    };
-    let mut eligible = candidates.iter().filter(|candidate| matches_ref(candidate));
-    let first = eligible.next()?;
-    eligible
-        .all(|candidate| candidate.backend_id == first.backend_id && candidate.effective == first.effective)
-        .then_some(first)
-}
-
-/// Return a candidate only when both participating references select its key.
-#[cfg(feature = "openai-conversations")]
-fn mutually_selected_candidate<'a>(
-    candidates: &'a [CombinedCandidate],
-    location: StoreRefLocation,
-    name: &str,
-) -> Option<&'a CombinedCandidate> {
-    let candidate = selected_candidate(candidates, location, name)?;
-    let response = selected_candidate(candidates, candidate.response, DEFAULT_STORE_NAME)?;
-    let conversation = selected_candidate(candidates, candidate.conversation, CONVERSATIONS_STORE_NAME)?;
-    (response.backend_id == candidate.backend_id
-        && response.effective == candidate.effective
-        && conversation.backend_id == candidate.backend_id
-        && conversation.effective == candidate.effective)
-        .then_some(candidate)
-}
-
-/// Promote compatible Responses and Conversations references to one combined
-/// backend configuration across every listener, so all matching registry
-/// names share one backend and pool.
-#[cfg(feature = "openai-conversations")]
-fn coalesce_compatible_filter_refs(
-    plans: &mut [ListenerStorePlan],
-    factories: &HashMap<&str, &dyn StoreBackendFactory>,
-) -> Result<HashSet<StoreRefLocation>, ProvisionError> {
-    let candidates = combined_candidates(plans, factories)?;
-    let mut promoted = HashSet::new();
-    for (plan_index, plan) in plans.iter_mut().enumerate() {
-        for (ref_index, store_ref) in plan.refs.iter_mut().enumerate() {
-            if let Some(candidate) = mutually_selected_candidate(&candidates, (plan_index, ref_index), &store_ref.name)
-            {
-                store_ref.config.clone_from(&candidate.config);
-                promoted.insert((plan_index, ref_index));
-            }
-        }
-    }
-    Ok(promoted)
-}
-
 /// Build a per-listener store plan for every listener whose chains configure a
 /// response or conversations store. All reachable filters are retained here so
 /// their effective configurations can be checked before duplicate registry
@@ -711,18 +275,7 @@ fn build_listener_store_plans(config: &Config) -> Vec<ListenerStorePlan> {
 
     let mut plans = Vec::new();
     for listener in &config.listeners {
-        let mut refs = Vec::new();
-        refs.extend(
-            find_listener_store_configs(listener, &chains, RESPONSE_STORE_FILTER_NAME)
-                .into_iter()
-                .filter_map(|filter_config| response_store_ref(&filter_config)),
-        );
-        #[cfg(feature = "openai-conversations")]
-        refs.extend(
-            find_listener_store_configs(listener, &chains, CONVERSATIONS_STORE_FILTER_NAME)
-                .into_iter()
-                .filter_map(|filter_config| conversations_store_ref(&filter_config)),
-        );
+        let refs = plan::discover_store_refs_permissive(&listener.filter_chains, &chains);
         if !refs.is_empty() {
             plans.push(ListenerStorePlan {
                 listener: listener.name.clone(),
@@ -750,10 +303,6 @@ pub(crate) fn store_listener_names(config: &Config) -> Vec<String> {
 
 /// Reject one listener binding a registry name to different effective backend
 /// configurations, then collapse repeated references to the same backend.
-#[expect(
-    clippy::too_many_lines,
-    reason = "factory resolution, effective-key comparison, and deduplication are one validation pass"
-)]
 fn validate_and_deduplicate_refs(
     plans: &mut [ListenerStorePlan],
     factories: &[Arc<dyn StoreBackendFactory>],
@@ -786,45 +335,11 @@ fn validate_and_deduplicate_refs(
         if let (Some(cache), Some(active_plans)) = (cache, active_plans) {
             preserve_active_store_configs(plans, active_plans, &factories, cache, &promoted)?;
         }
-        validate_sql_namespace_collisions(plans, &factories)?;
+        validate_cross_store_collisions(plans, &factories)?;
     }
 
     for plan in plans {
-        let mut bound: HashMap<Arc<str>, (Arc<str>, EffectiveConfigKey)> = HashMap::new();
-        let mut unique = Vec::with_capacity(plan.refs.len());
-        for store_ref in plan.refs.drain(..) {
-            let factory =
-                factories
-                    .get(store_ref.backend_id.as_ref())
-                    .ok_or_else(|| ProvisionError::UnknownBackend {
-                        name: Arc::clone(&store_ref.name),
-                        backend_id: Arc::clone(&store_ref.backend_id),
-                    })?;
-            let effective = factory
-                .effective_key(&store_ref.config)
-                .map_err(|source| ProvisionError::Backend {
-                    name: Arc::clone(&store_ref.name),
-                    source,
-                })?;
-            if let Some((backend_id, existing)) = bound.get(&store_ref.name) {
-                if backend_id != &store_ref.backend_id || existing != &effective {
-                    return Err(ProvisionError::Backend {
-                        name: Arc::clone(&store_ref.name),
-                        source: BackendError::Config(format!(
-                            "listener '{}' configures conflicting stores for registry name '{}'",
-                            plan.listener, store_ref.name
-                        )),
-                    });
-                }
-                continue;
-            }
-            bound.insert(
-                Arc::clone(&store_ref.name),
-                (Arc::clone(&store_ref.backend_id), effective),
-            );
-            unique.push(store_ref);
-        }
-        plan.refs = unique;
+        plan::deduplicate_refs(&format!("listener '{}'", plan.listener), &mut plan.refs, &factories)?;
     }
     Ok(())
 }
@@ -1027,7 +542,7 @@ impl StoreProvisionService {
     /// Provision all listeners concurrently as one atomic generation.
     ///
     /// [`BackendCache`] already applies the bounded transient retry budget. Any
-    /// error returned here, including [`BackendError::Unavailable`], is terminal
+    /// error returned here, including [`praxis_ai_store::BackendError::Unavailable`], is terminal
     /// for this generation and must not be retried by the server.
     #[expect(
         clippy::too_many_lines,
@@ -1221,6 +736,7 @@ async fn release_after_drain(old_pipelines: Vec<Weak<FilterPipeline>>, leases: V
 }
 
 #[cfg(test)]
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, clippy::too_many_lines, reason = "tests")]
 mod tests {
@@ -1416,7 +932,7 @@ filter_chains:
             chains:
               - name: first-store
                 filters:
-                  - filter: openai_response_store
+                  - filter: openai_responses_store
                     backend: {backend}
                     database_url: "{first_url}"
                     responses_table: responses
@@ -1425,7 +941,7 @@ filter_chains:
             chains:
               - name: second-store
                 filters:
-                  - filter: openai_response_store
+                  - filter: openai_responses_store
                     backend: {backend}
                     database_url: "{second_url}"
                     responses_table: responses
@@ -1445,7 +961,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: {backend}
         database_url: "{database_url}"
         responses_table: responses
@@ -1453,6 +969,52 @@ filter_chains:
 "#
         ))
         .expect("single store config")
+    }
+
+    #[cfg(feature = "store-sqlite")]
+    fn sqlite_store_config_with_event_bounds() -> Config {
+        Config::from_yaml(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        responses_table: responses
+        conversations_table: conversations
+        max_event_count: 5000
+        max_event_bytes: 8388608
+"#,
+        )
+        .expect("sqlite store config with explicit replay bounds")
+    }
+
+    #[cfg(feature = "store-postgres")]
+    fn postgres_store_config_with_event_bounds() -> Config {
+        Config::from_yaml(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_responses_store
+        backend: postgres
+        database_url: "postgresql://user:password@8.8.8.8/store"
+        responses_table: responses
+        conversations_table: conversations
+        max_event_count: 5000
+        max_event_bytes: 8388608
+"#,
+        )
+        .expect("postgres store config with explicit replay bounds")
     }
 
     #[cfg(feature = "openai-conversations")]
@@ -1469,7 +1031,7 @@ listeners:
 filter_chains:
   - name: responses
     filters:
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: {backend}
         database_url: "{database_url}"
         responses_table: responses
@@ -1517,14 +1079,14 @@ listeners:
 filter_chains:
   - name: responses-a
     filters:
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: {backend}
         database_url: "{database_url}"
         responses_table: responses_a
         conversations_table: conversations
   - name: responses-b
     filters:
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: {backend}
         database_url: "{database_url}"
         responses_table: responses_b
@@ -1542,6 +1104,19 @@ filter_chains:
     }
 
     #[test]
+    fn store_discovery_keeps_permissive_server_behavior() {
+        let mut config = single_store_config("sqlite", "sqlite::memory:");
+        config.filter_chains.first_mut().expect("main chain").filters = serde_yaml::from_str(
+            "- filter: openai_responses_store\n  backend: 7\n- filter: iterative_request_router\n  steps:\n    - filters: malformed\n    - filters: [7, {filter: openai_responses_store, backend: sqlite, database_url: 'sqlite::memory:'}]",
+        ).expect("mixed filter entries");
+        let plans = build_listener_store_plans(&config);
+        assert_eq!(plans.len(), 1);
+        let refs = &plans.first().expect("listener plan").refs;
+        assert_eq!(refs.len(), 1, "valid nested sibling must survive malformed entries");
+        assert_eq!(refs.first().expect("store reference").backend_id.as_ref(), "sqlite");
+    }
+
+    #[test]
     fn store_listener_names_exclude_stateless_listeners() {
         let config = Config::from_yaml(
             r#"
@@ -1555,7 +1130,7 @@ listeners:
 filter_chains:
   - name: store
     filters:
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "sqlite::memory:"
         responses_table: responses
@@ -1620,6 +1195,45 @@ filter_chains:
         assert_eq!(registries.len(), 1);
         assert_eq!(provisioner.plans.len(), 1);
         assert_eq!(provisioner.plans.first().expect("listener plan").refs.len(), 1);
+    }
+
+    #[cfg(feature = "store-sqlite")]
+    #[test]
+    fn explicit_replay_event_bounds_do_not_block_sqlite_provisioning() {
+        // The replay-log bounds are filter-only knobs; the SQLite factory config
+        // rejects unknown fields. Provisioning must strip them so an operator that
+        // sets them explicitly in YAML still boots, and the backend never sees them.
+        let config = sqlite_store_config_with_event_bounds();
+        let (_registries, provisioner, _reload, _readiness) =
+            build_store_wiring(&config).expect("explicit replay bounds must not reach the SQLite factory");
+        let store_ref = provisioner
+            .plans
+            .first()
+            .and_then(|plan| plan.refs.first())
+            .expect("one provisioned response store");
+        assert!(
+            store_ref.config.get("max_event_count").is_none(),
+            "filter-only max_event_count must be stripped before dispatch to the backend factory"
+        );
+        assert!(
+            store_ref.config.get("max_event_bytes").is_none(),
+            "filter-only max_event_bytes must be stripped before dispatch to the backend factory"
+        );
+    }
+
+    #[cfg(feature = "store-postgres")]
+    #[test]
+    fn explicit_replay_event_bounds_do_not_block_postgres_provisioning() {
+        // Same filter-only strip must apply to the Postgres factory, whose config
+        // also rejects unknown fields; `response_store_ref` drops the bounds for
+        // every backend before dispatch.
+        let config = postgres_store_config_with_event_bounds();
+        let result = build_store_wiring(&config);
+        assert!(
+            result.is_ok(),
+            "explicit replay bounds must be stripped for the Postgres factory too: {:?}",
+            result.err()
+        );
     }
 
     #[cfg(feature = "openai-conversations")]
@@ -1874,6 +1488,40 @@ filter_chains:
 
     #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
     #[test]
+    fn event_log_table_participates_in_namespace_collision_checks() {
+        // The response store derives an event-log table `<responses>_events`. A
+        // conversations items_table that reuses that derived name must be caught
+        // by the pre-provisioning collision check, not left to fail later when
+        // the second CREATE TABLE runs against an incompatible existing table.
+        let mut config = responses_and_conversations_config_for("sqlite", "sqlite::memory:");
+        let conversations = config
+            .filter_chains
+            .get_mut(1)
+            .and_then(|chain| chain.filters.first_mut())
+            .expect("Conversations filter");
+        let items_table = conversations
+            .config
+            .as_mapping_mut()
+            .and_then(|mapping| mapping.get_mut(serde_yaml::Value::String("items_table".to_owned())))
+            .expect("items table config");
+        *items_table = serde_yaml::Value::String("responses_events".to_owned());
+
+        let error = build_store_wiring(&config)
+            .err()
+            .expect("event-log table collision must fail startup");
+        let message = error.to_string();
+        assert!(
+            message.contains("same SQL namespace"),
+            "actionable namespace error: {message}"
+        );
+        assert!(
+            message.contains("responses event-log table"),
+            "event-log owner in collision: {message}"
+        );
+    }
+
+    #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
+    #[test]
     fn coalesced_schema_ignores_discarded_conversations_placeholder_objects() {
         let mut config = responses_and_conversations_config_for("sqlite", "sqlite::memory:");
         let responses = config
@@ -1906,7 +1554,7 @@ listeners:
 filter_chains:
   - name: responses
     filters:
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "{database_url}"
         responses_table: responses
@@ -1920,7 +1568,7 @@ filter_chains:
         items_table: items
   - name: other-responses
     filters:
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "{database_url}"
         responses_table: conversations_unused_responses_pending_approvals
@@ -2270,41 +1918,6 @@ filter_chains:
         for lease in leases {
             lease.release().await;
         }
-    }
-
-    #[test]
-    fn sqlite_normalization_removes_only_accepted_noop_fields() {
-        let mut config = json!({
-            "ssl_mode": null,
-            "ssl_root_cert": null,
-            "ssl_client_cert": null,
-            "ssl_client_key": null,
-            "require_certificate_authentication": false,
-            "allow_private_database_url": false,
-            "database_url": "sqlite::memory:",
-        });
-
-        normalize_sqlite_factory_config("sqlite", &mut config);
-
-        let config = config.as_object().expect("object");
-        assert_eq!(config.len(), 1);
-        assert_eq!(config.get("database_url"), Some(&json!("sqlite::memory:")));
-    }
-
-    #[test]
-    fn sqlite_normalization_preserves_rejected_nondefault_fields() {
-        let mut config = json!({
-            "ssl_mode": "verify_full",
-            "require_certificate_authentication": true,
-            "allow_private_database_url": true,
-        });
-
-        normalize_sqlite_factory_config("sqlite", &mut config);
-
-        let config = config.as_object().expect("object");
-        assert_eq!(config.get("ssl_mode"), Some(&json!("verify_full")));
-        assert_eq!(config.get("require_certificate_authentication"), Some(&json!(true)));
-        assert_eq!(config.get("allow_private_database_url"), Some(&json!(true)));
     }
 
     #[tokio::test]
