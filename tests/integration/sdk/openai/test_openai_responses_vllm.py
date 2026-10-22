@@ -4836,6 +4836,68 @@ class TestResponsesCompactionVLLM:
             "a rejected malformed-content request must never reach the summarizer"
         )
 
+    def test_explicit_compact_rejects_non_text_input_before_callout(self, compact_client):
+        """Issue #1252: compaction must not silently discard image content."""
+        before = len(CompactionHandler.requests)
+        with pytest.raises(BadRequestError) as exc_info:
+            compact_client.responses.compact(
+                model=VLLM_MODEL,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_image",
+                                "image_url": "data:image/png;base64,iVBORw0KGgo=",
+                                "detail": "auto",
+                            }
+                        ],
+                    }
+                ],
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "non-text compaction source must return 400"
+        assert error.type == "invalid_request_error", (
+            "non-text rejection must use invalid_request_error"
+        )
+        assert "non-text" in str(error), "error must explain the non-text rejection"
+        assert "input_image" in str(error), "error must name the offending input_image part"
+        assert len(CompactionHandler.requests) == before, (
+            "rejected non-text content must never reach the summarizer"
+        )
+
+    def test_explicit_compact_rejects_unrenderable_compaction_before_callout(
+        self, compact_client
+    ):
+        """Compaction must not discard opaque prior compaction state."""
+        before = len(CompactionHandler.requests)
+        with pytest.raises(BadRequestError) as exc_info:
+            compact_client.responses.compact(
+                model=VLLM_MODEL,
+                extra_body={
+                    "input": [
+                        {
+                            "type": "compaction",
+                            "encrypted_content": "provider-opaque-state",
+                        }
+                    ]
+                },
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400, "unrenderable compaction state must return 400"
+        assert error.type == "invalid_request_error", (
+            "unrenderable compaction rejection must use invalid_request_error"
+        )
+        assert "compaction" in str(error), "error must name the offending compaction item"
+        assert "cannot be represented" in str(error), (
+            "error must explain why the compaction item cannot be replaced"
+        )
+        assert len(CompactionHandler.requests) == before, (
+            "rejected opaque compaction state must never reach the summarizer"
+        )
+
     def test_explicit_compact_valid_input_makes_one_callout(self, compact_client):
         """Control for the #1403 rejection: a well-typed inline input compacts
         with exactly one summarization callout and returns a compaction object."""

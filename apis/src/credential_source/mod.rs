@@ -135,7 +135,7 @@ pub struct SecretHandle {
 
 impl SecretHandle {
     /// Construct a handle whose cell starts at `snapshot`.
-    pub(crate) fn new(snapshot: SecretSnapshot) -> Self {
+    pub fn new(snapshot: SecretSnapshot) -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(snapshot)),
         }

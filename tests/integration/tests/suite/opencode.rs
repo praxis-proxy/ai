@@ -82,17 +82,17 @@ pub(super) const GATEWAY_USER: &str = "gateway";
 /// Provider id the OpenCode configuration declares.
 pub(super) const PROVIDER_ID: &str = "praxis";
 /// Served model name, addressed by the client as `<provider>/<model>`.
-const MODEL_ID: &str = "qwen3-8b";
+pub(super) const MODEL_ID: &str = "qwen3-8b";
 /// Chat Completions path every request must take.
 pub(super) const CHAT_PATH: &str = "/v1/chat/completions";
 /// Fixed prompt. Tool use is suppressed so one scripted reply ends the turn.
-const PROMPT: &str = "Reply with exactly PONG. Do not call any tools.";
+pub(super) const PROMPT: &str = "Reply with exactly PONG. Do not call any tools.";
 /// Text the scripted backend streams back.
-const REPLY: &str = "PONG";
+pub(super) const REPLY: &str = "PONG";
 /// Log line the client emits, only under `--print-logs`, when the hook throws.
 pub(super) const PLUGIN_FAILURE_LOG: &str = "plugin config hook failed";
 /// Bound on one child run. The client is a Bun binary with a slow cold start.
-const CHILD_TIMEOUT: Duration = Duration::from_secs(90);
+pub(super) const CHILD_TIMEOUT: Duration = Duration::from_secs(90);
 /// Scripted responses to queue. A trivial prompt costs two turns (a toolless
 /// title turn and the main turn); the surplus absorbs any extra client chatter
 /// so an exhausted script never masquerades as a protocol failure.
@@ -190,7 +190,7 @@ pub(super) fn gateway_credential() -> String {
 ///
 /// A silent no-op here would build an unpatched config that still parses and
 /// still serves, so the test would exercise the wrong thing rather than fail.
-fn replace_once(haystack: &str, from: &str, to: &str, what: &str) -> String {
+pub(super) fn replace_once(haystack: &str, from: &str, to: &str, what: &str) -> String {
     let count = haystack.matches(from).count();
     assert_eq!(
         count, 1,
@@ -207,7 +207,7 @@ fn replace_once(haystack: &str, from: &str, to: &str, what: &str) -> String {
 /// and `unsafe_code` is denied workspace-wide, so the password is inlined and
 /// `VLLM_API_KEY` is repointed at `CARGO_PKG_NAME`, which Cargo always sets for
 /// a test binary. Mirrors `examples/anthropic_messages_native_vllm.rs`.
-fn gateway_config(proxy_port: u16, backend_port: u16) -> Config {
+pub(super) fn gateway_config(proxy_port: u16, backend_port: u16) -> Config {
     let path = example_config_path(EXAMPLE_CONFIG);
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
     let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:8000", backend_port)]));
@@ -255,7 +255,7 @@ fn pong_sse() -> String {
 }
 
 /// A backend queued with enough identical replies to outlast client chatter.
-fn scripted_backend() -> StatefulCapturingBackend {
+pub(super) fn scripted_backend() -> StatefulCapturingBackend {
     StatefulCapturingBackend::new((0..SCRIPTED_RESPONSES).map(|_| (200, pong_sse())).collect())
 }
 
@@ -447,7 +447,7 @@ pub(super) async fn launch(spec: LaunchSpec<'_>) -> CapturedChildOutput {
 }
 
 /// Assert the child finished within its bound, surfacing both pipes on failure.
-fn assert_not_timed_out(output: &CapturedChildOutput, scenario: &str) {
+pub(super) fn assert_not_timed_out(output: &CapturedChildOutput, scenario: &str) {
     assert!(
         !output.timed_out,
         "{scenario}: OpenCode exceeded {CHILD_TIMEOUT:?}. If no request reached the backend, \
@@ -710,21 +710,30 @@ fn assert_requests_authenticated(requests: &[praxis_test_utils::CapturedRequest]
         lane.expects_credential(),
         "only credential-bearing lanes should be checked here"
     );
+    assert_requests_carry_injected_credential(requests, &format!("{lane:?}"));
+}
+
+/// Assert every captured request was authenticated at the gateway and reached
+/// the backend carrying only the injected server-owned credential.
+///
+/// Shared with the 2.x lane in [`super::opencode_v2`]: the gateway contract is
+/// the same for both client majors, only the client-side recipe differs.
+pub(super) fn assert_requests_carry_injected_credential(requests: &[praxis_test_utils::CapturedRequest], lane: &str) {
     assert!(
         !requests.is_empty(),
-        "{lane:?} lane: the backend should have received at least one request"
+        "{lane} lane: the backend should have received at least one request"
     );
 
     let injected = std::env::var("CARGO_PKG_NAME").expect("CARGO_PKG_NAME is always set by cargo test");
     for (index, request) in requests.iter().enumerate() {
         assert_eq!(
             request.method, "POST",
-            "{lane:?} lane request #{index} should be a POST, got {}",
+            "{lane} lane request #{index} should be a POST, got {}",
             request.method
         );
         assert!(
             request.uri.starts_with(CHAT_PATH),
-            "{lane:?} lane request #{index} should target {CHAT_PATH}, got {}",
+            "{lane} lane request #{index} should target {CHAT_PATH}, got {}",
             request.uri
         );
         // The gateway credential is verified and stripped; only the injected
@@ -732,18 +741,18 @@ fn assert_requests_authenticated(requests: &[praxis_test_utils::CapturedRequest]
         assert_eq!(
             header_value(&request.headers, "authorization"),
             Some(format!("Bearer {injected}").as_str()),
-            "{lane:?} lane request #{index} should carry the injected backend credential: {}",
+            "{lane} lane request #{index} should carry the injected backend credential: {}",
             request.headers
         );
         assert!(
             !request.headers.contains(gateway_password()),
-            "{lane:?} lane request #{index} must not leak the gateway password upstream"
+            "{lane} lane request #{index} must not leak the gateway password upstream"
         );
         // `anthropic_messages_protocol` is scoped to /v1/messages, so an
         // Anthropic protocol header has no business on this path.
         assert!(
             header_value(&request.headers, "anthropic-version").is_none(),
-            "{lane:?} lane request #{index} should not carry anthropic-version: {}",
+            "{lane} lane request #{index} should not carry anthropic-version: {}",
             request.headers
         );
     }
@@ -762,7 +771,13 @@ fn assert_requests_authenticated(requests: &[praxis_test_utils::CapturedRequest]
 /// dependency, and the handful of pins asserted here are all top-level scalars
 /// written one per line.
 pub(super) fn pin_value(key: &str) -> String {
-    let manifest = std::fs::read_to_string(fixture_path(PIN_MANIFEST)).expect("pin manifest should be readable");
+    pin_value_in(PIN_MANIFEST, key)
+}
+
+/// Read one scalar value from the pin manifest at `manifest`, relative to this
+/// crate's `fixtures/` directory. Returns the first line declaring `key`.
+pub(super) fn pin_value_in(manifest: &str, key: &str) -> String {
+    let manifest = std::fs::read_to_string(fixture_path(manifest)).expect("pin manifest should be readable");
     let needle = format!("{key} =");
     let line = manifest
         .lines()
@@ -775,6 +790,39 @@ pub(super) fn pin_value(key: &str) -> String {
         .trim()
         .trim_matches('"')
         .to_owned()
+}
+
+/// The client guide every OpenCode lane validates, relative to the repo root.
+pub(super) const GUIDE: &str = "docs/developing/cli-vllm-through-praxis.md";
+/// Heading that opens the guide's OpenCode 1.x setup.
+pub(super) const GUIDE_V1_HEADING: &str = "\n### OpenCode 1.x\n";
+/// Heading that opens the guide's OpenCode 2.x setup, and closes the 1.x one.
+pub(super) const GUIDE_V2_HEADING: &str = "\n### OpenCode 2.x\n";
+
+/// The guide text from `start` up to (not including) `end`.
+///
+/// Each client major publishes its own plugin and config blocks, so the
+/// byte-equality assertions are scoped to one section; a whole-document search
+/// would match the other major's block. Panics if either heading is missing or
+/// out of order, so a restructured guide fails here rather than silently
+/// matching nothing.
+pub(super) fn guide_section(start: &str, end: &str) -> String {
+    let doc = std::fs::read_to_string(repo_root().join(GUIDE)).expect("client guide should be readable");
+    let (_, rest) = doc
+        .split_once(start)
+        .unwrap_or_else(|| panic!("{GUIDE} should contain the heading {start:?}"));
+    let (section, _) = rest
+        .split_once(end)
+        .unwrap_or_else(|| panic!("{GUIDE} should contain {end:?} after {start:?}"));
+    format!("{start}{section}")
+}
+
+/// Every fenced code block tagged `lang` in `text`, without its fences.
+pub(super) fn fenced_blocks<'a>(text: &'a str, lang: &str) -> Vec<&'a str> {
+    text.split(&format!("```{lang}\n"))
+        .skip(1)
+        .filter_map(|rest| rest.split_once("```").map(|(block, _)| block))
+        .collect()
 }
 
 #[test]
@@ -810,18 +858,12 @@ fn documented_plugin_matches_fixture() {
     // The acceptance lane loads the fixture, so without this assertion the
     // suite would validate its own private copy of the plugin rather than the
     // one the guide tells users to create.
-    let guide = repo_root().join("docs/developing/cli-vllm-through-praxis.md");
-    let doc = std::fs::read_to_string(&guide).expect("client guide should be readable");
-
-    let blocks: Vec<&str> = doc
-        .split("```typescript\n")
-        .skip(1)
-        .filter_map(|rest| rest.split_once("```").map(|(block, _)| block))
-        .collect();
+    let section = guide_section(GUIDE_V1_HEADING, GUIDE_V2_HEADING);
+    let blocks = fenced_blocks(&section, "typescript");
     assert_eq!(
         blocks.len(),
         1,
-        "the guide should publish exactly one TypeScript block (the Praxis auth plugin)"
+        "the guide's OpenCode 1.x section should publish exactly one TypeScript block (the Praxis auth plugin)"
     );
 
     let fixture = std::fs::read_to_string(fixture_path(PLUGIN_FIXTURE)).expect("plugin fixture should be readable");

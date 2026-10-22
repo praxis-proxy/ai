@@ -395,14 +395,12 @@ impl CompactFilter {
                 return Err(reject_compaction_budget());
             }
         }
-        let (params, conversation_text) = match should_compact(state, &self.config.tiktoken_encoding) {
-            Ok(Some(pair)) => pair,
-            Ok(None) => return Ok(None),
-            Err(msg) => {
-                let rej = responses_error_rejection(400, "invalid_request_error", &msg);
-                return Err(FilterAction::Reject(rej));
-            },
+        let Some((params, conversation_text)) = should_compact(state, &self.config.tiktoken_encoding)
+            .map_err(|msg| FilterAction::Reject(responses_error_rejection(400, "invalid_request_error", &msg)))?
+        else {
+            return Ok(None);
         };
+        validate_reactive_compaction_source(state)?;
         self.execute_compaction(state, &params, &conversation_text).await
     }
 
@@ -431,9 +429,38 @@ impl CompactFilter {
         let mut req = parse_compact_request_body(body)?;
         let (store, owner) = resolve_store_and_owner(ctx)?;
         let messages = collect_compact_messages(&store, &mut req, &mut budget).await?;
-        if let Some(budget) = budget.as_mut() {
-            reserve_compact_json(budget, &messages, COMPACTION_SOURCE_MULTIPLIER)?;
-        }
+        let collected = CollectedExplicitCompact {
+            store,
+            owner,
+            req,
+            messages,
+            budget,
+        };
+        Box::pin(self.finish_explicit_compact(ctx, collected)).await
+    }
+
+    /// Validate, summarize, and persist an already collected compact request.
+    ///
+    /// Keeping this phase separate prevents its callout and persistence futures
+    /// from sharing one stack frame with the stored-history lookup future.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "validation, callout, and persistence form one post-lookup phase"
+    )]
+    async fn finish_explicit_compact(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        collected: CollectedExplicitCompact,
+    ) -> Result<FilterAction, FilterAction> {
+        let CollectedExplicitCompact {
+            store,
+            owner,
+            req,
+            messages,
+            mut budget,
+        } = collected;
+        validate_compaction_source(messages.iter())?;
+        reserve_explicit_compact_source(budget.as_mut(), &messages)?;
         let writer = CompactionWriter {
             filter: self,
             ctx,
@@ -790,6 +817,20 @@ struct ExplicitCompactRequest {
     previous_response_id: Option<String>,
     /// Optional instructions to prepend to the summarization prompt.
     instructions: Option<String>,
+}
+
+/// Owned inputs for the post-lookup explicit compaction phase.
+struct CollectedExplicitCompact {
+    /// Owner-scoped destination store.
+    store: OwnerScopedResponseStore,
+    /// Authenticated owner recorded with the compacted response.
+    owner: StateOwner,
+    /// Parsed explicit compaction request.
+    req: ExplicitCompactRequest,
+    /// Stored and inline source messages in conversation order.
+    messages: Vec<Value>,
+    /// Request-wide allocation budget, when configured.
+    budget: Option<SimpleBudget>,
 }
 
 /// Parse and validate the `POST /v1/responses/compact` body.
@@ -1225,6 +1266,138 @@ fn stored_message_array(messages: Value) -> Vec<Value> {
         Value::Array(arr) => arr,
         _ => Vec::new(),
     }
+}
+
+/// Reject source items whose meaning the text-only summarizer cannot retain.
+///
+/// Syntax validation deliberately accepts all Responses content kinds. This
+/// separate check runs only once compaction will replace the source, preventing
+/// images, files, audio, and other non-text items from being silently discarded.
+fn validate_compaction_source<I>(messages: I) -> Result<(), FilterAction>
+where
+    I: IntoIterator,
+    I::Item: std::ops::Deref<Target = Value>,
+{
+    for (idx, item) in messages.into_iter().enumerate() {
+        let item = &*item;
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {},
+            Some("compaction") if decode_compaction_summary(item).is_some() => {},
+            Some("compaction") => return Err(reject_unrepresentable_item(idx, "compaction")),
+            Some("function_call_output") => {
+                validate_representable_text_field(idx, "output", item.get("output"))?;
+            },
+            Some("message") => {
+                validate_representable_text_field(idx, "content", item.get("content"))?;
+            },
+            None if item.get("role").is_some() => {
+                validate_representable_text_field(idx, "content", item.get("content"))?;
+            },
+            Some(kind) => return Err(reject_unrepresentable_item(idx, kind)),
+            None if item.get("id").is_some() => return Err(reject_unrepresentable_item(idx, "item_reference")),
+            None => return Err(reject_unrepresentable_item(idx, "untyped non-message")),
+        }
+    }
+    Ok(())
+}
+
+/// Validate only the prefix that [`replace_messages`] will discard.
+fn validate_reactive_compaction_source(state: &ResponsesState) -> Result<(), FilterAction> {
+    let replaced_len = state.messages.len().saturating_sub(state.input.len());
+    validate_compaction_source(state.messages.iter().take(replaced_len))
+}
+
+/// Charge the explicit endpoint for retaining its validated source history.
+fn reserve_explicit_compact_source(budget: Option<&mut SimpleBudget>, messages: &[Value]) -> Result<(), FilterAction> {
+    if let Some(budget) = budget {
+        reserve_compact_json(budget, &messages, COMPACTION_SOURCE_MULTIPLIER)?;
+    }
+    Ok(())
+}
+
+/// A compaction text field is representable only when every part is textual.
+fn validate_representable_text_field(item_idx: usize, field: &str, value: Option<&Value>) -> Result<(), FilterAction> {
+    match value {
+        Some(Value::String(_)) => Ok(()),
+        Some(Value::Array(parts)) => {
+            for (part_idx, part) in parts.iter().enumerate() {
+                let kind = part.get("type").and_then(Value::as_str).unwrap_or("unknown");
+                if !matches!(kind, "input_text" | "output_text" | "text")
+                    || !matches!(part.get("text"), Some(Value::String(_)))
+                {
+                    return Err(reject_compact(
+                        400,
+                        "invalid_request_error",
+                        &format!(
+                            "compaction cannot replace source item {item_idx}: {field}[{part_idx}] has non-text type `{kind}` that cannot be represented in the summary"
+                        ),
+                    ));
+                }
+                validate_text_part_metadata(item_idx, field, part_idx, kind, part)?;
+            }
+            Ok(())
+        },
+        _ => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("compaction cannot replace source item {item_idx}: {field} cannot be represented in the summary"),
+        )),
+    }
+}
+
+/// Reject text-part fields that the summary renderer would silently omit.
+///
+/// OpenAI output text commonly carries empty `annotations` and `logprobs`
+/// arrays, which contain no information and remain safe to collapse to text.
+/// Non-empty values and unknown extension fields are semantic metadata and
+/// therefore make the source unrepresentable.
+fn validate_text_part_metadata(
+    item_idx: usize,
+    field: &str,
+    part_idx: usize,
+    kind: &str,
+    part: &Value,
+) -> Result<(), FilterAction> {
+    let Some(object) = part.as_object() else {
+        return Err(reject_unrepresentable_part_metadata(
+            item_idx,
+            field,
+            part_idx,
+            "non-object part",
+        ));
+    };
+    for (key, value) in object {
+        let represented = matches!(key.as_str(), "type" | "text");
+        let empty_output_metadata = kind == "output_text"
+            && matches!(key.as_str(), "annotations" | "logprobs")
+            && (value.is_null() || value.as_array().is_some_and(Vec::is_empty));
+        if !represented && !empty_output_metadata {
+            return Err(reject_unrepresentable_part_metadata(item_idx, field, part_idx, key));
+        }
+    }
+    Ok(())
+}
+
+/// Build a rejection for semantic content-part metadata omitted by rendering.
+fn reject_unrepresentable_part_metadata(item_idx: usize, field: &str, part_idx: usize, key: &str) -> FilterAction {
+    reject_compact(
+        400,
+        "invalid_request_error",
+        &format!(
+            "compaction cannot replace source item {item_idx}: {field}[{part_idx}].{key} cannot be represented in the summary"
+        ),
+    )
+}
+
+/// Build the fail-closed rejection for a non-text conversation item.
+fn reject_unrepresentable_item(item_idx: usize, kind: &str) -> FilterAction {
+    reject_compact(
+        400,
+        "invalid_request_error",
+        &format!(
+            "compaction cannot replace source item {item_idx}: item type `{kind}` cannot be represented in the summary"
+        ),
+    )
 }
 
 /// Borrows everything needed to build and persist an explicit compaction
@@ -1692,21 +1865,20 @@ fn append_line(buf: &mut String, label: &str, text: &str) {
     buf.push_str(text);
 }
 
-/// Append a compaction item's summary to the buffer.
+/// Decode a non-empty UTF-8 compaction summary from `encrypted_content`.
 ///
-/// Decodes `encrypted_content` and borrows the result as `&str` directly,
-/// avoiding the `String::from_utf8` conversion that would copy the buffer.
+/// `String::from_utf8` reuses the decoded byte allocation, so validation and
+/// rendering share one definition of representability without another copy.
+fn decode_compaction_summary(msg: &Value) -> Option<String> {
+    let encoded = msg.get("encrypted_content").and_then(Value::as_str)?;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    String::from_utf8(decoded).ok().filter(|summary| !summary.is_empty())
+}
+
+/// Append a representable compaction item's summary to the buffer.
 fn append_compaction_summary(buf: &mut String, msg: &Value) {
-    let Some(encoded) = msg.get("encrypted_content").and_then(Value::as_str) else {
-        return;
-    };
-    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
-        return;
-    };
-    if let Ok(summary) = std::str::from_utf8(&decoded)
-        && !summary.is_empty()
-    {
-        append_line(buf, "[previous context summary]", summary);
+    if let Some(summary) = decode_compaction_summary(msg) {
+        append_line(buf, "[previous context summary]", &summary);
     }
 }
 
@@ -1737,10 +1909,9 @@ fn extract_content(msg: &Value) -> Cow<'_, str> {
 /// no separator, matching how the Responses-to-Chat translation joins text
 /// (`convert_function_call_output` and the text-only content collapse, both
 /// joined with no separator), so `"pass"` + `"word"` reads as `"password"` just
-/// as the backend would see it. Non-text parts (images, files) are dropped
-/// because the summarizer input is text-only; the backend instead preserves a
-/// mixed-content message as a parts array, so such a message is rendered lossily
-/// here by design.
+/// as the backend would see it. The renderer itself remains text-only; callers
+/// must validate every item they will replace and may omit non-text content only
+/// from a current-turn tail that remains preserved verbatim.
 fn extract_text_parts(value: Option<&Value>) -> Cow<'_, str> {
     let Some(value) = value else {
         return Cow::Borrowed("");

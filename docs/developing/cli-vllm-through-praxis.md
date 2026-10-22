@@ -513,13 +513,21 @@ See [Anthropic's auto-mode classifier documentation](https://code.claude.com/doc
 
 ## 5. Connect OpenCode
 
-This example targets OpenCode 1.x. Check your version with `opencode --version`.
-OpenCode 2.x requires a different plugin implementation; see the
-[OpenCode migration guide](https://opencode.ai/v2/docs/migrate-v1/).
+OpenCode 1.x and 2.x need different setups. Check your version with
+`opencode --version`: 1.x prints a bare version such as `1.18.35`, and 2.x
+prints `opencode v2.1.2`. The two majors ship as different npm packages
+(`opencode-ai` for 1.x, `@opencode/cli` for 2.x), and the 1.x plugin does not
+load in 2.x.
 
-Use the native Claude configuration from section 2. It forwards OpenCode's
+Both use the native Claude configuration from section 2. It forwards OpenCode's
 `/v1/chat/completions` requests to vLLM and authenticates clients with Basic
 auth using username `gateway` and password from `GATEWAY_AUTH_PASSWORD`.
+Nothing changes on the Praxis side between the two majors.
+
+### OpenCode 1.x
+
+These steps are verified against OpenCode 1.19.3.
+
 Add this configuration to
 `~/.config/opencode/opencode.jsonc`, merging the `plugin` and `provider`
 entries with any existing settings:
@@ -602,7 +610,7 @@ opencode --model "praxis/$VLLM_MODEL"
 Quit and restart OpenCode after changing its configuration or plugin. You can
 also select the configured model with `/models`.
 
-### Headless invocation
+#### Headless invocation
 
 `opencode run` drives a single turn non-interactively, which is what CI and
 scripts want:
@@ -629,7 +637,7 @@ indefinitely after logging `init` — before it issues a single request — even
 though the prompt was supplied as an argument. In a script or CI job that
 presents as a hang with no output and no network activity.
 
-### Alternative: per-model headers without a plugin
+#### Alternative: per-model headers without a plugin
 
 The plugin above exists because `provider.<id>.options` has no `headers` key —
 it accepts only `apiKey`, `baseURL`, `enterpriseUrl`, `setCacheKey`, `timeout`,
@@ -668,6 +676,182 @@ it bakes a base64 credential into a file on disk and will send it wherever
 `baseURL` happens to point. Use it for CI and ephemeral credentials, not for a
 developer's `~/.config`.
 
+### OpenCode 2.x
+
+These steps are verified against OpenCode 2.1.2. For the upstream changes, see
+the [OpenCode V1 migration guide](https://opencode.ai/v2/docs/migrate-v1/).
+
+Add this configuration to `~/.config/opencode/opencode.jsonc`, merging the
+`providers` entry with any existing settings. 2.x renames `provider` to
+`providers`, `npm` to `package` (with an `aisdk:` prefix), and moves
+`options.baseURL` to `settings.baseURL`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "praxis": {
+      "package": "aisdk:@ai-sdk/openai-compatible",
+      "name": "Praxis",
+      "settings": { "baseURL": "http://127.0.0.1:8080/v1" },
+      "models": {
+        "qwen3-8b": {
+          "name": "Qwen3 8B",
+          "limit": { "context": 32768, "output": 8192 }
+        }
+      }
+    }
+  }
+}
+```
+
+Replace `qwen3-8b` with the exact served name in `VLLM_MODEL` and adjust the
+limits to match your vLLM server. For a remote Praxis gateway, replace the
+`baseURL` with its HTTPS address, keeping the `/v1` suffix, and export the same
+URL so the plugin can verify the destination:
+
+```console
+export PRAXIS_BASE_URL="https://gateway.example.com/v1"
+```
+
+For the local `http://127.0.0.1:8080/v1` example, no URL export is needed.
+
+> **2.x ignores unknown configuration keys.** OpenCode 1.x rejected a
+> misspelled key at startup. 2.1.2 ignores it without any message, so a typo
+> such as `setting` instead of `settings` drops the `baseURL`. Copy the keys
+> exactly.
+
+Create `~/.config/opencode/plugins/praxis-auth.ts`. OpenCode 2.x loads every
+plugin in that directory automatically, so the configuration needs no
+`plugins` entry:
+
+```typescript
+import { Plugin } from "@opencode/plugin"
+
+export default Plugin.define({
+  id: "praxis-auth",
+  async setup(ctx) {
+    await ctx.session.hook(
+      "model.request",
+      (event) => {
+        const trustedURL = process.env.PRAXIS_BASE_URL ?? "http://127.0.0.1:8080/v1"
+        if (event.baseURL !== trustedURL) {
+          throw new Error("Praxis baseURL does not match the trusted gateway")
+        }
+        const password = process.env.GATEWAY_AUTH_PASSWORD
+        if (!password) throw new Error("GATEWAY_AUTH_PASSWORD is required for Praxis")
+        const token = Buffer.from(`gateway:${password}`).toString("base64")
+        event.headers.Authorization = `Basic ${token}`
+      },
+      { providerID: "praxis" },
+    )
+  },
+})
+```
+
+The plugin runs before every model request to the `praxis` provider. It
+checks the resolved `baseURL` against `PRAXIS_BASE_URL`, then attaches Basic
+auth with username `gateway`. Set `PRAXIS_BASE_URL` only to a gateway you
+trust. It must exactly match `baseURL`, including any trailing slash.
+
+> **The guard now blocks the request, but a plugin that fails to load still
+> fails open.** Verified against OpenCode 2.1.2:
+>
+> - If the hook throws (a `baseURL` mismatch or an unset
+>   `GATEWAY_AUTH_PASSWORD`), OpenCode does **not** send the request. It emits
+>   an `error` event carrying the plugin's message and exits `1`. This is
+>   stricter than 1.x, where the turn went out without credentials.
+> - If the plugin fails to **load** (a syntax error, a 1.x-style plugin, or a
+>   `plugins` entry that points at a file rather than a directory), OpenCode
+>   logs `failed to load plugin` at WARN and **continues**, sending every turn
+>   with no `Authorization` header and exiting `0`. The message only appears
+>   with `--print-logs`.
+> - If you change the `providerID` in the plugin so it no longer matches the
+>   provider, the hook never runs and nothing is logged.
+>
+> Against a real Praxis gateway an unauthenticated turn is rejected with
+> `401`. Read a sudden `401` as a possible plugin load failure.
+
+Launch OpenCode from the shell where `GATEWAY_AUTH_PASSWORD` was exported in
+section 2. OpenCode does not need `VLLM_API_KEY`:
+
+```console
+opencode --model "praxis/$VLLM_MODEL"
+```
+
+#### Headless invocation (2.x)
+
+```console
+opencode run --standalone --model "praxis/$VLLM_MODEL" --format json "Summarize README.md" < /dev/null
+```
+
+The 2.x command line differs from 1.x in ways that fail quietly:
+
+- **Pass `--standalone` in scripts.** Without it, `opencode run` connects to a
+  shared background server (`opencode serve --service`) and starts one if none
+  is running. That server keeps running after `run` exits. `--standalone` runs
+  a private server that exits with the command.
+- **Do not put `--` before the prompt.** In 2.1.2, `opencode run -- "hello"`
+  sends `hello hello`, so the prompt is duplicated. Pass the prompt as the
+  final argument with no separator.
+- `-p` is not a flag on `run` in 2.x. `opencode run -p "..."` prints the help
+  text and exits `1`.
+- There is no `--pure` flag. To run without the plugin, remove it from
+  `~/.config/opencode/plugins/`.
+- **Redirect stdin from `/dev/null`.** As in 1.x, `opencode run` hangs with no
+  output and no network activity while stdin stays open.
+
+`--format json` emits one JSON event per line. A plain text turn emits only
+`text` events (assistant text is at `part.text`). A turn that calls a tool
+emits `step_start`, `tool_use`, `step_finish`, then `text`. A failed turn emits
+an `error` event with `error.type` and `error.message`. A gateway `401`
+appears as `error.type` `provider.auth` with `error.status` `401`. Use
+`--print-logs --log-level warn` to see plugin load failures. `ERROR` hides
+them, because they are logged at WARN.
+
+2.x renames some built-in tools: `bash` is now `shell` and `task` is now
+`subagent`. Use the new names when a prompt asks for a tool by name.
+
+#### Alternative: provider headers without a plugin (2.x)
+
+2.x accepts a `headers` map at the provider level, and `{env:NAME}`
+substitution works inside it. You can attach the gateway credential with no
+plugin and keep it out of the file:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "praxis": {
+      "package": "aisdk:@ai-sdk/openai-compatible",
+      "name": "Praxis",
+      "settings": { "baseURL": "http://127.0.0.1:8080/v1" },
+      "headers": { "Authorization": "Basic {env:PRAXIS_GATEWAY_BASIC_TOKEN}" },
+      "models": {
+        "qwen3-8b": {
+          "name": "Qwen3 8B",
+          "limit": { "context": 32768, "output": 8192 }
+        }
+      }
+    }
+  }
+}
+```
+
+Export the Basic token, which is the base64 encoding of `gateway:<password>`:
+
+```console
+export PRAXIS_GATEWAY_BASIC_TOKEN="$(printf 'gateway:%s' "$GATEWAY_AUTH_PASSWORD" | base64)"
+```
+
+If the variable is unset, OpenCode substitutes an empty string and the gateway
+answers `401`. Do not install the plugin alongside this configuration.
+
+**The plugin is still the better choice for interactive use.** It refuses to
+send anything when a project-level config has pointed `baseURL` at another
+host. The `headers` map has no such check and sends the token wherever
+`baseURL` points.
+
 ## Cleanup
 
 When finished, stop local Praxis and cancel the on-demand endpoint workflow:
@@ -697,6 +881,19 @@ kill "$PRAXIS_PID"
   `OPENAI_API_KEY`: the provider `options` were not applied, which upstream has
   reported for both the bundled adapter and sub-sessions. Confirm the resolved
   `baseURL` with `--print-logs --log-level DEBUG` and pin a known-good version.
+- OpenCode 2.x sends requests with no `Authorization` header and exits `0`: the
+  plugin did not load. Re-run with `--print-logs --log-level warn` and look for
+  `failed to load plugin`. Common causes: a 1.x-style plugin, a syntax error,
+  or a `plugins` entry that points at a file rather than a directory. Leaving
+  the plugin in `~/.config/opencode/plugins/` with no `plugins` entry avoids
+  the last one.
+- OpenCode 2.x exits `1` with `Praxis baseURL does not match the trusted
+  gateway` or `GATEWAY_AUTH_PASSWORD is required for Praxis`, and nothing
+  reaches Praxis: the plugin's guard refused the request. Fix
+  `PRAXIS_BASE_URL` or export the password.
+- OpenCode 2.x processes keep running after `opencode run` exits: the run
+  started the shared background server. Pass `--standalone`, or stop the
+  server with `opencode service stop`.
 - `401` from vLLM: `VLLM_API_KEY` does not match the key passed to vLLM.
 - `401` from Praxis on a Codex path gated by `basic_auth`: `env_key` is
   probably still set alongside `env_http_headers`. Codex appends the `env_key`

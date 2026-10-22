@@ -145,6 +145,7 @@ pub(crate) fn transform_request_degrading(
         degraded.prompt_caching = degrade_prompt_caching(&mut body)?;
     }
 
+    normalize_nullable_tool_cache_control(&mut body);
     validate_faithful_request(&body)?;
     reject_unrepresentable_fields(&mut body)?;
     remove_null_unmappable_fields(&mut body);
@@ -179,6 +180,26 @@ pub(crate) fn transform_request_degrading(
 
     let body = serde_json::to_vec(&Value::Object(chat)).map_err(|e| format!("serialization failed: {e}"))?;
     Ok(TransformOutput { body, degraded })
+}
+
+/// Remove nullable prompt-caching markers from Anthropic tool definitions.
+///
+/// The Anthropic schema permits explicit null for `cache_control`, with the
+/// same meaning as omission. Normalize it before validation so it does not
+/// fail the tool-field allowlist. Non-null values remain for the existing
+/// strict validation and operator-approved degradation paths.
+fn normalize_nullable_tool_cache_control(body: &mut Map<String, Value>) {
+    let Some(Value::Array(tools)) = body.get_mut("tools") else {
+        return;
+    };
+    for tool in tools {
+        let Some(tool) = tool.as_object_mut() else {
+            continue;
+        };
+        if tool.get("cache_control").is_some_and(Value::is_null) {
+            tool.remove("cache_control");
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -531,7 +552,7 @@ fn validate_faithful_request(body: &Map<String, Value>) -> Result<(), String> {
         for tool in tools {
             let tool = tool.as_object().ok_or("tool must be an object")?;
             let supported_type = match tool.get("type") {
-                None => true,
+                None | Some(Value::Null) => true,
                 Some(Value::String(kind)) => kind == "custom",
                 _ => false,
             };
@@ -1442,7 +1463,7 @@ fn json_type_name(value: &Value) -> &'static str {
 /// tools fail closed instead of leaking to the backend as client functions.
 fn is_translatable_client_tool(tool: &Value) -> bool {
     match tool.get("type") {
-        None => true,
+        None | Some(Value::Null) => true,
         Some(Value::String(tool_type)) if tool_type == "custom" => true,
         Some(Value::String(tool_type)) => {
             warn!(tool_type, "dropping typed Anthropic tool");
@@ -2542,6 +2563,65 @@ mod tests {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"type":"bash_20241022","name":"bash"},{"type":"text_editor_20241022","name":"text_editor"},{"type":"code_execution_20250522","name":"code_execution"},{"type":"computer_20250124","name":"computer","display_width_px":1024,"display_height_px":768},{"type":"future_server_tool_20270101","name":"future_server_tool"},{"type":42,"name":"invalid_type","input_schema":{"type":"object"}},{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{}}},{"type":"custom","name":"get_time","description":"Get time","input_schema":{"type":"object","properties":{}}}],"messages":[{"role":"user","content":"Hi"}]}"#;
         let error = transform_bytes(body).unwrap_err();
         assert!(error.contains("typed"), "{error}");
+    }
+
+    #[test]
+    fn nullable_tool_fields_are_equivalent_to_omission() {
+        let base = json!({
+            "model": "m",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{
+                "name": "lookup",
+                "description": "Look up a value",
+                "input_schema": {"type": "object"}
+            }]
+        });
+
+        for allow in [LossyFeatureAllowlist::default(), CACHE] {
+            let expected = transform_request_degrading(base.clone(), allow).unwrap();
+            for fields in [
+                ["type"].as_slice(),
+                ["cache_control"].as_slice(),
+                ["type", "cache_control"].as_slice(),
+            ] {
+                let mut request = base.clone();
+                for field in fields {
+                    request["tools"][0][field] = Value::Null;
+                }
+                let actual = transform_request_degrading(request, allow).unwrap();
+                assert_eq!(actual.body, expected.body, "nullable {fields:?} must match omission");
+                assert_eq!(
+                    actual.degraded, expected.degraded,
+                    "nullable {fields:?} must not report degradation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_nullable_tool_fields_remain_strict() {
+        for (field, value, allow) in [
+            ("type", json!("web_search_20250305"), LossyFeatureAllowlist::default()),
+            ("type", json!(42), LossyFeatureAllowlist::default()),
+            (
+                "cache_control",
+                json!({"type": "ephemeral"}),
+                LossyFeatureAllowlist::default(),
+            ),
+            ("cache_control", json!({"type": "forever"}), CACHE),
+        ] {
+            let mut request = json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "tools": [{"name": "lookup", "input_schema": {"type": "object"}}]
+            });
+            request["tools"][0][field] = value;
+            assert!(
+                transform_request_degrading(request, allow).is_err(),
+                "non-null tool {field} must retain strict validation"
+            );
+        }
     }
 
     #[test]

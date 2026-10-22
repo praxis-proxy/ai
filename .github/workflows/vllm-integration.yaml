@@ -87,8 +87,8 @@ on:
         type: boolean
       run_opencode_acceptance:
         description: >-
-          Run pinned OpenCode through the native Chat Completions path against
-          real Qwen3-8B. When run_live_vllm is false, this skips the complete
+          Run pinned OpenCode 1.x and 2.x through the native Chat Completions
+          path against real Qwen3-8B. When run_live_vllm is false, this skips the complete
           Responses SDK suite.
         required: false
         default: false
@@ -546,6 +546,8 @@ jobs:
       opencode_model: ${{ steps.load.outputs.opencode_model }}
       opencode_vllm_image: ${{ steps.load.outputs.opencode_vllm_image }}
       opencode_vllm_flags: ${{ steps.load.outputs.opencode_vllm_flags }}
+      opencode_v2_version: ${{ steps.load.outputs.opencode_v2_version }}
+      opencode_v2_platform: ${{ steps.load.outputs.opencode_v2_platform }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -628,26 +630,41 @@ jobs:
           # ---- OpenCode -------------------------------------------------
           # Exported so the acceptance job carries no hardcoded version
           # strings. Scattering them is exactly how the Codex pins drifted.
-          oc_manifest = pathlib.Path("tests/integration/fixtures/opencode-cli/pin.toml")
-          oc = tomllib.loads(oc_manifest.read_text())
+          # Each OpenCode major has its own manifest and its own plugin. Every
+          # manifest is validated against the major it declares AND the major
+          # its path is reserved for, so a 2.x version dropped into the 1.x
+          # manifest (or the reverse) still fails here: crossing the boundary
+          # needs a rewritten plugin and a re-validated manifest, not a bump.
+          oc_manifests = {
+              1: pathlib.Path("tests/integration/fixtures/opencode-cli/pin.toml"),
+              2: pathlib.Path("tests/integration/fixtures/opencode-cli-v2/pin.toml"),
+          }
+          oc_by_major = {}
+          for lane_major, path in oc_manifests.items():
+              manifest_data = tomllib.loads(path.read_text())
+              client = manifest_data["opencode"]
+              declared_major = int(client["major_series"])
+              actual_major = int(client["version"].split(".")[0])
+              if declared_major != actual_major:
+                  raise SystemExit(
+                      f"{path}: opencode.major_series {declared_major} disagrees with version "
+                      f"{client['version']}"
+                  )
+              if actual_major != lane_major:
+                  raise SystemExit(
+                      f"{path}: the OpenCode acceptance lane is pinned to the {lane_major}.x plugin "
+                      f"contract; version {client['version']} needs its own manifest and a "
+                      "rewritten praxis-auth plugin"
+                  )
+              # The prompt is positional on both majors; the flag that would
+              # swallow it differs (-p was the 1.x server password).
+              if client["launch"]["prompt_is_positional"] is not True:
+                  raise SystemExit(f"{path}: opencode.launch.prompt_is_positional must stay true")
+              oc_by_major[lane_major] = manifest_data
+
+          oc = oc_by_major[1]
           opencode, oc_provider, oc_vllm = oc["opencode"], oc["opencode"]["provider"], oc["vllm"]
           oc_flags = oc_vllm["launch"]["flags"]
-
-          # 2.x replaces the `config` plugin hook the acceptance lane depends
-          # on, so crossing the major boundary needs a rewritten plugin rather
-          # than a version bump.
-          declared_major = int(opencode["major_series"])
-          actual_major = int(opencode["version"].split(".")[0])
-          if declared_major != actual_major:
-              raise SystemExit(
-                  f"opencode.major_series {declared_major} disagrees with version "
-                  f"{opencode['version']}"
-              )
-          if actual_major != 1:
-              raise SystemExit(
-                  "the OpenCode acceptance lane is pinned to the 1.x plugin contract; "
-                  f"version {opencode['version']} needs a rewritten praxis-auth plugin"
-              )
 
           # The client window, the manifest, and the server flag must agree, or
           # the client advertises a context the backend will not honor.
@@ -670,11 +687,6 @@ jobs:
                   "and pass --enable-auto-tool-choice"
               )
 
-          # The prompt is positional; -p on `run` is the server Basic-auth
-          # password. Assert the manifest still records that.
-          if opencode["launch"]["prompt_is_positional"] is not True:
-              raise SystemExit("opencode.launch.prompt_is_positional must stay true")
-
           # A github-release install is only reproducible with both pins.
           if opencode["install"] == "github-release":
               for key in ("url", "sha256"):
@@ -685,14 +697,54 @@ jobs:
           # allowed to reach must have an explicit route, so the OpenCode path
           # can never silently regress onto the catch-all that exists for
           # health checks and startup probes.
-          example = pathlib.Path("examples/configs") / oc["gateway"]["example_config"]
-          example_text = example.read_text()
-          for prefix in oc["startup_matrix"]["allowed_prefixes"]:
-              if f'- path: "{prefix}"' not in example_text:
-                  raise SystemExit(
-                      f"{example} must declare an explicit route for {prefix}; "
-                      "relying on the catch-all is not a supported client path"
-                  )
+          for manifest_data in oc_by_major.values():
+              example = pathlib.Path("examples/configs") / manifest_data["gateway"]["example_config"]
+              example_text = example.read_text()
+              for prefix in manifest_data["startup_matrix"]["allowed_prefixes"]:
+                  if f'- path: "{prefix}"' not in example_text:
+                      raise SystemExit(
+                          f"{example} must declare an explicit route for {prefix}; "
+                          "relying on the catch-all is not a supported client path"
+                      )
+
+          # ---- OpenCode 2.x ---------------------------------------------
+          # The 2.x scenarios run in the same job against the SAME vLLM
+          # container, so the backend pins live once, in the 1.x manifest. The
+          # 2.x client must address the model that container serves and must
+          # not advertise a window it will not honor.
+          oc2 = oc_by_major[2]
+          opencode2, oc2_provider = oc2["opencode"], oc2["opencode"]["provider"]
+          if "vllm" in oc2:
+              raise SystemExit(
+                  f"{oc_manifests[2]} must not declare [vllm]: the 2.x scenarios share the 1.x "
+                  "lane's vLLM container, whose pins live in the 1.x manifest"
+              )
+          if oc2_provider["model_id"] != oc_provider["model_id"]:
+              raise SystemExit(
+                  f"OpenCode 2.x model {oc2_provider['model_id']} must match the served model "
+                  f"{oc_provider['model_id']}"
+              )
+          if int(oc2_provider["context"]) != oc_vllm_context:
+              raise SystemExit(
+                  f"OpenCode 2.x context {oc2_provider['context']} must equal vllm.context_length "
+                  f"{oc_vllm_context}"
+              )
+          if int(oc2_provider["output"]) >= oc_vllm_context:
+              raise SystemExit("OpenCode 2.x provider.output must be below the context window")
+          # Both 2.x lanes stage the registry tarball verified against the
+          # committed checksum; that is what makes them byte-identical.
+          if opencode2["install"] != "registry-tarball":
+              raise SystemExit("OpenCode 2.x must install from the verified registry tarball")
+          oc2_checksum = (
+              oc_manifests[2].parent / f"{opencode2['version']}-{opencode2['platform']}.sha256"
+          )
+          if not oc2_checksum.is_file():
+              raise SystemExit(f"OpenCode 2.x needs a checksum fixture at {oc2_checksum}")
+
+          exported.update({
+              "opencode_v2_version": opencode2["version"],
+              "opencode_v2_platform": opencode2["platform"],
+          })
 
           exported.update({
               "opencode_version": opencode["version"],
@@ -1862,9 +1914,9 @@ jobs:
   #
   # Nothing on that path translates a body, so this job deliberately does NOT
   # re-prove wire fidelity — `examples::anthropic_messages_native_vllm` does
-  # that deterministically on every PR, and the `opencode-cpu` job in
-  # integration.yaml proves both documented credential recipes against a
-  # scripted backend. What only a real model shows is that a multi-turn
+  # that deterministically on every PR, and the `opencode-cpu` and
+  # `opencode-v2-cpu` jobs in integration.yaml prove each major's documented
+  # credential recipes against a scripted backend. What only a real model shows is that a multi-turn
   # tool-calling conversation survives the round trip under real token timing,
   # with streamed `tool_calls` deltas crossing arbitrary chunk boundaries.
   #
@@ -1872,9 +1924,15 @@ jobs:
   # reasoning-parser pairing, as the Claude planning scenario does) and one
   # tool-call round trip, which is the scenario that earns GPU time.
   #
+  # Both scenarios run twice: once with the pinned 1.x client and once with
+  # the pinned 2.x client (`opencode_v2_vllm`), against the SAME vLLM container
+  # and namespace. Each major keeps its own manifest and checksum, and its own
+  # cases in the results artifact.
+  #
   # Every pin comes from the `pins` job, so this file contains no hardcoded
   # version string. Reproducibility-critical values live in
-  # tests/integration/fixtures/opencode-cli/pin.toml.
+  # tests/integration/fixtures/opencode-cli/pin.toml and
+  # tests/integration/fixtures/opencode-cli-v2/pin.toml.
   # ----------------------------------------------------------------------------
 
   vllm-gpu-opencode-acceptance:
@@ -1905,6 +1963,8 @@ jobs:
       OPENCODE_VLLM_MODEL: ${{ needs.pins.outputs.opencode_model }}
       OPENCODE_VLLM_IMAGE: ${{ needs.pins.outputs.opencode_vllm_image }}
       OPENCODE_VLLM_FLAGS: ${{ needs.pins.outputs.opencode_vllm_flags }}
+      OPENCODE_V2_VERSION: ${{ needs.pins.outputs.opencode_v2_version }}
+      OPENCODE_V2_PLATFORM: ${{ needs.pins.outputs.opencode_v2_platform }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1930,7 +1990,8 @@ jobs:
           # The pins job validates the manifest; this guards against an output
           # silently arriving empty, which would otherwise install `opencode-ai@`
           # and fail much later with a confusing error.
-          for name in OPENCODE_VERSION OPENCODE_NPM_PACKAGE OPENCODE_VLLM_MODEL OPENCODE_VLLM_IMAGE OPENCODE_VLLM_FLAGS; do
+          for name in OPENCODE_VERSION OPENCODE_NPM_PACKAGE OPENCODE_VLLM_MODEL OPENCODE_VLLM_IMAGE OPENCODE_VLLM_FLAGS \
+              OPENCODE_V2_VERSION OPENCODE_V2_PLATFORM; do
             value="${!name}"
             if [ -z "$value" ] || case "$value" in *TBD*) true ;; *) false ;; esac; then
               echo "::error::pin $name is empty or TBD: '$value'"
@@ -1985,6 +2046,38 @@ jobs:
           # The client prints the bare version with no product prefix.
           test "$("$dest" --version)" = "${OPENCODE_VERSION}"
           echo "PRAXIS_TEST_OPENCODE_BIN=$dest" >> "$GITHUB_ENV"
+
+      - name: Install pinned OpenCode 2.x CLI
+        run: |
+          set -euo pipefail
+          # Byte-identical to the `opencode-v2-cpu` lane in integration.yaml:
+          # the scoped `@opencode/cli-<platform>` registry tarball, verified
+          # against the committed checksum. Staged under a distinct name so it
+          # can never shadow the 1.x binary above.
+          tarball="cli-$OPENCODE_V2_PLATFORM-$OPENCODE_V2_VERSION.tgz"
+          work="$RUNNER_TEMP/opencode-v2-$OPENCODE_V2_VERSION"
+          mkdir -p "$work"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            --output "$work/$tarball" \
+            "https://registry.npmjs.org/@opencode/cli-$OPENCODE_V2_PLATFORM/-/$tarball"
+          (
+            cd "$work"
+            sha256sum --check \
+              "$GITHUB_WORKSPACE/tests/integration/fixtures/opencode-cli-v2/$OPENCODE_V2_VERSION-$OPENCODE_V2_PLATFORM.sha256"
+          )
+          tar --extract --gzip --file "$work/$tarball" --directory "$work"
+          native="$work/package/bin/opencode"
+          if [ ! -x "$native" ]; then
+            echo "::error::expected the native OpenCode 2.x binary at $native; tarball layout changed"
+            tar tzf "$work/$tarball" | head -n 20 || true
+            exit 1
+          fi
+          dest="$GITHUB_WORKSPACE/target/acceptance-bin/opencode2"
+          mkdir -p "$(dirname "$dest")"
+          install -m 0755 "$native" "$dest"
+          # 2.x prints `opencode v<version>`, unlike the bare 1.x version.
+          test "$("$dest" --version)" = "opencode v${OPENCODE_V2_VERSION}"
+          echo "PRAXIS_TEST_OPENCODE_V2_BIN=$dest" >> "$GITHUB_ENV"
 
       - name: Generate ephemeral vLLM backend credential
         run: |
@@ -2117,6 +2210,7 @@ jobs:
           # A Rust test that early-returns reports as PASSED, so assert the gate
           # variable really points at an executable before trusting any result.
           test -x "$PRAXIS_TEST_OPENCODE_BIN"
+          test -x "$PRAXIS_TEST_OPENCODE_V2_BIN"
           echo "TEST_BIN=$TEST_BIN" >> "$GITHUB_ENV"
 
       - name: Run OpenCode text-turn vLLM acceptance test (once, no retry)
@@ -2157,6 +2251,44 @@ jobs:
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/opencode-acceptance-tool-call.log"
           exit "${PIPESTATUS[0]}"
 
+      - name: Run OpenCode 2.x text-turn vLLM acceptance test (once, no retry)
+        id: opencode_v2_text
+        if: ${{ always() && !cancelled() && steps.opencode_vllm_preflight.outcome == 'success' && steps.opencode_namespace.outcome == 'success' && steps.opencode_test_binary.outcome == 'success' }}
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.OPENCODE_VLLM_MODEL }}
+          PRAXIS_TEST_OPENCODE_NETNS: ${{ env.OPENCODE_NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.202.0.1
+          PRAXIS_TEST_OPENCODE_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          sudo --preserve-env=PRAXIS_TEST_OPENCODE_V2_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_OPENCODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_OPENCODE_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            opencode_v2_vllm::opencode_v2_vllm_plugin_auth_completes_text_turn \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/opencode-acceptance-v2-text.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Run OpenCode 2.x tool-call vLLM acceptance test (once, no retry)
+        id: opencode_v2_tool_call
+        if: ${{ always() && !cancelled() && steps.opencode_vllm_preflight.outcome == 'success' && steps.opencode_namespace.outcome == 'success' && steps.opencode_test_binary.outcome == 'success' }}
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.OPENCODE_VLLM_MODEL }}
+          PRAXIS_TEST_OPENCODE_NETNS: ${{ env.OPENCODE_NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.202.0.1
+          PRAXIS_TEST_OPENCODE_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          # The 2.x client names its shell tool `shell`, not `bash`; the test
+          # prompt reads that name from the 2.x manifest.
+          sudo --preserve-env=PRAXIS_TEST_OPENCODE_V2_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_OPENCODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_OPENCODE_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            opencode_v2_vllm::opencode_v2_vllm_tool_call_round_trip_writes_hash_verified_marker \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/opencode-acceptance-v2-tool-call.log"
+          exit "${PIPESTATUS[0]}"
+
       - name: Capture diagnostics on failure
         if: ${{ always() }}
         run: |
@@ -2183,6 +2315,8 @@ jobs:
         env:
           TEXT_OUTCOME: ${{ steps.opencode_text.outcome }}
           TOOL_CALL_OUTCOME: ${{ steps.opencode_tool_call.outcome }}
+          V2_TEXT_OUTCOME: ${{ steps.opencode_v2_text.outcome }}
+          V2_TOOL_CALL_OUTCOME: ${{ steps.opencode_v2_tool_call.outcome }}
         run: |
           set -euo pipefail
           python3 - "$RUNNER_TEMP/opencode-acceptance.json" <<'PY'
@@ -2191,8 +2325,8 @@ jobs:
           # working tree: vllm_qualification.acceptance() compares all three
           # against the values finish() is invoked with, and any mismatch
           # silently degrades the suite to "unreported" rather than failing.
-          names = ("TEXT_OUTCOME", "TOOL_CALL_OUTCOME")
-          ids = ("opencode_text", "opencode_tool_call")
+          names = ("TEXT_OUTCOME", "TOOL_CALL_OUTCOME", "V2_TEXT_OUTCOME", "V2_TOOL_CALL_OUTCOME")
+          ids = ("opencode_text", "opencode_tool_call", "opencode_v2_text", "opencode_v2_tool_call")
           data = {
               "run_id": int(os.environ["GITHUB_RUN_ID"]),
               "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),

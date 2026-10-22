@@ -586,6 +586,11 @@ fn transform_chunk(
     output: &mut Vec<u8>,
     max_tool_blocks: usize,
 ) -> Result<(), FilterError> {
+    let choice = extract_first_choice(chunk);
+    if choice.is_some_and(|choice| reject_untranslatable_choice(ctx, choice, output)) {
+        return Ok(());
+    }
+
     let started = ctx
         .filter_metadata
         .get(STREAM_STATE_KEY)
@@ -595,7 +600,7 @@ fn transform_chunk(
         emit_message_start(ctx, chunk, output);
     }
 
-    if let Some(choice) = extract_first_choice(chunk) {
+    if let Some(choice) = choice {
         if let Some(delta) = choice.get("delta") {
             transform_delta(ctx, delta, output, max_tool_blocks)?;
         }
@@ -613,6 +618,30 @@ fn transform_chunk(
 
     extract_usage_tokens(ctx, chunk);
     Ok(())
+}
+
+/// Terminate when a valid Chat chunk carries output Anthropic cannot represent.
+fn reject_untranslatable_choice(ctx: &mut HttpFilterContext<'_>, choice: &Value, output: &mut Vec<u8>) -> bool {
+    let has_refusal = choice
+        .get("delta")
+        .and_then(|delta| delta.get("refusal"))
+        .is_some_and(|refusal| !refusal.is_null());
+    let was_content_filtered = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .is_some_and(|reason| reason == "content_filter");
+
+    if !has_refusal && !was_content_filtered {
+        return false;
+    }
+
+    debug!(
+        has_refusal,
+        was_content_filtered, "untranslatable upstream streaming outcome"
+    );
+    emit_upstream_transform_error(output);
+    mark_stream_failed(ctx);
+    true
 }
 
 /// Extract token usage from a chunk and store in filter metadata.
@@ -837,12 +866,17 @@ fn extract_or_fail_tool_call<'a>(
         Err(error) => {
             debug!(%error, "invalid upstream streaming tool call");
             emit_upstream_transform_error(output);
-            ctx.filter_metadata.remove(LINE_BUFFER_KEY);
-            ctx.filter_metadata.remove(UTF8_BUFFER_KEY);
-            ctx.set_metadata(STREAM_STATE_KEY, STREAM_STATE_FAILED.to_owned());
+            mark_stream_failed(ctx);
             None
         },
     }
+}
+
+/// Discard parser state and suppress every event after a terminal stream error.
+fn mark_stream_failed(ctx: &mut HttpFilterContext<'_>) {
+    ctx.filter_metadata.remove(LINE_BUFFER_KEY);
+    ctx.filter_metadata.remove(UTF8_BUFFER_KEY);
+    ctx.set_metadata(STREAM_STATE_KEY, STREAM_STATE_FAILED.to_owned());
 }
 
 /// Extract and validate the tool-call ID and function name from an OpenAI tool-call delta.
@@ -1126,7 +1160,7 @@ fn emit_event(output: &mut Vec<u8>, event_type: &str, data: &Value) {
     output.extend_from_slice(b"\n\n");
 }
 
-/// Emit a client-safe terminal error when an upstream tool call cannot be
+/// Emit a client-safe terminal error for an upstream outcome that cannot be
 /// represented in Anthropic's streaming schema.
 fn emit_upstream_transform_error(output: &mut Vec<u8>) {
     let body = crate::anthropic::wire::error_body(
@@ -1283,6 +1317,55 @@ mod tests {
         assert!(out.contains("message_delta"), "DONE should emit message_delta");
         assert!(out.contains("message_stop"), "DONE should emit message_stop");
         assert!(out.contains("end_turn"), "stop reason should be end_turn");
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "covers all refusal/filter combinations")]
+    fn refusal_and_content_filter_emit_terminal_error() {
+        for (description, delta, finish_reason) in [
+            ("refusal", r#"{"role":"assistant","refusal":"blocked"}"#, "stop"),
+            (
+                "filtered refusal",
+                r#"{"role":"assistant","refusal":"blocked"}"#,
+                "content_filter",
+            ),
+            (
+                "filtered content",
+                r#"{"role":"assistant","content":"partial"}"#,
+                "content_filter",
+            ),
+        ] {
+            let (filter, mut ctx) = make_filter_and_context();
+            let chunk = format!(
+                "data: {{\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{{\"delta\":{delta},\"index\":0,\"finish_reason\":\"{finish_reason}\"}}]}}\n\n"
+            );
+            let mut body = Some(Bytes::from(chunk));
+            drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+            let output = String::from_utf8(body.unwrap().to_vec()).unwrap();
+            assert!(
+                output.contains("event: error")
+                    && output.contains(r#""type":"api_error""#)
+                    && output.contains("upstream response could not be transformed"),
+                "{description} should emit a terminal Anthropic error: {output}"
+            );
+            assert!(
+                !output.contains("text_delta"),
+                "{description} must not emit lossy content"
+            );
+            assert!(
+                !output.contains("event: message_stop"),
+                "{description} must terminate without message_stop: {output}"
+            );
+
+            let mut trailing_body = Some(Bytes::from_static(b"data: [DONE]\n\n"));
+            drop(filter.on_response_body(&mut ctx, &mut trailing_body, true).unwrap());
+            assert_eq!(
+                trailing_body,
+                Some(Bytes::new()),
+                "{description} must suppress events after the terminal error"
+            );
+        }
     }
 
     #[test]

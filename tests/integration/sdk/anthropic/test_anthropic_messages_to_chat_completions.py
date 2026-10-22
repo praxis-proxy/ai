@@ -81,6 +81,7 @@ class RecordingBackend(BaseHTTPRequestHandler):
     send_tool_reply_once = False
     tool_call_arguments = "{}"
     untranslatable_reply_once: str | None = None
+    untranslatable_stream_once: str | None = None
     error_response_once = False
 
     def do_POST(self):
@@ -105,7 +106,12 @@ class RecordingBackend(BaseHTTPRequestHandler):
             self.wfile.write(reply)
             return
         if body.get("stream"):
-            self._send_invalid_tool_id_stream()
+            if RecordingBackend.untranslatable_stream_once:
+                kind = RecordingBackend.untranslatable_stream_once
+                RecordingBackend.untranslatable_stream_once = None
+                self._send_untranslatable_stream(kind)
+            else:
+                self._send_invalid_tool_id_stream()
             return
 
         choice = {
@@ -211,6 +217,37 @@ class RecordingBackend(BaseHTTPRequestHandler):
         self.wfile.write(chunks[1])
         self.wfile.flush()
 
+    def _send_untranslatable_stream(self, kind: str):
+        if kind == "refusal":
+            outcomes = [({"role": "assistant", "refusal": "blocked"}, None)]
+        else:
+            outcomes = [
+                ({"role": "assistant", "content": "partial"}, None),
+                ({}, "content_filter"),
+            ]
+        chunks = []
+        for delta, finish_reason in outcomes:
+            chunk = {
+                "id": "chatcmpl-stub",
+                "object": "chat.completion.chunk",
+                "created": 1_700_000_000,
+                "model": MODEL,
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }],
+            }
+            chunks.append(f"data: {json.dumps(chunk)}\n\n")
+        chunks.append("data: [DONE]\n\n")
+        wire = "".join(chunks).encode()
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(wire)))
+        self.end_headers()
+        self.wfile.write(wire)
+        self.wfile.flush()
+
     def log_message(self, format, *args):
         pass
 
@@ -304,6 +341,33 @@ def degrading_client():
 
 
 class TestRequestFieldHandling:
+    @pytest.mark.parametrize("field", ["type", "cache_control"])
+    def test_nullable_tool_fields_match_omission(
+        self, anthropic_client, degrading_client, field
+    ):
+        for client in [anthropic_client, degrading_client]:
+            RecordingBackend.bodies.clear()
+            tool = {
+                "name": "lookup",
+                "description": "Look up a value",
+                "input_schema": {"type": "object"},
+                field: None,
+            }
+
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[{"role": "user", "content": "Call lookup"}],
+                extra_body={"tools": [tool]},
+            )
+
+            assert response.content[0].text == "4"
+            [upstream] = RecordingBackend.bodies
+            [translated] = upstream["tools"]
+            assert translated["type"] == "function"
+            assert translated["function"]["name"] == "lookup"
+            assert field not in translated["function"]
+
     def test_tool_input_presence_is_preserved(self, anthropic_client):
         RecordingBackend.bodies.clear()
 
@@ -617,6 +681,37 @@ class TestStreamingResponseValidation:
         ), "aborted stream must not start a tool_use block"
         [upstream] = RecordingBackend.bodies
         assert upstream["stream"] is True, "forwarded request must have been a stream"
+
+    @pytest.mark.parametrize("kind", ["refusal", "content_filter"])
+    def test_untranslatable_outcome_terminates_stream(self, anthropic_client, kind):
+        RecordingBackend.bodies.clear()
+        RecordingBackend.untranslatable_stream_once = kind
+        events = []
+        try:
+            with pytest.raises(APIStatusError) as excinfo:
+                with anthropic_client.messages.stream(
+                    model=MODEL,
+                    max_tokens=64,
+                    messages=[{"role": "user", "content": "Hi"}],
+                ) as stream:
+                    events.extend(stream)
+        finally:
+            RecordingBackend.untranslatable_stream_once = None
+
+        error = excinfo.value
+        assert error.body.get("type") == "error", (
+            f"{kind} must use the Anthropic error envelope"
+        )
+        assert error.body.get("error", {}).get("type") == "api_error", (
+            f"{kind} must surface as an Anthropic api_error"
+        )
+        assert not any(event.type == "message_stop" for event in events), (
+            f"{kind} must terminate without message_stop"
+        )
+        [upstream] = RecordingBackend.bodies
+        assert upstream["stream"] is True, (
+            f"{kind} must be exercised through a forwarded streaming request"
+        )
 
 
 DEGRADED_HEADER = "x-degraded-features"
