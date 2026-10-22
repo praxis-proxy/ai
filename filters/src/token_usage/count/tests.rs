@@ -2186,3 +2186,109 @@ fn bedrock_headers_without_headers_record_nothing() {
         "missing Bedrock token headers should record nothing, got {snap:?}"
     );
 }
+
+// -----------------------------------------------------------------------------
+// TPOT and finish-reason metrics
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn metrics_sse_openai_records_finish_reason() {
+    let filter = make_filter(ProviderKind::OpenAi);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.cluster = Some("test-cluster".to_owned().into());
+    ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "test-model");
+
+    let mut resp = make_response_with_content_type("text/event-stream");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let events = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\n";
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        let mut body = Some(Bytes::copy_from_slice(events));
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+    });
+    let snap = snapshotter.snapshot().into_vec();
+
+    let total: u64 = snap
+        .iter()
+        .filter(|(key, ..)| {
+            key.key().name() == crate::llm_metrics::METRIC_FINISH_REASONS_TOTAL
+                && key.key().labels().any(|l| l.key() == "reason" && l.value() == "stop")
+        })
+        .filter_map(|(_, _, _, value)| match value {
+            DebugValue::Counter(count) => Some(*count),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(total, 1, "OpenAI finish_reason stop should be recorded once");
+}
+
+#[test]
+fn record_tpot_records_inter_delta_samples() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.cluster = Some("test-cluster".to_owned().into());
+    ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "test-model");
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        record_tpot_delta(&mut ctx);
+        record_tpot_delta(&mut ctx);
+    });
+    let snap = snapshotter.snapshot().into_vec();
+
+    let samples: usize = snap
+        .iter()
+        .filter_map(|(key, _, _, value)| {
+            if key.key().name() == crate::llm_metrics::METRIC_TPOT_SECONDS
+                && let DebugValue::Histogram(values) = value
+            {
+                Some(values.len())
+            } else {
+                None
+            }
+        })
+        .sum();
+    assert_eq!(samples, 1, "the second delta should record one TPOT sample");
+}
+
+#[test]
+fn extract_finish_reason_is_provider_aware() {
+    assert_eq!(
+        extract_finish_reason(br#"{"choices":[{"finish_reason":"stop"}]}"#, ProviderKind::OpenAi),
+        Some("stop".to_owned())
+    );
+    assert_eq!(
+        extract_finish_reason(br#"{"delta":{"stop_reason":"end_turn"}}"#, ProviderKind::Anthropic),
+        Some("end_turn".to_owned())
+    );
+    assert_eq!(
+        extract_finish_reason(
+            br#"{"candidates":[{"finishReason":"MAX_TOKENS"}]}"#,
+            ProviderKind::Google
+        ),
+        Some("MAX_TOKENS".to_owned())
+    );
+    assert_eq!(
+        extract_finish_reason(br#"{"messageStop":{"stopReason":"tool_use"}}"#, ProviderKind::Bedrock),
+        Some("tool_use".to_owned())
+    );
+    assert_eq!(extract_finish_reason(b"{}", ProviderKind::Auto), None);
+    assert_eq!(extract_finish_reason(b"{}", ProviderKind::BedrockInvokeModel), None);
+}
+
+#[test]
+fn normalize_finish_reason_bounds_labels() {
+    assert_eq!(normalize_finish_reason("stop"), "stop");
+    assert_eq!(normalize_finish_reason("end_turn"), "stop");
+    assert_eq!(normalize_finish_reason("max_tokens"), "length");
+    assert_eq!(normalize_finish_reason("tool_use"), "tool_calls");
+    assert_eq!(normalize_finish_reason("SAFETY"), "content_filter");
+    assert_eq!(normalize_finish_reason("stop_sequence"), "stop_sequence");
+    assert_eq!(normalize_finish_reason("brand_new_reason"), "other");
+}

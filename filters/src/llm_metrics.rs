@@ -231,7 +231,6 @@ pub fn record_token_usage(
 }
 
 /// Emit an inter-delta (decode) timing sample.
-#[expect(dead_code, reason = "wired by consumers that measure inter-delta timing")]
 pub fn record_tpot(ctx: &HttpFilterContext<'_>, delta_seconds: f64) {
     ensure_described();
     let model = resolve_model(ctx);
@@ -240,7 +239,6 @@ pub fn record_tpot(ctx: &HttpFilterContext<'_>, delta_seconds: f64) {
 }
 
 /// Emit one finish-reason observation.
-#[expect(dead_code, reason = "wired by consumers that parse finish reasons")]
 pub fn record_finish_reason(ctx: &HttpFilterContext<'_>, reason: &str) {
     let model = resolve_model(ctx);
     let cluster = cluster(ctx);
