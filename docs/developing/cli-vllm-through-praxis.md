@@ -526,7 +526,7 @@ Nothing changes on the Praxis side between the two majors.
 
 ### OpenCode 1.x
 
-These steps are verified against OpenCode 1.18.35.
+These steps are verified against OpenCode 1.19.3.
 
 Add this configuration to
 `~/.config/opencode/opencode.jsonc`, merging the `plugin` and `provider`
