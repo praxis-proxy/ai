@@ -187,10 +187,11 @@ reading the body. Publishes a typed `AiOperationMatch`
 in request extensions plus metadata and filter results
 for branching, so downstream filters know the protocol
 and operation before any body-reading filter runs. Runs
-in both the header and body phases: the body-phase hook
-inspects only the head and publishes once, guaranteeing
-the match is available before a downstream filter's
-buffered body pre-read. A matched operation is
+once in the request-head phase, which core executes
+before any downstream filter's buffered body pre-read and
+before the main request phase, so the match is available
+to a consumer that reads the body under
+`BodyMode::StreamBuffer`. A matched operation is
 authoritative over body shape.
 
 ### `model_to_header`
