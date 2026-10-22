@@ -1047,6 +1047,7 @@ async fn run_compaction_flow(live: &LiveConfig, build_config: fn(&LiveConfig, u1
     // explicitly unproven continuation. In either case, skip the unreliable
     // downstream completion assertions rather than failing the GPU job.
     if compaction_is_xfail {
+        assert_qwen_compaction_xfail_child_outcome(&output, &stdout);
         match trace_outcome {
             CompactionTraceOutcome::PostCompactionToolCall => eprintln!(
                 "XFAIL (model `{model}`, documented Qwen3-8B limitation): verified the pinned Claude \
@@ -1118,6 +1119,45 @@ fn assert_child_completed(output: &CapturedChildOutput, scenario: &str) {
         stdout = String::from_utf8_lossy(&output.stdout),
         stderr = String::from_utf8_lossy(&output.stderr),
     );
+}
+
+/// Rejects client or proxy failures before a Qwen compaction limitation is
+/// recorded as XFAIL. A timeout is allowed because the known model can loop after
+/// compaction; any terminal error result remains a hard failure.
+fn assert_qwen_compaction_xfail_child_outcome(output: &CapturedChildOutput, stdout: &str) {
+    let trace = ToolTrace::parse(stdout);
+    if let Err(reason) = validate_qwen_compaction_xfail_child_outcome(output.timed_out, output.status.success(), &trace)
+    {
+        panic!(
+            "Qwen compaction XFAIL requires model incompletion, not a child or terminal error: \
+             {reason} (timed_out={}, exit={:?})\nstdout:\n{}\nstderr:\n{}",
+            output.timed_out,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+fn validate_qwen_compaction_xfail_child_outcome(
+    timed_out: bool,
+    child_succeeded: bool,
+    trace: &ToolTrace,
+) -> Result<(), &'static str> {
+    if trace.result_is_error {
+        return Err("terminal result reported is_error=true");
+    }
+    if trace
+        .result_subtype
+        .as_deref()
+        .is_some_and(|subtype| subtype != "success")
+    {
+        return Err("terminal result subtype was not success");
+    }
+    if !timed_out && !child_succeeded {
+        return Err("Claude Code exited unsuccessfully");
+    }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -2957,6 +2997,42 @@ fn qwen_compaction_trace_without_post_boundary_tool_is_an_expected_xfail() {
         workspace.assert_compaction_task_trace(&stdout, true),
         CompactionTraceOutcome::NoPostCompactionToolCall,
     );
+}
+
+#[test]
+fn qwen_compaction_xfail_allows_the_documented_timeout_without_a_terminal_error() {
+    let trace =
+        ToolTrace::parse(r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto"}}"#);
+
+    assert_eq!(
+        validate_qwen_compaction_xfail_child_outcome(true, false, &trace),
+        Ok(()),
+    );
+}
+
+#[test]
+fn qwen_compaction_xfail_rejects_an_unexpected_child_exit_failure() {
+    let trace = ToolTrace::parse("");
+
+    assert_eq!(
+        validate_qwen_compaction_xfail_child_outcome(false, false, &trace),
+        Err("Claude Code exited unsuccessfully"),
+    );
+}
+
+#[test]
+fn qwen_compaction_xfail_rejects_terminal_errors_even_after_timeout() {
+    for stdout in [
+        r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#,
+        r#"{"type":"result","subtype":"success","is_error":true}"#,
+        r#"{"type":"result","subtype":"error_max_turns","is_error":false}"#,
+    ] {
+        let trace = ToolTrace::parse(stdout);
+        assert!(
+            validate_qwen_compaction_xfail_child_outcome(true, false, &trace).is_err(),
+            "terminal error must not be classified as the timeout XFAIL: {stdout}"
+        );
+    }
 }
 
 #[test]

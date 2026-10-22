@@ -297,9 +297,13 @@ async fn conversation_compaction_continuation_reaches_scripted_provider_tool_cal
         );
         if parse_status(&raw) == 200 {
             let items: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
-            compaction_was_appended = items["data"]
-                .as_array()
-                .is_some_and(|items| items.iter().any(|item| item["id"] == "cmp_conversation"));
+            compaction_was_appended = items["data"].as_array().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["id"] == "cmp_conversation"
+                        && item["type"] == "compaction"
+                        && item["encrypted_content"] == "provider-opaque-state"
+                })
+            });
             if compaction_was_appended {
                 break;
             }
@@ -352,7 +356,11 @@ async fn conversation_compaction_continuation_reaches_scripted_provider_tool_cal
         .as_array()
         .expect("rehydrated input should be an array");
     assert!(
-        input.iter().any(|item| item["id"] == "cmp_conversation"),
+        input.iter().any(|item| {
+            item["id"] == "cmp_conversation"
+                && item["type"] == "compaction"
+                && item["encrypted_content"] == "provider-opaque-state"
+        }),
         "Praxis should rehydrate the stored compaction item before forwarding: {forwarded}"
     );
     assert_eq!(
