@@ -36,8 +36,46 @@ pub(crate) const MAX_CALLS_PER_ROUND: usize = 1_024;
 /// and JSON-body allocation before the provider request fails (issue #1145).
 pub(crate) const MAX_SEARCH_QUERY_BYTES: usize = 8 * 1024;
 
-/// Default per-query bound when the operator omits `max_query_bytes`.
-const DEFAULT_MAX_QUERY_BYTES: usize = MAX_SEARCH_QUERY_BYTES;
+// -----------------------------------------------------------------------------
+// MaxQueryBytes
+// -----------------------------------------------------------------------------
+
+/// Per-query UTF-8 byte bound, validated to `1..=`[`MAX_SEARCH_QUERY_BYTES`]
+/// at parse time.
+///
+/// [`MAX_SEARCH_QUERY_BYTES`] is a hard safety ceiling, not just the default:
+/// an operator may lower the bound but never raise it past the cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "u16")]
+pub(crate) struct MaxQueryBytes(usize);
+
+impl MaxQueryBytes {
+    /// The validated bound in bytes.
+    pub(crate) fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for MaxQueryBytes {
+    fn default() -> Self {
+        Self(MAX_SEARCH_QUERY_BYTES)
+    }
+}
+
+impl TryFrom<u16> for MaxQueryBytes {
+    type Error = String;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        let value = usize::from(value);
+        if (1..=MAX_SEARCH_QUERY_BYTES).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(format!(
+                "max_query_bytes must be between 1 and {MAX_SEARCH_QUERY_BYTES}, got {value}"
+            ))
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // SearchProvider
@@ -154,7 +192,7 @@ pub(crate) struct WebSearchFilterConfig {
     /// call locally instead of reaching the provider. 8192 is a hard ceiling:
     /// admins may lower the bound but cannot raise it.
     #[serde(default)]
-    pub(crate) max_query_bytes: Option<usize>,
+    pub(crate) max_query_bytes: MaxQueryBytes,
 
     /// Override the provider's default API base URL.
     #[serde(default)]
@@ -232,7 +270,7 @@ pub(crate) struct OpenAiWebSearchConfig {
     /// call locally instead of reaching the provider. 8192 is a hard ceiling:
     /// admins may lower the bound but cannot raise it.
     #[serde(default)]
-    pub(crate) max_query_bytes: Option<usize>,
+    pub(crate) max_query_bytes: MaxQueryBytes,
 
     /// Override the provider's default API base URL.
     #[serde(default)]
@@ -395,7 +433,7 @@ fn build_validated_config(
         default_context_size: validate_context_size(filter_name, raw.default_context_size.as_deref())?,
         timeout_ms: callout_policy::validate_timeout_ms(filter_name, raw.timeout_ms, DEFAULT_TIMEOUT_MS)?,
         max_body_bytes: validate_max_body_bytes_field(filter_name, raw.max_body_bytes)?,
-        max_query_bytes: validate_max_query_bytes(filter_name, raw.max_query_bytes)?,
+        max_query_bytes: raw.max_query_bytes.get(),
         base_url: raw.base_url.clone(),
         user_credential: raw.user_credential.clone(),
     })
@@ -419,21 +457,6 @@ fn validate_context_size(filter_name: &'static str, raw: Option<&str>) -> Result
 fn validate_max_body_bytes_field(filter_name: &'static str, raw: Option<usize>) -> Result<usize, FilterError> {
     let value = raw.unwrap_or(MAX_JSON_BODY_BYTES);
     validate_max_body_bytes(filter_name, value)?;
-    Ok(value)
-}
-
-/// Validate `max_query_bytes`, applying the default and rejecting values
-/// outside the `1..=`[`MAX_SEARCH_QUERY_BYTES`] range.
-///
-/// [`MAX_SEARCH_QUERY_BYTES`] is a hard safety ceiling, not a default: an
-/// operator may lower the per-query bound but never raise it past the cap.
-fn validate_max_query_bytes(filter_name: &'static str, raw: Option<usize>) -> Result<usize, FilterError> {
-    let value = raw.unwrap_or(DEFAULT_MAX_QUERY_BYTES);
-    if value == 0 || value > MAX_SEARCH_QUERY_BYTES {
-        return Err(FilterError::from(format!(
-            "{filter_name}: max_query_bytes must be between 1 and {MAX_SEARCH_QUERY_BYTES}"
-        )));
-    }
     Ok(value)
 }
 
@@ -463,7 +486,7 @@ mod tests {
             default_context_size: None,
             timeout_ms: None,
             max_body_bytes: None,
-            max_query_bytes: None,
+            max_query_bytes: MaxQueryBytes::default(),
             base_url: None,
             outbound_chain: ChainRef::Named("web_search_outbound".to_owned()),
         }
@@ -706,9 +729,9 @@ mod tests {
     }
 
     #[test]
-    fn build_config_accepts_lower_max_query_bytes() {
+    fn build_config_threads_lower_max_query_bytes() {
         let mut cfg = base_config();
-        cfg.max_query_bytes = Some(1_024);
+        cfg.max_query_bytes = MaxQueryBytes::try_from(1_024).unwrap();
         let (validated, _watch) = build_config("anthropic_web_search", &cfg).unwrap();
         assert_eq!(
             validated.max_query_bytes, 1_024,
@@ -717,25 +740,72 @@ mod tests {
     }
 
     #[test]
-    fn build_config_rejects_zero_max_query_bytes() {
-        let mut cfg = base_config();
-        cfg.max_query_bytes = Some(0);
-        assert!(
-            build_config("openai_web_search_dispatch", &cfg).is_err(),
-            "max_query_bytes=0 should be rejected"
+    fn max_query_bytes_try_from_enforces_range() {
+        for accepted in [1, 1_024, 8_192] {
+            assert_eq!(
+                MaxQueryBytes::try_from(accepted).map(MaxQueryBytes::get),
+                Ok(usize::from(accepted)),
+                "max_query_bytes={accepted} is within 1..=8192 and must be accepted"
+            );
+        }
+        for rejected in [0, 8_193, u16::MAX] {
+            let error =
+                MaxQueryBytes::try_from(rejected).expect_err("max_query_bytes outside 1..=8192 must be rejected");
+            assert!(
+                error.contains("max_query_bytes must be between 1 and 8192"),
+                "the diagnostic should name the knob and the ceiling: {error}"
+            );
+        }
+    }
+
+    /// Parse `max_query_bytes` (or its omission) through the given config type.
+    fn parse_max_query_bytes<T: serde::de::DeserializeOwned>(
+        filter_name: &'static str,
+        line: &str,
+        project: impl Fn(T) -> MaxQueryBytes,
+    ) -> Result<usize, FilterError> {
+        let yaml = serde_yaml::from_str(&format!("provider: brave\napi_key:\n  value: k\n{line}")).unwrap();
+        parse_filter_config::<T>(filter_name, &yaml).map(|raw| project(raw).get())
+    }
+
+    fn assert_max_query_bytes_parsing(parse: impl Fn(&str) -> Result<usize, FilterError>) {
+        assert_eq!(
+            parse("").unwrap(),
+            MAX_SEARCH_QUERY_BYTES,
+            "omitting max_query_bytes must default to the 8 KiB ceiling"
         );
+        for accepted in [1, 1_024, MAX_SEARCH_QUERY_BYTES] {
+            assert_eq!(
+                parse(&format!("max_query_bytes: {accepted}")).unwrap(),
+                accepted,
+                "max_query_bytes={accepted} is within 1..=8192 and must parse"
+            );
+        }
+        for rejected in ["0", "8193", "70000", "-1"] {
+            assert!(
+                parse(&format!("max_query_bytes: {rejected}")).is_err(),
+                "max_query_bytes={rejected} is outside 1..=8192 and must fail at parse time"
+            );
+        }
     }
 
     #[test]
-    fn build_config_rejects_max_query_bytes_above_ceiling() {
-        let mut cfg = base_config();
-        cfg.max_query_bytes = Some(MAX_SEARCH_QUERY_BYTES + 1);
-        let error = build_config("anthropic_web_search", &cfg)
-            .expect_err("max_query_bytes above the ceiling should be rejected");
-        assert!(
-            error.to_string().contains("max_query_bytes"),
-            "the diagnostic should name the knob: {error}"
-        );
+    fn parse_config_validates_max_query_bytes() {
+        assert_max_query_bytes_parsing(|line| {
+            parse_max_query_bytes("anthropic_web_search", line, |raw: WebSearchFilterConfig| {
+                raw.max_query_bytes
+            })
+        });
+    }
+
+    #[cfg(feature = "openai-responses")]
+    #[test]
+    fn openai_parse_config_validates_max_query_bytes() {
+        assert_max_query_bytes_parsing(|line| {
+            parse_max_query_bytes("openai_web_search_dispatch", line, |raw: OpenAiWebSearchConfig| {
+                raw.into_shared().max_query_bytes
+            })
+        });
     }
 
     #[test]

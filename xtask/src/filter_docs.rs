@@ -1525,9 +1525,8 @@ fn render_type_path(tp: &syn::TypePath, enums: &BTreeMap<String, EnumInfo>) -> S
         "ChainRef" => "string \\| object".to_owned(),
         "Value" => "any".to_owned(),
         "bool" => ident,
-        "RetainedBytes" | "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "isize" => {
-            "integer".to_owned()
-        },
+        "RetainedBytes" | "MaxQueryBytes" | "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64"
+        | "isize" => "integer".to_owned(),
         "f32" | "f64" => "number".to_owned(),
         other => enums
             .get(other)
@@ -2855,6 +2854,7 @@ mod tests {
             ("u64", "integer"),
             ("usize", "integer"),
             ("RetainedBytes", "integer"),
+            ("MaxQueryBytes", "integer"),
             ("i8", "integer"),
             ("i16", "integer"),
             ("i32", "integer"),

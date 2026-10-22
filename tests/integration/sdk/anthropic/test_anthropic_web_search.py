@@ -44,13 +44,20 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-from anthropic import Anthropic, AuthenticationError
+from anthropic import Anthropic, AuthenticationError, BadRequestError
 
 CONFIG_PATH = "examples/configs/anthropic/full-flow-agentic.yaml"
 SCOPED_CONFIG_PATH = "examples/configs/anthropic/web-search-scoped-credentials.yaml"
 TOOL_USE_ID = "toolu_web_search_01"
 FINAL_TEXT = "Potato is a starchy tuber native to the Americas."
 LARGE_ASSISTANT_TEXT = "Searching first. " + "x" * (256 * 1024)
+# Hard safety ceiling on one search query; the example config keeps the default.
+MAX_QUERY_BYTES = 8192
+# Prompt marker -> model-generated WebSearch query the proxy must refuse locally.
+INVALID_QUERIES = {
+    "blank query": "   ",
+    "oversized query": "q" * (MAX_QUERY_BYTES + 1),
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -197,7 +204,9 @@ def _answer_round_sse() -> bytes:
 
 
 def _search_round_json(
-    large_assistant_content: bool = False, sequence_tool_block: bool = False
+    large_assistant_content: bool = False,
+    sequence_tool_block: bool = False,
+    query: str = "potato",
 ) -> bytes:
     content = []
     if large_assistant_content:
@@ -210,7 +219,7 @@ def _search_round_json(
                 "type": "tool_use",
                 "id": TOOL_USE_ID,
                 "name": "WebSearch",
-                "input": {"query": "potato"},
+                "input": {"query": query},
             }
         )
     return json.dumps(
@@ -315,10 +324,23 @@ class _ModelHandler(BaseHTTPRequestHandler):
                 and "sequence-shaped tool block" in message["content"]
                 for message in request.get("messages", [])
             )
+            prompts = [
+                message["content"]
+                for message in request.get("messages", [])
+                if isinstance(message.get("content"), str)
+            ]
+            query = next(
+                (
+                    invalid
+                    for marker, invalid in INVALID_QUERIES.items()
+                    if any(marker in prompt for prompt in prompts)
+                ),
+                "potato",
+            )
             body = (
                 _answer_round_json()
                 if answering
-                else _search_round_json(large_assistant_content, sequence_tool_block)
+                else _search_round_json(large_assistant_content, sequence_tool_block, query)
             )
             content_type = "application/json"
 
@@ -690,6 +712,41 @@ class TestAnthropicWebSearch:
         assert len(model.requests) == 2, "streaming loop re-enters the model"
         assert len(search.requests) == 1, "streaming loop dispatches one search"
         assert model.requests[0].get("stream") is True, "the first model round must request streaming transport"
+
+
+    @pytest.mark.parametrize(
+        ("marker", "expected_message"),
+        [
+            ("blank query", "non-empty id and input.query"),
+            ("oversized query", f"input.query must not exceed {MAX_QUERY_BYTES} bytes"),
+        ],
+    )
+    def test_buffered_invalid_query_rejected_before_search(
+        self, anthropic_client, web_search_stack, marker, expected_message
+    ):
+        model = web_search_stack["model"]
+        search = web_search_stack["search"]
+        model.requests.clear()
+        search.requests.clear()
+        kwargs = _messages_kwargs()
+        kwargs["messages"][0]["content"] = f"Use web search with a {marker}."
+
+        with pytest.raises(BadRequestError) as exc_info:
+            anthropic_client.messages.create(**kwargs)
+
+        error = exc_info.value
+        assert error.status_code == 400, f"a {marker} must be rejected with 400; got {error.status_code}"
+        assert error.body["type"] == "error", f"error envelope type must be error: {error.body}"
+        assert error.body["error"]["type"] == "invalid_request_error", (
+            f"a {marker} must surface as invalid_request_error: {error.body}"
+        )
+        assert expected_message in error.body["error"]["message"], (
+            f"the error must explain why the {marker} was refused: {error.body}"
+        )
+        assert len(model.requests) == 1, (
+            f"a {marker} must stop the loop after the first model round: {len(model.requests)} rounds"
+        )
+        assert search.requests == [], f"a {marker} must never reach the search provider: {search.requests}"
 
 
 class TestAnthropicWebSearchCredential:
