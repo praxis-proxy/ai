@@ -133,7 +133,7 @@ is reserved for this single-user development workload. If you lower the window
 or share the GPU, do not use auto mode unless the classifier request still
 fits.
 
-Claude Code's default output budget is also larger than this window; section 4
+Claude Code's default output budget also covers most of this window; section 4
 explains why that is harmless on the vLLM version this guide serves.
 
 ## 2. Point a Praxis example at vLLM
@@ -531,11 +531,9 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL="$VLLM_MODEL"
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 # Optional headroom: cap the requested output budget (see the note below).
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192
-# Pull Claude Code's auto-compaction below the server's window: the window
-# variable's 100k minimum combined with a percentage of it (see the note
-# below; the window variable needs Claude Code 2.1.75 and newer).
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000
-export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=30
+# Tell Claude Code the served model's real window so it auto-compacts before
+# vLLM rejects the prompt (see the note below).
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=32768
 # Required if you select Claude Code's auto permission mode with this backend.
 export CLAUDE_CODE_AUTO_MODE_SERVER=0
 
@@ -569,30 +567,30 @@ default `max_tokens` for the Anthropic model name it believes it is calling —
 around 21,000 tokens. vLLM treats that budget as an upper bound, not a
 reservation: `get_max_tokens` caps it at `--max-model-len` minus the prompt
 length, and a request is rejected up front only when the prompt itself exceeds
-the window (verified against vLLM 0.29.0 — the version the on-demand endpoint
-and the GPU nightly serve — on both the Chat Completions and the
-Anthropic-compatible `/v1/messages` paths). An oversized budget therefore
-costs no prompt space, and the 8192 cap above is optional: it is kept to make
-each turn's output budget predictable on the 32,768-token server, not to
-prevent a failure.
+the window or the budget alone exceeds `--max-model-len` (verified against
+vLLM 0.32.0 — the version the on-demand endpoint and the GPU nightly serve —
+on both the Chat Completions and the Anthropic-compatible `/v1/messages`
+paths). Claude Code's default stays below the 32,768-token window, so an
+oversized budget costs no prompt space, and the 8192 cap above is optional: it
+is kept to make each turn's output budget predictable on the 32,768-token
+server, not to prevent a failure.
 
-Claude Code also sizes its own auto-compaction against the window it assumes,
-not the real one, so it will not compact in time on its own: once the prompt
-alone passes `--max-model-len`, every later request fails with HTTP 400 and an
-over-long conversation cannot be compacted, only `/clear`ed. On Claude Code
-2.1.75 and newer, `CLAUDE_CODE_AUTO_COMPACT_WINDOW` is the knob — but it
-cannot name this server's window directly: it accepts 100,000 to 1,000,000
-tokens, and a smaller value draws a startup warning and is treated as the
-100k minimum, still above the 32,768-token server. The pair exported above
-is the supported configuration under that floor: the window at its 100k
-minimum, and `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` lowering the trigger to a
-percentage of that window — 30% of 100,000 is 30,000 tokens, below the
-server limit. The percentage only applies in sessions that already compact
-before the model's context limit, which is why the window variable must
-accompany it. Older clients have no way to pull the trigger below the
-assumed 200K window, so run `/compact` by hand if a long session creeps
-toward the limit. A larger window is the alternative, but Qwen3-8B is
-natively 32,768 tokens and anything beyond it needs `--rope-scaling` on
+Claude Code also sizes its own auto-compaction against the window it assumes
+for a model name it does not recognize, not the server's real one, so on its
+own it will not compact in time: once the prompt alone passes
+`--max-model-len`, every later request fails with HTTP 400 and an over-long
+conversation cannot be compacted, only `/clear`ed.
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` names the real window for a model Claude Code
+does not recognize — any name that is not a canonical `claude-*` id, which
+includes the served alias — so set it to the server's `--max-model-len`. It is
+the variable the GPU nightly's Claude Code acceptance test sets against the
+pinned Claude Code 2.1.278, whose compaction scenario asserts that the client
+then auto-compacts below the server window on its own. Do not reach for
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` here: it accepts 100,000 to 1,000,000 tokens,
+and a smaller value draws a startup warning and is treated as the 100k minimum,
+still above the 32,768-token server. Run `/compact` by hand if a long session
+still creeps toward the limit. A larger window is the alternative, but Qwen3-8B
+is natively 32,768 tokens and anything beyond it needs `--rope-scaling` on
 `vllm serve`.
 
 Praxis and vLLM do not implement Anthropic's server-side auto-mode classifier
