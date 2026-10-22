@@ -1,0 +1,63 @@
+name: Publish (quay)
+
+# Fork-side quay publish. The upstream publish.yaml targets GHCR on a
+# nightly schedule with FIPS variants; this workflow pushes the EnMaaS
+# deployment image (quay.io/modden/praxis-ai) on every push to main so
+# the opps digest pins track the fork. Keeping it a separate file means
+# upstream rebases never conflict with it.
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: publish-quay-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  publish-quay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      IMAGE: quay.io/modden/praxis-ai
+      # MUST match the in-cluster BC build (bc/pricetag-praxis-et):
+      # gcp-adc-filter is required for the vertex cluster's gcp_adc
+      # credential filter — prod breaks without it.
+      PRAXIS_AI_FEATURES: full,gcp-adc-filter
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to quay
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Containerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:main
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          build-args: |
+            PRAXIS_AI_FEATURES=${{ env.PRAXIS_AI_FEATURES }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Print digest (for the opps digest pin)
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:main" \
+            --format '{{json .Manifest.Digest}}'
