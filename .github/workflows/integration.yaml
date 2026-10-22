@@ -609,6 +609,132 @@ jobs:
             "$PRAXIS_TEST_OPENCODE_BIN"
 
   # ----------------------------------------------------------------------------
+  # Pinned OpenCode 2.x CLI acceptance
+  #
+  # The 2.x client is a breaking release proven beside the 1.x lane above, not
+  # instead of it. Same network-namespace isolation, same scripted backend,
+  # four lanes: plugin, provider headers, plugin absent, and guard tripped.
+  #
+  # 2.x ships as `@opencode/cli`, not `opencode-ai`. Rather than
+  # `npm install -g` — whose `opencode`/`opencode2` bins collide with a global
+  # 1.x install — this fetches the self-contained platform tarball and verifies
+  # it against the committed checksum, exactly as the GPU lane does, so both
+  # lanes stage a byte-identical client.
+  #
+  # Pins live in tests/integration/fixtures/opencode-cli-v2/pin.toml. To bump
+  # the version, update that manifest, its checksum fixture,
+  # OPENCODE_V2_PINNED_VERSION in tests/integration/tests/suite/harness.rs, and
+  # OPENCODE_V2_VERSION below together; `pin_toml_version_matches_harness_const`,
+  # `checksum_fixture_names_the_pinned_platform_tarball`, and
+  # `opencode_v2_lane_is_wired_in_ci` fail if any of them drifts.
+  # ----------------------------------------------------------------------------
+
+  opencode-v2-cpu:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      OPENCODE_V2_VERSION: "2.1.2"
+      OPENCODE_V2_PLATFORM: "linux-x64"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: opencode-v2-cpu-cargo
+
+      - name: Install pinned OpenCode 2.x CLI
+        run: |
+          set -euo pipefail
+          tarball="cli-$OPENCODE_V2_PLATFORM-$OPENCODE_V2_VERSION.tgz"
+          work="$RUNNER_TEMP/opencode-v2-$OPENCODE_V2_VERSION"
+          mkdir -p "$work"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            --output "$work/$tarball" \
+            "https://registry.npmjs.org/@opencode/cli-$OPENCODE_V2_PLATFORM/-/$tarball"
+          (
+            cd "$work"
+            sha256sum --check \
+              "$GITHUB_WORKSPACE/tests/integration/fixtures/opencode-cli-v2/$OPENCODE_V2_VERSION-$OPENCODE_V2_PLATFORM.sha256"
+          )
+          tar --extract --gzip --file "$work/$tarball" --directory "$work"
+          native="$work/package/bin/opencode"
+          if [ ! -x "$native" ]; then
+            echo "::error::expected the native OpenCode 2.x binary at $native; tarball layout changed"
+            tar tzf "$work/$tarball" | head -n 20 || true
+            exit 1
+          fi
+          # Staged beside the Rust artifacts under a distinct name, matching the
+          # GPU lane, so it never shadows a 1.x `opencode` and never executes
+          # from the Actions _temp mount inside the namespace.
+          opencode_bin="$GITHUB_WORKSPACE/target/acceptance-bin/opencode2"
+          mkdir -p "$(dirname "$opencode_bin")"
+          install -m 0755 "$native" "$opencode_bin"
+          # 2.x prints `opencode v<version>`, unlike the bare 1.x version.
+          test "$("$opencode_bin" --version)" = "opencode v${OPENCODE_V2_VERSION}"
+          echo "PRAXIS_TEST_OPENCODE_V2_BIN=$opencode_bin" >> "$GITHUB_ENV"
+
+      - name: Build test binary
+        # Compiled outside the namespace, where the network still exists.
+        run: cargo test -p praxis-tests-integration --features openai-all,store-all --test suite --no-run
+
+      - name: OpenCode 2.x acceptance (network namespace)
+        run: |
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          runner_home="$HOME"
+          runner_cargo_home="$CARGO_HOME"
+          runner_path="$PATH"
+
+          sudo unshare --net -- bash -ceu '
+            runner_uid="$1"
+            runner_gid="$2"
+            runner_home="$3"
+            runner_cargo_home="$4"
+            runner_path="$5"
+            opencode_bin="$6"
+
+            ip link set lo up
+            if ip route show default | grep -q .; then
+              echo "unexpected default route in OpenCode 2.x test namespace" >&2
+              exit 1
+            fi
+            if ip route get 1.1.1.1 >/dev/null 2>&1; then
+              echo "external route available in OpenCode 2.x test namespace" >&2
+              exit 1
+            fi
+
+            setpriv \
+              --reuid="$runner_uid" \
+              --regid="$runner_gid" \
+              --clear-groups \
+              -- env \
+                HOME="$runner_home" \
+                CARGO_HOME="$runner_cargo_home" \
+                CARGO_INCREMENTAL=0 \
+                PATH="$runner_path" \
+                PRAXIS_TEST_OPENCODE_V2_BIN="$opencode_bin" \
+                bash -ceu "
+                  cargo test --offline -p praxis-tests-integration --features openai-all,store-all --test suite \
+                    opencode_v2:: -- --nocapture
+                "
+          ' bash \
+            "$runner_uid" \
+            "$runner_gid" \
+            "$runner_home" \
+            "$runner_cargo_home" \
+            "$runner_path" \
+            "$PRAXIS_TEST_OPENCODE_V2_BIN"
+
+  # ----------------------------------------------------------------------------
   # OpenAI Python SDK vs Vertex/Gemini translation (local fake backend)
   # ----------------------------------------------------------------------------
 
