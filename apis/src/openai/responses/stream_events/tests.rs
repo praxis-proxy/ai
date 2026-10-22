@@ -1763,6 +1763,207 @@ async fn accumulation_byte_budget_fails_closed_across_chunks() {
     );
 }
 
+#[test]
+fn projected_staged_bytes_sums_only_events_held_behind_a_deferred_opening() {
+    // #1767: the pre-loop preflight sizes exactly the events a deferred shell opening
+    // would hold, so an overflow fails the chunk closed before any event renders (and
+    // commits a delivery milestone).
+    use std::collections::BTreeSet;
+
+    use super::client_tools::ClientToolDisposition;
+    use crate::openai::sse::responses::ResponsesEvent;
+
+    let shell_added = ResponsesEvent::OutputItemAdded(json!({
+        "output_index": 0,
+        "item": {"type": "function_call", "id": "fc_sh", "name": "shell", "arguments": ""}
+    }));
+    let func_added = ResponsesEvent::OutputItemAdded(json!({
+        "output_index": 1,
+        "item": {"type": "function_call", "id": "fc_l", "name": "lookup", "arguments": ""}
+    }));
+    let func_delta = ResponsesEvent::FunctionCallArgumentsDelta(json!({
+        "output_index": 1, "item_id": "fc_l", "delta": "{}"
+    }));
+    let events = vec![shell_added, func_added, func_delta];
+
+    // Shell `added` is suppressed (records the deferred opening at index 0); the two
+    // index-1 events are held behind it, so their serialized sizes are summed.
+    let deferred = vec![
+        ClientToolDisposition::Suppress,
+        ClientToolDisposition::Passthrough,
+        ClientToolDisposition::Passthrough,
+    ];
+    let expected = events[1].payload().to_string().len() + events[2].payload().to_string().len();
+    assert_eq!(
+        super::projected_staged_bytes(&BTreeSet::new(), &events, &deferred),
+        expected,
+        "preflight must size exactly the events held behind the deferred opening"
+    );
+
+    // With no opening deferred, nothing is staged and the preflight projects zero.
+    let none_deferred = vec![ClientToolDisposition::Passthrough; 3];
+    assert_eq!(
+        super::projected_staged_bytes(&BTreeSet::new(), &events, &none_deferred),
+        0,
+        "no deferred opening means no staging and no projected bytes"
+    );
+
+    // A synthesized opening carries an owned restored item far larger than its small raw
+    // `arguments.done` frame; the retained size must include that payload, not just the
+    // raw event, so the ceiling bounds the real memory a deferred opening can retain.
+    let big_item = json!({
+        "type": "shell_call", "id": "sh_big", "call_id": "x".repeat(4096),
+        "action": {"type": "exec", "command": ["pwd"]}, "status": "completed"
+    });
+    let args_done = ResponsesEvent::FunctionCallArgumentsDone(json!({
+        "output_index": 1, "item_id": "fc_big", "name": "shell", "arguments": "{}"
+    }));
+    let big_disposition = ClientToolDisposition::EmitTypedAdded { item: big_item.clone() };
+    let charged = super::staged_event_bytes(&args_done, &big_disposition);
+    assert!(
+        charged > 4096,
+        "staged size must include the owned restored item ({charged} bytes), not just the raw frame"
+    );
+
+    // Retype/custom-input dispositions carry owned name/identifier strings the raw frame
+    // does not bound (original names are hashed to shorter backend forms); each must be
+    // charged so repeated small frames cannot retain far more than the ceiling admits.
+    let small_event = ResponsesEvent::FunctionCallArgumentsDone(json!({"output_index": 1, "item_id": "fc"}));
+    let retype = ClientToolDisposition::RetypeInPlace {
+        item_type: "function_call",
+        name: "n".repeat(2048),
+        namespace: Some("s".repeat(1024)),
+    };
+    assert!(
+        super::staged_event_bytes(&small_event, &retype) > 3072,
+        "RetypeInPlace must charge its owned name and namespace strings"
+    );
+    let retype_args = ClientToolDisposition::RetypeArgumentsName { name: "n".repeat(2048) };
+    assert!(
+        super::staged_event_bytes(&small_event, &retype_args) > 2048,
+        "RetypeArgumentsName must charge its owned name string"
+    );
+    let custom_input = ClientToolDisposition::EmitCustomInput {
+        key: "k".repeat(512),
+        item_id: "i".repeat(512),
+        output_index: 1,
+        input: "p".repeat(1024),
+    };
+    assert!(
+        super::staged_event_bytes(&small_event, &custom_input) > 2048,
+        "EmitCustomInput must charge its owned key, item_id, and input strings"
+    );
+}
+
+#[tokio::test]
+async fn staged_byte_budget_fails_closed_without_committing_delivery() {
+    // #1767: events held behind a deferred shell opening are retained, and
+    // `output_text` deltas are not accumulation-charged, so only the staging budget
+    // bounds them. An overflow must reject the chunk (emit nothing), poison the stream,
+    // and stay poisoned — never leaving a delivery milestone for undelivered bytes. The
+    // pre-render preflight guarantees the rejection happens before any event renders.
+    let filter = make_filter_from("max_accumulated_bytes: 2048");
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+    let mut responses = ResponsesState::from_request_body(json!({
+        "model": "test-model", "input": "hi", "stream": true
+    }));
+    responses.client_tool_lowering.insert(
+        "shell".to_owned(),
+        LoweredClientTool {
+            original_name: "shell".to_owned(),
+            namespace: None,
+            restore: ClientToolRestore::Shell,
+        },
+    );
+    ctx.extensions.insert(responses);
+    filter.arm(&mut ctx);
+
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({"response": {"id": "resp_staged", "status": "in_progress", "output": []}, "sequence_number": 0}),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+
+    // The shell opening at index 0 is deferred (suppressed → pending opening).
+    let mut shell_added = Some(make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "id": "fc_sh", "call_id": "call_sh", "name": "shell", "arguments": ""}
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut shell_added, false).unwrap();
+
+    // A later message opens and is held behind the deferred shell (staged, not rejected).
+    let mut msg_added = Some(make_sse_chunk(
+        "response.output_item.added",
+        &json!({"output_index": 1, "item": {"type": "message", "id": "msg_1", "role": "assistant", "content": []}}),
+    ));
+    filter.on_response_body(&mut ctx, &mut msg_added, false).unwrap();
+    assert_eq!(
+        ctx.get_metadata("responses.stream_parse_error"),
+        None,
+        "a staged (held) event must not poison the stream"
+    );
+
+    // The emission sequence before the overflow chunk; rendering any event advances it.
+    let seq_before = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("responses state")
+        .logical_stream_sequence;
+
+    // Co-batch a renderable snapshot event (which, if rendered, would advance the
+    // sequence counter and flush any pending local-tool milestones) *ahead of* a large
+    // text delta that overflows the staging budget, in ONE chunk. The pre-render
+    // preflight must reject the whole chunk before the snapshot renders, so a rejected
+    // chunk commits no delivery milestone — the sequence counter stays put.
+    let mut combined = Vec::new();
+    combined.extend_from_slice(&make_sse_chunk(
+        "response.in_progress",
+        &json!({"response": {"id": "resp_staged", "status": "in_progress", "output": []}, "sequence_number": 9}),
+    ));
+    combined.extend_from_slice(&make_sse_chunk(
+        "response.output_text.delta",
+        &json!({"output_index": 1, "item_id": "msg_1", "content_index": 0, "delta": "x".repeat(4096)}),
+    ));
+    let mut overflow = Some(Bytes::from(combined));
+    filter.on_response_body(&mut ctx, &mut overflow, false).unwrap();
+    assert!(overflow.is_none(), "the staged-overflow chunk must emit nothing");
+    assert_eq!(
+        ctx.get_metadata("responses.stream_parse_error"),
+        Some("true"),
+        "staged-byte overflow must poison the stream"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "overflowed streams must not be persisted"
+    );
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .expect("responses state")
+            .logical_stream_sequence,
+        seq_before,
+        "a rejected chunk must render nothing (and commit no milestone) before the overflow is detected"
+    );
+
+    // The poison is sticky: a later chunk is dropped too.
+    let mut later = Some(make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "output_index": 1,
+            "item": {"type": "message", "id": "msg_1", "role": "assistant", "status": "completed", "content": []}
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut later, false).unwrap();
+    assert!(later.is_none(), "a poisoned stream must drop subsequent chunks");
+}
+
 #[tokio::test]
 async fn accumulation_item_count_budget_fails_closed() {
     // The item-count dimension trips independently of the byte ceiling: with a
@@ -4738,6 +4939,9 @@ fn parse_error_sets_metadata() {
         local_synthesis_reserved: false,
         local_tool_items: std::collections::HashMap::new(),
         client_tool_items: Vec::new(),
+        client_tool_pending_opens: std::collections::BTreeSet::new(),
+        client_tool_staged: Vec::new(),
+        client_tool_staged_bytes: 0,
         stream_failed: false,
         retained_budget_failed: false,
     });
@@ -4793,6 +4997,9 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
             output_index: 0,
             item_id: Some("call_1".to_owned()),
         }],
+        client_tool_pending_opens: std::collections::BTreeSet::new(),
+        client_tool_staged: Vec::new(),
+        client_tool_staged_bytes: 0,
         stream_failed: false,
         retained_budget_failed: false,
     });

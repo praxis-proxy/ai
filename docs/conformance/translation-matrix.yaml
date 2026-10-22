@@ -42,7 +42,7 @@ preconditions:
       Praxis emits a provider-shaped error only when one of three filters ran
       and matched. With none installed the proxy emits RFC 9457
       application/problem+json, not the client's dialect.
-    evidence: praxis-proxy-protocol-0.7.4/src/http/pingora/handler/fail_to_proxy.rs:267-283
+    evidence: praxis-proxy-protocol-0.7.5/src/http/pingora/handler/fail_to_proxy.rs:267-283
     detail:
       - "Installers: ai_operation (apis/src/operation_classifier/mod.rs:280-293, picks the
          OpenAI or Anthropic formatter from the matched protocol),
@@ -362,7 +362,7 @@ surfaces:
         status: dropped
         note: See the shared oversized-body gap below.
         blocker: TODO-ISSUE format the 413 produced by the body-limit filter
-        evidence: praxis-proxy-protocol-0.7.4/src/http/pingora/handler/request_body_filter.rs:99-127
+        evidence: praxis-proxy-protocol-0.7.5/src/http/pingora/handler/request_body_filter.rs:99-127
 
   # -------------------------------------------------------------------------
   - id: responses-to-chat-completions
@@ -514,7 +514,7 @@ surfaces:
         status: dropped
         note: See the shared oversized-body gap below.
         blocker: TODO-ISSUE format the 413 produced by the body-limit filter
-        evidence: praxis-proxy-protocol-0.7.4/src/http/pingora/handler/request_body_filter.rs:99-127
+        evidence: praxis-proxy-protocol-0.7.5/src/http/pingora/handler/request_body_filter.rs:99-127
 
   # -------------------------------------------------------------------------
   - id: chat-completions-to-vertexai-gemini
@@ -660,7 +660,7 @@ surfaces:
         status: dropped
         note: See the shared oversized-body gap below.
         blocker: TODO-ISSUE format the 413 produced by the body-limit filter
-        evidence: praxis-proxy-protocol-0.7.4/src/http/pingora/handler/request_body_filter.rs:99-127
+        evidence: praxis-proxy-protocol-0.7.5/src/http/pingora/handler/request_body_filter.rs:99-127
 
   # -------------------------------------------------------------------------
   - id: chat-completions-to-azureai
@@ -726,7 +726,7 @@ surfaces:
         status: dropped
         note: See the shared oversized-body gap below.
         blocker: TODO-ISSUE format the 413 produced by the body-limit filter
-        evidence: praxis-proxy-protocol-0.7.4/src/http/pingora/handler/request_body_filter.rs:99-127
+        evidence: praxis-proxy-protocol-0.7.5/src/http/pingora/handler/request_body_filter.rs:99-127
 
   # -------------------------------------------------------------------------
   - id: chat-completions-to-bedrock-converse
@@ -871,7 +871,7 @@ surfaces:
         status: dropped
         note: See the shared oversized-body gap below.
         blocker: TODO-ISSUE format the 413 produced by the body-limit filter
-        evidence: praxis-proxy-protocol-0.7.4/src/http/pingora/handler/request_body_filter.rs:99-127
+        evidence: praxis-proxy-protocol-0.7.5/src/http/pingora/handler/request_body_filter.rs:99-127
 
 # ---------------------------------------------------------------------------
 # Defects that span surfaces. Rendered once, above the per-surface tables, so

@@ -161,6 +161,7 @@ impl HttpFilter for ChatCompletionsToAzureaiChatCompletionsFilter {
                 .as_ref()
                 .map_or(500, |response| response.status.as_u16());
             ctx.set_metadata(RESPONSE_STATUS_KEY, status.to_string());
+            normalize_event_stream_error_content_type(ctx);
         }
 
         if transform == RESPONSE_TRANSFORM_SSE {
@@ -183,9 +184,7 @@ impl HttpFilter for ChatCompletionsToAzureaiChatCompletionsFilter {
     ) -> Result<FilterAction, FilterError> {
         match ctx.get_metadata(RESPONSE_TRANSFORM_KEY) {
             Some(RESPONSE_TRANSFORM_SSE) => strip_sse_chunk(ctx, body, end_of_stream)?,
-            Some(RESPONSE_TRANSFORM_ERROR) if end_of_stream => {
-                transform_error_body(ctx, body);
-            },
+            Some(RESPONSE_TRANSFORM_ERROR) if end_of_stream => transform_error_body(ctx, body),
             Some(RESPONSE_TRANSFORM_SUCCESS) if end_of_stream => {
                 transform_success_body(body);
             },
@@ -248,6 +247,24 @@ fn remove_stale_content_length(ctx: &mut HttpFilterContext<'_>) {
     }
 }
 
+/// Correct an erroneous event-stream content type before error body normalization.
+fn normalize_event_stream_error_content_type(ctx: &mut HttpFilterContext<'_>) {
+    if let Some(response) = &mut ctx.response_header {
+        let is_event_stream = response
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(crate::is_event_stream_content_type);
+        if is_event_stream {
+            response.headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/json"),
+            );
+            ctx.response_headers_modified = true;
+        }
+    }
+}
+
 /// Select the response transformation mode while headers are available.
 fn response_transform(ctx: &HttpFilterContext<'_>) -> &'static str {
     let status = ctx.response_header.as_ref().map(|r| r.status);
@@ -259,10 +276,10 @@ fn response_transform(ctx: &HttpFilterContext<'_>) -> &'static str {
         .and_then(|v| v.to_str().ok())
         .is_some_and(crate::is_event_stream_content_type);
 
-    if is_sse {
-        RESPONSE_TRANSFORM_SSE
-    } else if is_error {
+    if is_error {
         RESPONSE_TRANSFORM_ERROR
+    } else if is_sse {
+        RESPONSE_TRANSFORM_SSE
     } else {
         RESPONSE_TRANSFORM_SUCCESS
     }
@@ -621,6 +638,21 @@ mod tests {
         ctx.response_header = Some(&mut response);
 
         assert_eq!(response_transform(&ctx), RESPONSE_TRANSFORM_SSE);
+    }
+
+    #[test]
+    fn response_transform_error_for_4xx_event_stream() {
+        let request = make_request(Method::POST, "/chat/completions");
+        let mut ctx = make_filter_context(&request);
+        let mut response = make_response();
+        response.status = StatusCode::BAD_REQUEST;
+        response.headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        ctx.response_header = Some(&mut response);
+
+        assert_eq!(response_transform(&ctx), RESPONSE_TRANSFORM_ERROR);
     }
 
     #[tokio::test]

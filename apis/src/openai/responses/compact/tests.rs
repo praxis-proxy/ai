@@ -894,6 +894,7 @@ fn non_2xx_response_open_mode_skips_compaction() {
     let filter = make_filter("open");
     let resp = subrequest::SubResponse {
         status: 503,
+        version: http::Version::HTTP_11,
         headers: http::HeaderMap::new(),
         body: Bytes::from_static(b"service unavailable"),
     };
@@ -907,6 +908,7 @@ fn non_2xx_response_closed_mode_rejects_request() {
     let filter = make_filter("closed");
     let resp = subrequest::SubResponse {
         status: 429,
+        version: http::Version::HTTP_11,
         headers: http::HeaderMap::new(),
         body: Bytes::from_static(b"rate limited"),
     };

@@ -38,20 +38,20 @@ fn create_request() -> Request {
 ///
 /// The consumer consumes operation identity from the typed match the classifier
 /// publishes, so every test must stage that match first. Running the real
-/// classifier — through the same body hook core drives in a `StreamBuffer`
-/// pre-read — exercises the production two-filter handoff rather than a
-/// hand-built extension.
+/// classifier — through the same request-head phase core drives before any
+/// `StreamBuffer` pre-read — exercises the production two-filter handoff rather
+/// than a hand-built extension.
 async fn classify_head(ctx: &mut HttpFilterContext<'_>) {
     let classifier =
         crate::operation_classifier::AiOperationFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
-    drop(classifier.on_request_body(ctx, &mut None, true).await.unwrap());
+    drop(classifier.on_request_head(ctx).await.unwrap());
 }
 
 /// Build a filter context with the operation match already published.
 ///
-/// Mirrors the chain order the workaround requires: `ai_operation` ahead of
-/// `openai_responses_request`, so the match is in extensions before the consumer
-/// reads it.
+/// Mirrors the production order: `ai_operation` classifies in the request-head
+/// phase ahead of `openai_responses_request`, so the match is in extensions
+/// before the consumer reads it.
 async fn classified_context(request: &Request) -> HttpFilterContext<'_> {
     let mut ctx = make_filter_context(request);
     classify_head(&mut ctx).await;
@@ -272,6 +272,54 @@ async fn run_streaming_create<'a>(filter: &dyn HttpFilter, request: &'a Request)
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Release));
     ctx
+}
+
+/// The request-head phase publishes the match before this consumer's pre-read.
+///
+/// This is the invariant the migration off the body-phase workaround relies on:
+/// `ai_operation` classifies in core's request-head phase, which runs before any
+/// filter's buffered body pre-read, so a `BodyMode::StreamBuffer` consumer finds
+/// the typed match already in `ctx.extensions` when its pre-read begins — no
+/// chain ordering and no body-phase re-classification required. Drive the real
+/// classifier head hook with no body buffered, confirm the match is published,
+/// then run the consumer's pre-read and confirm it consumed that identity.
+#[tokio::test]
+async fn the_request_head_phase_publishes_the_match_before_the_pre_read() {
+    let classifier =
+        crate::operation_classifier::AiOperationFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+
+    // The head hook runs with nothing buffered — exactly core's ordering.
+    assert!(
+        ctx.buffered_request_body.is_none(),
+        "no body is read before the head phase"
+    );
+    drop(classifier.on_request_head(&mut ctx).await.unwrap());
+
+    let matched = ctx
+        .extensions
+        .get::<AiOperationMatch>()
+        .expect("the head phase publishes the match before any body is read");
+    assert_eq!(matched.application_protocol.as_str(), "openai_responses");
+
+    // The StreamBuffer consumer's pre-read now observes that head-published match.
+    let consumer = default_filter();
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
+    ));
+    let action = consumer.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "the consumer processes the matched Responses body"
+    );
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_request.format")
+            .map(String::as_str),
+        Some("openai_responses"),
+        "the pre-read consumed the head-published operation identity"
+    );
 }
 
 #[tokio::test]

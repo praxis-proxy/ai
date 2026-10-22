@@ -32,6 +32,23 @@
 # admissions racing on one key may briefly overshoot the budget by
 # their estimates.
 #
+# Sentinel is an alternative to `url` and remains behind this backend
+# connection layer. Redis and Valkey use the same native Sentinel path:
+#
+#   backend:
+#     kind: valkey                 # or redis
+#     sentinel:
+#       endpoints: ["redis://sentinel-0:26379", "redis://sentinel-1:26379"]
+#       service_name: mymaster
+#       redis_password: "${REDIS_PASSWORD}"
+#       sentinel_password: "${SENTINEL_PASSWORD}"
+#       discovery_timeout: 3s
+#       # Use rediss:// or valkeys:// endpoints when Sentinel TLS is required.
+#
+# Healthy requests reuse the cached writable-primary connection. Discovery is
+# bounded during replacement; ambiguous mutations are never replayed. Async
+# replication remains in effect: this does not provide WAIT/WAITAOF or RPO=0.
+#
 # Set `key:` to partition each matching rule's budget. Scalars
 # (`global`, `authenticated_subject`, `ip`, `model`), a header mapping
 # (`header: x-tenant-id`), or a list of those (composite, e.g. subject

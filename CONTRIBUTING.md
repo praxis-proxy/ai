@@ -17,6 +17,12 @@ Requirements are listed in the [development setup guide].
 
 [development setup guide]: docs/developing/getting-started.md#requirements
 
+`make lint-clippy` and `make fmt` refresh the lint toolchains before running,
+matching CI: stable comes from `rust-toolchain.toml`, and rustfmt uses the
+current nightly. Clippy runs through `rustup` so another `cargo` on `PATH`
+cannot select a different compiler. Refresh requires network access; a failed
+refresh stops the target rather than accepting results from an old nightly.
+
 ## Picking Up an Issue
 
 Only issues a maintainer has triaged (given a milestone

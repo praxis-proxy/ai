@@ -13,7 +13,7 @@ Reads `intelligent_route.credential.*` filter metadata written by the preceding 
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `credentials` | CredentialEntryConfig[] | no | Credential entries, keyed by secretRef (name/namespace/key). May be empty only when `projected_credential_mount_base` is configured. |
+| `credentials` | object[] | no | Credential entries, keyed by secretRef (name/namespace/key). May be empty only when `projected_credential_mount_base` is configured. |
 | `credentials[].name` | string | yes | Kubernetes Secret name — must match `intelligent_route.credential.name`. |
 | `credentials[].namespace` | string | yes | Kubernetes Secret namespace — must match `intelligent_route.credential.namespace`. |
 | `credentials[].key` | string | yes | Key within `Secret.data` — must match `intelligent_route.credential.key`. |

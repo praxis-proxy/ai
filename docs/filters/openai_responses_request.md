@@ -22,7 +22,7 @@ Extends the shared classification settings with the one option that gates the ma
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `on_invalid` | `continue` \| `reject` \| `error` | no | Behavior when the body cannot be classified. |
-| `headers` | ResponsesClassificationHeaders | no | Header names for promoted classification facts. Must not be hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` names. Dedicated defaults remain allowed. |
+| `headers` | object | no | Header names for promoted classification facts. Must not be hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` names. Dedicated defaults remain allowed. |
 | `headers.format` | string | no | Header name for the detected format (e.g. `openai_responses`, `openai_chat_completions`). Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-format` remains allowed. |
 | `headers.model` | string | no | Header name for the extracted model value. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-model` remains allowed. Must not overwrite other classification facts such as `x-praxis-ai-format`. |
 | `headers.stream` | string | no | Header name for the extracted stream flag. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-stream` remains allowed. |

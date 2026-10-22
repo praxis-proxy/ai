@@ -25,10 +25,10 @@ Supports two protocol profiles: `current` (session-based, default) and `stateles
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `header_validation` | HeaderValidation | no | Header validation settings. |
+| `header_validation` | object | no | Header validation settings. |
 | `header_validation.mismatch` | `reject` \| `ignore` | no | Behavior when header value conflicts with body-derived value. |
 | `header_validation.missing` | `ignore` \| `synthesize` \| `reject` | no | Behavior when expected MCP headers are absent. |
-| `headers` | McpHeaders | no | Header names for MCP metadata promotion. Must not be hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` names. Dedicated `x-praxis-mcp-*` defaults remain allowed. |
+| `headers` | object | no | Header names for MCP metadata promotion. Must not be hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` names. Dedicated `x-praxis-mcp-*` defaults remain allowed. |
 | `headers.kind` | string | no | Header name for the JSON-RPC kind (e.g. `x-praxis-mcp-kind`). |
 | `headers.method` | string | no | Header name for the MCP method (e.g. `x-praxis-mcp-method`). |
 | `headers.name` | string | no | Header name for the tool/resource/prompt name (e.g. `x-praxis-mcp-name`). |
@@ -42,12 +42,12 @@ Supports two protocol profiles: `current` (session-based, default) and `stateles
 | `invalid_tool_policy` | `reject_server` \| `filter_out` | no | Behavior when a tool has an invalid schema. |
 | `path` | string | no | Public MCP path handled by Praxis. |
 | `protocol_profile` | `current` \| `stateless` | no | Protocol profile governing session semantics and header requirements for this broker instance. |
-| `servers` | McpServerConfig[] | no | Backend server definitions. |
+| `servers` | object[] | no | Backend server definitions. |
 | `servers[].name` | string | yes | Unique server name. |
 | `servers[].cluster` | string | yes | Backend cluster name. |
 | `servers[].path` | string | no | Backend MCP path. |
 | `servers[].tool_prefix` | string | no | Tool prefix for this server. |
-| `servers[].tools` | ToolConfig[] | no | Statically defined tools. |
+| `servers[].tools` | object[] | no | Statically defined tools. |
 | `servers[].tools[].name` | string | yes | Tool name on the backend. |
 | `servers[].tools[].description` | string | no | Optional description. |
 | `servers[].tools[].inputSchema` | any | no | Optional input schema. `schema` is accepted as a local shorthand. |

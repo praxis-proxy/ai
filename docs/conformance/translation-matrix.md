@@ -35,7 +35,7 @@ surface section. These facts change what a cell means in a given deployment.
 - **clean-rejection-is-opt-in** — Praxis emits a provider-shaped error only when one of three filters ran and matched. With none installed the proxy emits RFC 9457 application/problem+json, not the client's dialect.
   - Installers: ai_operation (apis/src/operation_classifier/mod.rs:280-293, picks the OpenAI or Anthropic formatter from the matched protocol), openai_responses_request (apis/src/openai/responses/request/mod.rs:523 via apis/src/openai/responses/mod.rs:368-376), anthropic_messages_request (apis/src/anthropic/messages_request/mod.rs:273-277).
   - 53 of 105 configs under examples/configs install none of the three.
-  - Evidence: `praxis-proxy-protocol-0.7.4/src/http/pingora/handler/fail_to_proxy.rs:267-283`
+  - Evidence: `praxis-proxy-protocol-0.7.5/src/http/pingora/handler/fail_to_proxy.rs:267-283`
 - **on-invalid-defaults-to-continue** — Malformed or unrecognized bodies are forwarded to the backend and lose the error formatter. 21 of the 51 examples that set on_invalid choose continue.
   - Evidence: `apis/src/openai/responses/config.rs:119-120`
 - **no-deny-unknown-fields-on-the-wire** — No request body is deserialized into a typed struct on any surface. Unknown fields are governed only by hand-written allowlists, where those exist. Absence of an allowlist means silent acceptance.
@@ -151,7 +151,7 @@ defects, not support levels.
 | Server-side state continuation | `n/a` |  |  |
 | Unsupported operations on a supported path | `n/a` |  |  |
 | Error envelope matches the client dialect | `lossy` | Upstream errors carrying Anthropic vocabulary are preserved; a foreign error.type is replaced by the HTTP-status mapping and only `message` survives. OpenAI error.code and error.param are not read. | `apis/src/anthropic/messages_to_chat_completions/response.rs:22-31; apis/src/anthropic/messages_to_chat_completions/response.rs:131-154; apis/src/anthropic/wire.rs:58-86` |
-| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.4/src/http/pingora/handler/request_body_filter.rs:99-127` |
+| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.5/src/http/pingora/handler/request_body_filter.rs:99-127` |
 
 ### OpenAI Responses to OpenAI Chat Completions
 
@@ -186,7 +186,7 @@ defects, not support levels.
 | Server-side state continuation | `gap` | previous_response_id and conversation rehydrate correctly, but on continuation any stored output item that is not message, function_call, function_call_output, reasoning, compaction or item_reference is skipped with no error — the model silently loses hosted-tool history. Separately, an unknown previous_response_id returns 400 where OpenAI returns 404. | `apis/src/openai/responses/rehydrate/mod.rs:1252-1277; apis/src/openai/responses/rehydrate/mod.rs:1324-1327` |
 | Unsupported operations on a supported path | `gap` | The GET /v1/responses WebSocket upgrade is positively classified as Responses traffic, and POST /v1/responses/compact is too unless openai_responses_compact is in the chain to answer it locally. The translator passes anything that is not POST /v1/responses through untouched, so both reach a Chat-Completions-only backend verbatim. No guard says "this Responses operation has no Chat Completions translation". Accounts for 9 of the 10 templates the OpenResponses manifest marks inapplicable. | `apis/src/classifier/mod.rs:116-118; apis/src/openai/responses/responses_to_chat_completions/mod.rs:530-533; apis/src/openai/responses/routes/mod.rs:200-208; apis/src/openai/responses/routes/mod.rs:256-264; apis/src/openai/responses/compact/mod.rs:331-376` |
 | Error envelope matches the client dialect | `lossy` | `type` and `code` are always set to the same string, where OpenAI usually leaves code null or distinct. Provider param, type and extra fields are discarded on upstream errors. | `apis/src/openai/responses/error.rs:20-37; apis/src/openai/responses/responses_to_chat_completions/error.rs:42-79` |
-| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.4/src/http/pingora/handler/request_body_filter.rs:99-127` |
+| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.5/src/http/pingora/handler/request_body_filter.rs:99-127` |
 
 ### OpenAI Chat Completions to Vertex AI Gemini
 
@@ -221,7 +221,7 @@ defects, not support levels.
 | Server-side state continuation | `n/a` |  |  |
 | Unsupported operations on a supported path | `n/a` |  |  |
 | Error envelope matches the client dialect | `lossy` | OpenAI-shaped with param:null. Differs from the Bedrock filter's envelope — see the cross-surface gap below. | `apis/src/vertex/wire.rs:151-164` |
-| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.4/src/http/pingora/handler/request_body_filter.rs:99-127` |
+| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.5/src/http/pingora/handler/request_body_filter.rs:99-127` |
 
 ### OpenAI Chat Completions to Azure AI Chat Completions
 
@@ -256,7 +256,7 @@ defects, not support levels.
 | Server-side state continuation | `n/a` |  |  |
 | Unsupported operations on a supported path | `n/a` |  |  |
 | Error envelope matches the client dialect | `lossy` | error.type is filled from the HTTP status; Azure's innererror is stripped. | `apis/src/azure/wire.rs:20-58` |
-| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.4/src/http/pingora/handler/request_body_filter.rs:99-127` |
+| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.5/src/http/pingora/handler/request_body_filter.rs:99-127` |
 
 ### OpenAI Chat Completions to AWS Bedrock Converse
 
@@ -292,7 +292,7 @@ defects, not support levels.
 | Server-side state continuation | `n/a` |  |  |
 | Unsupported operations on a supported path | `n/a` |  |  |
 | Error envelope matches the client dialect | `lossy` | OpenAI-shaped but omits `param` and uses code "invalid_request". Differs from the Vertex filter's envelope — see the cross-surface gap below. | `apis/src/bedrock/wire.rs:61-72; apis/src/bedrock/wire.rs:113-126` |
-| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.4/src/http/pingora/handler/request_body_filter.rs:99-127` |
+| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.7.5/src/http/pingora/handler/request_body_filter.rs:99-127` |
 
 ## Native surfaces
 

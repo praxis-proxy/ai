@@ -51,11 +51,11 @@ Supports two modes:
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `candidates` | CandidateConfig[] | no | Static list of route candidates (mutually exclusive with `overlay_file`). |
+| `candidates` | object[] | no | Static list of route candidates (mutually exclusive with `overlay_file`). |
 | `candidates[].cluster` | string | yes | Cluster name to select when this candidate is chosen. |
-| `candidates[].credential` | CandidateCredential | no | Optional final-hop credential reference. |
+| `candidates[].credential` | object | no | Optional final-hop credential reference. |
 | `candidates[].credential.strategy` | string | yes | Injection strategy. |
-| `candidates[].credential.secretRef` | CredentialRef | yes | Secret locator, never secret bytes. |
+| `candidates[].credential.secretRef` | object | yes | Secret locator, never secret bytes. |
 | `candidates[].credential.secretRef.key` | string | yes | Secret data key. |
 | `candidates[].credential.secretRef.name` | string | yes | Secret name. |
 | `candidates[].credential.secretRef.namespace` | string | yes | Secret namespace. |
@@ -70,16 +70,16 @@ Supports two modes:
 | `skip_paths` | string[] | no | Request-path prefixes that bypass model resolution entirely. Management and discovery endpoints (model listing, subscriptions, API-key management, health) carry no routable model; a matching request returns `Continue` before any model lookup. Defaults to the well-known OpenAI-style management paths; set an explicit list to override, or `[]` to disable path skipping. See `path_is_management` for the match rule. |
 | `management_cluster` | string | no | Cluster that serves skipped management/discovery paths. When set, a request whose path matches `skip_paths` has `ctx.cluster` set to this cluster and continues straight to `load_balancer`. When unset, skipped paths continue with the cluster untouched. Requires a non-empty `skip_paths`. |
 | `provider_hop_clusters` | string[] | no | Clusters that terminate the authenticated provider-hop protocol. A selected candidate emits the fixed routing context only when its cluster is present in this allowlist. Each named cluster must use an mTLS-authenticated Praxis provider gateway. Direct API/backend clusters remain absent. |
-| `expected_overlay_scope` | ExpectedOverlayScope | no | Expected scope of the overlay envelope. When set, each specified field is validated against the envelope scope on load and every reload. Rejected on mismatch. Only relevant in overlay mode with envelope-format files. |
+| `expected_overlay_scope` | object | no | Expected scope of the overlay envelope. When set, each specified field is validated against the envelope scope on load and every reload. Rejected on mismatch. Only relevant in overlay mode with envelope-format files. |
 | `expected_overlay_scope.network` | string | no | Expected network name. |
 | `expected_overlay_scope.gateway` | string | no | Expected gateway name. |
 | `expected_overlay_scope.namespace` | string | no | Expected namespace. |
 | `expected_overlay_scope.local_site` | string | no | Expected local site. |
 | `overlay_file` | PathBuf | no | Path to a routing overlay JSON file (`routing-overlay.json` envelope or legacy `routing-config.json`). When set, candidates and `local_site` are read from the overlay instead of the YAML config. |
-| `reload` | ReloadConfig | no | Hot reload configuration for overlay mode. Only valid when `overlay_file` is set.  Providing a `reload:` block with static `candidates` is rejected — static candidates are immutable for the lifetime of the filter. |
+| `reload` | object | no | Hot reload configuration for overlay mode. Only valid when `overlay_file` is set.  Providing a `reload:` block with static `candidates` is rejected — static candidates are immutable for the lifetime of the filter. |
 | `reload.enabled` | bool | no | Whether file watching is enabled (default: `true`). |
 | `reload.debounce_ms` | integer | no | Debounce window in milliseconds (default: 500). |
-| `session_affinity` | SessionAffinityConfig | no | Session affinity configuration (disabled by default). |
+| `session_affinity` | object | no | Session affinity configuration (disabled by default). |
 | `session_affinity.cookie` | string | no | Name of a cookie to extract the session key from. |
 | `session_affinity.enabled` | bool | no | Whether session affinity is enabled (default: `false`). |
 | `session_affinity.header` | string | no | Header name to extract the session key from. |

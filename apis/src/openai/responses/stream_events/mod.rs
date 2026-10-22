@@ -63,6 +63,22 @@ struct DeferredTerminalEvent {
     payload: Value,
 }
 
+/// An output-item SSE event held behind an earlier still-deferred opening (#1767).
+///
+/// Held as a parsed event plus its planned disposition so it is rendered — and
+/// `sequence_number`-stamped — in emission order once the earlier opening is announced,
+/// never in the (different) order it arrived relative to the deferred opening.
+struct StagedEvent {
+    /// Raw output index the held event carries, used to order releases.
+    output_index: u64,
+    /// Serialized byte size, charged against and refunded from the retained-byte total.
+    byte_len: usize,
+    /// The deferred event.
+    event: ResponsesEvent,
+    /// Its planned client-tool disposition.
+    disposition: client_tools::ClientToolDisposition,
+}
+
 /// Completion state observed while parsing a Responses SSE stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CompletionState {
@@ -135,6 +151,23 @@ pub(super) struct StreamEventsState {
     /// so the plan pass can enforce lifecycle order and (Tasks 5-7) synthesize the
     /// typed restoration. Empty for native (non-lowered) traffic.
     client_tool_items: Vec<client_tools::ClientToolStreamItem>,
+    /// #1767: output indices of deferred `Shell`/`ToolSearch` openings whose typed
+    /// `output_item.added` has not yet been synthesized. A suppressed raw `added`
+    /// records its index here; the synthesized typed `added` at `arguments.done`
+    /// clears it. While any is pending, later output-item events are staged so the
+    /// deferred opening is still announced before them (the OpenAI SDK's streaming
+    /// accumulator requires contiguous, ascending opening order).
+    client_tool_pending_opens: BTreeSet<u64>,
+    /// #1767: output-item events held behind an earlier pending deferred opening.
+    /// Held as parsed events (not serialized bytes) so they are rendered — and
+    /// `sequence_number`-stamped — in emission order once the earlier opening is
+    /// announced. Empty unless a deferred opening is overtaken by a later item, so
+    /// native and in-order lowered traffic pay nothing.
+    client_tool_staged: Vec<StagedEvent>,
+    /// #1767: running serialized byte size of `client_tool_staged`, charged against
+    /// `max_accumulated_bytes` so a deferred opening cannot retain an unbounded
+    /// volume of later events (text/reasoning deltas are otherwise un-accumulated).
+    client_tool_staged_bytes: usize,
     /// #1159 C1: once any chunk fails, the whole logical stream is poisoned; every
     /// later chunk is dropped closed so a post-failure event (e.g. a co-batched
     /// lowered `output_item.done` whose `.added` was rolled back) cannot emit.
@@ -233,6 +266,9 @@ impl StreamEventsFilter {
             local_synthesis_reserved: false,
             local_tool_items: HashMap::new(),
             client_tool_items: Vec::new(),
+            client_tool_pending_opens: BTreeSet::new(),
+            client_tool_staged: Vec::new(),
+            client_tool_staged_bytes: 0,
             stream_failed: false,
             retained_budget_failed: false,
         }
@@ -1152,18 +1188,260 @@ fn restore_and_append_chunk(
     };
 
     let mut logical_output = Vec::new();
-    for (index, event) in events.into_iter().enumerate() {
-        match dispositions.as_ref().and_then(|dispositions| dispositions.get(index)) {
-            None | Some(client_tools::ClientToolDisposition::Passthrough) => {
+    match dispositions {
+        // Native / no lowering armed: no client-tool opening is ever deferred, so no
+        // staging can occur. Encode each event directly into the chunk output — no
+        // per-event scratch buffer or copy (#1767 keeps this path zero-overhead).
+        None => {
+            for event in events {
                 append_logical_event(state, ctx, event, &mut logical_output);
-            },
-            Some(client_tools::ClientToolDisposition::Suppress) => {},
-            Some(disposition) => {
-                apply_client_tool_disposition(state, ctx, disposition, event, &mut logical_output);
-            },
-        }
+            }
+        },
+        Some(dispositions) => {
+            append_lowered_chunk(state, ctx, events, dispositions, &mut logical_output)?;
+        },
     }
     Ok(logical_output)
+}
+
+/// Append a lowered-traffic chunk, honoring #1767 output-item staging.
+///
+/// Fails the chunk closed BEFORE rendering any event — and therefore before any event
+/// commits a delivery milestone — if the events it would hold behind a deferred opening
+/// push the retained staged volume past the ceiling. Keeping the only fallible step ahead
+/// of every append preserves the invariant that a rejected chunk leaves no milestone for
+/// bytes the client never received.
+fn append_lowered_chunk(
+    state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    events: Vec<ResponsesEvent>,
+    dispositions: Vec<client_tools::ClientToolDisposition>,
+    output: &mut Vec<u8>,
+) -> Result<(), SseParseError> {
+    let projected = state.client_tool_staged_bytes.saturating_add(projected_staged_bytes(
+        &state.client_tool_pending_opens,
+        &events,
+        &dispositions,
+    ));
+    if projected > state.max_accumulated_bytes {
+        return Err(SseParseError::AccumulationLimitExceeded {
+            dimension: "client_tool_staged_bytes",
+            value: projected,
+            limit: state.max_accumulated_bytes,
+        });
+    }
+    for (event, disposition) in events.into_iter().zip(dispositions) {
+        append_or_stage_event(state, ctx, event, disposition, output);
+    }
+    Ok(())
+}
+
+/// Sum the bytes this chunk would newly stage behind a deferred opening (#1767) —
+/// each event plus any owned restoration payload its disposition carries — replaying the
+/// opening-hole transitions over a scratch copy of the pending set without rendering.
+/// Intentionally does not model intra-chunk releases, so it is a safe upper bound on the
+/// staged volume this chunk can reach — used to admit the chunk before any event renders.
+fn projected_staged_bytes(
+    pending: &BTreeSet<u64>,
+    events: &[ResponsesEvent],
+    dispositions: &[client_tools::ClientToolDisposition],
+) -> usize {
+    let mut pending = pending.clone();
+    let mut total = 0_usize;
+    for (event, disposition) in events.iter().zip(dispositions) {
+        let event_index = event_output_index(event);
+        if matches!(disposition, client_tools::ClientToolDisposition::Suppress) {
+            if matches!(event, ResponsesEvent::OutputItemAdded(_))
+                && let Some(idx) = event_index
+            {
+                pending.insert(idx);
+            }
+            continue;
+        }
+        if matches!(disposition, client_tools::ClientToolDisposition::EmitTypedAdded { .. })
+            && let Some(idx) = event_index
+        {
+            pending.remove(&idx);
+        }
+        if let Some(min_pending) = pending.iter().next().copied()
+            && event_index.is_some_and(|idx| idx > min_pending)
+        {
+            total = total.saturating_add(staged_event_bytes(event, disposition));
+        }
+    }
+    total
+}
+
+/// Apply one committed event's client-tool disposition to the logical stream,
+/// honoring #1767 output-item staging.
+///
+/// A suppressed `output_item.added` is a deferred `Shell`/`ToolSearch` typed opening
+/// whose complete call is synthesized at `arguments.done` (#1159 Task 6): its index is
+/// recorded as a pending opening so a later item that overtakes it is staged behind it
+/// (#1767). Every other `Suppress` just drops the event. A deferred typed opening
+/// (`EmitTypedAdded`) clears its pending index before the staging gate. An event whose
+/// index is behind an still-pending earlier opening is held (as a parsed event, so it
+/// is `sequence_number`-stamped in emission order when later rendered); otherwise it is
+/// rendered now. Filling an opening then releases every staged event the fill unblocked,
+/// in ascending index order, so both opening order and per-item lifecycle order hold.
+fn append_or_stage_event(
+    state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    event: ResponsesEvent,
+    disposition: client_tools::ClientToolDisposition,
+    output: &mut Vec<u8>,
+) {
+    let event_index = event_output_index(&event);
+    if matches!(disposition, client_tools::ClientToolDisposition::Suppress) {
+        if matches!(event, ResponsesEvent::OutputItemAdded(_))
+            && let Some(idx) = event_index
+        {
+            state.client_tool_pending_opens.insert(idx);
+        }
+        return;
+    }
+    let fills_hole = matches!(disposition, client_tools::ClientToolDisposition::EmitTypedAdded { .. });
+    if fills_hole && let Some(idx) = event_index {
+        state.client_tool_pending_opens.remove(&idx);
+    }
+    // Hold events whose index is behind a still-pending earlier opening. The staged
+    // volume was already admitted by the pre-loop preflight, so holding never fails here.
+    if let Some(min_pending) = state.client_tool_pending_opens.iter().next().copied()
+        && event_index.is_some_and(|idx| idx > min_pending)
+    {
+        // `event_index` is Some by the guard above.
+        stage_event(state, event_index.unwrap_or_default(), event, disposition);
+        return;
+    }
+    render_restored_event(state, ctx, event, disposition, output);
+    if fills_hole {
+        release_unblocked_staged(state, ctx, output);
+    }
+}
+
+/// The raw (pre-offset) output index an event's payload carries, if any. Lifecycle
+/// events (`response.created`/`completed`/...) carry no `output_index` and return
+/// `None`, so they never participate in #1767 output-item staging.
+fn event_output_index(event: &ResponsesEvent) -> Option<u64> {
+    event.payload().get("output_index").and_then(Value::as_u64)
+}
+
+/// Render one committed event to the logical stream by its disposition. `Passthrough`
+/// forwards the event; every other emitting disposition is applied by
+/// [`apply_client_tool_disposition`]. `Suppress` is handled before dispatch and must
+/// never reach here.
+fn render_restored_event(
+    state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    event: ResponsesEvent,
+    disposition: client_tools::ClientToolDisposition,
+    output: &mut Vec<u8>,
+) {
+    match disposition {
+        client_tools::ClientToolDisposition::Passthrough => append_logical_event(state, ctx, event, output),
+        client_tools::ClientToolDisposition::Suppress => {
+            debug_assert!(false, "Suppress is handled before render_restored_event");
+        },
+        other => apply_client_tool_disposition(state, ctx, &other, event, output),
+    }
+}
+
+/// Hold one output-item event behind an earlier still-deferred opening (#1767),
+/// tracking its retained size in the running staged-byte total. The ceiling is
+/// enforced by the pre-loop preflight in [`restore_and_append_chunk`] before any event
+/// renders, so this records the hold without re-checking (and never fails mid-append).
+fn stage_event(
+    state: &mut StreamEventsState,
+    output_index: u64,
+    event: ResponsesEvent,
+    disposition: client_tools::ClientToolDisposition,
+) {
+    let byte_len = staged_event_bytes(&event, &disposition);
+    state.client_tool_staged_bytes = state.client_tool_staged_bytes.saturating_add(byte_len);
+    state.client_tool_staged.push(StagedEvent {
+        output_index,
+        byte_len,
+        event,
+        disposition,
+    });
+}
+
+/// Bytes a staged event retains while held: its own payload plus every owned payload its
+/// disposition carries. A synthesized `EmitTypedAdded`/`EmitCustom*`/`RestoreSnapshot`
+/// holds a full restored item, and the retype/custom-input variants hold owned
+/// identifier/name strings the raw frame does not bound (names are hashed to shorter
+/// backend forms). Charging only the raw event would let a deferred opening retain far
+/// more than the ceiling admits. Allocation-free via `bounded_json_size` (no throwaway
+/// serialized copy).
+fn staged_event_bytes(event: &ResponsesEvent, disposition: &client_tools::ClientToolDisposition) -> usize {
+    use client_tools::ClientToolDisposition as D;
+    let json_size = |value: &Value| {
+        crate::openai::responses::bounded_json_size(value, usize::MAX)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    };
+    let disposition_bytes = match disposition {
+        D::EmitCustomShell { item }
+        | D::EmitCustomItemDone { item }
+        | D::EmitTypedAdded { item }
+        | D::EmitTypedDone { item } => json_size(item),
+        D::RestoreSnapshot { response } => json_size(response),
+        D::EmitCustomInput {
+            key, item_id, input, ..
+        } => key.len().saturating_add(item_id.len()).saturating_add(input.len()),
+        D::RetypeInPlace { name, namespace, .. } => {
+            name.len().saturating_add(namespace.as_ref().map_or(0, String::len))
+        },
+        D::RetypeArgumentsName { name } => name.len(),
+        D::Passthrough | D::Suppress => 0,
+    };
+    json_size(event.payload()).saturating_add(disposition_bytes)
+}
+
+/// Render every staged event that is no longer behind a pending earlier opening.
+///
+/// Called after a deferred opening is filled: events whose index is below the new
+/// smallest pending opening (or all staged events when none remain) are released in
+/// ascending output-index order (a stable sort keeps each item's own events in arrival
+/// order), so both opening order and `sequence_number` stay monotonic. Arrival order
+/// alone is not enough: a synthesized opening is produced at its `arguments.done`, which
+/// can arrive after a later item's events, so the staged queue is not index-ordered.
+fn release_unblocked_staged(state: &mut StreamEventsState, ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) {
+    if state.client_tool_staged.is_empty() {
+        return;
+    }
+    let barrier = state.client_tool_pending_opens.iter().next().copied();
+    let mut staged = std::mem::take(&mut state.client_tool_staged);
+    staged.sort_by_key(|staged_event| staged_event.output_index);
+    let mut retained = Vec::new();
+    for staged_event in staged {
+        if barrier.is_some_and(|barrier| staged_event.output_index >= barrier) {
+            retained.push(staged_event);
+        } else {
+            state.client_tool_staged_bytes = state.client_tool_staged_bytes.saturating_sub(staged_event.byte_len);
+            render_restored_event(state, ctx, staged_event.event, staged_event.disposition, output);
+        }
+    }
+    state.client_tool_staged = retained;
+}
+
+/// Fail-safe drain of any staged events still held at stream finalization (#1767).
+///
+/// A well-formed stream fills every deferred opening before the terminal, leaving this
+/// empty; it only releases events a truncated stream left behind an opening that never
+/// arrived, in ascending index order, so their bytes reach the client rather than being
+/// dropped.
+fn drain_remaining_staged(state: &mut StreamEventsState, ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) {
+    if state.client_tool_staged.is_empty() {
+        return;
+    }
+    let mut staged = std::mem::take(&mut state.client_tool_staged);
+    staged.sort_by_key(|staged_event| staged_event.output_index);
+    state.client_tool_staged_bytes = 0;
+    for staged_event in staged {
+        render_restored_event(state, ctx, staged_event.event, staged_event.disposition, output);
+    }
 }
 
 /// Whether an event is a response lifecycle-creation event
@@ -2433,12 +2711,17 @@ fn record_retained_payload_failure(ctx: &mut HttpFilterContext<'_>) {
 fn emit_deferred_terminal(
     ctx: &mut HttpFilterContext<'_>,
     terminal: &mut DeferredTerminalEvent,
-    parser_state: &StreamEventsState,
+    parser_state: &mut StreamEventsState,
     output: &mut Vec<u8>,
 ) -> Result<(), SseParseError> {
     // #276: stream any locally generated tool items that never reached the
     // client as incremental events before the terminal snapshot.
     flush_local_output_items(ctx, output);
+    // #1767 fail-safe: a well-formed stream drains every staged output-item event
+    // when its deferred opening is synthesized, so this is normally a no-op; it only
+    // releases events a truncated stream left held behind an opening that never
+    // arrived, keeping them ahead of the terminal rather than dropping them.
+    drain_remaining_staged(parser_state, ctx, output);
     let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
     // Match the wire-rewrite decision so the persisted store source cannot disagree
     // with the streamed frame (#1150).

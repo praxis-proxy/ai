@@ -15,26 +15,26 @@ Makes an outbound HTTP request during request processing, optionally forwarding 
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `target` | TargetConfig | yes | Callout target configuration. |
+| `target` | object | yes | Callout target configuration. |
 | `target.url` | string | yes | Absolute HTTP(S) URL to call. |
 | `target.allow_private_addresses` | bool | no | Allow the target to resolve to a private, loopback, or link-local address. Defaults to `false`. Set to `true` explicitly when a trusted loopback/sidecar or private service is the intended destination. When disabled, the callout is rejected at request time if any resolved peer address is private/loopback/link-local. Cloud metadata, unspecified, and multicast addresses remain blocked when this option is enabled. |
 | `target.timeout` | Duration | no | Request timeout (e.g. `"2s"`, `"500ms"`). |
-| `target.headers` | HeaderEntry[] | no | Static headers to send with every callout. |
+| `target.headers` | object[] | no | Static headers to send with every callout. |
 | `target.headers[].name` | string | yes | Header name. |
 | `target.headers[].value` | string | yes | Header value. Supports `${VAR}` env-var expansion. |
 | `target.forward_headers` | string[] | no | Headers to copy from the downstream request. |
 | `target.body` | object<string, string> | no | Reshape the downstream request body for the callout. Each key becomes a field in the callout JSON body; each value is a `JSONPath` expression evaluated against the downstream body. When set, only the listed fields are sent — the downstream body goes to upstream untouched. When absent, the downstream body is forwarded verbatim. |
-| `request` | RequestConfig | no | Request phase and body forwarding options. |
+| `request` | object | no | Request phase and body forwarding options. |
 | `request.phase` | `request_headers` \| `request_body` | no | Phase at which the callout executes. |
 | `request.max_body_bytes` | integer | no | Maximum body bytes to buffer. Caps both the forwarded request body and the accepted callout response body. |
-| `response` | ResponseConfig | no | Response extraction and header injection. |
-| `response.extract` | ExtractionConfig[] | no | `JSONPath` extractions to write into [`FilterResultSet`]. |
+| `response` | object | no | Response extraction and header injection. |
+| `response.extract` | object[] | no | `JSONPath` extractions to write into [`FilterResultSet`]. |
 | `response.extract[].json_path` | string | yes | `JSONPath` expression to evaluate against the response body. |
 | `response.extract[].result_key` | string | yes | Key to write the result under in [`FilterResultSet`]. |
 | `response.inject_headers` | string[] | no | Callout response headers to inject into the upstream request on success. |
 | `on_failure` | `closed` \| `open` | no | Behavior when the callout itself fails (DNS, connect, timeout, I/O): `open` continues the request, `closed` rejects it. Note: this is distinct from the pipeline entry's own `failure_mode` key, which governs how the pipeline reacts when a filter returns an error. Core strips `failure_mode` as a structural key before this config is parsed, so it cannot be used as an alias here. |
 | `status_on_error` | integer | no | HTTP error status code (`400..=599`) to return when rejecting on error. |
-| `circuit_breaker` | CircuitBreakerConfig | no | Circuit breaker configuration. |
+| `circuit_breaker` | object | no | Circuit breaker configuration. |
 | `circuit_breaker.failure_threshold` | integer | yes | Consecutive failures to trip the breaker. |
 | `circuit_breaker.recovery_timeout` | Duration | yes | Recovery window (e.g. `"30s"`). |
 | `max_depth` | integer | no | Maximum callout depth for loop prevention. |

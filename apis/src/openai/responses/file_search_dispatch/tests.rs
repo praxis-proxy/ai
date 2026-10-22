@@ -1976,10 +1976,9 @@ fn closed_loopback_addr() -> String {
 async fn execute_against(client: &SubRequestClient, peer_addr: &str) -> Result<SubResponse, SubRequestError> {
     use bytes::Bytes;
     use http::HeaderMap;
-    use pingora_core::upstreams::peer::HttpPeer;
-    use praxis_core::subrequest::SubRequest;
+    use praxis_core::{egress::PeerSpec, subrequest::SubRequest};
 
-    let peer = HttpPeer::new(peer_addr.to_owned(), false, String::new());
+    let peer = PeerSpec::plain(peer_addr.parse().unwrap());
     let request = SubRequest {
         method: http::Method::GET,
         uri: "/".parse().unwrap(),

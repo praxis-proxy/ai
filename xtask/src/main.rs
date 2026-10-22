@@ -82,6 +82,11 @@ enum Command {
     #[cfg(feature = "dev")]
     CheckInference(inference_fixtures::CheckArgs),
 
+    /// Check the runtime Anthropic Messages operation registry
+    /// against the pinned Anthropic specification.
+    #[cfg(feature = "dev")]
+    CheckAnthropicMessagesRegistry,
+
     /// Check the runtime Responses operation registry against
     /// the pinned OpenAI specification.
     #[cfg(feature = "dev")]
@@ -223,6 +228,7 @@ fn main() {
 #[cfg(feature = "dev")]
 fn run_dev(command: Command) {
     match command {
+        Command::CheckAnthropicMessagesRegistry => openai_conformance::run_anthropic_messages_registry_check(),
         Command::CheckInference(args) => inference_fixtures::run_check(&args),
         Command::CheckResponsesRegistry => openai_conformance::run_responses_registry_check(),
         Command::CheckChatCompletionsRegistry => openai_conformance::run_chat_completions_registry_check(),
@@ -236,6 +242,14 @@ fn run_dev(command: Command) {
         Command::LintSeparators(args) => lint_separators::run(args),
         Command::ImportInference(args) => inference_fixtures::run_import(args),
         Command::MakeReplayFixture(args) => make_replay_fixture::run(args),
+        command => run_dev_continued(command),
+    }
+}
+
+/// Continuation of development subcommand dispatch.
+#[cfg(feature = "dev")]
+fn run_dev_continued(command: Command) {
+    match command {
         Command::SyncExampleReadme(args) => sync_example_readme::run(&args),
         Command::GenerateFilterDocs(args) => filter_docs::generate(args),
         Command::LintFilterDocs(args) => filter_docs::lint(args),
@@ -251,6 +265,7 @@ fn run_dev(command: Command) {
         Command::VisualizeConfig(args) => visualize_config::run(&args),
         Command::SyncResponsesReadme(args) => sync_responses_readme::run(&args),
         Command::Fips(args) => fips::run(args),
+        _ => unreachable!(),
     }
 }
 

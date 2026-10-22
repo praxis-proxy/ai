@@ -106,38 +106,48 @@ covers the Anthropic SDK image/vision path against `Qwen3-VL-4B-Instruct`.
 
 ### Known model limitation: self-compaction task completion on Qwen3-8B
 
-The self-compaction tests prove two things independently of model capability,
-and these are **always hard assertions**:
+The self-compaction tests require these hard assertions:
 
 1. The pinned CLI performed its **own** self-compaction. Codex's summarization
    request is observed **traversing Praxis** on the wire. Claude Code's
    `compact_boundary {trigger: auto}` is a client-side stream-json event that is
    local to the CLI (it does not itself cross Praxis); the test observes that event
-   and separately verifies post-boundary requests continue **through Praxis**.
-2. The session **continued after the boundary** — at least one more successful
-   tool call flowed through Praxis post-compaction.
+   and separately verifies that the pre-compaction Read carrying the per-run
+   marker reached Praxis and returned successfully.
 
-What Qwen3-8B cannot do reliably is **finish the downstream chore** after it
-self-compacts. It either falls into a loop re-reading the same ballast file until
-the deadline, or drops the high-entropy marker across its own lossy summary and
-writes the wrong value. This is a model-capability limit, not a proxy or flake,
-and it was observed on **both** lanes against live Qwen3-8B.
+On the Claude Code Qwen3-8B lane, a post-compaction tool call is checked when the
+model emits one, but its absence is an expected limitation and is logged as
+`XFAIL`. That lane still proves the client self-compacted and that the marker
+Read passed through Praxis before compaction; it does not claim a post-compaction
+request traversed Praxis when none was emitted. Other Claude Code models and the
+Codex lane retain a hard post-compaction continuation requirement.
 
-Both lanes grade identically by design — **XFAIL on Qwen3-8B**:
+Qwen3-8B also cannot reliably **finish the downstream chore** after it
+self-compacts. It may stop after its summary, loop re-reading the same ballast
+file until the deadline, or drop the high-entropy marker across its lossy summary
+and write the wrong value. A deterministic scripted-provider integration test
+covers compaction-history rehydration and forwarding separately from this
+model-driven acceptance lane.
 
-- **Codex.** After the hard wire-compaction proof, the downstream
+The downstream task-completion oracle is an **XFAIL on Qwen3-8B**:
+
+- **Codex.** After the hard wire-compaction and post-compaction continuation
+  proofs, the downstream
   task-completion assertions (correct `result.txt`, wire ordering of the write
   after compaction, the ordered JSONL trace, `./verify.sh`) are **skipped** when
   the live model matches `COMPACTION_XFAIL_MODEL` (`qwen3-8b`), with an
   `XFAIL (...)` line logged.
-- **Claude Code.** Same shape: after the hard proofs (self-compaction boundary,
-  the pre-compaction Read carrying the marker through Praxis, and a
-  post-compaction tool call through Praxis), the downstream completion assertions
+- **Claude Code.** After the hard proofs (self-compaction boundary and the
+  pre-compaction Read carrying the marker through Praxis), the test checks for a
+  post-compaction tool call. On Qwen3-8B, an absent call is logged as an expected
+  XFAIL; if a call is emitted, the test verifies it followed compaction. The
+  downstream completion assertions
   (successful post-compaction Edit of the uppercase marker into
   `result/value.txt`, then a passing `./verify.sh`) are **skipped** on
-  `COMPACTION_XFAIL_MODEL`, with an `XFAIL (...)` line logged. The prompt steers a
-  post-compaction re-read of `source/value.txt` to recover the marker, but the
-  oracle never mandated that specific tool call.
+  `COMPACTION_XFAIL_MODEL`, with an `XFAIL (...)` line logged. On capable models,
+  post-compaction continuation and task completion remain hard requirements. The
+  prompt steers a post-compaction re-read of `source/value.txt` to recover the
+  marker, but the oracle never mandates that specific tool call.
 
 Each lane uses a shorter deadline (`COMPACTION_XFAIL_CHILD_TIMEOUT`, 180s) on the
 XFAIL model so a looping run ends quickly once compaction is already captured.

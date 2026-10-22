@@ -7,7 +7,7 @@
 //! parameter nesting under `generationConfig`, tool definitions, and
 //! `stream` flag extraction for URL path selection.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::HashMap};
 
 use serde_json::{Map, Value, json};
 
@@ -274,9 +274,13 @@ fn convert_messages(obj: &Map<String, Value>) -> Result<(Vec<Value>, Option<Valu
 
     let mut contents = Vec::new();
     let mut system_parts = Vec::new();
+    // Request-local, borrowed from `messages`: populated while traversing
+    // assistant tool calls so each tool result resolves its function name
+    // with one lookup instead of rescanning history per result.
+    let mut tool_call_names = ToolCallNameIndex::new();
 
     for (i, msg) in messages.iter().enumerate() {
-        convert_one_message(&mut contents, &mut system_parts, messages, i, msg)?;
+        convert_one_message(&mut contents, &mut system_parts, &mut tool_call_names, messages, i, msg)?;
     }
 
     let system_instruction = if system_parts.is_empty() {
@@ -289,12 +293,22 @@ fn convert_messages(obj: &Map<String, Value>) -> Result<(Vec<Value>, Option<Valu
 }
 
 /// Translate a single OpenAI message into `contents` or `system_parts`.
-fn convert_one_message(
+///
+/// `tool_call_names` accumulates the tool-call declarations seen so far; it
+/// is only ever updated by the `assistant` arm and read by the
+/// `tool`/`function` arm, so results can only resolve against preceding
+/// declarations.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "accumulator pattern requires passing all traversal state"
+)]
+fn convert_one_message<'a>(
     contents: &mut Vec<Value>,
     system_parts: &mut Vec<Value>,
-    messages: &[Value],
+    tool_call_names: &mut ToolCallNameIndex<'a>,
+    messages: &'a [Value],
     i: usize,
-    msg: &Value,
+    msg: &'a Value,
 ) -> Result<(), String> {
     let role = msg
         .get("role")
@@ -304,9 +318,9 @@ fn convert_one_message(
     match role {
         "system" | "developer" => collect_system_parts(system_parts, msg)?,
         "user" => convert_user_message(contents, msg)?,
-        "assistant" => convert_assistant_message(contents, msg)?,
+        "assistant" => convert_assistant_message(contents, tool_call_names, msg)?,
         "tool" | "function" => {
-            convert_tool_result(contents, messages, i, msg, is_tool_result_continuation(messages, i))?;
+            convert_tool_result(contents, tool_call_names, msg, is_tool_result_continuation(messages, i))?;
         },
         _ => return Err(format!("unsupported message role `{role}`")),
     }
@@ -470,13 +484,22 @@ fn guess_mime_type(url: &str) -> &'static str {
 ///
 /// Handles plain text, tool calls (`functionCall` parts), and any
 /// `thoughtSignature` stashed on the tool call as `extra_content`.
-fn convert_assistant_message(contents: &mut Vec<Value>, msg: &Value) -> Result<(), String> {
+///
+/// Valid tool-call declarations are also recorded into `tool_call_names` so
+/// later tool results can resolve their function names without rescanning
+/// history.
+fn convert_assistant_message<'a>(
+    contents: &mut Vec<Value>,
+    tool_call_names: &mut ToolCallNameIndex<'a>,
+    msg: &'a Value,
+) -> Result<(), String> {
     let mut parts = Vec::new();
 
     collect_assistant_content(&mut parts, msg.get("content"))?;
 
     if let Some(tool_calls) = msg.get("tool_calls").filter(|calls| !calls.is_null()) {
         let tool_calls = tool_calls.as_array().ok_or("assistant `tool_calls` must be an array")?;
+        tool_call_names.record(tool_calls);
         for tc in tool_calls {
             parts.push(convert_tool_call(tc)?);
         }
@@ -603,19 +626,18 @@ fn is_tool_result_continuation(messages: &[Value], index: usize) -> bool {
 /// Resolves the function name in order of preference:
 /// 1. `msg["name"]` — present on deprecated `function` messages and some clients that add it to `tool` messages for
 ///    convenience
-/// 2. `tool_call_id` → nearest preceding assistant `tool_calls` entry with that id
+/// 2. `tool_call_id` → the nearest preceding assistant `tool_calls` entry with that id (via `tool_call_names`)
 /// 3. Reject when neither source identifies the function.
 ///
 /// When `append_to_last` is `true`, the part is appended to the last `contents`
 /// entry rather than opening a new `user` turn (required for parallel tool calls).
-fn convert_tool_result(
+fn convert_tool_result<'a>(
     contents: &mut Vec<Value>,
-    messages: &[Value],
-    index: usize,
-    msg: &Value,
+    tool_call_names: &ToolCallNameIndex<'a>,
+    msg: &'a Value,
     append_to_last: bool,
 ) -> Result<(), String> {
-    let name = resolve_tool_function_name(messages, index, msg)?;
+    let name = resolve_tool_function_name(tool_call_names, msg)?;
 
     let content = tool_result_content(msg.get("content"))?;
 
@@ -673,10 +695,11 @@ fn tool_result_content(content: Option<&Value>) -> Result<Cow<'_, str>, String> 
 /// Resolve the function name for a tool/function result message.
 ///
 /// Tries `msg["name"]` first (always present on deprecated `function`
-/// messages, sometimes present on `tool` messages). Falls back to the
-/// nearest preceding assistant `tool_calls` entry with a matching id,
-/// so a reused id from a later round cannot steal an earlier result.
-fn resolve_tool_function_name<'a>(messages: &'a [Value], tool_index: usize, msg: &'a Value) -> Result<&'a str, String> {
+/// messages, sometimes present on `tool` messages). Falls back to
+/// `tool_call_names`, which holds the nearest preceding declaration for
+/// the `tool_call_id`, so a reused id from a later round cannot steal an
+/// earlier result.
+fn resolve_tool_function_name<'a>(tool_call_names: &ToolCallNameIndex<'a>, msg: &'a Value) -> Result<&'a str, String> {
     if let Some(name) = msg.get("name").and_then(Value::as_str)
         && !name.is_empty()
     {
@@ -687,37 +710,62 @@ fn resolve_tool_function_name<'a>(messages: &'a [Value], tool_index: usize, msg:
         return Err("tool message requires `name` or `tool_call_id`".to_owned());
     };
 
-    if let Some(name) = name_from_preceding_tool_call(messages, tool_index, tool_call_id) {
-        return Ok(name);
-    }
-    Err(format!(
-        "tool message `tool_call_id` `{tool_call_id}` has no matching function call"
-    ))
+    tool_call_names
+        .resolve(tool_call_id)
+        .ok_or_else(|| format!("tool message `tool_call_id` `{tool_call_id}` has no matching function call"))
 }
 
-/// Scan messages before `tool_index` for the nearest assistant `tool_calls`
-/// entry whose `id` matches `tool_call_id`.
-fn name_from_preceding_tool_call<'a>(messages: &'a [Value], tool_index: usize, tool_call_id: &str) -> Option<&'a str> {
-    let (prior, _) = messages.split_at(tool_index);
-    for earlier in prior.iter().rev() {
-        if earlier.get("role").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        let Some(Value::Array(tool_calls)) = earlier.get("tool_calls") else {
-            continue;
-        };
-        for tc in tool_calls.iter().rev() {
-            if tc.get("id").and_then(Value::as_str) != Some(tool_call_id) {
+/// Request-local index from tool-call IDs to declared function names.
+///
+/// Built during the forward traversal in [`convert_messages`]: each
+/// assistant message's `tool_calls` entries are recorded in order, so a
+/// later valid declaration overwrites an earlier one and lookups resolve to
+/// the nearest preceding valid name — the same result the previous
+/// per-result reverse scan produced, without rescanning history for every
+/// tool result.
+///
+/// Keys and values borrow from the parsed `messages` array, so populating
+/// the index never clones or serializes history. The index only ever holds
+/// declarations from messages traversed so far: a tool result cannot be
+/// satisfied by an assistant call that appears later in the request.
+struct ToolCallNameIndex<'a> {
+    /// Tool-call ID → nearest preceding non-empty `function.name`.
+    names: HashMap<&'a str, &'a str>,
+}
+
+impl<'a> ToolCallNameIndex<'a> {
+    /// Create an empty index for one request translation.
+    fn new() -> Self {
+        Self { names: HashMap::new() }
+    }
+
+    /// Record one assistant message's `tool_calls` declarations in order.
+    ///
+    /// Skips entries without a string `id` or a non-empty string
+    /// `function.name`, mirroring the previous reverse scan: a declaration
+    /// with a missing or empty name never satisfies a lookup and never
+    /// overwrites an earlier valid declaration for the same id. Recording
+    /// runs on the raw array before per-call conversion; a conversion error
+    /// aborts the whole translation, so partial recording is unobservable.
+    fn record(&mut self, tool_calls: &'a [Value]) {
+        for tc in tool_calls {
+            let (Some(id), Some(name)) = (
+                tc.get("id").and_then(Value::as_str),
+                tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str),
+            ) else {
                 continue;
-            }
-            if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str)
-                && !name.is_empty()
-            {
-                return Some(name);
+            };
+            if !name.is_empty() {
+                self.names.insert(id, name);
             }
         }
     }
-    None
+
+    /// Resolve the function name declared by the nearest preceding tool
+    /// call with this ID, if any.
+    fn resolve(&self, tool_call_id: &str) -> Option<&'a str> {
+        self.names.get(tool_call_id).copied()
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1158,6 +1206,213 @@ mod tests {
         assert_eq!(weather["response"]["temp"], 72);
         assert_eq!(calendar["name"], "get_calendar");
         assert_eq!(calendar["response"]["event"], "standup");
+    }
+
+    #[test]
+    fn duplicate_ids_within_one_assistant_message_resolve_to_last_valid() {
+        // Forward index insert must overwrite, matching the reverse scan's
+        // "first valid match from the end" within a single tool_calls array.
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"user","content":"run"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"dup","type":"function","function":{"name":"first","arguments":"{}"}},
+                {"id":"dup","type":"function","function":{"name":"second","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"dup","content":"{}"}
+        ]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+        assert_eq!(parsed["contents"][2]["parts"][0]["functionResponse"]["name"], "second");
+
+        // An empty nearer name is skipped, so the earlier valid name wins.
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"user","content":"run"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"dup","type":"function","function":{"name":"third","arguments":"{}"}},
+                {"id":"dup","type":"function","function":{"name":"","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"dup","content":"{}"}
+        ]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+        assert_eq!(parsed["contents"][2]["parts"][0]["functionResponse"]["name"], "third");
+    }
+
+    #[test]
+    fn empty_name_declaration_does_not_shadow_earlier_valid_declaration() {
+        // The nearest preceding declaration for the id has an empty name.
+        // The reverse scan skipped it and kept scanning; the index must not
+        // let it overwrite the earlier valid declaration either.
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"user","content":"run"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_x","type":"function","function":{"name":"valid_name","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"call_x","content":"{}"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_x","type":"function","function":{"name":"","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"call_x","content":"{}"}
+        ]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+        assert_eq!(
+            parsed["contents"][4]["parts"][0]["functionResponse"]["name"],
+            "valid_name"
+        );
+    }
+
+    #[test]
+    fn empty_name_only_declaration_is_rejected() {
+        // The id's only declaration carries an empty `function.name`, so
+        // nothing can satisfy the lookup: the reverse scan kept scanning and
+        // rejected, and the index must reject the same way rather than emit
+        // a `functionResponse` with an empty name.
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"user","content":"run"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_e","type":"function","function":{"name":"","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"call_e","content":"{}"}
+        ]}"#;
+        let error = transform_request(body).unwrap_err();
+        assert!(error.contains("no matching function call"), "{error}");
+    }
+
+    #[test]
+    fn future_declaration_cannot_satisfy_earlier_result() {
+        // The assistant call appears AFTER the result that references its id.
+        // Nearest-preceding semantics: the index must not see forward
+        // declarations, so this stays a rejection.
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"user","content":"run"},
+            {"role":"tool","tool_call_id":"call_future","content":"{}"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_future","type":"function","function":{"name":"too_late","arguments":"{}"}}
+            ]}
+        ]}"#;
+        let error = transform_request(body).unwrap_err();
+        assert!(error.contains("no matching function call"), "{error}");
+    }
+
+    #[test]
+    fn explicit_name_takes_precedence_over_matching_tool_call_id() {
+        // A non-empty explicit name wins over an id-declared name; an empty
+        // explicit name falls through to the id lookup.
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"user","content":"run"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_a","type":"function","function":{"name":"declared","arguments":"{}"}}
+            ]},
+            {"role":"tool","name":"explicit","tool_call_id":"call_a","content":"{}"}
+        ]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+        assert_eq!(
+            parsed["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "explicit"
+        );
+
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"user","content":"run"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_a","type":"function","function":{"name":"declared","arguments":"{}"}}
+            ]},
+            {"role":"tool","name":"","tool_call_id":"call_a","content":"{}"}
+        ]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+        assert_eq!(
+            parsed["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "declared"
+        );
+    }
+
+    #[test]
+    fn unknown_id_after_resolved_round_is_rejected() {
+        // Index entries from earlier results must not leak into later ones:
+        // the second round's unmatched id is still a rejection.
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"user","content":"run"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_known","type":"function","function":{"name":"known","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"call_known","content":"{}"},
+            {"role":"tool","tool_call_id":"call_unknown","content":"{}"}
+        ]}"#;
+        let error = transform_request(body).unwrap_err();
+        assert!(error.contains("no matching function call"), "{error}");
+    }
+
+    #[test]
+    fn empty_tool_call_id_matches_empty_id_declaration() {
+        // The old scan compared id strings with ==, so "" matched "".
+        // The index keys by the raw string and must keep that behavior.
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"user","content":"run"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"","type":"function","function":{"name":"empty_id_fn","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"","content":"{}"}
+        ]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+        assert_eq!(
+            parsed["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "empty_id_fn"
+        );
+    }
+
+    #[test]
+    fn legacy_function_message_resolves_by_name() {
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"user","content":"run"},
+            {"role":"function","name":"legacy_fn","content":"{\"ok\":true}"}
+        ]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+        let fr = &parsed["contents"][1]["parts"][0]["functionResponse"];
+        assert_eq!(fr["name"], "legacy_fn");
+        assert_eq!(fr["response"]["ok"], true);
+    }
+
+    #[test]
+    fn translated_output_matches_explicit_names_byte_for_byte() {
+        // The issue's probe compared whole-request translation via call-ID
+        // lookup against equivalent explicit result names and required
+        // byte-equal output. Encoded here as a regression test.
+        let via_lookup = transform_request(&paired_body(24, false)).unwrap();
+        let via_explicit = transform_request(&paired_body(24, true)).unwrap();
+        assert_eq!(via_lookup.body, via_explicit.body);
+    }
+
+    /// Build a request with `pairs` assistant tool calls followed by `pairs`
+    /// of tool results that reference each function either by `tool_call_id`
+    /// or by an explicit `name` (the lookup-bypass equivalent form).
+    fn paired_body(pairs: usize, explicit_names: bool) -> Vec<u8> {
+        let mut messages = vec![json!({"role": "user", "content": "run all tools"})];
+        let calls: Vec<Value> = (0..pairs)
+            .map(|i| {
+                json!({
+                    "id": format!("call_{i}"),
+                    "type": "function",
+                    "function": {"name": format!("tool_{i}"), "arguments": "{}"}
+                })
+            })
+            .collect();
+        messages.push(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": calls
+        }));
+        for i in 0..pairs {
+            messages.push(if explicit_names {
+                json!({"role": "tool", "name": format!("tool_{i}"), "content": "{}"})
+            } else {
+                json!({"role": "tool", "tool_call_id": format!("call_{i}"), "content": "{}"})
+            });
+        }
+        serde_json::to_vec(&json!({"model": "gemini-1.5-pro", "messages": messages})).unwrap()
     }
 
     #[test]

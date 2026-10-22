@@ -6,11 +6,10 @@
 //! Operation identity is consumed from the typed `AiOperationMatch` that the
 //! `ai_operation` classifier publishes from the request head, so the body is
 //! never inspected to decide whether this filter applies and the identity is not
-//! re-derived here. `ai_operation` is ordered ahead of this filter in every chain
-//! and declares a read-only body hook, so its match is available even under the
-//! buffered body pre-read this filter triggers — the AI-only workaround for
-//! praxis-proxy/praxis#1142, whose limit is noted on [`matched_responses_operation`].
-//! A matched request is then deserialized once, and that one parsed value produces
+//! re-derived here. `ai_operation` classifies in core's request-head phase
+//! (praxis-proxy/praxis#1142), which runs once before any filter's buffered body
+//! pre-read, so its match is available even under the pre-read this filter
+//! triggers. A matched request is then deserialized once, and that one parsed value produces
 //! every downstream fact: the classification metadata, the promoted routing
 //! headers and filter results, the proxy-owned identifiers, and [`ResponsesState`].
 //!
@@ -630,20 +629,17 @@ fn classify_matched_operation(obj: &serde_json::Map<String, serde_json::Value>) 
 /// Consumed from the typed [`AiOperationMatch`] that `ai_operation` publishes
 /// from the request head, so operation identity, protocol, and body shape all
 /// come from the one head classification rather than a second route lookup here.
-/// `ai_operation` is ordered ahead of this filter in every chain and declares a
-/// read-only body hook, so its match is in `ctx.extensions` even under the
-/// buffered body pre-read this filter's `BodyMode::StreamBuffer` triggers — core
-/// runs that pre-read in pipeline order, so the earlier filter publishes first.
+/// `ai_operation` classifies in core's request-head phase, which runs once
+/// before any filter's buffered body pre-read, so its match is in
+/// `ctx.extensions` even under the pre-read this filter's `BodyMode::StreamBuffer`
+/// triggers.
 ///
 /// Only a match whose protocol is Responses is returned; another protocol's
 /// match (Chat Completions, Anthropic, Conversations), or no match at all, yields
-/// `None` and the request is released untouched. The requirement that
-/// `ai_operation` precede this filter is the AI-only workaround for
-/// praxis-proxy/praxis#1142: core exposes no request-head phase before the
-/// buffered pre-read, so a separate head classifier ordered first supplies the
-/// identity. The limit is stated with that issue: core can still reject an
-/// oversized body with a 413 before the first body hook runs, so this does not
-/// give #1142's guarantee of classification ahead of all pre-read work.
+/// `None` and the request is released untouched. The request-head phase
+/// (praxis-proxy/praxis#1142) is guaranteed ahead of every pre-read step, so the
+/// identity is published before this filter's pre-read — and before an oversized
+/// body could be rejected with a 413.
 ///
 /// Every matched Responses operation is returned, body-bearing or not: the
 /// endpoint is authoritative that the request is Responses even when there is no

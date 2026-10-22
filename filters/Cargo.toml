@@ -123,8 +123,12 @@ zeroize = { workspace = true, features = ["serde"] }
 # The SigV4 reference implementation the OpenSSL-backed signer is checked
 # against (filters/src/aws/signing.rs); never linked into the binary.
 aws-sigv4 = { workspace = true }
+rcgen = { workspace = true }
 metrics-util = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio-rustls = { workspace = true }
 tracing-subscriber = { workspace = true }
 wiremock = { workspace = true }

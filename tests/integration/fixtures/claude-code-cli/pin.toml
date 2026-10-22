@@ -208,13 +208,12 @@ flags = [
 # Container image pinned by digest for Claude Code acceptance
 # (env.VLLM_GPU_IMAGE in .github/workflows/vllm-integration.yaml). The GPU full
 # Responses suite builds the model-baked image from vllm/Containerfile instead.
-# vLLM v0.29.0
-# serves the native Anthropic Messages surface (`/v1/messages`,
+# vLLM v0.32.0 serves the native Anthropic Messages surface (`/v1/messages`,
 # `/v1/messages/count_tokens`) by default, in addition to `/v1/chat/completions`,
 # so one container backs both the native and transformed acceptance paths with no
 # extra flag. Qwen3-8B on the A10G (24GB) is the capable model the full suite is
 # already green with; the 0.6B CPU model cannot drive Claude Code's tool use.
-image = "docker.io/vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2"
+image = "docker.io/vllm/vllm-openai:v0.32.0-cu129@sha256:bc0445dac61accbf1c3b17fbb524a71eee0b1b32f55ba45952095e3be8991c3f"
 # Exact served model name. Set via `--served-model-name`; every model-selection
 # surface in the test (--model and the ANTHROPIC_*_MODEL env vars) pins this. A
 # slash-free ALIAS is used deliberately: vLLM's Anthropic client surface cannot

@@ -1,0 +1,59 @@
+version: 1
+id: responses/client-tool-compat-stream-shell-order
+description: Parallel client-owned local shell plus an ordinary function where the backend announces openings in order (0 then 1) but completes the function (index 1) before the shell (index 0); the deferred shell opening must still be announced before the function so the client SSE accumulator sees contiguous ascending openings (#1767).
+protocol: openai_responses
+example_config: openai/responses/client-tool-compat.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.client_tool_compat.stream_opening_order
+turns:
+  - name: deferred-shell-opening-precedes-function
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Inspect the environment and look up data.
+          store: false
+          stream: true
+          parallel_tool_calls: true
+          tools:
+            - type: shell
+              environment:
+                type: local
+            - type: function
+              name: lookup
+              parameters:
+                type: object
+                properties: {}
+                required: []
+                additionalProperties: false
+              strict: true
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /v1/responses
+      upstream_body_kind: json
+      client_sse_events:
+        - response.output_item.added
+        - response.output_item.added
+        - response.function_call_arguments.delta
+        - response.function_call_arguments.done
+        - response.output_item.done
+        - response.output_item.done
+        - response.completed
+      upstream_sse_events:
+        - response.output_item.added
+        - response.output_item.added
+        - response.function_call_arguments.delta
+        - response.function_call_arguments.done
+        - response.output_item.done
+        - response.function_call_arguments.delta
+        - response.function_call_arguments.done
+        - response.output_item.done
+        - response.completed

@@ -55,7 +55,7 @@ openssl = "0.10.81"
 quote = "1.0.47"
 rand = "0.10.3"
 rcgen = "0.14.10"
-redis = { version = "1.7.0", default-features = false, features = ["tokio-comp"] }
+redis = { version = "1.7.0", default-features = false, features = ["sentinel", "tokio-rustls-comp"] }
 regex = "1.13.1"
 # reqwest is a dev/test-only dependency. Production callouts use
 # SubRequestClient, which inherits TLS from the process-wide Pingora
@@ -67,8 +67,9 @@ rmcp = { version = "3.4.0", default-features = false, features = ["client", "tra
 # aws-lc-rs into every test binary, and `prefer-post-quantum` implies
 # `aws_lc_rs`. The provider is whatever the process installed.
 rustls = { version = "0.23.46", default-features = false, features = ["logging", "std", "tls12"] }
-schemars = "1.2.2"
 rustls-pemfile = "2.2.0"
+rustls-pki-types = "1.15.1"
+schemars = "1.2.2"
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json_canonicalizer = "0.3.2"
@@ -119,11 +120,11 @@ zstd = "0.14.0"
 # Policy Engine) and the pure-Rust cryptography its plugins carry; praxis-ai
 # forwards that engine through its own `policy-engine` feature instead, on by
 # default and off in the FIPS build (see FIPS_FEATURES in the Makefile).
-praxis-core = { version = "0.7.4", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.7.4", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
-praxis-protocol = { version = "0.7.4", package = "praxis-proxy-protocol" }
-praxis-tls = { version = "0.7.4", package = "praxis-proxy-tls" }
-praxis = { version = "0.7.4", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api"] }
+praxis-core = { version = "0.7.5", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.7.5", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
+praxis-protocol = { version = "0.7.5", package = "praxis-proxy-protocol" }
+praxis-tls = { version = "0.7.5", package = "praxis-proxy-tls" }
+praxis = { version = "0.7.5", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api", "pingora"] }
 praxis-test-utils = { path = "tests/utils", default-features = false }
 
 # AI-owned llm-d ext_proc compatibility layer

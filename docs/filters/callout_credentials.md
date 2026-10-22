@@ -15,10 +15,10 @@ Place this filter once in the outer request chain, before body pre-read callouts
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `credentials` | RawSlot[] | no | Per-user credential slots to capture from ingress headers. |
+| `credentials` | object[] | no | Per-user credential slots to capture from ingress headers. |
 | `credentials[].slot` | string | yes | Config-static slot identifier. |
 | `credentials[].source_header` | string | yes | Ingress header name to read the per-user secret from. |
-| `assertions` | RawSlot[] | no | Opaque authorization-assertion slots to capture from trusted ingress headers. |
+| `assertions` | object[] | no | Opaque authorization-assertion slots to capture from trusted ingress headers. |
 | `assertions[].slot` | string | yes | Config-static slot identifier. |
 | `assertions[].source_header` | string | yes | Ingress header name to read the per-user secret from. |
 

@@ -1285,6 +1285,7 @@ mod tests {
                 vec!["responses_client_tool_compat"],
                 vec!["responses_client_tool_compat"],
                 vec!["responses_client_tool_compat"],
+                vec!["responses_client_tool_compat"],
                 vec!["responses_client_tool_compat", "openai_responses_to_chat_completions"],
                 vec!["responses_client_tool_compat", "openai_responses_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
@@ -1294,6 +1295,7 @@ mod tests {
                 vec!["chat_completions_to_bedrock_converse"],
                 vec!["chat_completions_to_bedrock_converse"],
                 vec!["chat_completions_to_bedrock_converse"],
+                vec!["openai_chat_completions_to_azureai_chat_completions"],
                 vec!["openai_chat_completions_to_azureai_chat_completions"],
                 vec!["openai_chat_completions_to_vertexai_gemini"],
                 vec!["chat_completions_to_bedrock_converse"],
@@ -1383,9 +1385,11 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
@@ -1415,13 +1419,14 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 87, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 67, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 72, "manifest recording inventory count");
+        assert_eq!(report.features_total, 88, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 68, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 73, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
                 "azure/annotation-stream",
+                "azure/error-status-event-stream",
                 "bedrock/basic-nonstream",
                 "messages/basic-nonstream",
                 "messages/basic-stream",
@@ -1475,6 +1480,7 @@ mod tests {
                 "responses/client-tool-compat-chat-stream",
                 "responses/client-tool-compat-mcp-namespace",
                 "responses/client-tool-compat-stream",
+                "responses/client-tool-compat-stream-shell-order",
                 "responses/invalid-stream-event-type",
                 "responses/irr-terminal-streaming",
                 "responses/mcp-tool-admission-untrusted-direct",
@@ -1490,7 +1496,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 87, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 88, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1762,6 +1768,10 @@ mod tests {
                     &vec!["responses/client-tool-compat-stream".to_owned()]
                 ),
                 (
+                    &"responses.client_tool_compat.stream_opening_order".to_owned(),
+                    &vec!["responses/client-tool-compat-stream-shell-order".to_owned()]
+                ),
+                (
                     &"responses.client_tool_compat.chat_lower_restore".to_owned(),
                     &vec!["responses/client-tool-compat-chat".to_owned()]
                 ),
@@ -1803,6 +1813,10 @@ mod tests {
                 (
                     &"azure.chat.response.annotation_stream".to_owned(),
                     &vec!["azure/annotation-stream".to_owned()]
+                ),
+                (
+                    &"azure.chat.response.error_status_event_stream".to_owned(),
+                    &vec!["azure/error-status-event-stream".to_owned()]
                 ),
                 (
                     &"vertex.gemini.request.invalid_content".to_owned(),
@@ -2020,7 +2034,7 @@ mod tests {
                 vec![("vllm", CoverageStatus::LiveCovered)],
             );
         }
-        for feature in &manifest.features[42..57] {
+        for feature in &manifest.features[42..58] {
             assert_eq!(
                 feature
                     .providers
@@ -2031,20 +2045,12 @@ mod tests {
             );
         }
         assert_eq!(
-            manifest.features[57]
-                .providers
-                .iter()
-                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                .collect::<Vec<_>>(),
-            vec![("vllm", CoverageStatus::LiveCovered)],
-        );
-        assert_eq!(
             manifest.features[58]
                 .providers
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                 .collect::<Vec<_>>(),
-            vec![("synthetic", CoverageStatus::SyntheticOnly)],
+            vec![("vllm", CoverageStatus::LiveCovered)],
         );
         assert_eq!(
             manifest.features[59]
@@ -2052,9 +2058,17 @@ mod tests {
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                 .collect::<Vec<_>>(),
+            vec![("synthetic", CoverageStatus::SyntheticOnly)],
+        );
+        assert_eq!(
+            manifest.features[60]
+                .providers
+                .iter()
+                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)],
         );
-        for feature in &manifest.features[60..79] {
+        for feature in &manifest.features[61..80] {
             assert_eq!(
                 feature
                     .providers
@@ -2064,7 +2078,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)],
             );
         }
-        for feature in &manifest.features[78..86] {
+        for feature in &manifest.features[79..87] {
             assert_eq!(
                 feature
                     .providers

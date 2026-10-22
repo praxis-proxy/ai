@@ -13,7 +13,7 @@ When `task_routing.enabled` is true, the filter captures task and context owners
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `headers` | A2aHeaders | no | Header names for A2A metadata promotion. Must not be hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` names. Dedicated `x-praxis-a2a-*` defaults remain allowed. |
+| `headers` | object | no | Header names for A2A metadata promotion. Must not be hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` names. Dedicated `x-praxis-a2a-*` defaults remain allowed. |
 | `headers.context_id` | string | no | Header name for the extracted context ID (e.g. `x-praxis-a2a-context-id`). |
 | `headers.family` | string | no | Header name for the A2A family (e.g. `x-praxis-a2a-family`). |
 | `headers.kind` | string | no | Header name for the JSON-RPC kind (e.g. `x-praxis-a2a-kind`). |
@@ -24,7 +24,7 @@ When `task_routing.enabled` is true, the filter captures task and context owners
 | `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer`. |
 | `method_aliases` | object<string, string> | no | Method aliases for compatibility (slash-delimited → `PascalCase`). |
 | `on_invalid` | `continue` \| `reject` \| `error` | no | Invalid input handling behavior. |
-| `task_routing` | TaskRoutingConfig | no | Task-ownership routing configuration. |
+| `task_routing` | object | no | Task-ownership routing configuration. |
 | `task_routing.enabled` | bool | no | Whether task routing is enabled. |
 | `task_routing.max_response_body_bytes` | integer | no | Maximum response body bytes to buffer for task route capture. |
 | `task_routing.on_lookup_miss` | `continue` | no | Behavior when a task route lookup misses. |

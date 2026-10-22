@@ -535,6 +535,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.client_tool_compat.stream_opening_order
+    scopes:
+      - responses_client_tool_compat
+    status: synthetic_only
+    scenarios:
+      - responses/client-tool-compat-stream-shell-order
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.client_tool_compat.chat_lower_restore
     scopes:
       - responses_client_tool_compat
@@ -626,6 +635,15 @@ features:
     status: synthetic_only
     scenarios:
       - azure/annotation-stream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: azure.chat.response.error_status_event_stream
+    scopes:
+      - openai_chat_completions_to_azureai_chat_completions
+    status: synthetic_only
+    scenarios:
+      - azure/error-status-event-stream
     providers:
       synthetic:
         status: synthetic_only

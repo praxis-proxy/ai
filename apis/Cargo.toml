@@ -70,7 +70,6 @@ metrics = { workspace = true }
 notify = { workspace = true }
 openssl = { workspace = true }
 percent-encoding = { workspace = true }
-pingora-core = { workspace = true }
 praxis-ai-store = { workspace = true }
 praxis-ai-store-lifecycle = { workspace = true, optional = true }
 # apis uses the SQL backends directly in the responses and conversations store

@@ -43,9 +43,10 @@
 //! Distinguishing beta behavior is left to Anthropic request processing and the
 //! backend, which can read the header.
 //!
-//! That document is a pinned reference, not a wired conformance gate — there is
-//! no `oasdiff` or capability projection for Anthropic, so this registry makes
-//! no machine-checked specification-conformance claim.
+//! `cargo xtask check-anthropic-messages-registry` compares this registry's
+//! methods, paths, and operation IDs against the pinned document at CI time.
+//! There is no `oasdiff` structural comparison or capability projection for
+//! Anthropic.
 //!
 //! # Handling modes
 //!
