@@ -61,6 +61,9 @@ ROLES_NONE = {"weather": {"roles": []}}
 # is opaque to enforcement; it is forwarded unchanged and observed for item 7.
 WRISTBAND = "praxis-forwarded-wristband-" + "a" * 32
 
+# Same tool, but requiring explicit approval (two-turn flow) for items 5/6b.
+APPROVAL_TOOL = {**MCP_TOOL, "require_approval": "always"}
+
 
 # --- low-level helpers -------------------------------------------------------
 
@@ -232,6 +235,17 @@ def _mcp_call_error(resp_json):
     )
 
 
+def _approval_request_id(resp_json):
+    for o in resp_json.get("output") or []:
+        if o.get("type") == "mcp_approval_request":
+            return o.get("id")
+    return None
+
+
+def _post(praxis_url, user, token, body):
+    return httpx.post(praxis_url + "/v1/responses", headers=_headers(user, token), json=body, timeout=90)
+
+
 # --- fixtures ----------------------------------------------------------------
 
 @pytest.fixture(scope="session")
@@ -298,6 +312,54 @@ def praxis(stack, scripted_model):
             proc.kill()
             proc.wait()
         os.unlink(cfg_path)
+
+
+@pytest.fixture(scope="session")
+def praxis_store(stack, scripted_model):
+    """Like `praxis` but with a file-backed SQLite Responses store armed before
+    dispatch, so approval create/resume survives two client turns (items 5/6b).
+    Requires praxis-ai built with store-sqlite."""
+    proxy_port = _free_port()
+    fd_db, db = tempfile.mkstemp(suffix=".db", prefix="kuadrant-store-")
+    os.close(fd_db)
+    os.unlink(db)  # let sqlite create it fresh (mode=rwc); avoids a stale-db 500
+    cfg = EXAMPLE_CONFIG.read_text()
+    cfg = cfg.replace("0.0.0.0:8080", f"127.0.0.1:{proxy_port}")
+    cfg = cfg.replace("127.0.0.1:3001", f"127.0.0.1:{scripted_model}")
+    cfg = cfg.replace("http://127.0.0.1:8000/mcp", stack["KUADRANT_GATEWAY_URL"])
+    store_block = (
+        "      - filter: openai_responses_store\n"
+        "        backend: sqlite\n"
+        f'        database_url: "sqlite://{db}?mode=rwc"\n'
+        "        responses_table: openai_responses\n"
+        "        conversations_table: openai_conversations\n"
+        "      - filter: openai_responses_rehydrate\n"
+    )
+    cfg = cfg.replace(
+        "      - filter: openai_tool_parse\n",
+        "      - filter: openai_tool_parse\n" + store_block,
+        1,
+    )
+    fd, cfg_path = tempfile.mkstemp(suffix=".yaml", prefix="praxis-kuadrant-store-")
+    with os.fdopen(fd, "w") as f:
+        f.write(cfg)
+    proc = subprocess.Popen(
+        [_find_binary(), "-c", cfg_path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_tcp(proxy_port, 30)
+        yield f"http://127.0.0.1:{proxy_port}"
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        os.unlink(cfg_path)
+        if os.path.exists(db):
+            os.unlink(db)
 
 
 # --- tests -------------------------------------------------------------------
@@ -482,6 +544,80 @@ def test_item4b_invalid_forwarded_wristband_is_not_an_enforcement_point(stack, p
     assert r.status_code == 200, r.text
     assert _mcp_call_ok(r.json()), r.text
     assert _backend_count(stack, "get_forecast") == 1
+
+
+def test_item5_require_approval_never_does_not_bypass(stack, praxis, scripted_model):
+    """With require_approval:never there is no approval step to exploit; an
+    unauthorized call still reaches the gateway and is denied (exec==0)."""
+    _switch_authconfig("opendisco")
+    try:
+        token = _mint(stack, "userB", ROLES_NONE)
+        _reset_backend(stack)
+        r = _responses(praxis, "userB", token, [MCP_TOOL], stream=False)  # MCP_TOOL => require_approval:never
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert _approval_request_id(j) is None, j
+        assert _mcp_call_error(j), j
+        assert _backend_count(stack, "get_forecast") == 0
+    finally:
+        _switch_authconfig("filtered")
+
+
+def test_item5_approved_resume_still_denied_when_unauthorized(stack, praxis_store, scripted_model):
+    """An approved resume must NOT bypass authorization: userB creates an approval,
+    approves it, the resume re-dials the gateway, and it is still denied (exec==0)."""
+    _switch_authconfig("opendisco")
+    try:
+        token = _mint(stack, "userB", ROLES_NONE)
+        _reset_backend(stack)
+        t1 = _post(praxis_store, "userB", token, {
+            "model": "scripted-model", "input": "weather?", "store": True, "stream": False,
+            "tools": [APPROVAL_TOOL]})
+        assert t1.status_code == 200, t1.text
+        j1 = t1.json()
+        aid = _approval_request_id(j1)
+        assert aid, j1
+        assert _backend_count(stack, "get_forecast") == 0  # no dispatch before approval
+        t2 = _post(praxis_store, "userB", token, {
+            "model": "scripted-model", "previous_response_id": j1.get("id"), "store": True, "stream": False,
+            "tools": [APPROVAL_TOOL],
+            "input": [{"type": "mcp_approval_response", "approval_request_id": aid, "approve": True}]})
+        assert t2.status_code == 200, t2.text
+        assert _mcp_call_error(t2.json()), t2.text
+        assert _backend_count(stack, "get_forecast") == 0
+    finally:
+        _switch_authconfig("filtered")
+
+
+def test_item5_approved_resume_still_denied_streaming(stack, praxis_store, scripted_model):
+    """Streaming resume: the approved resume denial completes a clean SSE lifecycle,
+    surfaces the tool error, and never executes the backend."""
+    _switch_authconfig("opendisco")
+    try:
+        token = _mint(stack, "userB", ROLES_NONE)
+        _reset_backend(stack)
+        t1 = _post(praxis_store, "userB", token, {
+            "model": "scripted-model", "input": "weather?", "store": True, "stream": False,
+            "tools": [APPROVAL_TOOL]})
+        assert t1.status_code == 200, t1.text
+        j1 = t1.json()
+        aid = _approval_request_id(j1)
+        assert aid, j1
+        body = {
+            "model": "scripted-model", "previous_response_id": j1.get("id"), "store": True, "stream": True,
+            "tools": [APPROVAL_TOOL],
+            "input": [{"type": "mcp_approval_response", "approval_request_id": aid, "approve": True}]}
+        raw = ""
+        with httpx.stream("POST", praxis_store + "/v1/responses", headers=_headers("userB", token),
+                          json=body, timeout=90) as r:
+            assert r.status_code == 200, r.read()
+            for chunk in r.iter_text():
+                raw += chunk
+        assert _sse_terminated_cleanly(raw), raw
+        assert _mcp_call_error({"output": _sse_final_output(raw)}), raw
+        assert _backend_count(stack, "get_forecast") == 0
+    finally:
+        _switch_authconfig("filtered")
 
 
 if __name__ == "__main__":
