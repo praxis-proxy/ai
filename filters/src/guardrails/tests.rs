@@ -269,6 +269,42 @@ provider:
 }
 
 #[test]
+fn nemo_token_file_must_exist_at_startup() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+provider:
+  type: nemo
+  endpoint: "http://127.0.0.1:8000/v1/checks"
+  token_file: /nonexistent/nemo-token
+"#,
+    )
+    .unwrap();
+
+    let err = AiGuardrailsFilter::from_config(&yaml)
+        .err()
+        .expect("a missing token file must be rejected at startup");
+    assert!(err.to_string().contains("cannot read"), "{err}");
+}
+
+#[test]
+fn nemo_token_file_rejects_non_loopback_http() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+provider:
+  type: nemo
+  endpoint: "http://nemo:8000/v1/checks"
+  token_file: /var/run/secrets/tokens/nemo/token
+"#,
+    )
+    .unwrap();
+
+    let err = AiGuardrailsFilter::from_config(&yaml)
+        .err()
+        .expect("a token file on a non-loopback http endpoint must be rejected");
+    assert!(err.to_string().contains("loopback"), "{err}");
+}
+
+#[test]
 fn valid_config_with_all_fields() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"

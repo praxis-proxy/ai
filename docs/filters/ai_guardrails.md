@@ -23,6 +23,10 @@ When `phase.response` is enabled, Chat Completions requests with `"stream": true
 
 For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail configurations. When `provider.guardrails` is omitted, the request omits `config_ids` so the service can use its default configuration. Omit `provider.model` to leave the selected configuration's models unchanged; a non-empty value replaces or adds its main model.
 
+In production, set `provider.endpoint` to `https://`. Set `provider.tls.ca_file` to the PEM bundle that signed the `NeMo` server certificate. That bundle is this peer's trust store, and hostname verification stays enabled. Without it, the call uses the trust store loaded for the Praxis process.
+
+`provider.token_file` is optional. When set, Praxis reads that Kubernetes login token at startup and sends it on the call to this `NeMo` address. The token is not on the request the outbound chain sees. Praxis adds `Authorization` after that chain runs, so a filter there cannot remove or replace it. An `http` endpoint is refused unless its host is loopback. A missing file refuses to start. If the file later disappears, the `NeMo` call is refused and the chat is not sent to the model.
+
 ## Configuration
 
 | Field | Type | Required | Description |
@@ -42,9 +46,11 @@ filter: ai_guardrails
 outbound_chain: nemo-outbound # optional
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/checks"
+  endpoint: "https://nemo.default.svc:8443/v1/checks"
   guardrails:
     config_ids: ["your-config"]
+  tls:
+    ca_file: /var/run/secrets/nemo/ca.crt
   timeout_ms: 5000
 phase:
   request: true

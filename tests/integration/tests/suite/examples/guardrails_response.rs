@@ -53,6 +53,7 @@ fn chat_backend(content: &str) -> BackendGuard {
         .start_with_shutdown()
 }
 
+/// Load `nemo-guardrails-response.yaml` with its listener and NeMo ports patched.
 fn load_response_config(proxy_port: u16, backend_port: u16, nemo_port: u16) -> praxis_core::config::Config {
     load_example_config(
         "nemo-guardrails-response.yaml",
