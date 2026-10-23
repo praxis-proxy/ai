@@ -34,6 +34,15 @@ make test-kuadrant-acceptance
 bash tests/integration/kuadrant/teardown.sh          # add --purge to drop .run/ + .stack-env
 ```
 
+## Runtime & CI
+
+Measured runtime (local, warm image cache): stack-up ~30s, the 7-item buffered+
+streaming suite ~8s; the praxis-ai build dominates (`make test-kuadrant-acceptance`
+rebuilds with `full,store-sqlite`). End-to-end `make` run ~2min warm; budget
+~8–12min on a cold CI runner. The gated lane (`.github/workflows/kuadrant.yaml`) is
+path-filtered (only MCP courier / harness / example-config changes trigger it) and
+auto-registered as a required check by `ci-status.yaml` — no central list edit.
+
 `stack_up.sh` emits `.stack-env` (git-ignored) with `KUADRANT_GATEWAY_URL`,
 `KUADRANT_ISSUER_PRIV`, `KUADRANT_ISSUER_KID`, `KUADRANT_KUBECONFIG`,
 `KUADRANT_BACKEND_STATS`, consumed by the pytest acceptance
