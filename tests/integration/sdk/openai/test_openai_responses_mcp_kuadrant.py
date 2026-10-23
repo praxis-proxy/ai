@@ -38,6 +38,7 @@ KDIR = REPO / "tests" / "integration" / "kuadrant"
 STACK_ENV = KDIR / ".stack-env"
 MINT = KDIR / "scripts" / "mint_user_jwt.py"
 SCRIPTED_MODEL = KDIR / "scripts" / "scripted_model.py"
+SWITCH = KDIR / "switch_authconfig.sh"
 EXAMPLE_CONFIG = REPO / "examples" / "configs" / "openai" / "responses" / "mcp-kuadrant-gateway.yaml"
 
 # The MCP tool entry the client sends: connector-only (connector_id, NOT server_url)
@@ -117,6 +118,11 @@ def _reset_backend(stack):
 
 def _backend_count(stack, tool):
     return httpx.get(stack["KUADRANT_BACKEND_STATS"] + "/stats", timeout=5).json().get(tool, 0)
+
+
+def _switch_authconfig(variant):
+    """Apply an AuthConfig variant and wait for Authorino to reconcile it."""
+    subprocess.run(["bash", str(SWITCH), variant], check=True)
 
 
 def _responses(praxis_url, user, token, tools, stream=False, input_text="What is the weather in NYC?"):
@@ -268,6 +274,25 @@ def test_item3a_praxis_does_not_dispatch_undiscovered_tool(stack, praxis, script
     j = r.json()
     assert not _mcp_call_ok(j), j
     assert _backend_count(stack, "get_forecast") == 0
+
+
+def test_item3b_gateway_denies_discovered_but_forbidden_call(stack, praxis, scripted_model):
+    """Open-discovery variant: userB CAN discover weather_get_forecast, but the
+    gateway's per-call authz denies the invocation (403 -> mcp_call.error). Proves
+    discovery is not enforcement and that the call reaches the gateway through
+    Praxis dispatch."""
+    _switch_authconfig("opendisco")
+    try:
+        token = _mint(stack, "userB", ROLES_NONE)
+        _reset_backend(stack)
+        r = _responses(praxis, "userB", token, [MCP_TOOL], stream=False)
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert "weather_get_forecast" in _discovered_tools(j), j
+        assert _mcp_call_error(j), j
+        assert _backend_count(stack, "get_forecast") == 0
+    finally:
+        _switch_authconfig("filtered")
 
 
 if __name__ == "__main__":
