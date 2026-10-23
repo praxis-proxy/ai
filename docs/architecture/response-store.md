@@ -144,8 +144,10 @@ supported persistence profiles:
 | SQLite-only | `standard,openai-all,store-sqlite` | SQLite |
 | Combined | `standard,openai-all,store-all` | PostgreSQL and SQLite |
 
-The released container image builds `full` without Responses or stores. Build
-with `--build-arg PRAXIS_AI_FEATURES=full,openai-all,store-sqlite` to opt in.
+The standard container image builds `full` without Responses or stores. The
+`-experimental` image tags build `full,openai-all,store-all`; build with
+`--build-arg PRAXIS_AI_FEATURES=full,openai-all,store-all` to do the same
+locally.
 SQLite configurations use a database path under the image's writable state
 directory, as described below.
 

@@ -59,7 +59,7 @@ image is needed without creating a tagged GitHub Release. Its optional
 commit associated with the selected dispatch ref.
 
 The same workflow runs nightly from the latest commit on `main`, publishing
-the rolling `nightly` and `nightly-fips` tags.
+the rolling `nightly`, `nightly-experimental`, and `nightly-fips` tags.
 
 [ghcr]: https://ghcr.io/praxis-proxy/ai
 
@@ -74,9 +74,17 @@ The release workflow produces these tags per run:
 | `<major>.<minor>` | `0.1` | Major.minor shorthand |
 | `latest` | `latest` | Most recent tagged release |
 | `nightly` | `nightly` | Latest scheduled build from `main` |
+| `<any of the above>-experimental` | `0.1.0-experimental` | Same runs, for the experimental image |
 | `<any of the above>-fips` | `0.1.0-fips` | Same runs, for the FIPS image |
 
 The workflow also publishes a `sha-<hash>` tag for traceability.
+
+Every run that pushes a standard image also pushes the experimental image
+under the same tag with an `-experimental` suffix. It is built from the same
+`Containerfile` with `PRAXIS_AI_FEATURES=full,openai-all,store-all`, adding
+the experimental OpenAI groups (Responses, agentic loop, response store,
+Conversations, compaction, file resolve, MCP tools) and the SQLite and
+PostgreSQL store backends. Other experimental filters are not included.
 
 Every run that pushes a standard image also pushes the FIPS image, built
 from `Containerfile.fips` on UBI 9 with Red Hat's toolchain and OpenSSL,

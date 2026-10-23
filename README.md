@@ -134,7 +134,10 @@ docker pull ghcr.io/praxis-proxy/ai:latest
 ```
 
 Podman can pull the same OCI image. See the [quickstart] for a source build
-and the [release documentation] for image contents and tagging. A FIPS 140-3
+and the [release documentation] for image contents and tagging. An image
+with the experimental OpenAI Responses filters and SQLite and PostgreSQL
+stores is published with an `-experimental` suffix (for example
+`nightly-experimental`). A FIPS 140-3
 build for Red Hat Enterprise Linux hosts is published under the same tags
 with a `-fips` suffix (for example `latest-fips`); see
 [FIPS 140-3](docs/fips.md).
