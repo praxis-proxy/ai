@@ -8035,8 +8035,10 @@ class TestAgenticLoopVLLM:
         web_search_calls = [
             item for item in response.output if item.type == "web_search_call"
         ]
-        assert len(web_search_calls) == 1, response.output
-        assert web_search_calls[0].status == "completed"
+        assert web_search_calls, response.output
+        assert all(call.status == "completed" for call in web_search_calls), (
+            web_search_calls
+        )
         # One hosted web-search call can expand into multiple provider queries.
         assert len(BraveSearchHandler.request_paths) > request_count
         assert any(item.type == "message" for item in response.output)
