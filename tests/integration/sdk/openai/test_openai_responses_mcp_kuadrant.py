@@ -125,6 +125,52 @@ def _switch_authconfig(variant):
     subprocess.run(["bash", str(SWITCH), variant], check=True)
 
 
+# --- streaming helpers -------------------------------------------------------
+
+def _responses_stream(praxis_url, user, token, tools, input_text="What is the weather in NYC?"):
+    """Drive a streaming Responses request; return (status, raw_sse_text)."""
+    body = {"model": "scripted-model", "input": input_text, "store": False, "stream": True, "tools": tools}
+    headers = {
+        "Content-Type": "application/json",
+        "x-auth-tenant": "acme",
+        "x-auth-user": user,
+        "x-user-mcp-key": token,
+    }
+    raw = ""
+    with httpx.stream("POST", praxis_url + "/v1/responses", headers=headers, json=body, timeout=90) as r:
+        status = r.status_code
+        for chunk in r.iter_text():
+            raw += chunk
+    return status, raw
+
+
+def _sse_final_output(raw):
+    """Extract the final response.output from the terminal response.completed event."""
+    cur = None
+    for line in raw.splitlines():
+        if line.startswith("event:"):
+            cur = line[len("event:"):].strip()
+        elif line.startswith("data:") and cur == "response.completed":
+            try:
+                payload = json.loads(line[len("data:"):].strip())
+            except Exception:
+                continue
+            return (payload.get("response") or {}).get("output") or []
+    return []
+
+
+def _sse_terminated_cleanly(raw):
+    """A valid terminal SSE lifecycle: exactly one response.created and exactly one
+    terminal event (response.completed for success, or response.failed/error)."""
+    created = raw.count("event: response.created")
+    terminal = (
+        raw.count("event: response.completed")
+        + raw.count("event: response.failed")
+        + raw.count("event: error")
+    )
+    return created == 1 and terminal == 1
+
+
 def _responses(praxis_url, user, token, tools, stream=False, input_text="What is the weather in NYC?"):
     body = {
         "model": "scripted-model",
@@ -290,6 +336,56 @@ def test_item3b_gateway_denies_discovered_but_forbidden_call(stack, praxis, scri
         j = r.json()
         assert "weather_get_forecast" in _discovered_tools(j), j
         assert _mcp_call_error(j), j
+        assert _backend_count(stack, "get_forecast") == 0
+    finally:
+        _switch_authconfig("filtered")
+
+
+def test_item1_authorized_streaming(stack, praxis, scripted_model):
+    """Streaming equivalent of item 1: userA discovers + invokes over SSE, the
+    logical stream completes cleanly, and the backend executes once."""
+    token = _mint(stack, "userA", ROLES_AUTHORIZED)
+    _reset_backend(stack)
+    status, raw = _responses_stream(praxis, "userA", token, [MCP_TOOL])
+    assert status == 200, raw
+    assert raw.count("event: response.created") == 1, raw
+    assert raw.count("event: response.completed") == 1, raw
+    out = _sse_final_output(raw)
+    assert any(
+        o.get("type") == "mcp_list_tools"
+        and any(t.get("name") == "weather_get_forecast" for t in (o.get("tools") or []))
+        for o in out
+    ), raw
+    assert any(o.get("type") == "mcp_call" and not o.get("error") and o.get("output") for o in out), raw
+    assert _backend_count(stack, "get_forecast") == 1
+
+
+def test_item3a_undiscovered_streaming(stack, praxis, scripted_model):
+    """Streaming item 3a: a force-emitted call to an undiscovered tool is not
+    dispatched; the logical stream still completes cleanly with zero execution."""
+    token = _mint(stack, "userB", ROLES_NONE)
+    _reset_backend(stack)
+    status, raw = _responses_stream(
+        praxis, "userB", token, [MCP_TOOL], input_text="force-call:weather_get_forecast"
+    )
+    assert status == 200, raw
+    assert _sse_terminated_cleanly(raw), raw
+    assert not _mcp_call_ok({"output": _sse_final_output(raw)}), raw
+    assert _backend_count(stack, "get_forecast") == 0
+
+
+def test_item3b_gateway_denial_streaming(stack, praxis, scripted_model):
+    """Streaming item 3b: under open-discovery userB invokes the tool, the gateway
+    denies it, the tool error is surfaced, the stream completes cleanly, and the
+    backend never executes."""
+    _switch_authconfig("opendisco")
+    try:
+        token = _mint(stack, "userB", ROLES_NONE)
+        _reset_backend(stack)
+        status, raw = _responses_stream(praxis, "userB", token, [MCP_TOOL])
+        assert status == 200, raw
+        assert _sse_terminated_cleanly(raw), raw
+        assert _mcp_call_error({"output": _sse_final_output(raw)}), raw
         assert _backend_count(stack, "get_forecast") == 0
     finally:
         _switch_authconfig("filtered")

@@ -73,18 +73,18 @@ def base_response(body, output):
     }
 
 
-def final_message(body, text):
-    return base_response(body, [{
+def _msg_item(text):
+    return {
         "type": "message",
         "id": "msg_" + uuid.uuid4().hex[:16],
         "role": "assistant",
         "status": "completed",
         "content": [{"type": "output_text", "text": text, "annotations": []}],
-    }])
+    }
 
 
-def function_call(body, name):
-    return base_response(body, [{
+def _fc_item(name):
+    return {
         "type": "function_call",
         "id": "fc_" + uuid.uuid4().hex[:16],
         "call_id": "call_" + uuid.uuid4().hex[:16],
@@ -93,7 +93,13 @@ def function_call(body, name):
         "caller": None,
         "namespace": None,
         "status": "completed",
-    }])
+    }
+
+
+def _sse_frame(ev, data):
+    payload = {"type": ev}
+    payload.update(data)
+    return f"event: {ev}\ndata: {json.dumps(payload)}\n\n".encode()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -107,6 +113,36 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_sse(self, body, item):
+        rid = "resp_" + uuid.uuid4().hex[:16]
+        frames = [
+            _sse_frame("response.created", {
+                "response": {"id": rid, "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0,
+            }),
+            _sse_frame("response.output_item.added", {
+                "response_id": rid, "output_index": 0, "item": item, "sequence_number": 1,
+            }),
+        ]
+        seq = 2
+        if item["type"] == "message":
+            frames.append(_sse_frame("response.output_text.delta", {
+                "response_id": rid, "item_id": item["id"], "output_index": 0,
+                "delta": item["content"][0]["text"], "sequence_number": seq,
+            }))
+            seq += 1
+        resp = base_response(body, [item])
+        resp["id"] = rid
+        frames.append(_sse_frame("response.completed", {"response": resp, "sequence_number": seq}))
+        frames.append(b"data: [DONE]\n\n")
+        data = b"".join(frames)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length) if length else b""
@@ -116,24 +152,23 @@ class Handler(BaseHTTPRequestHandler):
             log("bad json:", e); self.send_response(400); self.send_header("Content-Length","0"); self.end_headers(); return
 
         ftools = function_tools(body)
+        stream = bool(body.get("stream"))
         if input_has_tool_output(body):
-            log(f"turn2 (tool result present) -> final message; tools={ftools}")
-            self._send(final_message(body, "The weather in NYC is sunny, 21C. (final answer)"))
-            return
-
-        forced = forced_tool(body)
-        if forced:
-            log(f"turn1 -> FORCED function_call {forced}; tools={ftools}")
-            self._send(function_call(body, forced))
-            return
-
-        match = next((n for n in ftools if SUBSTR in n), None)
-        if match:
-            log(f"turn1 -> function_call {match}; tools={ftools}")
-            self._send(function_call(body, match))
+            log(f"turn2 (tool result present) -> final message; stream={stream}; tools={ftools}")
+            item = _msg_item("The weather in NYC is sunny, 21C. (final answer)")
         else:
-            log(f"turn1 -> NO matching tool (substr='{SUBSTR}'); final message; tools={ftools}")
-            self._send(final_message(body, f"I don't have a '{SUBSTR}' tool available."))
+            name = forced_tool(body) or next((n for n in ftools if SUBSTR in n), None)
+            if name:
+                log(f"turn1 -> function_call {name}; stream={stream}; tools={ftools}")
+                item = _fc_item(name)
+            else:
+                log(f"turn1 -> NO matching tool (substr='{SUBSTR}'); final message; stream={stream}; tools={ftools}")
+                item = _msg_item(f"I don't have a '{SUBSTR}' tool available.")
+
+        if stream:
+            self._send_sse(body, item)
+        else:
+            self._send(base_response(body, [item]))
 
     def do_GET(self):
         self.send_response(200); self.send_header("Content-Length","2"); self.end_headers(); self.wfile.write(b"ok")
