@@ -1318,6 +1318,7 @@ fn validate_compactable_reasoning_item(item_idx: usize, item: &Value) -> Result<
     validate_reasoning_content(item_idx, item)
 }
 
+/// Reject reasoning fields that the compaction prompt cannot represent.
 fn validate_reasoning_item_fields(item_idx: usize, item: &Value) -> Result<(), FilterAction> {
     const ALLOWED_FIELDS: &[&str] = &["type", "id", "status", "summary", "content", "encrypted_content"];
 
@@ -1334,6 +1335,7 @@ fn validate_reasoning_item_fields(item_idx: usize, item: &Value) -> Result<(), F
     Ok(())
 }
 
+/// Validate reasoning identifiers, status, and opaque provider state.
 fn validate_reasoning_item_metadata(item_idx: usize, item: &Value) -> Result<(), FilterAction> {
     if item.get("encrypted_content").is_some_and(|value| !value.is_null()) {
         return Err(reject_reasoning_compaction(
@@ -1355,6 +1357,7 @@ fn validate_reasoning_item_metadata(item_idx: usize, item: &Value) -> Result<(),
     Ok(())
 }
 
+/// Require the reasoning summary to contain only plain summary text.
 fn validate_reasoning_summary(item_idx: usize, item: &Value) -> Result<(), FilterAction> {
     let Some(Value::Array(summary)) = item.get("summary") else {
         return Err(reject_reasoning_compaction(
@@ -1373,6 +1376,7 @@ fn validate_reasoning_summary(item_idx: usize, item: &Value) -> Result<(), Filte
     Ok(())
 }
 
+/// Validate optional raw reasoning content without including it in compaction.
 fn validate_reasoning_content(item_idx: usize, item: &Value) -> Result<(), FilterAction> {
     let Some(content) = item.get("content") else {
         return Ok(());
@@ -1394,6 +1398,7 @@ fn validate_reasoning_content(item_idx: usize, item: &Value) -> Result<(), Filte
     Ok(())
 }
 
+/// Check that a reasoning part contains only its expected type and text fields.
 fn is_reasoning_text_part(part: &Value, expected_type: &str) -> bool {
     part.get("type").and_then(Value::as_str) == Some(expected_type)
         && part.get("text").is_some_and(Value::is_string)
