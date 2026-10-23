@@ -39,6 +39,13 @@ filter_chains:
         credentials:
           - slot: mcp_gateway
             source_header: x-user-mcp-key
+        # The opaque x-mcp-authorized wristband courier. In Topology A the gateway's
+        # Authorino mints its own wristband, so this forwarded value is not the
+        # enforcement carrier — it is forwarded opaquely and asserted for courier
+        # correctness (reaches both discovery and dispatch; missing -> fail closed).
+        assertions:
+          - slot: mcp_gateway
+            source_header: x-mcp-authorized
       - filter: project_state_owner_headers
         tenant_header: x-tenant-id
         subject_header: x-user-id
@@ -70,6 +77,7 @@ filter_chains:
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
         user_credential: mcp_gateway
+        authorization_assertion: mcp_gateway
         forward_headers:
           - x-tenant-id
           - x-user-id
@@ -107,6 +115,7 @@ filter_chains:
                 timeout_secs: 600
               - filter: openai_mcp_dispatch
                 user_credential: mcp_gateway
+                authorization_assertion: mcp_gateway
                 forward_headers:
                   - x-tenant-id
                   - x-user-id

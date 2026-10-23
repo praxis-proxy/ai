@@ -22,6 +22,7 @@ Run: make test-kuadrant-acceptance   (or: uv run <this file> -s)
 """
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -54,6 +55,11 @@ MCP_TOOL = {
 # resource_access role sets for the two identities.
 ROLES_AUTHORIZED = {"weather": {"roles": ["tool:get_forecast"]}}
 ROLES_NONE = {"weather": {"roles": []}}
+
+# A representative opaque x-mcp-authorized wristband forwarded by Praxis (the courier
+# the issue names). In Topology A the gateway's Authorino mints its own, so the value
+# is opaque to enforcement; it is forwarded unchanged and observed for item 7.
+WRISTBAND = "praxis-forwarded-wristband-" + "a" * 32
 
 
 # --- low-level helpers -------------------------------------------------------
@@ -125,19 +131,26 @@ def _switch_authconfig(variant):
     subprocess.run(["bash", str(SWITCH), variant], check=True)
 
 
+def _ingress_lines(stack):
+    """Parse the Envoy ingress observer's one-way digests (item 7) from envoy logs."""
+    engine = stack["KUADRANT_CONTAINER_ENGINE"]
+    out = subprocess.run([engine, "logs", "envoy"], capture_output=True, text=True)
+    text = (out.stdout or "") + (out.stderr or "")
+    lines = []
+    for ln in text.splitlines():
+        m = re.search(r"MCPINGRESS method=(\S+) bearer=(\S+) wristband=(\S+)", ln)
+        if m:
+            lines.append({"method": m.group(1), "bearer": m.group(2), "wristband": m.group(3)})
+    return lines
+
+
 # --- streaming helpers -------------------------------------------------------
 
 def _responses_stream(praxis_url, user, token, tools, input_text="What is the weather in NYC?"):
     """Drive a streaming Responses request; return (status, raw_sse_text)."""
     body = {"model": "scripted-model", "input": input_text, "store": False, "stream": True, "tools": tools}
-    headers = {
-        "Content-Type": "application/json",
-        "x-auth-tenant": "acme",
-        "x-auth-user": user,
-        "x-user-mcp-key": token,
-    }
     raw = ""
-    with httpx.stream("POST", praxis_url + "/v1/responses", headers=headers, json=body, timeout=90) as r:
+    with httpx.stream("POST", praxis_url + "/v1/responses", headers=_headers(user, token), json=body, timeout=90) as r:
         status = r.status_code
         for chunk in r.iter_text():
             raw += chunk
@@ -171,7 +184,20 @@ def _sse_terminated_cleanly(raw):
     return created == 1 and terminal == 1
 
 
-def _responses(praxis_url, user, token, tools, stream=False, input_text="What is the weather in NYC?"):
+def _headers(user, token, wristband=WRISTBAND):
+    h = {
+        "Content-Type": "application/json",
+        "x-auth-tenant": "acme",
+        "x-auth-user": user,
+        "x-user-mcp-key": token,
+    }
+    if wristband is not None:
+        h["x-mcp-authorized"] = wristband
+    return h
+
+
+def _responses(praxis_url, user, token, tools, stream=False,
+               input_text="What is the weather in NYC?", wristband=WRISTBAND):
     body = {
         "model": "scripted-model",
         "input": input_text,
@@ -179,13 +205,8 @@ def _responses(praxis_url, user, token, tools, stream=False, input_text="What is
         "stream": stream,
         "tools": tools,
     }
-    headers = {
-        "Content-Type": "application/json",
-        "x-auth-tenant": "acme",
-        "x-auth-user": user,
-        "x-user-mcp-key": token,
-    }
-    return httpx.post(praxis_url + "/v1/responses", headers=headers, json=body, timeout=90)
+    return httpx.post(praxis_url + "/v1/responses", headers=_headers(user, token, wristband),
+                      json=body, timeout=90)
 
 
 def _discovered_tools(resp_json):
@@ -389,6 +410,24 @@ def test_item3b_gateway_denial_streaming(stack, praxis, scripted_model):
         assert _backend_count(stack, "get_forecast") == 0
     finally:
         _switch_authconfig("filtered")
+
+
+def test_item7_same_forwarded_identity_reaches_discovery_and_dispatch(stack, praxis, scripted_model):
+    """At gateway ingress (before Authorino replaces the header), the same per-user
+    Bearer and forwarded x-mcp-authorized reach BOTH discovery (tools/list) and
+    dispatch (tools/call), compared as one-way digests — never logging raw creds."""
+    token = _mint(stack, "userA", ROLES_AUTHORIZED)
+    _reset_backend(stack)
+    before = len(_ingress_lines(stack))
+    r = _responses(praxis, "userA", token, [MCP_TOOL], stream=False)
+    assert r.status_code == 200, r.text
+    assert _mcp_call_ok(r.json()), r.text  # both discovery and dispatch occurred
+    new = _ingress_lines(stack)[before:]
+    lists = [ln for ln in new if ln["method"] == "tools/list"]
+    calls = [ln for ln in new if ln["method"] == "tools/call"]
+    assert lists and calls, new
+    assert lists[-1]["bearer"] == calls[-1]["bearer"] != "0", new
+    assert lists[-1]["wristband"] == calls[-1]["wristband"] != "0", new
 
 
 if __name__ == "__main__":

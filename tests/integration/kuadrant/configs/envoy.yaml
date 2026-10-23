@@ -29,6 +29,31 @@ static_resources:
                         - match: {prefix: "/"}
                           route: {cluster: broker_http, timeout: 60s}
                 http_filters:
+                  # Ingress observer (item 7): runs FIRST, before the MCP router strips
+                  # x-mcp-authorized on the dispatch (tools/call) path and before
+                  # Authorino replaces it, so a test can prove the SAME forwarded Bearer
+                  # + x-mcp-authorized reach both discovery and dispatch. Labels each
+                  # request by the JSON-RPC method in the body; logs only a one-way djb2
+                  # fingerprint — never the raw credential.
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      default_source_code:
+                        inline_string: |
+                          function djb2(s)
+                            if s == nil or s == "" then return "0" end
+                            local h = 5381
+                            for i = 1, #s do
+                              h = (h * 33 + string.byte(s, i)) % 4294967296
+                            end
+                            return string.format("%08x", h)
+                          end
+                          function envoy_on_request(handle)
+                            local hdr = handle:headers()
+                            local md = handle:streamInfo():dynamicMetadata()
+                            md:set("mcp.ingress", "bearer", djb2(hdr:get("authorization")))
+                            md:set("mcp.ingress", "wristband", djb2(hdr:get("x-mcp-authorized")))
+                          end
                   - name: envoy.filters.http.ext_proc
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
@@ -46,6 +71,21 @@ static_resources:
                         response_trailer_mode: SKIP
                       grpc_service:
                         envoy_grpc: {cluster_name: router_grpc}
+                  # Ingress observer part 2 (item 7): runs AFTER the router sets
+                  # x-mcp-method, reads the pre-strip digests captured in dynamic
+                  # metadata, and logs them labeled by the JSON-RPC method.
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      default_source_code:
+                        inline_string: |
+                          function envoy_on_request(handle)
+                            local hdr = handle:headers()
+                            local md = handle:streamInfo():dynamicMetadata():get("mcp.ingress") or {}
+                            handle:logWarn("MCPINGRESS method=" .. (hdr:get("x-mcp-method") or "?") ..
+                              " bearer=" .. (md["bearer"] or "0") ..
+                              " wristband=" .. (md["wristband"] or "0"))
+                          end
                   - name: envoy.filters.http.ext_authz
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
