@@ -718,6 +718,10 @@ fn keep_tool_answers_adjacent(messages: &mut Vec<Value>) {
 /// Each answer position is assigned to the first block that expects its call
 /// ID, so a block can collect answers that trail a later block. Answers that
 /// appear before their block, or that no block expects, are left in place.
+/// Planning scans the drained slot list once per expected call ID, so its cost
+/// is linear in history length per expected answer and it runs once per
+/// translated request; displacement itself is a single rebuild that moves
+/// each message exactly once.
 fn plan_answer_pulls(slots: &[Option<Value>], consumed: &mut HashSet<usize>) -> HashMap<usize, Vec<usize>> {
     let mut pulled_after: HashMap<usize, Vec<usize>> = HashMap::new();
     for (block, slot) in slots.iter().enumerate() {
