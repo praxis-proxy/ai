@@ -430,5 +430,59 @@ def test_item7_same_forwarded_identity_reaches_discovery_and_dispatch(stack, pra
     assert lists[-1]["wristband"] == calls[-1]["wristband"] != "0", new
 
 
+def test_item4a_invalid_bearer_rejected_at_gateway(stack, praxis, scripted_model):
+    """A tampered per-user Bearer is forwarded opaquely by Praxis (no short-circuit)
+    and rejected at the gateway (Authorino), so no tool is invoked and the backend
+    never executes."""
+    bad = _mint(stack, "userA", ROLES_AUTHORIZED, tamper=True)
+    _reset_backend(stack)
+    before = len(_ingress_lines(stack))
+    r = _responses(praxis, "userA", bad, [MCP_TOOL], stream=False)
+    # Praxis forwards the tampered bearer opaquely (no short-circuit): it reaches the
+    # gateway, Authorino rejects it, and discovery fails — surfaced as a connector
+    # resolve failure (502), never a successful invocation.
+    assert r.status_code == 502, r.text
+    assert "trusted-mcp" in r.text and "resolve" in r.text, r.text
+    assert len(_ingress_lines(stack)) > before, "the bad bearer must reach the gateway (no short-circuit)"
+    assert _backend_count(stack, "get_forecast") == 0
+
+
+def test_item4_missing_bearer_slot_fails_closed_at_praxis(stack, praxis, scripted_model):
+    """A configured credential slot that resolves to nothing (ingress omits
+    x-user-mcp-key) fails closed AT PRAXIS before any gateway dial — distinct from a
+    present-but-invalid Bearer, which is forwarded (item 4a)."""
+    _reset_backend(stack)
+    before = len(_ingress_lines(stack))
+    headers = {
+        "Content-Type": "application/json",
+        "x-auth-tenant": "acme",
+        "x-auth-user": "userA",
+        "x-mcp-authorized": WRISTBAND,  # assertion present; the bearer slot is the one missing
+    }
+    body = {"model": "scripted-model", "input": "weather?", "store": False, "stream": False, "tools": [MCP_TOOL]}
+    r = httpx.post(praxis + "/v1/responses", headers=headers, json=body, timeout=30)
+    # Praxis fails closed locally: no gateway ingress for this request, no execution.
+    assert len(_ingress_lines(stack)) == before, "gateway must see no request (Praxis short-circuits)"
+    assert _backend_count(stack, "get_forecast") == 0
+    # and the request did not succeed in invoking the tool
+    try:
+        assert not _mcp_call_ok(r.json()), r.text
+    except ValueError:
+        pass  # non-JSON error body is also acceptable
+
+
+def test_item4b_invalid_forwarded_wristband_is_not_an_enforcement_point(stack, praxis, scripted_model):
+    """EXPLICITLY UNCOVERED in Topology A: a garbage forwarded x-mcp-authorized has no
+    enforcement effect — the front-door Authorino mints its own wristband. With a
+    valid Bearer the call still succeeds. (A broker-trust topology would instead yield
+    an empty discovery list, not a 401/403; we do not claim 'rejected' here.)"""
+    token = _mint(stack, "userA", ROLES_AUTHORIZED)
+    _reset_backend(stack)
+    r = _responses(praxis, "userA", token, [MCP_TOOL], stream=False, wristband="garbage-not-a-jwt")
+    assert r.status_code == 200, r.text
+    assert _mcp_call_ok(r.json()), r.text
+    assert _backend_count(stack, "get_forecast") == 1
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"] + sys.argv[1:]))
