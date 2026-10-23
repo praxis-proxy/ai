@@ -431,9 +431,10 @@ impl ResponsesToChatCompletionsFilter {
                 "openai_responses_to_chat_completions: missing Responses state for streaming translation".into(),
             );
         };
-        // `input` was moved out of `request_body` at state init (#1618); rebuild
-        // the client's input so streaming snapshots echo it onto the resource.
-        let echoed_input = super::request_input::input_echo_value(state);
+        // `input` was moved out of `request_body` at state init (#1618); rebuild the
+        // client's input once for this stream so lifecycle snapshots echo it without
+        // every heartbeat callback reconstructing it.
+        converter.ensure_echoed_input(state);
         let inputs = SnapshotInputs {
             request_body: &state.request_body,
             tools: &state.tools,
@@ -442,7 +443,6 @@ impl ResponsesToChatCompletionsFilter {
             // hosted form even after openai_file_search_dispatch lowers
             // request_body for the backend.
             original_tool_choice: state.original_tool_choice.as_ref().or(Some(&state.tool_choice)),
-            input: echoed_input.as_ref(),
             now,
         };
 
@@ -549,7 +549,10 @@ fn reserve_chat_stream_snapshots(ctx: &mut HttpFilterContext<'_>) -> Option<usiz
         )
         .ok()
         .flatten()?;
-        let source = request.checked_add(tools)?.checked_add(choice)?;
+        // `input` was moved out of `request_body` at init (#1618); the lifecycle
+        // snapshots echo it back, so include the retained input in the projection.
+        let input = bounded_json_size(&state.input, MAX_JSON_BODY_BYTES).ok().flatten()?;
+        let source = request.checked_add(tools)?.checked_add(choice)?.checked_add(input)?;
         let reserve = source
             .checked_mul(CHAT_STREAM_ECHO_MULTIPLIER)?
             .checked_add(CHAT_STREAM_ERROR_RESERVE)?;
@@ -666,9 +669,12 @@ fn reserve_finite_chat_response(ctx: &mut HttpFilterContext<'_>, body: &[u8]) ->
         if state.simple_budget.is_none() {
             return true;
         }
+        // `input` was moved out of `request_body` at init (#1618), so size the echo
+        // from the parameters plus the retained input snapshot the resource rebuilds.
         bounded_json_size(&state.request_body, MAX_JSON_BODY_BYTES)
             .ok()
             .flatten()
+            .and_then(|params| params.checked_add(bounded_json_size(&state.input, MAX_JSON_BODY_BYTES).ok().flatten()?))
             .and_then(|bytes| bytes.checked_mul(4))
     };
     let charge = echo_charge.and_then(|echo| output_charge(body)?.checked_add(echo));

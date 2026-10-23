@@ -123,6 +123,44 @@ fn budgeted_chat_response_overflow_rejects_before_json_parse() {
     assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
 }
 
+#[test]
+fn budgeted_finite_echo_reservation_counts_moved_out_input() {
+    // #1618 moved `input` out of `request_body`; the finite echo reservation must
+    // still count it, or a large input echo slips through unreserved. A tiny-param
+    // request with a large input and headroom that fits the params echo but not the
+    // input echo must reject.
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(RESPONSE_TRANSFORM_KEY, "success");
+    let big_input: Vec<_> = (0..400)
+        .map(|i| json!({"role": "user", "content": format!("message {i} with some filler text to add bytes")}))
+        .collect();
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": big_input, "store": false}));
+    assert!(
+        state.request_body.get("input").is_none(),
+        "precondition: #1618 strips input from request_body"
+    );
+    // Headroom (limit - input_charge - response_reserve = 1M - 605K - 375K = 20K)
+    // comfortably covers the params echo + small response, but not the
+    // (params + input) * 4 echo projection the ~28 KB input adds (~112 KB).
+    state.simple_budget = SimpleBudget::new_with_store(1_000_000, 605_000, false);
+    assert!(state.simple_budget.is_some(), "budget params must be admissible");
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(
+        br#"{"id":"c","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+    ));
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("the finite echo reservation must count the moved-out input and reject");
+    };
+    assert_eq!(rejection.status, 502);
+    assert!(body.is_none());
+}
+
 #[tokio::test]
 async fn budgeted_chat_stream_rejects_partial_frame_before_retaining_it() {
     for headers_committed in [false, true] {

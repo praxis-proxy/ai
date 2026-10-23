@@ -48,7 +48,6 @@ fn tools_of(body: &Value) -> &[Value] {
 /// Feed one chunk and append any emitted bytes to `raw`.
 fn push(conv: &mut StreamConverter, body: &Value, chunk: &[u8], raw: &mut Vec<u8>) {
     let inputs = SnapshotInputs {
-        input: None,
         request_body: body,
         tools: tools_of(body),
         original_tool_choice: None,
@@ -62,7 +61,6 @@ fn push(conv: &mut StreamConverter, body: &Value, chunk: &[u8], raw: &mut Vec<u8
 /// Finalize the stream and append any emitted bytes to `raw`.
 fn finish(conv: &mut StreamConverter, body: &Value, raw: &mut Vec<u8>) {
     let inputs = SnapshotInputs {
-        input: None,
         request_body: body,
         tools: tools_of(body),
         original_tool_choice: None,
@@ -566,7 +564,6 @@ fn streaming_file_search_echo_uses_hosted_tools_after_backend_lowering() {
     let hosted_tools = vec![json!({"type": "file_search", "vector_store_ids": ["vs_q4"]})];
     let hosted_tool_choice = json!({"type": "file_search"});
     let inputs = SnapshotInputs {
-        input: None,
         request_body: &lowered_request_body,
         tools: &hosted_tools,
         original_tool_choice: Some(&hosted_tool_choice),
@@ -861,7 +858,6 @@ fn partial_frame_after_terminal_fails_at_eof() {
         &mut raw,
     );
     let inputs = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -1351,7 +1347,6 @@ fn trailing_frame_after_terminal_in_later_callback_fails() {
         &mut raw,
     );
     let inputs = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -1374,7 +1369,6 @@ fn trailing_frame_after_terminal_in_same_callback_fails() {
     let body = request_body();
     let mut conv = converter(wide_limits());
     let inputs = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -1409,7 +1403,6 @@ fn empty_callback_after_terminal_is_tolerated() {
         &mut raw,
     );
     let inputs = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -1475,7 +1468,6 @@ fn empty_stream_with_tiny_event_budget_still_emits_failed() {
         };
         let mut conv = converter(limits);
         let inputs = SnapshotInputs {
-            input: None,
             request_body: &body,
             tools: tools_of(&body),
             original_tool_choice: None,
@@ -1584,7 +1576,6 @@ fn timeout_emits_failed() {
     let mut raw = Vec::new();
     // First push establishes the start time.
     let first = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -1601,7 +1592,6 @@ fn timeout_emits_failed() {
     }
     // A later push beyond the timeout window fails.
     let late = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -1723,7 +1713,6 @@ fn failed_terminal_does_not_echo_unbounded_request_fields() {
     let mut conv = converter(limits);
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -1806,7 +1795,6 @@ fn failed_terminal_fallback_is_schema_complete() {
     let mut conv = converter(limits);
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -1878,7 +1866,6 @@ fn failed_terminal_fallback_is_bounded_by_request_fields() {
     let mut conv = converter(limits);
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -1936,7 +1923,6 @@ fn bounded_failure_has_null_completed_at() {
     let mut conv = converter(limits);
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -1985,7 +1971,6 @@ fn finish_after_timeout_emits_failed() {
     // Establish the start time and reach provider-done without emitting a
     // terminal (no `[DONE]`), so the terminal is deferred to `finish`.
     let started = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -2002,7 +1987,6 @@ fn finish_after_timeout_emits_failed() {
     }
     // The EOF callback arrives well past the timeout window.
     let elapsed = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -2206,7 +2190,6 @@ fn large_lifecycle_frame_needs_accumulator_headroom() {
     let mut conv = converter(limits);
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -2314,7 +2297,6 @@ fn lifecycle_frame_overflow_rolls_back_the_pair() {
         "stream": true,
     });
     let inputs = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -2464,7 +2446,6 @@ fn terminal_over_byte_limit_fails_without_committed_items() {
     let mut conv = converter(limits);
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -2526,7 +2507,6 @@ fn oversized_lifecycle_frame_fails_closed_with_minimal_snapshot() {
     let mut conv = converter(limits);
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -2616,7 +2596,6 @@ fn minimal_failed_frame_persists_under_default_accumulator() {
     let mut conv = converter(limits);
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -2791,7 +2770,6 @@ fn minimal_terminal_fits_at_floor_ceiling() {
     let mut conv = converter(limits);
     let mut raw = Vec::new();
     let inputs = SnapshotInputs {
-        input: None,
         request_body: &body,
         tools: tools_of(&body),
         original_tool_choice: None,
@@ -3279,4 +3257,35 @@ fn late_reasoning_replay_position_is_published_once_only_after_success() {
     );
     assert_eq!(parse_events(&raw).last().unwrap().0, "response.failed");
     assert_eq!(conv.take_replay_reasoning_index(), None);
+}
+
+#[test]
+fn streaming_heartbeats_do_not_rebuild_input_echo() {
+    // #1618: `input` moved out of `request_body`; the converter reconstructs the
+    // echo once (`ensure_echoed_input`) rather than on every SSE callback. Many
+    // heartbeat comments must therefore not reallocate the large input echo.
+    let big_input: Vec<_> = (0..400)
+        .map(|i| json!({"role": "user", "content": format!("message {i} with some filler text to add bytes")}))
+        .collect();
+    let state = ResponsesState::from_request_body(json!({"model": "m", "input": big_input}));
+    let input_bytes = serde_json::to_vec(&state.input).unwrap().len();
+    assert!(input_bytes > 20_000, "test needs a large input to be meaningful");
+
+    let mut conv = converter(wide_limits());
+    conv.ensure_echoed_input(&state); // one-time reconstruction, outside the measured region
+    let params_body = state.request_body.clone(); // input-stripped params, as production sees
+
+    let info = allocation_counter::measure(|| {
+        let mut raw = Vec::new();
+        for _ in 0..200 {
+            push(&mut conv, &params_body, b": ping\n\n", &mut raw);
+        }
+        std::hint::black_box(&raw);
+    });
+
+    assert!(
+        info.bytes_total < input_bytes as u64,
+        "200 heartbeat callbacks must not rebuild the {input_bytes}-byte input echo (allocated {} bytes)",
+        info.bytes_total
+    );
 }
