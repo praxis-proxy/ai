@@ -4898,22 +4898,39 @@ class TestResponsesCompactionVLLM:
             "rejected opaque compaction state must never reach the summarizer"
         )
 
-    def test_explicit_compact_valid_input_makes_one_callout(self, compact_client):
-        """Control for the #1403 rejection: a well-typed inline input compacts
-        with exactly one summarization callout and returns a compaction object."""
+    def test_explicit_compact_preserves_reasoning_summary_without_raw_content(
+        self, compact_client
+    ):
+        """The SDK compacts a reasoning item using only its safe summary."""
+        safe_summary = "safe reasoning summary for compaction"
+        raw_reasoning = "PRIVATE-RAW-REASONING-DO-NOT-SEND"
         before = len(CompactionHandler.requests)
         result = compact_client.responses.compact(
             model=VLLM_MODEL,
-            input=[
-                {"role": "user", "content": "Explain TCP vs UDP."},
-                {"role": "assistant", "content": "TCP is reliable; UDP is not."},
-            ],
+            extra_body={
+                "input": [
+                    {"role": "user", "content": "Explain TCP vs UDP."},
+                    {
+                        "type": "reasoning",
+                        "id": "rs_sdk_compact",
+                        "status": "completed",
+                        "summary": [{"type": "summary_text", "text": safe_summary}],
+                        "content": [{"type": "reasoning_text", "text": raw_reasoning}],
+                    },
+                    {"role": "assistant", "content": "TCP is reliable; UDP is not."},
+                ]
+            },
         )
 
         assert result.id, "a successful compact returns an identified compaction"
         assert result.object == "response.compaction"
         assert len(CompactionHandler.requests) == before + 1, (
             "a valid explicit compact must make exactly one summarization callout"
+        )
+        conversation = CompactionHandler.requests[-1]["messages"][1]["content"]
+        assert safe_summary in conversation, "the reasoning summary must reach the summarizer"
+        assert raw_reasoning not in conversation, (
+            "raw reasoning text must stay out of the summarizer request"
         )
 
     def test_below_threshold_skips_compaction(self, compact_client):
@@ -9012,8 +9029,9 @@ class TestAgenticLoopVLLM:
         # against *resumed*-round text without depending on model prose.
         added = []  # (output_index, item_type, item_id, sequence_number)
         done = []   # (output_index, item_type, item_id, sequence_number)
-        # #276 tool-specific progress/outcome events: (type, item_id, seq).
+        # #276 tool-specific progress/outcome events: (type, item_id, output_index, seq).
         ws_progress = []
+        sequence_numbers = []
         ws_added_at = None
         # (position, output_index) per output_text.delta; the ordering check
         # isolates resumed text (output_index > ws_index) from any round-0
@@ -9022,6 +9040,7 @@ class TestAgenticLoopVLLM:
         final_response = None
 
         for position, event in enumerate(stream):
+            sequence_numbers.append(event.sequence_number)
             etype = event.type
             if etype == "response.output_item.added":
                 item = event.item.model_dump()
@@ -9043,7 +9062,7 @@ class TestAgenticLoopVLLM:
                 "response.web_search_call.completed",
             ):
                 ws_progress.append(
-                    (etype, event.item_id, event.sequence_number)
+                    (etype, event.item_id, event.output_index, event.sequence_number)
                 )
             elif etype == "response.output_text.delta":
                 text_deltas.append((position, event.output_index))
@@ -9053,6 +9072,8 @@ class TestAgenticLoopVLLM:
         assert final_response is not None, (
             "stream must terminate with a response.completed event"
         )
+        assert all(isinstance(number, int) for number in sequence_numbers), sequence_numbers
+        assert sequence_numbers == sorted(set(sequence_numbers)), sequence_numbers
 
         # #276 core: each locally executed web_search_call must be streamed as
         # one incremental output_item.added. Without the synthesis they appear
@@ -9080,7 +9101,7 @@ class TestAgenticLoopVLLM:
 
         # Each local call gets one complete progress lifecycle between its
         # output-item events, regardless of how many times the model searches.
-        progress_ids = [item_id for _, item_id, _ in ws_progress]
+        progress_ids = [item_id for _, item_id, _, _ in ws_progress]
         assert len(progress_ids) == len(ws_ids) * 3 and set(progress_ids) == set(ws_ids), (
             "each web_search_call must emit exactly three progress events; "
             f"added ids={ws_ids}, progress events={ws_progress}"
@@ -9102,10 +9123,20 @@ class TestAgenticLoopVLLM:
                 f"web_search_call {ws_id!r} must emit its progress events once "
                 f"in order; got: {ws_prog}"
             )
-            event_sequences = [ws_added_seq, *(p[2] for p in ws_prog), ws_done_item[3]]
-            assert all(left < right for left, right in zip(event_sequences, event_sequences[1:])), (
+            assert all(p[2] == ws_index for p in ws_prog), (
+                "each web_search_call progress event must reuse the added item's "
+                f"output_index; id={ws_id!r}, added index={ws_index}, progress={ws_prog}"
+            )
+            assert (
+                ws_added_seq
+                < ws_prog[0][3]
+                < ws_prog[1][3]
+                < ws_prog[2][3]
+                < ws_done_item[3]
+            ), (
                 "web_search_call events must be ordered added -> in_progress -> "
-                f"searching -> completed -> done; id={ws_id!r}, seqs={event_sequences}"
+                f"searching -> completed -> done; id={ws_id!r}, "
+                f"seqs={[ws_added_seq, *(p[3] for p in ws_prog), ws_done_item[3]]}"
             )
 
         ws_index = ws_added[0][0]
@@ -9137,14 +9168,19 @@ class TestAgenticLoopVLLM:
         # was streamed at -- the incremental events and final snapshot are one
         # coherent view, not two divergent ones.
         snapshot = [
-            (idx, item.id)
+            (idx, item.id, item.status)
             for idx, item in enumerate(final_response.output)
             if item.type == "web_search_call"
         ]
         streamed_calls = [(idx, item_id) for idx, _, item_id, _ in ws_added]
-        assert snapshot == streamed_calls, (
+        snapshot_calls = [(idx, item_id) for idx, item_id, _ in snapshot]
+        assert snapshot_calls == streamed_calls, (
             "the terminal snapshot must match every streamed web_search_call "
-            f"at the same output index; streamed={streamed_calls}, snapshot={snapshot}"
+            f"at the same output index; streamed={streamed_calls}, snapshot={snapshot_calls}"
+        )
+        assert all(status == "completed" for _, _, status in snapshot), (
+            "each terminal web_search_call must be completed; "
+            f"snapshot={snapshot}"
         )
 
     def test_client_function_exits_openai(self, agentic_client):

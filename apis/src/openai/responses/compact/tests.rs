@@ -1085,6 +1085,40 @@ fn compaction_source_rejects_encrypted_reasoning_state() {
 }
 
 #[test]
+fn compaction_source_rejects_unrepresentable_reasoning_items() {
+    let cases = [
+        json!({"type": "reasoning", "id": "rs_1", "summary": [], "extra": 1}),
+        json!({"type": "reasoning", "summary": []}),
+        json!({"type": "reasoning", "id": 7, "summary": []}),
+        json!({"type": "reasoning", "id": "rs_1", "status": "bogus", "summary": []}),
+        json!({"type": "reasoning", "id": "rs_1"}),
+        json!({"type": "reasoning", "id": "rs_1", "summary": "not an array"}),
+        json!({"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": 1}]}),
+        json!({"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "x", "extra": 1}]}),
+        json!({"type": "reasoning", "id": "rs_1", "summary": [], "content": "not an array"}),
+        json!({"type": "reasoning", "id": "rs_1", "summary": [], "content": [{"type": "other", "text": "x"}]}),
+        json!({"type": "reasoning", "id": "rs_1", "summary": [], "content": [{"type": "reasoning_text", "text": 1}]}),
+        json!({"type": "reasoning", "id": "rs_1", "summary": [], "content": [{"type": "reasoning_text", "text": "x", "extra": 1}]}),
+    ];
+
+    for item in cases {
+        assert_compaction_source_rejects_reasoning_item(item);
+    }
+}
+
+#[test]
+fn compaction_source_accepts_null_encrypted_reasoning_content() {
+    let messages = [json!({
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [],
+        "encrypted_content": null
+    })];
+
+    validate_compaction_source(messages.iter()).expect("null encrypted_content carries no opaque state");
+}
+
+#[test]
 fn compaction_source_accepts_renderable_compaction_summary() {
     let messages = [build_compaction_item(
         "compact_prior",
@@ -2025,6 +2059,20 @@ fn is_compactable_returns_false_with_non_compaction_config() {
 // =============================================================================
 // Test Utilities
 // =============================================================================
+
+#[track_caller]
+fn assert_compaction_source_rejects_reasoning_item(item: Value) {
+    let messages = [item];
+    let Err(FilterAction::Reject(rejection)) = validate_compaction_source(messages.iter()) else {
+        panic!("unrepresentable reasoning item must be rejected");
+    };
+    assert_eq!(rejection.status, 400, "unrepresentable reasoning must return HTTP 400");
+    let body = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(
+        body.contains("compaction cannot replace source item"),
+        "unexpected rejection: {body}"
+    );
+}
 
 /// Assert a parse result is an HTTP 400 `invalid_request_error` whose message
 /// contains `needle`. Generic over the success type so it covers both whole-body
