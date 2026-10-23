@@ -236,6 +236,18 @@ pub(super) struct TokenRateLimitConfig {
     #[serde(default)]
     pub default_weights: super::weights::TokenTypeWeightsConfig,
 
+    /// Reconcile reservations from `token.quota.value` published by an
+    /// earlier response-phase `token_quota` filter instead of recomputing
+    /// static token weights inside this filter. Defaults to `false` for full
+    /// compatibility with existing configurations.
+    ///
+    /// Mutually exclusive with both `default_weights` and per-rule `weights`:
+    /// the shared CEL result must be the single source of quota units.
+    /// Server startup also requires one unconditional response chain ordered
+    /// `token_rate_limit`, `token_quota`, then `token_count`.
+    #[serde(default)]
+    pub use_token_quota: bool,
+
     /// Optional three-level hierarchy enforcing independent org, team,
     /// and user budgets on each request. Exactly three levels in
     /// `[org, team, user]` order are required when present; each level

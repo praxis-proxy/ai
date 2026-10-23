@@ -11,6 +11,8 @@
 mod ceiling;
 mod count;
 mod headers;
+#[cfg(any(feature = "token-quota-filter", feature = "token-rate-limit-filter"))]
+pub(crate) mod normalized;
 mod providers;
 mod stream_usage;
 mod streaming;
@@ -58,6 +60,34 @@ pub(crate) const META_TOKEN_CACHE_WRITE: &str = "token.cache_write";
 
 /// Metadata key for reasoning / thinking tokens reported by the provider.
 pub(crate) const META_TOKEN_REASONING: &str = "token.reasoning";
+
+/// Metadata containing CEL-derived quota units for downstream consumers.
+pub(crate) const META_TOKEN_QUOTA_VALUE: &str = "token.quota.value";
+
+/// Metadata identifying the formula that produced [`META_TOKEN_QUOTA_VALUE`].
+pub(crate) const META_TOKEN_QUOTA_FORMULA: &str = "token.quota.formula";
+
+/// Metadata naming the non-currency unit of [`META_TOKEN_QUOTA_VALUE`].
+pub(crate) const META_TOKEN_QUOTA_UNIT: &str = "token.quota.unit";
+
+/// Metadata describing the quota evaluation outcome.
+pub(crate) const META_TOKEN_QUOTA_STATUS: &str = "token.quota.status";
+
+/// [`META_TOKEN_QUOTA_STATUS`] value for a published quota result.
+#[cfg(any(feature = "token-quota-filter", feature = "token-rate-limit-filter"))]
+pub(crate) const TOKEN_QUOTA_STATUS_EVALUATED: &str = "evaluated";
+
+/// Exact CEL inputs retained request-locally for audit-event consumers.
+///
+/// This richer object intentionally uses typed extensions instead of bounded
+/// string metadata. Scalar quota results remain metadata for generic consumers.
+#[derive(Clone, Debug)]
+pub(crate) struct TokenQuotaAudit {
+    /// Normalized usage object supplied to CEL.
+    pub(crate) usage: serde_json::Value,
+    /// Routing context object supplied to CEL.
+    pub(crate) context: serde_json::Value,
+}
 
 /// Unified token usage extracted from an AI provider response.
 ///

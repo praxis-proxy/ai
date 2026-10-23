@@ -3570,6 +3570,7 @@ dependencies = [
  "aws-sigv4",
  "base64 0.23.1",
  "bytes",
+ "cel",
  "chrono",
  "dashmap",
  "http",

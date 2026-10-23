@@ -20,13 +20,11 @@
 //! at the input weight so quota cannot drop below the provider total.
 //! See [`weighted_cost`].
 
-use praxis_filter::{FilterError, HttpFilterContext};
+use praxis_filter::FilterError;
 use serde::Deserialize;
 
-use crate::token_usage::{
-    META_TOKEN_CACHE_READ, META_TOKEN_CACHE_WRITE, META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_REASONING,
-    META_TOKEN_STATUS, META_TOKEN_TOTAL, TOKEN_STATUS_OVERFLOW,
-};
+use crate::token_usage::normalized::{NormalizedUsage, UsageInput};
+pub(super) use crate::token_usage::normalized::{UsageCounts, parse_u64_meta};
 
 /// Cap for the float→integer conversion. Matches the `f64` safe-integer
 /// bound the ledgers already enforce on `capacity`, so a weighted cost can
@@ -66,6 +64,17 @@ pub(super) struct TokenTypeWeightsConfig {
     /// Weight for reasoning / thinking tokens (`token.reasoning`).
     #[serde(default)]
     pub reasoning: Option<f64>,
+}
+
+impl TokenTypeWeightsConfig {
+    /// Whether this layer contributes no weight overrides.
+    pub(super) fn is_empty(&self) -> bool {
+        self.input.is_none()
+            && self.output.is_none()
+            && self.cached_input.is_none()
+            && self.cache_write.is_none()
+            && self.reasoning.is_none()
+    }
 }
 
 /// Resolved weights applied on the reconcile hot path. Every field is
@@ -132,51 +141,6 @@ fn checked_weight(value: f64, loc: &str, field: &str) -> Result<f64, FilterError
     }
 }
 
-/// Typed usage recovered from `token_count` metadata. Every count is
-/// optional so absence stays distinct from a reported zero.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct UsageCounts {
-    /// `token.input`, cache included.
-    pub input: Option<u64>,
-    /// `token.output` (visible candidates on Google).
-    pub output: Option<u64>,
-    /// `token.total`.
-    pub total: Option<u64>,
-    /// `token.cache_read`, a subset of `input`.
-    pub cache_read: Option<u64>,
-    /// `token.cache_write`, a subset of `input`.
-    pub cache_write: Option<u64>,
-    /// `token.reasoning`.
-    pub reasoning: Option<u64>,
-    /// `token.status == overflow`: capture was abandoned; do not trust
-    /// any partial counts for quota.
-    pub overflow: bool,
-}
-
-impl UsageCounts {
-    /// Read the `token.*` keys `token_count` publishes onto `ctx`.
-    ///
-    /// Unparseable values are treated as absent, matching the pre-M4
-    /// `token.total` parse.
-    pub(super) fn from_context(ctx: &HttpFilterContext<'_>) -> Self {
-        Self {
-            input: parse_u64_meta(ctx, META_TOKEN_INPUT),
-            output: parse_u64_meta(ctx, META_TOKEN_OUTPUT),
-            total: parse_u64_meta(ctx, META_TOKEN_TOTAL),
-            cache_read: parse_u64_meta(ctx, META_TOKEN_CACHE_READ),
-            cache_write: parse_u64_meta(ctx, META_TOKEN_CACHE_WRITE),
-            reasoning: parse_u64_meta(ctx, META_TOKEN_REASONING),
-            overflow: ctx.get_metadata(META_TOKEN_STATUS) == Some(TOKEN_STATUS_OVERFLOW),
-        }
-    }
-}
-
-/// Parse a metadata value as `u64`. Missing or unparseable strings are
-/// `None`, matching the pre-M4 `token.total` path.
-pub(super) fn parse_u64_meta(ctx: &HttpFilterContext<'_>, key: &str) -> Option<u64> {
-    ctx.get_metadata(key).and_then(|value| value.parse::<u64>().ok())
-}
-
 /// Compute the integer cost to settle against the reservation.
 ///
 /// Returns:
@@ -188,12 +152,10 @@ pub(super) fn parse_u64_meta(ctx: &HttpFilterContext<'_>, key: &str) -> Option<u
 ///   charged at the input weight, then `ceil(Σ type × weight)`.
 #[must_use]
 pub(super) fn weighted_cost(usage: UsageCounts, weights: TokenWeights) -> Option<u64> {
-    if usage.overflow {
-        return None;
-    }
-    match (usage.input, usage.output) {
-        (Some(input), Some(output)) => Some(partitioned_cost(input, output, usage, weights)),
-        _ => usage.total,
+    match usage.normalize() {
+        UsageInput::Missing | UsageInput::Overflow => None,
+        UsageInput::Available(usage) if !usage.typed => Some(usage.total),
+        UsageInput::Available(usage) => Some(partitioned_cost(&usage, weights)),
     }
 }
 
@@ -204,56 +166,14 @@ pub(super) fn weighted_cost(usage: UsageCounts, weights: TokenWeights) -> Option
 /// `inputTokens` is uncached-only and cache lives only in `totalTokens`),
 /// the uncovered remainder is charged at [`TokenWeights::input`] so the
 /// cost cannot fall below what `token.total` covered.
-fn partitioned_cost(input: u64, output: u64, usage: UsageCounts, weights: TokenWeights) -> u64 {
-    let cache_read = usage.cache_read.unwrap_or(0).min(input);
-    let after_read = input - cache_read;
-    let cache_write = usage.cache_write.unwrap_or(0).min(after_read);
-    let uncached = after_read - cache_write;
-
-    let reasoning = usage.reasoning.unwrap_or(0);
-    let nested = reasoning_is_nested(input, output, usage.total, reasoning);
-    let (visible_output, reasoning_tokens) = if nested {
-        let nested_reasoning = reasoning.min(output);
-        (output - nested_reasoning, nested_reasoning)
-    } else {
-        (output, reasoning)
-    };
-
-    let mut accounted = input.saturating_add(output);
-    if !nested {
-        accounted = accounted.saturating_add(reasoning);
-    }
-    let uncovered = usage.total.map_or(0, |total| total.saturating_sub(accounted));
-
-    let cost = to_cost_f64(uncached) * weights.input
-        + to_cost_f64(cache_read) * weights.cached_input
-        + to_cost_f64(cache_write) * weights.cache_write
-        + to_cost_f64(visible_output) * weights.output
-        + to_cost_f64(reasoning_tokens) * weights.reasoning
-        + to_cost_f64(uncovered) * weights.input;
+fn partitioned_cost(usage: &NormalizedUsage, weights: TokenWeights) -> u64 {
+    let cost = to_cost_f64(usage.input.uncached) * weights.input
+        + to_cost_f64(usage.input.cache_read) * weights.cached_input
+        + to_cost_f64(usage.input.cache_write) * weights.cache_write
+        + to_cost_f64(usage.output.visible) * weights.output
+        + to_cost_f64(usage.output.reasoning) * weights.reasoning
+        + to_cost_f64(usage.unclassified) * weights.input;
     ceil_cost(cost)
-}
-
-/// Decide whether reasoning is already inside `output`.
-///
-/// `token_count` publishes `token.total = input + output` for OpenAI /
-/// Anthropic (reasoning ⊆ output) and `token.total = input + output +
-/// reasoning` for Google (thoughts billed separately). When `total` is
-/// absent, nested is the conservative default: it never charges reasoning
-/// twice on the common providers.
-fn reasoning_is_nested(input: u64, output: u64, total: Option<u64>, reasoning: u64) -> bool {
-    if reasoning == 0 {
-        return true;
-    }
-    let Some(total) = total else {
-        return true;
-    };
-    let nested_sum = input.saturating_add(output);
-    let additive_sum = nested_sum.saturating_add(reasoning);
-    // Closer to `input + output` → nested (OpenAI/Anthropic). Closer to
-    // `input + output + reasoning` → additive (Google). Equal distance
-    // prefers nested so we never double-count the common case.
-    total.abs_diff(nested_sum) <= total.abs_diff(additive_sum)
 }
 
 /// `f64` form of [`COST_U64_CAP`]. `2^53` is an exact `f64` value.
@@ -421,22 +341,6 @@ mod tests {
         let mut counts = usage(50, 80, 330);
         counts.reasoning = Some(200);
         assert_eq!(weighted_cost(counts, unity()), Some(330));
-    }
-
-    #[test]
-    fn total_identity_classifies_nested_vs_additive_reasoning() {
-        assert!(
-            reasoning_is_nested(120, 800, Some(920), 640),
-            "OpenAI: total == input+output"
-        );
-        assert!(
-            !reasoning_is_nested(50, 80, Some(330), 200),
-            "Google: total == input+output+reasoning"
-        );
-        assert!(
-            reasoning_is_nested(50, 80, None, 200),
-            "missing total defaults to nested"
-        );
     }
 
     #[test]

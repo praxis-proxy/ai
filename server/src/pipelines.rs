@@ -222,6 +222,8 @@ fn build_listener_pipelines(
         let request_body_limit = agentic_request_body_cap(config.body_limits.max_request_bytes, budget_policy);
         #[cfg(not(feature = "openai-responses"))]
         let request_body_limit = config.body_limits.max_request_bytes;
+        #[cfg(feature = "token-rate-limit-filter")]
+        validate_shared_token_quota_pipeline(&entries, &listener.name)?;
         let mut pipeline =
             FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &config.insecure_options)?;
         configure_pipeline(
@@ -246,6 +248,82 @@ fn build_listener_pipelines(
     }
 
     Ok(ListenerPipelines::new(pipelines))
+}
+
+/// Validate the single-source response chain used by shared quota enforcement.
+///
+/// Request filters are declared in `token_rate_limit -> token_quota ->
+/// token_count` order so their response-body hooks run in the inverse order.
+/// Requiring unconditional, unique producers prevents a missing branch or
+/// response condition from silently settling a reservation at its estimate.
+#[cfg(feature = "token-rate-limit-filter")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps uniqueness, conditions, and ordering in one startup invariant audit"
+)]
+fn validate_shared_token_quota_pipeline(
+    entries: &[FilterEntry],
+    listener_name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let shared_limiters = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.filter_type == "token_rate_limit" && config_bool(entry, "use_token_quota"))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if shared_limiters.is_empty() {
+        return Ok(());
+    }
+
+    let quota_filters = filter_indices(entries, "token_quota");
+    let token_counters = filter_indices(entries, "token_count");
+    let ([quota_index], [count_index]) = (quota_filters.as_slice(), token_counters.as_slice()) else {
+        return Err(format!(
+            "listener '{listener_name}': token_rate_limit with use_token_quota requires exactly one token_quota and one token_count filter"
+        )
+        .into());
+    };
+    let (Some(quota), Some(counter)) = (entries.get(*quota_index), entries.get(*count_index)) else {
+        return Err(format!("listener '{listener_name}': internal shared quota filter index is invalid").into());
+    };
+    if !quota.conditions.is_empty()
+        || !quota.response_conditions.is_empty()
+        || !counter.conditions.is_empty()
+        || !counter.response_conditions.is_empty()
+    {
+        return Err(format!(
+            "listener '{listener_name}': token_quota and token_count must be unconditional when token_rate_limit uses shared quota"
+        )
+        .into());
+    }
+    if shared_limiters.iter().any(|index| index >= quota_index) || quota_index >= count_index {
+        return Err(format!(
+            "listener '{listener_name}': shared quota filters must be ordered token_rate_limit -> token_quota -> token_count"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Return every index for one filter type in an expanded listener chain.
+#[cfg(feature = "token-rate-limit-filter")]
+fn filter_indices(entries: &[FilterEntry], filter_type: &str) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| (entry.filter_type == filter_type).then_some(index))
+        .collect()
+}
+
+/// Read one boolean from a filter's flattened configuration mapping.
+#[cfg(feature = "token-rate-limit-filter")]
+fn config_bool(entry: &FilterEntry, field: &str) -> bool {
+    entry
+        .config
+        .as_mapping()
+        .and_then(|mapping| mapping.get(serde_yaml::Value::String(field.to_owned())))
+        .and_then(serde_yaml::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Clone `registry` and hand it the proxy's shared sub-request `connector` as
@@ -799,6 +877,67 @@ mod tests {
     use praxis_filter::FilterRegistry;
 
     use super::*;
+
+    #[cfg(feature = "token-rate-limit-filter")]
+    #[test]
+    fn shared_token_quota_pipeline_requires_unique_unconditional_ordered_producers() {
+        let valid: Vec<FilterEntry> = serde_yaml::from_str(
+            "
+- filter: token_rate_limit
+  use_token_quota: true
+- filter: token_quota
+- filter: token_count
+",
+        )
+        .unwrap();
+        validate_shared_token_quota_pipeline(&valid, "inference").unwrap();
+
+        for (yaml, expected) in [
+            (
+                "
+- filter: token_rate_limit
+  use_token_quota: true
+- filter: token_count
+",
+                "exactly one token_quota and one token_count",
+            ),
+            (
+                "
+- filter: token_quota
+- filter: token_rate_limit
+  use_token_quota: true
+- filter: token_count
+",
+                "token_rate_limit -> token_quota -> token_count",
+            ),
+            (
+                "
+- filter: token_rate_limit
+  use_token_quota: true
+- filter: token_quota
+  response_conditions:
+    - when:
+        status: [200]
+- filter: token_count
+",
+                "must be unconditional",
+            ),
+            (
+                "
+- filter: token_rate_limit
+  use_token_quota: true
+- filter: token_quota
+- filter: token_quota
+- filter: token_count
+",
+                "exactly one token_quota and one token_count",
+            ),
+        ] {
+            let entries: Vec<FilterEntry> = serde_yaml::from_str(yaml).unwrap();
+            let error = validate_shared_token_quota_pipeline(&entries, "inference").unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
 
     #[test]
     fn filter_duration_flag_enables_per_filter_histograms() {

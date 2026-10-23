@@ -73,6 +73,7 @@ for how these are authored and regenerated.
 | [time-to-first-token.yaml](configs/time-to-first-token.yaml) | Measures the elapsed time from request receipt to the first non-empty SSE body chunk and records a praxis_ai_ttft_seconds Prometheus histogram labeled by model |
 | [token-ceiling.yaml](configs/token-ceiling.yaml) | Place token_ceiling after any request translation or prompt enrichment so it evaluates the final provider-bound JSON body |
 | [token-counting.yaml](configs/token-counting.yaml) | Extracts token usage from AI inference responses (streaming and non-streaming) and makes counts available to downstream filters via filter metadata as token.input, token.output, and token.total |
+| [token-quota.yaml](configs/token-quota.yaml) | Evaluates one CEL expression over the final normalized token usage snapshot |
 | [token-rate-limit-header-keys.yaml](configs/token-rate-limit-header-keys.yaml) | Extends token-rate-limit.yaml with M5 header dimensions (ai#123 / ai#129): each distinct `x-tenant-id` value gets its own token budget under the same catch-all rule |
 | [token-rate-limit-hierarchy.yaml](configs/token-rate-limit-hierarchy.yaml) | Optional org, then team, then user budgets on one token_rate_limit admission (ai#125) |
 | [token-rate-limit-ip-keys.yaml](configs/token-rate-limit-ip-keys.yaml) | Honor X-Forwarded-For for the IP budget only when a trusted proxy sanitizes it and direct access is blocked; otherwise omit `header` to key on the TCP peer |

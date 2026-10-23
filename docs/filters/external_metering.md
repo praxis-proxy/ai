@@ -11,6 +11,8 @@ Tenant identity is resolved from the highest-trust source available: verified `{
 
 When no `{prefix}model` identity header names the model and `model_to_provider` mapped the request, balance checks and usage events use the client-facing model ID it recorded rather than the provider target. That filter buffers the request body, so its body pass completes before this filter's request hook runs the balance check.
 
+Usage events include the optional `quota_value`, `quota_formula`, `quota_unit`, and `quota_status` fields when `token_quota` runs earlier in the response phase. `quota_usage` and `quota_context` preserve the exact normalized objects supplied to CEL, including missing-field presence flags, so the result can be audited and recomputed. Declare `external_metering` before `token_quota`, and `token_quota` before `token_count`, because response hooks run in reverse filter order. Quota fields are enforcement/audit data, never currency.
+
 ## Configuration
 
 | Field | Type | Required | Description |

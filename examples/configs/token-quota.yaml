@@ -1,0 +1,51 @@
+# Token quota formula
+#
+# Evaluates one CEL expression over the final normalized token usage snapshot.
+# The result is an enforcement quota unit, not a monetary price. Raw token.*
+# metadata remains available for audit, event logs, and later cost calculation.
+#
+# Run with:
+#   cargo run -p praxis-ai-proxy --features token-quota-filter -- \
+#     -c examples/configs/token-quota.yaml
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      - filter: model_to_header
+
+      # Response hooks run in reverse order. token_quota is declared before
+      # token_count so it sees token_count's final per-request snapshot.
+      - filter: token_quota
+        formula_id: weighted-quota-v1
+        unit: quota_units
+        expression: >-
+          double(usage.input.uncached + usage.unclassified) / 3.0
+          + double(usage.output.visible)
+          + double(usage.input.cache_write) / 2.4
+          + double(usage.input.cache_read) / 30.0
+          + double(usage.output.reasoning)
+
+      - filter: token_count
+        provider: openai
+
+      - filter: access_log
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true

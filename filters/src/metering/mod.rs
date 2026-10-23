@@ -7,7 +7,11 @@
 //! Reads token counts from [`filter_metadata`] keys set by the `token_count`
 //! filter (`token.input`, `token.output`, `token.total`, the prompt cache
 //! breakdown `token.cache_read` / `token.cache_write`, and the reasoning
-//! breakdown `token.reasoning`). The metering filter
+//! breakdown `token.reasoning`). When `token_quota` ran earlier in the
+//! response chain, the event also carries its derived value, unit, formula
+//! identity, and evaluation status. These are quota/audit fields, not a
+//! monetary charge; raw usage remains the recomputable source of truth.
+//! The metering filter
 //! must be declared *before* `token_count` in the YAML filter chain so that
 //! response hooks (which run in reverse order) execute after token extraction.
 //!
@@ -53,8 +57,9 @@ use self::config::{ExternalMeteringConfig, validate_config};
 // Import the token metadata keys from `token_count`, their sole writer, so this
 // reader can never drift to a stale literal and silently meter zero tokens.
 use crate::token_usage::{
-    META_TOKEN_CACHE_READ, META_TOKEN_CACHE_WRITE, META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_REASONING,
-    META_TOKEN_TOTAL,
+    META_TOKEN_CACHE_READ, META_TOKEN_CACHE_WRITE, META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_QUOTA_FORMULA,
+    META_TOKEN_QUOTA_STATUS, META_TOKEN_QUOTA_UNIT, META_TOKEN_QUOTA_VALUE, META_TOKEN_REASONING, META_TOKEN_TOTAL,
+    TokenQuotaAudit,
 };
 
 // -----------------------------------------------------------------------------
@@ -138,6 +143,15 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// the client-facing model ID it recorded rather than the provider target.
 /// That filter buffers the request body, so its body pass completes before
 /// this filter's request hook runs the balance check.
+///
+/// Usage events include the optional `quota_value`, `quota_formula`,
+/// `quota_unit`, and `quota_status` fields when `token_quota` runs earlier in
+/// the response phase. `quota_usage` and `quota_context` preserve the exact
+/// normalized objects supplied to CEL, including missing-field presence flags,
+/// so the result can be audited and recomputed. Declare `external_metering`
+/// before `token_quota`, and `token_quota` before `token_count`, because
+/// response hooks run in reverse filter order. Quota fields are
+/// enforcement/audit data, never currency.
 ///
 /// # YAML
 ///
@@ -390,7 +404,7 @@ impl ExternalMeteringFilter {
         let event = if state.is_error {
             build_error_event(&event_ctx)
         } else {
-            build_usage_event(&event_ctx, &TokenCounts::read(ctx))
+            build_usage_event(&event_ctx, TokenCounts::read(ctx))
         };
 
         // Resolve the callout credential on the filter (not in the spawned
@@ -561,6 +575,7 @@ struct MeteringState {
 }
 
 /// Token counts published by the `token_count` filter.
+#[derive(Default)]
 struct TokenCounts {
     /// Completion tokens.
     output: u64,
@@ -579,11 +594,34 @@ struct TokenCounts {
 
     /// Reasoning/thinking tokens; a subset of `output`.
     reasoning: u64,
+
+    /// Shared quota units derived by `token_quota`, when evaluated.
+    quota_value: Option<u64>,
+
+    /// Stable formula identity needed to audit or recompute the quota value.
+    quota_formula: Option<String>,
+
+    /// Non-currency unit attached to the quota value.
+    quota_unit: Option<String>,
+
+    /// Formula evaluation outcome, including explicit missing/error states.
+    quota_status: Option<String>,
+
+    /// Exact normalized usage object supplied to the quota formula.
+    quota_usage: Option<serde_json::Value>,
+
+    /// Exact routing context object supplied to the quota formula.
+    quota_context: Option<serde_json::Value>,
 }
 
 impl TokenCounts {
     /// Read the counts the `token_count` filter left in `filter_metadata`.
     fn read(ctx: &HttpFilterContext<'_>) -> Self {
+        // The event is dispatched asynchronously after this request hook, so
+        // take the only owned copy of the bounded audit objects at that boundary.
+        let (quota_usage, quota_context) = ctx.extensions.get::<TokenQuotaAudit>().map_or((None, None), |audit| {
+            (Some(audit.usage.clone()), Some(audit.context.clone()))
+        });
         Self {
             input: read_token_meta(ctx, META_TOKEN_INPUT),
             output: read_token_meta(ctx, META_TOKEN_OUTPUT),
@@ -591,6 +629,14 @@ impl TokenCounts {
             cache_read: read_token_meta(ctx, META_TOKEN_CACHE_READ),
             cache_write: read_token_meta(ctx, META_TOKEN_CACHE_WRITE),
             reasoning: read_token_meta(ctx, META_TOKEN_REASONING),
+            quota_value: ctx
+                .get_metadata(META_TOKEN_QUOTA_VALUE)
+                .and_then(|value| value.parse::<u64>().ok()),
+            quota_formula: ctx.get_metadata(META_TOKEN_QUOTA_FORMULA).map(str::to_owned),
+            quota_unit: ctx.get_metadata(META_TOKEN_QUOTA_UNIT).map(str::to_owned),
+            quota_status: ctx.get_metadata(META_TOKEN_QUOTA_STATUS).map(str::to_owned),
+            quota_usage,
+            quota_context,
         }
     }
 }
@@ -1077,7 +1123,7 @@ fn build_balance_url(base_url: &str, customer_id: &str, feature_key: &str, model
 // -----------------------------------------------------------------------------
 
 /// Build an `inference.tokens.used` event.
-fn build_usage_event(ctx: &EventContext<'_>, tokens: &TokenCounts) -> serde_json::Value {
+fn build_usage_event(ctx: &EventContext<'_>, tokens: TokenCounts) -> serde_json::Value {
     let mut event = build_envelope(ctx, CE_TYPE_USAGE);
 
     if let Some(data) = event.get_mut("data").and_then(serde_json::Value::as_object_mut) {
@@ -1087,6 +1133,24 @@ fn build_usage_event(ctx: &EventContext<'_>, tokens: &TokenCounts) -> serde_json
         data.insert("cached_input_tokens".to_owned(), tokens.cache_read.into());
         data.insert("cache_creation_tokens".to_owned(), tokens.cache_write.into());
         data.insert("reasoning_tokens".to_owned(), tokens.reasoning.into());
+        if let Some(value) = tokens.quota_value {
+            data.insert("quota_value".to_owned(), value.into());
+        }
+        if let Some(formula) = tokens.quota_formula {
+            data.insert("quota_formula".to_owned(), formula.into());
+        }
+        if let Some(unit) = tokens.quota_unit {
+            data.insert("quota_unit".to_owned(), unit.into());
+        }
+        if let Some(status) = tokens.quota_status {
+            data.insert("quota_status".to_owned(), status.into());
+        }
+        if let Some(usage) = tokens.quota_usage {
+            data.insert("quota_usage".to_owned(), usage);
+        }
+        if let Some(context) = tokens.quota_context {
+            data.insert("quota_context".to_owned(), context);
+        }
     }
 
     event

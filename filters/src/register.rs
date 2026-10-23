@@ -18,6 +18,8 @@ use crate::InFlightTrackerFilter;
 use crate::Sigv4SignFilter;
 #[cfg(feature = "token-ceiling-filter")]
 use crate::TokenCeilingFilter;
+#[cfg(feature = "token-quota-filter")]
+use crate::TokenQuotaFilter;
 #[cfg(feature = "token-rate-limit-filter")]
 use crate::TokenRateLimitFilter;
 use crate::{
@@ -257,6 +259,11 @@ fn register_token_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "token_usage_headers" => TokenUsageHeadersFilter::from_config
+    );
+    #[cfg(feature = "token-quota-filter")]
+    praxis_filter::register_filters!(
+        @register registry,
+        http "token_quota" => TokenQuotaFilter::from_config
     );
     #[cfg(feature = "token-rate-limit-filter")]
     praxis_filter::register_filters!(

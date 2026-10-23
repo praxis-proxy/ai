@@ -67,6 +67,9 @@ vertex-anthropic-filter = ["experimental", "praxis-ai-apis/vertex-anthropic"]
 # optional so the rest of the crate (and its consumers) don't compile the
 # Valkey client and its transitive deps unless this feature is on.
 token-rate-limit-filter = ["experimental", "dep:redis", "dep:thiserror"]
+# Experimental: evaluates a bounded CEL formula over the final normalized
+# per-request token usage snapshot and publishes reusable quota-unit metadata.
+token-quota-filter = ["experimental", "dep:cel"]
 # Experimental pre-forward input/output token ceiling guard.  Kept separate
 # from token-rate-limit-filter because static request admission must fail
 # closed independently of quota-backend health.
@@ -92,6 +95,7 @@ aws-credential-types = { workspace = true, optional = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+cel = { workspace = true, optional = true }
 dashmap = { workspace = true }
 http = { workspace = true }
 metrics = { workspace = true }

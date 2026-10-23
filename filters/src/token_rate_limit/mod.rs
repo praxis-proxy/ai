@@ -143,6 +143,7 @@ use self::{
     },
     weights::{TokenWeights, UsageCounts, parse_u64_meta, weighted_cost},
 };
+use crate::token_usage::{META_TOKEN_QUOTA_STATUS, META_TOKEN_QUOTA_VALUE, TOKEN_QUOTA_STATUS_EVALUATED};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -1076,6 +1077,15 @@ struct AccountingPolicy {
     weights: TokenWeights,
     /// Stable digest of the filter-wide budget-key policy.
     key_fingerprint: String,
+}
+
+/// Source of the final response-phase reconciliation charge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconciliationSource {
+    /// Preserve the legacy filter/rule token-weight calculation.
+    LegacyWeights,
+    /// Consume the shared CEL-derived `token.quota.value` result.
+    SharedQuota,
 }
 
 /// Extract `max_tokens` (preferred) or `max_completion_tokens` from a
@@ -2096,6 +2106,8 @@ fn compile_rule(
 ///   cached_input: 0.1                # prompt-cache hits (token.cache_read)
 ///   cache_write: 1.25                # prompt-cache writes (token.cache_write)
 ///   reasoning: 0.9                   # thinking tokens (token.reasoning)
+/// # use_token_quota: true            # alternatively consume token.quota.value;
+///                                    # mutually exclusive with all weights
 /// rules:
 ///   - name: team-alpha                 # human-readable, unique per filter instance
 ///     match:                           # optional: omit for a catch-all rule
@@ -2147,6 +2159,9 @@ pub struct TokenRateLimitFilter {
     /// Optional compiled hierarchy levels (org, team, user).
     hierarchy: Option<Vec<CompiledHierarchyLevel>>,
 
+    /// Authoritative source for the response-phase reconciliation charge.
+    reconciliation_source: ReconciliationSource,
+
     /// Expected shared-backend failure behavior for admission.
     on_failure: BackendOnFailure,
 }
@@ -2173,6 +2188,13 @@ impl TokenRateLimitFilter {
             if !seen_names.insert(rule.name.clone()) {
                 return Err(format!("token_rate_limit: duplicate rule name '{}'", rule.name).into());
             }
+        }
+        if cfg.use_token_quota
+            && (!cfg.default_weights.is_empty() || cfg.rules.iter().any(|rule| !rule.weights.is_empty()))
+        {
+            return Err(
+                "token_rate_limit: use_token_quota cannot be combined with default_weights or per-rule weights".into(),
+            );
         }
 
         let backend = build_backend_resource(&cfg.backend)?;
@@ -2208,6 +2230,11 @@ impl TokenRateLimitFilter {
             epoch: Instant::now(),
             valkey_clock: matches!(backend, BackendResource::Shared { .. }),
             hierarchy,
+            reconciliation_source: if cfg.use_token_quota {
+                ReconciliationSource::SharedQuota
+            } else {
+                ReconciliationSource::LegacyWeights
+            },
             on_failure: cfg.backend.on_failure,
         }))
     }
@@ -2233,6 +2260,16 @@ impl TokenRateLimitFilter {
     /// by `headers`, alongside its index for reconciliation.
     fn matching_rule(&self, headers: &http::HeaderMap) -> Option<(usize, &CompiledRule)> {
         self.rules.iter().enumerate().find(|(_, rule)| rule.matches(headers))
+    }
+
+    /// Resolve the final per-request quota charge from the configured source.
+    fn actual_cost(&self, ctx: &HttpFilterContext<'_>, rule: &CompiledRule) -> Option<u64> {
+        if self.reconciliation_source == ReconciliationSource::SharedQuota {
+            return (ctx.get_metadata(META_TOKEN_QUOTA_STATUS) == Some(TOKEN_QUOTA_STATUS_EVALUATED))
+                .then(|| parse_u64_meta(ctx, META_TOKEN_QUOTA_VALUE))
+                .flatten();
+        }
+        weighted_cost(UsageCounts::from_context(ctx), rule.weights)
     }
 
     /// Resolve an opaque backend bucket key from request state.
@@ -2809,7 +2846,7 @@ impl TokenRateLimitFilter {
             .get_metadata(META_RULE_INDEX)
             .and_then(|v| v.parse::<usize>().ok())
             .and_then(|index| self.rules.get(index))?;
-        let actual = weighted_cost(UsageCounts::from_context(ctx), rule.weights);
+        let actual = self.actual_cost(ctx, rule);
         if actual.is_none() {
             tracing::trace!("token_rate_limit: no usable token usage metadata at end of stream, charging at estimate");
         }
@@ -3273,7 +3310,7 @@ impl HttpFilter for TokenRateLimitFilter {
                     .get_metadata(META_RULE_INDEX)
                     .and_then(|v| v.parse::<usize>().ok())
                     .and_then(|index| self.rules.get(index));
-                let actual = rule.and_then(|r| weighted_cost(UsageCounts::from_context(ctx), r.weights));
+                let actual = rule.and_then(|rule| self.actual_cost(ctx, rule));
                 reconcile_hierarchy(hierarchy, ctx, actual, self.now_ms());
                 Self::clear_hierarchy_metadata(ctx);
             }
@@ -3411,6 +3448,7 @@ mod backend_injection_tests {
             epoch: std::time::Instant::now() - std::time::Duration::from_secs(5),
             valkey_clock: false,
             hierarchy: None,
+            reconciliation_source: super::ReconciliationSource::LegacyWeights,
             on_failure: super::config::BackendOnFailure::Closed,
         };
         assert!(
@@ -3529,6 +3567,7 @@ mod backend_injection_tests {
             epoch: std::time::Instant::now(),
             valkey_clock: false,
             hierarchy: None,
+            reconciliation_source: super::ReconciliationSource::LegacyWeights,
             on_failure: super::config::BackendOnFailure::Closed,
         };
 

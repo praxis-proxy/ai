@@ -422,9 +422,10 @@ fn usage_event_has_correct_structure() {
         cache_read: 80,
         cache_write: 20,
         reasoning: 30,
+        ..TokenCounts::default()
     };
 
-    let event = build_usage_event(&event_ctx("evt-1", &state), &tokens);
+    let event = build_usage_event(&event_ctx("evt-1", &state), tokens);
 
     assert_eq!(event["specversion"], "1.0");
     assert_eq!(event["type"], CE_TYPE_USAGE);
@@ -451,9 +452,10 @@ fn usage_event_carries_reasoning_tokens() {
         cache_read: 0,
         cache_write: 0,
         reasoning: 64,
+        ..TokenCounts::default()
     };
 
-    let event = build_usage_event(&event_ctx("evt-r", &state), &tokens);
+    let event = build_usage_event(&event_ctx("evt-r", &state), tokens);
 
     assert_eq!(
         event["data"]["reasoning_tokens"], 64,
@@ -490,6 +492,44 @@ fn token_counts_read_defaults_reasoning_to_zero() {
 }
 
 #[test]
+fn usage_event_carries_shared_quota_audit_fields() {
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut filter_ctx = make_filter_context(&req);
+    filter_ctx.set_metadata(META_TOKEN_QUOTA_VALUE, "55");
+    filter_ctx.set_metadata(META_TOKEN_QUOTA_FORMULA, "weighted-quota-v1");
+    filter_ctx.set_metadata(META_TOKEN_QUOTA_UNIT, "quota_units");
+    filter_ctx.set_metadata(META_TOKEN_QUOTA_STATUS, "evaluated");
+    filter_ctx.extensions.insert(quota_audit_fixture());
+    let tokens = TokenCounts::read(&filter_ctx);
+    let state = state_for("testuser", "gpt-4");
+
+    let event = build_usage_event(&event_ctx("evt-quota", &state), tokens);
+
+    assert_eq!(event["data"]["quota_value"], 55);
+    assert_eq!(event["data"]["quota_formula"], "weighted-quota-v1");
+    assert_eq!(event["data"]["quota_unit"], "quota_units");
+    assert_eq!(event["data"]["quota_status"], "evaluated");
+    assert_eq!(event["data"]["quota_usage"]["input"]["uncached"], 12);
+    assert_eq!(event["data"]["quota_usage"]["reported"]["cache_read"], false);
+    assert_eq!(event["data"]["quota_context"]["route"], "chat");
+    assert_eq!(event["data"]["quota_context"]["backend"], "openai-primary");
+}
+
+/// Build the exact normalized objects retained by `token_quota` for auditing.
+fn quota_audit_fixture() -> TokenQuotaAudit {
+    TokenQuotaAudit {
+        usage: serde_json::from_str(
+            r#"{"input":{"total":12,"uncached":12,"cache_read":0,"cache_write":0},"output":{"total":3,"visible":3,"reasoning":0},"total":15,"unclassified":0,"typed":true,"reported":{"input":true,"output":true,"total":true,"cache_read":false,"cache_write":false,"reasoning":false}}"#,
+        )
+        .unwrap(),
+        context: serde_json::from_str(
+            r#"{"route":"chat","backend":"openai-primary","provider":"openai","model":"gpt-4"}"#,
+        )
+        .unwrap(),
+    }
+}
+
+#[test]
 fn error_event_has_correct_structure() {
     let mut state = state_for("testuser", "gpt-4");
     state.is_error = true;
@@ -512,13 +552,14 @@ fn absent_organization_and_cost_center_emit_empty_strings() {
 
     let event = build_usage_event(
         &event_ctx("evt-empty", &state),
-        &TokenCounts {
+        TokenCounts {
             input: 1,
             output: 1,
             total: 2,
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            ..TokenCounts::default()
         },
     );
 
