@@ -72,7 +72,10 @@ const CE_TYPE_USAGE: &str = "inference.tokens.used";
 
 /// Metadata key holding the resolved model name, written during the request
 /// body phase and read during the response body phase.
-const META_METERING_MODEL: &str = "metering.model";
+pub(crate) const META_METERING_MODEL: &str = "metering.model";
+
+/// Metadata key for the tenant username resolved by external metering.
+pub(crate) const META_METERING_USERNAME: &str = "metering.username";
 
 /// Counter incremented whenever a usage or error event fails to reach the
 /// metering service (transport failure or non-2xx acknowledgement).
@@ -433,6 +436,11 @@ impl HttpFilter for ExternalMeteringFilter {
             state.username.clone_from(fallback);
         }
 
+        // Publish the resolved identity for downstream consumers such as
+        // token_usage_metrics. This avoids repeating trust-tier resolution
+        // when external_metering already ran earlier in the pipeline.
+        ctx.set_metadata(META_METERING_USERNAME, state.username.clone());
+
         if !state.model.is_empty() {
             ctx.filter_metadata
                 .insert(META_METERING_MODEL.to_owned(), state.model.clone());
@@ -639,7 +647,7 @@ fn capture_identity(ctx: &mut HttpFilterContext<'_>, prefix: &str, identity_name
         .unwrap_or_default()
         .to_owned();
 
-    let mut identity = read_identity_headers(ctx, prefix, identity_namespace);
+    let mut identity = crate::identity::resolve_tenant_identity(ctx, prefix, identity_namespace);
     strip_client_credentials(ctx);
 
     if identity.group.is_empty() {
@@ -659,6 +667,7 @@ fn capture_identity(ctx: &mut HttpFilterContext<'_>, prefix: &str, identity_name
         username: identity.username,
     }
 }
+
 
 /// Tenant identity as carried on the request headers.
 #[derive(Default)]

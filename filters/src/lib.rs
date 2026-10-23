@@ -18,6 +18,7 @@ pub mod callout;
 #[cfg(feature = "gcp-adc-filter")]
 pub mod gcp;
 pub mod guardrails;
+mod identity;
 mod identity_guard;
 pub mod inference;
 pub mod inflight;
@@ -59,6 +60,9 @@ pub use store_readiness::{FILTER_NAME as STORE_READINESS_GATE_FILTER_NAME, Store
 pub use time_to_first_token::TimeToFirstTokenFilter;
 #[cfg(feature = "token-rate-limit-filter")]
 pub use token_rate_limit::TokenRateLimitFilter;
+pub use token_usage::{
+    StreamUsageInjectFilter, TokenCountFilter, TokenUsageHeadersFilter, TokenUsageMetricsFilter,
+};
 #[cfg(feature = "token-ceiling-filter")]
 pub use token_usage::TokenCeilingFilter;
 pub use token_usage::{StreamUsageInjectFilter, TokenCountFilter, TokenUsageHeadersFilter};
