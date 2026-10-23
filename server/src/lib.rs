@@ -7,6 +7,8 @@ mod fd_limit;
 pub(crate) mod pipelines;
 #[cfg(feature = "_store-backend")]
 pub mod readiness;
+#[cfg(feature = "_store-backend")]
+pub(crate) mod reaper;
 pub(crate) mod reload;
 mod server;
 #[cfg(feature = "_store-backend")]

@@ -570,6 +570,17 @@ impl StoreRegistry {
         self.stores.contains_key(name)
     }
 
+    /// Look up the raw combined backend handle by name.
+    ///
+    /// Returned for process-wide maintenance that runs outside any single
+    /// request, such as the TTL reaper, which deletes expired rows un-scoped by
+    /// owner. Request-path code must use [`Self::get_scoped`] instead so every
+    /// query stays bound to one tenant.
+    #[must_use]
+    pub fn backend(&self, name: &str) -> Option<Arc<dyn PersistedStateBackend>> {
+        self.get_backend(name)
+    }
+
     /// Mark this listener's complete store set ready for request traffic.
     pub fn mark_ready(&self) {
         self.ready.store(true, Ordering::Release);

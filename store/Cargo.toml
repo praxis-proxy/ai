@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+# cargo-machete cannot see crates referenced only through a serde string path
+# (`#[serde(with = "humantime_serde")]` in reaper_config.rs), so ignore the
+# false positive rather than drop a genuinely-used dependency.
+[package.metadata.cargo-machete]
+ignored = ["humantime-serde"]
+
 [lints]
 workspace = true
 
@@ -22,6 +28,7 @@ compression = ["dep:zstd", "dep:tokio"]
 
 [dependencies]
 async-trait = { workspace = true }
+humantime-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dashmap = { workspace = true }

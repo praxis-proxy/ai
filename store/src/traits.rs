@@ -10,7 +10,7 @@ use crate::{
     owner::StateOwner,
     types::{
         BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-        ResponseEventRecord, ResponseRecord, StoreError,
+        ResponseEventRecord, ResponseRecord, StoreError, SweepStats,
     },
 };
 
@@ -109,6 +109,30 @@ pub trait ResponseStore: Send + Sync {
     ///
     /// Returns [`StoreError`] if the database operation fails.
     async fn delete_response(&self, owner: &StateOwner, id: &str) -> Result<bool, StoreError>;
+
+    /// Delete expired records across all tables.
+    ///
+    /// Removes up to `batch_size` rows **per table** where `created_at < cutoff_secs`.
+    /// Each table is swept independently in its own transaction. The sweep is
+    /// un-scoped across owners and tenants: it removes all expired rows visible
+    /// to the backend regardless of ownership.
+    ///
+    /// Returns [`SweepStats`] describing how many rows were deleted from each table.
+    /// The caller should loop until `stats.max_table() < batch_size` to ensure all
+    /// tables are exhausted.
+    ///
+    /// The default implementation is a no-op that returns zero stats, allowing
+    /// unrelated `ResponseStore` implementations (test fakes) to compile without
+    /// overriding this method. Production backends (SQLite, `PostgreSQL`, in-memory)
+    /// override it with real sweep logic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if any database operation fails.
+    async fn sweep_expired(&self, cutoff_secs: i64, batch_size: u32) -> Result<SweepStats, StoreError> {
+        let _ = (cutoff_secs, batch_size);
+        Ok(SweepStats::default())
+    }
 
     /// Retrieve conversation messages by conversation ID and owner.
     ///

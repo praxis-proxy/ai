@@ -3,8 +3,10 @@
 
 //! Configuration types for the conversations filter.
 
+use std::{num::NonZeroU32, time::Duration};
+
 use percent_encoding::percent_decode_str;
-use praxis_ai_store::{PoolConfig, SslMode, validate_table_identifier};
+use praxis_ai_store::{PoolConfig, ReaperConfig, SslMode, validate_table_identifier};
 #[cfg(feature = "_store-postgres")]
 use praxis_ai_store_backends::{PgTlsConfig, postgres_url, validate_postgres_table_set_identifiers};
 use praxis_filter::{FilterError, has_dot_dot_traversal, parse_filter_config};
@@ -62,6 +64,9 @@ pub fn store_ref_config(filter_config: &serde_yaml::Value) -> Result<(String, Va
         .as_object_mut()
         .ok_or_else(|| FilterError::from(format!("{FILTER_NAME}: config must be a mapping")))?;
     obj.remove("backend");
+    obj.remove("ttl");
+    obj.remove("sweep_interval");
+    obj.remove("sweep_batch_size");
     // The parsed config is authoritative for the table set: it applies the same
     // defaults the filter uses and generates the unused responses table the
     // combined backend's DDL requires.
@@ -167,6 +172,19 @@ pub(crate) struct ConversationsConfig {
     /// `idle_timeout = 600s`, `acquire_timeout = 30s`).
     #[serde(default)]
     pub pool: Option<PoolConfig>,
+
+    /// Time-to-live for stored records. Records older than this are eligible
+    /// for deletion. When unset, the reaper is disabled.
+    #[serde(default, with = "humantime_serde")]
+    pub ttl: Option<Duration>,
+
+    /// How often to run the reaper sweep. Defaults to 1 hour when `ttl` is set.
+    #[serde(default, with = "humantime_serde")]
+    pub sweep_interval: Option<Duration>,
+
+    /// Maximum number of records to delete in a single sweep batch.
+    #[serde(default)]
+    pub sweep_batch_size: Option<NonZeroU32>,
 }
 
 /// Serde default for [`ConversationsConfig::conversations_table`].
@@ -217,6 +235,12 @@ pub(crate) fn validate_config(cfg: &ConversationsConfig) -> Result<(), FilterErr
     if let Some(pool) = &cfg.pool {
         pool.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
     }
+    let reaper = ReaperConfig {
+        ttl: cfg.ttl,
+        sweep_interval: cfg.sweep_interval,
+        sweep_batch_size: cfg.sweep_batch_size,
+    };
+    reaper.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
     validate_table_names(cfg)?;
     match cfg.backend {
         StorageBackend::Sqlite => {
@@ -357,6 +381,52 @@ fn sqlite_file_path(database_url: &str) -> Option<&str> {
         .strip_prefix("sqlite://")
         .or_else(|| database_url.strip_prefix("sqlite:"))
         .map(|rest| rest.split_once('?').map_or(rest, |(path, _query)| path))
+}
+
+#[cfg(test)]
+#[cfg(feature = "store-sqlite")]
+#[expect(clippy::expect_used, reason = "tests")]
+mod reaper_config_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(feature = "store-sqlite")]
+    fn validate_rejects_sweep_interval_without_ttl() {
+        let yaml = serde_yaml::from_str(
+            "backend: sqlite\n\
+             database_url: 'sqlite::memory:'\n\
+             sweep_interval: 1h\n",
+        )
+        .expect("valid YAML");
+        let cfg: ConversationsConfig = serde_yaml::from_value(yaml).expect("parses");
+        let err = validate_config(&cfg).expect_err("sweep_interval without ttl must fail");
+        assert!(err.to_string().contains("sweep_interval requires"), "{err}");
+    }
+
+    #[test]
+    #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
+    fn accepts_ttl_with_defaults() {
+        use std::time::Duration;
+
+        use crate::store::plan::reaper_policy_from_conversations;
+
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            "backend: sqlite\n\
+             database_url: 'sqlite::memory:'\n\
+             ttl: 1d\n",
+        )
+        .expect("valid YAML");
+        let cfg: ConversationsConfig = serde_yaml::from_value(yaml.clone()).expect("parses");
+        validate_config(&cfg).expect("ttl without sweep_interval is valid");
+
+        // Verify extraction helper returns expected policy.
+        let policy = reaper_policy_from_conversations(&yaml)
+            .expect("extraction succeeds")
+            .expect("ttl set => policy present");
+        assert_eq!(policy.ttl, Duration::from_secs(24 * 3600));
+        assert_eq!(policy.sweep_interval, Duration::from_secs(3600)); // default 1h
+        assert_eq!(policy.batch_size.get(), 1000); // default
+    }
 }
 
 #[cfg(test)]

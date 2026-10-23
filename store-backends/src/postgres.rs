@@ -689,6 +689,7 @@ async fn check_schema_version(connection: &mut sqlx::PgConnection, tables: &Tabl
 
 #[expect(
     clippy::too_many_lines,
+    clippy::large_stack_frames,
     reason = "async_trait counts the store method group as one expansion"
 )]
 #[async_trait]
@@ -1415,6 +1416,119 @@ impl ResponseStore for PostgresResponseStore {
         } else {
             Ok(EventLogStatus::Incomplete { max_sequence })
         }
+    }
+
+    async fn sweep_expired(&self, cutoff_secs: i64, batch_size: u32) -> Result<super::SweepStats, StoreError> {
+        let mut stats = super::SweepStats::default();
+
+        // Each sweep keys the batch on `(tableoid, ctid)`, not `ctid` alone.
+        // `ctid` is unique only WITHIN a single physical table, so on a
+        // partitioned table a `ctid` chosen from one partition can match an
+        // unexpired row in another partition and delete it. `tableoid`
+        // identifies the owning partition, making the pair globally unique
+        // across partitions; on a plain (non-partitioned) table every row
+        // shares one `tableoid`, so the pair reduces to `ctid` and stays
+        // correct. Schema validation accepts operator-created partitioned
+        // tables (it checks columns and unique indexes only), so this must be
+        // safe regardless of partitioning.
+
+        // Sweep responses table
+        let responses_sql = format!(
+            "DELETE FROM {} WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM {} WHERE created_at < $1 LIMIT $2)",
+            self.tables.responses, self.tables.responses
+        );
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+        sqlx::query(AssertSqlSafe("SET LOCAL statement_timeout = '30s'"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        let result = sqlx::query(AssertSqlSafe(responses_sql.as_str()))
+            .bind(cutoff_secs)
+            .bind(i64::from(batch_size))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        stats.responses = result.rows_affected();
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
+
+        // Sweep conversations table
+        let conversations_sql = format!(
+            "DELETE FROM {} WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM {} WHERE created_at < $1 LIMIT $2)",
+            self.tables.conversations, self.tables.conversations
+        );
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+        sqlx::query(AssertSqlSafe("SET LOCAL statement_timeout = '30s'"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        let result = sqlx::query(AssertSqlSafe(conversations_sql.as_str()))
+            .bind(cutoff_secs)
+            .bind(i64::from(batch_size))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        stats.conversations = result.rows_affected();
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
+
+        // Sweep items table if present
+        if let Some(items_table) = &self.tables.items {
+            let items_sql = format!(
+                "DELETE FROM {items_table} WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM {items_table} WHERE created_at < $1 LIMIT $2)"
+            );
+            let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+            sqlx::query(AssertSqlSafe("SET LOCAL statement_timeout = '30s'"))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| self.db_err(&e))?;
+            let result = sqlx::query(AssertSqlSafe(items_sql.as_str()))
+                .bind(cutoff_secs)
+                .bind(i64::from(batch_size))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| self.db_err(&e))?;
+            stats.items = result.rows_affected();
+            tx.commit().await.map_err(|e| self.db_err(&e))?;
+        }
+
+        // Sweep pending_approvals table
+        let approvals_table = pending_approvals_table(&self.tables.responses);
+        let approvals_sql = format!(
+            "DELETE FROM {approvals_table} WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM {approvals_table} WHERE created_at < $1 LIMIT $2)"
+        );
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+        sqlx::query(AssertSqlSafe("SET LOCAL statement_timeout = '30s'"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        let result = sqlx::query(AssertSqlSafe(approvals_sql.as_str()))
+            .bind(cutoff_secs)
+            .bind(i64::from(batch_size))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        stats.pending_approvals = result.rows_affected();
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
+
+        // Sweep events table
+        let events_table_name = events_table(&self.tables.responses);
+        let events_sql = format!(
+            "DELETE FROM {events_table_name} WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM {events_table_name} WHERE created_at < $1 LIMIT $2)"
+        );
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+        sqlx::query(AssertSqlSafe("SET LOCAL statement_timeout = '30s'"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        let result = sqlx::query(AssertSqlSafe(events_sql.as_str()))
+            .bind(cutoff_secs)
+            .bind(i64::from(batch_size))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        stats.events = result.rows_affected();
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
+
+        Ok(stats)
     }
 }
 

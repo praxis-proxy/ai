@@ -13,6 +13,7 @@ mod backend_config;
 pub mod compression;
 mod factory;
 mod owner;
+mod reaper_config;
 mod registry;
 mod retained_payload;
 mod size;
@@ -35,6 +36,7 @@ pub use factory::{
     BackendError, BackendNamespaceKey, EffectiveConfigKey, ProvisionedBackend, RetireBackend, StoreBackendFactory,
 };
 pub use owner::{StateOwner, StateOwnerError, validate_component};
+pub use reaper_config::{DEFAULT_SWEEP_BATCH_SIZE, DEFAULT_SWEEP_INTERVAL_SECS, ReaperConfig, ReaperPolicy};
 pub use registry::{OwnerScopedStore, StoreRegistry};
 pub use retained_payload::{
     RETAINED_JSON_BYTE_MULTIPLIER, RETAINED_JSON_NODE_BYTES, json_payload_charge, json_values_charge, retained_charge,
@@ -43,5 +45,5 @@ pub use size::json_values_fit;
 pub use traits::{ConversationItemStore, PersistedStateBackend, ResponseStore};
 pub use types::{
     BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-    ResponseEventRecord, ResponseRecord, StoreError,
+    ResponseEventRecord, ResponseRecord, StoreError, SweepStats,
 };

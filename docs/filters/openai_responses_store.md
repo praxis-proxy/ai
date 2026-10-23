@@ -29,6 +29,9 @@ Replay becomes available only after the original response and event log are pers
 | `compression` | StoreCompressionConfig | no | Optional payload compression for stored JSON columns. When omitted, payloads are stored uncompressed. Reads auto-detect the format, so enabling compression keeps existing uncompressed records readable. |
 | `max_event_count` | NonZeroU32 | no | Maximum number of SSE events retained in a streamed response's replay log (`GET /v1/responses/{id}?stream=true`). A stream that exceeds this stops event capture for that response, so its terminal event is never recorded and the response becomes non-replayable. The live client stream and the plain JSON record are unaffected. |
 | `max_event_bytes` | NonZeroU64 | no | Maximum total payload bytes retained in a streamed response's replay log. Same over-budget behavior as `max_event_count`. |
+| `ttl` | Duration | no | Time-to-live for stored records. Records older than this are eligible for deletion. When unset, the reaper is disabled. |
+| `sweep_interval` | Duration | no | How often to run the reaper sweep. Defaults to 1 hour when `ttl` is set. |
+| `sweep_batch_size` | NonZeroU32 | no | Maximum number of records to delete in a single sweep batch. |
 
 ## Example
 
