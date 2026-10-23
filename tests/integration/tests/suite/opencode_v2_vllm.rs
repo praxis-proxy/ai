@@ -53,7 +53,7 @@ async fn run_live(live: &LiveConfig, workspace: &Path, prompt: &str) -> Captured
     let home = TempDir::new().expect("temporary HOME should be creatable");
 
     launch(LaunchSpec {
-        bin: &live.opencode_bin,
+        bin: &live.client_bin,
         home: home.path(),
         workspace,
         base_url: &base_url,

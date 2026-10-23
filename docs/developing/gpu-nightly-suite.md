@@ -51,6 +51,7 @@ backend can serve the same client.
 | **Claude Code** | native | Anthropic Messages passed through | `/v1/messages` |
 | **Claude Code** | translated | `anthropic_messages_to_chat_completions[_stream]` | `/v1/chat/completions` |
 | **OpenCode** | native | Chat Completions passed through, CLI **1.x and 2.x** | `/v1/chat/completions` |
+| **pi** | native | Chat Completions passed through (`openai-completions` provider) | `/v1/chat/completions` |
 | **OpenAI Agents SDK** | native | SDK-owned tool loop over Responses | `/v1/responses` |
 | **OpenAI SDK (Responses)** | native | Responses SDK suite, SDK **2.x and 3.x** | `/v1/responses` |
 | **OpenAI SDK (Chat Completions)** | translated (selected provider) | `openai_chat_completions_to_anthropic[_stream]` | `/v1/messages` |
@@ -262,12 +263,18 @@ for a pulled image.
   locked-down network namespace. Each major is reported as separate cases
   (`opencode_text`, `opencode_tool_call`, `opencode_v2_text`,
   `opencode_v2_tool_call`).
+- `vllm-gpu-pi-acceptance` — pinned pi over the same native Chat Completions
+  path, with the documented `models.json`: one text turn and one tool-call
+  round trip (`pi_text`, `pi_tool_call`). It runs its own vLLM container from
+  the OpenCode backend pins and launches the client inside its own locked-down
+  network namespace.
 - `pins` — parses `tests/integration/fixtures/claude-code-cli/pin.toml`,
-  `tests/integration/fixtures/opencode-cli/pin.toml`, and
-  `tests/integration/fixtures/opencode-cli-v2/pin.toml`, cross-validates their
-  invariants (each OpenCode manifest against its own declared major), and
-  exports every value the acceptance jobs consume so those jobs carry no
-  hardcoded version strings.
+  `tests/integration/fixtures/opencode-cli/pin.toml`,
+  `tests/integration/fixtures/opencode-cli-v2/pin.toml`, and
+  `tests/integration/fixtures/pi-cli/pin.toml`, cross-validates their
+  invariants (each OpenCode manifest against its own declared major, and pi
+  against the OpenCode backend pins it shares), and exports every value the
+  acceptance jobs consume so those jobs carry no hardcoded version strings.
 - `gpu-qualification-summary` — writes `qualification.json` and the Actions
   summary even if provisioning fails.
 
@@ -303,6 +310,11 @@ carry the detail.
   `opencode_v2_vllm_tool_call_round_trip_writes_hash_verified_marker`). The
   deterministic CPU lane is `suite/opencode_v2.rs`, run by the
   `opencode-v2-cpu` job in `integration.yaml`.
+- `tests/integration/tests/suite/pi_vllm.rs` — pi acceptance
+  (`pi_vllm_documented_config_completes_text_turn`,
+  `pi_vllm_tool_call_round_trip_writes_hash_verified_marker`). The
+  deterministic CPU lane is `suite/pi.rs`, run by the `pi-cpu` job in
+  `integration.yaml`.
 - `tests/integration/tests/suite/live_vllm.rs` — namespace, egress-probe and
   example-patching scaffolding shared by the live CLI suites.
 
@@ -323,9 +335,10 @@ VLLM_MODEL=Qwen/Qwen3-8B VLLM_TEST_BACKEND=live \
   (`qualification.json` schema, report fields, pass/fail semantics, release
   selection).
 - [cli-vllm-through-praxis.md](cli-vllm-through-praxis.md) — running Codex /
-  Claude Code / OpenCode through Praxis and vLLM; reasoning-flag regression,
-  the headless `opencode run` forms, each OpenCode major's documented
-  credential recipes, and how the 2.x plugin behaves when it fails.
+  Claude Code / OpenCode / pi through Praxis and vLLM; reasoning-flag
+  regression, the headless `opencode run` and `pi --print` forms, each
+  OpenCode major's documented credential recipes, how the 2.x plugin behaves
+  when it fails, and how pi's credential recipe behaves when it fails.
 - [`vllm/README.md`](../../vllm/README.md) — GPU container: build, run, health
   check, hardware/model rationale.
 - [llmd-integration-testing.md](llmd-integration-testing.md) — adjacent CPU-side

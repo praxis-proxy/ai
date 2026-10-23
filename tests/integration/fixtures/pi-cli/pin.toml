@@ -1,0 +1,215 @@
+# pi acceptance pin manifest
+#
+# Single source of truth for the pinned pi acceptance tests
+# (`tests/integration/tests/suite/pi.rs` and `pi_vllm.rs`) and their CI jobs
+# (`pi-cpu` in `.github/workflows/integration.yaml` and
+# `vllm-gpu-pi-acceptance` in `.github/workflows/vllm-integration.yaml`). pi
+# (https://github.com/earendil-works/pi) is the fourth coding client documented
+# in `docs/developing/cli-vllm-through-praxis.md`. It can speak several wire
+# APIs; the supported lane is OpenAI Chat Completions, the same untranslated
+# path OpenCode uses:
+#
+#   pi (openai-completions) -> Praxis /v1/chat/completions -> vLLM /v1/chat/completions
+#
+# There is no body translation anywhere on that path. Praxis authenticates the
+# caller, scrubs client credentials, injects the backend credential, and routes
+# — so these tests prove client compatibility and credential isolation, not a
+# transformation. Wire fidelity is proven deterministically against controlled
+# backends in
+# `tests/integration/tests/suite/examples/anthropic_messages_native_vllm.rs`.
+#
+# Every value below was validated by hand against the pinned executable. Where
+# a value encodes observed client behavior rather than a choice, the comment
+# says so — those are the ones to re-validate when the version changes.
+
+[pi]
+# Version asserted from `pi --version`. Keep in sync with PI_PINNED_VERSION in
+# `tests/integration/tests/suite/harness.rs` and PI_VERSION in the `pi-cpu`
+# job; the offline tests `pin_toml_version_matches_harness_const` and
+# `pi_lane_is_wired_in_ci` enforce both pairs.
+#
+# `pi --version` prints the bare version with NO product prefix (`1.4.0`).
+version = "1.4.0"
+# Platform slug of the pinned release archive.
+platform = "linux-x64"
+# How CI obtains the executable.
+#
+# `github-release` downloads the upstream release archive
+# `pi-<platform>.tar.gz` from the `v<version>` tag and verifies it against
+# `tests/integration/fixtures/pi-cli/<version>-<platform>.sha256`, which is
+# copied verbatim from the release's own `SHA256SUMS`. Both lanes stage the
+# SAME archive with only curl, sha256sum, and tar, so the GPU AMI (which ships
+# no Node) needs nothing extra.
+#
+# The npm package `@earendil-works/pi-coding-agent` was rejected: it pulls about
+# twenty runtime dependencies, so its top-level integrity hash does not pin
+# what actually executes. The release archive is a Bun-compiled ELF plus sidecar
+# files it reads at runtime (package.json, themes, a wasm image codec, docs), so
+# the whole extracted directory is staged, not just the binary. Observed: the
+# ELF copied out alone still completes a turn but reports `--version` as
+# `0.0.0`, because the version comes from the sibling package.json — the
+# version check in both lanes is what catches a binary staged without its
+# directory.
+install = "github-release"
+url = "https://github.com/earendil-works/pi/releases/download/v1.4.0/pi-linux-x64.tar.gz"
+archive = "pi-linux-x64.tar.gz"
+# The executable's path inside the extracted archive.
+archive_binary = "pi/pi"
+# Major-series tripwire. The headless flags, JSON event shapes, and
+# `models.json` header resolution below were validated on 1.x; a bump across
+# a major boundary must re-validate this manifest, not just the version.
+major_series = 1
+
+[pi.launch]
+# Headless entry point: `--print` processes the prompt and exits. The prompt
+# is the final POSITIONAL argument after `--`, so a prompt beginning with `-`
+# is never parsed as a flag.
+print_flag = "--print"
+# `--mode json` emits strict JSONL on stdout: a `session` header, then
+# `agent_start`, `turn_start`, `message_start`/`message_update`/`message_end`,
+# `turn_end`, `agent_end`, `agent_settled`. Assistant text is the `text`
+# content of the final assistant `message_end.message`. Tool runs add
+# `tool_execution_start`/`_update`/`_end` with `toolName`.
+mode = "json"
+# Hermetic flags: no extension, MCP, skill, prompt-template, theme, or context
+# file discovery, no persisted session, project-local `.pi` files ignored, and
+# no startup network operations.
+hermetic_flags = [
+  "--offline", "--no-extensions", "--no-mcp", "--no-skills",
+  "--no-prompt-templates", "--no-themes", "--no-context-files",
+  "--no-session", "--no-approve",
+]
+#
+# !! EXIT STATUS IS NOT AN ERROR ORACLE IN JSON MODE. !!
+#
+# With `--mode json`, a turn that fails — a gateway 401, or a header that
+# cannot be resolved — still exits 0. The failure is reported only as
+# `stopReason: "error"` with an `errorMessage` on the final assistant message
+# (`401: {...}` for an HTTP rejection). `--mode text` exits 1 for the same
+# failures. The tests therefore assert on `stopReason`, never on the exit code
+# alone.
+exit_code_meaningful_in_json_mode = false
+exit_code_meaningful_in_text_mode = true
+# Observed request count: ONE POST to /v1/chat/completions for a trivial
+# prompt (no title or summary side turn), and two for a single tool-call round
+# trip. No `GET /v1/models` probe; model discovery comes from `models.json`.
+observed_turns_for_trivial_prompt = 1
+observed_turns_for_one_tool_call = 2
+probes_models_endpoint = false
+# A transport error (connection refused, unresolvable host) is retried: four
+# attempts over ~14s were observed. An HTTP 401 is NOT retried. Scripted
+# backends must still queue surplus responses.
+retries_transport_errors = true
+retries_http_401 = false
+
+# STDIN MUST BE /dev/null.
+#
+# With stdin left open, `pi --print` blocks forever, before issuing a single
+# request, waiting for stdin EOF. Piped stdin is read to EOF and PREPENDED to
+# the prompt, so a harness that pipes anything changes what the model sees.
+[pi.launch.stdin]
+must_be_null = true
+prepended_to_prompt = true
+
+[pi.auth]
+# The documented recipe: a provider-level `headers.Authorization` in
+# `models.json` carries the gateway Basic credential, read from the
+# environment with `${NAME}` interpolation (`$NAME` and a leading `!command`
+# also work; all resolve at request time).
+config_file = "models.json"
+# The fixture beside this manifest is asserted byte-equal to the sole ```json
+# block in the guide's pi section by `documented_models_json_matches_fixture`.
+fixture = "models.json"
+doc = "docs/developing/cli-vllm-through-praxis.md"
+header_name = "Authorization"
+header_value = "Basic ${PRAXIS_GATEWAY_BASIC_TOKEN}"
+env_token = "PRAXIS_GATEWAY_BASIC_TOKEN"
+# `apiKey` must be NON-EMPTY or the model is unavailable: pi exits 1 with
+# `No API key found for praxis.` before sending anything. The configured
+# `Authorization` header REPLACES the `Bearer <apiKey>` pi would otherwise
+# send, so the key is a placeholder that never leaves the client. Verified on
+# the wire: only the Basic credential arrives.
+api_key_required = true
+api_key_placeholder = "local-pi-client-key"
+header_replaces_bearer = true
+#
+# THE HEADER RECIPE IS FAIL-CLOSED.
+#
+# When `PRAXIS_GATEWAY_BASIC_TOKEN` is unset, pi sends NO request. The turn ends
+# with `stopReason: "error"` and the message below. Unlike the OpenCode 1.x
+# plugin, a missing credential never degrades into an unauthenticated request.
+fail_closed = true
+unresolved_header_error = 'Failed to resolve provider "praxis" header "Authorization"'
+
+[pi.provider]
+# Provider id `models.json` declares; the model is addressed as
+# `<id>/<model_id>` on `--model`.
+id = "praxis"
+api = "openai-completions"
+model_id = "qwen3-8b"
+context_window = 32768
+max_tokens = 8192
+# baseUrl carries the `/v1` suffix; the client appends `/chat/completions`.
+base_url_suffix = "/v1"
+# Unknown keys are SILENTLY IGNORED, so a misspelled key drops its setting
+# without an error. `models_json_is_schema_key_safe` checks the fixture against
+# these allowlists, taken from the bundled `docs/models-configuration.md`;
+# `schema_allowlists_match_the_manifest` keeps the test's copies in sync.
+provider_keys = [
+  "name", "baseUrl", "apiKey", "api", "oauth", "headers", "compat",
+  "authHeader", "models", "modelOverrides",
+]
+model_keys = [
+  "id", "name", "api", "baseUrl", "reasoning", "thinkingLevelMap", "input",
+  "inputLimits", "cost", "promptCache", "contextWindow", "maxTokens",
+  "samplingParams", "samplingParamsByThinkingLevel", "headers", "compat",
+]
+# No `compat` overrides are needed for vLLM. With `reasoning` left at its
+# default of false, pi sends no reasoning or thinking fields at all; Qwen3
+# thinking is disabled server-side by the chat-template kwargs in the shared
+# vLLM pins. Observed request body keys: model, messages, tools, stream,
+# stream_options (include_usage), store (false), max_completion_tokens.
+compat_required = false
+# Request header that identifies the client, captured from a real request.
+user_agent_prefix = "pi/"
+
+[pi.isolation]
+# NO startup egress is required.
+#
+# Verified two ways: the full flow completes in ~0.3s inside a loopback-only
+# network namespace (`unshare --net`, lo up, no default route), and with
+# HTTP(S)_PROXY pointed at a logging listener no outbound connection was
+# attempted, with or without `--offline`. The binary does know pi.dev endpoints
+# (latest-version, install report); `--offline` and the variables below keep
+# them disabled as hygiene, not as a correctness prerequisite.
+requires_egress = false
+verified_in_netns = true
+disable_env = ["PI_OFFLINE", "PI_SKIP_VERSION_CHECK", "PI_TELEMETRY"]
+# Configuration root. Pointed at a temporary directory so a real `~/.pi`
+# (stored credentials, settings, extensions) can never be reached.
+config_dir_env = "PI_CODING_AGENT_DIR"
+
+[pi.tools]
+# Tool names the pinned client registers, verbatim from a captured request,
+# with or without the hermetic flags. Lowercase, like OpenCode 1.x.
+registered = ["read", "bash", "edit", "write"]
+bash_tool = "bash"
+# No permission prompt: a scripted `bash` call executes immediately in
+# headless mode, and its `role: "tool"` result goes back up as a second POST.
+requires_approval = false
+
+[gateway]
+# The example config the documented path rides, shared with OpenCode. The
+# backend pins for the GPU lane are the `[vllm]` block of
+# `opencode-cli/pin.toml`: one Chat Completions backend, pinned once. The
+# `pins` job asserts this manifest's model and window agree with it.
+example_config = "anthropic/messages-native-vllm.yaml"
+basic_auth_user = "gateway"
+password_env = "GATEWAY_AUTH_PASSWORD"
+backend_credential_env = "VLLM_API_KEY"
+backend_pins = "opencode-cli/pin.toml"
+
+[startup_matrix]
+# Every prefix the client is allowed to reach through the gateway. Each one
+# must have a matching explicit `- path:` route in `gateway.example_config`.
+allowed_prefixes = ["/v1/chat/completions"]

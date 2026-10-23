@@ -17,6 +17,7 @@ Credentialed Tools: skipped.
 Claude Acceptance: success.
 Codex Acceptance: skipped.
 Opencode Acceptance: unavailable.
+Pi Acceptance: unavailable.
 
 [Workflow run](https://github.com/praxis-proxy/ai/actions/runs/17) and [report/diagnostic artifacts](https://github.com/praxis-proxy/ai/actions/runs/17#artifacts)
 

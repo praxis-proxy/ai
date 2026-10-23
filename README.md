@@ -34,7 +34,7 @@ backends and applies policy.
   [Bedrock](examples/configs/bedrock/chat-completions-to-converse.yaml), and
   [Vertex](examples/configs/vertex/chat-completions-to-gemini.yaml) examples.
 - **Code harness support.** Run Codex through OpenAI Responses, Claude Code
-  through Anthropic Messages, and OpenCode through Chat Completions. The
+  through Anthropic Messages, and OpenCode and pi through Chat Completions. The
   [coding client guide](docs/developing/cli-vllm-through-praxis.md) shows each
   client reaching native vLLM endpoints or Chat Completions through translation.
 - **Manage OpenAI response state.** Persist and rehydrate Responses history,
