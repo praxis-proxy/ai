@@ -56,9 +56,10 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit test-unit-apis test-unit-filters test-unit-proxy \
-	test-schema test-integration test-inference-fixtures bench-model-to-provider \
+	test-schema test-integration test-integration-experimental \
+	test-inference-fixtures test-inference-xtask bench-model-to-provider \
 	test-store-features test-responses-features \
-	test-postgres-unit test-postgres-integration test-environment \
+	test-postgres-unit test-postgres-integration test-environment test-environment-suite \
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
 	test-token-rate-limit-sentinel-integration \
 	openai-conformance check-openai-conformance-reference test-openai-conformance \
@@ -237,6 +238,12 @@ test-integration:
 	cargo build -p praxis-ai-proxy --bin praxis-ai --features openai-all,store-all
 	PRAXIS_AI_BIN=$(abspath $(or $(CARGO_TARGET_DIR),target)/debug/praxis-ai) \
 	cargo test -p praxis-tests-integration --features openai-all,store-all $(_NOCAPTURE)
+
+# The experimental-filter permutation builds a second feature graph (store-all
+# plus the example-config filters) and runs only the example suites that need
+# them. Split into its own parallel CI job so this rebuild no longer extends the
+# test-integration critical path.
+test-integration-experimental:
 	cargo build -p praxis-ai-proxy --bin praxis-ai --features openai-all,store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES)
 	PRAXIS_AI_BIN=$(abspath $(or $(CARGO_TARGET_DIR),target)/debug/praxis-ai) \
 	cargo test -p praxis-tests-integration --features openai-all,store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
@@ -246,8 +253,13 @@ test-integration:
 
 test-inference-fixtures:
 	cargo test -p praxis-test-utils --features openai-all,store-all,vertex-anthropic-filter $(_NOCAPTURE)
-	cargo test -p xtask --features openai-all,store-all inference_fixtures $(_NOCAPTURE)
 	cargo test -p praxis-tests-integration --features openai-all,store-all,vertex-anthropic-filter --test suite inference_fixtures $(_NOCAPTURE)
+
+# The xtask inference-fixture compile is a distinct crate graph from the
+# test-utils/suite builds above; split into its own parallel CI job so it no
+# longer serializes behind them.
+test-inference-xtask:
+	cargo test -p xtask --features openai-all,store-all inference_fixtures $(_NOCAPTURE)
 
 # Every ignored test in praxis-ai-apis is a PostgreSQL store contract, so
 # --ignored alone selects them all: no name filter can drop one silently.
@@ -307,8 +319,13 @@ test-responses-conformance:
 
 test-environment:
 	cargo test -p praxis-ai-llmd-ext-proc $(_NOCAPTURE)
-	cargo test -p praxis-tests-integration --features llmd-ext-proc llmd_ext_proc $(_NOCAPTURE)
 	cargo test -p praxis-tests-environment --features llmd-ext-proc $(_NOCAPTURE)
+
+# The llmd-ext-proc integration suite is the heaviest compile in this group;
+# split into its own parallel CI job so it no longer serializes behind the
+# ext-proc and environment crates.
+test-environment-suite:
+	cargo test -p praxis-tests-integration --features llmd-ext-proc llmd_ext_proc $(_NOCAPTURE)
 
 # -------------------------------------------------------------------
 # Quality

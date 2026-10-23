@@ -235,6 +235,13 @@ jobs:
 
       - name: Setup Rust
         uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          # vllm-responses and vllm-live-cpu build the identical
+          # standard,openai-all,store-sqlite proxy, but had no cache-suffix, so
+          # they collided on the default key and effectively built cold (~20m).
+          # Share one stable key so the build is warm (~14m). This target/ cache
+          # is the one accepted new family under the hard 10 GB cap.
+          cache-suffix: vllm-cpu-cargo
 
       - name: Install uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -433,6 +440,10 @@ jobs:
 
       - name: Setup Rust
         uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          # Shares the store-sqlite rust-cache with vllm-responses (identical
+          # standard,openai-all,store-sqlite proxy). See that job for rationale.
+          cache-suffix: vllm-cpu-cargo
 
       - name: Install uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
