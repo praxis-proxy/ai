@@ -845,3 +845,12 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.tools.orphan_output_projection
+    scopes:
+      - openai_responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-orphan-tool-output
+    providers:
+      synthetic:
+        status: synthetic_only

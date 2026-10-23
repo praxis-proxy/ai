@@ -1319,6 +1319,7 @@ mod tests {
                 vec!["openai_chat_completions_to_anthropic_messages"],
                 vec!["responses_native_passthrough"],
                 vec!["openai_chat_completions_to_anthropic_messages"],
+                vec!["openai_responses_to_chat_completions"],
             ]
         );
         assert_eq!(
@@ -1417,11 +1418,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 89, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 69, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 74, "manifest recording inventory count");
+        assert_eq!(report.features_total, 90, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 70, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 75, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1461,6 +1463,7 @@ mod tests {
                 "responses/chat-malformed-compaction",
                 "responses/chat-multi-choice-nonstream",
                 "responses/chat-null-tool-choice",
+                "responses/chat-orphan-tool-output",
                 "responses/chat-reasoning-disabled",
                 "responses/chat-reasoning-nonstream",
                 "responses/chat-reasoning-replay",
@@ -1496,7 +1499,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 89, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 90, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1906,6 +1909,10 @@ mod tests {
                     &"external_model.anthropic.response.null_cache_usage".to_owned(),
                     &vec!["openai_legacy/anthropic-json-sse-error".to_owned()]
                 ),
+                (
+                    &"responses.chat.tools.orphan_output_projection".to_owned(),
+                    &vec!["responses/chat-orphan-tool-output".to_owned()]
+                ),
             ]
         );
         for feature in &manifest.features[0..2] {
@@ -2078,7 +2085,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)],
             );
         }
-        for feature in &manifest.features[79..87] {
+        for feature in &manifest.features[79..90] {
             assert_eq!(
                 feature
                     .providers
