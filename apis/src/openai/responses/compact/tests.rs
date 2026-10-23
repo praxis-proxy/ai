@@ -1068,6 +1068,18 @@ fn compaction_source_accepts_reasoning_item_with_empty_summary() {
 }
 
 #[test]
+fn compaction_source_accepts_reasoning_item_with_null_status() {
+    let messages = [json!({
+        "type": "reasoning",
+        "id": "rs_null_status",
+        "status": null,
+        "summary": []
+    })];
+
+    validate_compaction_source(messages.iter()).expect("null reasoning status is equivalent to an absent status");
+}
+
+#[test]
 fn compaction_source_rejects_encrypted_reasoning_state() {
     let messages = [json!({
         "type": "reasoning",

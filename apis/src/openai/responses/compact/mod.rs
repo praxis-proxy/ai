@@ -1347,6 +1347,7 @@ fn validate_reasoning_item_metadata(item_idx: usize, item: &Value) -> Result<(),
         return Err(reject_reasoning_compaction(item_idx, "reasoning.id must be a string"));
     }
     if let Some(status) = item.get("status")
+        && !status.is_null()
         && !matches!(status.as_str(), Some("in_progress" | "completed" | "incomplete"))
     {
         return Err(reject_reasoning_compaction(
