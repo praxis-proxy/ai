@@ -13,7 +13,7 @@ Compaction applies in two scenarios:
 
 - **Rehydrated history** - stored history loaded via `previous_response_id` or `conversation`. Only the stored history is summarized; the current turn is preserved.
 
-- **Explicit compact** - `POST /v1/responses/compact` with a required `model` and an inline `input` conversation and/or a `previous_response_id`. Loads any stored history, appends the inline input, summarizes the combined conversation, and returns a `response.compaction` object (with `output` and `usage`) per the OpenAI contract.
+- **Explicit compact** - `POST /v1/responses/compact` with a required `model` and an optional inline `input` conversation and/or `previous_response_id`. Loads any stored history, appends the inline input, summarizes the combined conversation, and returns a `response.compaction` object (with `output` and `usage`) per the OpenAI contract. A schema-valid empty conversation is not rejected: no callout is made and a no-op compaction is persisted (issue #1139).
 
 Direct input requests (full conversation in `input` with no stored history) skip reactive compaction because `state.input == state.messages` - there is no separable "current turn" to preserve after summarization. Requests without rehydrated history are released without compaction.
 

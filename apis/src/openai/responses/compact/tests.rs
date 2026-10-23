@@ -1288,6 +1288,69 @@ async fn explicit_compaction_loads_previous_response_only_for_exact_owner() {
     assert_eq!(messages, vec![json!({"role": "user", "content": "private"})]);
 }
 
+#[tokio::test]
+#[cfg(feature = "store-sqlite")]
+async fn collect_compact_messages_model_only_is_empty() {
+    // Issue #1139: `model` is the only required field, so a request with no
+    // inline input and no `previous_response_id` collects an empty conversation
+    // rather than being rejected; the caller persists a no-op compaction.
+    let backend: std::sync::Arc<dyn crate::store::PersistedStateBackend> = std::sync::Arc::new(
+        crate::store::SqliteResponseStore::new("sqlite::memory:", "responses", "conversations", None, None, None)
+            .await
+            .unwrap(),
+    );
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    let registry = ResponseStoreRegistry::new();
+    registry.register(&std::sync::Arc::from("default"), backend).unwrap();
+    let mut request = parse_compact_request_body(&Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#))).unwrap();
+
+    let store = registry.get_scoped("default", &owner).unwrap();
+    let messages = collect_compact_messages(&store, &mut request, &mut None).await.unwrap();
+    assert!(
+        messages.is_empty(),
+        "a model-only request collects an empty conversation"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "store-sqlite")]
+async fn collect_compact_messages_empty_stored_history_is_empty() {
+    // Issue #1139: a `previous_response_id` whose stored history is empty also
+    // collects an empty conversation and is compacted as a no-op rather than
+    // rejected with "no messages to compact".
+    let backend: std::sync::Arc<dyn crate::store::PersistedStateBackend> = std::sync::Arc::new(
+        crate::store::SqliteResponseStore::new("sqlite::memory:", "responses", "conversations", None, None, None)
+            .await
+            .unwrap(),
+    );
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    backend
+        .upsert_response(&ResponseRecord {
+            id: "resp_empty".to_owned(),
+            owner: owner.clone(),
+            created_at: 1_000,
+            model: "gpt-4.1".to_owned(),
+            response_object: json!({"id": "resp_empty", "status": "completed"}),
+            input: json!([]),
+            messages: json!([]),
+        })
+        .await
+        .unwrap();
+    let registry = ResponseStoreRegistry::new();
+    registry.register(&std::sync::Arc::from("default"), backend).unwrap();
+    let mut request = parse_compact_request_body(&Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","previous_response_id":"resp_empty"}"#,
+    )))
+    .unwrap();
+
+    let store = registry.get_scoped("default", &owner).unwrap();
+    let messages = collect_compact_messages(&store, &mut request, &mut None).await.unwrap();
+    assert!(
+        messages.is_empty(),
+        "an empty stored history collects an empty conversation"
+    );
+}
+
 #[test]
 fn parse_compact_request_body_with_string_input() {
     let body = Some(Bytes::from(
@@ -1344,10 +1407,29 @@ fn parse_compact_request_body_empty_model() {
 }
 
 #[test]
-fn parse_compact_request_body_missing_content() {
-    // `model` alone, with neither `input` nor `previous_response_id`.
+fn parse_compact_request_body_model_only_is_accepted() {
+    // Issue #1139: `model` is the only required field, so a body with neither
+    // `input` nor `previous_response_id` is schema-valid and must parse.
     let body = Some(Bytes::from(serde_json::to_vec(&json!({"model": "gpt-4o"})).unwrap()));
-    assert!(parse_compact_request_body(&body).is_err());
+    let req = parse_compact_request_body(&body).unwrap();
+    assert_eq!(req.model, "gpt-4o");
+    assert!(req.input.is_empty());
+    assert!(req.previous_response_id.is_none());
+    assert!(req.instructions.is_none());
+}
+
+#[test]
+fn parse_compact_request_body_empty_input_variants_are_accepted() {
+    // Issue #1139: explicit null, empty-string, and empty-array `input` values
+    // are all schema-valid ways to carry no conversation.
+    for field in [json!(null), json!(""), json!([])] {
+        let body = Some(Bytes::from(
+            serde_json::to_vec(&json!({"model": "gpt-4o", "input": field})).unwrap(),
+        ));
+        let req = parse_compact_request_body(&body).unwrap();
+        assert!(req.input.is_empty(), "{field} must collect an empty conversation");
+        assert!(req.previous_response_id.is_none());
+    }
 }
 
 // =============================================================================
@@ -1414,7 +1496,7 @@ fn parse_compact_input_absent_and_null_are_empty_list() {
 #[test]
 fn parse_compact_input_empty_string_is_empty_list() {
     // An empty-content string is distinct from a wrong type; it is schema-valid
-    // emptiness (tracked by #1139), not a 400.
+    // emptiness that compacts to a no-op (#1139), not a 400.
     assert!(parse_compact_input(Some(json!(""))).unwrap().is_empty());
 }
 
@@ -1744,8 +1826,8 @@ fn parse_compact_input_message_without_content_is_rejected() {
 
 #[test]
 fn parse_compact_input_message_with_empty_content_is_accepted() {
-    // Schema-valid emptiness (#1139) must not be rejected: an empty string and
-    // an empty content list are both well-formed.
+    // Schema-valid emptiness (#1139) is accepted, not rejected: an empty string
+    // and an empty content list are both well-formed.
     assert_eq!(
         parse_compact_input(Some(json!([{"role": "user", "content": ""}])))
             .unwrap()

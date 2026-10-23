@@ -20,7 +20,8 @@
 //!   requests that include `previous_response_id` or `conversation`. Single-turn requests (no stored history, even with
 //!   `context_management` set) are released without compaction because there is no prior history to summarize.
 //! - **Explicit** — `POST /v1/responses/compact`, which summarizes any previously stored response (plus optional inline
-//!   `input`) regardless of rehydration, returning a `response.compaction` object.
+//!   `input`) regardless of rehydration, returning a `response.compaction` object. `model` is the only required field,
+//!   so a schema-valid empty conversation is compacted as a no-op (issue #1139).
 //!
 //! See [`CompactFilter`] for the full description of both scenarios.
 //!
@@ -148,9 +149,11 @@ struct Summarization {
 /// - **Rehydrated history** - stored history loaded via `previous_response_id` or `conversation`. Only the stored
 ///   history is summarized; the current turn is preserved.
 ///
-/// - **Explicit compact** - `POST /v1/responses/compact` with a required `model` and an inline `input` conversation
-///   and/or a `previous_response_id`. Loads any stored history, appends the inline input, summarizes the combined
-///   conversation, and returns a `response.compaction` object (with `output` and `usage`) per the OpenAI contract.
+/// - **Explicit compact** - `POST /v1/responses/compact` with a required `model` and an optional inline `input`
+///   conversation and/or `previous_response_id`. Loads any stored history, appends the inline input, summarizes the
+///   combined conversation, and returns a `response.compaction` object (with `output` and `usage`) per the OpenAI
+///   contract. A schema-valid empty conversation is not rejected: no callout is made and a no-op compaction is
+///   persisted (issue #1139).
 ///
 /// Direct input requests (full conversation in `input` with no stored history) skip reactive compaction because
 /// `state.input == state.messages` - there is no separable "current turn" to preserve after summarization.
@@ -439,14 +442,12 @@ impl CompactFilter {
         Box::pin(self.finish_explicit_compact(ctx, collected)).await
     }
 
-    /// Validate, summarize, and persist an already collected compact request.
+    /// Validate an already collected compact request, then summarize and
+    /// persist it via [`Self::persist_explicit_compaction`].
     ///
-    /// Keeping this phase separate prevents its callout and persistence futures
-    /// from sharing one stack frame with the stored-history lookup future.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "validation, callout, and persistence form one post-lookup phase"
-    )]
+    /// Keeping the phases separate prevents the callout and persistence
+    /// futures from sharing one stack frame with the stored-history lookup
+    /// future.
     async fn finish_explicit_compact(
         &self,
         ctx: &HttpFilterContext<'_>,
@@ -471,19 +472,46 @@ impl CompactFilter {
         };
         // The callout future carries a buffered response. Keep it off the
         // request filter's stack while the source messages remain live.
-        let response_object =
-            if let Some(summary) = Box::pin(self.summarize_messages(&req, &messages, &mut budget)).await? {
-                writer.persist_compacted(&summary, &mut budget).await?
-            } else {
-                warn!("fail-open compaction: summarization callout failed; persisting uncompacted no-op");
-                writer.persist_uncompacted(&mut budget).await?
-            };
+        let response_object = Box::pin(self.persist_explicit_compaction(&writer, &mut budget)).await?;
         let body_bytes = serde_json::to_vec(&response_object).unwrap_or_default();
         Ok(FilterAction::Reject(
             praxis_filter::Rejection::status(200)
                 .with_header("content-type", "application/json")
                 .with_body(Bytes::from(body_bytes)),
         ))
+    }
+
+    /// Summarize the collected conversation and persist the matching
+    /// compaction result.
+    ///
+    /// Kept as a separate pinned phase so its callout and persistence futures
+    /// stay off the request filter's stack (see [`Self::finish_explicit_compact`]).
+    /// A schema-valid empty conversation (issue #1139) skips the callout —
+    /// there is nothing to summarize — and persists a no-op compaction, the
+    /// same result shape a fail-open callout failure produces.
+    async fn persist_explicit_compaction(
+        &self,
+        writer: &CompactionWriter<'_>,
+        budget: &mut Option<SimpleBudget>,
+    ) -> Result<Value, FilterAction> {
+        // `model` is the only required field, so a schema-valid request can
+        // carry an empty conversation (issue #1139). There is nothing to
+        // summarize, so no callout is made and the empty conversation is
+        // persisted as a no-op compaction below.
+        let summary = if writer.messages.is_empty() {
+            debug!("explicit compact of an empty conversation; persisting no-op compaction");
+            None
+        } else {
+            Box::pin(self.summarize_messages(writer.req, writer.messages, budget)).await?
+        };
+        if let Some(summary) = summary {
+            writer.persist_compacted(&summary, budget).await
+        } else {
+            if !writer.messages.is_empty() {
+                warn!("fail-open compaction: summarization callout failed; persisting uncompacted no-op");
+            }
+            writer.persist_uncompacted(budget).await
+        }
     }
 }
 
@@ -840,7 +868,6 @@ struct CollectedExplicitCompact {
 /// rather than silently dropped to absence/empty (see issue #1403). The scalar
 /// fields are moved out of the parsed body (rather than cloned) so the
 /// potentially large `input` array is never copied just to own it.
-#[expect(clippy::too_many_lines, reason = "linear field parsing and validation")]
 fn parse_compact_request_body(body: &Option<Bytes>) -> Result<ExplicitCompactRequest, FilterAction> {
     let bytes = body
         .as_ref()
@@ -860,13 +887,6 @@ fn parse_compact_request_body(body: &Option<Bytes>) -> Result<ExplicitCompactReq
     let previous_response_id =
         parse_compact_previous_response_id(parsed.get_mut("previous_response_id").map(Value::take))?;
     let input = parse_compact_input(parsed.get_mut("input").map(Value::take))?;
-    if input.is_empty() && previous_response_id.is_none() {
-        return Err(reject_compact(
-            400,
-            "invalid_request_error",
-            "request must include input or previous_response_id",
-        ));
-    }
     Ok(ExplicitCompactRequest {
         model,
         input,
@@ -913,8 +933,8 @@ fn parse_compact_previous_response_id(previous_response_id: Option<Value>) -> Re
 /// Normalize and validate the `input` field into a list of conversation items.
 ///
 /// Accepts:
-/// - absent or explicit `null`: an empty list (the caller still enforces the `input` or `previous_response_id`
-///   requirement),
+/// - absent or explicit `null`: an empty list (a request may legitimately carry no conversation; an empty collected
+///   conversation is compacted as a no-op, issue #1139),
 /// - a non-empty string: coerced into a single `user` message (an empty string contributes no content, matching the
 ///   prior behavior),
 /// - an array: each item must be a JSON object whose consumed fields are well-typed (see
@@ -924,8 +944,8 @@ fn parse_compact_previous_response_id(previous_response_id: Option<Value>) -> Re
 /// malformed array item (e.g. `[123]`, or a message whose `content` is a number)
 /// is rejected rather than accepted into the list where it would be silently
 /// formatted into empty text and summarized/stored anyway (issue #1403).
-/// Whether a schema-valid but empty input should itself be rejected is tracked
-/// separately in #1139.
+/// Schema-valid emptiness is not rejected: a request whose collected
+/// conversation is empty compacts to a no-op (issue #1139).
 fn parse_compact_input(input: Option<Value>) -> Result<Vec<Value>, FilterAction> {
     match input {
         None | Some(Value::Null) => Ok(Vec::new()),
@@ -961,7 +981,8 @@ fn parse_compact_input(input: Option<Value>) -> Result<Vec<Value>, FilterAction>
 /// `content` (see [`validate_compact_message_like`]). A message's `content` and
 /// a function output's `output` are required `string | content-list` values, so
 /// absent/null/scalar values are rejected; an empty string or empty array is
-/// schema-valid emptiness and is left for the separate #1139 question. The
+/// schema-valid emptiness and is accepted, contributing to a conversation that
+/// may compact to a no-op (issue #1139). The
 /// schema-required string fields are required here too, since the formatter would
 /// otherwise silently default them: `name`/`arguments` on a function call,
 /// `encrypted_content` on a compaction, and `role` on a message. The optional
@@ -1095,7 +1116,8 @@ fn require_string_item_field(idx: usize, item: &Value, field: &str) -> Result<()
 /// content-list` in the Responses schema, so a missing or null value would
 /// otherwise be silently formatted into empty text and summarized/stored
 /// (issue #1403). An empty string or empty array is schema-valid emptiness and
-/// is left for the separate #1139 question.
+/// is accepted; a request whose collected conversation is empty compacts to a
+/// no-op (issue #1139).
 fn validate_required_text_field(idx: usize, field: &str, value: Option<&Value>) -> Result<(), FilterAction> {
     match value {
         Some(value) => validate_text_field_value(idx, field, value),
@@ -1201,7 +1223,10 @@ fn resolve_store_and_owner(
 /// Assemble the conversation to compact from stored history and inline input.
 ///
 /// When `previous_response_id` is set, its stored messages are loaded
-/// first and the inline `input` items are appended after.
+/// first and the inline `input` items are appended after. The result may be
+/// empty — `model` is the only required field, so a schema-valid request can
+/// carry no conversation at all — and an empty conversation is compacted as a
+/// no-op by the caller (issue #1139).
 async fn collect_compact_messages(
     store: &OwnerScopedResponseStore,
     req: &mut ExplicitCompactRequest,
@@ -1213,9 +1238,6 @@ async fn collect_compact_messages(
         messages.extend(stored_message_array(record.messages));
     }
     messages.append(&mut req.input);
-    if messages.is_empty() {
-        return Err(reject_compact(400, "invalid_request_error", "no messages to compact"));
-    }
     Ok(messages)
 }
 
@@ -1443,15 +1465,17 @@ impl CompactionWriter<'_> {
             .await
     }
 
-    /// Persist an uncompacted no-op when the summarization callout fails under
-    /// `on_failure: open`.
+    /// Persist an uncompacted no-op: either the summarization callout failed
+    /// under `on_failure: open`, or the collected conversation is schema-valid
+    /// but empty (issue #1139), in which case there was nothing to summarize.
     ///
     /// The response `output` is an empty array: there is no summary, so no
     /// `compaction` item is emitted, and its absence is the caller's no-op
     /// signal. Returning the raw `{role, content}` messages instead would
     /// violate the Responses output schema (items require `type`/`id`/`status`).
     /// The intact conversation is still persisted as the record's history so a
-    /// follow-up request referencing this response id rehydrates it in full.
+    /// follow-up request referencing this response id rehydrates it in full
+    /// (an empty conversation persists an empty history).
     async fn persist_uncompacted(&self, budget: &mut Option<SimpleBudget>) -> Result<Value, FilterAction> {
         if let Some(budget) = budget.as_mut() {
             reserve_compact_json(budget, &self.messages, COMPACTION_PERSIST_MULTIPLIER)?;

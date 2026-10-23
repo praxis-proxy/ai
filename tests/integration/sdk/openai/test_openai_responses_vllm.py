@@ -4916,6 +4916,36 @@ class TestResponsesCompactionVLLM:
             "a valid explicit compact must make exactly one summarization callout"
         )
 
+    def test_explicit_compact_model_only_returns_noop_without_callout(self, compact_client):
+        """Issue #1139: ``model`` is the only required field, so a model-only
+        compact is schema-valid. It must not be rejected; with nothing to
+        summarize there is no callout, and the empty conversation is persisted
+        as a no-op compaction (empty ``output``, zero usage).
+        """
+        before = len(CompactionHandler.requests)
+        result = compact_client.responses.compact(model=VLLM_MODEL)
+
+        assert result.id, "a no-op compact still returns an identified compaction"
+        assert result.object == "response.compaction"
+        assert result.status == "completed", "a no-op compaction is completed"
+        assert result.output == [], "a no-op compaction emits no compaction item"
+        assert result.usage.input_tokens == 0, "an empty conversation has no input tokens"
+        assert result.usage.output_tokens == 0, "no summary was produced"
+        assert len(CompactionHandler.requests) == before, (
+            "a model-only compact must not reach the summarizer"
+        )
+
+        # `input: null` is an equally schema-valid way to carry no conversation.
+        result = compact_client.responses.compact(
+            model=VLLM_MODEL,
+            extra_body={"input": None},
+        )
+        assert result.object == "response.compaction"
+        assert result.output == [], "a null-input compact is also a no-op"
+        assert len(CompactionHandler.requests) == before, (
+            "a null-input compact must not reach the summarizer"
+        )
+
     def test_below_threshold_skips_compaction(self, compact_client):
         first = compact_client.responses.create(
             model=VLLM_MODEL,
