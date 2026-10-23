@@ -29,12 +29,15 @@ static_resources:
                         - match: {prefix: "/"}
                           route: {cluster: broker_http, timeout: 60s}
                 http_filters:
-                  # Ingress observer (item 7): runs FIRST, before the MCP router strips
-                  # x-mcp-authorized on the dispatch (tools/call) path and before
+                  # Ingress observer part 1 (item 7): runs FIRST, before the MCP router
+                  # strips x-mcp-authorized on the dispatch (tools/call) path and before
                   # Authorino replaces it, so a test can prove the SAME forwarded Bearer
-                  # + x-mcp-authorized reach both discovery and dispatch. Labels each
-                  # request by the JSON-RPC method in the body; logs only a one-way djb2
-                  # fingerprint — never the raw credential.
+                  # + x-mcp-authorized reach both discovery and dispatch. It captures a
+                  # one-way fingerprint of each into dynamic metadata; part 2 (after the
+                  # router, which sets x-mcp-method) logs them labeled by method.
+                  # djb2 (not SHA-256) is deliberate: Envoy's inline Lua has no crypto
+                  # stdlib, and a 32-bit fingerprint is enough to compare equality of two
+                  # values from the SAME request while never exposing the raw credential.
                   - name: envoy.filters.http.lua
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua

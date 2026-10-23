@@ -147,6 +147,18 @@ def _ingress_lines(stack):
     return lines
 
 
+def _ingress_since(stack, before, predicate, tries=25):
+    """Poll the new ingress lines (those after index `before`) until `predicate`
+    holds — container log capture can lag the HTTP response by a few ms."""
+    new = _ingress_lines(stack)[before:]
+    for _ in range(tries):
+        if predicate(new):
+            return new
+        time.sleep(0.1)
+        new = _ingress_lines(stack)[before:]
+    return new
+
+
 # --- streaming helpers -------------------------------------------------------
 
 def _responses_stream(praxis_url, user, token, tools, input_text="What is the weather in NYC?"):
@@ -416,7 +428,9 @@ def test_item3a_praxis_does_not_dispatch_undiscovered_tool(stack, praxis, script
     )
     assert r.status_code == 200, r.text
     j = r.json()
-    assert not _mcp_call_ok(j), j
+    # Praxis must not dispatch the undiscovered tool at all: no mcp_call item is
+    # produced (distinguishes client-side non-dispatch from dispatched-then-denied).
+    assert not any(o.get("type") == "mcp_call" for o in (j.get("output") or [])), j
     assert _backend_count(stack, "get_forecast") == 0
 
 
@@ -499,7 +513,10 @@ def test_item7_same_forwarded_identity_reaches_discovery_and_dispatch(stack, pra
     r = _responses(praxis, "userA", token, [MCP_TOOL], stream=False)
     assert r.status_code == 200, r.text
     assert _mcp_call_ok(r.json()), r.text  # both discovery and dispatch occurred
-    new = _ingress_lines(stack)[before:]
+    new = _ingress_since(
+        stack, before,
+        lambda ls: any(x["method"] == "tools/list" for x in ls) and any(x["method"] == "tools/call" for x in ls),
+    )
     lists = [ln for ln in new if ln["method"] == "tools/list"]
     calls = [ln for ln in new if ln["method"] == "tools/call"]
     assert lists and calls, new
@@ -520,7 +537,8 @@ def test_item4a_invalid_bearer_rejected_at_gateway(stack, praxis, scripted_model
     # resolve failure (502), never a successful invocation.
     assert r.status_code == 502, r.text
     assert "trusted-mcp" in r.text and "resolve" in r.text, r.text
-    assert len(_ingress_lines(stack)) > before, "the bad bearer must reach the gateway (no short-circuit)"
+    assert _ingress_since(stack, before, lambda ls: len(ls) > 0), \
+        "the bad bearer must reach the gateway (no short-circuit)"
     assert _backend_count(stack, "get_forecast") == 0
 
 
@@ -659,8 +677,8 @@ def test_item6a_revoke_streaming(stack, praxis, scripted_model):
     """Streaming equivalent of 6a: after revocation the streaming dispatch is denied
     with a clean terminal SSE lifecycle and zero execution."""
     token = _mint(stack, "userA", ROLES_AUTHORIZED)
-    _switch_authconfig("revoked")
     try:
+        _switch_authconfig("revoked")
         assert _mcp_call_error(_call_until(stack, praxis, "userA", token, _mcp_call_error) or {}), \
             "revocation did not take effect"
         _reset_backend(stack)
