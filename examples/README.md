@@ -117,6 +117,7 @@ for how these are authored and regenerated.
 
 | File | Description |
 | ------ | ------------- |
+| [fallback-with-provider-translation.yaml](configs/inference/fallback-with-provider-translation.yaml) | Demonstrates provider failover from an OpenAI-compatible backend to an Anthropic Messages provider with JSON and streaming SSE translation using the iterative_request_router |
 | [fallback-with-translation.yaml](configs/inference/fallback-with-translation.yaml) | Demonstrates provider failover with Responses-to-Chat Completions protocol translation using the iterative_request_router |
 
 ### OpenAI
