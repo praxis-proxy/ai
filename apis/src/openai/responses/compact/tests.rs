@@ -1020,6 +1020,71 @@ fn compaction_source_accepts_text_only_messages_and_function_outputs() {
 }
 
 #[test]
+fn compaction_source_keeps_safe_reasoning_summary_and_omits_raw_reasoning() {
+    let messages = [
+        json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "status": "completed",
+            "summary": [{"type": "summary_text", "text": "safe reasoning summary"}],
+            "content": [{"type": "reasoning_text", "text": "PRIVATE-RAW-REASONING"}]
+        }),
+        json!({"type": "message", "role": "assistant", "content": "visible answer"}),
+    ];
+
+    validate_compaction_source(messages.iter()).expect("standard reasoning items should be compactable");
+    let rendered = build_conversation_text(messages.iter());
+    assert!(
+        rendered.contains("safe reasoning summary"),
+        "safe summary should reach the compactor: {rendered}"
+    );
+    assert!(
+        rendered.contains("visible answer"),
+        "visible assistant text should reach the compactor: {rendered}"
+    );
+    assert!(
+        !rendered.contains("PRIVATE-RAW-REASONING"),
+        "raw chain-of-thought must not reach the compactor"
+    );
+}
+
+#[test]
+fn compaction_source_accepts_reasoning_item_with_empty_summary() {
+    let messages = [
+        json!({"type": "reasoning", "id": "rs_qwen", "status": "completed", "summary": []}),
+        json!({"type": "message", "role": "assistant", "content": "visible answer"}),
+    ];
+
+    validate_compaction_source(messages.iter()).expect("empty reasoning summaries should not block compaction");
+    let rendered = build_conversation_text(messages.iter());
+    assert!(
+        rendered.contains("visible answer"),
+        "visible answer should reach the compactor: {rendered}"
+    );
+    assert!(
+        !rendered.contains("reasoning"),
+        "empty reasoning item should contribute no prompt text: {rendered}"
+    );
+}
+
+#[test]
+fn compaction_source_rejects_encrypted_reasoning_state() {
+    let messages = [json!({
+        "type": "reasoning",
+        "id": "rs_opaque",
+        "summary": [],
+        "encrypted_content": "provider-opaque-state"
+    })];
+
+    let Err(FilterAction::Reject(rejection)) = validate_compaction_source(messages.iter()) else {
+        panic!("opaque reasoning state must remain fail-closed during compaction");
+    };
+    assert_eq!(rejection.status, 400, "opaque reasoning must return HTTP 400");
+    let body = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(body.contains("encrypted reasoning"), "unexpected rejection: {body}");
+}
+
+#[test]
 fn compaction_source_accepts_renderable_compaction_summary() {
     let messages = [build_compaction_item(
         "compact_prior",

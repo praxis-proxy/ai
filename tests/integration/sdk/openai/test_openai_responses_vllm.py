@@ -8987,12 +8987,12 @@ class TestAgenticLoopVLLM:
         Chat-Completions-backed model the proxy executes the search locally, so
         the model backend's SSE stream never carries the web_search_call.*
         progress events. Without #276 the search surfaces only in the terminal
-        response.completed snapshot; this asserts the behavior #276 adds: the
+        response.completed snapshot; this asserts the behavior #276 adds: every
         locally executed web_search_call is synthesized as an incremental
         output_item.added -> web_search_call.in_progress -> searching ->
-        completed -> output_item.done sequence, exactly once (no re-emission
-        across IRR rounds), before the resumed model output, with an id and
-        output index that agree with the terminal snapshot.
+        completed -> output_item.done sequence exactly once per call (no
+        re-emission across IRR rounds), with ids and output indices that agree
+        with the terminal snapshot. The live model may make multiple searches.
         """
         stream = translated_agentic_client.responses.create(
             model=CHAT_TRANSLATION_MODEL,
@@ -9054,79 +9054,61 @@ class TestAgenticLoopVLLM:
             "stream must terminate with a response.completed event"
         )
 
-        # #276 core: the locally executed web_search_call must be streamed as
-        # exactly one incremental output_item.added. Without the synthesis it
-        # appears only in the terminal snapshot and never here -- so this is the
-        # assertion that fails when #276 is absent.
+        # #276 core: each locally executed web_search_call must be streamed as
+        # one incremental output_item.added. Without the synthesis they appear
+        # only in the terminal snapshot and never here.
         ws_added = [a for a in added if a[1] == "web_search_call"]
-        assert len(ws_added) == 1, (
-            "the locally executed web_search_call should surface as exactly one "
+        assert ws_added, (
+            "locally executed web_search_calls should surface as incremental "
             f"response.output_item.added; got incremental added items: {added}"
         )
-        ws_index, _, ws_id, ws_added_seq = ws_added[0]
-        assert ws_id, (
-            f"synthesized web_search_call must carry an id; got: {ws_added}"
+        ws_ids = [item_id for _, _, item_id, _ in ws_added]
+        assert all(ws_ids), f"every synthesized web_search_call must carry an id; got: {ws_added}"
+        assert len(ws_ids) == len(set(ws_ids)), (
+            "each locally executed search must be announced once with a unique id; "
+            f"got: {ws_ids}"
         )
 
-        # Exactly one matching output_item.done for the same id: proves the
-        # item is not re-emitted across IRR rounds and that the pair is closed.
-        ws_done = [d for d in done if d[1] == "web_search_call" and d[2] == ws_id]
-        assert len(ws_done) == 1, (
-            "the web_search_call should be closed by exactly one "
-            f"output_item.done for id {ws_id!r}; got incremental done: {done}"
-        )
-        assert ws_done[0][0] == ws_index, (
-            "output_item.done must reuse the added item's output_index; "
-            f"added index={ws_index}, done index={ws_done[0][0]}"
-        )
-        assert ws_added_seq < ws_done[0][3], (
-            "output_item.added must carry a lower sequence_number than its "
-            f"output_item.done; added={ws_added_seq}, done={ws_done[0][3]}"
+        # Each id must have exactly one matching output_item.done, proving the
+        # item is not re-emitted across IRR rounds and that every pair closes.
+        ws_done = [d for d in done if d[1] == "web_search_call"]
+        done_ids = [item_id for _, _, item_id, _ in ws_done]
+        assert len(done_ids) == len(set(done_ids)) and set(done_ids) == set(ws_ids), (
+            "each synthesized web_search_call must close exactly once; "
+            f"added ids={ws_ids}, done ids={done_ids}"
         )
 
-        # #276 tool-specific events: between the generic output-item pair the
-        # synthesized web_search_call must emit in_progress -> searching ->
-        # completed (the search succeeds; web search has no failed event). This
-        # is what turns an opaque output-item pair into search progress the
-        # client can render live.
-        ws_prog = [p for p in ws_progress if p[1] == ws_id]
-        prog_types = [p[0] for p in ws_prog]
-        assert prog_types.count("response.web_search_call.in_progress") == 1, (
-            "the synthesized web_search_call must emit exactly one in_progress "
-            f"event for id {ws_id!r}; got progress events: {ws_progress}"
+        # Each local call gets one complete progress lifecycle between its
+        # output-item events, regardless of how many times the model searches.
+        progress_ids = [item_id for _, item_id, _ in ws_progress]
+        assert len(progress_ids) == len(ws_ids) * 3 and set(progress_ids) == set(ws_ids), (
+            "each web_search_call must emit exactly three progress events; "
+            f"added ids={ws_ids}, progress events={ws_progress}"
         )
-        assert prog_types.count("response.web_search_call.searching") == 1, (
-            "the synthesized web_search_call must emit exactly one searching "
-            f"event for id {ws_id!r}; got progress events: {ws_progress}"
-        )
-        assert prog_types.count("response.web_search_call.completed") == 1, (
-            "a successful web_search_call must emit exactly one completed "
-            f"outcome event for id {ws_id!r}; got progress events: {ws_progress}"
-        )
-        in_progress_seq = next(
-            p[2] for p in ws_prog
-            if p[0] == "response.web_search_call.in_progress"
-        )
-        searching_seq = next(
-            p[2] for p in ws_prog
-            if p[0] == "response.web_search_call.searching"
-        )
-        completed_seq = next(
-            p[2] for p in ws_prog
-            if p[0] == "response.web_search_call.completed"
-        )
-        assert (
-            ws_added_seq < in_progress_seq
-            < searching_seq
-            < completed_seq
-            < ws_done[0][3]
-        ), (
-            "web_search_call events must be ordered added -> in_progress -> "
-            f"searching -> completed -> done by sequence_number; "
-            f"added={ws_added_seq}, in_progress={in_progress_seq}, "
-            f"searching={searching_seq}, completed={completed_seq}, "
-            f"done={ws_done[0][3]}"
-        )
+        for ws_index, _, ws_id, ws_added_seq in ws_added:
+            ws_done_item = next(item for item in ws_done if item[2] == ws_id)
+            assert ws_done_item[0] == ws_index, (
+                "output_item.done must reuse the added item's output_index; "
+                f"id={ws_id!r}, added index={ws_index}, done index={ws_done_item[0]}"
+            )
+            ws_prog = [p for p in ws_progress if p[1] == ws_id]
+            prog_types = [p[0] for p in ws_prog]
+            expected_progress = [
+                "response.web_search_call.in_progress",
+                "response.web_search_call.searching",
+                "response.web_search_call.completed",
+            ]
+            assert prog_types == expected_progress, (
+                f"web_search_call {ws_id!r} must emit its progress events once "
+                f"in order; got: {ws_prog}"
+            )
+            event_sequences = [ws_added_seq, *(p[2] for p in ws_prog), ws_done_item[3]]
+            assert all(left < right for left, right in zip(event_sequences, event_sequences[1:])), (
+                "web_search_call events must be ordered added -> in_progress -> "
+                f"searching -> completed -> done; id={ws_id!r}, seqs={event_sequences}"
+            )
+
+        ws_index = ws_added[0][0]
 
         # Ordering: synthesized tool activity must precede the *resumed* model
         # output. The model may narrate (stream output_text) in the round that
@@ -9155,16 +9137,14 @@ class TestAgenticLoopVLLM:
         # was streamed at -- the incremental events and final snapshot are one
         # coherent view, not two divergent ones.
         snapshot = [
-            (idx, item.type, item.id)
+            (idx, item.id)
             for idx, item in enumerate(final_response.output)
+            if item.type == "web_search_call"
         ]
-        assert any(
-            item_type == "web_search_call" and item_id == ws_id
-            and idx == ws_index
-            for idx, item_type, item_id in snapshot
-        ), (
-            "the terminal snapshot must agree with the streamed web_search_call "
-            f"(id={ws_id!r}, index={ws_index}); got snapshot: {snapshot}"
+        streamed_calls = [(idx, item_id) for idx, _, item_id, _ in ws_added]
+        assert snapshot == streamed_calls, (
+            "the terminal snapshot must match every streamed web_search_call "
+            f"at the same output index; streamed={streamed_calls}, snapshot={snapshot}"
         )
 
     def test_client_function_exits_openai(self, agentic_client):
