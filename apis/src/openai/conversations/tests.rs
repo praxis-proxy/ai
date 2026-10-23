@@ -5178,6 +5178,18 @@ impl ConversationItemStore for FailingItemStore {
 // ConversationItemStore result. The response methods are never invoked.
 #[async_trait::async_trait]
 impl ResponseStore for FailingItemStore {
+    async fn compare_and_swap_response_object(
+        &self,
+        _owner: &crate::StateOwner,
+        _id: &str,
+        _expected_response_object: &Value,
+        _response_object: &Value,
+    ) -> Result<crate::store::ResponseCasOutcome, StoreError> {
+        // Conversation tests never swap a response object; report "no such
+        // record" so an accidental call shows up rather than looking applied.
+        Ok(crate::store::ResponseCasOutcome::NotFound)
+    }
+
     async fn get_conversation(
         &self,
         owner: &crate::StateOwner,
@@ -5454,6 +5466,18 @@ impl ConversationItemStore for AppendDuringUpdateStore {
 // Every other response method delegates to the real inner store.
 #[async_trait::async_trait]
 impl ResponseStore for AppendDuringUpdateStore {
+    async fn compare_and_swap_response_object(
+        &self,
+        _owner: &crate::StateOwner,
+        _id: &str,
+        _expected_response_object: &Value,
+        _response_object: &Value,
+    ) -> Result<crate::store::ResponseCasOutcome, StoreError> {
+        // Conversation tests never swap a response object; report "no such
+        // record" so an accidental call shows up rather than looking applied.
+        Ok(crate::store::ResponseCasOutcome::NotFound)
+    }
+
     async fn get_conversation(
         &self,
         owner: &crate::StateOwner,

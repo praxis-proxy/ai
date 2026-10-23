@@ -6,6 +6,8 @@ rust_out
 
 # Test artifacts
 **/*.db
+**/*.db-shm
+**/*.db-wal
 **/postgres.rs.tmp*
 
 # Rustfmt backup files

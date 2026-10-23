@@ -9,8 +9,8 @@ use serde_json::json;
 
 use super::{
     CompressionAlgorithm, ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord,
-    PersistedStateBackend, PgTlsConfig, PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry,
-    SqliteResponseStore, SslMode, StoreCompressionConfig, StoreError,
+    PersistedStateBackend, PgTlsConfig, PostgresResponseStore, ResponseCasOutcome, ResponseRecord, ResponseStore,
+    ResponseStoreRegistry, SqliteResponseStore, SslMode, StoreCompressionConfig, StoreError,
 };
 use crate::{
     openai::include::IncludeFields,
@@ -5474,6 +5474,90 @@ async fn sqlite_backend_satisfies_the_store_contract() {
         Some("contract_items"),
         None,
         None,
+    )
+    .await
+    .expect("store creation should succeed");
+    praxis_ai_store::contract_tests::run_contract_suite(&store).await;
+}
+
+/// A response written before compression was enabled stays swappable after it
+/// is turned on.
+///
+/// Reads detect the codec per row, so a record written with `none` still
+/// decodes once the store is reopened with zstd. The conditional write has to
+/// agree: comparing freshly encoded bytes against that row would never match,
+/// and the response could never leave its current state again.
+#[tokio::test]
+async fn response_cas_survives_enabling_compression() {
+    let dir = tempfile::tempdir().expect("temp dir should be created");
+    let db_path = dir.path().join("codec_change.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let owner = crate::test_utils::test_owner("tenant_codec");
+    let queued = json!({"id": "resp_codec", "status": "queued"});
+    let running = json!({"id": "resp_codec", "status": "in_progress"});
+
+    let plain = SqliteResponseStore::new(&url, "test_responses", "test_conversations", None, None, None)
+        .await
+        .expect("uncompressed store should open");
+    plain
+        .upsert_response(&ResponseRecord {
+            id: "resp_codec".to_owned(),
+            owner: owner.clone(),
+            created_at: 1,
+            model: "m".to_owned(),
+            response_object: queued.clone(),
+            input: json!({}),
+            messages: json!([]),
+        })
+        .await
+        .expect("seed response");
+    drop(plain);
+
+    let compressed = SqliteResponseStore::new(
+        &url,
+        "test_responses",
+        "test_conversations",
+        None,
+        None,
+        Some(&zstd_compression()),
+    )
+    .await
+    .expect("compressed store should open");
+
+    assert_eq!(
+        compressed
+            .compare_and_swap_response_object(&owner, "resp_codec", &queued, &running)
+            .await
+            .expect("swap across a codec change"),
+        ResponseCasOutcome::Applied,
+        "a record written before compression was enabled must stay swappable"
+    );
+    let stored = compressed
+        .get_response(&owner, "resp_codec")
+        .await
+        .expect("read back")
+        .expect("response present");
+    assert_eq!(
+        stored.response_object, running,
+        "the swap must be visible after re-encoding"
+    );
+}
+
+/// The SQLite backend satisfies the same contract with payload compression on.
+///
+/// Worth its own run because the conditional response-object write compares
+/// the *stored* form: with zstd the comparison is against a compressed frame,
+/// not readable JSON, so a predicate that reached inside the payload would
+/// quietly stop matching here while still passing uncompressed.
+#[tokio::test]
+async fn sqlite_backend_satisfies_the_store_contract_with_compression() {
+    let store = SqliteResponseStore::new(
+        "sqlite::memory:",
+        "contract_responses",
+        "contract_conversations",
+        Some("contract_items"),
+        None,
+        Some(&zstd_compression()),
     )
     .await
     .expect("store creation should succeed");
