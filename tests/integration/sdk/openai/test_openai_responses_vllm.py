@@ -8037,7 +8037,8 @@ class TestAgenticLoopVLLM:
         ]
         assert len(web_search_calls) == 1, response.output
         assert web_search_calls[0].status == "completed"
-        assert len(BraveSearchHandler.request_paths) == request_count + 1
+        # One hosted web-search call can expand into multiple provider queries.
+        assert len(BraveSearchHandler.request_paths) > request_count
         assert any(item.type == "message" for item in response.output)
         if VLLM_TEST_BACKEND == "simulator":
             _assert_simulator_auto_tool_round(
