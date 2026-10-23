@@ -45,6 +45,16 @@ def function_tools(body):
     return out
 
 
+def forced_tool(body):
+    """If the user input is `force-call:<name>`, emit a function_call for <name> on
+    turn 1 regardless of whether it was discovered. Used to prove Praxis won't
+    dispatch a model-generated call to a tool the user never discovered."""
+    inp = body.get("input")
+    if isinstance(inp, str) and inp.startswith("force-call:"):
+        return inp.split(":", 1)[1].strip()
+    return None
+
+
 def base_response(body, output):
     return {
         "id": "resp_" + uuid.uuid4().hex[:16],
@@ -109,6 +119,12 @@ class Handler(BaseHTTPRequestHandler):
         if input_has_tool_output(body):
             log(f"turn2 (tool result present) -> final message; tools={ftools}")
             self._send(final_message(body, "The weather in NYC is sunny, 21C. (final answer)"))
+            return
+
+        forced = forced_tool(body)
+        if forced:
+            log(f"turn1 -> FORCED function_call {forced}; tools={ftools}")
+            self._send(function_call(body, forced))
             return
 
         match = next((n for n in ftools if SUBSTR in n), None)

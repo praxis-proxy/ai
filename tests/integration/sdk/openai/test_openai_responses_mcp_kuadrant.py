@@ -242,5 +242,33 @@ def test_item1_authorized_user_discovers_and_invokes_buffered(stack, praxis, scr
     assert _backend_count(stack, "get_forecast") == 1
 
 
+def test_item2_unauthorized_user_sees_empty_discovery(stack, praxis, scripted_model):
+    """userB (no weather roles): the gateway filters weather_get_forecast out of
+    discovery, so the model is never offered it and nothing dispatches."""
+    token = _mint(stack, "userB", ROLES_NONE)
+    _reset_backend(stack)
+    r = _responses(praxis, "userB", token, [MCP_TOOL], stream=False)
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert "weather_get_forecast" not in _discovered_tools(j), j
+    assert _backend_count(stack, "get_forecast") == 0
+
+
+def test_item3a_praxis_does_not_dispatch_undiscovered_tool(stack, praxis, scripted_model):
+    """Even when the model force-emits a call to a tool userB never discovered,
+    Praxis does not dispatch it to the gateway (defense in depth): no successful MCP
+    call, no backend execution."""
+    token = _mint(stack, "userB", ROLES_NONE)
+    _reset_backend(stack)
+    r = _responses(
+        praxis, "userB", token, [MCP_TOOL], stream=False,
+        input_text="force-call:weather_get_forecast",
+    )
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert not _mcp_call_ok(j), j
+    assert _backend_count(stack, "get_forecast") == 0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"] + sys.argv[1:]))
