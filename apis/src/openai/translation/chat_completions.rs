@@ -663,7 +663,9 @@ fn build_chat_messages(
 /// Call IDs that an assistant `tool_calls` message expects tool answers for.
 ///
 /// Returns `None` for messages that do not open a tool-call block. The IDs
-/// are copied because the message list is mutated while they are held.
+/// are copied into owned `String`s so planning can hold them while scanning
+/// the whole slot list; the cost is one short allocation per expected call
+/// ID, once per translated request.
 fn expected_tool_answers(message: &Value) -> Option<Vec<String>> {
     if message.get("role").and_then(Value::as_str) != Some("assistant") {
         return None;
