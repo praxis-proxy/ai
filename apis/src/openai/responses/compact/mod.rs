@@ -1362,7 +1362,7 @@ fn validate_compactable_reasoning_item(item_idx: usize, item: &Value) -> Result<
     }
 
     if let Some(content) = item.get("content") {
-        let Some(Value::Array(parts)) = content else {
+        let Value::Array(parts) = content else {
             return Err(reject_reasoning_compaction(
                 item_idx,
                 "reasoning.content must be an array",
