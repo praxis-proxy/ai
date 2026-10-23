@@ -1312,6 +1312,13 @@ where
 /// summarizer. Provider-encrypted reasoning is opaque and cannot be represented
 /// by the text-only compaction item, so it remains fail-closed.
 fn validate_compactable_reasoning_item(item_idx: usize, item: &Value) -> Result<(), FilterAction> {
+    validate_reasoning_item_fields(item_idx, item)?;
+    validate_reasoning_item_metadata(item_idx, item)?;
+    validate_reasoning_summary(item_idx, item)?;
+    validate_reasoning_content(item_idx, item)
+}
+
+fn validate_reasoning_item_fields(item_idx: usize, item: &Value) -> Result<(), FilterAction> {
     const ALLOWED_FIELDS: &[&str] = &["type", "id", "status", "summary", "content", "encrypted_content"];
 
     if let Some(object) = item.as_object() {
@@ -1324,7 +1331,10 @@ fn validate_compactable_reasoning_item(item_idx: usize, item: &Value) -> Result<
             }
         }
     }
+    Ok(())
+}
 
+fn validate_reasoning_item_metadata(item_idx: usize, item: &Value) -> Result<(), FilterAction> {
     if item.get("encrypted_content").is_some_and(|value| !value.is_null()) {
         return Err(reject_reasoning_compaction(
             item_idx,
@@ -1342,7 +1352,10 @@ fn validate_compactable_reasoning_item(item_idx: usize, item: &Value) -> Result<
             "reasoning.status is not representable",
         ));
     }
+    Ok(())
+}
 
+fn validate_reasoning_summary(item_idx: usize, item: &Value) -> Result<(), FilterAction> {
     let Some(Value::Array(summary)) = item.get("summary") else {
         return Err(reject_reasoning_compaction(
             item_idx,
@@ -1350,38 +1363,41 @@ fn validate_compactable_reasoning_item(item_idx: usize, item: &Value) -> Result<
         ));
     };
     for (part_idx, part) in summary.iter().enumerate() {
-        let is_summary_text = part.get("type").and_then(Value::as_str) == Some("summary_text")
-            && part.get("text").is_some_and(Value::is_string)
-            && part.as_object().is_some_and(|object| object.len() == 2);
-        if !is_summary_text {
+        if !is_reasoning_text_part(part, "summary_text") {
             return Err(reject_reasoning_compaction(
                 item_idx,
                 &format!("reasoning.summary[{part_idx}] is not representable"),
             ));
         }
     }
+    Ok(())
+}
 
-    if let Some(content) = item.get("content") {
-        let Value::Array(parts) = content else {
+fn validate_reasoning_content(item_idx: usize, item: &Value) -> Result<(), FilterAction> {
+    let Some(content) = item.get("content") else {
+        return Ok(());
+    };
+    let Value::Array(parts) = content else {
+        return Err(reject_reasoning_compaction(
+            item_idx,
+            "reasoning.content must be an array",
+        ));
+    };
+    for (part_idx, part) in parts.iter().enumerate() {
+        if !is_reasoning_text_part(part, "reasoning_text") {
             return Err(reject_reasoning_compaction(
                 item_idx,
-                "reasoning.content must be an array",
+                &format!("reasoning.content[{part_idx}] is not representable"),
             ));
-        };
-        for (part_idx, part) in parts.iter().enumerate() {
-            let is_reasoning_text = part.get("type").and_then(Value::as_str) == Some("reasoning_text")
-                && part.get("text").is_some_and(Value::is_string)
-                && part.as_object().is_some_and(|object| object.len() == 2);
-            if !is_reasoning_text {
-                return Err(reject_reasoning_compaction(
-                    item_idx,
-                    &format!("reasoning.content[{part_idx}] is not representable"),
-                ));
-            }
         }
     }
-
     Ok(())
+}
+
+fn is_reasoning_text_part(part: &Value, expected_type: &str) -> bool {
+    part.get("type").and_then(Value::as_str) == Some(expected_type)
+        && part.get("text").is_some_and(Value::is_string)
+        && part.as_object().is_some_and(|object| object.len() == 2)
 }
 
 /// Build a fail-closed rejection for a reasoning item that cannot be compacted.
