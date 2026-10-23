@@ -53,6 +53,13 @@ fn chat_backend(content: &str) -> BackendGuard {
         .start_with_shutdown()
 }
 
+/// Start a mock upstream that returns a protocol-native JSON response.
+fn json_backend(body: &str) -> BackendGuard {
+    Backend::status(200, body)
+        .header("Content-Type", "application/json")
+        .start_with_shutdown()
+}
+
 fn load_response_config(proxy_port: u16, backend_port: u16, nemo_port: u16) -> praxis_core::config::Config {
     load_example_config(
         "nemo-guardrails-response.yaml",
@@ -107,6 +114,62 @@ fn response_guardrails_pass_forwards_upstream_body() {
             .and_then(|c| c.as_str()),
         Some("Hello! I'm doing well."),
         "upstream Chat Completion body should reach the client unchanged"
+    );
+}
+
+/// A native Responses request preserves its operation identity through the
+/// example pipeline, so the output body is extracted and checked by NeMo.
+#[test]
+fn response_guardrails_extracts_openai_responses_output() {
+    let upstream = r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello from Responses"}]}]}"#;
+    let backend = json_backend(upstream);
+    let nemo = start_capturing_backend(r#"{"status":"passed","content":"Hello from Responses"}"#);
+    let proxy_port = free_port();
+    let config = load_response_config(proxy_port, backend.port(), nemo.port());
+    let proxy = start_proxy(&config);
+
+    let (status, body) = http_post(proxy.addr(), "/v1/responses", r#"{"model":"test","input":"Hello"}"#);
+
+    assert_eq!(status, 200, "Responses output should pass when NeMo passes it");
+    assert_eq!(
+        body, upstream,
+        "the native upstream response should reach the client unchanged"
+    );
+    let payload: serde_json::Value = serde_json::from_str(&nemo.body()).unwrap();
+    assert_eq!(
+        payload["messages"],
+        serde_json::json!([{"role":"assistant","content":"Hello from Responses"}]),
+        "the Responses output extractor must send assistant text to NeMo"
+    );
+}
+
+/// A native Anthropic request preserves its operation identity through the
+/// example pipeline, so the output body is extracted and checked by NeMo.
+#[test]
+fn response_guardrails_extracts_anthropic_messages_output() {
+    let upstream = r#"{"role":"assistant","content":[{"type":"text","text":"Hello from Anthropic"}]}"#;
+    let backend = json_backend(upstream);
+    let nemo = start_capturing_backend(r#"{"status":"passed","content":"Hello from Anthropic"}"#);
+    let proxy_port = free_port();
+    let config = load_response_config(proxy_port, backend.port(), nemo.port());
+    let proxy = start_proxy(&config);
+
+    let (status, body) = http_post(
+        proxy.addr(),
+        "/v1/messages",
+        r#"{"model":"test","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}"#,
+    );
+
+    assert_eq!(status, 200, "Anthropic output should pass when NeMo passes it");
+    assert_eq!(
+        body, upstream,
+        "the native upstream response should reach the client unchanged"
+    );
+    let payload: serde_json::Value = serde_json::from_str(&nemo.body()).unwrap();
+    assert_eq!(
+        payload["messages"],
+        serde_json::json!([{"role":"assistant","content":"Hello from Anthropic"}]),
+        "the Anthropic output extractor must send assistant text to NeMo"
     );
 }
 
