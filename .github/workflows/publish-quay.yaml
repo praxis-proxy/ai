@@ -3,8 +3,9 @@ name: Publish (quay)
 # Fork-side quay publish. The upstream publish.yaml targets GHCR on a
 # nightly schedule with FIPS variants; this workflow pushes the EnMaaS
 # deployment image (quay.io/modden/praxis-ai) on every push to main so
-# the opps digest pins track the fork. Keeping it a separate file means
-# upstream rebases never conflict with it.
+# deployment digest pins track the fork. Keeping it a separate file means
+# upstream rebases never conflict with it. Ownership, rotation, and the
+# release policy are documented in docs/enmaas-image-publishing.md.
 
 on:
   push:
@@ -24,9 +25,9 @@ jobs:
       contents: read
     env:
       IMAGE: quay.io/modden/praxis-ai
-      # MUST match the in-cluster BC build (bc/pricetag-praxis-et):
-      # gcp-adc-filter is required for the vertex cluster's gcp_adc
-      # credential filter — prod breaks without it.
+      # MUST match the production deployment build:
+      # gcp-adc-filter is required for the production GCP ADC credential
+      # filter — production routing breaks without it.
       PRAXIS_AI_FEATURES: full,gcp-adc-filter
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -44,6 +45,7 @@ jobs:
           password: ${{ secrets.QUAY_TOKEN }}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -52,12 +54,32 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:main
             ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
           build-args: |
             PRAXIS_AI_FEATURES=${{ env.PRAXIS_AI_FEATURES }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Print digest (for the opps digest pin)
+      - name: Record digest
+        id: digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          docker buildx imagetools inspect "${IMAGE}:main" \
-            --format '{{json .Manifest.Digest}}'
+          test -n "$DIGEST"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Published praxis-ai image"
+            echo ""
+            echo "\`$IMAGE@$DIGEST\`"
+            echo ""
+            echo "- commit: \`$GITHUB_SHA\`"
+            echo "- ref: \`$GITHUB_REF\`"
+            echo "- workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out of Quay
+        if: always()
+        run: docker logout quay.io || true
