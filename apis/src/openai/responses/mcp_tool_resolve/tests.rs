@@ -1073,7 +1073,8 @@ fn write_state_creates_state_when_missing() {
         Vec::new(),
         context_policy.clone(),
         McpAdmissionDecisions::default(),
-    );
+    )
+    .expect("write_state should succeed within the node limit");
 
     let state = ctx.extensions.get::<ResponsesState>().expect("state should be created");
     assert!(
@@ -1115,7 +1116,8 @@ fn write_state_updates_existing_state() {
         Vec::new(),
         McpConnectorContextPolicy::default(),
         McpAdmissionDecisions::default(),
-    );
+    )
+    .expect("write_state should succeed within the node limit");
 
     let state = ctx.extensions.get::<ResponsesState>().expect("state should exist");
     assert!(
@@ -2031,7 +2033,8 @@ fn write_state_skips_state_creation_with_previous_response_id() {
         Vec::new(),
         McpConnectorContextPolicy::default(),
         McpAdmissionDecisions::default(),
-    );
+    )
+    .expect("write_state should succeed within the node limit");
 
     let state = ctx
         .extensions
@@ -2768,7 +2771,8 @@ fn write_state_syncs_request_body_and_tools_on_existing_state() {
         Vec::new(),
         McpConnectorContextPolicy::default(),
         McpAdmissionDecisions::default(),
-    );
+    )
+    .expect("write_state should succeed within the node limit");
 
     let state = ctx.extensions.get::<ResponsesState>().expect("state should exist");
     assert_eq!(state.tools.len(), 1, "tools synced from rewritten body");
@@ -3441,6 +3445,43 @@ async fn expanded_body_exceeding_limit_returns_413() {
     let resp = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
     assert!(resp.contains("invalid_request_error"), "error type: {resp}");
     assert_eq!(body.as_deref(), Some(body_bytes.as_slice()), "body must be unchanged");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.mcp_tool_map.is_empty(),
+        "tool map must not be populated on rejection"
+    );
+}
+
+/// The deferred-expansion bound counts the current input, which lives in the
+/// message history rather than `request_body` since #1618: small expanded tools
+/// fit the cap, but the large input pushes the measured outbound body over it,
+/// producing a 413. A measurement that ignored the input would wrongly continue.
+#[tokio::test]
+async fn expanded_body_counts_input_toward_limit() {
+    let filter = filter_with_max_rewritten_body_bytes(2048);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let server_url = "http://8.8.8.8/mcp";
+    let mut body_json = mcp_body(server_url);
+    // A large current input; the expanded tool below is small, so only counting
+    // the input pushes the outbound body past the 2 KiB cap.
+    body_json["input"] = serde_json::json!("x".repeat(4096));
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather", "server_url": server_url,
+        "tools": [{"name": "get_weather", "description": "Get weather"}],
+    })];
+    ctx.extensions.insert(state);
+
+    let body_bytes = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(body_bytes));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 413),
+        "the current input must count toward the rewritten-body cap (#1618): {action:?}"
+    );
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(
         state.mcp_tool_map.is_empty(),

@@ -63,7 +63,10 @@ use serde_json::Value;
 use tracing::{debug, trace, warn};
 
 use super::{
-    super::{DEFAULT_STORE_NAME, bound_body_outcome, error::responses_error_rejection, state::ResponsesState},
+    super::{
+        DEFAULT_STORE_NAME, bound_body_outcome, error::responses_error_rejection, request_input::input_echo_value,
+        state::ResponsesState,
+    },
     config::{ResponseStoreConfig, validate_config},
 };
 use crate::{
@@ -475,7 +478,8 @@ fn build_streaming_record(
     let response_object = state.response_object.clone();
     // The durable record owns independent JSON. Materialize shared values only
     // at this persistence boundary, not while reading or projecting history.
-    let state_messages = (!state.persisted_messages.is_empty()).then(|| state.persisted_messages.clone().into_values());
+    let state_messages = (state.captures_persistence_history() && !state.persisted_messages.is_empty())
+        .then(|| state.persisted_messages.clone().into_values());
     build_record(
         response_object,
         owner,
@@ -501,7 +505,9 @@ fn build_buffered_record(
     let state = ctx.extensions.get::<ResponsesState>();
     // The durable record owns independent JSON. Materialize shared values only
     // at this persistence boundary, not while reading or projecting history.
-    let state_messages = state.map(|state| state.persisted_messages.clone().into_values());
+    let state_messages = state
+        .filter(|state| state.captures_persistence_history())
+        .map(|state| state.persisted_messages.clone().into_values());
     let plan = state.map_or(StoredOutputPlan::EMPTY, |state| StoredOutputPlan {
         reasoning_replay: &state.translated_reasoning_replay,
         collected_rounds: &state.collected_rounds,
@@ -1105,10 +1111,18 @@ impl HttpFilter for ResponseStoreFilter {
         if let Err(action) = capture_persistence_owner(ctx) {
             return Ok(action);
         }
-        if !should_skip(ctx)
-            && let Some(input) = extract_request_input(body)
-        {
-            capture_request_input(ctx, input);
+        if !should_skip(ctx) {
+            // Reuse the input already decoded into ResponsesState (#1618) instead
+            // of re-parsing the whole request body. A standalone store passthrough
+            // without a managed/translation filter has no state, so fall back to
+            // parsing the body for input in that case.
+            let input = match ctx.extensions.get::<ResponsesState>() {
+                Some(state) => input_echo_value(state),
+                None => extract_request_input(body),
+            };
+            if let Some(input) = input {
+                capture_request_input(ctx, input);
+            }
         }
         if should_init_store_for_request(ctx) {
             if !store_available(ctx) {

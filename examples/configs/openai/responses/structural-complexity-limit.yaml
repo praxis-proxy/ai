@@ -1,0 +1,68 @@
+# Responses API Structural-Complexity Limit (#1618)
+# Requires `--features openai-responses` because these filters are opt-in.
+#
+# Build:
+#   cargo build -p praxis-ai-proxy --features openai-responses
+#
+# openai_responses_request.max_input_nodes bounds the STRUCTURAL size of a
+# managed create request — object members, array entries, and scalar leaves in
+# the parsed body — not its serialized byte length. Initialization materializes
+# memory proportional to that structure (normalized input, the Arc-shared
+# working and persistence histories, persistence capture), so a body of many
+# tiny objects amplifies far beyond its wire size. A raw byte cap
+# (body_limits.max_request_bytes) cannot see that; this limit can.
+#
+# The guard runs on every managed create, before that expansion, and is
+# independent of the optional agentic-loop retained-payload budget
+# (openai_agentic_loop.max_retained_bytes) — so it protects chains that have no
+# agentic-loop filter. It rejects with 413 before any state is built; a request
+# within the limit is forwarded to the backend unchanged.
+#
+# max_input_nodes is deliberately small (20) here so the structural cap is easy
+# to observe.
+#
+# Example accepted request (few structural nodes):
+#
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"Hello, world!"}'
+#
+# Example rejected request (15 small input items exceed 20 nodes, though the
+# body is only a few hundred bytes). The input is valid JSON so the request
+# reaches max_input_nodes rather than tripping on_invalid first:
+#
+#   items=$(printf '{"role":"user","content":"a"},%.0s' $(seq 15) | sed 's/,$//')
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d "{\"model\":\"gpt-4.1\",\"input\":[$items]}"
+
+listeners:
+  - name: responses-gateway
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - complexity-and-route
+
+filter_chains:
+  - name: complexity-and-route
+    filters:
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      - filter: openai_responses_request
+        on_invalid: reject
+        # Reject a managed create whose parsed body exceeds this many structural
+        # nodes before initialization materializes proportional memory (#1618).
+        max_input_nodes: 20
+
+      - filter: router
+        routes:
+          - path: "/v1/responses"
+            cluster: inference
+      - filter: load_balancer
+        clusters:
+          - name: inference
+            endpoints:
+              - "127.0.0.1:8000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

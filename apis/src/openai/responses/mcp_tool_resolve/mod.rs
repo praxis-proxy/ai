@@ -310,6 +310,7 @@ fn discovery_retained_charge(
     map: &HashMap<(String, String), serde_json::Value>,
     deferred: &[DeferredMcpConnector],
     listings: &[McpListing],
+    capture_persistence: bool,
 ) -> Result<usize, ResolveError> {
     // The ingress ledger already owns unchanged input fields. The resolver
     // replaces `tools` and may rewrite `tool_choice`, and also stores a
@@ -339,16 +340,23 @@ fn discovery_retained_charge(
     }
     for item in listings {
         let tools = discovery_values_charge(&item.tools)?;
-        let url_charge = item
-            .server_url
-            .as_deref()
-            .map_or(Some(0), discovery_string_charge)
-            .ok_or(ResolveError::RetainedBudget)?;
+        let url_charge = if capture_persistence {
+            item.server_url
+                .as_deref()
+                .map_or(Some(0), discovery_string_charge)
+                .ok_or(ResolveError::RetainedBudget)?
+        } else {
+            0
+        };
+        let listing_owners = if capture_persistence { 2 } else { 1 };
         charge = charge
-            .checked_add(tools.checked_mul(2).ok_or(ResolveError::RetainedBudget)?)
-            .and_then(|sum| sum.checked_add(discovery_string_charge(&item.server_label)?.checked_mul(2)?))
+            .checked_add(tools.checked_mul(listing_owners).ok_or(ResolveError::RetainedBudget)?)
+            .and_then(|sum| {
+                let label_owners = if capture_persistence { 2 } else { 1 };
+                sum.checked_add(discovery_string_charge(&item.server_label)?.checked_mul(label_owners)?)
+            })
             .and_then(|sum| sum.checked_add(url_charge))
-            .and_then(|sum| sum.checked_add(4_096))
+            .and_then(|sum| sum.checked_add(if capture_persistence { 4_096 } else { 2_048 }))
             .ok_or(ResolveError::RetainedBudget)?;
     }
     for item in deferred {
@@ -791,7 +799,13 @@ impl McpToolResolveFilter {
         };
         check_body_size(&serialized, self.max_rewritten_body_bytes)?;
         let retained = if budget.is_some() {
-            discovery_retained_charge(&parsed, &tool_map, &deferred_mcp, &listings)?
+            discovery_retained_charge(
+                &parsed,
+                &tool_map,
+                &deferred_mcp,
+                &listings,
+                ResponsesState::request_captures_persistence_history(&parsed),
+            )?
         } else {
             0
         };
@@ -805,7 +819,9 @@ impl McpToolResolveFilter {
         if let Some(tools) = parsed.get("tools").and_then(serde_json::Value::as_array) {
             decisions.mark_available_functions(tools);
         }
-        write_state(ctx, parsed, tool_map, deferred_mcp, connector_context_policy, decisions);
+        if let Err(action) = write_state(ctx, parsed, tool_map, deferred_mcp, connector_context_policy, decisions) {
+            return Ok(action);
+        }
         commit_discovery_items(ctx, listings);
         if let Some(slot) = budget {
             let state = ctx
@@ -3022,7 +3038,7 @@ fn write_state(
     deferred_mcp: Vec<DeferredMcpConnector>,
     connector_context_policy: McpConnectorContextPolicy,
     decisions: McpAdmissionDecisions,
-) {
+) -> Result<(), FilterAction> {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.mcp_tool_map = map;
         state.deferred_mcp = deferred_mcp;
@@ -3036,15 +3052,19 @@ fn write_state(
         if let Some(tc) = parsed.get("tool_choice") {
             state.tool_choice = tc.clone();
         }
-        state.request_body = parsed;
+        state.set_request_params(parsed);
     } else {
-        let mut state = ResponsesState::from_request_body(parsed);
+        // Fresh construction (no managed owner ran): enforce the structural-complexity
+        // bound so this alternate initialization path cannot bypass the guard (#1618).
+        super::complexity::enforce(ctx, &parsed)?;
+        let mut state = ResponsesState::from_managed_request_body(parsed);
         state.mcp_tool_map = map;
         state.deferred_mcp = deferred_mcp;
         state.mcp_connector_context_policy = connector_context_policy;
         state.mcp_admission = decisions;
         ctx.extensions.insert(state);
     }
+    Ok(())
 }
 
 /// Whether deferred connector discovery should run on this IRR iteration.
@@ -3276,11 +3296,28 @@ fn commit_deferred_listings(
 
     let expanded_tools = expand_deferred_tools_array(state.tools.clone(), &function_tools_by_label);
     detect_name_collisions(&expanded_tools, &generated_names)?;
-    let request_body = expanded_request_body(&state.request_body, &function_tools_by_label);
-    check_json_body_size(&request_body, max_rewritten_body_bytes)?;
+    let expanded_body = expanded_request_body(&state.request_body, &function_tools_by_label);
+    // Put the expanded tools in place, then bound the *actual* rewritten outbound
+    // body the serializer will send. `input` no longer lives in `request_body`
+    // (params-only, #1618): the backend receives the message history under `input`,
+    // so reuse the outbound projection — which translates compaction items and skips
+    // provider-owned history exactly as the wire body does — rather than measuring
+    // raw history items. A failed bound rejects the request, discarding this state.
+    state.set_request_params(expanded_body);
+    let outbound_len =
+        super::responses_proxy::serialized_outbound_body_len(state).map_err(ResolveError::Serialization)?;
+    if outbound_len > max_rewritten_body_bytes {
+        return Err(ResolveError::BodyTooLarge {
+            actual: outbound_len,
+            limit: max_rewritten_body_bytes,
+        });
+    }
 
     let retained = if let Some(slot) = budget {
-        let mut charge = request_body
+        // `expanded_body` was moved into `state.request_body` by `set_request_params`
+        // above, so read the expanded tools back from there (#1618 + #1483).
+        let mut charge = state
+            .request_body
             .get("tools")
             .map(discovery_value_charge)
             .transpose()?
@@ -3295,8 +3332,9 @@ fn commit_deferred_listings(
                 .ok_or(ResolveError::RetainedBudget)?
                 .checked_add(tool_charge)
                 .ok_or(ResolveError::RetainedBudget)?;
+            let listing_owners = if state.captures_persistence_history() { 2 } else { 1 };
             let listing_charge = discovery_value_charge(&item.listing_item)?
-                .checked_mul(2)
+                .checked_mul(listing_owners)
                 .ok_or(ResolveError::RetainedBudget)?;
             charge = charge
                 .checked_add(map_charge)
@@ -3320,14 +3358,17 @@ fn commit_deferred_listings(
         if let Some(id) = item.listing_item.get("id").and_then(serde_json::Value::as_str) {
             state.locally_executed_output_items.insert(id.to_owned());
         }
-        state.persisted_messages.push(item.listing_item.clone());
+        if state.captures_persistence_history() {
+            state.push_persisted_message(item.listing_item.clone());
+        }
         state.accumulated_output.push(item.listing_item);
     }
     // Record the newly model-visible deferred function names so a denied tool's
     // encoded-name collision cannot reject an admitted or client function (#1724).
     state.mcp_admission.mark_available_functions(&expanded_tools);
     state.tools = expanded_tools;
-    state.request_body = request_body;
+    // `request_body` already holds the expanded parameters (set before the size
+    // bound above); just flag the rebuild.
     state.mark_request_body_for_rebuild();
     Ok(retained)
 }
@@ -3347,18 +3388,6 @@ fn expanded_request_body(
         );
     }
     body
-}
-
-/// Reject an expanded provider body that exceeds `max_rewritten_body_bytes`.
-fn check_json_body_size(body: &serde_json::Value, max_rewritten_body_bytes: usize) -> Result<(), ResolveError> {
-    let actual = serialized_len(body).map_err(ResolveError::Serialization)?;
-    if actual > max_rewritten_body_bytes {
-        return Err(ResolveError::BodyTooLarge {
-            actual,
-            limit: max_rewritten_body_bytes,
-        });
-    }
-    Ok(())
 }
 
 /// Call `tools/list` for one deferred connector, redacting URLs on error.
@@ -3526,9 +3555,13 @@ fn commit_discovery_items(ctx: &mut HttpFilterContext<'_>, listings: Vec<McpList
     }
     // Assign ids up front (borrowing `id_generator`/`time_source`) so the mutable
     // `ResponsesState` borrow below never overlaps the id-generator borrow.
+    let capture_persistence = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .is_some_and(ResponsesState::captures_persistence_history);
     let items: Vec<(serde_json::Value, Option<serde_json::Value>)> = listings
         .into_iter()
-        .map(|listing| build_discovery_item(ctx, listing))
+        .map(|listing| build_discovery_item(ctx, listing, capture_persistence))
         .collect();
 
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
@@ -3538,7 +3571,7 @@ fn commit_discovery_items(ctx: &mut HttpFilterContext<'_>, listings: Vec<McpList
         if append_discovery_item(state, item)
             && let Some(cached) = cached
         {
-            state.persisted_messages.push(cached);
+            state.push_persisted_message(cached);
         }
     }
 }
@@ -3547,6 +3580,7 @@ fn commit_discovery_items(ctx: &mut HttpFilterContext<'_>, listings: Vec<McpList
 fn build_discovery_item(
     ctx: &HttpFilterContext<'_>,
     listing: McpListing,
+    capture_persistence: bool,
 ) -> (serde_json::Value, Option<serde_json::Value>) {
     let McpListing {
         server_label,
@@ -3563,23 +3597,31 @@ fn build_discovery_item(
     // The store's message history is never serialized as a Responses output item.
     // A second copy of the tool definitions is necessary at this persistence
     // boundary; the public item must not carry the target URL.
-    let cached = server_url.map(|server_url| {
-        let mut cached = serde_json::Map::new();
-        cached.insert(
-            "type".to_owned(),
-            serde_json::Value::String("praxis_mcp_cached_listing".to_owned()),
-        );
-        cached.insert(
-            "server_label".to_owned(),
-            serde_json::Value::String(server_label.clone()),
-        );
-        cached.insert("server_url".to_owned(), serde_json::Value::String(server_url));
-        cached.insert("tools".to_owned(), serde_json::Value::Array(tools.clone()));
-        serde_json::Value::Object(cached)
-    });
+    let cached = if capture_persistence {
+        server_url.map(|server_url| build_cached_listing(&server_label, server_url, &tools))
+    } else {
+        None
+    };
     item.insert("server_label".to_owned(), serde_json::Value::String(server_label));
     item.insert("tools".to_owned(), serde_json::Value::Array(tools));
     (serde_json::Value::Object(item), cached)
+}
+
+/// Build the private MCP cache record, copying tool definitions only at this
+/// durable persistence boundary.
+fn build_cached_listing(server_label: &str, server_url: String, tools: &[serde_json::Value]) -> serde_json::Value {
+    let mut cached = serde_json::Map::new();
+    cached.insert(
+        "type".to_owned(),
+        serde_json::Value::String("praxis_mcp_cached_listing".to_owned()),
+    );
+    cached.insert(
+        "server_label".to_owned(),
+        serde_json::Value::String(server_label.to_owned()),
+    );
+    cached.insert("server_url".to_owned(), serde_json::Value::String(server_url));
+    cached.insert("tools".to_owned(), serde_json::Value::Array(tools.to_vec()));
+    serde_json::Value::Object(cached)
 }
 
 /// Append a discovery item unless its server is already listed, recording the id

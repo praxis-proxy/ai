@@ -160,6 +160,20 @@ pub(crate) struct ResponsesRequestConfig {
     /// either way, so routing is unaffected.
     #[serde(default = "default_initialize_state")]
     pub initialize_state: bool,
+
+    /// Maximum structural node count permitted in a managed create request.
+    ///
+    /// Counts object members, array entries, and scalar leaves over the parsed
+    /// body and rejects before initialization materializes memory proportional to
+    /// that structure (normalized input, the shared working/persistence histories,
+    /// persistence capture). This bounds the many-small-objects amplification a
+    /// byte cap misses (#1618), for every managed create — including chains with
+    /// no agentic-loop filter, where the optional retained-payload budget is
+    /// absent. See [`DEFAULT_MAX_INPUT_NODES`] for the default rationale.
+    ///
+    /// [`DEFAULT_MAX_INPUT_NODES`]: super::complexity::DEFAULT_MAX_INPUT_NODES
+    #[serde(default = "default_max_input_nodes")]
+    pub max_input_nodes: std::num::NonZeroUsize,
 }
 
 /// The filter owns the managed-path lifecycle unless a chain opts out.
@@ -168,6 +182,11 @@ pub(crate) struct ResponsesRequestConfig {
 /// in with the Responses feature.
 const fn default_initialize_state() -> bool {
     true
+}
+
+/// Default structural-node ceiling for managed create requests.
+const fn default_max_input_nodes() -> std::num::NonZeroUsize {
+    super::complexity::DEFAULT_MAX_INPUT_NODES
 }
 
 // -----------------------------------------------------------------------------

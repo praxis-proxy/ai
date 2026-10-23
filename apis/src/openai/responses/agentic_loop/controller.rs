@@ -916,7 +916,9 @@ fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
         return;
     }
     let round_start = state.current_round_output_start.unwrap_or(0);
-    let mut pending = std::collections::HashMap::<String, usize>::new();
+    let mut pending = state
+        .captures_persistence_history()
+        .then(std::collections::HashMap::<String, usize>::new);
     for assignment in &state.tool_search_calls {
         if assignment
             .resolve(&state.accumulated_output, round_start, "tool_search_call")
@@ -928,10 +930,14 @@ fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
             && let Some(obj) = item.as_object_mut()
         {
             obj.insert("status".to_owned(), json!("incomplete"));
-            *pending.entry(assignment.item_id.clone()).or_default() += 1;
+            if let Some(pending) = pending.as_mut() {
+                *pending.entry(assignment.item_id.clone()).or_default() += 1;
+            }
         }
     }
-    mark_persisted_tool_searches_incomplete(&mut state.persisted_messages, &mut pending);
+    if let (Some(persisted_messages), Some(pending)) = (state.persisted_messages_mut(), pending.as_mut()) {
+        mark_persisted_tool_searches_incomplete(persisted_messages, pending);
+    }
     state.tool_search_calls.clear();
 }
 
@@ -1134,7 +1140,7 @@ fn collect_output_items(response: &mut Value, state: &mut ResponsesState, privat
                 // the opaque provider state back instead of translating it
                 // into an assistant summary.
                 state.messages.push(item.clone());
-                state.persist_collected_output(absolute_index, item.clone());
+                state.persist_collected_output(absolute_index, &item);
                 state
                     .provider_compaction_ids
                     .extend(ResponsesState::provider_compaction_ids_from_messages(
@@ -1150,7 +1156,7 @@ fn collect_output_items(response: &mut Value, state: &mut ResponsesState, privat
                 if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
                     state.web_search_calls.push(assignment);
                 }
-                state.persist_collected_output(absolute_index, item.clone());
+                state.persist_collected_output(absolute_index, &item);
             },
             Some("tool_search_call") if is_hosted_completed_tool_search(&item) => {
                 // Only a completed hosted search may trigger deferred
@@ -1159,10 +1165,10 @@ fn collect_output_items(response: &mut Value, state: &mut ResponsesState, privat
                 if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
                     state.tool_search_calls.push(assignment);
                 }
-                state.persist_collected_output(absolute_index, item.clone());
+                state.persist_collected_output(absolute_index, &item);
             },
             Some("tool_search_call") if is_completed_output_item(&item) => {
-                state.persist_collected_output(absolute_index, item.clone());
+                state.persist_collected_output(absolute_index, &item);
             },
             Some("file_search_call") => {
                 // Like a hosted web_search_call, a file_search_call is not valid
@@ -1171,7 +1177,7 @@ fn collect_output_items(response: &mut Value, state: &mut ResponsesState, privat
                 // `FileSearchAssignment`; openai_file_search_dispatch drains those
                 // at request-body EOS, runs the vector-store callouts, and mutates
                 // the indexed accumulator item in place.
-                state.persist_collected_output(absolute_index, item.clone());
+                state.persist_collected_output(absolute_index, &item);
                 if is_pending_file_search_call(&item) {
                     let synthesis = if private_indices.binary_search(&round_index).is_ok() {
                         SynthesisKind::Private
@@ -1308,7 +1314,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 // in both state projections before moving the item into the
                 // public streamed output accumulator.
                 state.messages.push(item.clone());
-                state.persist_collected_output(absolute_index, item.clone());
+                state.persist_collected_output(absolute_index, &item);
                 state
                     .provider_compaction_ids
                     .extend(ResponsesState::provider_compaction_ids_from_messages(
@@ -1325,7 +1331,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
                     state.web_search_calls.push(assignment);
                 }
-                state.persist_collected_output(absolute_index, item.clone());
+                state.persist_collected_output(absolute_index, &item);
                 state.accumulated_output.push(item);
             },
             Some("file_search_call") => {
@@ -1349,7 +1355,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 if is_pending_file_search_call(&item) {
                     pending_file_search.push((absolute_index, synthesis));
                 }
-                state.persist_collected_output(absolute_index, item.clone());
+                state.persist_collected_output(absolute_index, &item);
                 state.accumulated_output.push(item);
             },
             Some("tool_search_call") if is_hosted_completed_tool_search(&item) => {
@@ -1361,13 +1367,13 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                     state.tool_search_calls.push(assignment);
                 }
                 state.accumulated_output.push(item.clone());
-                state.persist_collected_output(absolute_index, item);
+                state.persist_collected_output(absolute_index, &item);
             },
             Some("tool_search_call") if is_completed_output_item(&item) => {
                 // Client-executed searches stay client-visible and stored, but
                 // must not queue server-side connector discovery.
                 state.accumulated_output.push(item.clone());
-                state.persist_collected_output(absolute_index, item);
+                state.persist_collected_output(absolute_index, &item);
             },
             _ => {
                 state.accumulated_output.push(item);

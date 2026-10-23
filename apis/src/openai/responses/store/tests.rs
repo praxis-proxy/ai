@@ -1903,6 +1903,58 @@ async fn on_response_body_uses_request_input_when_response_omits_input() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_request_body_captures_input_from_state_without_reparsing_body() {
+    // #1618: when ResponsesState already decoded the request, the store reuses its
+    // input snapshot instead of re-parsing the body. A body stripped of `input`
+    // (as ResponsesState::from_request_body leaves it) must still persist the
+    // original input, proving the capture came from state.
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let store = install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.current_filter_id = Some(7);
+
+    let request_input = json!([{"role": "user", "content": "From shared state"}]);
+    let state = ResponsesState::from_request_body(json!({"model": "gpt-4.1", "input": request_input}));
+    assert!(
+        state.request_body.get("input").is_none(),
+        "precondition: #1618 strips input from request_body"
+    );
+    ctx.extensions.insert(state);
+    // Params-only body: no `input` member for the store to re-parse.
+    let mut request_body = Some(Bytes::from(serde_json::to_vec(&json!({"model": "gpt-4.1"})).unwrap()));
+    assert!(matches!(
+        filter.on_request_body(&mut ctx, &mut request_body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let response_json = json!({
+        "id": "resp_state_reuse",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{"type": "message", "content": "Stored output"}]
+    });
+    let mut response_body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
+    ctx.current_filter_id = Some(7);
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut response_body, true).unwrap(),
+        FilterAction::Continue
+    ));
+
+    let record = store
+        .get_response(&crate::test_utils::test_owner("default"), "resp_state_reuse")
+        .await
+        .expect("get_response should succeed")
+        .expect("record should exist after persist");
+    assert_eq!(
+        record.input, request_input,
+        "stored input must be reconstructed from ResponsesState, not the input-stripped body"
+    );
+}
+
 // `streaming_record_uses_request_input_when_state_messages_are_empty` and
 // `streaming_record_preserves_mcp_metadata_from_persisted_messages` moved to the
 // service layer: `crate::service::responses` tests exercise `build_record`

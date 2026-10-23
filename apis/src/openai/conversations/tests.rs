@@ -3748,7 +3748,7 @@ async fn streaming_terminal_appends_once_without_buffering_sse() {
     ctx.set_metadata("openai_responses_request.stream", "true");
     ctx.set_metadata("openai_responses_request.store", "false");
     ctx.extensions.insert(ResponsesState {
-        input: vec![serde_json::json!({"role":"user","content":"streamed question"})],
+        input: vec![serde_json::json!({"role":"user","content":"streamed question"})].into(),
         response_object: serde_json::json!({
             "status": "completed",
             "output": [{"type":"message","role":"assistant","content":"streamed answer"}]
@@ -3805,7 +3805,7 @@ async fn local_stream_completion_appends_before_eos() {
     ctx.set_metadata("responses.conversation_id", &conv_id);
     ctx.set_metadata("openai_responses_request.stream", "true");
     ctx.extensions.insert(ResponsesState {
-        input: vec![serde_json::json!({"type":"message","role":"user","content":"local input"})],
+        input: vec![serde_json::json!({"type":"message","role":"user","content":"local input"})].into(),
         response_object: serde_json::json!({
             "status":"completed",
             "output":[{"type":"message","role":"assistant","content":"local output"}]
@@ -3861,7 +3861,7 @@ async fn stream_without_completed_terminal_does_not_append_conversation_items() 
         ctx.set_metadata("responses.conversation_id", &conv_id);
         ctx.set_metadata("openai_responses_request.stream", "true");
         ctx.extensions.insert(ResponsesState {
-            input: vec![serde_json::json!({"type":"message","role":"user","content":"unfinished"})],
+            input: vec![serde_json::json!({"type":"message","role":"user","content":"unfinished"})].into(),
             response_object: serde_json::json!({"status":status,"output":[]}),
             logical_stream_terminal_emitted: status == "incomplete",
             ..ResponsesState::default()
@@ -4245,7 +4245,7 @@ async fn on_response_body_appends_completed_response() {
         "content": "hello from append"
     })];
     ctx.extensions.insert(ResponsesState {
-        input: input_items.clone(),
+        input: input_items.clone().into(),
         ..ResponsesState::default()
     });
 
@@ -4268,11 +4268,10 @@ async fn on_response_body_appends_completed_response() {
     let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
-    assert_eq!(
+    assert!(
         ctx.extensions
             .get::<ResponsesState>()
-            .map(|state| state.input.as_slice()),
-        Some(input_items.as_slice()),
+            .is_some_and(|state| state.input == input_items),
         "append-back must clone ResponsesState.input without taking or clearing it"
     );
 
@@ -4319,7 +4318,7 @@ async fn append_back_cannot_write_another_owners_conversation() {
     ctx.set_metadata("openai_responses_request.has_conversation", "true");
     ctx.set_metadata("responses.conversation_id", &conversation_id);
     ctx.extensions.insert(ResponsesState {
-        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "intruder"})],
+        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "intruder"})].into(),
         ..ResponsesState::default()
     });
     drop(filter.on_request(&mut ctx).await.unwrap());
@@ -4368,7 +4367,7 @@ async fn on_response_body_surfaces_item_insert_failure() {
     set_append_back_metadata(&mut ctx);
     capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
     ctx.extensions.insert(ResponsesState {
-        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "hello from append"})],
+        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "hello from append"})].into(),
         ..ResponsesState::default()
     });
 
@@ -4409,7 +4408,7 @@ async fn streaming_terminal_propagates_append_failure_before_release() {
     set_append_back_metadata(&mut ctx);
     ctx.set_metadata("openai_responses_request.stream", "true");
     ctx.extensions.insert(ResponsesState {
-        input: vec![serde_json::json!({"type":"message","role":"user","content":"hello"})],
+        input: vec![serde_json::json!({"type":"message","role":"user","content":"hello"})].into(),
         response_object: serde_json::json!({"status":"completed","output":[]}),
         logical_stream_terminal_emitted: true,
         ..ResponsesState::default()
@@ -4451,7 +4450,7 @@ async fn on_response_body_surfaces_transaction_failure() {
     set_append_back_metadata(&mut ctx);
     capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
     ctx.extensions.insert(ResponsesState {
-        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "hello from append"})],
+        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "hello from append"})].into(),
         ..ResponsesState::default()
     });
 

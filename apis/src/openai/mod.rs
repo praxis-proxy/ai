@@ -49,6 +49,10 @@ pub use responses::CompactFilter;
 pub use responses::FileResolveFilter;
 #[cfg(feature = "openai-responses-openapi")]
 pub use responses::implementation_openapi_json as responses_openapi_json;
+/// Hidden entry points used by the workspace's Responses initialization benchmark.
+#[cfg(feature = "bench-responses-state")]
+#[doc(hidden)]
+pub use responses::initialization_benchmark as responses_state_benchmark;
 #[cfg(feature = "openai-responses")]
 pub use responses::{
     ClientToolCompatFilter, DocExtractFilter, FileSearchDispatchFilter, OpenaiResponsesRequestFilter,
