@@ -36,12 +36,14 @@ bash tests/integration/kuadrant/teardown.sh          # add --purge to drop .run/
 
 ## Runtime & CI
 
-Measured runtime (local, warm image cache): stack-up ~30s, the 7-item buffered+
-streaming suite ~8s; the praxis-ai build dominates (`make test-kuadrant-acceptance`
-rebuilds with `full,store-sqlite`). End-to-end `make` run ~2min warm; budget
-~8–12min on a cold CI runner. The gated lane (`.github/workflows/kuadrant.yaml`) is
-path-filtered (only MCP courier / harness / example-config changes trigger it) and
-auto-registered as a required check by `ci-status.yaml` — no central list edit.
+Measured runtime (local, warm image cache): stack-up ~30s; the 18-case
+buffered+streaming matrix ~2min (the item-6 live-revocation cases dominate — each
+applies a revoked AuthConfig, confirms the reconcile, then restores). The praxis-ai
+build (`make test-kuadrant-acceptance` rebuilds with `full,store-sqlite`) adds a few
+minutes cold. Budget ~10–15min on a cold CI runner (30min lane timeout). The gated
+lane (`.github/workflows/kuadrant.yaml`) is path-filtered (only MCP courier / harness
+/ example-config changes trigger it) and auto-registered as a required check by
+`ci-status.yaml` — no central list edit.
 
 `stack_up.sh` emits `.stack-env` (git-ignored) with `KUADRANT_GATEWAY_URL`,
 `KUADRANT_ISSUER_PRIV`, `KUADRANT_ISSUER_KID`, `KUADRANT_KUBECONFIG`,

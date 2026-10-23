@@ -48,7 +48,10 @@ def main():
 
     if args.tamper:
         head, mid, sig = token.split(".")
-        bad = ("A" if sig[-1] != "A" else "B") + sig[1:-1] + ("A" if sig[0] != "A" else "B")
+        # Flip the FIRST signature char (6 fully-significant bits) to a guaranteed
+        # different value — reliably invalidates the RS256 signature. (The last char
+        # encodes only padding-adjacent bits, so changing it is not reliable.)
+        bad = ("B" if sig[0] != "B" else "C") + sig[1:]
         token = f"{head}.{mid}.{bad}"
 
     sys.stdout.write(token)

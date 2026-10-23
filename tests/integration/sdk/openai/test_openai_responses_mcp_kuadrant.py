@@ -246,6 +246,21 @@ def _post(praxis_url, user, token, body):
     return httpx.post(praxis_url + "/v1/responses", headers=_headers(user, token), json=body, timeout=90)
 
 
+def _call_until(stack, praxis_url, user, token, predicate, tries=8):
+    """Drive plain auto-exec calls until predicate(resp_json) holds — confirms an
+    Authorino policy change actually took effect, instead of racing a fixed sleep."""
+    j = None
+    for _ in range(tries):
+        _reset_backend(stack)
+        r = _responses(praxis_url, user, token, [MCP_TOOL], stream=False)
+        if r.status_code == 200:
+            j = r.json()
+            if predicate(j):
+                return j
+        time.sleep(1)
+    return j
+
+
 # --- fixtures ----------------------------------------------------------------
 
 @pytest.fixture(scope="session")
@@ -609,6 +624,110 @@ def test_item5_approved_resume_still_denied_streaming(stack, praxis_store, scrip
             "input": [{"type": "mcp_approval_response", "approval_request_id": aid, "approve": True}]}
         raw = ""
         with httpx.stream("POST", praxis_store + "/v1/responses", headers=_headers("userB", token),
+                          json=body, timeout=90) as r:
+            assert r.status_code == 200, r.read()
+            for chunk in r.iter_text():
+                raw += chunk
+        assert _sse_terminated_cleanly(raw), raw
+        assert _mcp_call_error({"output": _sse_final_output(raw)}), raw
+        assert _backend_count(stack, "get_forecast") == 0
+    finally:
+        _switch_authconfig("filtered")
+
+
+def test_item6a_revoke_between_discovery_and_dispatch(stack, praxis, scripted_model):
+    """Live-policy revocation: userA is authorized, then the operator revokes userA's
+    get_forecast at the gateway. userA still DISCOVERS the tool (revocation is
+    per-call, not discovery) but the dispatch is now denied — exec==0."""
+    token = _mint(stack, "userA", ROLES_AUTHORIZED)
+    _switch_authconfig("filtered")
+    try:
+        _reset_backend(stack)
+        baseline = _responses(praxis, "userA", token, [MCP_TOOL], stream=False)
+        assert _mcp_call_ok(baseline.json()), baseline.text
+        assert _backend_count(stack, "get_forecast") == 1
+        _switch_authconfig("revoked")
+        j = _call_until(stack, praxis, "userA", token, _mcp_call_error)
+        assert j is not None and _mcp_call_error(j), "revocation did not take effect"
+        assert "weather_get_forecast" in _discovered_tools(j), j  # still discovered -> per-call revocation
+        assert _backend_count(stack, "get_forecast") == 0
+    finally:
+        _switch_authconfig("filtered")
+
+
+def test_item6a_revoke_streaming(stack, praxis, scripted_model):
+    """Streaming equivalent of 6a: after revocation the streaming dispatch is denied
+    with a clean terminal SSE lifecycle and zero execution."""
+    token = _mint(stack, "userA", ROLES_AUTHORIZED)
+    _switch_authconfig("revoked")
+    try:
+        assert _mcp_call_error(_call_until(stack, praxis, "userA", token, _mcp_call_error) or {}), \
+            "revocation did not take effect"
+        _reset_backend(stack)
+        status, raw = _responses_stream(praxis, "userA", token, [MCP_TOOL])
+        assert status == 200, raw
+        assert _sse_terminated_cleanly(raw), raw
+        assert _mcp_call_error({"output": _sse_final_output(raw)}), raw
+        assert _backend_count(stack, "get_forecast") == 0
+    finally:
+        _switch_authconfig("filtered")
+
+
+def test_item6b_revoke_between_approval_and_resume(stack, praxis, praxis_store, scripted_model):
+    """Revoke between approval creation and resume: userA creates an approval (allowed),
+    the operator revokes get_forecast, and the approved resume re-dials the gateway and
+    is now denied — the approval was validly consumed but authorization still denies."""
+    token = _mint(stack, "userA", ROLES_AUTHORIZED)
+    _switch_authconfig("filtered")
+    try:
+        _reset_backend(stack)
+        t1 = _post(praxis_store, "userA", token, {
+            "model": "scripted-model", "input": "weather?", "store": True, "stream": False,
+            "tools": [APPROVAL_TOOL]})
+        assert t1.status_code == 200, t1.text
+        j1 = t1.json()
+        aid = _approval_request_id(j1)
+        assert aid, j1
+        assert _backend_count(stack, "get_forecast") == 0
+        _switch_authconfig("revoked")
+        assert _mcp_call_error(_call_until(stack, praxis, "userA", token, _mcp_call_error) or {}), \
+            "revocation did not take effect before resume"
+        _reset_backend(stack)
+        t2 = _post(praxis_store, "userA", token, {
+            "model": "scripted-model", "previous_response_id": j1.get("id"), "store": True, "stream": False,
+            "tools": [APPROVAL_TOOL],
+            "input": [{"type": "mcp_approval_response", "approval_request_id": aid, "approve": True}]})
+        assert t2.status_code == 200, t2.text
+        assert _mcp_call_error(t2.json()), t2.text
+        assert _backend_count(stack, "get_forecast") == 0
+    finally:
+        _switch_authconfig("filtered")
+
+
+def test_item6b_revoke_resume_streaming(stack, praxis, praxis_store, scripted_model):
+    """Streaming equivalent of 6b: the revoked approved-resume denial streams a clean
+    terminal SSE lifecycle, surfaces the tool error, and never executes."""
+    token = _mint(stack, "userA", ROLES_AUTHORIZED)
+    _switch_authconfig("filtered")
+    try:
+        _reset_backend(stack)
+        t1 = _post(praxis_store, "userA", token, {
+            "model": "scripted-model", "input": "weather?", "store": True, "stream": False,
+            "tools": [APPROVAL_TOOL]})
+        assert t1.status_code == 200, t1.text
+        j1 = t1.json()
+        aid = _approval_request_id(j1)
+        assert aid, j1
+        _switch_authconfig("revoked")
+        assert _mcp_call_error(_call_until(stack, praxis, "userA", token, _mcp_call_error) or {}), \
+            "revocation did not take effect before resume"
+        _reset_backend(stack)
+        body = {
+            "model": "scripted-model", "previous_response_id": j1.get("id"), "store": True, "stream": True,
+            "tools": [APPROVAL_TOOL],
+            "input": [{"type": "mcp_approval_response", "approval_request_id": aid, "approve": True}]}
+        raw = ""
+        with httpx.stream("POST", praxis_store + "/v1/responses", headers=_headers("userA", token),
                           json=body, timeout=90) as r:
             assert r.status_code == 200, r.read()
             for chunk in r.iter_text():
