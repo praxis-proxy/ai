@@ -1571,6 +1571,15 @@ fn append_logical_event(
         .unwrap_or_else(|| event.event_type())
         .to_owned();
     let mut payload = event.into_payload();
+    // #1145: the model streams a web_search_call's raw query before the
+    // dispatcher validates it; bound an invalid one before it reaches the client.
+    if matches!(
+        event_type.as_str(),
+        "response.output_item.added" | "response.output_item.done"
+    ) && let Some(item) = payload.get_mut("item")
+    {
+        crate::openai::responses::web_search_dispatch::bound_streamed_search_action(ctx, item);
+    }
     normalize_logical_payload(ctx, &mut payload, state.output_index_offset);
     encode_sse_event(&event_type, &payload, output);
 }

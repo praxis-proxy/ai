@@ -3341,3 +3341,66 @@ fn build_tool_result_messages_incomplete_with_results_keeps_them() {
         "the partial notice is appended so the model knows the rows are incomplete"
     );
 }
+
+// -----------------------------------------------------------------------------
+// bound_streamed_search_action tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn bound_streamed_search_action_replaces_invalid_queries() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata(MAX_QUERY_METADATA, "16".to_owned());
+    let oversized = "x".repeat(17);
+    for action in [
+        serde_json::json!({"type": "search", "query": oversized}),
+        serde_json::json!({"type": "search", "query": "   "}),
+        serde_json::json!({"type": "search", "queries": ["ok", oversized]}),
+        serde_json::json!({"type": "search", "queries": [{"nested": oversized}]}),
+    ] {
+        let mut item = serde_json::json!({"type": "web_search_call", "id": "ws_1", "action": action});
+        bound_streamed_search_action(&ctx, &mut item);
+        assert_eq!(
+            item["action"],
+            invalid_search_action(),
+            "an undispatchable streamed query is replaced with the bounded placeholder"
+        );
+    }
+}
+
+#[test]
+fn bound_streamed_search_action_keeps_valid_and_queryless_items() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata(MAX_QUERY_METADATA, "16".to_owned());
+    for item in [
+        serde_json::json!({"type": "web_search_call", "id": "ws_1", "action": {"type": "search", "query": " rust "}}),
+        serde_json::json!({"type": "web_search_call", "id": "ws_1", "status": "in_progress"}),
+        serde_json::json!({"type": "web_search_call", "id": "ws_1", "action": {"type": "search"}}),
+        serde_json::json!({"type": "message", "action": {"query": "x".repeat(17)}}),
+    ] {
+        let mut bounded = item.clone();
+        bound_streamed_search_action(&ctx, &mut bounded);
+        assert_eq!(
+            bounded, item,
+            "a dispatchable, queryless, or non-search item passes unchanged"
+        );
+    }
+}
+
+#[test]
+fn bound_streamed_search_action_is_noop_without_dispatcher_bound() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let ctx = crate::test_utils::make_filter_context(&req);
+    let item = serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "action": {"type": "search", "query": "x".repeat(MAX_SEARCH_QUERY_BYTES + 1)}
+    });
+    let mut bounded = item.clone();
+    bound_streamed_search_action(&ctx, &mut bounded);
+    assert_eq!(
+        bounded, item,
+        "without the dispatcher in the chain the stream filter leaves the item as-is"
+    );
+}

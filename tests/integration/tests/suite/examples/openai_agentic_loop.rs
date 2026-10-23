@@ -6846,6 +6846,138 @@ fn invalid_web_search_query_fails_locally_without_provider_request() {
     }
 }
 
+/// #1145: a streamed web_search_call whose query fails dispatch validation must
+/// never reach the client with its raw query. The model announces the call in
+/// `output_item.added` before the dispatcher validates it, so the proxy must
+/// bound that opening item too — not only the final replacement item.
+#[test]
+fn streaming_invalid_web_search_query_never_reaches_client() {
+    let oversized = "x".repeat(8193);
+    let search_call = serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_stream_invalid",
+        "status": "completed",
+        "action": {"type": "search", "query": oversized}
+    });
+    let first_response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_ws_stream_invalid_1", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.output_item.added",
+            serde_json::json!({
+                "response_id": "resp_ws_stream_invalid_1",
+                "output_index": 0,
+                "item": search_call,
+                "sequence_number": 1
+            }),
+        ),
+        sse_event(
+            "response.output_item.done",
+            serde_json::json!({
+                "response_id": "resp_ws_stream_invalid_1",
+                "output_index": 0,
+                "item": search_call,
+                "sequence_number": 2
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_ws_stream_invalid_1",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [search_call],
+                    "usage": {"input_tokens": 8, "output_tokens": 2, "total_tokens": 10}
+                },
+                "sequence_number": 3
+            }),
+        ),
+    ];
+    let final_message = serde_json::json!({
+        "type": "message",
+        "id": "msg_ws_stream_invalid_2",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "The search could not run."}]
+    });
+    let second_response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_ws_stream_invalid_2", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.output_text.delta",
+            serde_json::json!({
+                "response_id": "resp_ws_stream_invalid_2",
+                "item_id": "msg_ws_stream_invalid_2",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "The search could not run.",
+                "sequence_number": 1
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_ws_stream_invalid_2",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [final_message],
+                    "usage": {"input_tokens": 15, "output_tokens": 4, "total_tokens": 19}
+                },
+                "sequence_number": 2
+            }),
+        ),
+    ];
+    let (model_port, _model_requests, model_thread) = start_streaming_model(vec![first_response, second_response]);
+    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    let search_count = spawn_counting_search_mock(search_listener);
+    let proxy_port = free_port();
+    let proxy = start_proxy(&load_web_search_config(proxy_port, model_port, search_port));
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Search for something",
+        "stream": true,
+        "store": false,
+        "tools": [{"type": "web_search_preview"}]
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    let body = parse_body(&raw);
+
+    assert_eq!(parse_status(&raw), 200, "streamed invalid-query response failed: {raw}");
+    model_thread.join().expect("streaming model thread should finish");
+    assert_eq!(
+        search_count.load(Ordering::SeqCst),
+        0,
+        "an oversized streamed query must never reach the search provider"
+    );
+    assert!(
+        !body.contains(&oversized),
+        "the raw oversized query must never be streamed to the client (issue #1145)"
+    );
+    let frames = assert_logical_stream_conformance(&body, "resp_ws_stream_invalid_1");
+    let added = item_frame(&frames, "response.output_item.added", "web_search_call");
+    assert_eq!(
+        added.data["item"]["action"],
+        serde_json::json!({"type": "search", "query": ""}),
+        "the opening item carries the bounded placeholder action"
+    );
+    let done = item_frame(&frames, "response.output_item.done", "web_search_call");
+    assert_eq!(done.data["item"]["status"], "failed", "the streamed call fails");
+}
+
 // -----------------------------------------------------------------------------
 // #985: logical-stream SSE conformance helpers
 //

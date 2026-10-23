@@ -69,6 +69,10 @@ use crate::{
 /// Step-local metadata carrying the configured response fan-out cap to the owner.
 const MAX_CALLS_METADATA: &str = "responses.web_search_max_calls_per_round";
 
+/// Step-local metadata carrying the configured per-query byte bound to the
+/// stream filter, so it can bound a model-streamed item before dispatch runs.
+const MAX_QUERY_METADATA: &str = "responses.web_search_max_query_bytes";
+
 /// Include value that gates `action.sources` in the output item.
 const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
 
@@ -89,7 +93,7 @@ const MISSING_QUERY_OUTPUT: &str = "Web search could not run because the query w
 /// blank after trimming, or over the configured `max_query_bytes` bound.
 ///
 /// Names the configured cap so the model can shorten its query on the next
-/// round; the ceiling itself is [`crate::web_search::MAX_SEARCH_QUERY_BYTES`].
+/// round; the ceiling itself is [`crate::web_search::config::MAX_SEARCH_QUERY_BYTES`].
 fn invalid_query_output(max_query_bytes: usize) -> String {
     format!("Web search could not run because the query was blank or exceeded {max_query_bytes} bytes.")
 }
@@ -156,7 +160,7 @@ pub struct WebSearchDispatchFilter {
     /// Maximum calls accepted from one model response.
     max_calls_per_round: usize,
     /// Maximum UTF-8 bytes accepted for one dispatched search query. Defaults
-    /// to the shared [`crate::web_search::MAX_SEARCH_QUERY_BYTES`] ceiling; admins may lower it.
+    /// to the shared [`crate::web_search::config::MAX_SEARCH_QUERY_BYTES`] ceiling; admins may lower it.
     max_query_bytes: usize,
     /// Prebuilt outbound filter chain each provider request executes through.
     outbound: Arc<FilterPipeline>,
@@ -637,6 +641,7 @@ impl HttpFilter for WebSearchDispatchFilter {
             return Ok(FilterAction::Continue);
         }
         ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
+        ctx.set_metadata(MAX_QUERY_METADATA, self.max_query_bytes.to_string());
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
@@ -773,6 +778,49 @@ impl HttpFilter for WebSearchDispatchFilter {
 #[cfg(feature = "openai-agentic-loop")]
 pub(crate) fn configured_max_calls_per_round(ctx: &HttpFilterContext<'_>) -> Option<usize> {
     ctx.get_metadata(MAX_CALLS_METADATA)?.parse().ok()
+}
+
+/// Replace the action of a model-streamed `web_search_call` that can never
+/// dispatch with the bounded placeholder its final item will carry.
+///
+/// The model announces a call in `output_item.added` before this dispatcher
+/// validates it, so without this a body-sized query would reach a streaming
+/// client ahead of the bounded replacement item (issue #1145). An action that
+/// carries no `query`/`queries` yet (a normal in-progress opening) is left
+/// untouched. A no-op unless this dispatcher published its query bound for the
+/// request.
+pub(crate) fn bound_streamed_search_action(ctx: &HttpFilterContext<'_>, item: &mut Value) {
+    if item.get("type").and_then(Value::as_str) != Some("web_search_call") {
+        return;
+    }
+    let Some(max_query_bytes) = ctx
+        .get_metadata(MAX_QUERY_METADATA)
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return;
+    };
+    let Some(action) = item.get("action") else {
+        return;
+    };
+    if action.get("query").is_none() && action.get("queries").is_none() {
+        return;
+    }
+    let call_id = item.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
+    if matches!(
+        parse_search_request(item, call_id, 0, 0, max_query_bytes),
+        PreparedCall::Dispatchable { .. }
+    ) {
+        return;
+    }
+    if let Some(object) = item.as_object_mut() {
+        object.insert("action".to_owned(), invalid_search_action());
+    }
+}
+
+/// Bounded placeholder action carried by a call that dispatched nothing, so a
+/// potentially body-sized query is never echoed into public output.
+fn invalid_search_action() -> Value {
+    serde_json::json!({"type": "search", "query": ""})
 }
 
 /// Whether this is the initial client request (model round 0), not an IRR re-entry.
@@ -1228,7 +1276,7 @@ fn web_search_country_from_state(state: &ResponsesState) -> Option<&str> {
 /// Every query must pass the shared query policy ([`validate_search_query`])
 /// before it reaches hashing or request construction: one that is blank after
 /// trimming or exceeds the configured `max_query_bytes` (bounded above by
-/// [`crate::web_search::MAX_SEARCH_QUERY_BYTES`]) fails the whole call locally as a bounded
+/// [`crate::web_search::config::MAX_SEARCH_QUERY_BYTES`]) fails the whole call locally as a bounded
 /// incomplete turn, so no paid provider request is issued and no body-sized
 /// string is amplified into the outbound URI or JSON body (issue #1145).
 fn parse_search_request<'a>(
@@ -1417,13 +1465,7 @@ fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>, i
         return;
     }
     let include_sources = include_action_sources(ctx);
-    let output_item = build_output_item(
-        ids.public,
-        "failed",
-        serde_json::json!({"type": "search", "query": ""}),
-        &[],
-        include_sources,
-    );
+    let output_item = build_output_item(ids.public, "failed", invalid_search_action(), &[], include_sources);
     let bridge = build_incomplete_tool_result_messages(&ids.bridge, incomplete_output);
     push_search_turn(ctx, output_item, bridge, ids);
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
