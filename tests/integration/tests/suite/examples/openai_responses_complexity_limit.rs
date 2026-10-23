@@ -12,14 +12,14 @@ use std::collections::HashMap;
 
 use praxis_test_utils::{
     free_port, http_send, json_post, load_example_config, parse_body, parse_status, start_backend_with_shutdown,
-    start_proxy,
+    start_capturing_backend, start_proxy,
 };
 
 const CONFIG: &str = "openai/responses/structural-complexity-limit.yaml";
 
 #[test]
 fn request_within_node_limit_is_forwarded() {
-    let inference = start_backend_with_shutdown("inference");
+    let inference = start_capturing_backend("inference");
     let proxy_port = free_port();
 
     let config = load_example_config(
@@ -41,6 +41,14 @@ fn request_within_node_limit_is_forwarded() {
         parse_body(&raw),
         "inference",
         "a request within the node limit should reach the inference backend"
+    );
+    // Assert on the request the backend actually received: the input must survive
+    // forwarding even though #1618 moves it out of the parsed parameters.
+    let forwarded: serde_json::Value =
+        serde_json::from_str(&inference.body()).expect("backend received a JSON request body");
+    assert_eq!(
+        forwarded["input"], "Hello, world!",
+        "the forwarded request must preserve the client input"
     );
 }
 

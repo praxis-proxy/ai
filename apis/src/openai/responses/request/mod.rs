@@ -108,10 +108,9 @@ impl OpenaiResponsesRequestFilter {
     ///
     /// Returns [`FilterError`] when configuration is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        // `max_input_nodes` is a `NonZeroUsize`, so a `0` fails at config-parse time
+        // above rather than needing a runtime check here.
         let cfg: ResponsesRequestConfig = parse_filter_config(FILTER_NAME, config)?;
-        if cfg.max_input_nodes == 0 {
-            return Err(format!("{FILTER_NAME}: 'max_input_nodes' must be greater than 0").into());
-        }
         let shared = build_config(FILTER_NAME, cfg.shared)?;
         Ok(Box::new(Self {
             config: ResponsesRequestConfig { shared, ..cfg },
@@ -164,7 +163,7 @@ impl OpenaiResponsesRequestFilter {
             super::complexity::MAX_INPUT_NODES_METADATA,
             self.config.max_input_nodes.to_string(),
         );
-        if let Some(reason) = super::complexity::rejects(&parsed, self.config.max_input_nodes) {
+        if let Some(reason) = super::complexity::rejects(&parsed, self.config.max_input_nodes.get()) {
             return FilterAction::Reject(super::error::responses_error_rejection(
                 413,
                 "invalid_request_error",

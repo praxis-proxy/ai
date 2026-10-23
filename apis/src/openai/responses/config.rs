@@ -173,7 +173,7 @@ pub(crate) struct ResponsesRequestConfig {
     ///
     /// [`DEFAULT_MAX_INPUT_NODES`]: super::complexity::DEFAULT_MAX_INPUT_NODES
     #[serde(default = "default_max_input_nodes")]
-    pub max_input_nodes: usize,
+    pub max_input_nodes: std::num::NonZeroUsize,
 }
 
 /// The filter owns the managed-path lifecycle unless a chain opts out.
@@ -185,7 +185,7 @@ const fn default_initialize_state() -> bool {
 }
 
 /// Default structural-node ceiling for managed create requests.
-const fn default_max_input_nodes() -> usize {
+const fn default_max_input_nodes() -> std::num::NonZeroUsize {
     super::complexity::DEFAULT_MAX_INPUT_NODES
 }
 

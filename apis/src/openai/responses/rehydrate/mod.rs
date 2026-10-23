@@ -150,8 +150,20 @@ impl RehydrateFilter {
         // rehydration merges stored history into it rather than re-parsing the
         // body and rebuilding a second state. The selectors it validated remain in
         // `request_body` (only `input` was stripped), so they are re-read there.
-        if ctx.extensions.get::<ResponsesState>().is_some() {
-            return self.rehydrate_reusing_state(ctx).await;
+        //
+        // If history was already restored (e.g. this filter sits inside an
+        // `iterative_request_router` step whose buffered request-body hook re-runs
+        // each iteration over the same carried-forward state), skip: merging the
+        // stored replay into an already-rehydrated state in place would duplicate
+        // the backend input and persisted history.
+        match ctx
+            .extensions
+            .get::<ResponsesState>()
+            .map(|state| state.history_rehydrated)
+        {
+            Some(true) => return Ok(FilterAction::Release),
+            Some(false) => return self.rehydrate_reusing_state(ctx).await,
+            None => {},
         }
         match parse_body_and_extract_id(bytes) {
             Ok((body, Some(id))) => self.rehydrate_from_response(ctx, StateSource::Parsed(body), id).await,

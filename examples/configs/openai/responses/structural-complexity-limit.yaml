@@ -27,12 +27,14 @@
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"Hello, world!"}'
 #
-# Example rejected request (many small input items exceed 20 nodes, though the
-# body is only a few hundred bytes):
+# Example rejected request (15 small input items exceed 20 nodes, though the
+# body is only a few hundred bytes). The input is valid JSON so the request
+# reaches max_input_nodes rather than tripping on_invalid first:
 #
+#   items=$(printf '{"role":"user","content":"a"},%.0s' $(seq 15) | sed 's/,$//')
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
-#     -d '{"model":"gpt-4.1","input":[{"role":"user","content":"a"}, ...x15]}'
+#     -d "{\"model\":\"gpt-4.1\",\"input\":[$items]}"
 
 listeners:
   - name: responses-gateway

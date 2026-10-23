@@ -3289,3 +3289,46 @@ fn streaming_heartbeats_do_not_rebuild_input_echo() {
         info.bytes_total
     );
 }
+
+#[test]
+fn streaming_echoes_input_reconstructed_from_state() {
+    // #1618: input moved out of request_body; streaming lifecycle resources echo it
+    // from the converter's state-reconstructed copy, not from request_body.
+    let input = json!([{"role": "user", "content": [{"type": "input_text", "text": "hi there"}]}]);
+    let state = ResponsesState::from_request_body(json!({"model": "m", "input": input, "stream": true}));
+    assert!(
+        state.request_body.get("input").is_none(),
+        "precondition: #1618 strips input from request_body"
+    );
+    let params_body = state.request_body.clone();
+
+    let mut conv = converter(wide_limits());
+    conv.ensure_echoed_input(&state);
+    let mut raw = Vec::new();
+    push(
+        &mut conv,
+        &params_body,
+        &provider_stream(&[
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"m","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        ]),
+        &mut raw,
+    );
+    finish(&mut conv, &params_body, &mut raw);
+
+    let events = parse_events(&raw);
+    let mut checked = 0;
+    for (name, payload) in &events {
+        if name == "response.created" || name == "response.completed" {
+            assert_eq!(
+                payload["response"]["input"], input,
+                "{name} must echo the input reconstructed from state"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(
+        checked, 2,
+        "both response.created and response.completed must be present and checked"
+    );
+}

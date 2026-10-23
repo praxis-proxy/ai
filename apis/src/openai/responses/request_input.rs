@@ -183,7 +183,11 @@ mod tests {
 
     #[test]
     fn echo_rebuilds_null() {
-        assert_eq!(echo_input(json!({"model": "m", "input": null})), Some(json!(null)));
+        assert_eq!(
+            echo_input(json!({"model": "m", "input": null})),
+            Some(json!(null)),
+            "an explicit null input echoes as null"
+        );
     }
 
     #[test]
@@ -200,7 +204,11 @@ mod tests {
         // A scalar is not tracked in `input_form`; it stays in `request_body`, so
         // the echo falls back to the absent default here and the resource reads it
         // straight from the parameters instead (#1618).
-        assert_eq!(echo_input(json!({"model": "m", "input": 42})), None);
+        assert_eq!(
+            echo_input(json!({"model": "m", "input": 42})),
+            None,
+            "an unsupported scalar is not tracked, so the echo omits it"
+        );
     }
 
     #[cfg(feature = "openai-mcp-tools")]

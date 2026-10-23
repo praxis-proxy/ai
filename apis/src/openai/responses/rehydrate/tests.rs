@@ -326,6 +326,42 @@ async fn passthrough_when_previous_response_id_is_null() {
     );
 }
 
+#[tokio::test]
+async fn skips_rehydration_when_history_already_restored() {
+    // #1618 reuse path: under iterative re-entry the same already-rehydrated state
+    // is carried forward. Re-running must not merge the stored replay again, or it
+    // duplicates backend input and persisted history.
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "turn",
+        "previous_response_id": "resp_prev"
+    }));
+    state.history_rehydrated = true;
+    state.messages = vec![json!({"role": "user", "content": "already restored"})].into();
+    let messages_before = state.messages.len();
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"turn","previous_response_id":"resp_prev"}"#,
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "an already-rehydrated state must release without re-merging history"
+    );
+    assert_eq!(
+        ctx.extensions.get::<ResponsesState>().unwrap().messages.len(),
+        messages_before,
+        "history must not be duplicated on re-entry"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Validation + Metadata
 // -----------------------------------------------------------------------------

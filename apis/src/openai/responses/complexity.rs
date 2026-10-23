@@ -22,6 +22,8 @@
 //! iterator stack, so it bounds auxiliary memory by nesting depth (never by
 //! breadth) and stops promptly once a limit is exceeded — it never clones.
 
+use std::num::NonZeroUsize;
+
 #[cfg(any(feature = "store", feature = "openai-mcp-tools"))]
 use praxis_filter::{FilterAction, HttpFilterContext};
 use serde_json::Value;
@@ -40,7 +42,7 @@ pub(crate) const MAX_INPUT_NODES_METADATA: &str = "openai_responses.max_input_no
 /// expansion to a few hundred MiB while leaving ample headroom for legitimate
 /// multi-thousand-message conversations (tens to low-hundreds of thousands of
 /// nodes). Operators tune it with `max_input_nodes`.
-pub(crate) const DEFAULT_MAX_INPUT_NODES: usize = 1_000_000;
+pub(crate) const DEFAULT_MAX_INPUT_NODES: NonZeroUsize = NonZeroUsize::new(1_000_000).unwrap();
 
 /// Maximum nesting depth traversed before rejection.
 ///
@@ -126,12 +128,13 @@ pub(crate) fn rejects(root: &Value, max_nodes: usize) -> Option<ComplexityReason
 /// bounded 413 rejection when exceeded.
 #[cfg(any(feature = "store", feature = "openai-mcp-tools"))]
 pub(crate) fn enforce(ctx: &HttpFilterContext<'_>, parsed: &Value) -> Result<(), FilterAction> {
+    // A `NonZeroUsize` parse rejects a `0` (or malformed) published value without a
+    // separate runtime check, falling back to the default.
     let limit = ctx
         .get_metadata(MAX_INPUT_NODES_METADATA)
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|limit| *limit > 0)
+        .and_then(|value| value.parse::<NonZeroUsize>().ok())
         .unwrap_or(DEFAULT_MAX_INPUT_NODES);
-    if let Some(reason) = rejects(parsed, limit) {
+    if let Some(reason) = rejects(parsed, limit.get()) {
         return Err(FilterAction::Reject(super::error::responses_error_rejection(
             413,
             "invalid_request_error",
@@ -152,7 +155,7 @@ mod tests {
     #[test]
     fn within_budget_passes() {
         let value = json!({"model": "m", "input": [{"role": "user", "content": "hi"}]});
-        assert_eq!(rejects(&value, DEFAULT_MAX_INPUT_NODES), None);
+        assert_eq!(rejects(&value, DEFAULT_MAX_INPUT_NODES.get()), None);
     }
 
     #[test]
@@ -167,7 +170,7 @@ mod tests {
         let value = json!({"input": (0..50).map(|_| json!({})).collect::<Vec<_>>()});
         assert_eq!(rejects(&value, 10), Some(ComplexityReason::Nodes));
         // The same body passes under a generous budget.
-        assert_eq!(rejects(&value, DEFAULT_MAX_INPUT_NODES), None);
+        assert_eq!(rejects(&value, DEFAULT_MAX_INPUT_NODES.get()), None);
     }
 
     #[test]
