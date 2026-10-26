@@ -13,12 +13,15 @@
 //! values outside an allowlist use a fixed overflow label, so request order
 //! can never decide which values consume exporter cardinality.
 
-#![allow(
+#![expect(
     clippy::missing_docs_in_private_items,
     reason = "implementation details are documented at the filter API boundary"
 )]
 
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -88,7 +91,10 @@ fn default_overflow_model() -> String {
     DEFAULT_OVERFLOW_MODEL.to_owned()
 }
 
-#[expect(clippy::too_many_lines, reason = "configuration validation keeps all cardinality invariants together")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "configuration validation keeps all cardinality invariants together"
+)]
 fn validate_config(cfg: &TokenUsageMetricsConfig) -> Result<(), FilterError> {
     if cfg.tenant_metadata_key.is_empty()
         || cfg.tenant_metadata_key.contains('.')
@@ -168,10 +174,10 @@ fn validate_allowlist(field: &str, values: &[String], overflow: &str) -> Result<
 /// Declare this filter **before** `token_count` so response hooks (which run in
 /// reverse order) extract counts first.
 pub struct TokenUsageMetricsFilter {
-    allowed_models: HashSet<String>,
-    allowed_tenants: HashSet<String>,
-    overflow_model: SharedString,
-    overflow_tenant: SharedString,
+    allowed_models: HashMap<String, Arc<str>>,
+    allowed_tenants: HashMap<String, Arc<str>>,
+    overflow_model: Arc<str>,
+    overflow_tenant: Arc<str>,
     tenant_metadata_key: String,
 }
 
@@ -190,32 +196,42 @@ impl TokenUsageMetricsFilter {
         let cfg: TokenUsageMetricsConfig = parse_filter_config("token_usage_metrics", config)?;
         validate_config(&cfg)?;
         Ok(Self {
-            allowed_models: cfg.allowed_models.into_iter().collect(),
-            allowed_tenants: cfg.allowed_tenants.into_iter().collect(),
-            overflow_model: cfg.overflow_model.into(),
-            overflow_tenant: cfg.overflow_tenant.into(),
+            allowed_models: shared_labels(cfg.allowed_models),
+            allowed_tenants: shared_labels(cfg.allowed_tenants),
+            overflow_model: Arc::from(cfg.overflow_model.as_str()),
+            overflow_tenant: Arc::from(cfg.overflow_tenant.as_str()),
             tenant_metadata_key: cfg.tenant_metadata_key,
         })
     }
 
     fn tenant_label(&self, raw: &str) -> SharedString {
-        if self.allowed_tenants.contains(raw) {
-            raw.to_owned().into()
-        } else {
-            self.overflow_tenant.clone()
-        }
+        self.allowed_tenants
+            .get(raw)
+            .map_or_else(|| shared_string(&self.overflow_tenant), shared_string)
     }
 
     fn model_label(&self, raw: Option<&str>) -> SharedString {
         let Some(raw) = raw else {
             return SharedString::const_str(MODEL_UNKNOWN);
         };
-        if self.allowed_models.contains(raw) {
-            raw.to_owned().into()
-        } else {
-            self.overflow_model.clone()
-        }
+        self.allowed_models
+            .get(raw)
+            .map_or_else(|| shared_string(&self.overflow_model), shared_string)
     }
+}
+
+fn shared_labels(values: Vec<String>) -> HashMap<String, Arc<str>> {
+    values
+        .into_iter()
+        .map(|value| {
+            let label: Arc<str> = Arc::from(value.as_str());
+            (value, label)
+        })
+        .collect()
+}
+
+fn shared_string(label: &Arc<str>) -> SharedString {
+    SharedString::from_shared(Arc::clone(label))
 }
 
 struct MetricsRequestState {

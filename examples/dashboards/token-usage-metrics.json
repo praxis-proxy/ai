@@ -48,7 +48,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(praxis_ai_tokens_total[5m])) by (tenant, kind)",
+          "expr": "sum(rate(praxis_ai_tokens_total{kind=~\"input|output\"}[5m])) by (tenant, kind)",
           "legendFormat": "{{tenant}} {{kind}}",
           "refId": "A"
         }
