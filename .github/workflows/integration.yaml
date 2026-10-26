@@ -51,6 +51,10 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  # Line-tables-only debuginfo: faster codegen and much smaller target/ caches
+  # (debuginfo dominates artifact size), which also eases the hard 10 GB cache
+  # cap so caches survive longer. Backtraces still resolve.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   V: ${{ inputs.debug && '1' || '' }}
 
 jobs:

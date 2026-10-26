@@ -119,6 +119,10 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  # Line-tables-only debuginfo: faster codegen and much smaller target/ caches
+  # (debuginfo dominates artifact size), which also eases the hard 10 GB cache
+  # cap so caches survive longer. Backtraces still resolve.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   VLLM_IMAGE: "quay.io/opendatahub/vllm-cpu:Qwen3-0.6B-granite-embedding-125m-english@sha256:0212dc82981178033cb71c7477ba8ad1998fb6c0b1ee40646119fb9724ac951b"
   VLLM_MODEL: "Qwen/Qwen3-0.6B"
   # The acceptance jobs still use their pinned upstream image.
