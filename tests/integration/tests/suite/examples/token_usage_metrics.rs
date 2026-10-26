@@ -57,7 +57,7 @@ fn example_config_rejects_unverified_tenant_metrics() {
         &json_post_with_headers(
             "/v1/chat/completions",
             r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
-            &[("x-tenant-username", "token-metrics-example-alice")],
+            &[("x-tenant-username", "token-metrics-example-mallory")],
         ),
     );
     assert_eq!(parse_status(&raw), 200, "example config smoke test should return 200");
@@ -70,7 +70,7 @@ fn example_config_rejects_unverified_tenant_metrics() {
     assert_eq!(parse_status(&metrics), 200, "metrics endpoint should return 200");
     let metrics_body = parse_body(&metrics);
     assert!(
-        !metrics_body.contains("tenant=\"token-metrics-example-alice\""),
+        !metrics_body.contains("tenant=\"token-metrics-example-mallory\""),
         "raw client identity must not create a tenant metric series: {metrics_body}"
     );
 }

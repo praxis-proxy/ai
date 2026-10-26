@@ -13,9 +13,12 @@
 //! values outside an allowlist use a fixed overflow label, so request order
 //! can never decide which values consume exporter cardinality.
 
-#![expect(
-    clippy::missing_docs_in_private_items,
-    reason = "implementation details are documented at the filter API boundary"
+#![cfg_attr(
+    not(test),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "implementation details are documented at the filter API boundary"
+    )
 )]
 
 use std::{
