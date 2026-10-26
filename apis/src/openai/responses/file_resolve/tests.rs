@@ -166,7 +166,7 @@ fn reject_too_large_returns_413() {
 #[test]
 fn reject_file_url_blocked_returns_403() {
     let err = ResolveError::FileUrlBlocked {
-        label: "https://evil.example.com/file.pdf".to_owned(),
+        label: "PATH_SECRET".to_owned(),
     };
     let action = reject_resolve_error(&err);
     match action {
@@ -177,6 +177,10 @@ fn reject_file_url_blocked_returns_403() {
                 body.contains("blocked by security policy"),
                 "client response should describe the block reason"
             );
+            assert!(
+                !body.contains("PATH_SECRET"),
+                "client response must not expose the URL label"
+            );
         },
         _ => panic!("expected Reject action"),
     }
@@ -185,7 +189,7 @@ fn reject_file_url_blocked_returns_403() {
 #[test]
 fn reject_file_url_failed_returns_502() {
     let err = ResolveError::FileUrlFailed {
-        label: "https://files.example.com/report.pdf?token=[REDACTED]".to_owned(),
+        label: "PATH_SECRET".to_owned(),
         detail: "connection refused".to_owned(),
     };
     let action = reject_resolve_error(&err);
@@ -198,6 +202,10 @@ fn reject_file_url_failed_returns_502() {
                 "client response must not expose internal transport details"
             );
             assert!(body.contains("file URL"), "client response should identify a URL fetch");
+            assert!(
+                !body.contains("PATH_SECRET"),
+                "client response must not expose the URL label"
+            );
             assert!(
                 !body.contains("Files API"),
                 "URL fetch failures must not be described as Files API failures"
@@ -221,6 +229,195 @@ fn reject_rewritten_body_too_large_returns_413() {
 // -----------------------------------------------------------------------------
 // on_request_body
 // -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn budgeted_file_resolve_rejects_before_file_callout() {
+    let config = serde_yaml::from_str(
+        "files_api_url: http://127.0.0.1:9\nallow_pre_security_callout: true\non_missing: continue\ntimeout_ms: 100",
+    )
+    .unwrap();
+    let filter = FileResolveFilter::from_config(&config).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let raw = br#"{"model":"test","input":[{"type":"input_file","file_id":"file-1"}]}"#;
+    let mut body = Some(Bytes::from_static(raw));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert_eq!(body.as_deref(), Some(raw.as_slice()));
+}
+
+#[tokio::test]
+async fn budgeted_file_resolution_preserves_in_budget_request_and_history() {
+    let files_api_url = start_files_api_stub();
+    let filter = make_filter_with_outbound_for_url(&files_api_url);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let request = json!({
+        "model": "test",
+        "store": false,
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file-history"}]
+        }]
+    });
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.simple_budget =
+        Some(super::super::agentic_loop::budget::SimpleBudget::new_with_store(8_388_608, 128, false).unwrap());
+    let before = state.simple_budget.unwrap().remaining_bytes().unwrap();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let rewritten: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    let part = &rewritten["input"][0]["content"][0];
+    assert_eq!(part["file_data"], "aGlzdG9yeQ==");
+    assert_eq!(part["filename"], "history.txt");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.messages[0]["content"][0]["file_data"], "aGlzdG9yeQ==");
+    assert_eq!(state.persisted_messages[0]["content"][0]["file_data"], "aGlzdG9yeQ==");
+    assert!(state.simple_budget.unwrap().remaining_bytes().unwrap() < before);
+}
+
+#[tokio::test]
+async fn budgeted_plain_text_skips_file_resolution_without_changing_body() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let request = json!({"model":"test","input":"hello"});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.simple_budget =
+        Some(super::super::agentic_loop::budget::SimpleBudget::new_with_store(67_108_864, 128, true).unwrap());
+    ctx.extensions.insert(state);
+    let raw = Bytes::from(serde_json::to_vec(&request).unwrap());
+    let mut body = Some(raw.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "plain text needs no file resolution"
+    );
+    assert_eq!(body, Some(raw), "file resolver must leave the admitted body untouched");
+}
+
+#[tokio::test]
+async fn budgeted_text_message_array_skips_file_resolution() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let request = json!({"model":"test","input":[{"role":"user","content":[{"type":"input_text","text":"Hello"}]}]});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.simple_budget =
+        Some(super::super::agentic_loop::budget::SimpleBudget::new_with_store(67_108_864, 32_000, true).unwrap());
+    ctx.extensions.insert(state);
+    let raw = Bytes::from(serde_json::to_vec(&request).unwrap());
+    let mut body = Some(raw.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(body, Some(raw));
+}
+
+#[tokio::test]
+async fn budgeted_plain_text_needs_no_second_json_reserve() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let request = json!({"model":"test","input":"a".repeat(8192),"store":false});
+    let raw = Bytes::from(serde_json::to_vec(&request).unwrap());
+    let ingress_charge = super::super::agentic_loop::budget::input_charge(&raw).unwrap();
+    let mut state = ResponsesState::from_request_body(request);
+    state.simple_budget = Some(
+        super::super::agentic_loop::budget::SimpleBudget::new_with_store(1_048_576, ingress_charge, false).unwrap(),
+    );
+    let before = state.simple_budget.unwrap().remaining_bytes();
+    ctx.extensions.insert(state);
+    let mut body = Some(raw.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(body, Some(raw));
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .simple_budget
+            .unwrap()
+            .remaining_bytes(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn budgeted_restored_plain_history_skips_file_resolution() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let request = json!({"model":"test","input":"next","previous_response_id":"resp_prev"});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.history_rehydrated = true;
+    state.messages.insert(0, json!({"role":"user","content":"first"}));
+    state
+        .persisted_messages
+        .insert(0, json!({"role":"user","content":"first"}));
+    state.simple_budget =
+        Some(super::super::agentic_loop::budget::SimpleBudget::new_with_store(67_108_864, 128, true).unwrap());
+    ctx.extensions.insert(state);
+    let raw = Bytes::from(serde_json::to_vec(&request).unwrap());
+    let mut body = Some(raw.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(body, Some(raw));
+}
+
+#[tokio::test]
+async fn budgeted_restored_file_with_exhausted_budget_rejects_before_callout() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let request = json!({"model":"test","input":"next","previous_response_id":"resp_prev"});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.history_rehydrated = true;
+    state.persisted_messages.insert(
+        0,
+        json!({"role":"user","content":[{"type":"input_file","file_url":"https://example.com/file"}]}),
+    );
+    state.simple_budget =
+        Some(super::super::agentic_loop::budget::SimpleBudget::new_with_store(4_096, 128, true).unwrap());
+    ctx.extensions.insert(state);
+    let raw = Bytes::from(serde_json::to_vec(&request).unwrap());
+    let mut body = Some(raw.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert_eq!(body, Some(raw));
+}
 
 #[tokio::test]
 async fn skips_non_responses_request() {
@@ -1397,7 +1594,8 @@ async fn file_url_truncated_body_reports_url_failure() {
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    let stub_url = format!("http://{address}/file.txt?sig=secret");
+    let stub_url = format!("http://{address}/PATH_SECRET/file.txt?sig=QUERY_SECRET");
+    let expected_label = format!("http://{address}");
 
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -1424,8 +1622,7 @@ async fn file_url_truncated_body_reports_url_failure() {
 
     match result {
         Err(ResolveError::FileUrlFailed { label, .. }) => {
-            assert!(label.contains("[REDACTED]"), "signed query value should be redacted");
-            assert!(!label.contains("secret"), "signed query value must not be exposed");
+            assert_eq!(label, expected_label, "only the URL origin should be retained");
         },
         Err(other) => panic!("expected FileUrlFailed for a truncated URL body, got {other}"),
         Ok(_) => panic!("expected FileUrlFailed for a truncated URL body"),
@@ -1441,7 +1638,8 @@ async fn file_url_oversized_content_length_reports_generic_too_large() {
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    let stub_url = format!("http://{address}/file.txt?sig=secret");
+    let stub_url = format!("http://{address}/PATH_SECRET/file.txt?sig=QUERY_SECRET");
+    let expected_reference = format!("http://{address}");
 
     let body = "X".repeat(100);
     std::thread::spawn(move || {
@@ -1469,11 +1667,7 @@ async fn file_url_oversized_content_length_reports_generic_too_large() {
     match result {
         Err(ResolveError::TooLarge { reference, limit }) => {
             assert_eq!(limit, 64, "error should report the configured resolved-body limit");
-            assert!(
-                reference.contains("[REDACTED]"),
-                "signed query value should be redacted"
-            );
-            assert!(!reference.contains("secret"), "signed query value must not be exposed");
+            assert_eq!(reference, expected_reference, "only the URL origin should be retained");
         },
         Err(other) => panic!("expected TooLarge for an oversized URL response, got {other}"),
         Ok(_) => panic!("expected TooLarge for an oversized URL response"),
@@ -1816,17 +2010,11 @@ async fn file_url_too_large_is_not_swallowed_by_on_missing_continue() {
 }
 
 #[test]
-fn display_redacts_signed_file_url() {
+fn display_omits_file_url_path_and_query() {
     use crate::openai::responses::file_resolve::resolve::ReferenceSource;
 
-    let source = ReferenceSource::FileUrl("https://storage.example.com/file.pdf?sig=SECRET_TOKEN&exp=1234567890");
+    let source =
+        ReferenceSource::FileUrl("https://storage.example.com/PATH_SECRET/file.pdf?sig=QUERY_SECRET&exp=1234567890");
     let displayed = format!("{source}");
-    assert!(
-        !displayed.contains("SECRET_TOKEN"),
-        "Display must not expose signed query parameters: {displayed}"
-    );
-    assert!(
-        displayed.contains("[REDACTED]"),
-        "query values should be redacted: {displayed}"
-    );
+    assert_eq!(displayed, "https://storage.example.com");
 }

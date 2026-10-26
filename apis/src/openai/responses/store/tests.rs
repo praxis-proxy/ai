@@ -324,6 +324,38 @@ async fn on_request_selects_bounded_stream_buffer_for_non_streaming_responses() 
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_create_caps_store_response_buffer() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "false");
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    ctx.extensions
+        .insert(crate::openai::responses::AgenticBudgetPolicy::from_config(&config).unwrap());
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.response_body_mode, BodyMode::StreamBuffer { max_bytes: Some(512) });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budgeted_store_requires_request_budget_before_input_capture() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions
+        .insert(crate::openai::responses::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let original = Bytes::from_static(br#"{"input":"hello"}"#);
+    let mut body = Some(original.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 500));
+    assert_eq!(body, Some(original), "misconfigured Store must not copy input");
+}
+
 // -----------------------------------------------------------------------------
 // on_request Bypass
 // -----------------------------------------------------------------------------
@@ -805,26 +837,35 @@ async fn on_response_body_releases_streaming_request_before_eos() {
 /// exactly once (before the frame is released) and fails closed when that
 /// persistence errors. The real `SqliteResponseStore` cannot force an upsert
 /// failure or observe call counts.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RecordingStoreFailure {
+    None,
+    Upsert,
+    Delete,
+    Events,
+}
+
 struct RecordingResponseStore {
     upserts: std::sync::atomic::AtomicUsize,
-    fail: bool,
+    failure: RecordingStoreFailure,
     records: std::sync::Mutex<std::collections::HashMap<String, ResponseRecord>>,
     /// In-memory replay logs keyed by response id, kept ordered by
     /// `sequence_number`. Mirrors the real backend's owner-gated, insert-if-absent
     /// semantics so replay seam tests observe truthful behavior.
     events: std::sync::Mutex<std::collections::HashMap<String, Vec<crate::store::ResponseEventRecord>>>,
-    /// When true, `append_events` fails to prove the terminal seam fails closed.
-    fail_events: bool,
 }
 
 impl RecordingResponseStore {
     fn new(fail: bool) -> Self {
         Self {
             upserts: std::sync::atomic::AtomicUsize::new(0),
-            fail,
+            failure: if fail {
+                RecordingStoreFailure::Upsert
+            } else {
+                RecordingStoreFailure::None
+            },
             records: std::sync::Mutex::new(std::collections::HashMap::new()),
             events: std::sync::Mutex::new(std::collections::HashMap::new()),
-            fail_events: false,
         }
     }
 
@@ -832,7 +873,15 @@ impl RecordingResponseStore {
     /// used to prove the replay flush fails closed after the record is durable.
     fn new_failing_events() -> Self {
         Self {
-            fail_events: true,
+            failure: RecordingStoreFailure::Events,
+            ..Self::new(false)
+        }
+    }
+
+    /// A provisioned store whose DELETE operation fails.
+    fn new_failing_delete() -> Self {
+        Self {
+            failure: RecordingStoreFailure::Delete,
             ..Self::new(false)
         }
     }
@@ -859,7 +908,7 @@ impl RecordingResponseStore {
 impl crate::store::ResponseStore for RecordingResponseStore {
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), crate::store::StoreError> {
         self.upserts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self.fail {
+        if self.failure == RecordingStoreFailure::Upsert {
             return Err(crate::store::StoreError::Unavailable(
                 "recording store: forced failure".to_owned(),
             ));
@@ -886,6 +935,11 @@ impl crate::store::ResponseStore for RecordingResponseStore {
     }
 
     async fn delete_response(&self, _owner: &crate::StateOwner, _id: &str) -> Result<bool, crate::store::StoreError> {
+        if self.failure == RecordingStoreFailure::Delete {
+            return Err(crate::store::StoreError::Unavailable(
+                "recording store: forced delete failure".to_owned(),
+            ));
+        }
         Ok(false)
     }
 
@@ -932,7 +986,7 @@ impl crate::store::ResponseStore for RecordingResponseStore {
         response_id: &str,
         events: &[crate::store::ResponseEventRecord],
     ) -> Result<(), crate::store::StoreError> {
-        if self.fail_events {
+        if self.failure == RecordingStoreFailure::Events {
             return Err(crate::store::StoreError::Unavailable(
                 "recording store: forced event-log failure".to_owned(),
             ));
@@ -1892,6 +1946,15 @@ async fn pipeline_persists_after_format_request_body_classification() {
         "input": [{"role": "user", "content": "Hello"}]
     });
     let mut request_body = Some(Bytes::from(serde_json::to_vec(&request_json).unwrap()));
+    // Run the request-head phase first so `ai_operation` publishes its match
+    // before the body pre-read, exactly as core sequences the real pipeline.
+    assert!(
+        matches!(
+            pipeline.execute_http_request_head(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "request-head phase should classify before the body pre-read"
+    );
     let request_body_action = pipeline
         .execute_http_request_body(&mut ctx, &mut request_body, true)
         .await
@@ -2002,6 +2065,15 @@ async fn pipeline_persists_chunked_response_with_unarmed_conversations_filter() 
         "input": [{"role": "user", "content": "Hello"}]
     });
     let mut request_body = Some(Bytes::from(serde_json::to_vec(&request_json).unwrap()));
+    // Run the request-head phase first so `ai_operation` publishes its match
+    // before the body pre-read, exactly as core sequences the real pipeline.
+    assert!(
+        matches!(
+            pipeline.execute_http_request_head(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "request-head phase should classify before the body pre-read"
+    );
     assert!(matches!(
         pipeline
             .execute_http_request_body(&mut ctx, &mut request_body, true)
@@ -2113,6 +2185,15 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
         "stream": true
     });
     let mut request_body = Some(Bytes::from(serde_json::to_vec(&request_json).unwrap()));
+    // Run the request-head phase first so `ai_operation` publishes its match
+    // before the body pre-read, exactly as core sequences the real pipeline.
+    assert!(
+        matches!(
+            pipeline.execute_http_request_head(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "request-head phase should classify before the body pre-read"
+    );
     let request_body_action = pipeline
         .execute_http_request_body(&mut ctx, &mut request_body, true)
         .await
@@ -2240,6 +2321,15 @@ async fn pipeline_non_responses_post_does_not_open_sqlite_store() {
         "messages": [{"role": "user", "content": "Hello"}]
     });
     let mut request_body = Some(Bytes::from(serde_json::to_vec(&request_json).unwrap()));
+    // Run the request-head phase first so `ai_operation` publishes its match
+    // before the body pre-read, exactly as core sequences the real pipeline.
+    assert!(
+        matches!(
+            pipeline.execute_http_request_head(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "request-head phase should classify before the body pre-read"
+    );
     let request_body_action = pipeline
         .execute_http_request_body(&mut ctx, &mut request_body, true)
         .await
@@ -2337,6 +2427,15 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
         "previous_response_id": "resp_prev"
     });
     let mut request_body = Some(Bytes::from(serde_json::to_vec(&request_json).unwrap()));
+    // Run the request-head phase first so `ai_operation` publishes its match
+    // before the body pre-read, exactly as core sequences the real pipeline.
+    assert!(
+        matches!(
+            pipeline.execute_http_request_head(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "request-head phase should classify before the body pre-read"
+    );
     let request_body_action = pipeline
         .execute_http_request_body(&mut ctx, &mut request_body, true)
         .await
@@ -2479,6 +2578,15 @@ async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
         "previous_response_id": "resp_prev"
     });
     let mut request_body = Some(Bytes::from(serde_json::to_vec(&request_json).unwrap()));
+    // Run the request-head phase first so `ai_operation` publishes its match
+    // before the body pre-read, exactly as core sequences the real pipeline.
+    assert!(
+        matches!(
+            pipeline.execute_http_request_head(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "request-head phase should classify before the body pre-read"
+    );
     let request_body_action = pipeline
         .execute_http_request_body(&mut ctx, &mut request_body, true)
         .await
@@ -4748,6 +4856,29 @@ async fn delete_rejects_when_store_unavailable() {
         rejection.status, 500,
         "DELETE should reject with 500 when store is unavailable"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_store_failure_returns_server_error_envelope() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new_failing_delete());
+
+    let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_gone");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let store_dyn: Arc<dyn PersistedStateBackend> = store;
+    install_recording_store(&mut ctx, store_dyn);
+
+    let action = filter
+        .on_request(&mut ctx)
+        .await
+        .expect("store failures should be mapped to a rejection");
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 500, "DELETE store failures should return 500");
+    assert_has_json_content_type(&rejection);
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "server_error");
+    assert_eq!(body["error"]["message"], "Internal server error.");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

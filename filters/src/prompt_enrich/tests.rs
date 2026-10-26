@@ -323,6 +323,23 @@ async fn invalid_json_continue_leaves_body_unchanged() {
 }
 
 #[tokio::test]
+#[cfg(feature = "openai-responses")]
+async fn budgeted_responses_preserves_configured_missing_messages_rejection() {
+    let filter = make_filter_with_on_invalid(Some(&[("system", "configured instruction")]), None, "reject");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions
+        .insert(praxis_ai_apis::openai::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let raw = br#"{"model":"gpt-4.1","input":"Hello","store":false}"#;
+    let mut body = Some(Bytes::from_static(raw));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 400));
+    assert_eq!(body.as_deref(), Some(raw.as_slice()));
+}
+
+#[tokio::test]
 async fn invalid_json_rejects() {
     let filter = make_filter_with_on_invalid(Some(&[("system", "Hello.")]), None, "reject");
 
@@ -431,6 +448,67 @@ async fn body_none_returns_continue() {
         matches!(action, FilterAction::Continue),
         "should return Continue when body is None"
     );
+}
+
+#[tokio::test]
+#[cfg(feature = "openai-responses")]
+async fn budgeted_responses_without_messages_keeps_existing_continue_behavior() {
+    let filter = make_filter(Some(&[("system", "Be helpful.")]), None);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 65536").unwrap();
+    ctx.extensions
+        .insert(praxis_ai_apis::openai::AgenticBudgetPolicy::from_config(&config).unwrap());
+    let original = Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hello","store":false}"#);
+    let mut body = Some(original.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(body, Some(original));
+}
+
+#[tokio::test]
+#[cfg(feature = "openai-responses")]
+async fn budgeted_responses_enrichment_copies_messages_within_the_configured_limit() {
+    let filter = make_filter(Some(&[("system", "Be helpful.")]), None);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let original = Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hello","messages":[]}"#);
+
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 65536").unwrap();
+    ctx.extensions
+        .insert(praxis_ai_apis::openai::AgenticBudgetPolicy::from_config(&config).unwrap());
+    let mut body = Some(original);
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let parsed: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(parsed["messages"][0]["content"], "Be helpful.");
+}
+
+#[tokio::test]
+#[cfg(feature = "openai-responses")]
+async fn budgeted_responses_enrichment_rejects_when_configured_limit_is_exhausted() {
+    let filter = make_filter(Some(&[("system", "Be helpful.")]), None);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions
+        .insert(praxis_ai_apis::openai::AgenticBudgetPolicy::from_config(&config).unwrap());
+    let original = Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hello","messages":[]}"#);
+    let mut body = Some(original.clone());
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let rejection = match action {
+        FilterAction::Reject(rejection) => rejection,
+        other => panic!("exhausted enrichment budget must reject, got {other:?}"),
+    };
+    assert_eq!(rejection.status, 413);
+    let response_body = rejection.body.expect("rejection body");
+    let error: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("limit set by the platform administrator"), "{message}");
+    assert!(!message.contains("openai_agentic_loop.max_retained_bytes"), "{message}");
+    assert_eq!(body, Some(original), "no configured message was copied");
 }
 
 #[tokio::test]

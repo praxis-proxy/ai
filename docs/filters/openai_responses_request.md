@@ -7,6 +7,8 @@ Processes a Responses request body once and initializes state.
 
 ## Configuration Notes
 
+Enable Cargo feature `openai-responses` to compile and register this experimental filter. Default and `full` builds exclude it.
+
 The operation is recognized from the request head, and the registry decides which operations carry a body worth parsing: create, compact, and input token counts. Bodyless operations — fetch, delete, cancel, list input items, and the `WebSocket` handshake — are released untouched, as is Conversations API traffic. `on_invalid` governs only bodies that fail to parse.
 
 Rejects `background=true` and non-null `prompt` with a 400, the managed-path policy this filter now owns. A non-null `prompt` is the deprecated OpenAI reusable prompt object (`{ id, version, variables }`); OpenAI retires reusable prompts and `v1/prompts` on 2026-11-30, so clients should move its content into `input` rather than rely on the gateway to resolve the saved object. Prefer `input` over top-level `instructions`, which managed-path content-policy extraction does not screen.
@@ -20,7 +22,7 @@ Extends the shared classification settings with the one option that gates the ma
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `on_invalid` | `continue` \| `reject` \| `error` | no | Behavior when the body cannot be classified. |
-| `headers` | ResponsesClassificationHeaders | no | Header names for promoted classification facts. Must not be hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` names. Dedicated defaults remain allowed. |
+| `headers` | object | no | Header names for promoted classification facts. Must not be hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` names. Dedicated defaults remain allowed. |
 | `headers.format` | string | no | Header name for the detected format (e.g. `openai_responses`, `openai_chat_completions`). Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-format` remains allowed. |
 | `headers.model` | string | no | Header name for the extracted model value. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-model` remains allowed. Must not overwrite other classification facts such as `x-praxis-ai-format`. |
 | `headers.stream` | string | no | Header name for the extracted stream flag. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-stream` remains allowed. |

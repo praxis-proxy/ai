@@ -5,6 +5,7 @@
 
 use bytes::Bytes;
 use http::header::HeaderValue;
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use praxis_filter::{FilterAction, HttpFilter as _, Response};
 
 use super::*;
@@ -1610,6 +1611,239 @@ async fn json_bedrock_anthropic_fallback_records_thinking_tokens() {
 }
 
 // -----------------------------------------------------------------------------
+// StreamBuffer Delivery
+// -----------------------------------------------------------------------------
+
+/// `StreamBuffer` chains deliver each raw chunk to filters *and* re-deliver the
+/// frozen full buffer at end-of-stream. JSON extraction must read the EOS
+/// buffer alone, not the concatenation of both views.
+#[tokio::test]
+async fn json_stream_buffer_double_delivery_extracts_once() {
+    let json = br#"{"usage":{"input_tokens":15,"output_tokens":42}}"#;
+    let filter = make_filter(ProviderKind::Anthropic);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    // The runtime upgrade a dialect-translation filter performs for JSON responses.
+    ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: None };
+
+    let raw = Bytes::copy_from_slice(json);
+    let mut chunk = Some(raw.clone());
+    drop(filter.on_response_body(&mut ctx, &mut chunk, false).unwrap());
+
+    let mut frozen = Some(raw);
+    drop(filter.on_response_body(&mut ctx, &mut frozen, true).unwrap());
+
+    assert_eq!(
+        ctx.get_metadata("token.input"),
+        Some("15"),
+        "the EOS frozen buffer must be parsed exactly once"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.output"),
+        Some("42"),
+        "output tokens should match"
+    );
+}
+
+/// When a buffered chain releases its buffer mid-stream, the EOS call carries
+/// no body; extraction must then fall back to the hex-accumulated raw chunks.
+#[tokio::test]
+async fn json_stream_buffer_released_falls_back_to_chunks() {
+    let json = br#"{"usage":{"input_tokens":7,"output_tokens":11}}"#;
+    let filter = make_filter(ProviderKind::Anthropic);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: None };
+
+    let mid = json.len() / 2;
+    let mut first = Some(Bytes::copy_from_slice(&json[..mid]));
+    drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
+    let mut second = Some(Bytes::copy_from_slice(&json[mid..]));
+    drop(filter.on_response_body(&mut ctx, &mut second, false).unwrap());
+
+    let mut eos: Option<Bytes> = None;
+    drop(filter.on_response_body(&mut ctx, &mut eos, true).unwrap());
+
+    assert_eq!(
+        ctx.get_metadata("token.input"),
+        Some("7"),
+        "released buffers must still extract from the streamed chunks"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.output"),
+        Some("11"),
+        "output tokens should match"
+    );
+}
+
+/// After a release, Praxis core still reports `StreamBuffer` but the EOS call
+/// carries only the final chunk. Usage must come from the captured chunks plus
+/// that chunk, not from the final chunk alone.
+#[tokio::test]
+async fn json_stream_buffer_released_final_chunk_extracts_usage() {
+    let json = br#"{"id":"msg_1","usage":{"input_tokens":9,"output_tokens":13}}"#;
+    let filter = make_filter(ProviderKind::Anthropic);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: None };
+
+    let raw = Bytes::from_static(json);
+    let mid = json.len() / 2;
+    let mut first = Some(raw.slice(..mid));
+    drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
+    let mut last = Some(raw.slice(mid..));
+    drop(filter.on_response_body(&mut ctx, &mut last, true).unwrap());
+
+    assert_eq!(
+        ctx.get_metadata("token.input"),
+        Some("9"),
+        "a released chain's final chunk must be joined to the captured chunks"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.output"),
+        Some("13"),
+        "output tokens should match"
+    );
+    assert!(
+        ctx.get_metadata("token.status").is_none(),
+        "a released chain within the capture limit must not report overflow"
+    );
+    assert_no_working_metadata(&ctx);
+}
+
+/// Another filter may buffer more than `token_count` is allowed to capture, so
+/// the frozen EOS body is held to `max_body_bytes` too, even when it carries
+/// usage that would parse.
+#[tokio::test]
+async fn json_stream_buffer_frozen_body_beyond_limit_sets_overflow_status() {
+    let mut filter = make_filter(ProviderKind::OpenAi);
+    filter.max_body_bytes = 64;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: None };
+
+    let padding = "x".repeat(200);
+    let json = format!(
+        r#"{{"id":"resp-1","padding":"{padding}","usage":{{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}}}"#
+    );
+    let frozen_body = Bytes::from(json.into_bytes());
+
+    let mut first = Some(frozen_body.slice(..32));
+    drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
+    let mut frozen = Some(frozen_body);
+    drop(filter.on_response_body(&mut ctx, &mut frozen, true).unwrap());
+
+    assert!(
+        ctx.get_metadata("token.input").is_none(),
+        "a frozen body beyond the capture limit must not be parsed"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.status"),
+        Some("overflow"),
+        "an oversized frozen body must report overflow, not zero usage"
+    );
+    assert_no_working_metadata(&ctx);
+}
+
+/// A frozen buffer that reports no usage repeats the captured chunks. Retrying
+/// it as their concatenation would double its size and report a false
+/// overflow for a response that fits the capture limit.
+#[tokio::test]
+async fn json_stream_buffer_frozen_body_without_usage_is_not_overflow() {
+    let json = br#"{"object":"list","data":[{"id":"model-a"},{"id":"model-b"}]}"#;
+    let mut filter = make_filter(ProviderKind::OpenAi);
+    filter.max_body_bytes = json.len() + json.len() / 2;
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/models");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: None };
+
+    let raw = Bytes::from_static(json);
+    let mid = json.len() / 2;
+    let mut first = Some(raw.slice(..mid));
+    drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
+    let mut second = Some(raw.slice(mid..));
+    drop(filter.on_response_body(&mut ctx, &mut second, false).unwrap());
+    let mut frozen = Some(raw);
+    drop(filter.on_response_body(&mut ctx, &mut frozen, true).unwrap());
+
+    assert!(
+        ctx.get_metadata("token.input").is_none(),
+        "a response without usage records no counts"
+    );
+    assert!(
+        ctx.get_metadata("token.status").is_none(),
+        "a frozen body within the capture limit must not report overflow"
+    );
+    assert_no_working_metadata(&ctx);
+}
+
+/// The released-chain fallback joins the captured chunks to the final chunk,
+/// and that joined document is held to `max_body_bytes` like any capture.
+#[tokio::test]
+async fn json_stream_buffer_released_fallback_beyond_limit_sets_overflow_status() {
+    let json = br#"{"id":"msg_1","usage":{"input_tokens":9,"output_tokens":13}}"#;
+    let mut filter = make_filter(ProviderKind::Anthropic);
+    filter.max_body_bytes = json.len() - 1;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: None };
+
+    let raw = Bytes::from_static(json);
+    let mid = json.len() / 2;
+    let mut first = Some(raw.slice(..mid));
+    drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
+    let mut last = Some(raw.slice(mid..));
+    drop(filter.on_response_body(&mut ctx, &mut last, true).unwrap());
+
+    assert!(
+        ctx.get_metadata("token.input").is_none(),
+        "a joined document beyond the capture limit must not be parsed"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.status"),
+        Some("overflow"),
+        "an oversized released capture must report overflow, not zero usage"
+    );
+    assert_no_working_metadata(&ctx);
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 
@@ -1758,4 +1992,151 @@ async fn run_sse_extraction(
         ctx.get_metadata("token.output").map(str::to_owned),
         ctx.get_metadata("token.total").map(str::to_owned),
     )
+}
+
+// -----------------------------------------------------------------------------
+// LLM gateway metrics
+// -----------------------------------------------------------------------------
+
+#[test]
+#[expect(clippy::too_many_lines, reason = "test asserts many metrics")]
+fn publish_token_usage_records_llm_metrics() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.cluster = Some("cb-glm".to_owned().into());
+    ctx.set_metadata("openai_chat_completions_request.model", "gpt-x");
+
+    let usage = TokenUsage::new(12, 34, Some(46))
+        .with_cache(Some(5), None)
+        .with_reasoning(Some(2));
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || publish_token_usage(&mut ctx, usage));
+    let snap = snapshotter.snapshot().into_vec();
+
+    // Sum only series carrying the expected model/cluster labels so a
+    // resolver regression (model or cluster collapsing to "unknown") fails
+    // the totals below instead of passing on unlabeled counters.
+    let labeled_total = |name: &str| -> u64 {
+        snap.iter()
+            .filter(|(k, ..)| {
+                k.key().name() == name
+                    && k.key().labels().any(|l| l.key() == "model" && l.value() == "gpt-x")
+                    && k.key().labels().any(|l| l.key() == "cluster" && l.value() == "cb-glm")
+            })
+            .filter_map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => Some(*c),
+                _ => None,
+            })
+            .sum()
+    };
+    let present = |name: &str| snap.iter().any(|(k, ..)| k.key().name() == name);
+
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_PROMPT_TOKENS_TOTAL), 12);
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_OUTPUT_TOKENS_TOTAL), 34);
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_CACHE_READ_TOKENS_TOTAL), 5);
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_REASONING_TOKENS_TOTAL), 2);
+    assert!(
+        !present(crate::llm_metrics::METRIC_EMPTY_COMPLETIONS_TOTAL),
+        "empty_completions must not be recorded on a non-empty response"
+    );
+}
+
+#[test]
+fn publish_token_usage_bumps_empty_completions_on_zero_output() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "gpt-x");
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        publish_token_usage(&mut ctx, TokenUsage::new(12, 0, Some(12)));
+    });
+    let snap = snapshotter.snapshot().into_vec();
+
+    let total = |name: &str| -> u64 {
+        snap.iter()
+            .filter(|(k, ..)| k.key().name() == name)
+            .filter_map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => Some(*c),
+                _ => None,
+            })
+            .sum()
+    };
+
+    assert_eq!(total(crate::llm_metrics::METRIC_EMPTY_COMPLETIONS_TOTAL), 1);
+}
+
+#[test]
+#[expect(clippy::too_many_lines, reason = "test asserts many metrics")]
+fn bedrock_headers_record_llm_metrics() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.cluster = Some("bedrock".to_owned().into());
+    ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "claude-x");
+    let mut headers = http::HeaderMap::new();
+    headers.insert(HEADER_BEDROCK_INPUT, HeaderValue::from_static("40"));
+    headers.insert(HEADER_BEDROCK_OUTPUT, HeaderValue::from_static("7"));
+    let mut resp = Response {
+        headers,
+        status: http::StatusCode::OK,
+    };
+    ctx.response_header = Some(&mut resp);
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || extract_bedrock_headers(&mut ctx));
+    let snap = snapshotter.snapshot().into_vec();
+
+    // Sum only series carrying the expected model/cluster labels so a
+    // resolver regression (model or cluster collapsing to "unknown") fails
+    // the totals below instead of passing on unlabeled counters.
+    let labeled_total = |name: &str| -> u64 {
+        snap.iter()
+            .filter(|(k, ..)| {
+                k.key().name() == name
+                    && k.key().labels().any(|l| l.key() == "model" && l.value() == "claude-x")
+                    && k.key().labels().any(|l| l.key() == "cluster" && l.value() == "bedrock")
+            })
+            .filter_map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => Some(*c),
+                _ => None,
+            })
+            .sum()
+    };
+    let present = |name: &str| snap.iter().any(|(k, ..)| k.key().name() == name);
+
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_PROMPT_TOKENS_TOTAL), 40);
+    assert_eq!(labeled_total(crate::llm_metrics::METRIC_OUTPUT_TOKENS_TOTAL), 7);
+    assert!(
+        !present(crate::llm_metrics::METRIC_CACHE_READ_TOKENS_TOTAL),
+        "Bedrock headers carry no cache breakdown"
+    );
+    assert!(
+        !present(crate::llm_metrics::METRIC_EMPTY_COMPLETIONS_TOTAL),
+        "empty_completions must not be recorded on a non-empty response"
+    );
+}
+
+#[test]
+fn bedrock_headers_without_headers_record_nothing() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut resp = Response {
+        headers: http::HeaderMap::new(),
+        status: http::StatusCode::OK,
+    };
+    ctx.response_header = Some(&mut resp);
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || extract_bedrock_headers(&mut ctx));
+    let snap = snapshotter.snapshot().into_vec();
+
+    assert!(
+        snap.is_empty(),
+        "missing Bedrock token headers should record nothing, got {snap:?}"
+    );
 }

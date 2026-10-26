@@ -83,19 +83,35 @@ credentials, or MCP authorization assertions are copied into trace fields.
 
 When the experimental `token_rate_limit` filter and the `opentelemetry`
 feature are both enabled, every request that reaches a matching rule gets a
-request-scoped `token_rate_limit` span. It records these bounded fields:
+request-scoped `token_rate_limit` span. A hierarchy denial, authentication
+miss, or backend error before the rule reservation uses the same span with
+`token_rate_limit.rule` set to `hierarchy:org`, `hierarchy:team`, or
+`hierarchy:user`. It records these bounded fields:
 
-- `token_rate_limit.rule`: configured rule name.
+- `token_rate_limit.rule`: configured rule name, or `hierarchy:org`, `hierarchy:team`, or
+  `hierarchy:user` for a hierarchy-level outcome.
 - `token_rate_limit.algorithm`: `sliding_window` or `token_bucket`.
 - `token_rate_limit.estimated_cost`: tokens reserved or considered at admission.
 - `token_rate_limit.decision`: `admitted` (reservation made), `denied` (429,
   budget exhausted), `soft_over_quota` (soft mode forwarded over budget with
   annotation), `unauthenticated` (401, no trusted subject to key the budget
-  on), or `error` (503, the backend failed and the filter failed closed).
+  on), `error` (503, the backend failed and the filter failed closed),
+  `bypassed` (explicit fail-open before a mutation was dispatched), or
+  `unconfirmed` (explicit fail-open after a mutation may have been dispatched).
   Soft decisions align with `praxis_trl_requests_total{result=…}`.
 - `token_rate_limit.actual_cost`: provider-reported weighted usage, recorded
   when the response body ends. Absent when the decision was not `admitted`
   or no usage metadata was produced.
+
+The token-rate-limit Prometheus metrics include
+`praxis_trl_fail_open_admissions_total{rule,backend,outcome}` for explicit
+`backend.on_failure: open` admissions. `outcome` is `bypassed` when no backend
+mutation was dispatched and `unconfirmed` when a dispatched operation may have
+committed. Fail-open admissions are not included in
+`praxis_trl_backend_errors_total`, which is reserved for failed reservations
+that fail closed with 503, plus reconciliation failures.
+The bounded `backend` vocabulary is `memory` or `shared_kv`; Redis and Valkey
+both use `shared_kv`.
 
 The span is created at admission and dropped when the response body ends,
 so its lifetime covers the streamed response. It does not contain the
@@ -103,3 +119,12 @@ authenticated subject, internal budget key, prompt, body, model, or other
 request-specific identity. Valkey reconciliation runs asynchronously after
 response processing; its success or failure is exposed through metrics and
 accounting logs rather than extending the span further.
+
+Sentinel transport lifecycle is also metrics-only, not additional request-span
+attributes. `praxis_trl_sentinel_discovery_total{phase,result}` records
+bounded initial discovery and generation-fenced rediscovery outcomes;
+`praxis_trl_sentinel_failover_total{outcome}` records proxy-side
+recovery after invalidation. Their labels are fixed vocabularies and contain no
+endpoint, service-name, credential, subject, or bucket-key values. A
+`recovered` failover sample means that the proxy obtained a writable
+connection; it is not evidence that Sentinel promoted a replica.

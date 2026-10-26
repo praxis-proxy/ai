@@ -10,10 +10,11 @@
 
 use crate::{
     owner::StateOwner,
-    traits::{ConversationItemStore, PersistedStateBackend},
+    retained_payload::{json_values_charge, retained_charge},
+    traits::{ConversationItemStore, PersistedStateBackend, ResponseStore},
     types::{
         ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,
-        ResponseRecord,
+        ResponseRecord, StoreError,
     },
 };
 
@@ -89,6 +90,7 @@ async fn persist_parent_response(backend: &dyn PersistedStateBackend, owner: &St
 /// Panics if the backend violates the persistence contract.
 #[expect(
     clippy::large_stack_frames,
+    clippy::cognitive_complexity,
     reason = "sequentially runs the complete backend contract"
 )]
 pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
@@ -96,13 +98,21 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     response_id_is_globally_unique(backend).await;
     approvals_consume_all_or_nothing(backend).await;
     approvals_require_an_owner_matched_response(backend).await;
+    pending_approval_size_measures_payload_only(backend).await;
+    budgeted_response_reads_measure_and_limit(backend).await;
     persist_pairs_response_and_approvals(backend).await;
+    insert_if_absent_preserves_prior_response(backend).await;
     conversation_messages_cas(backend).await;
     conversation_id_is_globally_unique(backend).await;
     items_sync_positions_and_messages(backend).await;
     legacy_history_survives_incremental_mutations(backend).await;
+    bounded_read_reconstructs_full_history_and_bounds_raw_bytes(backend).await;
+    budgeted_conversation_reads_measure_and_limit(backend).await;
     history_orders_positions_without_truncation(backend).await;
     malformed_cache_requires_explicit_repair(backend).await;
+    bounded_append_rejects_without_mutation(backend).await;
+    bounded_append_charges_legacy_prefix_only_when_migrating(backend).await;
+    bounded_append_does_not_recharge_existing_item_rows(backend).await;
     item_sync_delete_rolls_back_without_parent(backend).await;
     item_ids_are_owner_scoped(backend).await;
     item_positions_are_owner_scoped_and_atomic(backend).await;
@@ -112,6 +122,182 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     event_log_requires_owner_matched_response(backend).await;
     event_log_status_gates_on_terminal(backend).await;
     event_log_removed_with_response(backend).await;
+}
+
+/// A budgeted response read returns the measured charge and rejects a record
+/// whose charge exceeds the caller's allowance.
+async fn budgeted_response_reads_measure_and_limit(backend: &dyn PersistedStateBackend) {
+    let o = owner("budgeted-response");
+    backend
+        .upsert_response(&ResponseRecord {
+            id: "resp_budgeted".to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            model: "model".to_owned(),
+            response_object: serde_json::json!({"status": "completed", "output": [{"text": "ok"}]}),
+            input: serde_json::json!([{"role": "user", "content": "hello"}]),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert budgeted response");
+    let admitted = ResponseStore::get_response_budgeted(backend, &o, "resp_budgeted", 1 << 20)
+        .await
+        .expect("budgeted response read")
+        .expect("response exists");
+    assert!(admitted.charge_bytes > 0, "admitted charge must be measured");
+    assert_eq!(admitted.record.id, "resp_budgeted", "admitted record identity");
+    assert!(
+        matches!(
+            ResponseStore::get_response_budgeted(backend, &o, "resp_budgeted", admitted.charge_bytes - 1).await,
+            Err(StoreError::PayloadTooLarge)
+        ),
+        "a charge below the measured allowance must be rejected"
+    );
+}
+
+/// `get_conversation_bounded` reconstructs the complete lazy-snapshot + items
+/// history, `get_conversation` returns only the retired snapshot, and the raw
+/// stored bytes are bounded against the caller's ceiling.
+///
+/// This pins why `rehydrate` must keep using `get_conversation_bounded` even for
+/// the unbounded case: `get_conversation` alone drops every items-table turn.
+#[expect(clippy::too_many_lines, reason = "linear bounded-read contract assertions")]
+async fn bounded_read_reconstructs_full_history_and_bounds_raw_bytes(backend: &dyn PersistedStateBackend) {
+    let o = owner("bounded-history");
+    let legacy = serde_json::json!([{"role": "user", "content": "legacy"}]);
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: "conv_bounded".to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: legacy.clone(),
+        })
+        .await
+        .expect("legacy parent");
+    let mut first = item(&o, "conv_bounded", "a");
+    first.item_data = serde_json::json!({"role": "assistant", "content": "a"});
+    first.position = 0;
+    let mut second = item(&o, "conv_bounded", "b");
+    second.item_data = serde_json::json!({"role": "user", "content": "b"});
+    second.position = 1;
+    backend
+        .create_items_and_sync_messages(&o, "conv_bounded", &[first, second])
+        .await
+        .expect("append item rows");
+
+    // The complete reconstructed history is the legacy prefix followed by the two
+    // item rows.
+    let full = ConversationItemStore::conversation_history(backend, &o, "conv_bounded")
+        .await
+        .expect("history read")
+        .expect("history exists");
+    assert_eq!(full.len(), 3, "legacy prefix plus two item rows");
+
+    // A generous ceiling returns that complete history.
+    let bounded = ResponseStore::get_conversation_bounded(backend, &o, "conv_bounded", 1 << 20)
+        .await
+        .expect("bounded read")
+        .expect("conversation exists");
+    assert_eq!(
+        bounded.messages,
+        serde_json::Value::Array(full),
+        "the bounded read reconstructs the full lazy-snapshot + items history"
+    );
+
+    // `get_conversation` returns only the retired lazy snapshot, not the items, so
+    // it must never be substituted for the bounded read on the unbounded path.
+    let snapshot = ResponseStore::get_conversation(backend, &o, "conv_bounded")
+        .await
+        .expect("snapshot read")
+        .expect("conversation exists");
+    assert_ne!(
+        snapshot.messages, bounded.messages,
+        "get_conversation returns the incomplete lazy snapshot, not the reconstructed history"
+    );
+
+    // A ceiling below the raw stored bytes rejects before the record is returned.
+    let err = ResponseStore::get_conversation_bounded(backend, &o, "conv_bounded", 1)
+        .await
+        .expect_err("a 1-byte ceiling must reject the stored history");
+    assert!(
+        matches!(err, StoreError::PayloadTooLarge),
+        "an oversized history is PayloadTooLarge, got {err:?}"
+    );
+
+    // Boundary: a legacy-prefix conversation stores its prefix in the snapshot
+    // column wrapped as `{"legacy_messages":[...]}`; that wrapper is stripped on
+    // reconstruction. A preflight that counted the wrapper column would over-count
+    // and falsely reject a ceiling set exactly at the decoded size. The exact
+    // decoded size is the compact metadata + messages the caller measures.
+    let exact = serde_json::to_vec(&bounded.metadata)
+        .expect("metadata serializes")
+        .len()
+        + serde_json::to_vec(&bounded.messages)
+            .expect("messages serializes")
+            .len();
+    assert!(
+        ResponseStore::get_conversation_bounded(backend, &o, "conv_bounded", exact)
+            .await
+            .expect("ceiling at the exact decoded size must not error")
+            .is_some(),
+        "a ceiling equal to the decoded columns must admit the record (no wrapper over-count)"
+    );
+    let under = ResponseStore::get_conversation_bounded(backend, &o, "conv_bounded", exact - 1)
+        .await
+        .expect_err("one byte under the decoded size must reject");
+    assert!(
+        matches!(under, StoreError::PayloadTooLarge),
+        "one byte under the decoded size is PayloadTooLarge, got {under:?}"
+    );
+}
+
+/// A budgeted conversation read reconstructs full history, returns the measured
+/// charge, and rejects history whose charge exceeds the caller's allowance.
+#[expect(
+    clippy::too_many_lines,
+    reason = "fixture setup, reconstruction, and rejection assertions form one scenario"
+)]
+async fn budgeted_conversation_reads_measure_and_limit(backend: &dyn PersistedStateBackend) {
+    let o = owner("budgeted-conversation");
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: "conv_budgeted".to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            metadata: serde_json::json!({"source": "test"}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("create conversation");
+    let mut first = item(&o, "conv_budgeted", "one");
+    first.item_data = serde_json::json!({"type": "message", "content": "x".repeat(8_192)});
+    let mut second = item(&o, "conv_budgeted", "two");
+    second.item_data = serde_json::json!({"type": "message", "content": "y".repeat(8_192)});
+    backend
+        .create_items_and_sync_messages(&o, "conv_budgeted", &[first, second])
+        .await
+        .expect("append history");
+    let admitted = ResponseStore::get_conversation_budgeted(backend, &o, "conv_budgeted", 16 * 1024 * 1024)
+        .await
+        .expect("budgeted conversation read")
+        .expect("conversation exists");
+    assert_eq!(
+        admitted.record.messages.as_array().map(Vec::len),
+        Some(2),
+        "reconstructed history must include both items"
+    );
+    assert!(
+        admitted.charge_bytes > 2 * 8_192 * 32,
+        "charge must account for both item payloads"
+    );
+    assert!(
+        matches!(
+            ResponseStore::get_conversation_budgeted(backend, &o, "conv_budgeted", admitted.charge_bytes - 1).await,
+            Err(StoreError::PayloadTooLarge)
+        ),
+        "a charge below the measured allowance must be rejected"
+    );
 }
 
 /// A conversation id is globally unique in the SQL schema: another owner may
@@ -334,6 +520,113 @@ async fn approvals_require_an_owner_matched_response(backend: &dyn PersistedStat
     );
 }
 
+/// `pending_approval_payload_bytes` sums the matched rows' payload size without
+/// materializing them, counts only owner- and response-scoped matches, treats
+/// unknown ids and an empty slice as zero, and never fetches a row that another
+/// owner or a different issuing response holds. This is the size-only admission
+/// probe aggregate budgeting runs before loading a stored approval.
+#[expect(clippy::too_many_lines, reason = "linear scoping and sizing assertions")]
+async fn pending_approval_size_measures_payload_only(backend: &dyn PersistedStateBackend) {
+    let o = owner("size");
+    let other = owner("size-other");
+    backend
+        .upsert_response(&ResponseRecord {
+            id: "resp_size".to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            model: "m".to_owned(),
+            response_object: serde_json::json!({}),
+            input: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert response for size query");
+
+    // Distinct, known-length ASCII fields so the expected byte total is the
+    // sum of every stored column and is not accidentally equal across rows.
+    let first = PendingApprovalRecord {
+        approval_id: "size_a".to_owned(),
+        server_label: "search-server".to_owned(),
+        tool_name: "lookup".to_owned(),
+        arguments: "{\"q\":\"alpha\"}".to_owned(),
+        target_fingerprint: "fp-aaaa".to_owned(),
+    };
+    let second = PendingApprovalRecord {
+        approval_id: "size_bb".to_owned(),
+        server_label: "db".to_owned(),
+        tool_name: "query-rows".to_owned(),
+        arguments: "{\"table\":\"orders\",\"limit\":100}".to_owned(),
+        target_fingerprint: "fp-b".to_owned(),
+    };
+    backend
+        .record_pending_approvals(&o, "resp_size", &[first.clone(), second.clone()], 10)
+        .await
+        .expect("record approvals for size query");
+
+    let payload_bytes = |record: &PendingApprovalRecord| {
+        record.approval_id.len()
+            + record.server_label.len()
+            + record.tool_name.len()
+            + record.arguments.len()
+            + record.target_fingerprint.len()
+    };
+
+    // Both rows matched; the unknown id contributes nothing to the total.
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&o, "resp_size", &["size_a", "size_bb", "size_missing"])
+            .await
+            .expect("size of matched rows"),
+        payload_bytes(&first) + payload_bytes(&second),
+        "size must sum only the matched rows and ignore unknown ids"
+    );
+    // A single id returns just that row's payload size.
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&o, "resp_size", &["size_bb"])
+            .await
+            .expect("size of one row"),
+        payload_bytes(&second),
+        "a single matched id measures only its own payload"
+    );
+    // Unknown id only: zero bytes, never an error.
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&o, "resp_size", &["size_missing"])
+            .await
+            .expect("size of missing row"),
+        0,
+        "unknown approval ids contribute zero"
+    );
+    // Wrong owner: the rows are invisible, so zero bytes.
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&other, "resp_size", &["size_a", "size_bb"])
+            .await
+            .expect("size under wrong owner"),
+        0,
+        "a non-owner must not measure another owner's approvals"
+    );
+    // Wrong issuing response: scoped out, so zero bytes.
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&o, "resp_other", &["size_a", "size_bb"])
+            .await
+            .expect("size under wrong response"),
+        0,
+        "approvals are scoped to their issuing response"
+    );
+    // An empty id slice measures nothing.
+    assert_eq!(
+        backend
+            .pending_approval_payload_bytes(&o, "resp_size", &[])
+            .await
+            .expect("size of empty slice"),
+        0,
+        "an empty id slice measures nothing"
+    );
+}
+
 /// `persist_response_with_pending_approvals` writes the response and its
 /// approvals together, and deleting the response takes its approvals with it.
 #[expect(clippy::too_many_lines, reason = "linear contract assertions")]
@@ -376,6 +669,85 @@ async fn persist_pairs_response_and_approvals(backend: &dyn PersistedStateBacken
             .expect("get after delete")
             .is_empty(),
         "approval orphaned after its response was deleted"
+    );
+}
+
+/// A rollback candidate must never replace a preexisting response or its
+/// approvals, including when a provider reuses an ID for the same owner.
+#[expect(
+    clippy::too_many_lines,
+    reason = "checks same-owner and cross-owner collisions with approvals"
+)]
+async fn insert_if_absent_preserves_prior_response(backend: &dyn PersistedStateBackend) {
+    let first_owner = owner("insert-first");
+    let second_owner = owner("insert-second");
+    let original = ResponseRecord {
+        id: "resp_insert_once".to_owned(),
+        owner: first_owner.clone(),
+        created_at: 1,
+        model: "old".to_owned(),
+        response_object: serde_json::json!({"id": "resp_insert_once", "marker": "old"}),
+        input: serde_json::json!([]),
+        messages: serde_json::json!([]),
+    };
+    assert!(
+        backend
+            .persist_response_with_pending_approvals_if_absent(&original, &[approval("pa_old")])
+            .await
+            .expect("first insert"),
+        "new response must insert"
+    );
+    let replacement = ResponseRecord {
+        model: "new".to_owned(),
+        response_object: serde_json::json!({"id": "resp_insert_once", "marker": "new"}),
+        ..original.clone()
+    };
+    assert!(
+        !backend
+            .persist_response_with_pending_approvals_if_absent(&replacement, &[approval("pa_new")])
+            .await
+            .expect("same-owner collision"),
+        "same-owner collision must not replace the existing response"
+    );
+    assert!(
+        !backend
+            .persist_response_with_pending_approvals_if_absent(
+                &ResponseRecord {
+                    owner: second_owner.clone(),
+                    ..replacement
+                },
+                &[approval("pa_other")],
+            )
+            .await
+            .expect("cross-owner collision"),
+        "cross-owner collision must not replace the existing response"
+    );
+    let stored = backend
+        .get_response(&first_owner, &original.id)
+        .await
+        .expect("get original")
+        .expect("original retained");
+    assert_eq!(
+        stored.response_object.get("marker"),
+        Some(&serde_json::json!("old")),
+        "same-owner collision changed the original response"
+    );
+    assert!(
+        backend
+            .get_response(&second_owner, &original.id)
+            .await
+            .expect("get other")
+            .is_none(),
+        "cross-owner collision leaked the original response"
+    );
+    assert_eq!(
+        backend
+            .get_pending_approvals(&first_owner, &original.id, &["pa_old", "pa_new", "pa_other"])
+            .await
+            .expect("get approvals")
+            .len(),
+        1,
+        "collisions must not write replacement approvals"
     );
 }
 
@@ -830,10 +1202,7 @@ async fn malformed_cache_requires_explicit_repair(backend: &dyn PersistedStateBa
             .create_items_and_sync_messages(&o, &id, std::slice::from_ref(&new))
             .await
             .expect_err("unsupported history must not be discarded automatically");
-        assert!(
-            matches!(err, crate::StoreError::Serialization(_)),
-            "typed history error"
-        );
+        assert!(matches!(err, StoreError::Serialization(_)), "typed history error");
         assert_eq!(
             backend
                 .max_item_position(&o, &id)
@@ -886,6 +1255,195 @@ async fn malformed_cache_requires_explicit_repair(backend: &dyn PersistedStateBa
             "repair preserves verified history and permits later appends"
         );
     }
+}
+
+/// A failed bounded append must not commit the new item or change the cache.
+#[expect(clippy::too_many_lines, reason = "transactional item and cache rollback assertions")]
+async fn bounded_append_rejects_without_mutation(backend: &dyn PersistedStateBackend) {
+    let o = owner("bounded-rollback");
+    let conversation_id = "conv_bounded_rollback";
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: conversation_id.to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("create conversation");
+    backend
+        .create_items_and_sync_messages(&o, conversation_id, &[item(&o, conversation_id, "prior")])
+        .await
+        .expect("seed prior item and cache");
+    let before = ConversationItemStore::get_conversation(backend, &o, conversation_id)
+        .await
+        .expect("read prior cache")
+        .expect("conversation exists");
+
+    assert!(
+        matches!(
+            backend
+                .create_items_and_sync_messages_bounded(&o, conversation_id, &[item(&o, conversation_id, "new")], 1)
+                .await,
+            Err(StoreError::PayloadTooLarge)
+        ),
+        "oversized rebuild must fail"
+    );
+    let listed = backend
+        .list_conversation_items(&o, conversation_id, None, 10, true)
+        .await
+        .expect("list after failed rebuild");
+    assert_eq!(listed.len(), 1, "failed append must not commit a second item");
+    assert_eq!(
+        listed.first().map(|item| item.item_id.as_str()),
+        Some("prior"),
+        "prior item must survive the rollback"
+    );
+    let after = ConversationItemStore::get_conversation(backend, &o, conversation_id)
+        .await
+        .expect("read cache after failed rebuild")
+        .expect("conversation survives");
+    assert_eq!(
+        after.messages, before.messages,
+        "failed append must not change the cached messages"
+    );
+}
+
+/// The first bounded append admits the one-time legacy-prefix migration; later
+/// appends do not charge that already wrapped prefix again.
+#[expect(
+    clippy::too_many_lines,
+    reason = "migration admission, rejection, and later-append assertions form one scenario"
+)]
+async fn bounded_append_charges_legacy_prefix_only_when_migrating(backend: &dyn PersistedStateBackend) {
+    let o = owner("bounded-legacy-prefix");
+    let conversation_id = "conv_bounded_legacy_prefix";
+    let legacy = serde_json::json!([{"role": "user", "content": "legacy history"}]);
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: conversation_id.to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: legacy.clone(),
+        })
+        .await
+        .expect("create cache-only conversation");
+
+    let first = item(&o, conversation_id, "first");
+    let new_item_charge = json_values_charge([&first.item_data], &[conversation_id, &first.item_id], usize::MAX)
+        .expect("measure new item");
+    assert!(
+        matches!(
+            backend
+                .create_items_and_sync_messages_bounded(
+                    &o,
+                    conversation_id,
+                    std::slice::from_ref(&first),
+                    new_item_charge
+                )
+                .await,
+            Err(StoreError::PayloadTooLarge)
+        ),
+        "a budget covering only the new item cannot also migrate the legacy prefix"
+    );
+    assert!(
+        backend
+            .list_conversation_items(&o, conversation_id, None, 10, true)
+            .await
+            .expect("list after rejected append")
+            .is_empty(),
+        "rejected migration must not create an item"
+    );
+
+    let legacy_charge = json_values_charge([&legacy], &[], usize::MAX).expect("measure legacy prefix");
+    let wrapper_charge = retained_charge(20, 2).expect("measure legacy wrapper");
+    let migration_budget = new_item_charge + legacy_charge + wrapper_charge;
+    backend
+        .create_items_and_sync_messages_bounded(&o, conversation_id, std::slice::from_ref(&first), migration_budget)
+        .await
+        .expect("admit new item and one-time legacy migration");
+
+    let second = item(&o, conversation_id, "second");
+    let second_item_charge = json_values_charge([&second.item_data], &[conversation_id, &second.item_id], usize::MAX)
+        .expect("measure second item");
+    backend
+        .create_items_and_sync_messages_bounded(&o, conversation_id, &[second], second_item_charge)
+        .await
+        .expect("already migrated history is not charged on later appends");
+    assert_eq!(
+        backend
+            .conversation_history(&o, conversation_id)
+            .await
+            .expect("read full history"),
+        Some(vec![
+            legacy
+                .as_array()
+                .expect("legacy array")
+                .first()
+                .expect("legacy entry")
+                .clone(),
+            first.item_data,
+            item(&o, conversation_id, "second").item_data,
+        ]),
+        "history is the migrated legacy prefix followed by both appended items"
+    );
+}
+
+/// An earlier read does not make append-back account old item rows again. The
+/// append path invalidates the cache and writes only the candidate item.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the restore, intervening write, and bounded append assertions form one scenario"
+)]
+async fn bounded_append_does_not_recharge_existing_item_rows(backend: &dyn PersistedStateBackend) {
+    let o = owner("intervening-append");
+    let id = "conv_intervening_append";
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: id.to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("create conversation");
+    backend
+        .create_items_and_sync_messages(&o, id, &[item(&o, id, "prior")])
+        .await
+        .expect("seed prior item");
+    let snapshot = backend
+        .get_conversation_bounded(&o, id, 65_536)
+        .await
+        .expect("bounded restore")
+        .expect("conversation exists");
+    assert_eq!(
+        snapshot.messages.as_array().map(Vec::len),
+        Some(1),
+        "restore sees the first item"
+    );
+
+    let mut concurrent = item(&o, id, "concurrent");
+    concurrent.item_data = serde_json::json!({"id":"concurrent", "content":"x".repeat(10_000)});
+    backend
+        .create_items_and_sync_messages(&o, id, &[concurrent])
+        .await
+        .expect("another writer appends after restore");
+    backend
+        .create_items_and_sync_messages_bounded(&o, id, &[item(&o, id, "candidate")], 65_536)
+        .await
+        .expect("a prior item is not charged against the new append allowance");
+    let listed = backend
+        .list_conversation_items(&o, id, None, 10, true)
+        .await
+        .expect("list items");
+    assert_eq!(listed.len(), 3, "the bounded append is stored");
+    assert!(
+        listed.iter().any(|record| record.item_id == "candidate"),
+        "the candidate item is persisted"
+    );
 }
 
 /// Deleting an item and invalidating its message cache is atomic when the parent

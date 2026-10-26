@@ -204,18 +204,30 @@ fn extract_tool_call_blocks<'a>(message: Option<&'a Value>, blocks: &mut Vec<Con
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "tool call missing required non-empty function `name`".to_owned())?;
-        let args_str = tc
-            .get("function")
-            .and_then(|f| f.get("arguments"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| "tool call arguments must be a JSON-encoded object string".to_owned())?;
-        let input = serde_json::from_str::<Map<String, Value>>(args_str)
-            .map_err(|error| format!("invalid tool call arguments: {error}"))?;
+        let input = parse_tool_call_arguments(tc)?;
 
         blocks.push(ContentBlock::tool_use(id, input, name));
     }
 
     Ok(())
+}
+
+/// Parse a Chat Completions tool call's `function.arguments` into an object map.
+///
+/// An empty or whitespace-only string is how Chat/vLLM tool parsers encode a
+/// parameterless tool call (the OpenAI streaming spec example uses `"arguments":""`),
+/// so it is absent arguments rather than malformed input and maps to `{}`.
+fn parse_tool_call_arguments(tool_call: &Value) -> Result<Map<String, Value>, String> {
+    let args_str = tool_call
+        .get("function")
+        .and_then(|f| f.get("arguments"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "tool call arguments must be a JSON-encoded object string".to_owned())?;
+    if args_str.trim().is_empty() {
+        return Ok(Map::new());
+    }
+    serde_json::from_str::<Map<String, Value>>(args_str)
+        .map_err(|error| format!("invalid tool call arguments: {error}"))
 }
 
 // -----------------------------------------------------------------------------
@@ -242,11 +254,17 @@ fn map_finish_reason<'a>(obj: &'a Map<String, Value>, stop_sequences: &[String])
         .and_then(|c| c.get("stop_reason"))
         .and_then(Value::as_str)
         .filter(|matched| stop_sequences.iter().any(|sequence| sequence == matched));
+    let has_tool_calls = choice
+        .and_then(|c| c.get("message"))
+        .and_then(|message| message.get("tool_calls"))
+        .and_then(Value::as_array)
+        .is_some_and(|tool_calls| !tool_calls.is_empty());
 
     let mapped = match finish_reason {
         "tool_calls" => "tool_use",
         "length" => "max_tokens",
         "stop" if stop_sequence.is_some() => "stop_sequence",
+        "stop" if has_tool_calls => "tool_use",
         _ => "end_turn",
     };
 
@@ -504,6 +522,17 @@ mod tests {
     }
 
     #[test]
+    fn tool_calls_with_stop_finish_reason_report_tool_use() {
+        let body = br#"{"id":"chatcmpl-3","model":"qwen3-8b","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":15}}"#;
+        let tr = transform_response(body, "qwen3-8b", &[]).unwrap();
+        let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
+
+        assert_eq!(parsed["stop_reason"], "tool_use");
+        assert_eq!(parsed["content"][0]["type"], "tool_use");
+        assert_eq!(tr.original_finish_reason, "stop");
+    }
+
+    #[test]
     fn matched_stop_sequence_is_reported() {
         let body = br#"{"id":"chatcmpl-7","model":"gpt-4","choices":[{"message":{"role":"assistant","content":"Count: 1"},"finish_reason":"stop","stop_reason":","}],"usage":{"prompt_tokens":20,"completion_tokens":4}}"#;
         let tr = transform_response(body, "gpt-4", &[",".to_owned()]).unwrap();
@@ -663,6 +692,27 @@ mod tests {
         assert!(
             error.contains("invalid tool call arguments"),
             "malformed arguments should fail response transformation: {error}"
+        );
+    }
+
+    #[test]
+    fn empty_string_tool_call_arguments_become_empty_object() {
+        // vLLM tool parsers (and the OpenAI streaming spec example) encode a
+        // parameterless call as `"arguments":""`; it must parse to `{}`, not error.
+        for arguments in ["", "   ", "\n\t"] {
+            let tool_call = json!({"function": {"name": "now", "arguments": arguments}});
+            assert_eq!(
+                parse_tool_call_arguments(&tool_call).unwrap(),
+                Map::new(),
+                "empty/whitespace args become an empty object for {arguments:?}"
+            );
+        }
+
+        let populated = json!({"function": {"name": "now", "arguments": "{\"tz\":\"utc\"}"}});
+        assert_eq!(
+            parse_tool_call_arguments(&populated).unwrap()["tz"],
+            json!("utc"),
+            "populated arguments still parse"
         );
     }
 

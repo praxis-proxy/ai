@@ -7,18 +7,33 @@
 VERSION          ?= $(shell sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' Cargo.toml | head -n 1)
 IMAGE            ?= praxis-ai
 CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+SENTINEL_PRODUCT ?= valkey
+SENTINEL_ENV_FILE ?= target/sentinel.env
+SENTINEL_DEAD_ENDPOINT ?=
+SENTINEL_DEAD_ENDPOINT_ENV := $(if $(strip $(SENTINEL_DEAD_ENDPOINT)),TOKEN_RATE_LIMIT_SENTINEL_DEAD_ENDPOINT='$(SENTINEL_DEAD_ENDPOINT)',-u TOKEN_RATE_LIMIT_SENTINEL_DEAD_ENDPOINT)
+SENTINEL_FAILOVER_BEFORE_COMMAND ?=
+SENTINEL_REPLICATION_HEALTH_TEST ?=
+SENTINEL_ON_FAILURE ?=
+SENTINEL_TEST_FILTER ?= sentinel_
 OPENAI_CONFORMANCE_ARGS ?=
 RESPONSES_CONFORMANCE_ARGS ?=
 V                ?=
+# CI uses this stable pin for Clippy and refreshes floating nightly for rustfmt.
+LINT_RUST_VERSION := $(shell sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+# Cargo also finds rustc/clippy/rustfmt through PATH; select their bin directory
+# so a Homebrew installation cannot override the selected toolchain's children.
+LINT_CARGO = PATH="$$(dirname "$$(rustup which --toolchain $(LINT_RUST_VERSION) cargo)"):$${PATH}" rustup run $(LINT_RUST_VERSION) cargo
+LINT_FMT_CARGO = PATH="$$(dirname "$$(rustup which --toolchain nightly cargo)"):$${PATH}" rustup run nightly cargo
 
 # Experimental filter features are package-specific and off by default.
 # Basic Auth is exposed by praxis-ai-proxy and forwarded by the integration-test
 # crate; it is not a praxis-ai-filters feature.
-FILTER_EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-ceiling-filter
-INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-ceiling-filter
-# Features for `make release`. The published container image builds
-# `full,store-sqlite` so it can also serve the SQLite-backed examples; `make
-# release` stays on `full` (PostgreSQL only), which is the production backend.
+FILTER_EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-ceiling-filter,inflight-tracker-filter,vertex-anthropic-filter
+INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-ceiling-filter,inflight-tracker-filter,vertex-anthropic-filter
+# Experimental praxis-ai-apis features, whose unit tests live in that crate.
+APIS_EXPERIMENTAL_FEATURES := vertex-anthropic
+# Release and container builds exclude experimental Responses and agents.
+# Opt in with PRAXIS_AI_FEATURES=full,openai-all,store-sqlite when needed.
 PRAXIS_AI_FEATURES ?= full
 # Crates that must never enter the explicit lean (`standard`) proxy graph.
 # openssl-sys is not on the list: praxis performs all cryptography through the
@@ -33,7 +48,7 @@ STORE_POSTGRES_FEATURES := standard,openai-all,store-postgres
 STORE_POSTGRES_CERT_AUTH_FEATURES := openai-responses,store-postgres-cert-auth
 STORE_SQLITE_FEATURES := standard,openai-all,store-sqlite
 STORE_COMBINED_FEATURES := standard,openai-all,store-all
-STORE_ALL_WORKSPACE_FEATURES := praxis-ai-proxy/store-all,praxis-tests-integration/store-all,praxis-tests-schema/store-all,praxis-tests-environment/store-all
+STORE_ALL_WORKSPACE_FEATURES := praxis-ai-benchmarks/store-all,praxis-ai-proxy/openai-all,praxis-tests-integration/openai-all,praxis-tests-schema/openai-all,praxis-ai-proxy/store-all,praxis-tests-integration/store-all,praxis-tests-schema/store-all,praxis-tests-environment/store-all
 
 ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
@@ -41,13 +56,15 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit test-unit-apis test-unit-filters test-unit-proxy \
-	test-schema test-integration test-inference-fixtures \
-	test-store-features \
+	test-schema test-integration test-inference-fixtures bench-model-to-provider \
+	test-store-features test-responses-features \
 	test-postgres-unit test-postgres-integration test-environment \
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
+	test-token-rate-limit-sentinel-integration \
 	openai-conformance check-openai-conformance-reference test-openai-conformance \
 	test-responses-conformance \
 	lint lint-clippy lint-xtask lint-lean check-dep-budget fmt doc audit coverage-check \
+	setup-lint-toolchains \
 	require-container-engine \
 	container container-run \
 	setup-hooks help \
@@ -102,6 +119,8 @@ container-run: | require-container-engine
 # -------------------------------------------------------------------
 
 test:
+	cargo build -p praxis-ai-proxy --bin praxis-ai --features openai-all,store-all
+	PRAXIS_AI_BIN=$(abspath $(or $(CARGO_TARGET_DIR),target)/debug/praxis-ai) \
 	cargo test --workspace --features $(STORE_ALL_WORKSPACE_FEATURES) $(_NOCAPTURE)
 
 # `make test-unit` runs every crate's permutations serially for local use; CI
@@ -112,18 +131,26 @@ test-unit: test-unit-apis test-unit-filters test-unit-proxy
 
 test-unit-apis:
 	cargo test -p praxis-ai-apis $(_NOCAPTURE)
-	cargo test -p praxis-ai-apis --features full $(_NOCAPTURE)
+	cargo test -p praxis-ai-apis --features full,openai-all,store-postgres $(_NOCAPTURE)
+	cargo test -p praxis-ai-apis --features full,openai-all,store-postgres,$(APIS_EXPERIMENTAL_FEATURES) $(_NOCAPTURE)
 	cargo test -p praxis-ai-build-support $(_NOCAPTURE)
+	cargo test -p praxis-ai-store -p praxis-ai-store-backends --no-default-features \
+		--features praxis-ai-store-backends/sqlite $(_NOCAPTURE)
 
 test-unit-filters:
 	cargo test -p praxis-ai-filters $(_NOCAPTURE)
-	cargo test -p praxis-ai-filters --features full $(_NOCAPTURE)
-	cargo test -p praxis-ai-filters --features full,$(FILTER_EXPERIMENTAL_FEATURES) $(_NOCAPTURE)
+	cargo test -p praxis-ai-filters --features full,openai-all,store-postgres $(_NOCAPTURE)
+	cargo test -p praxis-ai-filters --features full,openai-all,store-postgres,$(FILTER_EXPERIMENTAL_FEATURES) $(_NOCAPTURE)
+
+bench-model-to-provider:
+	cargo test --locked --release -p praxis-ai-filters --lib \
+		inference::model_to_provider::tests::mapping_latency_microbenchmark \
+		-- --ignored --exact --nocapture
 
 test-unit-proxy:
 	cargo test -p praxis-ai-proxy $(_NOCAPTURE)
-	cargo test -p praxis-ai-proxy --features full $(_NOCAPTURE)
-	cargo test -p praxis-ai-proxy --features full,basic-auth-filter $(_NOCAPTURE)
+	cargo test -p praxis-ai-proxy --features full,openai-all,store-postgres $(_NOCAPTURE)
+	cargo test -p praxis-ai-proxy --features full,openai-all,store-postgres,basic-auth-filter $(_NOCAPTURE)
 
 test-store-features:
 	cargo check -p praxis-ai-proxy
@@ -149,11 +176,10 @@ test-store-features:
 	for crate in sqlx sqlx-sqlite libsqlite3-sys; do assert_has "$$sqlite" "$$crate" SQLite-only; done; \
 	for crate in sqlx-postgres native-tls; do assert_lacks "$$sqlite" "$$crate" SQLite-only; done; \
 	for crate in sqlx sqlx-postgres sqlx-sqlite libsqlite3-sys native-tls; do assert_has "$$combined" "$$crate" combined; done; \
-	for crate in sqlx sqlx-postgres native-tls; do assert_has "$$default" "$$crate" default; done; \
-	for crate in sqlx-sqlite libsqlite3-sys; do assert_lacks "$$default" "$$crate" default; done
+	for crate in sqlx sqlx-core sqlx-postgres native-tls sqlx-sqlite libsqlite3-sys; do assert_lacks "$$default" "$$crate" default; done
 	@# Lint each opt-in group on its own so a gate leak in a partial feature set
 	@# cannot hide behind the lean and full builds that other targets cover.
-	@for group in openai-responses openai-file-resolve-filter store store-postgres store-postgres-cert-auth store-sqlite \
+	@for group in openai-responses openai-agentic-loop openai-file-resolve-filter store store-postgres store-postgres-cert-auth store-sqlite \
 		openai-conversations openai-compact openai-mcp-tools; do \
 		echo "clippy: standard + $$group"; \
 		cargo clippy -p praxis-ai-apis -p praxis-ai-filters -p praxis-ai-proxy --all-targets \
@@ -166,56 +192,70 @@ test-store-features:
 		echo "ERROR: full proxy dependency graph contains libsqlite3-sys"; \
 		exit 1; \
 	fi
-	@cargo tree -p praxis-ai-proxy --features full --edges features -i sqlx-core | grep -q '_tls-native-tls' || \
-		(echo "ERROR: full proxy SQLx graph does not enable native TLS"; exit 1)
-	@if cargo tree -p praxis-ai-proxy --features full --edges features -i sqlx-core | grep -q '_tls-rustls'; then \
-		echo "ERROR: full proxy SQLx graph contains a rustls TLS backend"; \
+	@cargo tree -p praxis-ai-proxy --features $(STORE_POSTGRES_FEATURES) --edges features -i sqlx-core | grep -q '_tls-native-tls' || \
+		(echo "ERROR: PostgreSQL proxy SQLx graph does not enable native TLS"; exit 1)
+	@if cargo tree -p praxis-ai-proxy --features $(STORE_POSTGRES_FEATURES) --edges features -i sqlx-core | grep -q '_tls-rustls'; then \
+		echo "ERROR: PostgreSQL proxy SQLx graph contains a rustls TLS backend"; \
 		exit 1; \
 	fi
 
-test-feature-isolation:
-	@for group in openai-file-resolve-filter openai-mcp-tools; do \
+# Exercise the independent gates and the Responses-only SDK path without vLLM.
+test-responses-features:
+	@set -eu; \
+	for group in full experimental; do \
+		graph="$$(cargo tree -p praxis-ai-proxy --no-default-features --features $$group --edges normal --prefix none --format '{p} {f}')"; \
+		if printf '%s\n' "$$graph" | grep -Eq '^praxis-ai-(apis|filters|proxy) .*openai-(responses|agentic-loop)'; then \
+			echo "ERROR: $$group enables experimental Responses or agentic code"; exit 1; \
+		fi; \
+	done
+	@for group in full experimental openai-responses openai-agentic-loop; do \
+		cargo test -p praxis-ai-filters --no-default-features --features full,$$group register::tests || exit 1; \
+	done
+	cargo build -p praxis-ai-proxy --features openai-responses
+	PRAXIS_AI_BIN=$(abspath $(or $(CARGO_TARGET_DIR),target)/debug/praxis-ai) PRAXIS_TEST_RESPONSES_ONLY=1 \
+		uv run tests/integration/sdk/openai/test_openai_conversations.py \
+		-k 'passthrough_chain_forwards_create or agentic_loop_requires_separate_feature'
+
+test-feature-isolation: test-responses-features
+	@for group in openai-responses openai-agentic-loop openai-file-resolve-filter openai-mcp-tools; do \
 		echo "check: $$group"; \
 		cargo check -p praxis-ai-proxy --features $$group || exit 1; \
 	done
-	@for group in azure-ad-filter gcp-adc-filter; do \
+	@for group in azure-ad-filter gcp-adc-filter vertex-anthropic-filter; do \
 		echo "check: $$group"; \
 		cargo check -p praxis-ai-proxy --features $$group || exit 1; \
 	done
 
 test-schema:
-	cargo test -p praxis-tests-schema --features store-all $(_NOCAPTURE)
+	cargo test -p praxis-tests-schema --features openai-all,store-all $(_NOCAPTURE)
 
 # The suite's subprocess tests need the praxis-ai binary prebuilt and named:
 # the harness refuses to build it from inside a test (see praxis_ai_bin in
 # tests/utils), because a nested cargo build inherits the outer run's
 # instrumentation and target-dir locks and can run for minutes.
 test-integration:
-	cargo build -p praxis-ai-proxy --bin praxis-ai
-	PRAXIS_AI_BIN=$(abspath target/debug/praxis-ai) \
-	cargo test -p praxis-tests-integration --features store-all $(_NOCAPTURE)
-	cargo build -p praxis-ai-proxy --bin praxis-ai --features $(INTEGRATION_EXPERIMENTAL_FEATURES)
-	PRAXIS_AI_BIN=$(abspath target/debug/praxis-ai) \
-	cargo test -p praxis-tests-integration --features store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
-		-- examples::azure_ad examples::gcp_adc examples::lakera_guard examples::token_rate_limit examples::token_ceiling \
+	cargo build -p praxis-ai-proxy --bin praxis-ai --features openai-all,store-all
+	PRAXIS_AI_BIN=$(abspath $(or $(CARGO_TARGET_DIR),target)/debug/praxis-ai) \
+	cargo test -p praxis-tests-integration --features openai-all,store-all $(_NOCAPTURE)
+	cargo build -p praxis-ai-proxy --bin praxis-ai --features openai-all,store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES)
+	PRAXIS_AI_BIN=$(abspath $(or $(CARGO_TARGET_DIR),target)/debug/praxis-ai) \
+	cargo test -p praxis-tests-integration --features openai-all,store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
+		-- examples::azure_ad examples::gcp_adc examples::lakera_guard examples::token_rate_limit examples::token_ceiling examples::inflight_tracking \
+		examples::vertex_anthropic \
 		$(if $(V),--nocapture)
 
 test-inference-fixtures:
-	cargo test -p praxis-test-utils --features store-all $(_NOCAPTURE)
-	cargo test -p xtask --features store-all inference_fixtures $(_NOCAPTURE)
-	cargo test -p praxis-tests-integration --features store-all --test suite inference_fixtures $(_NOCAPTURE)
+	cargo test -p praxis-test-utils --features openai-all,store-all,vertex-anthropic-filter $(_NOCAPTURE)
+	cargo test -p xtask --features openai-all,store-all inference_fixtures $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --features openai-all,store-all,vertex-anthropic-filter --test suite inference_fixtures $(_NOCAPTURE)
 
-# Both filters are needed. libtest matches each as a substring, and
-# `store::tests::pg_` is not a substring of
-# `store::tests::postgres_passes_shared_ownership_contract` (the character
-# after `pg` is `o`), so that test was never selected by this target and
-# never ran in CI. The file uses both naming conventions, so list both
-# prefixes; libtest ORs every filter that follows `--`, same as the
-# integration target below. When adding a PostgreSQL test, check it against
-# this list, because a missed prefix drops it silently.
+# Every ignored test in praxis-ai-apis is a PostgreSQL store contract, so
+# --ignored alone selects them all: no name filter can drop one silently.
+# Backend history regressions run the same way with only PostgreSQL enabled.
 test-postgres-unit:
-	cargo test -p praxis-ai-apis --no-default-features --features store-all -- --ignored \
-		store::tests::pg_ store::tests::postgres_ $(if $(V),--nocapture)
+	cargo test -p praxis-ai-apis --no-default-features --features openai-all,store-all -- --ignored $(if $(V),--nocapture)
+	cargo test -p praxis-ai-store-backends --no-default-features --features postgres \
+		-- --ignored $(if $(V),--nocapture)
 
 # Every PostgreSQL integration test is #[ignore]d (each spawns its own
 # container), so it runs only when named here. Enumerate every module explicitly:
@@ -229,6 +269,21 @@ test-postgres-integration:
 		openai_responses_store_postgres \
 		openai_responses_store_postgres_mtls \
 		openai_conversations_postgres_mtls $(if $(V),--nocapture)
+
+test-token-rate-limit-sentinel-integration:
+	@test -n "$(SENTINEL_IMAGE)" || { echo "SENTINEL_IMAGE must be an immutable @sha256 image reference" >&2; exit 2; }
+	@env \
+		$(SENTINEL_DEAD_ENDPOINT_ENV) \
+		TOKEN_RATE_LIMIT_SENTINEL_FAILOVER_BEFORE_COMMAND="$(SENTINEL_FAILOVER_BEFORE_COMMAND)" \
+		TOKEN_RATE_LIMIT_SENTINEL_REPLICATION_HEALTH_TEST="$(SENTINEL_REPLICATION_HEALTH_TEST)" \
+		TOKEN_RATE_LIMIT_SENTINEL_ON_FAILURE="$(SENTINEL_ON_FAILURE)" \
+		tests/integration/fixtures/token_rate_limit/start-sentinel-topology.sh \
+		--product "$(SENTINEL_PRODUCT)" --image "$(SENTINEL_IMAGE)" \
+		--env-file "$(SENTINEL_ENV_FILE)" -- \
+		sh -c 'cargo test -p praxis-ai-filters --features token-rate-limit-filter \
+			live_sentinel_ --lib -- --test-threads=1 $(if $(V),--nocapture) && \
+			cargo test -p praxis-tests-integration --features token-rate-limit-filter --test suite \
+			$(SENTINEL_TEST_FILTER) -- --ignored --test-threads=1 $(if $(V),--nocapture)'
 
 test-token-rate-limit-valkey-unit:
 	cargo test -p praxis-ai-filters --features token-rate-limit-filter valkey $(_NOCAPTURE)
@@ -270,21 +325,28 @@ lint: lint-clippy lint-xtask
 # Clippy across every feature permutation, plus the dependency budget, the
 # rustfmt check, and the unused-dependency scan. These are the rustc/clippy
 # steps; `cargo machete` is here because CI installs it only in this job.
-lint-clippy:
-	cargo clippy --workspace --all-targets -- -D warnings
-	cargo clippy --workspace --all-targets \
-		--features praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/basic-auth-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-ai-proxy/token-rate-limit-filter,praxis-ai-proxy/token-ceiling-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/basic-auth-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter,praxis-tests-integration/token-rate-limit-filter,praxis-tests-integration/token-ceiling-filter \
+lint-clippy: setup-lint-toolchains
+	$(LINT_CARGO) clippy --workspace --all-targets -- -D warnings
+	$(LINT_CARGO) clippy --workspace --all-targets \
+		--features $(STORE_ALL_WORKSPACE_FEATURES),xtask/openai-all,praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/basic-auth-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-ai-proxy/token-rate-limit-filter,praxis-ai-proxy/token-ceiling-filter,praxis-ai-proxy/inflight-tracker-filter,praxis-ai-proxy/vertex-anthropic-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/basic-auth-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter,praxis-tests-integration/token-rate-limit-filter,praxis-tests-integration/token-ceiling-filter,praxis-tests-integration/inflight-tracker-filter,praxis-tests-integration/vertex-anthropic-filter \
 		-- -D warnings
 	$(MAKE) lint-lean
 	$(MAKE) check-dep-budget
-	cargo +nightly fmt --all -- --check
-	cargo machete --with-metadata .
+	$(LINT_FMT_CARGO) fmt --all -- --check
+	$(LINT_CARGO) machete --with-metadata .
+
+# Match setup-rust-lint in CI: an old local nightly must not silently pass.
+# Refresh failures are fatal, rather than falling back to cached toolchains.
+setup-lint-toolchains:
+	@test -n "$(LINT_RUST_VERSION)" || { echo "ERROR: missing channel in rust-toolchain.toml" >&2; exit 1; }
+	rustup toolchain install $(LINT_RUST_VERSION) --profile minimal --component clippy --no-self-update
+	rustup toolchain install nightly --profile minimal --component rustfmt --allow-downgrade --no-self-update
 
 # xtask-driven meta lints (dep semver, separators, filter/example docs, markdown
 # links, README/registry/coverage sync checks) plus the FIPS dependency guard.
 # The first `cargo xtask` builds the full product tree once; grouping these
 # isolates that build from the clippy passes so the two halves run in parallel.
-lint-xtask:
+lint-xtask: lint-license-headers
 	cargo xtask lint-deps
 	$(MAKE) fips-deps
 	cargo xtask lint-separators
@@ -300,29 +362,42 @@ lint-xtask:
 	cargo xtask check-chat-completions-registry
 	cargo xtask check-files-registry
 	cargo xtask check-vector-stores-registry
+	cargo xtask check-anthropic-messages-registry
 	cargo xtask openresponses-coverage
+	cargo xtask translation-matrix
+
+# Rust sources in this workspace use Apache-2.0. Catch accidental MIT headers
+# before the xtask lints; git grep limits the check to tracked Rust source files.
+lint-license-headers:
+	@if git grep -n '^// SPDX-License-Identifier: MIT$$' -- '*.rs'; then \
+		echo "error: Rust source files must use the workspace Apache-2.0 SPDX header" >&2; \
+		exit 1; \
+	else \
+		status=$$?; \
+		if [ "$$status" -ne 1 ]; then exit "$$status"; fi; \
+	fi
 
 # Lint the product crates with only the default-on gates. `-p` without
 # `--workspace` keeps test-crate features from unifying in and hiding leaks.
 lint-lean:
-	cargo clippy -p praxis-ai-apis -p praxis-ai-filters -p praxis-ai-proxy --all-targets \
+	$(LINT_CARGO) clippy -p praxis-ai-apis -p praxis-ai-filters -p praxis-ai-proxy --all-targets \
 		--no-default-features --features praxis-ai-proxy/standard -- -D warnings
-	RUSTDOCFLAGS="-D warnings" cargo doc -p praxis-ai-apis -p praxis-ai-filters -p praxis-ai-proxy \
+	RUSTDOCFLAGS="-D warnings" $(LINT_CARGO) doc -p praxis-ai-apis -p praxis-ai-filters -p praxis-ai-proxy \
 		--no-deps --document-private-items --no-default-features --features praxis-ai-proxy/standard
 
 # Fail if a heavy crate enters the explicit lean proxy graph, or if that graph
 # grows past LEAN_GRAPH_BUDGET crates.
 check-dep-budget:
-	@tree="$$(cargo tree --locked -p praxis-ai-proxy -e normal,build --target all \
+	@tree="$$($(LINT_CARGO) tree --locked -p praxis-ai-proxy -e normal,build --target all \
 		--no-default-features --features standard --prefix none --format '{p}')" || { echo "ERROR: cargo tree failed"; exit 1; }; \
-	host="$$(cargo tree --locked -p praxis-ai-proxy -e normal,build \
+	host="$$($(LINT_CARGO) tree --locked -p praxis-ai-proxy -e normal,build \
 		--no-default-features --features standard --prefix none --format '{p}')" || { echo "ERROR: cargo tree failed"; exit 1; }; \
 	graph="$$(printf '%s\n' "$$tree" | awk '{print $$1"@"$$2}' | sort -u)"; \
 	status=0; \
 	for crate in $(LEAN_GRAPH_DENY); do \
 		if printf '%s\n' "$$graph" | grep -q "^$$crate@"; then \
 			echo "ERROR: $$crate is in the lean praxis-ai-proxy graph:"; \
-			cargo tree --locked -p praxis-ai-proxy -e normal,build --target all \
+			$(LINT_CARGO) tree --locked -p praxis-ai-proxy -e normal,build --target all \
 				--no-default-features --features standard -i "$$crate" | head -n 15; \
 			status=1; \
 		fi; \
@@ -333,8 +408,8 @@ check-dep-budget:
 	[ "$$count" -le $(LEAN_GRAPH_BUDGET) ] || { echo "ERROR: over budget"; status=1; }; \
 	exit $$status
 
-fmt:
-	cargo +nightly fmt --all
+fmt: setup-lint-toolchains
+	$(LINT_FMT_CARGO) fmt --all
 
 doc:
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
@@ -366,28 +441,13 @@ coverage-check:
 # FIPS
 # -------------------------------------------------------------------
 #
-# The published image (`full,store-sqlite`) enables every non-experimental
-# filter. The FIPS build turns off what is known not to be FIPS 140-3 compliant, so
-# nobody has to know which features to pick:
-#
-#   policy-engine        praxis-policy carries its own cryptography (sha2,
-#                        hmac, jsonwebtoken on aws-lc-rs)
-#   store, store-sqlite, store-postgres, openai-conversations, openai-compact
-#                        the general-purpose SQLx profile carries migration,
-#                        advisory-lock, and password-authentication crypto;
-#                        FIPS selects store-postgres-cert-auth instead
-#   openai-mcp-tools     depends on store functionality not included in the
-#                        current FIPS profile
-#   azure-ad-filter, gcp-adc-filter
-#                        experimental; off for the same reasons they are off
-#                        in the standard build
-#
-# The remaining non-experimental groups compile cleanly: openai-responses
-# (the Responses kernel, no crates), openai-file-resolve-filter (migrated
-# to SubRequestClient, no reqwest/aws-lc-rs), and aws-sigv4-filter (signs
-# through system OpenSSL), and store-postgres-cert-auth (certificate-only
-# PostgreSQL storage). FIPS_FEATURES is the single place this is defined;
-# Containerfile.fips (CARGO_FEATURES) mirrors it and must be kept in sync.
+# Both published images leave experimental Responses and agentic loops out.
+# The default FIPS profile also excludes the policy engine's non-OpenSSL crypto.
+# Certificate-authenticated PostgreSQL and Responses remain explicit opt-ins:
+#   make release-fips FIPS_FEATURES=aws-sigv4-filter,openai-responses,openai-file-resolve-filter,store-postgres-cert-auth
+# General SQLx password authentication, SQLite, compaction, Conversations and
+# MCP dependencies have not been cleared for the FIPS profile.
+# FIPS_FEATURES mirrors Containerfile.fips and xtask/src/fips.rs.
 #
 # The FIPS build goes to its own target directory so it never overwrites,
 # or is mistaken for, the standard build.
@@ -423,7 +483,7 @@ coverage-check:
 #
 # See docs/developing/fips.md and docs/developing/getting-started.md.
 
-FIPS_FEATURES           := openai-responses,openai-file-resolve-filter,aws-sigv4-filter,store-postgres-cert-auth
+FIPS_FEATURES           ?= aws-sigv4-filter
 # The same list qualified for a multi-package cargo invocation.
 _COMMA                  := ,
 FIPS_FEATURES_QUALIFIED := $(subst $(_COMMA),$(_COMMA)praxis-ai-proxy/,praxis-ai-proxy/$(FIPS_FEATURES))
@@ -577,7 +637,7 @@ test-schema-fips:
 # The certificate-authenticated PostgreSQL boundary on the actual FIPS host.
 # This runs outside the toolchain container because the test starts a sibling
 # PostgreSQL container through the host's rootless podman. It still resolves
-# exactly the shipped FIPS feature set, fails closed unless the host and
+# the explicit experimental certificate-auth profile, fails closed unless the host and
 # provider report FIPS mode, and exercises a write/read round trip with a
 # password-less URL against a server whose only TCP rule is `hostssl ... cert`.
 # A second peer selects SCRAM and must receive the fork's explicit
@@ -585,7 +645,7 @@ test-schema-fips:
 test-postgres-fips-host: | require-podman
 	PRAXIS_FIPS_HOST=1 PRAXIS_REQUIRE_FIPS=1 PRAXIS_TEST_FIPS_PROVIDER=1 \
 	cargo test --target-dir $(FIPS_TARGET_DIR) -p praxis-tests-integration \
-		--no-default-features --features $(FIPS_FEATURES) \
+		--no-default-features --features $(FIPS_FEATURES),store-postgres-cert-auth \
 		--test suite -- --ignored openai_response_store_postgres_mtls $(if $(V),--nocapture)
 
 # The same unit tests with the RHEL FIPS provider active in every test
@@ -841,13 +901,16 @@ help:
 	@echo "  test                 run all tests"
 	@echo "  test-unit            unit tests (providers, filters, server)"
 	@echo "  test-store-features   check the lean and store builds and lint each feature group alone"
+	@echo "  test-responses-features  independent experimental gates and Responses-only SDK smoke tests"
 	@echo "  test-schema          schema validation tests"
 	@echo "  test-integration     integration tests"
 	@echo "  test-inference-fixtures  inference fixture and replay tests"
+	@echo "  bench-model-to-provider  optimized mapped and fallback request-body timings"
 	@echo "  test-postgres-unit       postgres store unit tests (needs DATABASE_URL)"
 	@echo "  test-postgres-integration postgres store integration tests (needs container engine)"
 	@echo "  test-token-rate-limit-valkey-unit        token_rate_limit Valkey unit tests (needs TOKEN_RATE_LIMIT_VALKEY_URL)"
 	@echo "  test-token-rate-limit-valkey-integration token_rate_limit Valkey integration test (needs TOKEN_RATE_LIMIT_VALKEY_URL)"
+	@echo "  test-token-rate-limit-sentinel-integration Sentinel fixture smoke (needs SENTINEL_IMAGE; failover with SENTINEL_FAILOVER_BEFORE_COMMAND=1)"
 	@echo "  test-environment     llm-d ext_proc environment tests"
 	@echo "  openai-conformance   compare registered API areas with OpenAI's OpenAPI spec"
 	@echo "  check-openai-conformance-reference  verify the pinned complete OpenAI reference"
@@ -855,8 +918,10 @@ help:
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint                 clippy + rustfmt + dependency, docs, and example checks"
-	@echo "  lint-clippy          clippy (all feature sets) + rustfmt + dep budget + machete"
+		@echo "  lint-clippy          clippy (all feature sets) + rustfmt + dep budget + machete"
+		@echo "  setup-lint-toolchains refresh stable Clippy and nightly rustfmt to match CI"
 	@echo "  lint-xtask           xtask meta lints (docs, registries, coverage) + FIPS dep guard"
+	@echo "  lint-license-headers reject incorrect MIT SPDX headers in Rust sources"
 	@echo "  fmt                  format with nightly rustfmt"
 	@echo "  doc                  rustdoc with warnings"
 	@echo "  audit                cargo audit + cargo deny"

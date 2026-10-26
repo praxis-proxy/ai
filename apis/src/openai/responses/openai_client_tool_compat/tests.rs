@@ -9,7 +9,10 @@ use praxis_filter::body::MAX_JSON_BODY_BYTES;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::test_utils::{make_filter_context, make_request};
+use crate::{
+    openai::responses::agentic_loop::budget::SimpleBudget,
+    test_utils::{make_filter_context, make_request},
+};
 
 // -----------------------------------------------------------------------------
 // Test helpers
@@ -1095,6 +1098,115 @@ fn plain_function_call_history_item_is_unchanged() {
         "a plain function_call is not rewritten"
     );
     assert_eq!(item["name"], "f");
+}
+
+#[test]
+fn history_item_is_lowered_matches_the_lowering_pass() {
+    let no_ids = HashSet::new();
+    // Only entries `lower_history_items` rewrites count toward the lowering reserve.
+    assert!(history_item_is_lowered(&json!({"type": "custom_tool_call"}), &no_ids));
+    assert!(history_item_is_lowered(
+        &json!({"type": "custom_tool_call_output"}),
+        &no_ids
+    ));
+    assert!(
+        history_item_is_lowered(
+            &json!({"type": "function_call", "namespace": "ns", "name": "m"}),
+            &no_ids,
+        ),
+        "a namespaced function_call is flattened, so it is charged"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "function_call", "name": "f"}), &no_ids),
+        "a plain function_call is never lowered, so it is not charged"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "function_call", "namespace": "", "name": "f"}), &no_ids,),
+        "an empty namespace is not a namespaced call"
+    );
+    assert!(
+        history_item_is_lowered(
+            &json!({"type": "shell_call", "call_id": "c1", "action": {"type": "exec"}, "environment": {"type": "local"}}),
+            &no_ids,
+        ),
+        "a client-executed shell_call is lowered"
+    );
+    assert!(
+        !history_item_is_lowered(
+            &json!({"type": "shell_call", "call_id": "c2", "action": {"type": "exec"}}),
+            &no_ids,
+        ),
+        "a container/server shell_call is left untouched"
+    );
+    let lowered = lowered_ids(&["c1"]);
+    assert!(
+        history_item_is_lowered(&json!({"type": "shell_call_output", "call_id": "c1"}), &lowered),
+        "an output whose call was lowered is charged"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "shell_call_output", "call_id": "c2"}), &lowered),
+        "an output whose call was not lowered is left untouched"
+    );
+    assert!(
+        history_item_is_lowered(
+            &json!({"type": "tool_search_call", "call_id": "t1", "execution": "client"}),
+            &no_ids,
+        ),
+        "a client-executed tool_search_call is lowered"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "tool_search_call", "call_id": "t2"}), &no_ids),
+        "a tool_search_call without client execution is left untouched"
+    );
+    assert!(
+        !history_item_is_lowered(
+            &json!({"type": "tool_search_call", "call_id": "t3", "execution": "server"}),
+            &no_ids,
+        ),
+        "a server-executed tool_search_call is left untouched"
+    );
+    let lowered_search = lowered_ids(&["t1"]);
+    assert!(
+        history_item_is_lowered(&json!({"type": "tool_search_output", "call_id": "t1"}), &lowered_search),
+        "a tool_search_output whose call was lowered is charged"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "tool_search_output", "call_id": "t2"}), &lowered_search),
+        "a tool_search_output whose call was not lowered is left untouched"
+    );
+}
+
+#[test]
+fn budgeted_plain_function_history_reserves_no_lowering() {
+    // A budgeted request whose only tools are plain `function` tools and whose
+    // history holds only plain (non-namespaced) `function_call` items reserves
+    // nothing: the lowering pass rewrites none of them, so there is no owned
+    // lowered copy to charge. With the previous predicate every `function_call`
+    // was charged and this request would 413 against a saturated budget.
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m",
+        "input": "hi",
+        "tools": [{"type": "function", "name": "f", "parameters": {"type": "object"}}],
+    }));
+    state.messages = (0..64)
+        .map(|i| json!({"type": "function_call", "call_id": format!("call_{i}"), "name": "f", "arguments": "{}"}))
+        .collect();
+    // Saturate the budget so any lowering reservation at all would fail.
+    let mut budget = SimpleBudget::new(4_096, 0).unwrap();
+    let spare = budget.remaining_bytes().unwrap();
+    assert!(budget.reserve_additional_input(spare), "saturate the budget");
+    assert_eq!(budget.remaining_bytes(), Some(0), "no headroom remains");
+    state.simple_budget = Some(budget);
+
+    assert!(
+        reserve_client_tool_lowering(&mut state),
+        "plain function tools and plain function_call history must proceed without a lowering reserve"
+    );
+    assert_eq!(
+        state.simple_budget.unwrap().remaining_bytes(),
+        Some(0),
+        "no lowering reservation may be charged when nothing is lowered"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -5853,6 +5965,163 @@ async fn lowering_arms_response_buffer_and_strips_accept_encoding() {
         ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING),
         "Accept-Encoding is stripped so a compliant backend returns plaintext JSON",
     );
+}
+
+#[tokio::test]
+async fn budgeted_client_tool_lowering_rejects_before_mutating_request() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "store": false,
+        "tools": [{"type":"custom","name":"run_python","description":"Run Python"}]
+    }));
+    let original = state.request_body.clone();
+    state.simple_budget = SimpleBudget::new_with_store(4_096, 100, false);
+    ctx.extensions.insert(state);
+
+    let action = filter().on_request_body(&mut ctx, &mut None, true).await.unwrap();
+
+    let (status, message) = reject_parts(&action);
+    assert_eq!(status, 413);
+    assert!(message.contains("limit set by the platform administrator"));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.request_body, original);
+    assert!(state.client_tool_echo.is_none());
+}
+
+#[tokio::test]
+async fn budgeted_client_tool_lowering_arms_bounded_restoration() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(
+        AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 1048576").unwrap()).unwrap(),
+    );
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "store": false,
+        "tools": [{"type":"custom","name":"run_python","description":"Run Python"}]
+    }));
+    state.simple_budget = SimpleBudget::new_with_store(1_048_576, 2_000, false);
+    ctx.extensions.insert(state);
+
+    let action = filter().on_request_body(&mut ctx, &mut None, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .client_tool_echo
+            .is_some()
+    );
+    assert_eq!(
+        ctx.response_body_mode,
+        BodyMode::StreamBuffer {
+            max_bytes: Some(131_072)
+        }
+    );
+}
+
+#[test]
+fn budgeted_discovered_namespace_fanout_rejects_before_lowering() {
+    let members: Vec<Value> = (0..512)
+        .map(|index| json!({"type":"function", "name":format!("member_{index}")}))
+        .collect();
+    let discovered = json!([{
+        "type":"namespace", "name":"group", "description":"x".repeat(65_536), "tools":members
+    }]);
+    let mut state = state_with_discovered_tools(&discovered, false);
+    let original = state.request_body.clone();
+    state.simple_budget = SimpleBudget::new_with_store(67_108_864, 100, false);
+
+    assert!(!reserve_client_tool_lowering(&mut state));
+    assert_eq!(state.request_body, original);
+    assert!(state.client_tool_echo.is_none());
+}
+
+#[test]
+fn budgeted_restoration_accounts_repeated_namespace_names() {
+    let namespace = "n".repeat(32_768);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model":"m", "store":false, "input":"hi",
+        "tools":[{"type":"namespace", "name":namespace, "description":"group",
+            "tools":[{"type":"function", "name":"member"}]}]
+    }));
+    state.simple_budget = SimpleBudget::new_with_store(16_777_216, 100, false);
+    assert!(reserve_client_tool_lowering(&mut state));
+    filter().lower_request(&mut state, false, false).unwrap();
+    let lowered = namespace_member_name(&namespace, "member");
+    let output: Vec<Value> = (0..128)
+        .map(|index| {
+            json!({
+                "type":"function_call", "id":format!("fc_{index}"),
+                "call_id":format!("call_{index}"), "name":lowered, "arguments":"{}"
+            })
+        })
+        .collect();
+    let response = serde_json::to_vec(&json!({"object":"response", "output":output})).unwrap();
+
+    assert!(!reserve_client_tool_restoration(&mut state, &response));
+}
+
+#[test]
+fn budgeted_restoration_accounts_embedded_arguments_json() {
+    let mut state = ResponsesState::from_request_body(json!({"tools":[{"type":"tool_search"}]}));
+    filter().lower_request(&mut state, false, false).unwrap();
+    state.simple_budget = SimpleBudget::new_with_store(8_388_608, 100, false);
+    let deep = format!("{}0{}", "[".repeat(110), "]".repeat(110));
+    let arguments = format!("{{\"query\":[{}]}}", vec![deep; 180].join(","));
+    let response = serde_json::to_vec(&json!({
+        "object":"response", "output":[{
+            "type":"function_call", "id":"fc_1", "call_id":"call_1",
+            "name":"tool_search", "arguments":arguments
+        }]
+    }))
+    .unwrap();
+
+    assert!(!reserve_client_tool_restoration(&mut state, &response));
+}
+
+#[test]
+fn budgeted_client_tool_restoration_rejects_before_parsing_response() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "store": false,
+        "tools": [{"type":"custom","name":"run_python"}]
+    }));
+    filter().lower_request(&mut state, false, false).unwrap();
+    state.simple_budget = SimpleBudget::new_with_store(65_536, 2_000, false);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(vec![b'x'; 5_000]));
+
+    let action = filter().on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    let (status, message) = reject_parts(&action);
+    assert_eq!(status, 502);
+    assert!(message.contains("limit set by the platform administrator"));
+    assert!(body.is_none());
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn budgeted_client_tool_restoration_preserves_typed_output_when_in_budget() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = state_with_custom_lowered();
+    state.simple_budget = SimpleBudget::new_with_store(1_048_576, 2_000, false);
+    ctx.extensions.insert(state);
+    let response = json!({
+        "object": "response",
+        "output": [{"type":"function_call","id":"fc_1","call_id":"call_1","name":"run_python","arguments":"{\"input\":\"print(1)\"}"}]
+    });
+    let mut body = Some(Bytes::from(response.to_string()));
+
+    let action = filter().on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let restored: Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(restored["output"][0]["type"], "custom_tool_call");
+    assert_eq!(restored["tools"][0]["type"], "custom");
 }
 
 #[tokio::test]

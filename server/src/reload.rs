@@ -52,6 +52,7 @@ pub(crate) fn reload_pipelines(
     live: &ListenerPipelines,
     health_shutdown: &Arc<Mutex<CancellationToken>>,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
+    inflight_registry: &praxis_ai_filters::InFlightRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
     store_reload: &crate::StoreReloadHandle,
     health_slot: &crate::SharedHealthRegistry,
@@ -87,6 +88,7 @@ pub(crate) fn reload_pipelines(
             registry,
             &health_registry,
             kv_stores,
+            inflight_registry,
             &updated_client,
             &validation_registries,
         )?;
@@ -103,6 +105,7 @@ pub(crate) fn reload_pipelines(
         registry,
         &health_registry,
         kv_stores,
+        inflight_registry,
         &updated_client,
         prepared_stores
             .as_ref()
@@ -114,11 +117,19 @@ pub(crate) fn reload_pipelines(
         registry,
         &health_registry,
         kv_stores,
+        inflight_registry,
         &updated_client,
         &crate::StoreRegistries::default(),
     );
     #[cfg(not(feature = "store"))]
-    let build = crate::pipelines::resolve_pipelines(new_config, registry, &health_registry, kv_stores, &updated_client);
+    let build = crate::pipelines::resolve_pipelines(
+        new_config,
+        registry,
+        &health_registry,
+        kv_stores,
+        inflight_registry,
+        &updated_client,
+    );
     let new_pipelines = match build {
         Ok(p) => p,
         Err(e) => {
@@ -507,6 +518,7 @@ mod tests {
             &live,
             &shutdown,
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
             &crate::StoreReloadHandle::default(),
             &crate::SharedHealthRegistry::default(),
@@ -543,6 +555,7 @@ filter_chains:
             &live,
             &shutdown,
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
             &crate::StoreReloadHandle::default(),
             &crate::SharedHealthRegistry::default(),
@@ -561,8 +574,16 @@ filter_chains:
         let registry = crate::build_full_registry(&client);
         let health_registry: HealthRegistry = Arc::new(HashMap::new());
         let kv_stores = empty_kv_stores();
-        let live = resolve_pipelines(&old_config, &registry, &health_registry, &kv_stores, &client)
-            .expect("initial pipelines");
+        let inflight_registry = empty_inflight_registry();
+        let live = resolve_pipelines(
+            &old_config,
+            &registry,
+            &health_registry,
+            &kv_stores,
+            &inflight_registry,
+            &client,
+        )
+        .expect("initial pipelines");
         let temp = tempfile::tempdir().expect("tempdir");
         let outside = temp.path().join("outside.db");
         let database_url = format!("sqlite://{}/allowed/../outside.db?mode=rwc", temp.path().display());
@@ -591,6 +612,7 @@ filter_chains:
             &live,
             &Arc::new(Mutex::new(CancellationToken::new())),
             &kv_stores,
+            &inflight_registry,
             &client,
             &crate::StoreReloadHandle::default(),
             &crate::SharedHealthRegistry::default(),
@@ -619,6 +641,7 @@ filter_chains:
             &live,
             &shutdown,
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
             &crate::StoreReloadHandle::default(),
             &crate::SharedHealthRegistry::default(),
@@ -644,6 +667,7 @@ filter_chains:
             &live,
             &shutdown,
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
             &crate::StoreReloadHandle::default(),
             &crate::SharedHealthRegistry::default(),
@@ -684,6 +708,7 @@ filter_chains:
             &live,
             &shutdown,
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
             &crate::StoreReloadHandle::default(),
             &crate::SharedHealthRegistry::default(),
@@ -723,6 +748,7 @@ filter_chains:
             &live,
             &shutdown,
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
             &crate::StoreReloadHandle::default(),
             &crate::SharedHealthRegistry::default(),
@@ -1002,8 +1028,15 @@ filter_chains:
         let config = valid_config();
         let registry = FilterRegistry::with_builtins();
         let health_registry: HealthRegistry = Arc::new(HashMap::new());
-        let pipelines =
-            resolve_pipelines(&config, &registry, &health_registry, &empty_kv_stores(), &test_client()).unwrap();
+        let pipelines = resolve_pipelines(
+            &config,
+            &registry,
+            &health_registry,
+            &empty_kv_stores(),
+            &empty_inflight_registry(),
+            &test_client(),
+        )
+        .unwrap();
         let shutdown = Arc::new(Mutex::new(CancellationToken::new()));
         (pipelines, config, registry, shutdown)
     }
@@ -1011,6 +1044,11 @@ filter_chains:
     /// Empty KV store registry for tests without KV stores.
     fn empty_kv_stores() -> praxis_core::kv::KvStoreRegistry {
         praxis_core::kv::KvStoreRegistry::new()
+    }
+
+    /// Throwaway in-flight registry for tests that don't exercise it.
+    fn empty_inflight_registry() -> praxis_ai_filters::InFlightRegistry {
+        praxis_ai_filters::InFlightRegistry::new()
     }
 
     /// Minimal sub-request client for tests. The connector builds a rustls

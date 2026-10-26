@@ -47,6 +47,8 @@ pub(crate) mod file_search_dispatch;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod history;
 #[cfg(feature = "openai-mcp-tools")]
+pub(crate) mod mcp_admission;
+#[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_classify;
 #[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_dispatch;
@@ -78,7 +80,89 @@ pub(crate) mod tool_parse;
 pub(crate) mod usage;
 
 #[cfg(feature = "openai-responses")]
+pub use agentic_loop::AgenticBudgetPolicy;
+#[cfg(feature = "openai-agentic-loop")]
 pub use agentic_loop::AgenticLoopFilter;
+
+/// Preflight a budgeted Responses body before the first JSON parser allocates.
+/// The same listener policy applies to every reachable loop instance.
+#[cfg(feature = "openai-responses")]
+pub(crate) fn initial_agentic_budget_rejection(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option<FilterAction> {
+    let policy = ctx.extensions.get::<AgenticBudgetPolicy>()?;
+    if !(is_responses_create(&ctx.request.method, ctx.request.uri.path())
+        || (ctx.request.method == http::Method::POST
+            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"))
+    {
+        return None;
+    }
+    let admitted =
+        agentic_loop::budget::input_charge(bytes).is_some_and(|charge| charge <= policy.max_retained_bytes());
+    (!admitted).then(|| {
+        FilterAction::Reject(error::responses_error_rejection(
+            413,
+            "invalid_request_error",
+            "Request body exceeds a processing limit set by the platform administrator.",
+        ))
+    })
+}
+
+/// Initialize request-wide accounting for a classified Responses create.
+#[cfg(feature = "openai-responses")]
+pub(crate) fn plain_agentic_budget(
+    ctx: &HttpFilterContext<'_>,
+    parsed: &serde_json::Value,
+    bytes: &[u8],
+) -> Result<Option<agentic_loop::budget::SimpleBudget>, FilterAction> {
+    let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() else {
+        return Ok(None);
+    };
+    let Some(object) = parsed.as_object() else {
+        return Err(FilterAction::Reject(error::responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "a budgeted Responses request must be a JSON object",
+        )));
+    };
+    let charge = agentic_loop::budget::input_charge(bytes).unwrap_or(usize::MAX);
+    let will_store = object.get("store") != Some(&serde_json::Value::Bool(false));
+    let budget = agentic_loop::budget::SimpleBudget::new_with_store(policy.max_retained_bytes(), charge, will_store);
+    budget.map(Some).ok_or_else(|| {
+        FilterAction::Reject(error::responses_error_rejection(
+            413,
+            "invalid_request_error",
+            "Request body exceeds a processing limit set by the platform administrator.",
+        ))
+    })
+}
+
+/// Recognize requests whose file resolver can skip a second JSON projection.
+#[cfg(feature = "openai-file-resolve-filter")]
+fn text_only_input(input: Option<&serde_json::Value>) -> bool {
+    let Some(input) = input else {
+        return false;
+    };
+    match input {
+        serde_json::Value::String(_) => true,
+        serde_json::Value::Array(items) => items.iter().all(|item| {
+            let Some(message) = item.as_object() else {
+                return false;
+            };
+            if message.get("type").is_some_and(|kind| kind != "message") {
+                return false;
+            }
+            match message.get("content") {
+                Some(serde_json::Value::String(_)) => true,
+                Some(serde_json::Value::Array(parts)) => parts.iter().all(|part| {
+                    part.get("type").and_then(serde_json::Value::as_str) == Some("input_text")
+                        && part.get("text").is_some_and(serde_json::Value::is_string)
+                }),
+                _ => false,
+            }
+        }),
+        _ => false,
+    }
+}
+
 #[cfg(feature = "openai-responses")]
 pub use doc_extract::DocExtractFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
@@ -129,7 +213,7 @@ use tracing::trace;
 use self::config::ResponsesClassificationConfig;
 #[cfg(feature = "openai-responses")]
 use crate::{
-    classifier::{AiRequestFormat, ClassifiedRequest},
+    classifier::{AiRequestFormat, ClassifiedRequest, is_responses_create},
     promotion::is_promotable_value,
 };
 
@@ -158,7 +242,7 @@ pub(crate) fn bound_body_outcome(action: FilterAction) -> Result<BoundUpstreamBo
 const AGENTIC_STREAM_GUARD_KEY: &str = "responses.agentic_stream_guard";
 
 /// Arm the agentic streaming safety check for the current IRR round.
-#[cfg(feature = "openai-responses")]
+#[cfg(feature = "openai-agentic-loop")]
 pub(crate) fn arm_agentic_stream_guard(ctx: &mut HttpFilterContext<'_>) {
     ctx.set_metadata(AGENTIC_STREAM_GUARD_KEY, "true");
 }
@@ -632,17 +716,48 @@ fn promote_boolean_results(
     Ok(())
 }
 
+/// Whether a stored item replays verbatim as canonical `OpenResponses` input.
+///
+/// Hosted-tool output items (for example `web_search_call`) remain available in
+/// persisted history, but `OpenResponses` backends do not accept them in a
+/// subsequent request, so they are excluded.
+///
+/// Client-owned typed tool items (`custom_tool_call`/`custom_tool_call_output`)
+/// are preserved even though a function-only `OpenResponses` backend does not
+/// accept them raw: when a client-tool-compatibility adapter is configured it
+/// lowers them to `function_call`/`function_call_output` before they reach the
+/// backend, and dropping them during replay would silently lose prior client-tool
+/// execution context on stored continuations (#1764). Only items the configured
+/// adapter can lower are kept.
+///
+/// This is the single source of truth for both replay paths: the rehydrate
+/// shared fast path ([`rehydrate::replay_messages_from_stored`]) and the owning
+/// [`canonical_openresponses_replay_item`]. Keeping both behind this predicate
+/// prevents the two lists from drifting out of sync.
+#[cfg(feature = "store")]
+pub(crate) fn is_canonical_openresponses_replay_type(item: &serde_json::Value) -> bool {
+    matches!(
+        item.get("type").and_then(serde_json::Value::as_str),
+        Some(
+            "item_reference"
+                | "reasoning"
+                | "compaction"
+                | "message"
+                | "function_call"
+                | "function_call_output"
+                | "custom_tool_call"
+                | "custom_tool_call_output"
+        )
+    )
+}
+
 /// Return an item that can be sent back as canonical `OpenResponses` input.
 ///
-/// Hosted-tool output items remain available in persisted history, but
-/// `OpenResponses` backends do not accept them in a subsequent request. Old
-/// stored rows without the defaulted `type` field are normalized.
+/// Items whose type is [`is_canonical_openresponses_replay_type`] replay
+/// verbatim; old stored rows without the defaulted `type` field are normalized.
 #[cfg(feature = "store")]
 pub(crate) fn canonical_openresponses_replay_item(item: &serde_json::Value) -> Option<serde_json::Value> {
-    if matches!(
-        item.get("type").and_then(serde_json::Value::as_str),
-        Some("item_reference" | "reasoning" | "compaction" | "message" | "function_call" | "function_call_output")
-    ) {
+    if is_canonical_openresponses_replay_type(item) {
         return Some(item.clone());
     }
     let object = item.as_object()?;
@@ -680,7 +795,7 @@ fn defaulted_openresponses_item_type(object: &serde_json::Map<String, serde_json
 // -----------------------------------------------------------------------------
 
 /// Only a successfully terminated stream may authorize external side effects.
-#[cfg(feature = "openai-responses")]
+#[cfg(all(feature = "openai-responses", any(test, feature = "openai-agentic-loop")))]
 pub(crate) fn streamed_round_is_dispatchable(ctx: &HttpFilterContext<'_>, state: &state::ResponsesState) -> bool {
     state.request_body.get("stream").and_then(serde_json::Value::as_bool) != Some(true)
         || (ctx.get_metadata("responses.stream_completion") == Some("terminal")

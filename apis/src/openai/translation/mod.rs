@@ -677,14 +677,14 @@ mod tests {
             assert_eq!(mapped["tools"][0]["function"]["name"], "web_search");
             assert_eq!(
                 mapped["tools"][0]["function"]["parameters"]["required"],
-                json!(["query"])
+                json!(["queries"])
             );
             assert_eq!(
-                mapped["tools"][0]["function"]["parameters"]["properties"]["query"]["minLength"],
+                mapped["tools"][0]["function"]["parameters"]["properties"]["queries"]["items"]["minLength"],
                 1
             );
             assert_eq!(
-                mapped["tools"][0]["function"]["parameters"]["properties"]["query"]["maxLength"],
+                mapped["tools"][0]["function"]["parameters"]["properties"]["queries"]["items"]["maxLength"],
                 4096
             );
             assert_eq!(
@@ -1544,7 +1544,7 @@ mod tests {
                 "id": "call_search_1",
                 "type": "web_search_call",
                 "status": "completed",
-                "action": {"type": "search", "query": "Praxis Proxy"}
+                "action": {"type": "search", "queries": ["Praxis Proxy"]}
             })
         );
         assert_eq!(mapped["tools"], request["tools"]);
@@ -1557,11 +1557,20 @@ mod tests {
             super::chat_completions::ResponseContext::from_responses_request(&request, "resp_ws".to_owned(), 0);
 
         let oversized = serde_json::to_string(&json!({"query": "x".repeat(4097)})).unwrap();
+        let oversized_queries = serde_json::to_string(&json!({"queries": ["x".repeat(4097)]})).unwrap();
+        let too_many_queries = serde_json::to_string(&json!({"queries": vec!["q".to_owned(); 65]})).unwrap();
+        let both_query_shapes = serde_json::to_string(&json!({"query": "ok", "queries": ["ok"]})).unwrap();
         let cases = [
             "{}",
             "{\"query\":\"\"}",
             "{\"query\":42}",
             "{\"query\":\"ok\",\"extra\":true}",
+            "{\"queries\":[]}",
+            "{\"queries\":[\"\"]}",
+            "{\"queries\":[42]}",
+            both_query_shapes.as_str(),
+            too_many_queries.as_str(),
+            oversized_queries.as_str(),
             "not json",
             oversized.as_str(),
         ];
@@ -1584,6 +1593,31 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn private_web_search_call_accepts_the_maximum_query_count() {
+        let arguments = serde_json::to_string(&json!({"queries": vec!["q".to_owned(); 64]})).unwrap();
+        let response = json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {"role": "assistant", "tool_calls": [{
+                    "id": "call_ws",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": arguments}
+                }]}
+            }]
+        });
+        let request = json!({"model": "m", "tools": [{"type": "web_search"}]});
+        let context =
+            super::chat_completions::ResponseContext::from_responses_request(&request, "resp_ws".to_owned(), 0);
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(
+            mapped["output"][0]["action"],
+            json!({"type": "search", "queries": vec!["q".to_owned(); 64]})
+        );
     }
 
     #[test]
@@ -2026,15 +2060,160 @@ mod tests {
     }
 
     #[test]
-    fn function_call_output_without_call_id_returns_error() {
+    fn function_call_output_without_call_id_becomes_user_text() {
+        for item in [
+            json!({"type": "function_call_output", "output": "done"}),
+            json!({"type": "function_call_output", "call_id": null, "output": "done"}),
+            json!({"type": "function_call_output", "output": [{"type": "input_text", "text": "done"}]}),
+        ] {
+            let mapped = map(&json!({"model": "m", "input": [item]}));
+            assert_eq!(
+                mapped["messages"],
+                json!([{"role": "user", "content": "done"}]),
+                "an uncorrelated output retains its text without inventing a Chat tool-call relationship"
+            );
+        }
+    }
+
+    #[test]
+    fn function_call_output_with_invalid_call_id_still_returns_error() {
         let error = map_error(&json!({
             "model": "m",
-            "input": [{"type": "function_call_output", "output": "done"}]
+            "input": [{"type": "function_call_output", "call_id": 42, "output": "done"}]
         }));
-
         assert_eq!(
-            error,
-            "Responses function_call_output input item is missing required field `call_id`"
+            error, "Responses function_call_output input item field `call_id` must be a string",
+            "only absent or null call IDs may be lowered to uncorrelated text"
+        );
+    }
+
+    #[test]
+    fn orphan_output_between_call_and_linked_output_follows_tool_result() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "output": "orphan result"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "linked result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "linked result"},
+                {"role": "user", "content": "orphan result"},
+            ]),
+            "an orphan between a call and its linked output must not split the tool answer from its call"
+        );
+    }
+
+    #[test]
+    fn message_between_call_and_output_follows_tool_result() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"role": "user", "content": "interlude"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "linked result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "linked result"},
+                {"role": "user", "content": "interlude"},
+            ]),
+            "a message between a call and its output must not split the tool answer from its call"
+        );
+    }
+
+    #[test]
+    fn orphan_outputs_between_call_and_output_keep_their_relative_order() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "output": "orphan one"},
+                {"type": "function_call_output", "output": "orphan two"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "linked result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "linked result"},
+                {"role": "user", "content": "orphan one"},
+                {"role": "user", "content": "orphan two"},
+            ]),
+            "multiple orphans deferred past a tool answer keep their input order"
+        );
+    }
+
+    #[test]
+    fn linked_output_after_a_later_call_block_stays_with_its_call() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "output": "orphan result"},
+                {"type": "function_call", "call_id": "call_2", "name": "search", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "first result"},
+                {"type": "function_call_output", "call_id": "call_2", "output": "second result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "first result"},
+                {"role": "user", "content": "orphan result"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_2", "content": "second result"},
+            ]),
+            "an answer that trails a later call block must still directly follow its own call"
         );
     }
 
@@ -3163,6 +3342,52 @@ mod tests {
         let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
 
         assert!(error.to_string().contains("choices must contain an object"));
+    }
+
+    #[test]
+    fn response_with_multiple_valid_choices_is_rejected() {
+        let request = json!({"model": "m", "input": "hello"});
+        let context = make_response_context(&request);
+        let response = json!({
+            "id": "chatcmpl-multi",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "choices": [
+                {"finish_reason": "stop", "index": 0, "message": {"role": "assistant", "content": "first"}},
+                {"finish_reason": "stop", "index": 1, "message": {"role": "assistant", "content": "second"}}
+            ]
+        });
+
+        let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
+
+        assert!(
+            error.to_string().contains("choices must contain exactly one choice"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn response_with_one_valid_and_one_invalid_choice_is_rejected() {
+        let request = json!({"model": "m", "input": "hello"});
+        let context = make_response_context(&request);
+        let response = json!({
+            "id": "chatcmpl-multi",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "choices": [
+                {"finish_reason": "stop", "index": 0, "message": {"role": "assistant", "content": "first"}},
+                {"finish_reason": null, "index": 1, "message": {"role": "assistant", "content": "second"}}
+            ]
+        });
+
+        let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
+
+        assert!(
+            error.to_string().contains("choices must contain exactly one choice"),
+            "{error}"
+        );
     }
 
     #[test]

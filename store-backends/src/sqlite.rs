@@ -14,10 +14,12 @@ use sqlx::{
 use tracing::info;
 
 use super::{
-    ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-    PoolConfig, ResponseEventRecord, ResponseRecord, ResponseStore, StoreError,
-    compression::{StoreCompressionConfig, decode, decode_bytes, run_blocking},
+    BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
+    PendingApprovalRecord, PoolConfig, ResponseEventRecord, ResponseRecord, ResponseStore, StoreError,
+    compression::{StoreCompressionConfig, decode, decode_bounded, decode_budgeted, decode_bytes, run_blocking},
+    json_payload_charge, json_values_charge, json_values_fit,
     pool::apply_pool_config,
+    retained_charge,
     schemas::{
         ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
         check_schema, ddl_error, events_table, expected_tables, generate_ddl, pending_approvals_table,
@@ -37,6 +39,8 @@ use super::{
 pub struct SqliteResponseStore {
     /// Connection pool.
     pool: SqlitePool,
+    #[cfg(test)]
+    history_read_probe: Option<std::sync::Arc<tests::HistoryReadProbe>>,
     /// Configured table names.
     tables: TableNames,
     /// Payload compression codec applied on write.
@@ -119,6 +123,8 @@ impl SqliteResponseStore {
         );
         Ok(Self {
             pool,
+            #[cfg(test)]
+            history_read_probe: None,
             tables,
             compression: compression.cloned().unwrap_or_default(),
         })
@@ -570,6 +576,104 @@ impl ResponseStore for SqliteResponseStore {
         }
     }
 
+    async fn get_response_bounded(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ResponseRecord>, StoreError> {
+        let limit = i64::try_from(max_bytes).map_err(|_overflow| StoreError::PayloadTooLarge)?;
+        let sql = format!(
+            "SELECT id, tenant_id, owner_issuer, owner_subject, created_at, model, \
+                    response_object, input, messages \
+             FROM {} \
+             WHERE id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ? \
+               AND length(CAST(model AS BLOB)) + length(response_object) + length(input) + length(messages) <= ?",
+            self.tables.responses
+        );
+        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .bind(limit)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if let Some(row) = row {
+            return run_blocking(move || row_to_response_record_bounded(&row, max_bytes))
+                .await
+                .map(Some);
+        }
+        let exists_sql = format!(
+            "SELECT 1 FROM {} WHERE id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            self.tables.responses
+        );
+        let exists = sqlx::query_scalar::<_, i64>(AssertSqlSafe(exists_sql.as_str()))
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if exists.is_some() {
+            Err(StoreError::PayloadTooLarge)
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get_response_budgeted(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ResponseRecord>>, StoreError> {
+        let raw_limit = max_charge_bytes / praxis_ai_store::RETAINED_JSON_BYTE_MULTIPLIER;
+        let limit = i64::try_from(raw_limit).map_err(|_overflow| StoreError::PayloadTooLarge)?;
+        let sql = format!(
+            "SELECT id, tenant_id, owner_issuer, owner_subject, created_at, model, \
+                    response_object, input, messages \
+             FROM {} \
+             WHERE id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ? \
+               AND length(CAST(id AS BLOB)) + length(CAST(model AS BLOB)) + \
+                   length(response_object) + length(input) + length(messages) <= ?",
+            self.tables.responses
+        );
+        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .bind(limit)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if let Some(row) = row {
+            return run_blocking(move || row_to_response_record_budgeted(&row, max_charge_bytes))
+                .await
+                .map(Some);
+        }
+        let exists_sql = format!(
+            "SELECT 1 FROM {} WHERE id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            self.tables.responses
+        );
+        let exists = sqlx::query_scalar::<_, i64>(AssertSqlSafe(exists_sql.as_str()))
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if exists.is_some() {
+            Err(StoreError::PayloadTooLarge)
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn delete_response(&self, owner: &StateOwner, id: &str) -> Result<bool, StoreError> {
         let delete_response_sql = format!(
             "DELETE FROM {} WHERE id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
@@ -633,6 +737,25 @@ impl ResponseStore for SqliteResponseStore {
         conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError> {
         self.get_conversation_record(owner, conversation_id).await
+    }
+
+    async fn get_conversation_bounded(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        self.conversation_record_within(owner, conversation_id, max_bytes).await
+    }
+
+    async fn get_conversation_budgeted(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ConversationRecord>>, StoreError> {
+        self.conversation_record_budgeted(owner, conversation_id, max_charge_bytes)
+            .await
     }
 
     async fn record_pending_approvals(
@@ -755,6 +878,67 @@ impl ResponseStore for SqliteResponseStore {
         Ok(())
     }
 
+    async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        let [response_object, input, messages] = self.compression.encode(record).await?;
+        let insert_sql = format!(
+            "INSERT INTO {} \
+             (id, tenant_id, owner_issuer, owner_subject, created_at, model, response_object, input, messages) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+            self.tables.responses
+        );
+        let approval_sql = pending_approval_insert_sql(&self.tables.responses);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let inserted = sqlx::query(AssertSqlSafe(insert_sql.as_str()))
+            .bind(&record.id)
+            .bind(record.owner.tenant_id())
+            .bind(record.owner.issuer())
+            .bind(record.owner.subject())
+            .bind(record.created_at)
+            .bind(&record.model)
+            .bind(&response_object)
+            .bind(&input)
+            .bind(&messages)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?
+            .rows_affected()
+            == 1;
+        if !inserted {
+            return Ok(false);
+        }
+        for approval in pending_approvals {
+            sqlx::query(AssertSqlSafe(approval_sql.as_str()))
+                .bind(record.owner.tenant_id())
+                .bind(record.owner.issuer())
+                .bind(record.owner.subject())
+                .bind(&record.id)
+                .bind(&approval.approval_id)
+                .bind(&approval.server_label)
+                .bind(&approval.tool_name)
+                .bind(&approval.arguments)
+                .bind(&approval.target_fingerprint)
+                .bind(record.created_at)
+                .bind(Option::<i64>::None)
+                .bind(&record.id)
+                .bind(record.owner.tenant_id())
+                .bind(record.owner.issuer())
+                .bind(record.owner.subject())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+        }
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(true)
+    }
+
     async fn get_pending_approvals(
         &self,
         owner: &StateOwner,
@@ -789,6 +973,41 @@ impl ResponseStore for SqliteResponseStore {
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
         rows.iter().map(row_to_pending_approval_record).collect()
+    }
+
+    async fn pending_approval_payload_bytes(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        if approval_ids.is_empty() {
+            return Ok(0);
+        }
+        let table = pending_approvals_table(&self.tables.responses);
+        let placeholders = std::iter::repeat_n("?", approval_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT COALESCE(SUM(length(CAST(approval_id AS BLOB)) + length(CAST(server_label AS BLOB)) + \
+             length(CAST(tool_name AS BLOB)) + length(CAST(arguments AS BLOB)) + \
+             length(CAST(target_fingerprint AS BLOB))), 0) FROM {table} \
+             WHERE tenant_id = ? AND owner_issuer = ? AND owner_subject = ? \
+               AND response_id = ? AND approval_id IN ({placeholders})"
+        );
+        let mut query = sqlx::query_scalar::<_, i64>(AssertSqlSafe(sql.as_str()))
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .bind(response_id);
+        for approval_id in approval_ids {
+            query = query.bind(*approval_id);
+        }
+        let bytes = query
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        usize::try_from(bytes).map_err(|e| StoreError::Database(format!("pending approval payload size overflow: {e}")))
     }
 
     async fn consume_approvals(
@@ -1359,91 +1578,7 @@ impl ConversationItemStore for SqliteResponseStore {
         owner: &StateOwner,
         conversation_id: &str,
     ) -> Result<Option<Vec<serde_json::Value>>, StoreError> {
-        let Some(table) = self.tables.items.as_deref() else {
-            return Ok(self
-                .get_conversation_record(owner, conversation_id)
-                .await?
-                .map(|record| match record.messages {
-                    serde_json::Value::Array(messages) => messages,
-                    serde_json::Value::Object(mut object) => match object.remove("legacy_messages") {
-                        Some(serde_json::Value::Array(messages)) => messages,
-                        _ => Vec::new(),
-                    },
-                    _ => Vec::new(),
-                }));
-        };
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-        let exists_sql = format!(
-            "SELECT 1 FROM {} WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
-            self.tables.conversations
-        );
-        let exists = sqlx::query(AssertSqlSafe(exists_sql.as_str()))
-            .bind(conversation_id)
-            .bind(owner.tenant_id())
-            .bind(owner.issuer())
-            .bind(owner.subject())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-        if exists.is_none() {
-            return Ok(None);
-        }
-        let select_sql = format!(
-            "SELECT item_data FROM {table} WHERE conversation_id = ? AND tenant_id = ? \
-             AND owner_issuer = ? AND owner_subject = ? ORDER BY position ASC, item_id ASC"
-        );
-        let mut history = Vec::new();
-        {
-            let mut rows = sqlx::query_scalar::<_, String>(AssertSqlSafe(select_sql.as_str()))
-                .bind(conversation_id)
-                .bind(owner.tenant_id())
-                .bind(owner.issuer())
-                .bind(owner.subject())
-                .fetch(&mut *tx);
-            while let Some(json) = rows.try_next().await.map_err(|e| StoreError::Database(e.to_string()))? {
-                history.push(serde_json::from_str(&json).map_err(|e| StoreError::Serialization(e.to_string()))?);
-            }
-        }
-        {
-            let projection = if history.is_empty() {
-                "messages"
-            } else {
-                "CASE WHEN substr(messages, 1, 19) = '{\"legacy_messages\":' THEN messages ELSE '[]' END"
-            };
-            let legacy_sql = format!(
-                "SELECT {projection} FROM {} WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
-                self.tables.conversations
-            );
-            let json = sqlx::query_scalar::<_, String>(AssertSqlSafe(legacy_sql.as_str()))
-                .bind(conversation_id)
-                .bind(owner.tenant_id())
-                .bind(owner.issuer())
-                .bind(owner.subject())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| StoreError::Database(e.to_string()))?;
-            let cached: serde_json::Value =
-                serde_json::from_str(&json).map_err(|e| StoreError::Serialization(e.to_string()))?;
-            let prefix = match cached {
-                serde_json::Value::Array(messages) if history.is_empty() => messages,
-                serde_json::Value::Object(mut object) => match object.remove("legacy_messages") {
-                    Some(serde_json::Value::Array(messages)) => messages,
-                    _ => Vec::new(),
-                },
-                _ => Vec::new(),
-            };
-            if !prefix.is_empty() {
-                let mut complete = prefix;
-                complete.append(&mut history);
-                history = complete;
-            }
-        }
-        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
-        Ok(Some(history))
+        self.conversation_history_within(owner, conversation_id).await
     }
 
     async fn create_items_and_sync_messages(
@@ -1452,30 +1587,19 @@ impl ConversationItemStore for SqliteResponseStore {
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
-        require_matching_item_scope(owner, conversation_id, items)?;
-
-        let items_table = self
-            .tables
-            .items
-            .as_deref()
-            .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
-        let conv_table = &self.tables.conversations;
-
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, None)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+    }
 
-        sqlite_require_conversation(&mut tx, conv_table, owner, conversation_id).await?;
-        if items.is_empty() {
-            tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
-            return Ok(());
-        }
-        sqlite_create_items_and_sync(&mut tx, items_table, conv_table, owner, conversation_id, items).await?;
-
-        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
-        Ok(())
+    async fn create_items_and_sync_messages_bounded(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_append_charge_bytes: usize,
+    ) -> Result<(), StoreError> {
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, Some(max_append_charge_bytes))
+            .await
     }
 
     async fn delete_item_and_sync_messages(
@@ -1503,6 +1627,445 @@ impl ConversationItemStore for SqliteResponseStore {
 
         tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(deleted)
+    }
+}
+
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "transactional cache helpers sit beside their trait implementation"
+)]
+impl SqliteResponseStore {
+    /// Preflight and reconstruct a conversation in one stable read transaction.
+    /// The size-only query runs before any JSON column is returned to the process.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one read transaction keeps the size preflight and reconstruction on the same snapshot"
+    )]
+    async fn conversation_record_within(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        // `usize::MAX` is used by unbudgeted callers to request reconstruction
+        // without an effective size ceiling. SQLite lengths are signed 64-bit
+        // values, so saturating preserves that meaning.
+        let limit = i64::try_from(max_bytes).unwrap_or(i64::MAX);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let (message_bytes, item_bytes, item_exists) = if let Some(table) = self.tables.items.as_deref() {
+            let item_scope = "i.conversation_id = c.conversation_id AND i.tenant_id = c.tenant_id \
+                 AND i.owner_issuer = c.owner_issuer AND i.owner_subject = c.owner_subject";
+            (
+                format!(
+                    "CASE WHEN substr(c.messages, 1, 19) = '{{\"legacy_messages\":' \
+                       THEN length(CAST(c.messages AS BLOB)) - 20 \
+                       WHEN EXISTS (SELECT 1 FROM {table} i WHERE {item_scope}) THEN 0 \
+                       ELSE length(CAST(c.messages AS BLOB)) END"
+                ),
+                format!(
+                    "COALESCE((SELECT SUM(length(CAST(i.item_data AS BLOB))) FROM {table} i \
+                       WHERE {item_scope}), 0)"
+                ),
+                format!("EXISTS (SELECT 1 FROM {table} i WHERE {item_scope})"),
+            )
+        } else {
+            (
+                "CASE WHEN substr(c.messages, 1, 19) = '{\"legacy_messages\":' \
+                   THEN length(CAST(c.messages AS BLOB)) - 20 \
+                   ELSE length(CAST(c.messages AS BLOB)) END"
+                    .to_owned(),
+                "0".to_owned(),
+                "0".to_owned(),
+            )
+        };
+        let raw_size = format!("length(CAST(c.metadata AS BLOB)) + ({message_bytes}) + ({item_bytes})");
+        let size_sql = format!(
+            "SELECT ({raw_size}) <= ? AS within_limit FROM {} c \
+             WHERE c.conversation_id = ? AND c.tenant_id = ? \
+               AND c.owner_issuer = ? AND c.owner_subject = ?",
+            self.tables.conversations
+        );
+        let size_row = sqlx::query(AssertSqlSafe(size_sql.as_str()))
+            .bind(limit)
+            .bind(conversation_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let Some(size_row) = size_row else {
+            return Ok(None);
+        };
+        let fits: bool = size_row
+            .try_get("within_limit")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if !fits {
+            return Err(StoreError::PayloadTooLarge);
+        }
+
+        // Item rows supersede the old snapshot except for an explicitly wrapped
+        // legacy prefix. Project stale snapshots away before transferring them.
+        let messages_projection = if self.tables.items.is_some() {
+            format!(
+                "CASE WHEN {item_exists} AND substr(c.messages, 1, 19) <> '{{\"legacy_messages\":' \
+                 THEN '[]' ELSE c.messages END"
+            )
+        } else {
+            "c.messages".to_owned()
+        };
+        let record_sql = format!(
+            "SELECT c.conversation_id, c.tenant_id, c.owner_issuer, c.owner_subject, c.created_at, \
+                    c.metadata, ({messages_projection}) AS messages \
+             FROM {} c WHERE c.conversation_id = ? AND c.tenant_id = ? \
+               AND c.owner_issuer = ? AND c.owner_subject = ?",
+            self.tables.conversations
+        );
+        let row = sqlx::query(AssertSqlSafe(record_sql.as_str()))
+            .bind(conversation_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut record = row_to_conversation_record(&row)?;
+        let mut item_rows = Vec::new();
+        if let Some(table) = self.tables.items.as_deref() {
+            let items_sql = format!(
+                "SELECT item_data FROM {table} WHERE conversation_id = ? AND tenant_id = ? \
+                 AND owner_issuer = ? AND owner_subject = ? ORDER BY position ASC, item_id ASC"
+            );
+            let mut rows = sqlx::query_scalar::<_, String>(AssertSqlSafe(items_sql.as_str()))
+                .bind(conversation_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
+                .fetch(&mut *tx);
+            while let Some(json) = rows.try_next().await.map_err(|e| StoreError::Database(e.to_string()))? {
+                item_rows.push(serde_json::from_str(&json).map_err(|e| StoreError::Serialization(e.to_string()))?);
+            }
+        }
+        record.messages = serde_json::Value::Array(super::reconstruct_conversation_history(record.messages, item_rows));
+        if !json_values_fit(&[&record.metadata, &record.messages], max_bytes) {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(Some(record))
+    }
+
+    /// Reconstruct history after a byte-and-structure preflight. The database
+    /// query bounds the total raw JSON before transferring columns; each JSON
+    /// value is scanned before deserialization.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one read transaction keeps charge preflight and reconstruction on the same snapshot"
+    )]
+    #[cfg_attr(
+        feature = "sqlite",
+        expect(
+            clippy::large_stack_frames,
+            reason = "the async_trait boundary boxes this single-snapshot reconstruction future"
+        )
+    )]
+    async fn conversation_record_budgeted(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ConversationRecord>>, StoreError> {
+        let id_charge = json_values_charge(std::iter::empty(), &[conversation_id], max_charge_bytes)?;
+        let remaining = max_charge_bytes
+            .checked_sub(id_charge)
+            .ok_or(StoreError::PayloadTooLarge)?;
+        let raw_limit = remaining / praxis_ai_store::RETAINED_JSON_BYTE_MULTIPLIER;
+        let limit = i64::try_from(raw_limit).unwrap_or(i64::MAX);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let (message_bytes, item_bytes, item_exists) = if let Some(table) = self.tables.items.as_deref() {
+            let item_scope = "i.conversation_id = c.conversation_id AND i.tenant_id = c.tenant_id \
+                 AND i.owner_issuer = c.owner_issuer AND i.owner_subject = c.owner_subject";
+            (
+                format!(
+                    "CASE WHEN substr(c.messages, 1, 19) = '{{\"legacy_messages\":' \
+                       THEN length(CAST(c.messages AS BLOB)) \
+                       WHEN EXISTS (SELECT 1 FROM {table} i WHERE {item_scope}) THEN 2 \
+                       ELSE length(CAST(c.messages AS BLOB)) END"
+                ),
+                format!(
+                    "COALESCE((SELECT SUM(length(CAST(i.item_data AS BLOB))) FROM {table} i \
+                       WHERE {item_scope}), 0)"
+                ),
+                format!("EXISTS (SELECT 1 FROM {table} i WHERE {item_scope})"),
+            )
+        } else {
+            (
+                "length(CAST(c.messages AS BLOB))".to_owned(),
+                "0".to_owned(),
+                "0".to_owned(),
+            )
+        };
+        let raw_size = format!("length(CAST(c.metadata AS BLOB)) + ({message_bytes}) + ({item_bytes})");
+        let size_sql = format!(
+            "SELECT ({raw_size}) <= ? AS within_limit FROM {} c \
+             WHERE c.conversation_id = ? AND c.tenant_id = ? \
+               AND c.owner_issuer = ? AND c.owner_subject = ?",
+            self.tables.conversations
+        );
+        let size_row = sqlx::query(AssertSqlSafe(size_sql.as_str()))
+            .bind(limit)
+            .bind(conversation_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let Some(size_row) = size_row else {
+            return Ok(None);
+        };
+        let fits: bool = size_row
+            .try_get("within_limit")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if !fits {
+            return Err(StoreError::PayloadTooLarge);
+        }
+
+        let messages_projection = if self.tables.items.is_some() {
+            format!(
+                "CASE WHEN {item_exists} AND substr(c.messages, 1, 19) <> '{{\"legacy_messages\":' \
+                 THEN '[]' ELSE c.messages END"
+            )
+        } else {
+            "c.messages".to_owned()
+        };
+        let record_sql = format!(
+            "SELECT c.conversation_id, c.tenant_id, c.owner_issuer, c.owner_subject, c.created_at, \
+                    c.metadata, ({messages_projection}) AS messages \
+             FROM {} c WHERE c.conversation_id = ? AND c.tenant_id = ? \
+               AND c.owner_issuer = ? AND c.owner_subject = ?",
+            self.tables.conversations
+        );
+        let row = sqlx::query(AssertSqlSafe(record_sql.as_str()))
+            .bind(conversation_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let metadata_json: String = row
+            .try_get("metadata")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let messages_json: String = row
+            .try_get("messages")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let mut charge = id_charge;
+        let metadata_charge = json_payload_charge(metadata_json.as_bytes(), max_charge_bytes - charge)?;
+        charge = charge.checked_add(metadata_charge).ok_or(StoreError::PayloadTooLarge)?;
+        let messages_charge = json_payload_charge(messages_json.as_bytes(), max_charge_bytes - charge)?;
+        charge = charge.checked_add(messages_charge).ok_or(StoreError::PayloadTooLarge)?;
+        let metadata = serde_json::from_str(&metadata_json).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&messages_json).map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+        let mut item_rows = Vec::new();
+        if let Some(table) = self.tables.items.as_deref() {
+            let items_sql = format!(
+                "SELECT item_data FROM {table} WHERE conversation_id = ? AND tenant_id = ? \
+                 AND owner_issuer = ? AND owner_subject = ? ORDER BY position ASC, item_id ASC"
+            );
+            let mut rows = sqlx::query_scalar::<_, String>(AssertSqlSafe(items_sql.as_str()))
+                .bind(conversation_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
+                .fetch(&mut *tx);
+            while let Some(json) = rows.try_next().await.map_err(|e| StoreError::Database(e.to_string()))? {
+                let row_charge = json_payload_charge(json.as_bytes(), max_charge_bytes - charge)?;
+                charge = charge.checked_add(row_charge).ok_or(StoreError::PayloadTooLarge)?;
+                item_rows.push(serde_json::from_str(&json).map_err(|e| StoreError::Serialization(e.to_string()))?);
+            }
+        }
+        let item_count = item_rows.len();
+        let legacy_count = snapshot
+            .get("legacy_messages")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        let extra_commas = if item_count == 0 {
+            0
+        } else if legacy_count == 0 {
+            item_count.saturating_sub(1)
+        } else {
+            item_count
+        };
+        charge = charge
+            .checked_add(retained_charge(extra_commas, 0).ok_or(StoreError::PayloadTooLarge)?)
+            .filter(|value| *value <= max_charge_bytes)
+            .ok_or(StoreError::PayloadTooLarge)?;
+        let messages = serde_json::Value::Array(super::reconstruct_conversation_history(snapshot, item_rows));
+        let record = ConversationRecord {
+            conversation_id: row
+                .try_get("conversation_id")
+                .map_err(|e| StoreError::Database(e.to_string()))?,
+            owner: row_to_owner(&row)?,
+            created_at: row
+                .try_get("created_at")
+                .map_err(|e| StoreError::Database(e.to_string()))?,
+            metadata,
+            messages,
+        };
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(Some(BudgetedRecord {
+            record,
+            charge_bytes: charge,
+        }))
+    }
+
+    /// Reconstruct a conversation's full history (legacy prefix + item rows).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear history reconstruction reads item rows and the legacy prefix in one snapshot"
+    )]
+    async fn conversation_history_within(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, StoreError> {
+        let Some(table) = self.tables.items.as_deref() else {
+            return Ok(self
+                .get_conversation_record(owner, conversation_id)
+                .await?
+                .map(|record| super::reconstruct_conversation_history(record.messages, Vec::new())));
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let exists_sql = format!(
+            "SELECT 1 FROM {} WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            self.tables.conversations
+        );
+        let exists = sqlx::query(AssertSqlSafe(exists_sql.as_str()))
+            .bind(conversation_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if exists.is_none() {
+            return Ok(None);
+        }
+        let select_sql = format!(
+            "SELECT item_data FROM {table} WHERE conversation_id = ? AND tenant_id = ? \
+             AND owner_issuer = ? AND owner_subject = ? ORDER BY position ASC, item_id ASC"
+        );
+        #[cfg(not(test))]
+        let mut history = Vec::new();
+        // The test wrapper observes ownership of the actual decoded prefix.
+        #[cfg(test)]
+        let history = tests::ReadHistory::new();
+        {
+            let mut rows = sqlx::query_scalar::<_, String>(AssertSqlSafe(select_sql.as_str()))
+                .bind(conversation_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
+                .fetch(&mut *tx);
+            while let Some(json) = rows.try_next().await.map_err(|e| StoreError::Database(e.to_string()))? {
+                history.push(serde_json::from_str(&json).map_err(|e| StoreError::Serialization(e.to_string()))?);
+                #[cfg(test)]
+                if let Some(probe) = &self.history_read_probe {
+                    probe.after_row(&history).await;
+                }
+            }
+        }
+        #[cfg(test)]
+        let mut history = history.into_inner();
+        let projection = if history.is_empty() {
+            "messages"
+        } else {
+            "CASE WHEN substr(messages, 1, 19) = '{\"legacy_messages\":' THEN messages ELSE '[]' END"
+        };
+        let legacy_sql = format!(
+            "SELECT {projection} FROM {} WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            self.tables.conversations
+        );
+        let json = sqlx::query_scalar::<_, String>(AssertSqlSafe(legacy_sql.as_str()))
+            .bind(conversation_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let snapshot = serde_json::from_str(&json).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        history = super::reconstruct_conversation_history(snapshot, history);
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(Some(history))
+    }
+
+    /// Append items and migrate a cache-only legacy prefix in one transaction.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "parent check and bounded append share one SQLite transaction"
+    )]
+    async fn create_items_and_sync_messages_with_limit(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_append_charge_bytes: Option<usize>,
+    ) -> Result<(), StoreError> {
+        require_matching_item_scope(owner, conversation_id, items)?;
+
+        let items_table = self
+            .tables
+            .items
+            .as_deref()
+            .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
+        let conv_table = &self.tables.conversations;
+
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        sqlite_require_conversation(&mut tx, conv_table, owner, conversation_id).await?;
+        if items.is_empty() {
+            tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+            return Ok(());
+        }
+
+        sqlite_create_items_and_sync(
+            &mut tx,
+            items_table,
+            conv_table,
+            owner,
+            conversation_id,
+            items,
+            max_append_charge_bytes,
+        )
+        .await?;
+
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -1551,14 +2114,29 @@ async fn sqlite_create_items_and_sync(
     owner: &StateOwner,
     conversation_id: &str,
     items: &[ConversationItemRecord],
+    max_append_charge_bytes: Option<usize>,
 ) -> Result<(), StoreError> {
+    let remaining_budget = max_append_charge_bytes
+        .map(|maximum| {
+            let append_charge = super::conversation_append_charge(conversation_id, items, maximum)?;
+            maximum.checked_sub(append_charge).ok_or(StoreError::PayloadTooLarge)
+        })
+        .transpose()?;
+    let max_legacy_json_bytes = remaining_budget.map_or(usize::MAX, |remaining| {
+        remaining / praxis_ai_store::RETAINED_JSON_BYTE_MULTIPLIER
+    });
+    let max_legacy_json_bytes = i64::try_from(max_legacy_json_bytes).unwrap_or(i64::MAX);
     let scope_sql = format!(
         "SELECT CASE WHEN EXISTS (SELECT 1 FROM {items_table} \
          WHERE conversation_id = ?5 AND tenant_id = ?6 AND owner_issuer = ?7 AND owner_subject = ?8) \
-         THEN NULL ELSE messages END FROM {conv_table} WHERE conversation_id = ?1 AND tenant_id = ?2 \
+         THEN NULL WHEN length(CAST(messages AS BLOB)) <= ?9 THEN messages ELSE NULL END AS cached, \
+         CASE WHEN NOT EXISTS (SELECT 1 FROM {items_table} \
+         WHERE conversation_id = ?5 AND tenant_id = ?6 AND owner_issuer = ?7 AND owner_subject = ?8) \
+         AND messages IS NOT NULL AND length(CAST(messages AS BLOB)) > ?9 THEN 1 ELSE 0 END AS legacy_too_large \
+         FROM {conv_table} WHERE conversation_id = ?1 AND tenant_id = ?2 \
          AND owner_issuer = ?3 AND owner_subject = ?4"
     );
-    let writable = sqlx::query_scalar::<_, Option<String>>(AssertSqlSafe(scope_sql.as_str()))
+    let writable = sqlx::query(AssertSqlSafe(scope_sql.as_str()))
         .bind(conversation_id)
         .bind(owner.tenant_id())
         .bind(owner.issuer())
@@ -1567,11 +2145,34 @@ async fn sqlite_create_items_and_sync(
         .bind(owner.tenant_id())
         .bind(owner.issuer())
         .bind(owner.subject())
+        .bind(max_legacy_json_bytes)
         .fetch_optional(&mut **tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
-    let cached = writable.ok_or_else(|| StoreError::Database("conversation missing".to_owned()))?;
+    let writable = writable.ok_or_else(|| StoreError::Database("conversation missing".to_owned()))?;
+    let legacy_too_large: i64 = writable
+        .try_get("legacy_too_large")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    if legacy_too_large != 0 {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    let cached: Option<String> = writable
+        .try_get("cached")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
     if let Some(json) = cached {
+        if let Some(remaining) = remaining_budget {
+            let cache_charge = json_payload_charge(json.as_bytes(), remaining)?;
+            let remaining = remaining.checked_sub(cache_charge).ok_or(StoreError::PayloadTooLarge)?;
+            // The first append wraps a cache-only array as an explicit legacy
+            // prefix. Reserve that small wrapper when the raw value is an array;
+            // its contents are scanned before any Value tree is constructed.
+            if json.trim_start().starts_with('[') {
+                let wrapper_charge = retained_charge(20, 2).ok_or(StoreError::PayloadTooLarge)?;
+                if wrapper_charge > remaining {
+                    return Err(StoreError::PayloadTooLarge);
+                }
+            }
+        }
         let cached: serde_json::Value =
             serde_json::from_str(&json).map_err(|e| StoreError::Serialization(e.to_string()))?;
         if cached.as_array().is_some_and(|messages| !messages.is_empty()) {
@@ -1818,6 +2419,32 @@ fn row_to_pending_approval_record(row: &sqlx::sqlite::SqliteRow) -> Result<Pendi
 
 /// Convert a sqlx row to a [`ResponseRecord`].
 fn row_to_response_record(row: &sqlx::sqlite::SqliteRow) -> Result<ResponseRecord, StoreError> {
+    row_to_response_record_with_limit(row, None)
+}
+
+/// Decode a response row while enforcing the aggregate encoded and decoded limit.
+fn row_to_response_record_bounded(
+    row: &sqlx::sqlite::SqliteRow,
+    max_bytes: usize,
+) -> Result<ResponseRecord, StoreError> {
+    row_to_response_record_with_limit(row, Some(max_bytes))
+}
+
+/// Decode a response row, charging each JSON column against the remaining
+/// allowance and returning the total measured charge.
+#[expect(
+    clippy::too_many_lines,
+    reason = "each JSON column is charged and decoded in sequence"
+)]
+fn row_to_response_record_budgeted(
+    row: &sqlx::sqlite::SqliteRow,
+    max_charge_bytes: usize,
+) -> Result<BudgetedRecord<ResponseRecord>, StoreError> {
+    let id: &str = row.try_get("id").map_err(|e| StoreError::Database(e.to_string()))?;
+    let model: &str = row.try_get("model").map_err(|e| StoreError::Database(e.to_string()))?;
+    let mut remaining = max_charge_bytes
+        .checked_sub(json_values_charge(std::iter::empty(), &[id, model], max_charge_bytes)?)
+        .ok_or(StoreError::PayloadTooLarge)?;
     let response_object_json: Vec<u8> = row
         .try_get("response_object")
         .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -1826,16 +2453,77 @@ fn row_to_response_record(row: &sqlx::sqlite::SqliteRow) -> Result<ResponseRecor
         .try_get("messages")
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
+    let (response_object, charge) = decode_budgeted(&response_object_json, remaining)?;
+    remaining = remaining.checked_sub(charge).ok_or(StoreError::PayloadTooLarge)?;
+    let (input, charge) = decode_budgeted(&input_json, remaining)?;
+    remaining = remaining.checked_sub(charge).ok_or(StoreError::PayloadTooLarge)?;
+    let (messages, charge) = decode_budgeted(&messages_json, remaining)?;
+    remaining = remaining.checked_sub(charge).ok_or(StoreError::PayloadTooLarge)?;
+
+    Ok(BudgetedRecord {
+        record: ResponseRecord {
+            id: id.to_owned(),
+            owner: row_to_owner(row)?,
+            created_at: row
+                .try_get("created_at")
+                .map_err(|e| StoreError::Database(e.to_string()))?,
+            model: model.to_owned(),
+            response_object,
+            input,
+            messages,
+        },
+        charge_bytes: max_charge_bytes - remaining,
+    })
+}
+
+/// Convert a response row, optionally applying a bounded decode to its JSON columns.
+#[expect(
+    clippy::too_many_lines,
+    reason = "reads three stored columns and constructs one record"
+)]
+fn row_to_response_record_with_limit(
+    row: &sqlx::sqlite::SqliteRow,
+    max_bytes: Option<usize>,
+) -> Result<ResponseRecord, StoreError> {
+    let model: &str = row.try_get("model").map_err(|e| StoreError::Database(e.to_string()))?;
+    let response_object_json: Vec<u8> = row
+        .try_get("response_object")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let input_json: Vec<u8> = row.try_get("input").map_err(|e| StoreError::Database(e.to_string()))?;
+    let messages_json: Vec<u8> = row
+        .try_get("messages")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+    let (response_object, input, messages) = if let Some(max_bytes) = max_bytes {
+        let mut remaining = max_bytes.checked_sub(model.len()).ok_or(StoreError::PayloadTooLarge)?;
+        let mut bounded = |stored: &[u8]| {
+            let (value, bytes) = decode_bounded(stored, remaining)?;
+            remaining -= bytes;
+            Ok::<_, StoreError>(value)
+        };
+        (
+            bounded(&response_object_json)?,
+            bounded(&input_json)?,
+            bounded(&messages_json)?,
+        )
+    } else {
+        (
+            decode(&response_object_json)?,
+            decode(&input_json)?,
+            decode(&messages_json)?,
+        )
+    };
+
     Ok(ResponseRecord {
         id: row.try_get("id").map_err(|e| StoreError::Database(e.to_string()))?,
         owner: row_to_owner(row)?,
         created_at: row
             .try_get("created_at")
             .map_err(|e| StoreError::Database(e.to_string()))?,
-        model: row.try_get("model").map_err(|e| StoreError::Database(e.to_string()))?,
-        response_object: decode(&response_object_json)?,
-        input: decode(&input_json)?,
-        messages: decode(&messages_json)?,
+        model: model.to_owned(),
+        response_object,
+        input,
+        messages,
     })
 }
 
@@ -1937,7 +2625,23 @@ fn row_to_owner(row: &sqlx::sqlite::SqliteRow) -> Result<StateOwner, StoreError>
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
+    use std::sync::{Arc, Mutex, Weak};
+
     use super::*;
+
+    #[tokio::test]
+    async fn history_read_cancellation_releases_partial_progress() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), history_read_cleanup(true))
+            .await
+            .expect("cancelled history read must release its only connection");
+    }
+
+    #[tokio::test]
+    async fn history_read_error_releases_partial_progress() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), history_read_cleanup(false))
+            .await
+            .expect("failed history read must release its only connection");
+    }
 
     #[tokio::test]
     #[expect(clippy::too_many_lines, reason = "linear SQL mutation regression assertions")]
@@ -2096,6 +2800,308 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one fixture covers raw, compressed, and owner-scoped bounded reads"
+    )]
+    async fn bounded_response_read_rejects_raw_and_compressed_history() {
+        let owner = StateOwner::from_trusted_parts("tenant", "issuer", "subject").unwrap();
+        let mut record = ResponseRecord {
+            id: "resp_bounded".to_owned(),
+            owner: owner.clone(),
+            created_at: 1,
+            model: "test".to_owned(),
+            response_object: serde_json::json!({"status": "completed", "output": []}),
+            input: serde_json::json!("hello"),
+            messages: serde_json::json!([]),
+        };
+        let raw = SqliteResponseStore::new(
+            "sqlite::memory:",
+            "bounded_responses_raw",
+            "bounded_conversations_raw",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        raw.upsert_response(&record).await.unwrap();
+        assert!(
+            raw.get_response_bounded(&owner, &record.id, 4_096)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        record.messages = serde_json::json!([{"role": "assistant", "content": "x".repeat(16_384)}]);
+        raw.upsert_response(&record).await.unwrap();
+        assert!(
+            matches!(
+                raw.get_response_bounded(&owner, &record.id, 4_096).await,
+                Err(StoreError::PayloadTooLarge)
+            ),
+            "oversized raw response messages must exceed the bounded read limit"
+        );
+        // An oversized invalid column still reports the size failure: SQL
+        // excludes the blob before JSON decoding can inspect it.
+        sqlx::query("UPDATE bounded_responses_raw SET messages = ? WHERE id = ?")
+            .bind("not-json".repeat(2_048))
+            .bind(&record.id)
+            .execute(&raw.pool)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                raw.get_response_bounded(&owner, &record.id, 4_096).await,
+                Err(StoreError::PayloadTooLarge)
+            ),
+            "oversized invalid raw messages must report the size limit before JSON decoding"
+        );
+        let other = StateOwner::from_trusted_parts("other", "issuer", "subject").unwrap();
+        assert!(
+            raw.get_response_bounded(&other, &record.id, 4_096)
+                .await
+                .unwrap()
+                .is_none(),
+            "bounded reads must not reveal another owner's record"
+        );
+        // The non-JSON model column also belongs to the fetched snapshot.
+        sqlx::query("UPDATE bounded_responses_raw SET model = ?, messages = ? WHERE id = ?")
+            .bind("m".repeat(16_384))
+            .bind("[]")
+            .bind(&record.id)
+            .execute(&raw.pool)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                raw.get_response_bounded(&owner, &record.id, 4_096).await,
+                Err(StoreError::PayloadTooLarge)
+            ),
+            "an oversized model column must count toward the raw response snapshot limit"
+        );
+
+        let codec = StoreCompressionConfig {
+            algorithm: praxis_ai_store::CompressionAlgorithm::Zstd,
+            level: None,
+        };
+        let compressed = SqliteResponseStore::new(
+            "sqlite::memory:",
+            "bounded_responses_zstd",
+            "bounded_conversations_zstd",
+            None,
+            None,
+            Some(&codec),
+        )
+        .await
+        .unwrap();
+        compressed.upsert_response(&record).await.unwrap();
+        assert!(
+            matches!(
+                compressed.get_response_bounded(&owner, &record.id, 4_096).await,
+                Err(StoreError::PayloadTooLarge)
+            ),
+            "a compressed response whose decoded payload exceeds the limit must be rejected"
+        );
+
+        let conversation = ConversationRecord {
+            conversation_id: "conv_bounded".to_owned(),
+            owner: owner.clone(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: serde_json::json!([{"role": "assistant", "content": "x".repeat(16_384)}]),
+        };
+        raw.upsert_conversation(&conversation).await.unwrap();
+        assert!(
+            matches!(
+                raw.get_conversation_bounded(&owner, &conversation.conversation_id, 4_096)
+                    .await,
+                Err(StoreError::PayloadTooLarge)
+            ),
+            "oversized raw conversation messages must exceed the bounded read limit"
+        );
+        sqlx::query("UPDATE bounded_conversations_raw SET messages = ? WHERE conversation_id = ?")
+            .bind("not-json".repeat(2_048))
+            .bind(&conversation.conversation_id)
+            .execute(&raw.pool)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                raw.get_conversation_bounded(&owner, &conversation.conversation_id, 4_096)
+                    .await,
+                Err(StoreError::PayloadTooLarge)
+            ),
+            "oversized invalid snapshot JSON must fail the SQL size preflight before decoding"
+        );
+        sqlx::query("UPDATE bounded_conversations_raw SET metadata = ?, messages = '[]' WHERE conversation_id = ?")
+            .bind("not-json".repeat(2_048))
+            .bind(&conversation.conversation_id)
+            .execute(&raw.pool)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                raw.get_conversation_bounded(&owner, &conversation.conversation_id, 4_096)
+                    .await,
+                Err(StoreError::PayloadTooLarge)
+            ),
+            "oversized metadata must fail the SQL size preflight before decoding"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one bounded-read regression test covers item-row preflight, legacy-prefix reconstruction, and exact-fit admission"
+    )]
+    async fn bounded_conversation_preflights_item_rows_before_decoding_snapshot() {
+        let owner = StateOwner::from_trusted_parts("tenant", "issuer", "subject").unwrap();
+        let store = SqliteResponseStore::new(
+            "sqlite::memory:",
+            "bounded_item_responses",
+            "bounded_item_conversations",
+            Some("bounded_conversation_items"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let conversation = ConversationRecord {
+            conversation_id: "conv_item_bounded".to_owned(),
+            owner: owner.clone(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        };
+        store.upsert_conversation(&conversation).await.unwrap();
+        sqlx::query(
+            "UPDATE bounded_item_conversations SET metadata = 'not-json', messages = 'not-json' \
+             WHERE conversation_id = ?",
+        )
+        .bind(&conversation.conversation_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO bounded_conversation_items \
+             (item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind("item_bounded")
+        .bind(owner.tenant_id())
+        .bind(owner.issuer())
+        .bind(owner.subject())
+        .bind(&conversation.conversation_id)
+        .bind("not-json".repeat(2_048))
+        .bind(1_i64)
+        .bind(0_i64)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(
+                store
+                    .get_conversation_bounded(&owner, &conversation.conversation_id, 4_096)
+                    .await,
+                Err(StoreError::PayloadTooLarge)
+            ),
+            "oversized item rows must be rejected before malformed snapshot columns are decoded"
+        );
+
+        let metadata = serde_json::json!({"source": "legacy"});
+        let prefix = serde_json::json!([{"role": "user", "content": "before"}]);
+        let item = serde_json::json!({"type": "message", "role": "assistant", "content": "after"});
+        let snapshot = serde_json::to_string(&serde_json::json!({"legacy_messages": prefix.clone()})).unwrap();
+        sqlx::query("UPDATE bounded_item_conversations SET metadata = ?, messages = ? WHERE conversation_id = ?")
+            .bind(serde_json::to_string(&metadata).unwrap())
+            .bind(snapshot)
+            .bind(&conversation.conversation_id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE bounded_conversation_items SET item_data = ? WHERE item_id = 'item_bounded'")
+            .bind(serde_json::to_string(&item).unwrap())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let mut expected_messages = prefix.as_array().unwrap().clone();
+        expected_messages.push(item);
+        let expected_messages = serde_json::Value::Array(expected_messages);
+        let exact_bytes =
+            serde_json::to_vec(&metadata).unwrap().len() + serde_json::to_vec(&expected_messages).unwrap().len();
+        let bounded = store
+            .get_conversation_bounded(&owner, &conversation.conversation_id, exact_bytes)
+            .await
+            .unwrap()
+            .expect("an exact-fit legacy prefix and item row must be admitted");
+        assert_eq!(
+            bounded.messages, expected_messages,
+            "bounded reconstruction must preserve the legacy prefix and item row"
+        );
+        assert!(
+            matches!(
+                store
+                    .get_conversation_bounded(&owner, &conversation.conversation_id, exact_bytes - 1)
+                    .await,
+                Err(StoreError::PayloadTooLarge)
+            ),
+            "one byte below the reconstructed message size must reject"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "compressed-row regression checks both encoded and decoded charges"
+    )]
+    async fn compressed_response_read_counts_model_with_decoded_json() {
+        let owner = StateOwner::from_trusted_parts("tenant", "issuer", "subject").unwrap();
+        let codec = StoreCompressionConfig {
+            algorithm: praxis_ai_store::CompressionAlgorithm::Zstd,
+            level: None,
+        };
+        let store = SqliteResponseStore::new(
+            "sqlite::memory:",
+            "bounded_model_responses",
+            "bounded_model_conversations",
+            None,
+            None,
+            Some(&codec),
+        )
+        .await
+        .unwrap();
+        let record = ResponseRecord {
+            id: "resp_bounded_model".to_owned(),
+            owner: owner.clone(),
+            created_at: 1,
+            model: "m".repeat(3_900),
+            response_object: serde_json::json!({"output": "x".repeat(512)}),
+            input: serde_json::json!([]),
+            messages: serde_json::json!([]),
+        };
+        store.upsert_response(&record).await.unwrap();
+        let encoded_bytes: i64 = sqlx::query_scalar(
+            "SELECT length(CAST(model AS BLOB)) + length(response_object) + length(input) + length(messages) \
+             FROM bounded_model_responses WHERE id = ?",
+        )
+        .bind(&record.id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert!(encoded_bytes <= 4_096, "the encoded SQL row must pass its preflight");
+        assert!(
+            matches!(
+                store.get_response_bounded(&owner, &record.id, 4_096).await,
+                Err(StoreError::PayloadTooLarge)
+            ),
+            "the decoded JSON and model must share the same response limit"
+        );
+    }
+
     #[test]
     fn memory_url_short_form() {
         assert!(
@@ -2174,5 +3180,224 @@ mod tests {
             !is_memory_database_url(""),
             "empty URL should not be detected as memory"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test Utilities
+    // -------------------------------------------------------------------------
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "real SQL fixture, cancellation/error, and recovery assertions"
+    )]
+    async fn history_read_cleanup(cancel: bool) {
+        let mut store = SqliteResponseStore::new(
+            "sqlite::memory:",
+            "responses",
+            "conversations",
+            Some("items"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let owner = StateOwner::from_trusted_parts("tenant", "issuer", "subject").unwrap();
+        let legacy = serde_json::json!({"id": "legacy"});
+        store
+            .upsert_conversation(&ConversationRecord {
+                owner: owner.clone(),
+                conversation_id: "c".into(),
+                created_at: 1,
+                metadata: serde_json::json!({"keep": true}),
+                messages: serde_json::json!([legacy]),
+            })
+            .await
+            .unwrap();
+        // 64 rows overflow SQLx's 50-row worker channel: the reader pauses after
+        // one decoded row while the worker is parked on a full channel, so
+        // cancellation and failure must unblock the worker before the rollback
+        // can run. Three rows only ever exercised dropping buffered rows.
+        let items: Vec<_> = (0..64)
+            .map(|index| ConversationItemRecord {
+                owner: owner.clone(),
+                conversation_id: "c".into(),
+                item_id: format!("item_{index:08}"),
+                created_at: 1,
+                position: 0,
+                item_data: serde_json::json!({"id": index, "content": "x".repeat(64)}),
+            })
+            .collect();
+        store.create_items_and_sync_messages(&owner, "c", &items).await.unwrap();
+        if !cancel {
+            sqlx::query(
+                "UPDATE items SET item_data = '{broken-json' WHERE conversation_id = 'c' AND item_id = ? \
+                 AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            )
+            .bind(&items.get(1).unwrap().item_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        }
+        let before = read_snapshot(&store, &owner).await;
+        interrupt_history_read(&mut store, &owner, &items.first().unwrap().item_data, cancel).await;
+        let mut connection = store.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN")
+            .execute(&mut *connection)
+            .await
+            .expect("cancel/error rolled back the old transaction");
+        sqlx::query("ROLLBACK").execute(&mut *connection).await.unwrap();
+        drop(connection);
+        assert_eq!(
+            read_snapshot(&store, &owner).await,
+            before,
+            "reads must preserve item bytes, positions, and legacy cache"
+        );
+        let stranger = StateOwner::from_trusted_parts("other-tenant", "issuer", "subject").unwrap();
+        assert!(
+            store.conversation_history(&stranger, "c").await.unwrap().is_none(),
+            "a different tenant must not read the conversation history"
+        );
+        if !cancel {
+            sqlx::query(
+                "UPDATE items SET item_data = ? WHERE conversation_id = 'c' AND item_id = ? \
+                 AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            )
+            .bind(serde_json::to_string(&items.get(1).unwrap().item_data).unwrap())
+            .bind(&items.get(1).unwrap().item_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        }
+        let mut expected = Vec::with_capacity(items.len() + 1);
+        expected.push(legacy);
+        for item in &items {
+            expected.push(item.item_data.clone());
+        }
+        assert_eq!(
+            store.conversation_history(&owner, "c").await.unwrap(),
+            Some(expected),
+            "recovery preserves the complete legacy prefix and position/item-id ordering"
+        );
+        store.close().await;
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear checkpoint, cancellation, and ownership-release assertions"
+    )]
+    async fn interrupt_history_read(
+        store: &mut SqliteResponseStore,
+        owner: &StateOwner,
+        expected: &serde_json::Value,
+        cancel: bool,
+    ) {
+        let probe = Arc::new(HistoryReadProbe::default());
+        store.history_read_probe = Some(Arc::clone(&probe));
+        let mut read = Box::pin(store.conversation_history(owner, "c"));
+        let early = tokio::select! {
+            result = &mut read => Some(result),
+            () = probe.reached.notified() => None,
+        };
+        assert!(
+            early.is_none(),
+            "reader completed before the decoded-prefix checkpoint: {early:?}"
+        );
+        {
+            let prefix = probe
+                .prefix
+                .lock()
+                .unwrap()
+                .upgrade()
+                .expect("reader owns the allocated prefix");
+            let values = prefix.lock().unwrap();
+            assert_eq!(values.len(), 1, "pause after a decoded row, not pool acquisition");
+            assert_eq!(
+                values.first(),
+                Some(expected),
+                "the prefix holds the first ordered item"
+            );
+            drop(values);
+        }
+        assert_eq!(store.pool.size(), 1, "the memory store pool has exactly one connection");
+        assert_eq!(store.pool.num_idle(), 0, "reader holds the only lease");
+        if cancel {
+            drop(read);
+        } else {
+            probe.resume.notify_one();
+            assert!(
+                matches!(read.await, Err(StoreError::Serialization(_))),
+                "corrupt second row must not return the valid prefix"
+            );
+        }
+        assert!(
+            probe.prefix.lock().unwrap().upgrade().is_none(),
+            "the actual decoded vector and its payloads were dropped"
+        );
+        store.history_read_probe = None;
+    }
+
+    async fn read_snapshot(store: &SqliteResponseStore, owner: &StateOwner) -> (String, Vec<(String, i64, String)>) {
+        let cache = sqlx::query_scalar(
+            "SELECT messages FROM conversations WHERE conversation_id = 'c' \
+             AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+        )
+        .bind(owner.tenant_id())
+        .bind(owner.issuer())
+        .bind(owner.subject())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        let rows = sqlx::query_as(
+            "SELECT item_id, position, item_data FROM items WHERE conversation_id = 'c' \
+             AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ? ORDER BY position, item_id",
+        )
+        .bind(owner.tenant_id())
+        .bind(owner.issuer())
+        .bind(owner.subject())
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        (cache, rows)
+    }
+
+    #[derive(Default)]
+    pub(super) struct HistoryReadProbe {
+        prefix: Mutex<Weak<Mutex<Vec<serde_json::Value>>>>,
+        reached: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    impl HistoryReadProbe {
+        pub(super) async fn after_row(&self, history: &ReadHistory) {
+            if history.0.lock().unwrap().len() == 1 {
+                *self.prefix.lock().unwrap() = Arc::downgrade(&history.0);
+                self.reached.notify_one();
+                self.resume.notified().await;
+            }
+        }
+    }
+
+    // Weak observes the allocation that owns the real decoded values, not a
+    // detached drop sentinel. No guard is held while the reader is suspended.
+    pub(super) struct ReadHistory(Arc<Mutex<Vec<serde_json::Value>>>);
+
+    impl ReadHistory {
+        pub(super) fn new() -> Self {
+            Self(Arc::new(Mutex::new(Vec::new())))
+        }
+
+        pub(super) fn push(&self, item: serde_json::Value) {
+            self.0.lock().unwrap().push(item);
+        }
+
+        pub(super) fn into_inner(self) -> Vec<serde_json::Value> {
+            Arc::try_unwrap(self.0).unwrap().into_inner().unwrap()
+        }
     }
 }

@@ -144,9 +144,13 @@ jobs:
           context: ${{ inputs.commit != '' && 'git' || 'workflow' }}
           # Nightly and dispatch builds never own latest-fips: only the
           # Release workflow (on a version tag) moves latest and latest-fips.
+          # latest=false already keeps them off latest; onlatest=true keeps the
+          # -fips suffix pinned to latest as well, so if latest is ever
+          # re-enabled here it stays latest-fips and never a bare latest that
+          # would overwrite the standard image (issue #1731).
           flavor: |
             latest=false
-            suffix=-fips
+            suffix=-fips,onlatest=true
           tags: |
             type=sha
             type=ref,event=branch

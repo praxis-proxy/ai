@@ -311,16 +311,21 @@ impl HttpCalloutFilter {
     /// itself failed (DNS/connect/I/O) and the caller should apply
     /// [`Self::failure_action`].
     async fn perform_callout(&self, request: SubRequest, fw: &FrameworkHeaders) -> Option<SubResponse> {
-        match subrequest::execute_url_with_framework(
-            &self.client,
-            &self.url,
-            request,
-            self.max_body_bytes,
-            self.timeout,
-            AddressPolicy::from_allow_private(self.allow_private_addresses),
-            Some(fw),
-        )
-        .await
+        // The callout URL is operator-configured, so it resolves through the
+        // shared DNS cache.
+        match self
+            .client
+            .execute_url(
+                &self.url,
+                request,
+                subrequest::address_policy_hook(AddressPolicy::from_allow_private(self.allow_private_addresses)),
+                subrequest::UrlResolutionPolicy::OperatorCached,
+                self.timeout,
+                self.max_body_bytes,
+                Some(fw),
+            )
+            .await
+            .map_err(subrequest::map_url_error)
         {
             Ok(response) => Some(response),
             Err(e) => {

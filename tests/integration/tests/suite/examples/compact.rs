@@ -712,12 +712,12 @@ async fn compact_explicit_endpoint() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_explicit_endpoint_response_is_valid_follow_up_target() {
-    assert_compaction_follow_up(false).await;
+    Box::pin(assert_compaction_follow_up(false)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_explicit_endpoint_compressed_response_is_valid_follow_up_target() {
-    assert_compaction_follow_up(true).await;
+    Box::pin(assert_compaction_follow_up(true)).await;
 }
 
 /// Verify persisted compaction can be rehydrated with either storage codec.
@@ -1277,6 +1277,36 @@ async fn compact_explicit_endpoint_rejects_malformed_message_content() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_non_text_content_before_callout() {
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_non_text_content",
+        r#"{"model":"gpt-4.1","input":[{"role":"user","content":[{"type":"input_text","text":"look"},{"type":"input_image","image_url":"https://example.test/image.png"}]}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "input_image");
+    assert_eq!(
+        callouts, 0,
+        "non-text content must not trigger a lossy summarization callout"
+    );
+    assert_eq!(rows, 0, "rejected non-text content must not be persisted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_output_text_annotations_before_callout() {
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_output_annotations",
+        r#"{"model":"gpt-4.1","input":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"source","annotations":[{"type":"url_citation","url":"https://example.test"}]}]}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "annotations");
+    assert_eq!(
+        callouts, 0,
+        "annotated text must not trigger a lossy summarization callout"
+    );
+    assert_eq!(rows, 0, "rejected annotated text must not be persisted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_explicit_endpoint_rejects_wrong_typed_input_scalar() {
     // A wrong-typed scalar input with no prior id must 400 with the type error
     // rather than the generic "input or previous_response_id" message.
@@ -1411,6 +1441,211 @@ async fn compact_explicit_endpoint_valid_inline_input_makes_one_callout_and_pers
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_model_only_returns_noop_compaction() {
+    // Issue #1139: `model` is the only required field, so a model-only body is
+    // schema-valid and must not be rejected. With no conversation to summarize
+    // there is no callout, and the empty conversation is persisted as a no-op
+    // compaction (empty `output`, zero usage, empty stored history) — the same
+    // convention as a fail-open no-op.
+    let backend =
+        StatefulCapturingBackend::new(vec![(200, CHAT_COMPLETIONS_RESPONSE.to_owned()); 4]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("compact_model_only_noop");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+        .expect("example config should exist");
+    let config = load_compact_config(&yaml, db.url(), proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses/compact", r#"{"model":"gpt-4.1"}"#),
+    );
+    assert_eq!(parse_status(&raw), 200, "model-only compact should succeed: {raw}");
+
+    let resp: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be valid JSON");
+    assert_eq!(
+        resp["object"], "response.compaction",
+        "model-only response should be a response.compaction object"
+    );
+    assert_eq!(resp["status"], "completed", "a no-op compaction is completed");
+    let output = resp["output"].as_array().expect("output should be an array");
+    assert!(
+        output.is_empty(),
+        "a no-op compaction emits no compaction item, got: {output:?}"
+    );
+    assert_response_usage_contract(&resp["usage"]);
+    assert_eq!(
+        resp["usage"]["input_tokens"], 0,
+        "an empty conversation reports zero input tokens"
+    );
+    assert_eq!(
+        resp["usage"]["output_tokens"], 0,
+        "no summary was produced, so no output tokens"
+    );
+
+    let callouts = callout_count(&backend);
+    drop(proxy);
+    assert_eq!(
+        callouts, 0,
+        "an empty conversation must not trigger a summarization callout"
+    );
+    assert_eq!(
+        count_response_rows(db.url()).await,
+        1,
+        "the no-op compaction must be persisted so its id is a valid follow-up target"
+    );
+
+    // The persisted history is empty, matching the compacted conversation.
+    let returned_id = resp["id"].as_str().expect("response id should be a string");
+    let pool = sqlx::SqlitePool::connect(db.url())
+        .await
+        .expect("should connect to test database");
+    let row = sqlx::query("SELECT messages FROM openai_responses WHERE id = ?")
+        .bind(returned_id)
+        .fetch_one(&pool)
+        .await
+        .expect("no-op compaction record should be persisted");
+    pool.close().await;
+    let stored_messages: serde_json::Value =
+        serde_json::from_slice(&row.get::<Vec<u8>, _>("messages")).expect("messages should be valid JSON");
+    assert!(
+        stored_messages.as_array().is_some_and(Vec::is_empty),
+        "the persisted history of an empty conversation is empty: {stored_messages}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_empty_input_variants_return_noop_compaction() {
+    // Issue #1139: `input: null`, `input: ""`, and `input: []` are all
+    // schema-valid ways to carry no conversation; each compacts as a no-op
+    // with no summarization callout and one persisted row.
+    for (name, body) in [
+        ("compact_null_input_noop", r#"{"model":"gpt-4.1","input":null}"#),
+        ("compact_empty_string_input_noop", r#"{"model":"gpt-4.1","input":""}"#),
+        ("compact_empty_array_input_noop", r#"{"model":"gpt-4.1","input":[]}"#),
+    ] {
+        let (raw, callouts, rows) = run_inline_compact(name, body).await;
+        assert_eq!(parse_status(&raw), 200, "{body} should succeed: {raw}");
+        let resp: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be valid JSON");
+        assert_eq!(resp["object"], "response.compaction", "{body}: {raw}");
+        assert_eq!(resp["status"], "completed", "{body} is a completed no-op: {raw}");
+        assert!(
+            resp["output"].as_array().is_some_and(Vec::is_empty),
+            "{body} must return an empty output array: {raw}"
+        );
+        assert_response_usage_contract(&resp["usage"]);
+        assert_eq!(callouts, 0, "{body} must not trigger a summarization callout");
+        assert_eq!(rows, 1, "{body} must persist the no-op compaction");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_empty_input_with_referenced_history_still_compacts() {
+    // Companion to the empty-input no-op test above: an explicit empty inline
+    // `input` must not mask non-empty history referenced through
+    // `previous_response_id`. The referenced conversation is collected and
+    // summarized — never silently dropped as a no-op compaction.
+    //
+    // Phase 1: store a response with non-empty history via normal inference.
+    let backend1 = Backend::fixed(FIRST_RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("compact_empty_input_referenced_history");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
+        .expect("example config should exist");
+
+    let config1 = load_compact_config(&yaml, db.url(), proxy_port, backend1.port());
+    let proxy1 = start_proxy(&config1);
+    let raw1 = http_send(
+        proxy1.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Explain TCP vs UDP"}"#),
+    );
+    assert_eq!(parse_status(&raw1), 200, "first request should store response");
+    drop(backend1);
+    drop(proxy1);
+
+    // Phase 2: compact referencing the stored history with an explicit empty
+    // inline input.
+    let backend2 =
+        StatefulCapturingBackend::new(vec![(200, CHAT_COMPLETIONS_RESPONSE.to_owned()); 4]).start_with_shutdown();
+    let config2 = load_compact_config(&yaml, db.url(), proxy_port, backend2.port());
+    let proxy2 = start_proxy(&config2);
+
+    let raw2 = http_send(
+        proxy2.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-4.1","input":[],"previous_response_id":"resp_compact"}"#,
+        ),
+    );
+    assert_eq!(
+        parse_status(&raw2),
+        200,
+        "empty inline input with referenced history should compact: {raw2}"
+    );
+
+    // The referenced history must trigger exactly one summarization callout,
+    // and that callout must carry the referenced conversation.
+    let requests = backend2.requests();
+    let callouts: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
+    assert_eq!(
+        callouts.len(),
+        1,
+        "referenced history must trigger exactly one summarization callout"
+    );
+    assert!(
+        callouts[0].body.contains("Explain TCP vs UDP"),
+        "the summarization callout must carry the referenced history: {}",
+        callouts[0].body
+    );
+
+    // The returned compaction carries a summary item with usage threaded from
+    // the callout, not the empty output and zero usage of a no-op.
+    let resp: serde_json::Value = serde_json::from_str(&parse_body(&raw2)).expect("response should be valid JSON");
+    assert_eq!(resp["object"], "response.compaction", "compaction object: {raw2}");
+    let output = resp["output"].as_array().expect("output should be an array");
+    assert_eq!(
+        output.len(),
+        1,
+        "referenced history must produce one compaction item, not a no-op: {output:?}"
+    );
+    assert_compaction_item_contract(&output[0]);
+    assert_response_usage_contract(&resp["usage"]);
+    assert_eq!(
+        resp["usage"]["input_tokens"], 50,
+        "usage must be threaded from the callout, proving a summary was made"
+    );
+    drop(proxy2);
+
+    // The compaction is persisted with its summary item.
+    assert_eq!(
+        count_response_rows(db.url()).await,
+        2,
+        "the stored source response plus the new compaction row"
+    );
+    let returned_id = resp["id"].as_str().expect("response id should be a string");
+    let pool = sqlx::SqlitePool::connect(db.url())
+        .await
+        .expect("should connect to test database");
+    let row = sqlx::query("SELECT messages FROM openai_responses WHERE id = ?")
+        .bind(returned_id)
+        .fetch_one(&pool)
+        .await
+        .expect("compaction record should be persisted");
+    pool.close().await;
+    let stored_messages: serde_json::Value =
+        serde_json::from_slice(&row.get::<Vec<u8>, _>("messages")).expect("messages should be valid JSON");
+    let items = stored_messages.as_array().expect("messages should be an array");
+    assert_eq!(
+        items.len(),
+        1,
+        "persisted messages should hold the single compaction item"
+    );
+    assert_compaction_item_contract(&items[0]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_explicit_endpoint_accepts_function_call_output_content_list() {
     // Regression for the #1403 follow-up fix: a `function_call_output` whose
     // `output` is a content-list (`string | content-list` in the Responses API)
@@ -1458,83 +1693,31 @@ async fn compact_explicit_endpoint_accepts_function_call_output_content_list() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn compact_explicit_endpoint_accepts_additional_tools_item() {
-    // Regression for the #1403 follow-up fix: an `additional_tools` item is
-    // explicitly typed and carries a `role` but no `content`; it is not a message,
-    // so a request that pairs it with a valid user message must be accepted and
-    // summarized/stored rather than 400-rejected for a missing `content`.
-    let backend =
-        StatefulCapturingBackend::new(vec![(200, CHAT_COMPLETIONS_RESPONSE.to_owned()); 4]).start_with_shutdown();
-    let proxy_port = free_port();
-    let db = TempSqlite::new("compact_additional_tools");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
-        .expect("example config should exist");
-    let config = load_compact_config(&yaml, db.url(), proxy_port, backend.port());
-    let proxy = start_proxy(&config);
-
-    let raw = http_send(
-        proxy.addr(),
-        &json_post(
-            "/v1/responses/compact",
-            r#"{"model":"gpt-4.1","input":[{"type":"additional_tools","role":"developer","tools":[]},{"role":"user","content":"Hello"}]}"#,
-        ),
-    );
-    assert_eq!(
-        parse_status(&raw),
-        200,
-        "an additional_tools item must be accepted: {raw}"
-    );
-
-    let requests = backend.requests();
-    let callouts: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
-    assert_eq!(callouts.len(), 1, "a valid compact must make exactly one callout");
-    drop(proxy);
-
-    assert_eq!(
-        count_response_rows(db.url()).await,
-        1,
-        "a valid compact must persist exactly one compaction row"
-    );
+async fn compact_explicit_endpoint_rejects_unrepresentable_additional_tools_item() {
+    // The item remains schema-valid input, but the text renderer has no lossless
+    // representation for it, so compaction must fail before replacement.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_additional_tools",
+        r#"{"model":"gpt-4.1","input":[{"type":"additional_tools","role":"developer","tools":[]},{"role":"user","content":"Hello"}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "additional_tools");
+    assert_eq!(callouts, 0, "unrepresentable tool metadata must not trigger a callout");
+    assert_eq!(rows, 0, "unrepresentable tool metadata must not be persisted");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn compact_explicit_endpoint_accepts_null_type_item_reference() {
-    // Regression for the #1403 follow-up fix: `ItemReferenceParam.type` is nullable
-    // in the schema, so a reference-shaped item with an explicit null `type` and an
-    // `id` (but no `role`/`content`), paired with a valid user message, must be
-    // accepted and summarized/stored rather than 400-rejected.
-    let backend =
-        StatefulCapturingBackend::new(vec![(200, CHAT_COMPLETIONS_RESPONSE.to_owned()); 4]).start_with_shutdown();
-    let proxy_port = free_port();
-    let db = TempSqlite::new("compact_null_type_item_reference");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
-        .expect("example config should exist");
-    let config = load_compact_config(&yaml, db.url(), proxy_port, backend.port());
-    let proxy = start_proxy(&config);
-
-    let raw = http_send(
-        proxy.addr(),
-        &json_post(
-            "/v1/responses/compact",
-            r#"{"model":"gpt-4.1","input":[{"type":null,"id":"resp_123"},{"role":"user","content":"Hello"}]}"#,
-        ),
-    );
-    assert_eq!(
-        parse_status(&raw),
-        200,
-        "a null-typed item_reference must be accepted: {raw}"
-    );
-
-    let requests = backend.requests();
-    let callouts: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
-    assert_eq!(callouts.len(), 1, "a valid compact must make exactly one callout");
-    drop(proxy);
-
-    assert_eq!(
-        count_response_rows(db.url()).await,
-        1,
-        "a valid compact must persist exactly one compaction row"
-    );
+async fn compact_explicit_endpoint_rejects_unrepresentable_item_reference() {
+    // ItemReferenceParam.type may be null, so syntax parsing accepts this shape.
+    // Compaction still rejects it because the renderer omits the reference id.
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_null_type_item_reference",
+        r#"{"model":"gpt-4.1","input":[{"type":null,"id":"resp_123"},{"role":"user","content":"Hello"}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "item_reference");
+    assert_eq!(callouts, 0, "an item reference must not trigger a lossy callout");
+    assert_eq!(rows, 0, "an item reference must not be persisted after rejection");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1649,6 +1832,24 @@ async fn compact_explicit_endpoint_rejects_null_compaction_encrypted_content() {
         "a null encrypted_content must not trigger a summarization callout"
     );
     assert_eq!(rows, 0, "a null encrypted_content must not persist a compaction");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_rejects_unrenderable_compaction_content() {
+    let (raw, callouts, rows) = run_inline_compact(
+        "compact_reject_unrenderable_encrypted_content",
+        r#"{"model":"gpt-4.1","input":[{"type":"compaction","encrypted_content":"provider-opaque-state"}]}"#,
+    )
+    .await;
+    assert_rejected_400(&raw, "item type `compaction` cannot be represented");
+    assert_eq!(
+        callouts, 0,
+        "unrenderable compaction content must not trigger a summarization callout"
+    );
+    assert_eq!(
+        rows, 0,
+        "unrenderable compaction content must not persist a replacement"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

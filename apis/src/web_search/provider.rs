@@ -15,13 +15,15 @@ use std::{
 
 use bytes::Bytes;
 use http::HeaderMap;
-use praxis_core::connectivity::{PreparedSubrequest, PreparedTarget, prepare_url_target};
+use praxis_core::connectivity::{
+    PreparedSubrequest, PreparedTarget, UrlResolutionPolicy, prepare_url_target_with_policy,
+};
 use praxis_filter::{
     CalloutOutcome, CalloutResponse, DeferredCredential, FilterError, FilterPipeline, FilteredSubrequestExecutor,
     HttpFilterContext, IterationState, PendingCredentials, RequestExtensions, StagedUpstream, StagedUpstreamFallback,
     SubrequestRuntime,
 };
-use secrecy::{ExposeSecret as _, SecretString};
+use secrecy::ExposeSecret as _;
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -31,12 +33,13 @@ use super::{
 };
 use crate::{
     callout_identity::CalloutIdentity,
+    credential_source::SecretHandle,
     subrequest::{SubRequest, SubRequestClient, SubResponse},
 };
 
 /// Response body cap for search callouts (1 MiB). Distinct from
 /// `max_body_bytes` which governs inbound request buffering.
-const MAX_SEARCH_RESPONSE_BYTES: usize = 1_048_576;
+pub(crate) const MAX_SEARCH_RESPONSE_BYTES: usize = 1_048_576;
 
 // -----------------------------------------------------------------------------
 // SearchResult
@@ -62,6 +65,9 @@ pub(crate) struct SearchResult {
 pub(crate) enum SearchOutcome {
     /// Search succeeded. An empty vector is a successful zero-result search.
     Results(Vec<SearchResult>),
+    /// The request-wide retained-payload allowance stopped body collection.
+    /// This must terminate the logical response, not become a provider failure.
+    RetainedLimitExceeded,
     /// Search failed — timeout, transport error, non-2xx status, oversized
     /// response, or unparseable body. Callers continue with a truthful failed
     /// tool result rather than exposing provider details to the client.
@@ -151,8 +157,10 @@ pub(crate) struct SearchClient {
     timeout: Duration,
     /// Search backend provider.
     provider: SearchProvider,
-    /// API key for the search provider.
-    api_key: SecretString,
+    /// Published handle to the shared provider API key. A `None` payload (a
+    /// post-startup rotation gap) fails the callout closed rather than dialing
+    /// the provider unauthenticated.
+    api_key: SecretHandle,
     /// Default search context size.
     default_context_size: SearchContextSize,
     /// Override the provider's default API base URL.
@@ -205,14 +213,14 @@ fn provider_auth(provider: SearchProvider) -> (http::HeaderName, &'static str) {
 /// from.
 ///
 /// The executor resolves the callout destination from this same URL (via
-/// [`prepare_url_target`]), so binding the credential to the authority derived
+/// [`prepare_url_target_with_policy`]), so binding the credential to the authority derived
 /// here matches the resolved destination by construction while being dropped,
 /// zeroized, on any host *or* port divergence — an exact authority, never a host
 /// wildcard. The port is the URL's explicit port, else the scheme default (443
 /// for `https` or a scheme-less URL, 80 for `http`) — the same effective port the
-/// executor pins. `IPv6` literals are re-bracketed because `Uri::host` strips the
-/// brackets but [`DeferredCredential::new`] requires bracketed `IPv6` to separate
-/// host from port.
+/// executor pins. `Uri::host` already returns `IPv6` literals bracketed, so only
+/// an unbracketed literal is re-bracketed here; [`DeferredCredential::new`]
+/// requires bracketed `IPv6` to separate host from port.
 ///
 /// # Errors
 ///
@@ -256,17 +264,20 @@ fn is_iso_3166_alpha2(country: &str) -> bool {
 impl SearchClient {
     /// Build a search client from validated filter config.
     ///
+    /// The API key is already validated as a legal HTTP header value when its
+    /// [`SecretHandle`] is published (see `build_config`); the handle is cloned
+    /// here (a cheap `Arc` bump) so request-time staging always reads the live
+    /// token.
+    ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the API key header value is
-    /// not valid ASCII.
+    /// Returns [`FilterError`] if the effective base URL does not yield a
+    /// bindable `host:port` authority.
     pub(crate) fn from_config(
         filter_name: &'static str,
         config: &ValidatedConfig,
         subrequest_client: SubRequestClient,
     ) -> Result<Self, FilterError> {
-        http::HeaderValue::from_str(config.api_key.expose_secret())
-            .map_err(|e| FilterError::from(format!("{filter_name}: invalid API key header value: {e}")))?;
         // Validate up front that the effective base URL yields a bindable
         // `host:port` authority: a malformed authority would otherwise only
         // surface at callout time, silently dropping the deferred credential and
@@ -308,6 +319,34 @@ impl SearchClient {
         country: Option<&str>,
         identity: &CalloutIdentity,
     ) -> SearchOutcome {
+        self.search_with_response_limit(
+            outbound,
+            callout,
+            query,
+            context_size,
+            country,
+            identity,
+            MAX_SEARCH_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    /// Execute a search with a body ceiling derived from the enclosing
+    /// request's retained-payload budget.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the caller supplies identity and the request-wide body ceiling"
+    )]
+    pub(crate) async fn search_with_response_limit(
+        &self,
+        outbound: &Arc<FilterPipeline>,
+        callout: CalloutContext,
+        query: &str,
+        context_size: Option<SearchContextSize>,
+        country: Option<&str>,
+        identity: &CalloutIdentity,
+        response_limit: usize,
+    ) -> SearchOutcome {
         let size = context_size.unwrap_or(self.default_context_size);
         let count = size.result_count();
         debug!(
@@ -328,7 +367,8 @@ impl SearchClient {
             SearchProvider::Tavily => self.build_tavily_request(query, size),
             SearchProvider::You => self.build_you_request(query, count, country),
         };
-        self.execute_search(outbound, callout, &url, request, identity).await
+        self.execute_search_with_limit(outbound, callout, &url, request, identity, response_limit)
+            .await
     }
 
     /// Provider name for diagnostics and client-facing rejection messages.
@@ -405,7 +445,7 @@ impl SearchClient {
     /// Execute a search request through the outbound chain and map the response
     /// to a [`SearchOutcome`].
     ///
-    /// The provider destination is resolved with [`prepare_url_target`] (a
+    /// The provider destination is resolved with [`prepare_url_target_with_policy`] (a
     /// permissive validation hook — private-address/SSRF enforcement is deferred
     /// to the executor's connect-time `build_peer`, gated by
     /// `insecure_options.allow_private_upstreams`) and staged as a
@@ -421,6 +461,7 @@ impl SearchClient {
         clippy::too_many_arguments,
         reason = "threads the caller's per-callout identity through the fixed staging chain"
     )]
+    #[cfg(test)]
     async fn execute_search(
         &self,
         outbound: &Arc<FilterPipeline>,
@@ -429,6 +470,27 @@ impl SearchClient {
         request: SubRequest,
         identity: &CalloutIdentity,
     ) -> SearchOutcome {
+        self.execute_search_with_limit(outbound, callout, url, request, identity, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+    }
+
+    /// Execute one provider request with the selected response body limit.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "staged callout carries the request-wide body ceiling"
+    )]
+    async fn execute_search_with_limit(
+        &self,
+        outbound: &Arc<FilterPipeline>,
+        callout: CalloutContext,
+        url: &str,
+        request: SubRequest,
+        identity: &CalloutIdentity,
+        response_limit: usize,
+    ) -> SearchOutcome {
+        if response_limit == 0 {
+            return SearchOutcome::RetainedLimitExceeded;
+        }
         // A callout receives at most its configured timeout and never a fresh
         // budget beyond the enclosing IRR's absolute request deadline. This is
         // recomputed for every round, so later calls inherit only the time that
@@ -444,11 +506,11 @@ impl SearchClient {
             self.client.clone(),
             callout.runtime,
             callout.depth,
-            MAX_SEARCH_RESPONSE_BYTES,
+            response_limit.min(MAX_SEARCH_RESPONSE_BYTES),
             self.timeout,
         );
         let result = Self::dispatch_callout(executor, outbound, prepared.request(), extensions, deadline).await;
-        self.map_callout_outcome(result)
+        self.map_callout_outcome(result, response_limit < MAX_SEARCH_RESPONSE_BYTES)
     }
 
     /// Resolve and stage the provider destination for a callout.
@@ -466,14 +528,19 @@ impl SearchClient {
         identity: &CalloutIdentity,
     ) -> Option<(PreparedSubrequest, RequestExtensions)> {
         // Private-address / SSRF enforcement is deferred to the executor's
-        // connect-time `build_peer`, so this hook is permissive.
-        let target = match prepare_url_target(url, deadline, |_addrs| Ok(())).await {
-            Ok(target) => target,
-            Err(e) => {
-                warn!(provider = self.provider.as_str(), error = %e, "search callout target preparation failed");
-                return None;
-            },
-        };
+        // connect-time `build_peer`, so this hook is permissive. The provider
+        // endpoint is operator-configured, so it resolves through the shared
+        // DNS cache.
+        let target =
+            match prepare_url_target_with_policy(url, deadline, |_addrs| Ok(()), UrlResolutionPolicy::OperatorCached)
+                .await
+            {
+                Ok(target) => target,
+                Err(e) => {
+                    warn!(provider = self.provider.as_str(), error = %e, "search callout target preparation failed");
+                    return None;
+                },
+            };
         // Assemble the executor extensions while `target` is still owned, then
         // let `bind` consume it into the origin-form request.
         let extensions = self.stage_extensions(&target, url, identity)?;
@@ -554,15 +621,26 @@ impl SearchClient {
         // divergence (a retargeted or port-shifted callout cannot carry the secret).
         let authority = credential_authority(url)?;
         // Prefer the caller's per-user secret from the configured slot; fall back to
-        // the shared provider key. Both are deferred (never placed on the in-chain
-        // request) and injected by the executor only at the resolved, pinned host.
-        let secret = identity
-            .user_credential()
-            .map_or_else(|| self.api_key.expose_secret(), |user| user.expose_secret());
+        // the shared provider key read from its live handle. Both are deferred
+        // (never placed on the in-chain request) and injected by the executor only
+        // at the resolved, pinned host. A post-startup rotation that publishes no
+        // valid shared key (a `None` payload) fails the callout closed here rather
+        // than dialing the provider unauthenticated.
+        //
         // Assemble the scheme-prefixed header value. The transient String is the
         // same allocation `DeferredCredential::new` wraps in `Zeroizing`, so the
         // secret is wiped on drop; the empty prefix leaves the raw key unchanged.
-        let value = format!("{prefix}{secret}");
+        let value = if let Some(user) = identity.user_credential() {
+            format!("{prefix}{}", user.expose_secret())
+        } else {
+            let snapshot = self.api_key.current();
+            let Some(key) = snapshot.payload.as_deref() else {
+                return Err(FilterError::from(
+                    "web_search: API key unavailable after rotation".to_owned(),
+                ));
+            };
+            format!("{prefix}{key}")
+        };
         let credential = DeferredCredential::new(&authority, header, value)?;
         let mut pending = PendingCredentials::new();
         pending.push(credential);
@@ -594,9 +672,9 @@ impl SearchClient {
     /// loop and never surfaces a provider-response status to the client, so
     /// [`CalloutOutcome::ResponseTooLarge`] fails the callout closed — the model
     /// then continues with a truthful "search unavailable" result.
-    fn map_callout_outcome(&self, result: Result<CalloutOutcome, FilterError>) -> SearchOutcome {
+    fn map_callout_outcome(&self, result: Result<CalloutOutcome, FilterError>, request_limited: bool) -> SearchOutcome {
         match result {
-            Ok(outcome) => self.map_callout_success(outcome),
+            Ok(outcome) => self.map_callout_success(outcome, request_limited),
             Err(e) => {
                 warn!(provider = self.provider.as_str(), error = %e, "search callout failed");
                 SearchOutcome::Failed
@@ -608,7 +686,7 @@ impl SearchClient {
     /// [`SearchOutcome`], failing closed on anything but a bounded buffered
     /// response. Split from [`map_callout_outcome`](Self::map_callout_outcome)
     /// so each stays within the cognitive-complexity budget.
-    fn map_callout_success(&self, outcome: CalloutOutcome) -> SearchOutcome {
+    fn map_callout_success(&self, outcome: CalloutOutcome, request_limited: bool) -> SearchOutcome {
         match outcome {
             CalloutOutcome::Response(CalloutResponse::Buffered(response)) => self.map_search_result(&response),
             CalloutOutcome::Response(CalloutResponse::Streaming { .. }) => {
@@ -625,7 +703,11 @@ impl SearchClient {
                     limit,
                     "search callout response exceeded the size limit; treating as failed"
                 );
-                SearchOutcome::Failed
+                if request_limited {
+                    SearchOutcome::RetainedLimitExceeded
+                } else {
+                    SearchOutcome::Failed
+                }
             },
             // `CalloutOutcome` is `#[non_exhaustive]`: a future classified outcome
             // fails the callout closed rather than being read as a success.
@@ -915,8 +997,15 @@ mod tests {
     use praxis_core::connectivity::Upstream;
     use secrecy::SecretString;
     use serde_json::json;
+    use zeroize::Zeroizing;
 
     use super::*;
+    use crate::web_search::config::MAX_SEARCH_QUERY_BYTES;
+
+    /// Build a fixed, non-watched API-key handle for provider tests.
+    fn test_api_key(key: &str) -> SecretHandle {
+        SecretHandle::from_snapshot_for_test(Some(Zeroizing::new(key.to_owned())))
+    }
 
     fn test_subrequest_client() -> SubRequestClient {
         // Build the TLS connector (and its one-time macOS platform-cert load) once
@@ -1029,10 +1118,11 @@ mod tests {
     fn build_you_request_defers_api_key_and_sends_body() {
         let config = ValidatedConfig {
             provider: SearchProvider::You,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: None,
             user_credential: None,
         };
@@ -1065,10 +1155,11 @@ mod tests {
     fn test_client_for(provider: SearchProvider) -> SearchClient {
         let config = ValidatedConfig {
             provider,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: None,
             user_credential: None,
         };
@@ -1093,10 +1184,11 @@ mod tests {
     fn brave_config_with_shared_key(shared: &str) -> ValidatedConfig {
         ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: SecretString::from(shared.to_owned()),
+            api_key: test_api_key(shared),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: None,
             user_credential: None,
         }
@@ -1179,10 +1271,11 @@ mod tests {
     fn search_client_from_config() {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: None,
             user_credential: None,
         };
@@ -1191,24 +1284,30 @@ mod tests {
     }
 
     #[test]
-    fn invalid_api_key_diagnostic_names_owner() {
+    fn staged_credentials_fail_closed_when_shared_key_unavailable() {
+        // A post-startup rotation that publishes no valid token leaves the handle
+        // payload `None`. Staging the shared provider key must fail closed rather
+        // than dialing the provider unauthenticated. The key header value is
+        // validated when the handle is published, so `from_config` still builds.
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: SecretString::from("invalid\nkey".to_owned()),
+            api_key: SecretHandle::from_snapshot_for_test(None),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: None,
             user_credential: None,
         };
-
-        let error = SearchClient::from_config("anthropic_web_search", &config, test_subrequest_client()).unwrap_err();
-
+        let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
+        let (url, _) = client.build_brave_request("test", 5, None);
+        let error = client
+            .staged_credentials(&url, &shared_key_identity())
+            .err()
+            .expect("a None shared-key payload must fail staging closed");
         assert!(
-            error
-                .to_string()
-                .contains("anthropic_web_search: invalid API key header value"),
-            "diagnostic should name the owning filter: {error}"
+            error.to_string().contains("API key unavailable after rotation"),
+            "the fail-closed error should explain the rotation gap: {error}"
         );
     }
 
@@ -1216,10 +1315,11 @@ mod tests {
     fn base_url_overrides_brave_url() {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: Some("http://localhost:9999".into()),
             user_credential: None,
         };
@@ -1235,10 +1335,11 @@ mod tests {
     fn base_url_overrides_tavily_url() {
         let config = ValidatedConfig {
             provider: SearchProvider::Tavily,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: Some("http://localhost:9999".into()),
             user_credential: None,
         };
@@ -1254,10 +1355,11 @@ mod tests {
     fn base_url_overrides_you_url() {
         let config = ValidatedConfig {
             provider: SearchProvider::You,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: Some("http://localhost:9999".into()),
             user_credential: None,
         };
@@ -1435,10 +1537,11 @@ mod tests {
     fn parse_failure_returns_failed() {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: None,
             user_credential: None,
         };
@@ -1454,10 +1557,11 @@ mod tests {
     fn parse_empty_results_is_successful_zero_result_search() {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: None,
             user_credential: None,
         };
@@ -1472,14 +1576,32 @@ mod tests {
     fn test_search_client() -> SearchClient {
         let config = ValidatedConfig {
             provider: SearchProvider::Brave,
-            api_key: SecretString::from("test-key".to_owned()),
+            api_key: test_api_key("test-key"),
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 1000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: None,
             user_credential: None,
         };
         SearchClient::from_config("test", &config, test_subrequest_client()).unwrap()
+    }
+
+    #[test]
+    fn request_limited_web_body_overflow_is_distinct_from_provider_failure() {
+        let client = test_search_client();
+        let oversized = || CalloutOutcome::ResponseTooLarge {
+            actual: Some(33),
+            limit: 32,
+        };
+        assert!(matches!(
+            client.map_callout_success(oversized(), false),
+            SearchOutcome::Failed
+        ));
+        assert!(matches!(
+            client.map_callout_success(oversized(), true),
+            SearchOutcome::RetainedLimitExceeded
+        ));
     }
 
     #[test]
@@ -1909,10 +2031,14 @@ mod tests {
         let attacker_addr = attacker_listener.local_addr().unwrap();
         let attacker_rx = spawn_recording_server(attacker_listener, 200, "{}");
         let attacker_url = format!("http://{attacker_addr}/");
-        let attacker_target =
-            prepare_url_target(&attacker_url, Instant::now() + Duration::from_secs(5), |_addrs| Ok(()))
-                .await
-                .unwrap();
+        let attacker_target = prepare_url_target_with_policy(
+            &attacker_url,
+            Instant::now() + Duration::from_secs(5),
+            |_addrs| Ok(()),
+            UrlResolutionPolicy::OperatorCached,
+        )
+        .await
+        .unwrap();
         let attacker_upstream = StagedUpstream::from_prepared_target(&attacker_target).unwrap().0;
         let url = format!("http://{provider_addr}/res/v1/web/search?q=test&count=5");
         (url, retargeting_outbound(attacker_upstream), provider_rx, attacker_rx)
@@ -2102,9 +2228,14 @@ mod tests {
     async fn stage_extensions_projects_owner_into_child_extensions() {
         let client = test_client_for(SearchProvider::Brave);
         let url = "http://127.0.0.1:9/res/v1/web/search";
-        let target = prepare_url_target(url, Instant::now() + Duration::from_secs(5), |_addrs| Ok(()))
-            .await
-            .unwrap();
+        let target = prepare_url_target_with_policy(
+            url,
+            Instant::now() + Duration::from_secs(5),
+            |_addrs| Ok(()),
+            UrlResolutionPolicy::OperatorCached,
+        )
+        .await
+        .unwrap();
         let identity = CalloutIdentity::for_test(
             Some(crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap()),
             None,
@@ -2170,7 +2301,10 @@ mod tests {
     /// [`SearchClient::execute_search`] performs.
     async fn dispatch_with_staged_credential(url: &str, pending: PendingCredentials) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        let target = prepare_url_target(url, deadline, |_addrs| Ok(())).await.unwrap();
+        let target =
+            prepare_url_target_with_policy(url, deadline, |_addrs| Ok(()), UrlResolutionPolicy::OperatorCached)
+                .await
+                .unwrap();
         let mut extensions = RequestExtensions::default();
         extensions.insert(StagedUpstream::from_prepared_target(&target).unwrap());
         extensions.insert(StagedUpstreamFallback::from_prepared_target(&target));

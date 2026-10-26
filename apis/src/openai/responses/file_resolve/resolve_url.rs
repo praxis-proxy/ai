@@ -125,55 +125,48 @@ fn is_valid_mime_type(s: &str) -> bool {
         && subtype.chars().all(is_data_uri_safe_token)
 }
 
-/// Redact sensitive parts of a URL for safe logging.
+/// Return an origin-only URL label for safe logging.
 ///
-/// Strips credentials and fragments, and replaces query parameter values
-/// with `[REDACTED]`.
-pub(crate) fn redact_url(raw: &str) -> String {
-    let Ok(mut url) = url::Url::parse(raw) else {
+/// Paths can contain bearer tokens and signed download identifiers, so the
+/// complete path, query, fragment, and credentials are omitted.
+pub(crate) fn safe_url_label(raw: &str) -> String {
+    let Ok(url) = url::Url::parse(raw) else {
         return "<invalid URL>".to_owned();
     };
-    // Clear credentials (error only occurs if cannot-be-a-base, which was already validated)
-    #[expect(clippy::let_underscore_must_use, reason = "Result<(), ()> intentionally ignored")]
-    {
-        let _ = url.set_username("");
-        let _ = url.set_password(None);
+
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return "<unsupported URL scheme>".to_owned();
     }
 
-    url.set_fragment(None);
-
-    // Redact query values
-    if url.query().is_some() {
-        let redacted_pairs: Vec<_> = url
-            .query_pairs()
-            .map(|(key, _value)| format!("{key}=[REDACTED]"))
-            .collect();
-        if !redacted_pairs.is_empty() {
-            url.set_query(Some(&redacted_pairs.join("&")));
-        }
-    }
-
-    url.to_string()
+    url.origin().ascii_serialization()
 }
 
 /// Validate a `file_url`: must be http/https, no credentials, no fragment.
 pub(crate) fn validate_file_url(raw: &str) -> Result<url::Url, ResolveError> {
     let url = url::Url::parse(raw).map_err(|e| {
         tracing::debug!(error = %e, "invalid file_url");
-        ResolveError::FileUrlBlocked { label: redact_url(raw) }
+        ResolveError::FileUrlBlocked {
+            label: safe_url_label(raw),
+        }
     })?;
 
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" {
-        return Err(ResolveError::FileUrlBlocked { label: redact_url(raw) });
+        return Err(ResolveError::FileUrlBlocked {
+            label: safe_url_label(raw),
+        });
     }
 
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(ResolveError::FileUrlBlocked { label: redact_url(raw) });
+        return Err(ResolveError::FileUrlBlocked {
+            label: safe_url_label(raw),
+        });
     }
 
     if url.fragment().is_some() {
-        return Err(ResolveError::FileUrlBlocked { label: redact_url(raw) });
+        return Err(ResolveError::FileUrlBlocked {
+            label: safe_url_label(raw),
+        });
     }
 
     Ok(url)
@@ -342,7 +335,7 @@ impl FileUrlResolver {
         max_resolved_bytes: usize,
     ) -> Result<ResolvedFile, ResolveError> {
         let parsed_url = validate_file_url(url)?;
-        let label = redact_url(url);
+        let label = safe_url_label(url);
 
         // Pre-validate hostname before SubRequestClient handles DNS/SSRF
         if let Some(host) = parsed_url.host_str()
@@ -383,35 +376,41 @@ impl FileUrlResolver {
             body: bytes::Bytes::new(),
         };
 
-        let response = crate::subrequest::execute_url(
-            &self.client,
-            parsed_url.as_str(),
-            request,
-            max_resolved_bytes,
-            remaining,
-            address_policy,
-        )
-        .await
-        .map_err(|e| {
-            use crate::subrequest::SubRequestError;
-            match &e {
-                SubRequestError::DeadlineExceeded => ResolveError::FileUrlFailed {
-                    label: label.clone(),
-                    detail: "fetch timed out".to_owned(),
-                },
-                SubRequestError::Connect(detail) if detail.contains("blocked non-public address") => {
-                    ResolveError::FileUrlBlocked { label: label.clone() }
-                },
-                SubRequestError::ResponseTooLarge { .. } => ResolveError::TooLarge {
-                    reference: label.clone(),
-                    limit: max_resolved_bytes,
-                },
-                _ => ResolveError::FileUrlFailed {
-                    label: label.clone(),
-                    detail: "fetch failed".to_owned(),
-                },
-            }
-        })?;
+        // The file URL comes from the client's request, so resolve it per call
+        // to keep arbitrary hostnames out of the shared DNS cache.
+        let response = self
+            .client
+            .execute_url(
+                parsed_url.as_str(),
+                request,
+                crate::subrequest::address_policy_hook(address_policy),
+                crate::subrequest::UrlResolutionPolicy::ClientPerCall,
+                remaining,
+                max_resolved_bytes,
+                None,
+            )
+            .await
+            .map_err(crate::subrequest::map_url_error)
+            .map_err(|e| {
+                use crate::subrequest::SubRequestError;
+                match &e {
+                    SubRequestError::DeadlineExceeded => ResolveError::FileUrlFailed {
+                        label: label.clone(),
+                        detail: "fetch timed out".to_owned(),
+                    },
+                    SubRequestError::Connect(detail) if detail.contains("blocked non-public address") => {
+                        ResolveError::FileUrlBlocked { label: label.clone() }
+                    },
+                    SubRequestError::ResponseTooLarge { .. } => ResolveError::TooLarge {
+                        reference: label.clone(),
+                        limit: max_resolved_bytes,
+                    },
+                    _ => ResolveError::FileUrlFailed {
+                        label: label.clone(),
+                        detail: "fetch failed".to_owned(),
+                    },
+                }
+            })?;
 
         // Check success status
         let status = http::StatusCode::from_u16(response.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
@@ -1399,55 +1398,25 @@ mod tests {
         assert!(!is_valid_mime_type("text/x|plain"), "pipe is not URI-safe");
     }
 
-    // RedactedUrl tests
+    // Safe URL label tests
     #[test]
-    fn redact_url_strips_credentials() {
-        let redacted = redact_url("https://user:pass@example.com/path");
-        assert!(!redacted.contains("user"), "username should be stripped");
-        assert!(!redacted.contains("pass"), "password should be stripped");
-        assert!(redacted.contains("example.com"), "host should remain");
+    fn safe_url_label_returns_only_origin() {
+        let label =
+            safe_url_label("https://user:pass@example.com:8443/path/SECRET_TOKEN?sig=SECRET_QUERY#SECRET_FRAGMENT");
+        assert_eq!(label, "https://example.com:8443");
     }
 
     #[test]
-    fn redact_url_replaces_query_values() {
-        let redacted = redact_url("https://example.com/file?token=secret&id=123");
-        assert!(redacted.contains("token=[REDACTED]"), "query key should remain");
-        assert!(!redacted.contains("secret"), "query value should be redacted");
-        assert!(
-            redacted.contains("id=[REDACTED]"),
-            "all query values should be redacted"
-        );
+    fn safe_url_label_handles_invalid_url() {
+        let label = safe_url_label("not a url");
+        assert_eq!(label, "<invalid URL>", "invalid URL should return placeholder");
     }
 
     #[test]
-    fn redact_url_preserves_path() {
-        let redacted = redact_url("https://example.com/sensitive/path");
-        assert!(redacted.contains("/sensitive/path"), "path should be preserved");
-    }
+    fn safe_url_label_does_not_resolve_unsupported_blob_origin() {
+        let deeply_nested_blob_url = format!("{}https://example.com/secret", "blob:".repeat(15_000));
 
-    #[test]
-    fn redact_url_handles_invalid_url() {
-        let redacted = redact_url("not a url");
-        assert_eq!(redacted, "<invalid URL>", "invalid URL should return placeholder");
-    }
-
-    #[test]
-    fn redact_url_no_query_unchanged() {
-        let redacted = redact_url("https://example.com/file.pdf");
-        assert_eq!(
-            redacted, "https://example.com/file.pdf",
-            "URL without query should remain unchanged except for redaction"
-        );
-    }
-
-    #[test]
-    fn redact_url_strips_fragment() {
-        let redacted = redact_url("https://example.com/file#access_token=secret");
-        assert!(
-            !redacted.contains("access_token"),
-            "fragment should be stripped entirely"
-        );
-        assert!(!redacted.contains('#'), "fragment delimiter should not remain");
+        assert_eq!(safe_url_label(&deeply_nested_blob_url), "<unsupported URL scheme>");
     }
 
     // validate_file_url tests

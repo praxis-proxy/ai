@@ -579,6 +579,7 @@ fn mcp_mock_direct_field_schema_validated_at_startup() {
         description: None,
         input_schema: serde_json::json!({"type": "string"}),
         name: "bad".to_owned(),
+        annotations: None,
     };
     let config = McpMockConfig {
         tools: vec![bad_tool],

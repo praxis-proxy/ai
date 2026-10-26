@@ -156,6 +156,24 @@ fn intelligent_route_overlay_hot_reload() {
     );
     assert_eq!(status, 404, "granite should 404 after reload removed it");
 
+    // A revision naming a cluster outside the configured `clusters` list is
+    // rejected and the previously accepted snapshot keeps serving.
+    std::fs::write(
+        &overlay_path,
+        r#"{"local_site":"site-a","candidates":[{"kind":"inference_model","name":"llama-3.2-8b","site":"site-b","cluster":"undeclared-cluster","fresh":true}]}"#,
+    )
+    .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    let (status, body) = http_post(
+        proxy.addr(),
+        "/v1/chat/completions",
+        r#"{"model":"llama-3.2-8b","messages":[]}"#,
+    );
+    assert_eq!(status, 200, "llama should still route after a rejected revision");
+    assert_eq!(body, "llama-response");
+
     drop(proxy);
 }
 
@@ -303,6 +321,7 @@ filter_chains:
       - filter: intelligent_route
         overlay_file: "{overlay}"
         model_header: X-Model
+        clusters: [granite-local, llama-remote]
         reload:
           enabled: true
           debounce_ms: 200

@@ -37,6 +37,7 @@ PROFILE_FIXTURES = {
         "witness_replay_limited_tool_client", "provider_compaction_client",
         "reasoning_capture_client", "file_resolve_stub_env", "model_rewrite_client",
         "model_rewrite_proxy",
+        "streaming_mcp_failure_client",
     },
 }
 

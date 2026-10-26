@@ -28,6 +28,8 @@ Before tagging a release:
 - [ ] `Cargo.lock` is regenerated with the new version
 - [ ] `.github/SECURITY.md` lists the new minor version
 - [ ] Pull request labels produce useful generated release notes
+- [ ] Inspect CI runs for the final release commit; the release report records
+      missing, skipped, failed, and unfinished evidence as well as successes
 - [ ] If native GPU qualification is desired, dispatch the existing vLLM
       workflow on the final release commit/tag and inspect its report
 
@@ -90,11 +92,35 @@ workflow creates each release with generated notes. Review pull request
 labels before tagging so entries fall into the categories configured in
 `.github/release.yml`. There is no separate `CHANGELOG.md` file.
 
-Every release includes an exact-commit native vLLM qualification section and
-an attached `qualification.json` status report. Missing or unverifiable GPU
-evidence is stated as unavailable; it does not block the release. See
-[native vLLM qualification](developing/vllm-qualification.md) for the report
-schema, selection policy, and final-tag dispatch procedure.
+Every release includes a **Release CI evidence** table with the scope, result,
+job counts, and run link for each tracked CI workflow at the release commit.
+The release's own unit, schema, and integration test gate is included. Missing
+runs remain visible, including workflows with path filters or optional triggers.
+
+The release attaches three reports:
+
+- `release-qualification.md`: readable CI job and step outcomes plus GPU details
+- `release-qualification.json`: versioned CI snapshot and the GPU report
+- `qualification.json`: the original vLLM GPU qualification report
+
+CI evidence is a snapshot at publication time, not a claim of complete API
+coverage. Skipped jobs and steps remain visible even in successful workflows;
+job counts are not individual test counts. The report selects the newest
+eligible run for the exact release commit and its latest attempt. PR runs are
+excluded because they may check out a synthetic merge. No results are borrowed
+from another commit or an older green run. Rerunning Release refreshes the
+snapshot and replaces both marked sections and all three assets.
+The CI workflow inventory and its scope descriptions live in
+`.github/scripts/release_qualification.py`; update them when adding or changing
+a validation workflow. Run `python3 -m unittest discover -s tests/qualification`
+to check selection, rendering, and the report-generation command.
+
+The separate **vLLM Responses gateway qualification** section records live GPU
+evidence. Missing or unverifiable GPU evidence is stated as unavailable, with
+its reason and instructions to collect it; it does not block the release.
+The additional CI inventory is informational and does not change existing
+release gates. See [native vLLM qualification](developing/vllm-qualification.md)
+for the GPU schema, selection policy, and final-tag dispatch procedure.
 
 [gh-releases]: https://github.com/praxis-proxy/ai/releases
 
@@ -122,8 +148,8 @@ The production image is a minimal Alpine container:
   configuration read-only)
 - Writable state directory: `/var/lib/praxis`, owned by the `praxis` user, for
   backends that keep local files such as the SQLite response store
-- Cargo features: `full,store-sqlite` — `full` plus the SQLite store backend so
-  the SQLite-backed examples run without rebuilding the image
+- Cargo features: `full` — experimental Responses, agentic loops and stores
+  require a custom build with explicit [feature selection](features.md#cargo-features)
 
 The `-fips` image is the same binary's FIPS feature set on
 `ubi9/ubi-minimal`, built with Red Hat's `rust-toolset` and linked against

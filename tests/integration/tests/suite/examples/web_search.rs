@@ -8,10 +8,10 @@
 //! The `openai_web_search_dispatch` filter is a scaffolded passthrough — it validates
 //! config at startup but does not execute searches at runtime.
 //!
-//! The example config uses `${WEB_SEARCH_API_KEY}` for the API key.
+//! The example config sources the API key from `env_var: WEB_SEARCH_API_KEY`.
 //! Since `set_var` is `unsafe` in Rust 2024 and `unsafe_code` is
-//! denied, we patch the YAML to replace the env var reference with a
-//! literal test key.
+//! denied, we patch the YAML to replace the env-var source with an inline
+//! literal test key (`value: ...`).
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -31,9 +31,16 @@ fn resolve(yaml: &str) -> Result<(), String> {
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
     let subrequest_client = praxis_test_utils::test_subrequest_client();
     let registry = praxis_ai::build_full_registry(&subrequest_client);
-    praxis_ai::resolve_pipelines(&config, &registry, &health, &kv_stores, &subrequest_client)
-        .map(|_pipelines| ())
-        .map_err(|error| error.to_string())
+    praxis_ai::resolve_pipelines(
+        &config,
+        &registry,
+        &health,
+        &kv_stores,
+        &praxis_ai::InFlightRegistry::new(),
+        &subrequest_client,
+    )
+    .map(|_pipelines| ())
+    .map_err(|error| error.to_string())
 }
 
 // -----------------------------------------------------------------------------
@@ -46,7 +53,7 @@ fn load_web_search_config(proxy_port: u16, port_map: &HashMap<&str, u16>) -> Con
     let path = praxis_test_utils::example_config_path("openai/responses/web-search.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let patched = patch_yaml(&yaml, proxy_port, port_map);
-    let patched = patched.replace("${WEB_SEARCH_API_KEY}", "test-key-for-config");
+    let patched = patched.replace("env_var: WEB_SEARCH_API_KEY", "value: test-key-for-config");
     Config::from_yaml(&patched).unwrap_or_else(|e| panic!("parse web-search.yaml: {e}"))
 }
 
@@ -81,7 +88,7 @@ fn web_search_example_passthrough() {
 fn web_search_unresolvable_outbound_chain_fails_build() {
     let path = praxis_test_utils::example_config_path("openai/responses/web-search.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key-for-config");
+    let yaml = yaml.replace("env_var: WEB_SEARCH_API_KEY", "value: test-key-for-config");
     let yaml = yaml.replace("outbound_chain: web-search-outbound", "outbound_chain: does-not-exist");
 
     let error = resolve(&yaml).expect_err("an unresolvable outbound chain must fail the build");
@@ -100,7 +107,7 @@ fn web_search_unresolvable_outbound_chain_fails_build() {
 fn web_search_omitted_outbound_chain_builds_via_default() {
     let path = praxis_test_utils::example_config_path("openai/responses/web-search.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key-for-config");
+    let yaml = yaml.replace("env_var: WEB_SEARCH_API_KEY", "value: test-key-for-config");
     // Drop the filter's outbound_chain reference so it falls back to the default.
     let needle = "        outbound_chain: web-search-outbound\n";
     assert!(

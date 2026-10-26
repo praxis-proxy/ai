@@ -167,9 +167,9 @@ dependencies = [
 
 [[package]]
 name = "arc-swap"
-version = "1.9.2"
+version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+checksum = "380962b3d93b99642e50b9febf72c071e97e8b32d86eae9cf4ef582bb960ae6e"
 dependencies = [
  "rustversion",
 ]
@@ -1162,9 +1162,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
 ]
@@ -1488,7 +1488,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1847,9 +1847,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.19"
+version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
+checksum = "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1899,8 +1899,6 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -3041,7 +3039,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3497,9 +3495,10 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-apis"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "allocation-counter",
+ "arc-swap",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -3511,14 +3510,15 @@ dependencies = [
  "jsonschema",
  "metrics",
  "metrics-util",
+ "notify",
  "openssl",
  "percent-encoding",
  "praxis-ai-store",
  "praxis-ai-store-backends",
+ "praxis-ai-store-lifecycle",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-tls",
- "quixotic-plecostomus-core",
  "regex",
  "rmcp",
  "schemars 1.2.2",
@@ -3537,11 +3537,12 @@ dependencies = [
  "url",
  "utoipa",
  "yaml_serde",
+ "zeroize",
 ]
 
 [[package]]
 name = "praxis-ai-benchmarks"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "praxis-ai-apis",
@@ -3553,7 +3554,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-build-support"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "cargo_metadata",
  "tempfile",
@@ -3561,7 +3562,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-filters"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3575,13 +3576,17 @@ dependencies = [
  "metrics",
  "metrics-util",
  "notify",
+ "openssl",
  "percent-encoding",
  "praxis-ai-apis",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-tls",
  "rand 0.10.3",
+ "rcgen",
  "redis",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
@@ -3590,6 +3595,7 @@ dependencies = [
  "thiserror",
  "tiktoken-rs",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
@@ -3601,7 +3607,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-llmd-ext-proc"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3629,7 +3635,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-proxy"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3664,7 +3670,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-store"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -3677,8 +3683,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-store-backends"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
+ "allocation-counter",
  "async-trait",
  "futures",
  "percent-encoding",
@@ -3698,7 +3705,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-store-lifecycle"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -3709,9 +3716,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c29127807143a63fa3945ce53eb12f7d8c9d1054f50212ddeeea40cb5f04b476"
+checksum = "16a15db17e236119799a946d479574af9202880f588ddc437730cd0ed20fecaa"
 dependencies = [
  "praxis-policy-apl-cmf",
  "praxis-policy-apl-core",
@@ -3722,9 +3729,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-apl-cmf"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "936c4d020239bec0ce98668dd64911e7c7f955d4d0d84c05459e298715cc86d4"
+checksum = "d027a9e6e1be7a6ca70a8cd7124f52a46b3be9d9d48baba03cb41c65b48d2319"
 dependencies = [
  "praxis-policy-apl-core",
  "praxis-policy-core",
@@ -3733,9 +3740,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-apl-core"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4904bf1243f151b5d5863362f819be52603eb049db50aedb3afd2156499ee9ed"
+checksum = "ab3103d91e74eaea5ebf4088c44cc3faf1622befe0a7dcc9bed44b882ec392ac"
 dependencies = [
  "async-trait",
  "futures",
@@ -3750,9 +3757,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-apl-runtime"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd4cd985fca958142381efbe765ce54248bb187bf097a752b68c62251ce0fbbc"
+checksum = "2526dddeb0a1a5c982a5ca646b64b93b5f933854e1db8ea01856ec58e5c5ff7f"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3769,9 +3776,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-builtins"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3594abb9927fc58e15b50847cf51389b7975ed9607b11925f965da0f06e99db"
+checksum = "0de898d5b7db29bf2b1eb1ab35ae50f5bcf8ad08184bf78239d6a0e652b0fa36"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3799,25 +3806,29 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
  "yaml_serde",
  "zeroize",
 ]
 
 [[package]]
 name = "praxis-policy-core"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6e92e0efaa06b49c0b0fc44e0e44cd12cbc95e81ce7c70ac191c4a6940d7475"
+checksum = "93404cbc73d95267705f6aef5ab533525243f6fb4d4c8519aaa47b75529617fa"
 dependencies = [
  "arc-swap",
  "async-trait",
  "bytes",
  "chrono",
+ "futures",
  "hashbrown 0.17.1",
+ "hmac",
  "http",
  "praxis-policy-orchestration",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -3830,9 +3841,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-orchestration"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68bf14dc4bbff55bf6357733d76f1320343e69339c366b22b6b3bc6ff2707586"
+checksum = "ca9e7e35d58c278047576090f9425f036ea31ffb66708388c1d33db51944be46"
 dependencies = [
  "futures",
  "tokio",
@@ -3840,9 +3851,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy"
-version = "0.7.3"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6f402714db9ad19f8d7ab47b1dec83533412d0f3fd1b214a6d55606a66a8bfc"
+checksum = "d444bf405b588f4c3f82b1829df70b90120bf7a69481ab57a4a5036b748150fd"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -3862,9 +3873,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-core"
-version = "0.7.3"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be9a64d340db0f296e91b71aedebeb2b612d9c227879c0406b05ac211030b2d0"
+checksum = "800bdb16b087db79b8b26d172e18aa5ebb9ccfa38e67d5034012a1c9713b43f1"
 dependencies = [
  "bytes",
  "chrono",
@@ -3888,14 +3899,15 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-filter"
-version = "0.7.3"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47953af135b13051fb858fc8a47ef1f85c195a842d878d094e062004fd8644d8"
+checksum = "dbf9bd523d7e03bcc03ba7edb44718c0c26055d7c519a3df7fcbdb11d40ad183"
 dependencies = [
  "arc-swap",
  "async-trait",
  "base64 0.23.1",
  "bytes",
+ "chrono",
  "dashmap",
  "http",
  "metrics",
@@ -3905,7 +3917,6 @@ dependencies = [
  "praxis-policy",
  "praxis-proxy-core",
  "praxis-proxy-tls",
- "quixotic-plecostomus-core",
  "rand 0.10.3",
  "regex",
  "secrecy",
@@ -3916,15 +3927,16 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "unicase",
  "yaml_serde",
  "zeroize",
 ]
 
 [[package]]
 name = "praxis-proxy-protocol"
-version = "0.7.3"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddf2ff46c78f58f444459394b470b5b25c7bd4ba76ff82c2b9d6ae211207cf82"
+checksum = "61bd6d5159e6a3884e36591ec30d7e9f09733e62418cdbc24e71756e48ebaa39"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3941,8 +3953,10 @@ dependencies = [
  "quixotic-plecostomus-http",
  "quixotic-plecostomus-proxy",
  "rand 0.10.3",
+ "rustls",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
@@ -3951,9 +3965,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-tls"
-version = "0.7.3"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b79d96e17d8d3c65da4c42cfe5ce8f9f7b1380940cd080f728234af6a1c4158e"
+checksum = "1fed83b9958ab88faf6637fe0e504de37ddad8b8fe8f8af7336c99d7943074f7"
 dependencies = [
  "arc-swap",
  "notify",
@@ -3968,7 +3982,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-test-utils"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3980,6 +3994,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "metrics",
  "nix",
  "openssl",
  "praxis-ai-apis",
@@ -4012,7 +4027,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-environment"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "praxis-ai-proxy",
  "praxis-proxy-core",
@@ -4022,7 +4037,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-integration"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -4042,6 +4057,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "sqlx",
  "tempfile",
  "tokio",
@@ -4052,7 +4068,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-schema"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "praxis-proxy-core",
  "praxis-proxy-filter",
@@ -4126,8 +4142,8 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.4.1",
- "itertools 0.13.0",
+ "heck 0.5.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -4148,7 +4164,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4196,7 +4212,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb5cd191fad9142d096efc97c64715db73db4adb60c38ebdf22f5b54cd6ea712"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "prost",
  "prost-build",
  "prost-types",
@@ -4296,9 +4312,9 @@ dependencies = [
 
 [[package]]
 name = "quixotic-plecostomus-cache"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "648c751afa211b3f5f02af5ad21c54360851fa73bb138629a71f3f83ed16bdec"
+checksum = "263a6e2db6ce36e9a8de7526e90d6f6f089901ca003777c1f63e98765872e58a"
 dependencies = [
  "ahash",
  "arrayvec 0.7.8",
@@ -4332,9 +4348,9 @@ dependencies = [
 
 [[package]]
 name = "quixotic-plecostomus-core"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c045ef42063cc1f01fb490cc91faa600bd2732d0e2e370dd4a1ce12020e3ea4c"
+checksum = "fdbb499d4264efdbb98aa4e5178c4d9ad6545d57700d11ee626d9e6c5f99648a"
 dependencies = [
  "ahash",
  "async-trait",
@@ -4376,6 +4392,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-test",
+ "tokio-util",
  "unicase",
  "windows-sys 0.59.0",
  "x509-parser",
@@ -4385,15 +4402,15 @@ dependencies = [
 
 [[package]]
 name = "quixotic-plecostomus-error"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "766a57cfa0d9f878cd7ba904bf5108d2eb62b7c34cbc92b5b55676a067224840"
+checksum = "8f5194971dca8add6ff0af06c581ecd9a36c16e7d930e997ca507a87fe44714d"
 
 [[package]]
 name = "quixotic-plecostomus-header-serde"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e557031f5e005605e724041da51dfc26674d7b6db746ea459d85a67605c380f"
+checksum = "7ae773393e9a1ef81add82f4d8a95a47fd7c9cb7fc39ae1b40fce22836e21915"
 dependencies = [
  "bytes",
  "http",
@@ -4407,9 +4424,9 @@ dependencies = [
 
 [[package]]
 name = "quixotic-plecostomus-http"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8b4cf1627eee7eb403c7460de2998dab626abd8cd6f4f15752f45ed25bb9ded"
+checksum = "1c5b9b84e31715f3636a3d9795259ad752ba7f2a250a72e9d44b56dbdecb8dce"
 dependencies = [
  "bytes",
  "http",
@@ -4418,15 +4435,15 @@ dependencies = [
 
 [[package]]
 name = "quixotic-plecostomus-lru"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "262e2e6a09cd73f1238d6e28b138d955a151f13976960abf53c43f6a0d40ab9e"
+checksum = "10b38a989795e8007d39b663f3a93c5aab5a9d943403123c9a1903f50231d3db"
 dependencies = [
  "ahash",
  "arrayvec 0.7.8",
  "async-channel",
  "flurry",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
  "log",
  "parking_lot",
  "rand 0.10.3",
@@ -4435,9 +4452,9 @@ dependencies = [
 
 [[package]]
 name = "quixotic-plecostomus-pool"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36a34894279828fd7bd719502609bec5e1de32c2bec22e3033121bb45fb8770d"
+checksum = "4485a15f77716fd0a7a0725f66e75632d63441dcc86840dde41aac1cdebce8d3"
 dependencies = [
  "crossbeam-queue",
  "dashmap",
@@ -4451,9 +4468,9 @@ dependencies = [
 
 [[package]]
 name = "quixotic-plecostomus-proxy"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d899350b898c6641308b4009b5b33e6d77ddd26d54fc6a586f761c3f6cc1df7"
+checksum = "758b3f31391e4fe46f2ae86cfe0f914b6551f0065701c37f862fcd61530d7011"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4474,9 +4491,9 @@ dependencies = [
 
 [[package]]
 name = "quixotic-plecostomus-runtime"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b979a38a2bbd5f37985e1689a7466ba18b52604d1ffd1c0c8d94d8fa3583f7e2"
+checksum = "da9a37da793a8462cdf90ec3133e7a75f210be350bb80ee801322d3c9b9b0374"
 dependencies = [
  "log",
  "once_cell",
@@ -4488,9 +4505,9 @@ dependencies = [
 
 [[package]]
 name = "quixotic-plecostomus-rustls"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d00071361b274f59fd1bc361d63ef37ed45cf0c167a2d08f31e713f5cd107b63"
+checksum = "a4d17b81a9336b506f4452dcf4a683a8c37ee03eec1b210a5f7a48f92dc38023"
 dependencies = [
  "log",
  "no_debug",
@@ -4518,9 +4535,9 @@ dependencies = [
 
 [[package]]
 name = "quixotic-plecostomus-timeout"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16d77e25c2a9da147a5fe78f5d46ff08b85628160001ce5bb0b572986fb9f2c9"
+checksum = "43470b45f68afa629b14796d0ec5e3aacedfa21ca14ad6e2be92a8ad32dd91a9"
 dependencies = [
  "once_cell",
  "parking_lot",
@@ -4662,8 +4679,10 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "itoa",
+ "log",
  "percent-encoding",
  "pin-project-lite",
+ "rand 0.10.3",
  "rustls",
  "rustls-native-certs 0.8.4",
  "ryu",
@@ -4950,14 +4969,14 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -5028,7 +5047,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5039,9 +5058,9 @@ checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -5239,10 +5258,11 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.151"
+version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
+ "foldhash 0.2.0",
  "indexmap 2.14.2",
  "itoa",
  "memchr",
@@ -5481,9 +5501,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.16.2"
+version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
+checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
 dependencies = [
  "serde",
 ]
@@ -5847,7 +5867,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5856,7 +5876,7 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8c27177b12a6399ffc08b98f76f7c9a1f4fe9fc967c784c5a071fa8d93cf7e1"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5989,9 +6009,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
@@ -6060,9 +6080,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-util"
-version = "0.7.19"
+version = "0.7.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
+checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
 dependencies = [
  "bytes",
  "futures-core",
@@ -6344,9 +6364,9 @@ dependencies = [
 
 [[package]]
 name = "unicase"
-version = "2.9.0"
+version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-bidi"
@@ -6701,9 +6721,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -6742,7 +6762,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7030,7 +7050,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.6.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.23.1",
  "clap",
@@ -7156,9 +7176,9 @@ dependencies = [
 
 [[package]]
 name = "zeroize"
-version = "1.9.0"
+version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 dependencies = [
  "serde",
  "zeroize_derive",

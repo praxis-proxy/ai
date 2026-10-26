@@ -1,0 +1,141 @@
+# MCP Approval Floor
+# Requires `--features openai-mcp-tools,store-sqlite` because these filters are opt-in.
+#
+# Demonstrates the openai_mcp_dispatch operator approval floor on a complete
+# persisted agentic Responses pipeline. The floor (minimum_approval: always) is
+# combined monotonically with each MCP tool's client require_approval, so a
+# client that submits "require_approval": "never" still produces an
+# mcp_approval_request and runs zero tool calls until it is approved. Omit
+# minimum_approval to keep the default client-driven behavior.
+#
+# The effective policy is:
+#
+#     approval_required = operator_floor || client_requires_approval
+#
+# The floor can only raise the requirement: a client "never" (or a tool the
+# server annotates readOnlyHint: true) can never suppress an operator-required
+# approval. This enforces an approval *exchange*; it does not prove a human
+# approved the action, since an authorized API client can submit the
+# mcp_approval_response.
+#
+# The pipeline mirrors agentic-loop.yaml (see it for the full lifecycle): a pre-
+# IRR state setup with a Responses store and rehydrate, then an
+# iterative_request_router inference step that pairs openai_mcp_dispatch with the
+# openai_agentic_loop owner. The store is REQUIRED: a pending approval is
+# correlated on the follow-up turn via previous_response_id, so the floor fails
+# closed (store=false -> 400, no store -> 500) when it cannot persist.
+#
+# Pipeline ordering (pre-IRR, runs once):
+#   ai_operation -> openai_responses_request (x2) -> openai_tool_parse
+#     -> state_owner -> openai_responses_store -> openai_responses_rehydrate
+#     -> openai_mcp_tool_resolve
+# IRR inference step:
+#   openai_stream_events -> openai_mcp_dispatch (minimum_approval: always)
+#     -> openai_agentic_loop -> openai_responses_proxy -> router -> load_balancer
+#
+# Example (client asks for NO approval; the operator floor forces it):
+#
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "What is the weather in SF?",
+#       "tools": [{"type": "mcp", "server_label": "weather",
+#                  "server_url": "http://mcp-weather:8001/mcp",
+#                  "allowed_tools": ["get_weather"],
+#                  "require_approval": "never"}]
+#     }'
+#   # -> returns an mcp_approval_request output item (not an executed tool call).
+#   # Approve it on the next turn by echoing the returned response id and an
+#   # mcp_approval_response, exactly as in agentic-loop.yaml's round trip.
+#
+# Build:
+#   cargo build -p praxis-ai-proxy --features openai-mcp-tools,store-sqlite
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [mcp-approval-floor-pipeline]
+
+filter_chains:
+  - name: mcp-approval-floor-pipeline
+    filters:
+      - filter: ai_operation
+
+      - filter: openai_responses_request
+        initialize_state: false
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
+
+      - filter: openai_tool_parse
+
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+
+      # REQUIRED for the floor: the pending approval is persisted here and
+      # correlated on the follow-up turn via previous_response_id.
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+
+      - filter: openai_responses_rehydrate
+
+      - filter: openai_mcp_tool_resolve
+
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 11
+        max_stream_response_bytes: 67108864
+        timeout_ms: 360000
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_stream_events
+              - filter: openai_mcp_dispatch
+                # Operator approval floor: force approval for every MCP call in
+                # this pipeline, regardless of the client's per-tool
+                # require_approval. Remove this line to restore client-driven
+                # approval.
+                minimum_approval: always
+                max_calls_per_round: 32
+                max_parallel_calls: 8
+                max_result_bytes: 1048576
+                max_total_result_bytes: 8388608
+              - filter: openai_agentic_loop
+                max_infer_iters: 10
+              - filter: openai_responses_proxy
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: "inference-backend"
+              - filter: load_balancer
+                clusters:
+                  - name: "inference-backend"
+                    read_timeout_ms: 300000
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - filter: openai_agentic_loop
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends
+  allow_private_upstreams: true # permits loopback MCP servers in local dev

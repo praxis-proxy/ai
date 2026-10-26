@@ -15,6 +15,32 @@ use tempfile::TempDir;
 /// Pinned version of the Claude Code CLI executable used for E2E acceptance tests.
 pub(crate) const CLAUDE_CODE_PINNED_VERSION: &str = "2.1.267";
 
+/// Pinned version of the OpenCode CLI executable used for E2E acceptance tests.
+///
+/// `opencode --version` prints the bare version with no product prefix
+/// (`1.19.3`, not `opencode 1.19.3`), so this is compared for equality
+/// against the trimmed output rather than as a substring of a longer line.
+/// Kept in sync with `tests/integration/fixtures/opencode-cli/pin.toml` by
+/// `opencode::pin_toml_version_matches_harness_const`.
+pub(crate) const OPENCODE_PINNED_VERSION: &str = "1.19.3";
+
+/// Pinned version of the OpenCode 2.x CLI executable used for E2E acceptance tests.
+///
+/// The 2.x line is a breaking client release proven by its own lane beside the
+/// 1.x one. Unlike 1.x, `opencode --version` prints `opencode v2.1.2`, so the
+/// version check compares against that full line, not this bare value. Kept in
+/// sync with `tests/integration/fixtures/opencode-cli-v2/pin.toml` by
+/// `opencode_v2::pin_toml_version_matches_harness_const`.
+pub(crate) const OPENCODE_V2_PINNED_VERSION: &str = "2.1.2";
+
+/// Pinned version of the pi coding agent executable used for E2E acceptance tests.
+///
+/// `pi --version` prints the bare version with no product prefix, so this is
+/// compared for equality against the trimmed output. Kept in sync with
+/// `tests/integration/fixtures/pi-cli/pin.toml` by
+/// `pi::pin_toml_version_matches_harness_const`.
+pub(crate) const PI_PINNED_VERSION: &str = "1.4.0";
+
 /// Portable shell fragment that reads bytes on stdin and prints their lowercase
 /// sha256 hex digest (no filename column). GNU coreutils ships `sha256sum`, but
 /// macOS (where this suite's precompute and the CLI clients' fixed PATH run) ships
@@ -132,6 +158,7 @@ fn run_git_cmd(args: &[&str], dir: &Path) {
 
 /// Seed `count` uniquely-filled ballast files (`chapter_01.txt`, ...) of roughly
 /// `approx_bytes` each in `dir` and return their names in deterministic order.
+#[cfg(all(feature = "openai-agentic-loop", feature = "store"))]
 fn seed_ballast_files(dir: &Path, count: usize, approx_bytes: usize) -> std::io::Result<Vec<String>> {
     const WORDS: &[&str] = &[
         "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima",
@@ -172,11 +199,13 @@ fn seed_ballast_files(dir: &Path, count: usize, approx_bytes: usize) -> std::io:
 /// wire (the client's summarization POST), and the result write is proven to
 /// follow the compaction boundary; the on-disk source makes the final write
 /// reliable regardless of whether the model happened to retain the token verbatim.
+#[cfg(all(feature = "openai-agentic-loop", feature = "store"))]
 pub(crate) struct CodexCompactionWorkspace {
     dir: TempDir,
     marker: String,
 }
 
+#[cfg(all(feature = "openai-agentic-loop", feature = "store"))]
 impl CodexCompactionWorkspace {
     /// Create a workspace whose marker lives in `secret.txt`, with a marker-free
     /// hash-based `verify.sh`.

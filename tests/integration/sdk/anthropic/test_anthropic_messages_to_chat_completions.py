@@ -36,7 +36,7 @@ from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
-from anthropic import APIStatusError, Anthropic, BadRequestError
+from anthropic import APIConnectionError, APIStatusError, Anthropic, BadRequestError
 
 CONFIG_PATH = "examples/configs/anthropic/messages-to-openai.yaml"
 MODEL = "stub-model"
@@ -79,7 +79,9 @@ class RecordingBackend(BaseHTTPRequestHandler):
     bodies: list[dict] = []
     response_content_type = "application/json"
     send_tool_reply_once = False
+    tool_call_arguments = "{}"
     untranslatable_reply_once: str | None = None
+    untranslatable_stream_once: str | None = None
     error_response_once = False
 
     def do_POST(self):
@@ -104,7 +106,12 @@ class RecordingBackend(BaseHTTPRequestHandler):
             self.wfile.write(reply)
             return
         if body.get("stream"):
-            self._send_invalid_tool_id_stream()
+            if RecordingBackend.untranslatable_stream_once:
+                kind = RecordingBackend.untranslatable_stream_once
+                RecordingBackend.untranslatable_stream_once = None
+                self._send_untranslatable_stream(kind)
+            else:
+                self._send_invalid_tool_id_stream()
             return
 
         choice = {
@@ -114,13 +121,15 @@ class RecordingBackend(BaseHTTPRequestHandler):
         }
         if RecordingBackend.send_tool_reply_once:
             RecordingBackend.send_tool_reply_once = False
+            arguments = RecordingBackend.tool_call_arguments
+            RecordingBackend.tool_call_arguments = "{}"
             choice["message"] = {
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [{
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "lookup", "arguments": "{}"},
+                    "function": {"name": "lookup", "arguments": arguments},
                 }],
             }
             choice["finish_reason"] = "tool_calls"
@@ -208,6 +217,37 @@ class RecordingBackend(BaseHTTPRequestHandler):
         self.wfile.write(chunks[1])
         self.wfile.flush()
 
+    def _send_untranslatable_stream(self, kind: str):
+        if kind == "refusal":
+            outcomes = [({"role": "assistant", "refusal": "blocked"}, None)]
+        else:
+            outcomes = [
+                ({"role": "assistant", "content": "partial"}, None),
+                ({}, "content_filter"),
+            ]
+        chunks = []
+        for delta, finish_reason in outcomes:
+            chunk = {
+                "id": "chatcmpl-stub",
+                "object": "chat.completion.chunk",
+                "created": 1_700_000_000,
+                "model": MODEL,
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }],
+            }
+            chunks.append(f"data: {json.dumps(chunk)}\n\n")
+        chunks.append("data: [DONE]\n\n")
+        wire = "".join(chunks).encode()
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(wire)))
+        self.end_headers()
+        self.wfile.write(wire)
+        self.wfile.flush()
+
     def log_message(self, format, *args):
         pass
 
@@ -241,11 +281,14 @@ def _write_config(proxy_port: int, backend_port: int, allow_lossy: bool = False)
     return path
 
 
-def _start_client(*, allow_lossy: bool) -> Iterator[Anthropic]:
+def _start_client(*, allow_lossy: bool, process_holder=None) -> Iterator[Anthropic]:
     """Start a backend + proxy and yield an Anthropic client plus the proxy port.
 
     `allow_lossy` selects the strict example config (the default) or the same
     config with operator-approved degradation enabled on the translation filter.
+    When `process_holder` is supplied, the live proxy subprocess is published
+    under its ``"proxy"`` key so tests can assert the proxy stays up (e.g. a
+    connection abort must come from a committed-body reset, not a crash).
     """
     backend_port = _free_port()
     backend = HTTPServer(("127.0.0.1", backend_port), RecordingBackend)
@@ -260,6 +303,8 @@ def _start_client(*, allow_lossy: bool) -> Iterator[Anthropic]:
     )
     try:
         _wait_for_proxy(proxy_port)
+        if process_holder is not None:
+            process_holder["proxy"] = proc
         yield Anthropic(
             base_url=f"http://127.0.0.1:{proxy_port}",
             api_key="not-needed",
@@ -267,6 +312,8 @@ def _start_client(*, allow_lossy: bool) -> Iterator[Anthropic]:
             timeout=10.0,
         )
     finally:
+        if process_holder is not None:
+            process_holder.pop("proxy", None)
         proc.send_signal(signal.SIGINT)
         try:
             proc.wait(timeout=5)
@@ -278,8 +325,14 @@ def _start_client(*, allow_lossy: bool) -> Iterator[Anthropic]:
 
 
 @pytest.fixture(scope="module")
-def anthropic_client():
-    yield from _start_client(allow_lossy=False)
+def proxy_process():
+    """Holder populated by `anthropic_client` with the live proxy subprocess."""
+    yield {}
+
+
+@pytest.fixture(scope="module")
+def anthropic_client(proxy_process):
+    yield from _start_client(allow_lossy=False, process_holder=proxy_process)
 
 
 @pytest.fixture(scope="module")
@@ -288,6 +341,33 @@ def degrading_client():
 
 
 class TestRequestFieldHandling:
+    @pytest.mark.parametrize("field", ["type", "cache_control"])
+    def test_nullable_tool_fields_match_omission(
+        self, anthropic_client, degrading_client, field
+    ):
+        for client in [anthropic_client, degrading_client]:
+            RecordingBackend.bodies.clear()
+            tool = {
+                "name": "lookup",
+                "description": "Look up a value",
+                "input_schema": {"type": "object"},
+                field: None,
+            }
+
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[{"role": "user", "content": "Call lookup"}],
+                extra_body={"tools": [tool]},
+            )
+
+            assert response.content[0].text == "4"
+            [upstream] = RecordingBackend.bodies
+            [translated] = upstream["tools"]
+            assert translated["type"] == "function"
+            assert translated["function"]["name"] == "lookup"
+            assert field not in translated["function"]
+
     def test_tool_input_presence_is_preserved(self, anthropic_client):
         RecordingBackend.bodies.clear()
 
@@ -407,6 +487,26 @@ class TestRequestFieldHandling:
         assert upstream["messages"][1]["tool_calls"][0]["function"]["name"] == "lookup"
         assert upstream["messages"][2]["content"] == ""
 
+    def test_empty_string_tool_arguments_become_empty_input(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+        RecordingBackend.send_tool_reply_once = True
+        RecordingBackend.tool_call_arguments = ""
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[{"role": "user", "content": "Call lookup"}],
+        )
+
+        tool_use = next(block for block in response.content if block.type == "tool_use")
+        assert tool_use.name == "lookup"
+        assert tool_use.input == {}, (
+            'empty-string arguments ("arguments":"") are absent arguments, per the '
+            "vLLM tool parser / OpenAI streaming spec encoding, and must become input "
+            "{} rather than failing as a 500"
+        )
+        assert response.stop_reason == "tool_use"
+
     def test_empty_citations_in_history_reach_the_backend(self, anthropic_client):
         RecordingBackend.bodies.clear()
 
@@ -514,10 +614,14 @@ class TestResponseValidation:
         assert error.body["error"]["type"] == "api_error", "the Anthropic error type must normalize to api_error"
 
     @pytest.mark.parametrize("kind", ["finish_reason", "refusal"])
-    def test_untranslatable_success_fails_closed(self, anthropic_client, kind):
+    def test_untranslatable_success_fails_closed(
+        self, anthropic_client, proxy_process, kind
+    ):
         RecordingBackend.untranslatable_reply_once = kind
         try:
-            with pytest.raises((APIStatusError, json.JSONDecodeError)) as excinfo:
+            with pytest.raises(
+                (APIStatusError, json.JSONDecodeError, APIConnectionError)
+            ) as excinfo:
                 anthropic_client.messages.create(
                     model=MODEL,
                     max_tokens=64,
@@ -531,10 +635,22 @@ class TestResponseValidation:
             assert error.status_code == 500
             assert error.body["type"] == "error"
             assert error.body["error"]["type"] == "api_error"
-        else:
+        elif isinstance(error, json.JSONDecodeError):
             # A response-body rejection can abort after 200 headers have been
             # sent. The SDK then fails to parse the empty, aborted body.
             assert error.doc == ""
+        else:
+            # praxis 0.7.4 aborts a rejected response after the 200 headers are
+            # committed by closing the connection mid-body instead of flushing an
+            # empty terminal chunk; the SDK surfaces that as a connection error.
+            # Still fail-closed: the client never receives a usable translation.
+            assert isinstance(error, APIConnectionError)
+            # A proxy crash would raise the same SDK exception, so confirm the
+            # proxy is still running — the abort must be a deliberate reset.
+            assert proxy_process["proxy"].poll() is None, (
+                "the proxy must stay alive while it aborts the committed "
+                "200 response body"
+            )
 
 
 class TestStreamingResponseValidation:
@@ -565,6 +681,37 @@ class TestStreamingResponseValidation:
         ), "aborted stream must not start a tool_use block"
         [upstream] = RecordingBackend.bodies
         assert upstream["stream"] is True, "forwarded request must have been a stream"
+
+    @pytest.mark.parametrize("kind", ["refusal", "content_filter"])
+    def test_untranslatable_outcome_terminates_stream(self, anthropic_client, kind):
+        RecordingBackend.bodies.clear()
+        RecordingBackend.untranslatable_stream_once = kind
+        events = []
+        try:
+            with pytest.raises(APIStatusError) as excinfo:
+                with anthropic_client.messages.stream(
+                    model=MODEL,
+                    max_tokens=64,
+                    messages=[{"role": "user", "content": "Hi"}],
+                ) as stream:
+                    events.extend(stream)
+        finally:
+            RecordingBackend.untranslatable_stream_once = None
+
+        error = excinfo.value
+        assert error.body.get("type") == "error", (
+            f"{kind} must use the Anthropic error envelope"
+        )
+        assert error.body.get("error", {}).get("type") == "api_error", (
+            f"{kind} must surface as an Anthropic api_error"
+        )
+        assert not any(event.type == "message_stop" for event in events), (
+            f"{kind} must terminate without message_stop"
+        )
+        [upstream] = RecordingBackend.bodies
+        assert upstream["stream"] is True, (
+            f"{kind} must be exercised through a forwarded streaming request"
+        )
 
 
 DEGRADED_HEADER = "x-degraded-features"

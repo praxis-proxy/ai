@@ -169,9 +169,11 @@ under `apis/src/anthropic/`. Representative filters:
 Source of truth:
 `docs/conformance/specs/anthropic-spec.json` (see
 `docs/conformance/README.md`, "Anthropic Messages
-Reference Spec"). There is no automated Anthropic gate,
-so this manual cross-reference is the only conformance
-check for these surfaces.
+Reference Spec"). A registry drift check
+(`check-anthropic-messages-registry` in `make lint`)
+covers method, path, and operation ID alignment; this
+manual cross-reference is the conformance check for
+schemas, field names, types, enums, and optionality.
 
 Today the only Anthropic path Praxis handles is
 `/v1/messages` and its subpaths (`/v1/messages`,

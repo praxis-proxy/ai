@@ -7,7 +7,7 @@ use std::future::Future;
 
 use praxis_filter::{FilterAction, HttpFilter};
 
-use super::TokenRateLimitFilter;
+use super::{META_FAIL_OPEN, META_RESERVATION_ID, TokenRateLimitFilter};
 use crate::token_usage::{
     META_TOKEN_CACHE_READ, META_TOKEN_CACHE_WRITE, META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_REASONING,
     META_TOKEN_STATUS, META_TOKEN_TOTAL, TOKEN_STATUS_OVERFLOW,
@@ -621,13 +621,94 @@ fn from_config_rejects_valkey_backend_without_url() {
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
-    assert!(err.to_string().contains("backend.url is required"), "got: {err}");
+    assert!(
+        err.to_string().contains("backend.url or backend.sentinel is required"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn from_config_accepts_valkey_backend_with_url() {
     let yaml = single_rule_yaml_with(
         "backend:\n  kind: valkey\n  url: redis://127.0.0.1:6399",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_accepts_redis_backend_with_the_same_native_sentinel_path() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: redis\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_accepts_native_sentinel_backend_without_discovery_at_startup() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    discovery_timeout: 2s",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_rejects_mixed_standalone_and_sentinel_topology() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  url: redis://127.0.0.1:6379\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("topologies must be exclusive")
+    };
+    assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_a_missing_network_topology_during_parsing() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("network backends must declare a topology")
+    };
+    assert!(
+        err.to_string().contains("backend.url or backend.sentinel is required"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn from_config_rejects_insecure_tls_configuration() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    tls_insecure: true",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("insecure TLS configuration must be rejected")
+    };
+    assert!(err.to_string().contains("tls_insecure"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_the_removed_sentinel_tls_flag() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: redis\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    tls: true",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("the removed Sentinel TLS flag must be rejected")
+    };
+    assert!(err.to_string().contains("unknown field `tls`"), "got: {err}");
+}
+
+#[test]
+fn from_config_accepts_a_valkeys_tls_sentinel_endpoint() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [valkeys://127.0.0.1:26379]\n    service_name: mymaster",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
     assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
@@ -1008,7 +1089,7 @@ async fn missing_reservation_id_skips_reconciliation() {
         matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
         "the first 400-token request fits"
     );
-    ctx.filter_metadata.remove(super::META_RESERVATION_ID);
+    ctx.filter_metadata.remove(META_RESERVATION_ID);
     ctx.set_metadata(META_TOKEN_TOTAL, "200");
     let mut body = None;
     assert!(
@@ -1137,6 +1218,8 @@ fn debug_format_lists_configured_rule_names() {
         key_spec,
         epoch: std::time::Instant::now(),
         valkey_clock: false,
+        hierarchy: None,
+        on_failure: super::config::BackendOnFailure::Closed,
     };
     let debug = format!("{filter:?}");
     assert!(debug.contains("default"), "got: {debug}");
@@ -1738,7 +1821,7 @@ async fn valkey_unmarked_v2_state_fails_closed_with_503() {
         .arg("legacy-key")
         .ignore();
     pipe.cmd("PEXPIRE").arg(&state_index).arg(60_000).ignore();
-    let _: () = connection.pipeline(&pipe).await.unwrap();
+    let _: () = Box::pin(connection.pipeline(&pipe)).await.unwrap();
 
     let filter = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 5\nreserved_tokens: 1",
@@ -1781,7 +1864,7 @@ async fn valkey_unmarked_v2_quota_state_without_index_fails_closed_with_503() {
     let mut pipe = redis::pipe();
     pipe.cmd("SET").arg(marker_key).arg("v3:legacy-test").ignore();
     pipe.cmd("SET").arg(&usage_key).arg(5).arg("PX").arg(600_000).ignore();
-    let () = connection.pipeline(&pipe).await.unwrap();
+    let () = Box::pin(connection.pipeline(&pipe)).await.unwrap();
 
     let filter = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 5\nreserved_tokens: 1",
@@ -1869,6 +1952,61 @@ async fn valkey_failure_fails_closed() {
         },
         other => panic!("unreachable Valkey backend must not admit the request, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn valkey_failure_open_forwards_once_without_a_reservation_handle() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  url: redis://127.0.0.1:1\n  on_failure: open\n  operation_timeout: 20ms",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        ctx.get_metadata(META_RESERVATION_ID).is_none(),
+        "open mode must not fabricate a reservation ID"
+    );
+    assert_eq!(ctx.get_metadata(META_FAIL_OPEN), Some("bypassed"));
+
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+    assert!(
+        ctx.get_metadata(META_FAIL_OPEN).is_none(),
+        "fail-open marker must not leak across exchanges"
+    );
+}
+
+#[test]
+fn from_config_rejects_an_unbounded_backend_timeout() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  url: redis://127.0.0.1:6379\n  operation_timeout: 61s",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("timeout must remain bounded")
+    };
+    assert!(err.to_string().contains("must not exceed 60s"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_a_zero_backend_timeout() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    discovery_timeout: 0ms",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let Err(err) = TokenRateLimitFilter::from_config(&yaml) else {
+        panic!("timeout must be positive")
+    };
+    assert!(
+        err.to_string().contains("backend.discovery_timeout") && err.to_string().contains("duration must be positive"),
+        "got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -1964,6 +2102,23 @@ async fn valkey_token_bucket_failure_fails_closed() {
         },
         other => panic!("unreachable Valkey backend must not admit the token-bucket request, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn valkey_token_bucket_failure_open_forwards_without_reconciliation_metadata() {
+    let yaml = single_rule_yaml_with(
+        "backend:\n  kind: redis\n  url: redis://127.0.0.1:1\n  on_failure: open\n  operation_timeout: 20ms",
+        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 1\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(ctx.get_metadata(META_RESERVATION_ID).is_none());
+    assert_eq!(ctx.get_metadata(META_FAIL_OPEN), Some("bypassed"));
 }
 
 #[tokio::test]
@@ -2234,6 +2389,28 @@ async fn max_tokens_strategy_extracts_from_body_and_reserves() {
     assert_eq!(
         estimate_meta, "500",
         "estimate metadata should reflect extracted max_tokens"
+    );
+}
+
+#[tokio::test]
+async fn max_tokens_zero_without_fallback_is_rejected() {
+    let yaml =
+        single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 0, "messages": []}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Reject(rejection) if rejection.status == 429),
+        "a zero max_tokens with no fallback must not be forwarded unmetered"
+    );
+    assert!(
+        ctx.get_metadata("token_rate_limit.reservation_id").is_none(),
+        "a rejected zero estimate stores no reservation"
     );
 }
 
@@ -3638,22 +3815,39 @@ struct CapturedRecord {
     fields: std::collections::BTreeMap<&'static str, String>,
 }
 
-/// A `tracing` layer that records spans and events for assertions.
+/// A `tracing` capture whose storage is private to one test thread.
 ///
-/// Install it with [`TracingCapture::install`] and keep the returned
-/// guard alive for the duration of the scenario; it is a thread-local
-/// default, so drive the code under test on the current thread.
+/// The subscriber is installed once for the test binary, while this value is
+/// selected through a thread-local sink. Tracing callsite interest is cached
+/// process-wide, so installing a scoped subscriber per test can race with
+/// another test and cause an event to be permanently skipped.
 #[derive(Debug, Clone, Default)]
 struct TracingCapture {
     events: std::sync::Arc<std::sync::Mutex<Vec<CapturedRecord>>>,
     spans: std::sync::Arc<std::sync::Mutex<Vec<(u64, CapturedRecord)>>>,
 }
 
+thread_local! {
+    static ACTIVE_CAPTURE: std::cell::RefCell<Option<TracingCapture>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Process-wide always-interested layer; per-test routing happens through
+/// [`ACTIVE_CAPTURE`] rather than through a scoped dispatcher.
+#[derive(Debug, Default)]
+struct GlobalTracingCapture;
+
 impl TracingCapture {
-    /// Make this capture the default subscriber for the current thread.
-    fn install(&self) -> tracing::subscriber::DefaultGuard {
+    /// Select this capture for the current test thread.
+    fn install(&self) -> TracingCaptureGuard {
         use tracing_subscriber::layer::SubscriberExt as _;
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            tracing::subscriber::set_global_default(tracing_subscriber::registry().with(GlobalTracingCapture))
+                .expect("token-rate-limit tracing capture must own the test subscriber");
+        });
+        ACTIVE_CAPTURE.with(|active| TracingCaptureGuard {
+            previous: active.replace(Some(self.clone())),
+        })
     }
 
     /// Every event recorded so far, oldest first.
@@ -3670,6 +3864,19 @@ impl TracingCapture {
             .iter()
             .map(|(_, record)| record.clone())
             .collect()
+    }
+}
+
+/// Restores any prior capture when a test exits, including by unwinding.
+struct TracingCaptureGuard {
+    previous: Option<TracingCapture>,
+}
+
+impl Drop for TracingCaptureGuard {
+    fn drop(&mut self) {
+        ACTIVE_CAPTURE.with(|active| {
+            drop(active.replace(self.previous.take()));
+        });
     }
 }
 
@@ -3699,25 +3906,35 @@ impl tracing::field::Visit for FieldText {
     }
 }
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TracingCapture {
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for GlobalTracingCapture {
+    fn register_callsite(&self, _metadata: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::always()
+    }
+
     fn on_new_span(
         &self,
         attrs: &tracing::span::Attributes<'_>,
         id: &tracing::span::Id,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        let mut fields = FieldText::default();
-        attrs.record(&mut fields);
-        let metadata = attrs.metadata();
-        self.spans.lock().expect("capture lock").push((
-            id.into_u64(),
-            CapturedRecord {
-                name: metadata.name(),
-                target: metadata.target().to_owned(),
-                level: *metadata.level(),
-                fields: fields.0,
-            },
-        ));
+        ACTIVE_CAPTURE.with(|active| {
+            let active = active.borrow();
+            let Some(capture) = active.as_ref() else {
+                return;
+            };
+            let mut fields = FieldText::default();
+            attrs.record(&mut fields);
+            let metadata = attrs.metadata();
+            capture.spans.lock().expect("capture lock").push((
+                id.into_u64(),
+                CapturedRecord {
+                    name: metadata.name(),
+                    target: metadata.target().to_owned(),
+                    level: *metadata.level(),
+                    fields: fields.0,
+                },
+            ));
+        });
     }
 
     fn on_record(
@@ -3726,23 +3943,35 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TracingCapture {
         values: &tracing::span::Record<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        let mut fields = FieldText::default();
-        values.record(&mut fields);
-        let mut spans = self.spans.lock().expect("capture lock");
-        if let Some((_, record)) = spans.iter_mut().find(|(span_id, _)| *span_id == id.into_u64()) {
-            record.fields.extend(fields.0);
-        }
+        ACTIVE_CAPTURE.with(|active| {
+            let active = active.borrow();
+            let Some(capture) = active.as_ref() else {
+                return;
+            };
+            let mut fields = FieldText::default();
+            values.record(&mut fields);
+            let mut spans = capture.spans.lock().expect("capture lock");
+            if let Some((_, record)) = spans.iter_mut().find(|(span_id, _)| *span_id == id.into_u64()) {
+                record.fields.extend(fields.0);
+            }
+        });
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
-        let mut fields = FieldText::default();
-        event.record(&mut fields);
-        let metadata = event.metadata();
-        self.events.lock().expect("capture lock").push(CapturedRecord {
-            name: "event",
-            target: metadata.target().to_owned(),
-            level: *metadata.level(),
-            fields: fields.0,
+        ACTIVE_CAPTURE.with(|active| {
+            let active = active.borrow();
+            let Some(capture) = active.as_ref() else {
+                return;
+            };
+            let mut fields = FieldText::default();
+            event.record(&mut fields);
+            let metadata = event.metadata();
+            capture.events.lock().expect("capture lock").push(CapturedRecord {
+                name: "event",
+                target: metadata.target().to_owned(),
+                level: *metadata.level(),
+                fields: fields.0,
+            });
         });
     }
 }
@@ -3939,6 +4168,7 @@ const ACCOUNTING_FIELDS: &[&str] = &[
     "message",
     "phase",
     "rule",
+    "level",
     "algorithm",
     "backend",
     "result",
@@ -4442,4 +4672,547 @@ fn soft_enforcement_rejects_deny_tier() {
     );
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
     assert!(err.to_string().contains("deny tiers are incompatible"), "got: {err}");
+}
+
+// -----------------------------------------------------------------------------
+// Hierarchy config validation (from_config)
+// -----------------------------------------------------------------------------
+
+fn hierarchy_yaml(hierarchy_block: &str) -> serde_yaml::Value {
+    let yaml = format!(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   reserved_tokens: 500\n\
+         {hierarchy_block}"
+    );
+    serde_yaml::from_str(&yaml).unwrap()
+}
+
+fn valid_hierarchy_block() -> String {
+    "hierarchy:\n\
+     \x20 - level: org\n\
+     \x20   identity_header: x-org-id\n\
+     \x20   algorithm: sliding_window\n\
+     \x20   window: 1h\n\
+     \x20   capacity: 5000000\n\
+     \x20 - level: team\n\
+     \x20   identity_header: x-team-id\n\
+     \x20   algorithm: sliding_window\n\
+     \x20   window: 1h\n\
+     \x20   capacity: 1000000\n\
+     \x20 - level: user\n\
+     \x20   identity: authenticated_subject\n\
+     \x20   algorithm: sliding_window\n\
+     \x20   window: 1h\n\
+     \x20   capacity: 100000\n"
+        .to_owned()
+}
+
+#[test]
+fn from_config_parses_valid_hierarchy() {
+    let yaml = hierarchy_yaml(&valid_hierarchy_block());
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn from_config_rejects_hierarchy_with_wrong_level_order() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject wrong order");
+    assert!(err.to_string().contains("must be"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_with_fewer_than_three_levels() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject 2 levels");
+    assert!(err.to_string().contains("exactly 3 levels"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_with_more_than_three_levels() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-other\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 50000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject 4 levels");
+    assert!(err.to_string().contains("exactly 3 levels"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_with_duplicate_levels() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org2\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject duplicates");
+    assert!(
+        err.to_string().contains("must be") || err.to_string().contains("duplicate"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn from_config_rejects_hierarchy_org_level_with_identity_instead_of_identity_header() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject org with identity");
+    assert!(err.to_string().contains("identity_header"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_user_level_with_identity_header_instead_of_identity() {
+    let yaml = hierarchy_yaml(
+        "hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity_header: x-user-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("should reject user with identity_header");
+    assert!(
+        err.to_string().contains("identity: authenticated_subject"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn from_config_rejects_hierarchy_without_a_catch_all_rule() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: scoped\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: alpha\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   reserved_tokens: 500\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("hierarchy without a catch-all rule should be rejected");
+    assert!(err.to_string().contains("catch-all"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_when_a_rule_can_skip_estimation() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   estimation:\n\
+         \x20     strategy: max_tokens\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("hierarchy with a skippable estimate should be rejected");
+    assert!(err.to_string().contains("fallback_estimate"), "got: {err}");
+}
+
+// -----------------------------------------------------------------------------
+// Hierarchy identity-miss 401 tests
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn hierarchy_missing_org_header_returns_401() {
+    let yaml = hierarchy_yaml(&valid_hierarchy_block());
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-team-id"),
+        http::HeaderValue::from_static("team-a"),
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401),
+        "missing org header should return 401, got: {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn hierarchy_blank_org_header_returns_401() {
+    let yaml = hierarchy_yaml(&valid_hierarchy_block());
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-org-id"),
+        http::HeaderValue::from_static("   "),
+    );
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-team-id"),
+        http::HeaderValue::from_static("team-a"),
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401),
+        "blank org header should return 401, got: {action:?}"
+    );
+}
+
+#[test]
+fn hierarchy_missing_org_header_records_unauthenticated_metric() {
+    let snapshot = metrics_emitted_by(async {
+        let yaml = hierarchy_yaml(&valid_hierarchy_block());
+        let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+        let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        req.headers.insert(
+            http::header::HeaderName::from_static("x-team-id"),
+            http::HeaderValue::from_static("team-a"),
+        );
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401),
+            "missing org header should return 401, got: {action:?}"
+        );
+    });
+    assert_eq!(
+        counter_value(
+            &snapshot,
+            "praxis_trl_unauthenticated_total",
+            &[("rule", "hierarchy:org")]
+        ),
+        Some(1),
+        "a missing org identity is counted on the hierarchy:org rule label"
+    );
+}
+
+#[tokio::test]
+async fn hierarchy_missing_team_header_returns_401() {
+    let yaml = hierarchy_yaml(&valid_hierarchy_block());
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-org-id"),
+        http::HeaderValue::from_static("org-a"),
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401),
+        "missing team header should return 401, got: {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn hierarchy_missing_subject_returns_401() {
+    let yaml = hierarchy_yaml(&valid_hierarchy_block());
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-org-id"),
+        http::HeaderValue::from_static("org-a"),
+    );
+    req.headers.insert(
+        http::header::HeaderName::from_static("x-team-id"),
+        http::HeaderValue::from_static("team-a"),
+    );
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401),
+        "missing authenticated subject should return 401, got: {action:?}"
+    );
+}
+
+#[test]
+fn from_config_rejects_hierarchy_with_a_zero_fallback_estimate() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   estimation:\n\
+         \x20     strategy: max_tokens\n\
+         \x20     fallback_estimate: 0\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("a zero fallback estimate should be rejected when hierarchy is configured");
+    assert!(err.to_string().contains("fallback_estimate > 0"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_when_reserved_tokens_exceed_level_capacity() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   reserved_tokens: 500\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 300\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("a fixed estimate larger than a hierarchy capacity should be rejected");
+    assert!(err.to_string().contains("exceeds hierarchy org capacity"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_hierarchy_when_fixed_multiplier_exceeds_level_capacity() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   estimation:\n\
+         \x20     strategy: fixed\n\
+         \x20     fallback_estimate: 300\n\
+         \x20     multiplier: 2\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 500\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("a multiplied fixed estimate larger than a hierarchy capacity should be rejected");
+    assert!(err.to_string().contains("exceeds hierarchy org capacity"), "got: {err}");
+}
+
+#[test]
+fn extract_max_tokens_uses_fallback_for_zero_and_keeps_zero_without_one() {
+    let probe = super::BodyProbe {
+        max_tokens: Some(0),
+        max_completion_tokens: None,
+        model: None,
+    };
+    assert_eq!(super::extract_max_tokens(Some(&probe), Some(40)), Some(40));
+    assert_eq!(super::extract_max_tokens(Some(&probe), None), Some(0));
+    // `max_tokens: 0` is the chosen field, so `max_completion_tokens` is not used.
+    let completion = super::BodyProbe {
+        max_tokens: Some(0),
+        max_completion_tokens: Some(12),
+        model: None,
+    };
+    assert_eq!(super::extract_max_tokens(Some(&completion), Some(40)), Some(40));
+    assert_eq!(super::extract_max_tokens(Some(&completion), None), Some(0));
+}
+
+#[test]
+fn from_config_rejects_a_rule_named_like_a_hierarchy_level() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: hierarchy:user\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n\
+         \x20   reserved_tokens: 500\n\
+         hierarchy:\n\
+         \x20 - level: org\n\
+         \x20   identity_header: x-org-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 5000000\n\
+         \x20 - level: team\n\
+         \x20   identity_header: x-team-id\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 1000000\n\
+         \x20 - level: user\n\
+         \x20   identity: authenticated_subject\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100000\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml)
+        .err()
+        .expect("a rule named hierarchy:user should be rejected");
+    assert!(err.to_string().contains("reserved for hierarchy"), "got: {err}");
 }

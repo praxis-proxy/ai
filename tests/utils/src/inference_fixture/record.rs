@@ -38,8 +38,8 @@ use super::{
     },
     http_server::{RecordingBody, RecordingHandler, RecordingHttpServer, ResponseDelivery, observe_response_delivery},
     replay::{
-        build_replay_config, load_and_validate_config_source, send_recorded_request_with_header, validate_expectation,
-        validate_scenario_requests,
+        build_replay_config_with_aliases, load_and_validate_config_source, send_recorded_request_with_header,
+        validate_expectation, validate_scenario_requests,
     },
     sanitize::{sanitize_fixture_preserving_structure, validate_commit_safe_with_rules_and_credentials},
     schema::{
@@ -269,7 +269,7 @@ impl RecordingProxyGuard {
             return Err(runtime_error("recording proxy exceeded its expected request count"));
         }
         if state.attempts.len() != expected_exchanges {
-            return Err(runtime_error("recording proxy captured an unexpected request count"));
+            return Err(FixtureError::UnexpectedRecordingRequestCount);
         }
         if state
             .attempts
@@ -357,10 +357,11 @@ pub(super) async fn record_live(
 
     let listener = free_port_guard();
     let listener_port = listener.port();
-    let config = match build_replay_config(
+    let config = match build_replay_config_with_aliases(
         &config_source,
         listener_port,
         &bound.upstream_authority,
+        &bound.replay_upstream_aliases,
         recorder.addr().port(),
     ) {
         Ok(config) => config,
@@ -396,6 +397,12 @@ pub(super) async fn record_live(
         .await
         {
             Ok(client_response) => {
+                if client_response.status != turn.expect.client_status {
+                    operation_error = Some(FixtureError::UnexpectedRecordedClientStatus {
+                        actual: client_response.status,
+                        expected: turn.expect.client_status,
+                    });
+                }
                 previous_response_id = client_response.response_id().map(str::to_owned);
                 let exchange = BorrowedRecordedExchange {
                     request: &turn.request,
@@ -413,7 +420,9 @@ pub(super) async fn record_live(
             },
             Err(error) => operation_error = Some(error),
         }
-        if let Err(error) = recorder.wait_for_attempts(attempts, RECORDING_WAIT_TIMEOUT).await {
+        if let Err(error) = recorder.wait_for_attempts(attempts, RECORDING_WAIT_TIMEOUT).await
+            && operation_error.is_none()
+        {
             operation_error = Some(error);
         }
         if operation_error.is_some() {
@@ -425,11 +434,22 @@ pub(super) async fn record_live(
         .shutdown()
         .map_err(|_error| runtime_error("scenario proxy shutdown did not complete"));
     let captured = recorder.finish_captures(attempts);
-    let captured = captured?;
     proxy_result?;
-    if let Some(error) = operation_error {
-        return Err(error);
-    }
+    let captured = match captured {
+        Err(FixtureError::UnexpectedRecordingRequestCount) => {
+            if let Some(error) = operation_error {
+                return Err(error);
+            }
+            return Err(FixtureError::UnexpectedRecordingRequestCount);
+        },
+        Err(error) => return Err(error),
+        Ok(captured) => {
+            if let Some(error) = operation_error {
+                return Err(error);
+            }
+            captured
+        },
+    };
     if pending.len() != expected_turns || captured.len() != expected_turns {
         return Err(runtime_error("recording scenario did not complete every turn"));
     }
@@ -3311,6 +3331,87 @@ mod tests {
         provider.finish().await;
     }
 
+    #[tokio::test]
+    async fn record_live_preserves_unexpected_client_status_error() {
+        let provider = LocalProvider::start(handler(|_request| async move { chat_response(0) })).await;
+        let mut scenario = live_scenario();
+        scenario.turns.truncate(1);
+        scenario.turns[0].expect.client_status = 201;
+
+        let error = ScenarioRunner::record_live(&scenario, target(provider.http_url("/"), secret_headers()))
+            .await
+            .expect_err("recording must report the declared/observed client-status mismatch");
+
+        assert!(
+            matches!(
+                error,
+                FixtureError::UnexpectedRecordedClientStatus {
+                    actual: 200,
+                    expected: 201
+                }
+            ),
+            "recording should report actual status 200 against declared status 201"
+        );
+        provider.finish().await;
+    }
+
+    #[tokio::test]
+    async fn record_live_binds_declared_fallback_alias_to_owned_recorder() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let provider = LocalProvider::start(handler({
+            let request_count = Arc::clone(&request_count);
+            move |request| {
+                let request_count = Arc::clone(&request_count);
+                async move {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    let body = request.into_body().collect().await.unwrap().to_bytes();
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(
+                        body["model"], "claude-sonnet-4-5@20250929",
+                        "the actual example must rewrite the recorded provider request"
+                    );
+                    json_response(
+                        StatusCode::OK,
+                        &json!({
+                            "id": "msg_alias_1", "type": "message", "role": "assistant",
+                            "model": "claude-sonnet-4-5@20250929", "content": [{"type":"text", "text":"hi"}],
+                            "stop_reason": "end_turn", "stop_sequence": null,
+                            "usage": {"input_tokens": 1, "output_tokens": 1}
+                        }),
+                    )
+                }
+            }
+        }))
+        .await;
+        let mut scenario = live_scenario();
+        scenario.example_config = "model-to-provider.yaml".to_owned();
+        scenario.upstream_authority = "127.0.0.1:9001".to_owned();
+        scenario.replay_upstream_aliases = vec!["127.0.0.1:9002".to_owned()];
+        scenario.turns.truncate(1);
+        scenario.turns[0].expect.upstream_path = "/v1/messages".to_owned();
+        let mut target = target(provider.http_url("/"), secret_headers());
+        target.model = "claude-sonnet-4-5".to_owned();
+        let fixture = ScenarioRunner::record_live(&scenario, target)
+            .await
+            .expect("live recording must bind every declared alias before enforcing containment");
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "the scenario must contact only its owned provider once"
+        );
+        assert_eq!(
+            fixture.turns.len(),
+            1,
+            "the actual alias-bearing example must produce one complete recorded turn"
+        );
+        assert_eq!(
+            fixture.turns[0].upstream.request.path, "/v1/messages",
+            "recording must preserve the mapped request path"
+        );
+        super::super::validate_commit_safe(&fixture).unwrap();
+        provider.finish().await;
+    }
+
     // Drives the Responses proxy with a sqlite-backed response store to persist
     // and rebind `previous_response_id` across turns, so it needs the
     // store-sqlite backend compiled in (run via `make test-inference-fixtures`).
@@ -3901,6 +4002,7 @@ mod tests {
             protocol: InferenceProtocol::AnthropicMessages,
             example_config: "anthropic/messages-to-openai.yaml".to_owned(),
             upstream_authority: "127.0.0.1:8000".to_owned(),
+            replay_upstream_aliases: Vec::new(),
             features: vec!["messages.request.minimal".to_owned()],
             turns: vec![live_turn("first", "first prompt"), live_turn("second", "second prompt")],
         }
@@ -3946,6 +4048,7 @@ mod tests {
             protocol: InferenceProtocol::OpenaiResponses,
             example_config: "openai/responses/responses-to-chat-completions.yaml".to_owned(),
             upstream_authority: "127.0.0.1:3001".to_owned(),
+            replay_upstream_aliases: Vec::new(),
             features: vec!["responses.chat.continuation".to_owned()],
             turns: vec![
                 live_responses_turn("initial", "first prompt", None),

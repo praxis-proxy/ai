@@ -13,6 +13,7 @@ pub(crate) mod descriptor;
 pub(crate) mod group_index;
 mod intelligent_route;
 pub(crate) mod metadata;
+pub(crate) mod metrics;
 pub(crate) mod overlay;
 pub(crate) mod picker;
 mod provider_route;

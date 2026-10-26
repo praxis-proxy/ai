@@ -8,6 +8,11 @@ pub(super) const OPENAI_REFERENCE_SPEC: &str = "docs/conformance/specs/openai-op
 /// Provenance pin for the vendored complete OpenAI reference.
 pub(super) const OPENAI_REFERENCE_MANIFEST: &str = "docs/conformance/specs/openai-openapi-source.json";
 
+/// Vendored Anthropic `OpenAPI` reference.
+pub(super) const ANTHROPIC_REFERENCE_SPEC: &str = "docs/conformance/specs/anthropic-spec.json";
+/// Provenance pin for the vendored Anthropic reference.
+pub(super) const ANTHROPIC_REFERENCE_MANIFEST: &str = "docs/conformance/specs/anthropic-spec-source.json";
+
 /// Conversations operations selected from the full OpenAI reference.
 pub(super) const CONVERSATIONS_SCOPE: OperationScope =
     OperationScope::new("conversations", "Conversations", &["/conversations"]).without_inherited_security();
@@ -338,8 +343,18 @@ pub(super) const CONFORMANCE_AREAS: &[ApiArea] = &[
 
 /// Generate the Conversations implementation spec from crate code.
 fn conversations_implementation_spec() -> Result<String, String> {
-    praxis_ai_apis::openai::conversations_openapi_json()
-        .map_err(|e| format!("failed to generate Conversations implementation OpenAPI spec: {e}"))
+    #[cfg(feature = "openai-all")]
+    {
+        praxis_ai_apis::openai::conversations_openapi_json()
+            .map_err(|e| format!("failed to generate Conversations implementation OpenAPI spec: {e}"))
+    }
+    #[cfg(not(feature = "openai-all"))]
+    {
+        Err(
+            "Conversations conformance requires the experimental APIs: use cargo xtask or cargo run -p xtask --features openai-all --"
+                .to_owned(),
+        )
+    }
 }
 
 /// Return Conversations operations from the runtime route table.
@@ -361,8 +376,18 @@ fn conversations_supported_operations() -> Vec<SupportedOperation> {
 
 /// Generate the Responses implementation spec from crate code.
 fn responses_implementation_spec() -> Result<String, String> {
-    praxis_ai_apis::openai::responses_openapi_json()
-        .map_err(|e| format!("failed to generate Responses implementation OpenAPI spec: {e}"))
+    #[cfg(feature = "openai-all")]
+    {
+        praxis_ai_apis::openai::responses_openapi_json()
+            .map_err(|e| format!("failed to generate Responses implementation OpenAPI spec: {e}"))
+    }
+    #[cfg(not(feature = "openai-all"))]
+    {
+        Err(
+            "Responses conformance requires the experimental APIs: use cargo xtask or cargo run -p xtask --features openai-all --"
+                .to_owned(),
+        )
+    }
 }
 
 /// Return Responses operations from the runtime route table.

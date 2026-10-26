@@ -1,0 +1,70 @@
+# External Metering with a File-Backed Internal Auth Token
+#
+# Same pre-request balance check and post-response usage reporting as
+# external-metering.yaml, but the internal bearer credential used to
+# authenticate the metering callouts is read from a file rather than
+# embedded in the config or image.
+#
+# This suits a Kubernetes projected Secret mounted at a fixed path: the
+# platform rotates the file in place and `external_metering` picks up the
+# new token without a restart or image rebuild. The token value never
+# appears in logs, tracing, or the rendered config. If the file is
+# missing, unreadable, empty, or oversized at startup the proxy fails to
+# start; if a post-startup rotation produces no valid token the metering
+# callouts fail closed (never dialed unauthenticated) and the existing
+# `fail_open` policy then decides whether the request proceeds.
+#
+# Usage:
+#   printf 'my-internal-metering-token' > /etc/praxis/metering-token
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/external-metering-file-key.yaml
+#   curl -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -H "x-tenant-username: alice" \
+#     -H "x-tenant-group: engineering" \
+#     -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+#
+# The metering service then receives both callouts with an
+# `Authorization: Bearer <token>` header read live from the file:
+#   GET  {metering_url}/api/v1/customers/{username}/entitlements/{feature_key}/value?model={model}
+#   POST {metering_url}/api/v1/events  (CloudEvents 1.0 JSON)
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      - filter: external_metering
+        metering_url: "http://127.0.0.1:9090"
+        # The metering service in this example listens on loopback, a
+        # non-public address, so callouts must be explicitly opted in.
+        allow_private_endpoint: true
+        timeout_seconds: 5
+        feature_key: "inference-tokens"
+        source: "ai-gateway"
+        fail_open: true
+        identity_header_prefix: "x-tenant-"
+        # Internal bearer token for the metering callouts, read from a file
+        # and watched for rotation. One of `value | env_var | file`.
+        internal_auth_token:
+          file: /etc/praxis/metering-token
+
+      - filter: token_count
+        provider: openai
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

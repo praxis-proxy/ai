@@ -15,7 +15,13 @@ This filter is registered by the AI proxy (not Praxis core) because it encodes A
 
 **Selection:** session affinity is resolved first. New requests use the overlay's selection mode within the first viable producer-defined group. Missing group or policy metadata uses deterministic first-admitted ordering. Praxis AI does not recompute source geography, load, or score. `weightedRandom` is overlay-only: every non-empty weighted candidate list must supply a selection group and an integer `traffic_weight` from 1 through 1000. Weights are applied only among candidates in the first viable group. Inline static candidates cannot enable weighted selection. A validated versioned overlay may have no candidates in any selection mode; matching requests are rejected with HTTP 404. Static candidate lists and legacy flat overlays remain non-empty. `admission_state=none` is never eligible. `existing_only` is eligible only through an already-bound session affinity entry.
 
-**Metadata:** on successful selection, bounded in-process filter metadata is written under the `intelligent_route.` namespace (`kind`, `name`, `site`, `cluster`, `local_site`, `stable_id`, `admission_state`, and optionally `rank`, `selection_group`, `selection_mode`, and `selection_tier`). When session affinity is enabled, `session.bound`, `session.reused`, and `session.failover` keys are also written. When the selected cluster is present in `provider_hop_clusters`, client-supplied `x-ai-routing-candidate`, `x-ai-routing-request-id`, and `x-ai-routing-revision` values are removed and replaced with the selected stable ID, a generated provider-hop request ID, and the serving overlay revision (envelope mode only). These AI-owned, non-reserved headers are sent only to an mTLS-authenticated provider gateway; the provider must run `peer_identity_trust` before consuming them. No credential reference or value is forwarded. No request-time database, control-plane, or metrics lookups are performed.
+**Metadata:** every request leaves `intelligent_route.outcome` in the in-process filter metadata: `routed`, `reused`, `no_candidate`, `invalid`, `skipped`, `management`, or `preserved`. When a capability lookup happened, `intelligent_route.candidate_count` records how many candidates the serving snapshot carries for it before admission filtering. On successful selection, bounded metadata is written under the same namespace (`kind`, `name`, `site`, `cluster`, `local_site`, `stable_id`, `admission_state`, and optionally `rank`, `selection_group`, `selection_mode`, and `selection_tier`). When session affinity is enabled, `session.bound`, `session.reused`, and `session.failover` keys are also written. All keys are available to the access log as `metadata.<key>`, including on 400 and 404 rejections. When the selected cluster is present in `provider_hop_clusters`, client-supplied `x-ai-routing-candidate`, `x-ai-routing-request-id`, and `x-ai-routing-revision` values are removed and replaced with the selected stable ID, a generated provider-hop request ID, and the serving overlay revision (envelope mode only). These AI-owned, non-reserved headers are sent only to an mTLS-authenticated provider gateway; the provider must run `peer_identity_trust` before consuming them. No credential reference or value is forwarded. No request-time database, control-plane, or metrics lookups are performed.
+
+**Metrics:** the filter exports Prometheus series through the shared recorder. Label values come from closed vocabularies or from the bounded snapshot contract, never from client input, and candidate `stable_id` values are never used as labels.
+
+- `praxis_ai_intelligent_route_decisions_total{outcome, kind}` — one per request; `outcome` uses the metadata vocabulary above and `kind` is `inference_model`, `mcp_tool`, or `none` before a lookup exists. - `praxis_ai_intelligent_route_selected_total{cluster, site, selection_mode}` — one per fresh selection (session reuse is not a selection). - `praxis_ai_intelligent_route_session_total{event}` — `bound`, `reused`, or `failover`, when session affinity is enabled. - `praxis_ai_intelligent_route_session_table_entries` — entries in the session tables of every instance in this process, including expired entries not yet evicted; instances add up and a dropped instance subtracts its table. - `praxis_ai_intelligent_route_snapshot_candidates` — candidates in the serving snapshot, published by the instance serving requests and cleared when it is dropped. - `praxis_ai_intelligent_route_snapshot_reloads_total{result}` — `accepted`, `unchanged`, `rejected`, or `read_error`, per overlay reload attempt.
+
+Decision latency is covered by the core `praxis_filter_duration_seconds{filter="intelligent_route"}` histogram, which the proxy records only when `metrics.filter_duration: true` is set.
 
 **MCP lookup:** if `mcp.method` filter metadata is set to `tools/call` and `mcp.name` is present, `mcp_tool` candidates are matched. Other MCP methods (`initialize`, `notifications/*`, etc.) skip routing.
 
@@ -31,7 +37,7 @@ The revision lifecycle is observable as: - **rendered:** The producer constructe
 
 Invalid cold-start envelopes fail filter construction. Invalid reloads retain the same-process last-known-good snapshot. Envelope-mode provider hops carry the serving revision from the same immutable snapshot used for candidate selection.
 
-**Scope:** overlay hot reload swaps the candidate list and `local_site` only. It cannot add or remove `load_balancer` clusters or change cluster endpoints or TLS configuration; those changes require a full pipeline reload or pod restart. Overlay files never carry credential values. An already-configured projected credential resolver can use a newly selected, already-mounted Secret without rebuilding the filter pipeline. Every cluster name that may appear in any overlay version must already be configured in the downstream `load_balancer` filter. An overlay that references an unknown cluster will cause request-time failures, not a reload rejection.
+**Scope:** overlay hot reload swaps the candidate list and `local_site` only. It cannot add or remove `load_balancer` clusters or change cluster endpoints or TLS configuration; those changes require a full pipeline reload or pod restart. Overlay files never carry credential values. An already-configured projected credential resolver can use a newly selected, already-mounted Secret without rebuilding the filter pipeline. Every cluster name that may appear in any overlay version must already be configured in the downstream `load_balancer` filter. Pipeline validation checks the clusters this filter reports: the `clusters` list when configured, otherwise static candidates (they live in the same configuration), always plus `management_cluster`. Overlay candidates are never reported on their own, so an overlay revision the running gateway accepted cannot fail the next restart. With `clusters` configured, a reload naming a cluster outside the list is rejected and the previous snapshot is retained; without it, such a reload is accepted and the request fails when the `load_balancer` cannot resolve the cluster.
 
 Supports two modes:
 
@@ -39,15 +45,17 @@ Supports two modes:
 
 **Overlay mode** — candidates are loaded from an overlay envelope:
 
+`clusters` lists the clusters the downstream `load_balancer` declares. When present it is authoritative: pipeline validation checks every entry against the load balancer, and any overlay revision naming another cluster is rejected.
+
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `candidates` | CandidateConfig[] | no | Static list of route candidates (mutually exclusive with `overlay_file`). |
+| `candidates` | object[] | no | Static list of route candidates (mutually exclusive with `overlay_file`). |
 | `candidates[].cluster` | string | yes | Cluster name to select when this candidate is chosen. |
-| `candidates[].credential` | CandidateCredential | no | Optional final-hop credential reference. |
+| `candidates[].credential` | object | no | Optional final-hop credential reference. |
 | `candidates[].credential.strategy` | string | yes | Injection strategy. |
-| `candidates[].credential.secretRef` | CredentialRef | yes | Secret locator, never secret bytes. |
+| `candidates[].credential.secretRef` | object | yes | Secret locator, never secret bytes. |
 | `candidates[].credential.secretRef.key` | string | yes | Secret data key. |
 | `candidates[].credential.secretRef.name` | string | yes | Secret name. |
 | `candidates[].credential.secretRef.namespace` | string | yes | Secret namespace. |
@@ -56,21 +64,22 @@ Supports two modes:
 | `candidates[].name` | string | yes | Capability name (model name, tool name, or agent name). |
 | `candidates[].site` | string | yes | Site that owns this capability. |
 | `candidates[].traffic_weight` | integer | no | Optional weight for an overlay using `selection_policy.mode: weightedRandom`. Inline static candidates cannot use traffic weights. |
+| `clusters` | string[] | no | Clusters the downstream `load_balancer` declares for this filter. When set, the list is authoritative: pipeline validation checks every entry against the `load_balancer`, and a candidate (static or from any overlay revision) naming a cluster outside the list is rejected — at build for the initial snapshot, and on reload while retaining the previous snapshot. When unset, only the initial snapshot's clusters are reported to pipeline validation and overlay reloads are not checked. |
 | `local_site` | string | no | Name of the local site (required in static mode, provided by overlay in overlay mode). |
 | `model_header` | string | no | Header name that carries the model name (default: `X-Model`). |
 | `skip_paths` | string[] | no | Request-path prefixes that bypass model resolution entirely. Management and discovery endpoints (model listing, subscriptions, API-key management, health) carry no routable model; a matching request returns `Continue` before any model lookup. Defaults to the well-known OpenAI-style management paths; set an explicit list to override, or `[]` to disable path skipping. See `path_is_management` for the match rule. |
 | `management_cluster` | string | no | Cluster that serves skipped management/discovery paths. When set, a request whose path matches `skip_paths` has `ctx.cluster` set to this cluster and continues straight to `load_balancer`. When unset, skipped paths continue with the cluster untouched. Requires a non-empty `skip_paths`. |
 | `provider_hop_clusters` | string[] | no | Clusters that terminate the authenticated provider-hop protocol. A selected candidate emits the fixed routing context only when its cluster is present in this allowlist. Each named cluster must use an mTLS-authenticated Praxis provider gateway. Direct API/backend clusters remain absent. |
-| `expected_overlay_scope` | ExpectedOverlayScope | no | Expected scope of the overlay envelope. When set, each specified field is validated against the envelope scope on load and every reload. Rejected on mismatch. Only relevant in overlay mode with envelope-format files. |
+| `expected_overlay_scope` | object | no | Expected scope of the overlay envelope. When set, each specified field is validated against the envelope scope on load and every reload. Rejected on mismatch. Only relevant in overlay mode with envelope-format files. |
 | `expected_overlay_scope.network` | string | no | Expected network name. |
 | `expected_overlay_scope.gateway` | string | no | Expected gateway name. |
 | `expected_overlay_scope.namespace` | string | no | Expected namespace. |
 | `expected_overlay_scope.local_site` | string | no | Expected local site. |
 | `overlay_file` | PathBuf | no | Path to a routing overlay JSON file (`routing-overlay.json` envelope or legacy `routing-config.json`). When set, candidates and `local_site` are read from the overlay instead of the YAML config. |
-| `reload` | ReloadConfig | no | Hot reload configuration for overlay mode. Only valid when `overlay_file` is set.  Providing a `reload:` block with static `candidates` is rejected — static candidates are immutable for the lifetime of the filter. |
+| `reload` | object | no | Hot reload configuration for overlay mode. Only valid when `overlay_file` is set.  Providing a `reload:` block with static `candidates` is rejected — static candidates are immutable for the lifetime of the filter. |
 | `reload.enabled` | bool | no | Whether file watching is enabled (default: `true`). |
 | `reload.debounce_ms` | integer | no | Debounce window in milliseconds (default: 500). |
-| `session_affinity` | SessionAffinityConfig | no | Session affinity configuration (disabled by default). |
+| `session_affinity` | object | no | Session affinity configuration (disabled by default). |
 | `session_affinity.cookie` | string | no | Name of a cookie to extract the session key from. |
 | `session_affinity.enabled` | bool | no | Whether session affinity is enabled (default: `false`). |
 | `session_affinity.header` | string | no | Header name to extract the session key from. |

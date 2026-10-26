@@ -299,6 +299,7 @@ mod tests {
             site: Arc::from("site-a"),
             stable_id: Arc::from("stable-a"),
             traffic_weight: None,
+            provider_profile: None,
         }
     }
 }

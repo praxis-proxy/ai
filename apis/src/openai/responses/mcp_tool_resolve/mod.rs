@@ -72,14 +72,20 @@ use tracing::debug;
 
 use self::config::{McpToolResolveConfig, build_config};
 use super::{
+    AgenticBudgetPolicy,
+    agentic_loop::budget::input_charge,
     bound_body_outcome,
     error::responses_error_rejection,
+    mcp_admission::{
+        ConnectorToolPolicy, McpAdmissionDecisions, McpAdmissionPolicy, McpDenyReason, McpToolVerdict, evaluate_tool,
+    },
     state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState},
 };
 use crate::{
     StateOwner,
     callout_headers::effective_body_callout_headers,
     callout_identity::{McpCalloutIdentity, stage_mcp_callout_identity},
+    classifier::is_responses_create,
     json_body::{SerializedJson, serialize_json_body, serialized_len},
     mcp_client,
 };
@@ -87,6 +93,290 @@ use crate::{
 /// Maximum length for generated function names per the OpenAI
 /// Responses POST schema (`^[a-zA-Z0-9_-]+$`, max 64 chars).
 const MAX_FUNCTION_NAME_LEN: usize = 64;
+
+/// The same listing can be held by rmcp, the converted JSON tree, generated
+/// functions, the dispatch map, the rewritten request, and public/private
+/// discovery output at once. A byte of compact JSON can also be a JSON node.
+const DISCOVERY_LISTING_MULTIPLIER: usize = 256;
+/// Backing wire/string capacity per retained JSON owner.
+const DISCOVERY_RETAINED_WIRE_MULTIPLIER: usize = 8;
+/// Map/vector nodes and spare capacity per retained JSON owner.
+const DISCOVERY_RETAINED_NODE_RESERVE: usize = 256;
+/// A maximal function selector JSON owner plus its vector allocation.
+const DISCOVERY_FUNCTION_REF_CHARGE: usize = 2_304;
+/// Minimum capacity for the MCP initialize exchange before a callout.
+const MIN_DISCOVERY_SLOT: usize = 512 * 1_024;
+/// Ordinary MCP control-response ceiling, further reduced by the budget.
+const MAX_DISCOVERY_WIRE_BYTES: usize = 1_024 * 1_024;
+
+/// One reservation that covers eager or deferred discovery until it settles.
+#[derive(Clone, Copy)]
+struct DiscoveryBudget {
+    /// Peak request-wide capacity reserved before parsing or dialing.
+    reserved: usize,
+    /// Per-call transport and lexical parser ceilings.
+    limits: mcp_client::McpBudgetedCallLimits,
+    /// Maximum compact tool JSON retained by one listing operation.
+    listing_bytes: usize,
+    /// Aggregate capacity for per-tool dispatch metadata copies.
+    map_bytes: usize,
+}
+
+impl DiscoveryBudget {
+    /// Divide the aggregate reservation among concurrent MCP servers.
+    fn per_call(self, calls: usize) -> Self {
+        let count = calls.max(1);
+        Self {
+            limits: mcp_client::McpBudgetedCallLimits {
+                wire_limit: self.limits.wire_limit / count,
+                parse_charge_limit: self.limits.parse_charge_limit / count,
+            },
+            listing_bytes: self.listing_bytes / count,
+            ..self
+        }
+    }
+}
+
+/// Reserve all parser and listing owners before the first new allocation.
+fn reserve_discovery_budget(state: &mut ResponsesState, raw: Option<&[u8]>) -> Result<DiscoveryBudget, ResolveError> {
+    let budget = state.simple_budget.as_mut().ok_or(ResolveError::RetainedBudget)?;
+    let available = budget.remaining_bytes().ok_or(ResolveError::RetainedBudget)?;
+    let reserved = available / 2;
+    let parse = match raw {
+        Some(bytes) => input_charge(bytes).ok_or(ResolveError::RetainedBudget)?,
+        None => 0,
+    };
+    let staging = parse.checked_mul(3).ok_or(ResolveError::RetainedBudget)?;
+    let listing_pool = reserved.checked_sub(staging).ok_or(ResolveError::RetainedBudget)?;
+    if listing_pool < MIN_DISCOVERY_SLOT || !budget.reserve_additional_input(reserved) {
+        return Err(ResolveError::RetainedBudget);
+    }
+    Ok(DiscoveryBudget {
+        reserved,
+        limits: mcp_client::McpBudgetedCallLimits {
+            wire_limit: (listing_pool / 8).min(MAX_DISCOVERY_WIRE_BYTES),
+            parse_charge_limit: listing_pool / 2,
+        },
+        listing_bytes: listing_pool / DISCOVERY_LISTING_MULTIPLIER,
+        map_bytes: listing_pool / 2,
+    })
+}
+
+/// Replace peak capacity with the independently owned data left in state.
+fn settle_discovery_budget(
+    state: &mut ResponsesState,
+    budget: DiscoveryBudget,
+    retained: usize,
+) -> Result<(), ResolveError> {
+    if state
+        .simple_budget
+        .as_mut()
+        .is_some_and(|shared| shared.settle_additional_input(budget.reserved, retained))
+    {
+        Ok(())
+    } else {
+        Err(ResolveError::RetainedBudget)
+    }
+}
+
+/// Count a parsed JSON owner without serializing a second payload buffer.
+fn discovery_value_charge(value: &serde_json::Value) -> Result<usize, ResolveError> {
+    let wire = serialized_len(value).map_err(ResolveError::Serialization)?;
+    let nodes = discovery_node_count(value).ok_or(ResolveError::RetainedBudget)?;
+    wire.checked_mul(DISCOVERY_RETAINED_WIRE_MULTIPLIER)
+        .and_then(|bytes| bytes.checked_add(nodes.checked_mul(DISCOVERY_RETAINED_NODE_RESERVE)?))
+        .ok_or(ResolveError::RetainedBudget)
+}
+
+/// Charge one cloned JSON value before copying server metadata into a tool map.
+fn discovery_clone_charge(value: &serde_json::Value) -> Result<usize, ResolveError> {
+    let wire = serialized_len(value).map_err(ResolveError::Serialization)?;
+    let nodes = discovery_node_count(value).ok_or(ResolveError::RetainedBudget)?;
+    wire.checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(nodes.checked_mul(DISCOVERY_RETAINED_NODE_RESERVE)?))
+        .ok_or(ResolveError::RetainedBudget)
+}
+
+/// Bound the metadata that [`insert_tools`] clones once for every listed tool.
+fn dispatch_metadata_clone_charge(entry: &serde_json::Value) -> Result<usize, ResolveError> {
+    let mut charge = 4_096_usize;
+    for field in [
+        "server_label",
+        "server_url",
+        "connector_id",
+        "headers",
+        "authorization",
+        "require_approval",
+    ] {
+        if let Some(value) = entry.get(field) {
+            charge = charge
+                .checked_add(discovery_clone_charge(value)?)
+                .ok_or(ResolveError::RetainedBudget)?;
+        }
+    }
+    Ok(charge)
+}
+
+/// Bound repeated MCP selectors before they expand into function references.
+/// One short selector can select every tool on a server, and the same selector
+/// can appear many times in `tool_choice`.
+fn preflight_tool_choice_expansion(
+    choice: Option<&serde_json::Value>,
+    tool_map: &HashMap<(String, String), serde_json::Value>,
+    limit: usize,
+) -> Result<(), ResolveError> {
+    let references = match choice {
+        Some(choice) if choice.get("type").and_then(serde_json::Value::as_str) == Some("mcp") => {
+            selector_function_ref_count(choice, tool_map)
+        },
+        Some(choice) if choice.get("type").and_then(serde_json::Value::as_str) == Some("allowed_tools") => choice
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .map_or(Some(0), |tools| {
+                tools
+                    .iter()
+                    .filter(|tool| tool.get("type").and_then(serde_json::Value::as_str) == Some("mcp"))
+                    .try_fold(0_usize, |sum, selector| {
+                        sum.checked_add(selector_function_ref_count(selector, tool_map))
+                    })
+            })
+            .ok_or(ResolveError::RetainedBudget)?,
+        _ => 0,
+    };
+    let charge = references
+        .checked_mul(DISCOVERY_FUNCTION_REF_CHARGE)
+        .ok_or(ResolveError::RetainedBudget)?;
+    if charge > limit {
+        return Err(ResolveError::RetainedBudget);
+    }
+    Ok(())
+}
+
+/// Count exactly the function references produced by one MCP selector.
+fn selector_function_ref_count(
+    selector: &serde_json::Value,
+    tool_map: &HashMap<(String, String), serde_json::Value>,
+) -> usize {
+    let label = selector
+        .get("server_label")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    if let Some(name) = selector.get("name").and_then(serde_json::Value::as_str) {
+        usize::from(tool_map.contains_key(&(label.to_owned(), name.to_owned())))
+    } else {
+        tool_map
+            .keys()
+            .filter(|(server_label, _)| server_label == label)
+            .count()
+    }
+}
+
+/// Count map keys and JSON values, including sparse one-byte values.
+fn discovery_node_count(value: &serde_json::Value) -> Option<usize> {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .try_fold(1_usize, |sum, item| sum.checked_add(discovery_node_count(item)?)),
+        serde_json::Value::Object(fields) => fields.iter().try_fold(1_usize, |sum, (_, item)| {
+            sum.checked_add(1)?.checked_add(discovery_node_count(item)?)
+        }),
+        _ => Some(1),
+    }
+}
+
+/// Sum independently owned JSON items without cloning their vector.
+fn discovery_values_charge(values: &[serde_json::Value]) -> Result<usize, ResolveError> {
+    values
+        .iter()
+        .try_fold(0_usize, |sum, item| sum.checked_add(discovery_value_charge(item).ok()?))
+        .ok_or(ResolveError::RetainedBudget)
+}
+
+/// Count one owned string and its allocation metadata.
+fn discovery_string_charge(value: &str) -> Option<usize> {
+    value
+        .len()
+        .checked_mul(DISCOVERY_RETAINED_WIRE_MULTIPLIER)?
+        .checked_add(DISCOVERY_RETAINED_NODE_RESERVE)
+}
+
+/// Conservatively charge rewritten state, dispatch entries, and discovery output.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the fixed owners and each listing owner are accounted together"
+)]
+fn discovery_retained_charge(
+    parsed: &serde_json::Value,
+    map: &HashMap<(String, String), serde_json::Value>,
+    deferred: &[DeferredMcpConnector],
+    listings: &[McpListing],
+) -> Result<usize, ResolveError> {
+    // The ingress ledger already owns unchanged input fields. The resolver
+    // replaces `tools` and may rewrite `tool_choice`, and also stores a
+    // separate tools vector for dispatch.
+    let mut charge = parsed
+        .get("tools")
+        .map(discovery_value_charge)
+        .transpose()?
+        .unwrap_or(0)
+        .checked_mul(2)
+        .ok_or(ResolveError::RetainedBudget)?;
+    if let Some(choice) = parsed.get("tool_choice") {
+        charge = charge
+            .checked_add(
+                discovery_value_charge(choice)?
+                    .checked_mul(2)
+                    .ok_or(ResolveError::RetainedBudget)?,
+            )
+            .ok_or(ResolveError::RetainedBudget)?;
+    }
+    for ((label, name), value) in map {
+        charge = charge
+            .checked_add(discovery_string_charge(label).ok_or(ResolveError::RetainedBudget)?)
+            .and_then(|sum| sum.checked_add(discovery_string_charge(name)?))
+            .and_then(|sum| sum.checked_add(discovery_value_charge(value).ok()?))
+            .ok_or(ResolveError::RetainedBudget)?;
+    }
+    for item in listings {
+        let tools = discovery_values_charge(&item.tools)?;
+        let url_charge = item
+            .server_url
+            .as_deref()
+            .map_or(Some(0), discovery_string_charge)
+            .ok_or(ResolveError::RetainedBudget)?;
+        charge = charge
+            .checked_add(tools.checked_mul(2).ok_or(ResolveError::RetainedBudget)?)
+            .and_then(|sum| sum.checked_add(discovery_string_charge(&item.server_label)?.checked_mul(2)?))
+            .and_then(|sum| sum.checked_add(url_charge))
+            .and_then(|sum| sum.checked_add(4_096))
+            .ok_or(ResolveError::RetainedBudget)?;
+    }
+    for item in deferred {
+        for field in [
+            Some(item.connector_id.as_str()),
+            Some(item.server_label.as_str()),
+            Some(item.server_url.as_str()),
+            item.authorization.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            charge = charge
+                .checked_add(discovery_string_charge(field).ok_or(ResolveError::RetainedBudget)?)
+                .ok_or(ResolveError::RetainedBudget)?;
+        }
+        for value in [&item.allowed_tools, &item.headers, &item.require_approval]
+            .into_iter()
+            .flatten()
+        {
+            charge = charge
+                .checked_add(discovery_value_charge(value)?)
+                .ok_or(ResolveError::RetainedBudget)?;
+        }
+    }
+    Ok(charge)
+}
+
 
 // -----------------------------------------------------------------------------
 // McpToolResolveFilter
@@ -99,6 +389,13 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// Rejects the request with HTTP 400 before any callouts if two or
 /// more resolvable MCP entries share the same `server_label`
 /// (including entries that differ only by credentials).
+///
+/// With `require_connector: true`, raw client-selected `server_url` entries are
+/// rejected before identity staging or any MCP callout. `openai_mcp_dispatch`
+/// needs no duplicate gate: its existing connector-context policy already
+/// refuses ambient identity to non-connector entries and round-matches the
+/// resolver configuration, making resolve-side rejection the single effective
+/// connector-only gate.
 ///
 /// Configured `connector_id` entries with `defer_loading: true` are
 /// accepted when the request also includes a `tool_search` tool.
@@ -149,15 +446,40 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// timeout_ms: 5000
 /// max_rewritten_body_bytes: 67108864
 /// max_tools: 128
+/// # Operator-owned metadata admission (issue #1724). Defaults to advisory
+/// # (unchanged behavior); protected mode enforces the connector tool policy below.
+/// tool_admission:
+///   mode: protected          # advisory (default) | protected
 /// connectors:
 ///   - id: corp_drive
 ///     server_url: https://drive-mcp.internal/mcp
+///     # Connector policy defaults to deny. `allow_all` permits writes;
+///     # `read_only` admits only affirmed read-only tools.
+///     tool_policy: read_only
 /// ```
 ///
 /// `forward_headers` applies only to configured `connector_id` targets. Direct
 /// client-selected `server_url` targets never receive ambient request headers.
 /// Credential headers are rejected; use the MCP tool entry's dedicated
 /// `authorization` field for per-target credentials.
+///
+/// ## Metadata admission and read-only enforcement
+///
+/// The client selector `allowed_tools.read_only` stays **advisory**: it filters
+/// using the server-supplied `annotations.readOnlyHint` and is preserved for API
+/// compatibility, not as an operator guarantee. Operator enforcement is
+/// configured under `tool_admission` and cannot be weakened by client fields,
+/// tool descriptions, annotations, labels, or a matching URL.
+///
+/// In `protected` mode a client-selected direct `server_url` is untrusted and
+/// its tools are excluded (the target is not even dialed). A connector is
+/// excluded unless the operator configures its `tool_policy`. `allow_all` admits
+/// all of its tools, including tools that write. `read_only` admits only tools
+/// with an affirmative `readOnlyHint`; writable, missing, malformed, or
+/// conflicting classifications are excluded. Eligibility is re-enforced at
+/// dispatch, so a model-generated call to an excluded tool cannot execute. The
+/// service remains the owner of its catalog and per-call authorization; Praxis
+/// does not duplicate that policy engine.
 pub struct McpToolResolveFilter {
     /// Optional per-user bearer slot required for configured connectors.
     user_credential_slot: Option<String>,
@@ -170,6 +492,16 @@ pub struct McpToolResolveFilter {
 
     /// Connector ID to server URL mapping.
     connectors: HashMap<String, url::Url>,
+
+    /// Whether client-selected direct MCP `server_url` entries are rejected.
+    require_connector: bool,
+
+    /// Operator metadata-admission policy snapshot.
+    admission_policy: McpAdmissionPolicy,
+
+    /// Per-connector operator tool policies, keyed by connector id. Direct,
+    /// client-selected targets always use `Deny` and never appear here.
+    connector_tool_policies: HashMap<String, ConnectorToolPolicy>,
 
     /// Maximum size in bytes of the body produced after expanding
     /// `mcp` tool entries into `function` entries.
@@ -282,6 +614,7 @@ impl McpToolResolveFilter {
     /// # Errors
     ///
     /// Returns [`FilterError`] if a connector `server_url` cannot be parsed.
+    #[expect(clippy::too_many_lines, reason = "linear field assembly for the built filter")]
     fn assemble(
         validated: &McpToolResolveConfig,
         outbound_pipeline: Arc<FilterPipeline>,
@@ -295,6 +628,11 @@ impl McpToolResolveFilter {
                 Ok((c.id.clone(), url))
             })
             .collect::<Result<HashMap<String, url::Url>, FilterError>>()?;
+        let connector_tool_policies = validated
+            .connectors
+            .iter()
+            .map(|c| (c.id.clone(), c.tool_policy.snapshot()))
+            .collect();
         Ok(Box::new(Self {
             user_credential_slot: validated.user_credential.clone(),
             authorization_assertion_slot: validated.authorization_assertion.clone(),
@@ -304,6 +642,9 @@ impl McpToolResolveFilter {
                 .filter_map(|name| http::HeaderName::from_bytes(name.as_bytes()).ok())
                 .collect(),
             connectors,
+            require_connector: validated.require_connector,
+            admission_policy: validated.tool_admission.snapshot(),
+            connector_tool_policies,
             max_rewritten_body_bytes: validated.max_rewritten_body_bytes,
             max_servers: validated.max_servers,
             max_tools: validated.max_tools,
@@ -335,12 +676,23 @@ impl McpToolResolveFilter {
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
         mut parsed: serde_json::Value,
+        budget: Option<DiscoveryBudget>,
     ) -> Result<FilterAction, ResolveError> {
         let mut mcp_entries = extract_mcp_entries(&mut parsed);
         if mcp_entries.is_empty() {
+            if let Some(slot) = budget {
+                let state = ctx
+                    .extensions
+                    .get_mut::<ResponsesState>()
+                    .ok_or(ResolveError::RetainedBudget)?;
+                settle_discovery_budget(state, slot, 0)?;
+            }
             return Ok(FilterAction::Continue);
         }
 
+        if self.require_connector {
+            reject_direct_server_urls(&mcp_entries.values)?;
+        }
         resolve_connector_ids(&self.connectors, &mut mcp_entries.values)?;
         let has_configured_connector = mcp_entries
             .values
@@ -368,11 +720,20 @@ impl McpToolResolveFilter {
             self.timeout,
             self.max_tools,
             self.max_rewritten_body_bytes,
+            &self.connector_tool_policies,
+            self.admission_policy,
         );
         let resolution = self
-            .resolve_request_entries(ctx, &mcp_entries.values, &callout, connector_identity.as_ref())
+            .resolve_request_entries(ctx, &mcp_entries.values, &callout, connector_identity.as_ref(), budget)
             .await?;
         if !resolution.has_resolved && deferred_mcp.is_empty() {
+            if let Some(slot) = budget {
+                let state = ctx
+                    .extensions
+                    .get_mut::<ResponsesState>()
+                    .ok_or(ResolveError::RetainedBudget)?;
+                settle_discovery_budget(state, slot, 0)?;
+            }
             return Ok(FilterAction::Continue);
         }
         debug!(
@@ -392,13 +753,15 @@ impl McpToolResolveFilter {
             resolution,
             deferred_mcp,
             connector_context_policy,
+            budget,
         )
     }
 
     /// Rewrite the request body and store resolved plus deferred MCP state.
     #[expect(
         clippy::too_many_arguments,
-        reason = "rewrite needs the parsed body and both resolved maps"
+        clippy::too_many_lines,
+        reason = "rewrite needs the parsed body, resolved maps, and budget admission"
     )]
     fn commit_resolved_tools(
         &self,
@@ -409,32 +772,63 @@ impl McpToolResolveFilter {
         resolution: Resolution,
         deferred_mcp: Vec<DeferredMcpConnector>,
         connector_context_policy: McpConnectorContextPolicy,
+        budget: Option<DiscoveryBudget>,
     ) -> Result<FilterAction, ResolveError> {
         let Resolution {
             per_entry,
             tool_map,
             resolved_labels,
             listings,
+            mut decisions,
             ..
         } = resolution;
+        if let Some(slot) = budget {
+            preflight_tool_choice_expansion(parsed.get("tool_choice"), &tool_map, slot.map_bytes / 2)?;
+        }
         let Some(serialized) = rewrite_request_body(&mut parsed, mcp_entries, per_entry, &tool_map, &resolved_labels)?
         else {
             return Ok(FilterAction::Continue);
         };
         check_body_size(&serialized, self.max_rewritten_body_bytes)?;
+        let retained = if budget.is_some() {
+            discovery_retained_charge(&parsed, &tool_map, &deferred_mcp, &listings)?
+        } else {
+            0
+        };
+        if budget.is_some_and(|slot| retained > slot.reserved) {
+            return Err(ResolveError::RetainedBudget);
+        }
         serialized.commit(body, self.name(), "tools");
-        write_state(ctx, parsed, tool_map, deferred_mcp, connector_context_policy);
+        // Record the final model-visible function names so a denied tool's lossy
+        // encoded-name collision can never reject an admitted tool or a client
+        // function (#1724).
+        if let Some(tools) = parsed.get("tools").and_then(serde_json::Value::as_array) {
+            decisions.mark_available_functions(tools);
+        }
+        write_state(ctx, parsed, tool_map, deferred_mcp, connector_context_policy, decisions);
         commit_discovery_items(ctx, listings);
+        if let Some(slot) = budget {
+            let state = ctx
+                .extensions
+                .get_mut::<ResponsesState>()
+                .ok_or(ResolveError::RetainedBudget)?;
+            settle_discovery_budget(state, slot, retained)?;
+        }
         Ok(FilterAction::Continue)
     }
 
     /// Resolve request entries using the effective trusted-header view.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "resolution threads callout identity and budget"
+    )]
     async fn resolve_request_entries(
         &self,
         ctx: &HttpFilterContext<'_>,
         entries: &[serde_json::Value],
         callout: &mcp_client::McpCallout,
         connector_identity: Option<&McpCalloutIdentity>,
+        budget: Option<DiscoveryBudget>,
     ) -> Result<Resolution, ResolveError> {
         let previous_tools = ctx.extensions.get::<ResponsesState>().map(|s| &s.previous_tools);
         let owner_fingerprint = ctx
@@ -450,6 +844,7 @@ impl McpToolResolveFilter {
             &forwarded_headers,
             callout,
             connector_identity,
+            budget,
         )
         .await
     }
@@ -476,6 +871,7 @@ impl McpToolResolveFilter {
     /// entries always resolve independently.
     #[expect(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "concurrent resolution threads cache, trusted headers, executor, and scoped identity"
     )]
     async fn resolve_all_entries(
@@ -486,8 +882,13 @@ impl McpToolResolveFilter {
         forwarded_headers: &http::HeaderMap,
         callout: &mcp_client::McpCallout,
         connector_identity: Option<&McpCalloutIdentity>,
+        budget: Option<DiscoveryBudget>,
     ) -> Result<Resolution, ResolveError> {
         let (entry_to_task, task_entries, task_allowed_names) = dedup_entries(entries)?;
+        let budget = budget.map(|slot| slot.per_call(task_entries.len()));
+        if budget.is_some_and(|slot| slot.limits.parse_charge_limit < MIN_DISCOVERY_SLOT / 2) {
+            return Err(ResolveError::RetainedBudget);
+        }
 
         let futures: Vec<_> = task_entries
             .iter()
@@ -502,6 +903,7 @@ impl McpToolResolveFilter {
                         forwarded_headers,
                         callout,
                         connector_identity,
+                        budget,
                     )
                     .await;
                 redact_connector_client_error(result, entry)
@@ -509,14 +911,24 @@ impl McpToolResolveFilter {
             .collect();
         let task_results = futures::future::try_join_all(futures).await?;
 
-        collect_resolutions(entries, &entry_to_task, task_results)
+        if let Some(slot) = budget {
+            preflight_dispatch_metadata(entries, &entry_to_task, &task_results, slot.map_bytes)?;
+        }
+
+        collect_resolutions(
+            entries,
+            &entry_to_task,
+            task_results,
+            self.admission_policy,
+            &self.connector_tool_policies,
+        )
     }
 
     /// Resolve tools for a single MCP entry independently.
     ///
     /// `cache_allowed_names` is the union of `allowed_tools` names
     /// across all entries sharing this resolution task; it is passed
-    /// to [`find_cached_listing`] so the cache is only used when it
+    /// to [`find_cached_listing_budgeted`] so the cache is only used when it
     /// covers every entry in the group.
     #[expect(
         clippy::too_many_arguments,
@@ -532,31 +944,53 @@ impl McpToolResolveFilter {
         forwarded_headers: &http::HeaderMap,
         callout: &mcp_client::McpCallout,
         connector_identity: Option<&McpCalloutIdentity>,
+        budget: Option<DiscoveryBudget>,
     ) -> Result<Option<Vec<serde_json::Value>>, ResolveError> {
+        let label = server_label(entry);
+        let is_connector = entry.get("connector_id").is_some();
+        // Protected mode: a target with `tool_policy: deny` has every tool
+        // excluded regardless of what it would advertise.
+        // Resolve it to zero tools without dialing, so exclusion never contacts an
+        // untrusted, client-selected endpoint and does not depend on its
+        // reachability.
+        //
+        // This runs BEFORE the `resolvable_server_url` deferral gate so it also
+        // covers `defer_loading: true` entries — a deferred direct `server_url`
+        // (which `resolvable_server_url` reports as `None`) would otherwise
+        // pass through to the backend, and a deferred untrusted connector would
+        // otherwise be dialed later by `openai_mcp_dispatch` (#1724).
+        if let Some(reason) = protected_exclusion(entry, self.admission_policy, &self.connector_tool_policies) {
+            debug!(label, ?reason, "protected mode: excluding MCP target without dialing");
+            return Ok(Some(Vec::new()));
+        }
         let Some(server_url) = resolvable_server_url(entry) else {
             return Ok(None);
         };
-        let label = server_label(entry);
-        let is_connector = entry.get("connector_id").is_some();
         if can_reuse_cached_listing(entry, is_connector)
-            && let Some(cached) = find_cached_listing(
+            && let Some(cached) = find_cached_listing_budgeted(
                 previous_tools,
                 label,
                 server_url,
                 owner_fingerprint,
                 cache_allowed_names,
-            )
+                budget,
+            )?
         {
             // Cache hit: no dial is made, so validate the target here to preserve
             // the SSRF-rejection invariant. A cache miss instead validates during
             // the actual callout inside the subrequest transport, so exactly one
             // DNS resolution happens per path.
-            mcp_client::validate_mcp_target(server_url, self.timeout, callout.allow_private())
-                .await
-                .map_err(|source| ResolveError::Client {
-                    server_label: label.to_owned(),
-                    source,
-                })?;
+            mcp_client::validate_mcp_target(
+                server_url,
+                self.timeout,
+                callout.allow_private(),
+                mcp_client::mcp_resolution_policy(is_connector),
+            )
+            .await
+            .map_err(|source| ResolveError::Client {
+                server_label: label.to_owned(),
+                source,
+            })?;
             debug!(label, tool_count = cached.len(), "reusing cached MCP tool listing");
             return Ok(Some(cached));
         }
@@ -567,6 +1001,7 @@ impl McpToolResolveFilter {
             max_tools: self.max_tools,
             callout,
             connector_identity: is_connector.then_some(connector_identity).flatten(),
+            budget,
         };
         fetch_tools(entry, server_url, options).await.map(Some)
     }
@@ -625,6 +1060,10 @@ impl HttpFilter for McpToolResolveFilter {
         Ok(consume_pending_list_tools_failure(ctx).unwrap_or(FilterAction::Continue))
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "body preflight and atomic MCP resolution share the hook"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -642,7 +1081,25 @@ impl HttpFilter for McpToolResolveFilter {
         let Some(bytes) = body.as_ref().cloned() else {
             return Ok(FilterAction::Continue);
         };
+        let budget = if is_responses_create(&ctx.request.method, ctx.request.uri.path())
+            && ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
+        {
+            let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+                return Ok(resolve_error_rejection(&ResolveError::RetainedBudget));
+            };
+            match reserve_discovery_budget(state, Some(&bytes)) {
+                Ok(slot) => Some(slot),
+                Err(err) => return Ok(resolve_error_rejection(&err)),
+            }
+        } else {
+            None
+        };
         let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            if let Some(slot) = budget
+                && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+            {
+                drop(settle_discovery_budget(state, slot, 0));
+            }
             return Ok(FilterAction::Continue);
         };
 
@@ -651,9 +1108,16 @@ impl HttpFilter for McpToolResolveFilter {
         // `bytes` is an `Arc`-backed `Bytes`; cloning bumps a refcount rather than
         // copying the body, so keeping a handle for the failure path (which
         // captures the size-bounded request options from it) is cheap.
-        match Box::pin(self.resolve_mcp_tools(ctx, body, parsed)).await {
+        match Box::pin(self.resolve_mcp_tools(ctx, body, parsed, budget)).await {
             Ok(action) => Ok(action),
-            Err(e) => Ok(resolve_error_action(ctx, &e, streaming, &bytes)),
+            Err(e) => {
+                if let Some(slot) = budget
+                    && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+                {
+                    drop(settle_discovery_budget(state, slot, 0));
+                }
+                Ok(resolve_error_action(ctx, &e, streaming, &bytes))
+            },
         }
     }
 
@@ -674,6 +1138,9 @@ impl HttpFilter for McpToolResolveFilter {
 /// Internal error type for the resolution flow.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ResolveError {
+    /// The shared Responses retained-payload budget cannot cover discovery.
+    #[error("MCP tool discovery exceeds a processing limit set by the platform administrator")]
+    RetainedBudget,
     /// MCP client call failed.
     #[error("MCP tools/list failed for server_label \"{server_label}\": {source}")]
     Client {
@@ -719,6 +1186,13 @@ pub(crate) enum ResolveError {
     /// Unknown `connector_id` was referenced.
     #[error("unknown connector_id \"{0}\"")]
     UnknownConnector(String),
+
+    /// A direct client-selected `server_url` was supplied while connector-only
+    /// routing is enabled.
+    #[error(
+        "Direct MCP server URLs are disabled by your administrator. Use an administrator-configured connector_id instead."
+    )]
+    DirectServerUrl,
 
     /// Both `connector_id` and `server_url` were provided.
     #[error("connector_id and server_url are mutually exclusive on entry \"{0}\"")]
@@ -807,6 +1281,8 @@ struct Resolution {
     /// `ResponsesState.accumulated_output` as locally generated output items so the
     /// successful discovery lifecycle surfaces to the client (issue #1022).
     listings: Vec<McpListing>,
+    /// Operator admission verdicts recorded while building the tool map (#1724).
+    decisions: McpAdmissionDecisions,
 }
 
 /// A successful local MCP discovery listing awaiting commit as an
@@ -856,18 +1332,37 @@ fn collect_resolutions(
     entries: &[serde_json::Value],
     entry_to_task: &[Option<usize>],
     mut task_results: Vec<Option<Vec<serde_json::Value>>>,
+    policy: McpAdmissionPolicy,
+    connector_tool_policies: &HashMap<String, ConnectorToolPolicy>,
 ) -> Result<Resolution, ResolveError> {
     let mut tool_map = HashMap::new();
     let mut per_entry = Vec::with_capacity(entries.len());
     let mut has_resolved = false;
     let mut resolved_labels = HashSet::new();
     let mut listings = Vec::new();
+    let mut decisions = McpAdmissionDecisions::new(policy);
     let mut remaining_consumers = task_consumer_counts(entry_to_task, task_results.len());
 
     for (entry, task_idx) in entries.iter().zip(entry_to_task) {
         let tools =
             (*task_idx).and_then(|task_idx| consume_task_result(task_idx, &mut task_results, &mut remaining_consumers));
-        if let Some((resolution, listing_tools)) = build_entry_resolution(entry, tools, &mut tool_map)? {
+        // Record any target excluded without dialing so a forged call into its
+        // namespace is rejected explicitly, with the precise reason (untrusted
+        // source). Done for every excluded entry, whether it reaches
+        // the Resolved branch (eager short-circuit) or the deferred/targetless
+        // branch below (#1724).
+        let excluded = protected_exclusion(entry, policy, connector_tool_policies);
+        if let Some(reason) = excluded {
+            decisions.record_excluded_namespace(server_label(entry), reason);
+        }
+        if let Some((resolution, listing_tools)) = build_entry_resolution(
+            entry,
+            tools,
+            &mut tool_map,
+            policy,
+            connector_tool_policies,
+            &mut decisions,
+        )? {
             has_resolved = true;
             let label = server_label(entry).to_owned();
             resolved_labels.insert(label.clone());
@@ -877,6 +1372,21 @@ fn collect_resolutions(
                 tools: listing_tools,
             });
             per_entry.push(resolution);
+        } else if excluded.is_some() {
+            // A deferred untrusted target gets no resolution task, so the
+            // resolve_entry short-circuit never runs for it. Exclude it here —
+            // resolving to zero tools drops it from the outbound body rather than
+            // passing a deferred direct `server_url` through to the backend or
+            // leaving a deferred connector stub (#1724).
+            has_resolved = true;
+            let label = server_label(entry).to_owned();
+            resolved_labels.insert(label.clone());
+            listings.push(McpListing {
+                server_label: label,
+                server_url: reusable_listing_server_url(entry).map(str::to_owned),
+                tools: Vec::new(),
+            });
+            per_entry.push(EntryResolution::Resolved(Vec::new()));
         } else if is_deferred_connector(entry) {
             per_entry.push(EntryResolution::SanitizeDeferred);
         } else {
@@ -889,7 +1399,44 @@ fn collect_resolutions(
         has_resolved,
         resolved_labels,
         listings,
+        decisions,
     })
+}
+
+/// Bound metadata copied into each dispatch entry before `insert_tools` expands it.
+fn preflight_dispatch_metadata(
+    entries: &[serde_json::Value],
+    entry_to_task: &[Option<usize>],
+    task_results: &[Option<Vec<serde_json::Value>>],
+    limit: usize,
+) -> Result<(), ResolveError> {
+    let mut charge = 0_usize;
+    for (entry, task_index) in entries.iter().zip(entry_to_task) {
+        let Some(tools) = (*task_index)
+            .and_then(|index| task_results.get(index))
+            .and_then(Option::as_ref)
+        else {
+            continue;
+        };
+        let allowed = extract_allowed_tools(entry)?;
+        let count = tools
+            .iter()
+            .filter(|tool| {
+                is_allowed_tool(tool, &allowed) && tool.get("name").and_then(serde_json::Value::as_str).is_some()
+            })
+            .count();
+        charge = charge
+            .checked_add(
+                dispatch_metadata_clone_charge(entry)?
+                    .checked_mul(count)
+                    .ok_or(ResolveError::RetainedBudget)?,
+            )
+            .ok_or(ResolveError::RetainedBudget)?;
+        if charge > limit {
+            return Err(ResolveError::RetainedBudget);
+        }
+    }
+    Ok(())
 }
 
 /// Count how many entries consume each deduplicated resolution task.
@@ -957,6 +1504,19 @@ fn resolve_connector_ids(
     Ok(())
 }
 
+/// Reject direct client-selected MCP destinations before any identity staging or
+/// outbound callout is acquired.
+///
+/// The error intentionally contains no request data: `server_url`,
+/// `server_label`, credentials, and assertions must not leak through the
+/// client-visible rejection.
+fn reject_direct_server_urls(entries: &[serde_json::Value]) -> Result<(), ResolveError> {
+    if entries.iter().any(|entry| entry.get("server_url").is_some()) {
+        return Err(ResolveError::DirectServerUrl);
+    }
+    Ok(())
+}
+
 /// Validate that a connector entry has required fields and no conflicts.
 fn validate_connector_entry(entry: &serde_json::Value, connector_id: &str) -> Result<(), ResolveError> {
     let label = entry
@@ -985,10 +1545,17 @@ fn validate_connector_entry(entry: &serde_json::Value, connector_id: &str) -> Re
 /// the `MCPListToolsTool` shape) that becomes the successful `mcp_list_tools`
 /// output item (issue #1022). Both are derived from the same filtered `tools/list`
 /// result before it is consumed into `tool_map`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-entry resolution threads the operator admission policy and trust"
+)]
 fn build_entry_resolution(
     entry: &serde_json::Value,
     tools: Option<Vec<serde_json::Value>>,
     tool_map: &mut HashMap<(String, String), serde_json::Value>,
+    policy: McpAdmissionPolicy,
+    connector_tool_policies: &HashMap<String, ConnectorToolPolicy>,
+    decisions: &mut McpAdmissionDecisions,
 ) -> Result<Option<(EntryResolution, Vec<serde_json::Value>)>, ResolveError> {
     let Some(tools) = tools else {
         return Ok(None);
@@ -996,12 +1563,18 @@ fn build_entry_resolution(
     let allowed = extract_allowed_tools(entry)?;
     let filtered = apply_allowed_tools_filter(tools, &allowed);
     let label = server_label(entry);
-    let function_tools: Vec<serde_json::Value> = filtered
+    // Operator metadata admission runs after the client advisory selector. In
+    // advisory mode this returns `filtered` unchanged; in protected mode denied
+    // tools are dropped here and recorded in `decisions` so they never reach the
+    // model, the function tools, or the dispatch map.
+    let tool_policy = tool_policy_for_entry(entry, connector_tool_policies);
+    let admitted = admit_tools(policy, tool_policy, label, filtered, decisions);
+    let function_tools: Vec<serde_json::Value> = admitted
         .iter()
         .map(|def| mcp_tool_to_function_tool(label, def))
         .collect();
-    let listing_tools: Vec<serde_json::Value> = filtered.iter().map(mcp_tool_to_list_tools_entry).collect();
-    insert_tools(filtered, entry, tool_map);
+    let listing_tools: Vec<serde_json::Value> = admitted.iter().map(mcp_tool_to_list_tools_entry).collect();
+    insert_tools(admitted, entry, tool_map);
     Ok(Some((EntryResolution::Resolved(function_tools), listing_tools)))
 }
 
@@ -1046,13 +1619,15 @@ fn resolve_error_status(err: &ResolveError) -> (u16, &'static str) {
         | ResolveError::TooManyServers { .. }
         | ResolveError::NameCollision(_)
         | ResolveError::UnknownConnector(_)
+        | ResolveError::DirectServerUrl
         | ResolveError::MutuallyExclusiveTarget(_)
         | ResolveError::MissingToolSearch(_)
         | ResolveError::InvalidConnectorId
         | ResolveError::MissingConnectorLabel(_)
         | ResolveError::EmptyResolvedToolChoice(_)
         | ResolveError::InvalidAllowedTools(_) => (400, "invalid_request_error"),
-        ResolveError::BodyTooLarge { .. }
+        ResolveError::RetainedBudget
+        | ResolveError::BodyTooLarge { .. }
         | ResolveError::Client {
             source: mcp_client::McpClientError::ResponseTooLarge { .. },
             ..
@@ -1662,11 +2237,17 @@ fn has_tool_search(ctx: &HttpFilterContext<'_>) -> bool {
 /// The deferred `tools/list` callout is issued later by `openai_mcp_dispatch`
 /// inside the IRR step, so its SSRF posture is governed by that filter's outbound
 /// callout — not captured here.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "deferred snapshot threads limits, connector tool policy, and the admission policy"
+)]
 fn collect_deferred_connectors(
     entries: &[serde_json::Value],
     timeout: Duration,
     max_tools: usize,
     max_rewritten_body_bytes: usize,
+    connector_tool_policies: &HashMap<String, ConnectorToolPolicy>,
+    policy: McpAdmissionPolicy,
 ) -> Vec<DeferredMcpConnector> {
     entries
         .iter()
@@ -1674,6 +2255,15 @@ fn collect_deferred_connectors(
         .filter_map(|entry| {
             let connector_id = entry.get("connector_id").and_then(serde_json::Value::as_str)?;
             let server_url = entry.get("server_url").and_then(serde_json::Value::as_str)?;
+            let tool_policy = connector_tool_policies.get(connector_id).copied().unwrap_or_default();
+            // Protected mode excludes a connector that can supply no admissible
+            // tool in `resolve_entry` without dialing, so never queue it for
+            // deferred discovery — doing so would make `openai_mcp_dispatch` dial
+            // the service only to deny every tool (and abort the request if it is
+            // unreachable). Covers connectors with tool_policy: deny (#1724).
+            if protected_exclusion_reason(tool_policy, policy).is_some() {
+                return None;
+            }
             Some(DeferredMcpConnector {
                 authorization: entry
                     .get("authorization")
@@ -1688,6 +2278,10 @@ fn collect_deferred_connectors(
                 server_label: server_label(entry).to_owned(),
                 server_url: server_url.to_owned(),
                 timeout,
+                // Tool policy is stamped from operator configuration at resolve time so
+                // deferred discovery (which runs inside openai_mcp_dispatch) never
+                // needs the resolver's connector config.
+                tool_policy,
             })
         })
         .collect()
@@ -1802,10 +2396,16 @@ struct FetchToolsOptions<'a> {
     callout: &'a mcp_client::McpCallout,
     /// Request-scoped secrets and owner, present only for configured connectors.
     connector_identity: Option<&'a McpCalloutIdentity>,
+    /// Reserved request-wide discovery capacity for this MCP server.
+    budget: Option<DiscoveryBudget>,
 }
 
 /// Call `tools/list` on the MCP server with per-page
 /// `max_tools` enforcement.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the callout and budget error mapping share one boundary"
+)]
 async fn fetch_tools(
     entry: &serde_json::Value,
     server_url: &str,
@@ -1814,7 +2414,7 @@ async fn fetch_tools(
     let display_url = mcp_client::parse_display_url(server_url);
     debug!(label = server_label(entry), url = %display_url, "calling MCP tools/list");
     let auth = entry.get("authorization").and_then(serde_json::Value::as_str);
-    mcp_client::list_tools_with_forwarded_headers(
+    mcp_client::list_tools_with_forwarded_headers_budgeted(
         server_url,
         entry.get("headers"),
         auth,
@@ -1831,11 +2431,24 @@ async fn fetch_tools(
         options.timeout,
         options.max_tools,
         options.callout,
+        options.budget.map(|slot| (slot.limits, slot.listing_bytes)),
     )
     .await
-    .map_err(|source| ResolveError::Client {
-        server_label: server_label(entry).to_owned(),
-        source,
+    .map_err(|source| {
+        if options.budget.is_some()
+            && matches!(
+                source,
+                mcp_client::McpClientError::ResponseTooLarge { .. }
+                    | mcp_client::McpClientError::ListingTooLarge { .. }
+            )
+        {
+            ResolveError::RetainedBudget
+        } else {
+            ResolveError::Client {
+                server_label: server_label(entry).to_owned(),
+                source,
+            }
+        }
     })
 }
 
@@ -2308,19 +2921,23 @@ fn mcp_tool_to_list_tools_entry(definition: &serde_json::Value) -> serde_json::V
 /// produce the same output. Use [`detect_name_collisions`] after
 /// building the full tools array to catch this.
 pub(crate) fn encode_function_name(label: &str, tool_name: &str) -> String {
-    let raw = format!("{label}__{tool_name}");
-    let mut sanitized: String = raw
+    // Stop at the schema limit while building the string. Truncating a long
+    // allocation would leave its full capacity retained in every reference.
+    let mut sanitized = String::with_capacity(MAX_FUNCTION_NAME_LEN);
+    for character in label
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
+        .chain("__".chars())
+        .chain(tool_name.chars())
+        .take(MAX_FUNCTION_NAME_LEN)
+    {
+        sanitized.push(
+            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+                character
             } else {
                 '_'
-            }
-        })
-        .collect();
-    // Every character above is mapped to ASCII, so this byte index is always a character boundary.
-    sanitized.truncate(MAX_FUNCTION_NAME_LEN);
+            },
+        );
+    }
     sanitized
 }
 
@@ -2394,17 +3011,23 @@ impl<'a> McpToolIndex<'a> {
 /// Skips state creation when the body carries
 /// `previous_response_id` to avoid the downstream rebuild
 /// path in `openai_responses_proxy` which would strip it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "state sync commits the rewritten body, maps, policy snapshot, and verdicts together"
+)]
 fn write_state(
     ctx: &mut HttpFilterContext<'_>,
     parsed: serde_json::Value,
     map: HashMap<(String, String), serde_json::Value>,
     deferred_mcp: Vec<DeferredMcpConnector>,
     connector_context_policy: McpConnectorContextPolicy,
+    decisions: McpAdmissionDecisions,
 ) {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.mcp_tool_map = map;
         state.deferred_mcp = deferred_mcp;
         state.mcp_connector_context_policy = connector_context_policy;
+        state.mcp_admission = decisions;
         state.tools = parsed
             .get("tools")
             .and_then(serde_json::Value::as_array)
@@ -2419,13 +3042,14 @@ fn write_state(
         state.mcp_tool_map = map;
         state.deferred_mcp = deferred_mcp;
         state.mcp_connector_context_policy = connector_context_policy;
+        state.mcp_admission = decisions;
         ctx.extensions.insert(state);
     }
 }
 
 /// Whether deferred connector discovery should run on this IRR iteration.
 pub(crate) fn has_pending_deferred_discovery(state: &ResponsesState) -> bool {
-    !state.tool_search_calls.is_empty()
+    !state.selected_tool_search_calls().is_empty()
         && !state.deferred_mcp.is_empty()
         && super::state::tool_search_discovery_is_within_budget(state)
 }
@@ -2451,6 +3075,10 @@ async fn discover_deferred_connectors(state: &mut ResponsesState) -> Result<(), 
 /// sanitized deferred MCP entries with function tools. An exhausted
 /// `max_tool_calls` budget skips `tools/list` and leaves connectors
 /// pending so the round can return to the caller.
+#[expect(
+    clippy::too_many_lines,
+    reason = "transactional deferred discovery with budget reservation: snapshot, reserve, list, commit"
+)]
 pub(crate) async fn discover_deferred_connectors_with_forwarded_headers(
     state: &mut ResponsesState,
     forwarded_header_names: &[http::HeaderName],
@@ -2462,6 +3090,31 @@ pub(crate) async fn discover_deferred_connectors_with_forwarded_headers(
         return Ok(());
     }
 
+    // Snapshot the operator policy before taking the deferred list; deferred
+    // discovery evaluates admission under the same policy resolve recorded.
+    let policy = state.mcp_admission.policy();
+    let budget = if state.simple_budget.is_some() {
+        Some(reserve_discovery_budget(state, None)?)
+    } else {
+        None
+    };
+    if let Some(slot) = budget {
+        let existing = discovery_value_charge(&state.request_body)
+            .ok()
+            .and_then(|body| body.checked_add(discovery_values_charge(&state.tools).ok()?));
+        if existing.is_none_or(|charge| charge > slot.reserved / 2) {
+            drop(settle_discovery_budget(state, slot, 0));
+            return Err(ResolveError::RetainedBudget);
+        }
+    }
+    let per_call = budget.map(|slot| slot.per_call(state.deferred_mcp.len()));
+    if per_call.is_some_and(|slot| slot.limits.parse_charge_limit < MIN_DISCOVERY_SLOT / 2) {
+        if let Some(slot) = budget {
+            drop(settle_discovery_budget(state, slot, 0));
+        }
+        return Err(ResolveError::RetainedBudget);
+    }
+
     let pending = std::mem::take(&mut state.deferred_mcp);
     let prepared = match prepare_deferred_listings(
         &pending,
@@ -2469,21 +3122,35 @@ pub(crate) async fn discover_deferred_connectors_with_forwarded_headers(
         forwarded_headers,
         callout,
         connector_identity,
+        policy,
+        per_call,
     )
     .await
     {
         Ok(prepared) => prepared,
         Err(err) => {
             state.deferred_mcp = pending;
+            if let Some(slot) = budget {
+                drop(settle_discovery_budget(state, slot, 0));
+            }
             return Err(err);
         },
     };
     let max_bytes = pending
         .first()
         .map_or(MAX_JSON_BODY_BYTES, |connector| connector.max_rewritten_body_bytes);
-    if let Err(err) = commit_deferred_listings(state, prepared, max_bytes) {
-        state.deferred_mcp = pending;
-        return Err(err);
+    let retained = match commit_deferred_listings(state, prepared, max_bytes, budget) {
+        Ok(retained) => retained,
+        Err(err) => {
+            state.deferred_mcp = pending;
+            if let Some(slot) = budget {
+                drop(settle_discovery_budget(state, slot, 0));
+            }
+            return Err(err);
+        },
+    };
+    if let Some(slot) = budget {
+        settle_discovery_budget(state, slot, retained)?;
     }
     Ok(())
 }
@@ -2492,7 +3159,7 @@ pub(crate) async fn discover_deferred_connectors_with_forwarded_headers(
 struct PreparedDeferredListing {
     /// Reconstructed MCP entry used to populate `mcp_tool_map`.
     entry: serde_json::Value,
-    /// `allowed_tools`-filtered listing.
+    /// `allowed_tools`-filtered and operator-admitted listing.
     filtered: Vec<serde_json::Value>,
     /// Function tools generated from `filtered`.
     functions: Vec<serde_json::Value>,
@@ -2500,6 +3167,9 @@ struct PreparedDeferredListing {
     listing_item: serde_json::Value,
     /// Server label used to replace the sanitized deferred MCP tool.
     server_label: String,
+    /// Operator admission verdicts `(tool_name, verdict)` for this connector,
+    /// recorded into `ResponsesState.mcp_admission` after the atomic commit.
+    verdicts: Vec<(String, McpToolVerdict)>,
 }
 
 /// Call `tools/list` for every deferred connector without mutating state.
@@ -2507,12 +3177,18 @@ struct PreparedDeferredListing {
 /// Independent servers are listed concurrently so total latency is bounded by
 /// the slowest connector rather than the sum of per-server timeouts. Commit
 /// remains transactional in [`discover_deferred_connectors_with_forwarded_headers`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "concurrent deferred listing threads trusted headers, executor, identity, policy, and budget"
+)]
 async fn prepare_deferred_listings(
     pending: &[DeferredMcpConnector],
     forwarded_header_names: &[http::HeaderName],
     forwarded_headers: &http::HeaderMap,
     callout: &mcp_client::McpCallout,
     connector_identity: Option<&McpCalloutIdentity>,
+    policy: McpAdmissionPolicy,
+    budget: Option<DiscoveryBudget>,
 ) -> Result<Vec<PreparedDeferredListing>, ResolveError> {
     futures::future::try_join_all(pending.iter().map(|connector| {
         prepare_deferred_listing(
@@ -2521,18 +3197,26 @@ async fn prepare_deferred_listings(
             forwarded_headers,
             callout,
             connector_identity,
+            policy,
+            budget,
         )
     }))
     .await
 }
 
 /// List and rewrite one deferred connector without mutating shared state.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one deferred listing threads trusted headers, executor, identity, policy, and budget"
+)]
 async fn prepare_deferred_listing(
     connector: &DeferredMcpConnector,
     forwarded_header_names: &[http::HeaderName],
     forwarded_headers: &http::HeaderMap,
     callout: &mcp_client::McpCallout,
     connector_identity: Option<&McpCalloutIdentity>,
+    policy: McpAdmissionPolicy,
+    budget: Option<DiscoveryBudget>,
 ) -> Result<PreparedDeferredListing, ResolveError> {
     let entry = deferred_entry_view(connector);
     let listing = list_deferred_connector(
@@ -2542,31 +3226,41 @@ async fn prepare_deferred_listing(
         forwarded_headers,
         callout,
         connector_identity,
+        budget,
     )
     .await?;
     let allowed = extract_allowed_tools(&entry)?;
     let filtered = apply_allowed_tools_filter(listing, &allowed);
-    let functions: Vec<serde_json::Value> = filtered
+    // Operator admission runs on the deferred connector exactly as on fresh
+    // discovery, using the trust stamped onto the connector at resolve time.
+    let (admitted, verdicts) = admit_deferred_tools(policy, connector.tool_policy, filtered);
+    let functions: Vec<serde_json::Value> = admitted
         .iter()
         .map(|def| mcp_tool_to_function_tool(&connector.server_label, def))
         .collect();
-    let listing_tools = filtered.iter().map(mcp_listing_tool_for_responses).collect();
+    let listing_tools = admitted.iter().map(mcp_listing_tool_for_responses).collect();
     let listing_item = mcp_list_tools_item(connector.server_label.clone(), listing_tools);
     Ok(PreparedDeferredListing {
         entry,
-        filtered,
+        filtered: admitted,
         functions,
         listing_item,
         server_label: connector.server_label.clone(),
+        verdicts,
     })
 }
 
 /// Apply deferred listings after collision and body-size checks succeed.
+#[expect(
+    clippy::too_many_lines,
+    reason = "transactional commit of listings, verdicts, tool map, and retained-owner admission"
+)]
 fn commit_deferred_listings(
     state: &mut ResponsesState,
     prepared: Vec<PreparedDeferredListing>,
     max_rewritten_body_bytes: usize,
-) -> Result<(), ResolveError> {
+    budget: Option<DiscoveryBudget>,
+) -> Result<usize, ResolveError> {
     let mut function_tools_by_label: HashMap<&str, &[serde_json::Value]> = HashMap::new();
     let mut generated_names = HashSet::new();
     for item in &prepared {
@@ -2585,7 +3279,43 @@ fn commit_deferred_listings(
     let request_body = expanded_request_body(&state.request_body, &function_tools_by_label);
     check_json_body_size(&request_body, max_rewritten_body_bytes)?;
 
+    let retained = if let Some(slot) = budget {
+        let mut charge = request_body
+            .get("tools")
+            .map(discovery_value_charge)
+            .transpose()?
+            .unwrap_or(0)
+            .checked_add(discovery_values_charge(&expanded_tools)?)
+            .ok_or(ResolveError::RetainedBudget)?;
+        for item in &prepared {
+            let tool_charge = discovery_values_charge(&item.filtered)?;
+            let entry_charge = discovery_value_charge(&item.entry)?;
+            let map_charge = entry_charge
+                .checked_mul(item.filtered.len())
+                .ok_or(ResolveError::RetainedBudget)?
+                .checked_add(tool_charge)
+                .ok_or(ResolveError::RetainedBudget)?;
+            let listing_charge = discovery_value_charge(&item.listing_item)?
+                .checked_mul(2)
+                .ok_or(ResolveError::RetainedBudget)?;
+            charge = charge
+                .checked_add(map_charge)
+                .and_then(|sum| sum.checked_add(listing_charge))
+                .and_then(|sum| sum.checked_add(4_096))
+                .ok_or(ResolveError::RetainedBudget)?;
+        }
+        if charge > slot.reserved {
+            return Err(ResolveError::RetainedBudget);
+        }
+        charge
+    } else {
+        0
+    };
+
     for item in prepared {
+        for (tool_name, verdict) in item.verdicts {
+            state.mcp_admission.record(&item.server_label, &tool_name, verdict);
+        }
         insert_tools(item.filtered, &item.entry, &mut state.mcp_tool_map);
         if let Some(id) = item.listing_item.get("id").and_then(serde_json::Value::as_str) {
             state.locally_executed_output_items.insert(id.to_owned());
@@ -2593,10 +3323,13 @@ fn commit_deferred_listings(
         state.persisted_messages.push(item.listing_item.clone());
         state.accumulated_output.push(item.listing_item);
     }
+    // Record the newly model-visible deferred function names so a denied tool's
+    // encoded-name collision cannot reject an admitted or client function (#1724).
+    state.mcp_admission.mark_available_functions(&expanded_tools);
     state.tools = expanded_tools;
     state.request_body = request_body;
     state.mark_request_body_for_rebuild();
-    Ok(())
+    Ok(retained)
 }
 
 /// Expand deferred MCP entries in a cloned request body for size checking.
@@ -2640,6 +3373,7 @@ async fn list_deferred_connector(
     forwarded_headers: &http::HeaderMap,
     callout: &mcp_client::McpCallout,
     connector_identity: Option<&McpCalloutIdentity>,
+    budget: Option<DiscoveryBudget>,
 ) -> Result<Vec<serde_json::Value>, ResolveError> {
     // No upfront SSRF classifier: `fetch_tools` always dials, and the subrequest
     // transport validates the target during the callout, so the SSRF rejection is
@@ -2652,6 +3386,7 @@ async fn list_deferred_connector(
         max_tools: connector.max_tools,
         callout,
         connector_identity,
+        budget,
     };
     fetch_tools(entry, &connector.server_url, options)
         .await
@@ -3080,6 +3815,7 @@ impl AllowedTools {
 /// cache covers all named tools. Returns `None` for
 /// unrestricted entries because the cached listing may be
 /// a filtered subset from a previous response.
+#[cfg(test)]
 fn find_cached_listing(
     previous_tools: Option<&Vec<serde_json::Value>>,
     label: &str,
@@ -3087,67 +3823,224 @@ fn find_cached_listing(
     owner_fingerprint: Option<&str>,
     allowed_tools: Option<&[String]>,
 ) -> Option<Vec<serde_json::Value>> {
-    let previous = previous_tools?;
-    let allowed = allowed_tools?;
+    find_cached_listing_budgeted(
+        previous_tools,
+        label,
+        server_url,
+        owner_fingerprint,
+        allowed_tools,
+        None,
+    )
+    .ok()
+    .flatten()
+}
 
-    let entry = previous.iter().rev().find(|pt| {
+/// Preflight a Store cache hit before its tool tree is cloned into discovery.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "cache identity and budget are checked together"
+)]
+fn find_cached_listing_budgeted(
+    previous_tools: Option<&Vec<serde_json::Value>>,
+    label: &str,
+    server_url: &str,
+    owner_fingerprint: Option<&str>,
+    allowed_tools: Option<&[String]>,
+    budget: Option<DiscoveryBudget>,
+) -> Result<Option<Vec<serde_json::Value>>, ResolveError> {
+    let Some(previous) = previous_tools else {
+        return Ok(None);
+    };
+    let Some(allowed) = allowed_tools else {
+        return Ok(None);
+    };
+
+    let Some(entry) = previous.iter().rev().find(|pt| {
         pt.get("server_label").and_then(serde_json::Value::as_str) == Some(label)
             && pt.get("server_url").and_then(serde_json::Value::as_str) == Some(server_url)
             && pt
                 .get(super::mcp_dispatch::OWNER_FINGERPRINT)
                 .and_then(serde_json::Value::as_str)
                 == owner_fingerprint
-    })?;
+    }) else {
+        return Ok(None);
+    };
 
-    let cached_tools = entry.get("tools").and_then(serde_json::Value::as_array)?;
+    let Some(cached_tools) = entry.get("tools").and_then(serde_json::Value::as_array) else {
+        return Ok(None);
+    };
     let all_present = allowed.iter().all(|name| {
         cached_tools
             .iter()
             .any(|t| t.get("name").and_then(serde_json::Value::as_str) == Some(name))
     });
     if !all_present {
-        return None;
+        return Ok(None);
     }
 
-    Some(cached_tools.clone())
+    if budget.is_some_and(|slot| {
+        cached_tools
+            .iter()
+            .try_fold(0_usize, |sum, tool| sum.checked_add(serialized_len(tool).ok()?))
+            .is_none_or(|bytes| bytes > slot.listing_bytes)
+    }) {
+        return Err(ResolveError::RetainedBudget);
+    }
+
+    Ok(Some(cached_tools.clone()))
 }
 
 /// Filter tools by name list and/or read-only annotation.
 fn apply_allowed_tools_filter(tools: Vec<serde_json::Value>, allowed: &AllowedTools) -> Vec<serde_json::Value> {
-    let names = allowed.as_names();
-    let read_only = allowed.read_only;
-
-    if names.is_none() && read_only.is_none() {
+    if allowed.as_names().is_none() && allowed.read_only.is_none() {
         return tools;
     }
-
     tools
         .into_iter()
-        .filter(|t| {
-            if let Some(list) = names {
-                let matches_name = t
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|n| list.iter().any(|a| a == n));
-                if !matches_name {
-                    return false;
-                }
-            }
-            if let Some(want_read_only) = read_only {
-                return tool_read_only_hint(t) == want_read_only;
-            }
-            true
-        })
+        .filter(|tool| is_allowed_tool(tool, allowed))
         .collect()
+}
+
+/// Match the same allowed-tools policy during preflight and final filtering.
+fn is_allowed_tool(tool: &serde_json::Value, allowed: &AllowedTools) -> bool {
+    if let Some(names) = allowed.as_names() {
+        let matches_name = tool
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| names.iter().any(|allowed_name| allowed_name == name));
+        if !matches_name {
+            return false;
+        }
+    }
+    allowed
+        .read_only
+        .is_none_or(|want_read_only| tool_read_only_hint(tool) == want_read_only)
 }
 
 /// Return whether an MCP tool has `annotations.readOnlyHint`
 /// set to `true` (defaults to `false` when absent).
+///
+/// This is the **advisory** server hint consulted by the standard client
+/// `allowed_tools.read_only` selector only. It is not a trusted classification;
+/// operator-enforced read-only uses [`super::mcp_admission`] instead.
 fn tool_read_only_hint(tool: &serde_json::Value) -> bool {
     tool.get("annotations")
         .and_then(|a| a.get("readOnlyHint"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+}
+
+/// Apply operator metadata admission to the client-filtered tools of one entry.
+///
+/// In advisory mode this is a no-op: the tools pass through unchanged and no
+/// verdict is recorded, so existing behavior is byte-for-byte preserved. In
+/// protected mode each tool is evaluated against the operator policy and the
+/// resolving entry's connector policy ([`tool_policy_for_entry`]); admitted
+/// tools are returned (and reach the model + dispatch map), while denied tools are dropped
+/// and recorded in `decisions` so a later forged call can be rejected explicitly
+/// rather than mis-classified as a client function.
+fn admit_tools(
+    policy: McpAdmissionPolicy,
+    tool_policy: ConnectorToolPolicy,
+    label: &str,
+    tools: Vec<serde_json::Value>,
+    decisions: &mut McpAdmissionDecisions,
+) -> Vec<serde_json::Value> {
+    if !policy.is_protected() {
+        return tools;
+    }
+    let mut admitted = Vec::with_capacity(tools.len());
+    for tool in tools {
+        // A tool without a name has no dispatchable identity; in protected mode
+        // it is excluded rather than admitted under an unknown identity.
+        let Some(tool_name) = tool.get("name").and_then(serde_json::Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        let verdict = evaluate_tool(policy, tool_policy, &tool);
+        decisions.record(label, &tool_name, verdict);
+        if matches!(verdict, McpToolVerdict::Admitted(_)) {
+            admitted.push(tool);
+        }
+    }
+    admitted
+}
+
+/// Why protected mode excludes an MCP entry outright without dialing, or `None`
+/// if the target may be contacted.
+///
+/// A target is excluded without contact when its policy is `Deny` — direct
+/// `server_url` targets, denied connectors, and targetless (label-only) entries.
+///
+/// Centralizes the exclusion rule shared by `resolve_entry` (eager dial),
+/// `collect_resolutions` (deferred/targetless entries with no resolution task),
+/// and `collect_deferred_connectors` (deferred-discovery queueing) (#1724).
+fn protected_exclusion_reason(tool_policy: ConnectorToolPolicy, policy: McpAdmissionPolicy) -> Option<McpDenyReason> {
+    if !policy.is_protected() {
+        return None;
+    }
+    // Exhaustive over `ConnectorToolPolicy` on purpose: a new variant must force a
+    // decision here rather than silently become contactable.
+    match tool_policy {
+        ConnectorToolPolicy::Deny => Some(McpDenyReason::UntrustedSource),
+        ConnectorToolPolicy::AllowAll | ConnectorToolPolicy::ReadOnly => None,
+    }
+}
+
+/// [`protected_exclusion_reason`] resolved for one MCP entry via its connector
+/// policy ([`tool_policy_for_entry`]).
+fn protected_exclusion(
+    entry: &serde_json::Value,
+    policy: McpAdmissionPolicy,
+    connector_tool_policies: &HashMap<String, ConnectorToolPolicy>,
+) -> Option<McpDenyReason> {
+    protected_exclusion_reason(tool_policy_for_entry(entry, connector_tool_policies), policy)
+}
+
+/// Resolve the operator tool policy for one MCP entry.
+///
+/// A direct, client-selected `server_url` entry and an unknown connector are
+/// denied by default. A configured connector's policy is looked up by
+/// `connector_id`; a missing entry fails closed.
+fn tool_policy_for_entry(
+    entry: &serde_json::Value,
+    connector_tool_policies: &HashMap<String, ConnectorToolPolicy>,
+) -> ConnectorToolPolicy {
+    entry
+        .get("connector_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| connector_tool_policies.get(id))
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Evaluate operator admission for one deferred connector's client-filtered
+/// tools, returning the admitted tools and the `(tool_name, verdict)` pairs to
+/// record once concurrent discovery commits (the decisions live in `state`,
+/// which is not borrowed across the concurrent `tools/list` calls).
+///
+/// Advisory mode returns the tools unchanged with no verdicts.
+fn admit_deferred_tools(
+    policy: McpAdmissionPolicy,
+    tool_policy: ConnectorToolPolicy,
+    tools: Vec<serde_json::Value>,
+) -> (Vec<serde_json::Value>, Vec<(String, McpToolVerdict)>) {
+    if !policy.is_protected() {
+        return (tools, Vec::new());
+    }
+    let mut admitted = Vec::with_capacity(tools.len());
+    let mut verdicts = Vec::new();
+    for tool in tools {
+        let Some(tool_name) = tool.get("name").and_then(serde_json::Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        let verdict = evaluate_tool(policy, tool_policy, &tool);
+        verdicts.push((tool_name, verdict));
+        if matches!(verdict, McpToolVerdict::Admitted(_)) {
+            admitted.push(tool);
+        }
+    }
+    (admitted, verdicts)
 }
 
 /// Insert resolved tools into the tool map keyed by

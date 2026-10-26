@@ -6,11 +6,10 @@
 //! Operation identity is consumed from the typed `AiOperationMatch` that the
 //! `ai_operation` classifier publishes from the request head, so the body is
 //! never inspected to decide whether this filter applies and the identity is not
-//! re-derived here. `ai_operation` is ordered ahead of this filter in every chain
-//! and declares a read-only body hook, so its match is available even under the
-//! buffered body pre-read this filter triggers — the AI-only workaround for
-//! praxis-proxy/praxis#1142, whose limit is noted on [`matched_responses_operation`].
-//! A matched request is then deserialized once, and that one parsed value produces
+//! re-derived here. `ai_operation` classifies in core's request-head phase
+//! (praxis-proxy/praxis#1142), which runs once before any filter's buffered body
+//! pre-read, so its match is available even under the pre-read this filter
+//! triggers. A matched request is then deserialized once, and that one parsed value produces
 //! every downstream fact: the classification metadata, the promoted routing
 //! headers and filter results, the proxy-owned identifiers, and [`ResponsesState`].
 //!
@@ -72,6 +71,9 @@ const FILTER_NAME: &str = "openai_responses_request";
 
 /// Processes a Responses request body once and initializes state.
 ///
+/// Enable Cargo feature `openai-responses` to compile and register this
+/// experimental filter. Default and `full` builds exclude it.
+///
 /// The operation is recognized from the request head, and the registry decides
 /// which operations carry a body worth parsing: create, compact, and input
 /// token counts. Bodyless operations — fetch, delete, cancel, list input items,
@@ -115,14 +117,18 @@ impl OpenaiResponsesRequestFilter {
     /// Runs on the managed owner, either directly from its own parse or from the
     /// parse a pre-routing pass cached. Provider-owned fields that gateway-managed
     /// create requests cannot honor are rejected before any state is built.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "field-rejection, budget preflight, and state construction form one managed-create path"
+    )]
     fn finish_managed_request(&self, ctx: &mut HttpFilterContext<'_>, cached: CachedRequestParse) -> FilterAction {
         let CachedRequestParse {
             parsed,
             classified,
             operation,
-            // The raw body only backs the staleness check at consume; the owner has
-            // already confirmed the parse matches the body in flight.
-            raw: _,
+            // The parse matches the body in flight (confirmed at consume), so these
+            // raw bytes are the authoritative size for the retained-payload budget.
+            raw,
         } = cached;
 
         if let Some(action) = reject_unsupported_managed_fields(&classified, &parsed) {
@@ -137,6 +143,18 @@ impl OpenaiResponsesRequestFilter {
             return FilterAction::Release;
         }
 
+        // A budgeted create carries its retained-payload accounting into state; any
+        // other request, and any chain without the policy, carries none.
+        let budget =
+            if operation == ResponsesOperation::CreateResponse && classified.format == AiRequestFormat::Responses {
+                match super::plain_agentic_budget(ctx, &parsed, &raw) {
+                    Ok(budget) => budget,
+                    Err(action) => return action,
+                }
+            } else {
+                None
+            };
+
         let response_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
         let conversation_id = resolve_conversation_id(ctx, &parsed);
 
@@ -146,7 +164,7 @@ impl OpenaiResponsesRequestFilter {
         // reads this immutable owner when appending the completed turn.
         #[cfg(feature = "openai-conversations")]
         crate::openai::conversations::capture_validated_append_owner(ctx);
-        insert_responses_state(ctx, parsed, &response_id);
+        insert_responses_state(ctx, parsed, &response_id, budget);
 
         debug!(
             response_id = %response_id,
@@ -284,6 +302,10 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "classification and budget admission share one body pass"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -292,6 +314,22 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
+        }
+
+        // Compact owns its parse and retained-payload ledger, so the managed
+        // owner must not mint a second unmetered request state for it. Only the
+        // state-building instance short-circuits here; the facts-only classifier
+        // (`initialize_state: false`) must still classify compact so it promotes
+        // the routing format header the binding router needs.
+        if self.config.initialize_state
+            && ctx.extensions.get::<super::AgenticBudgetPolicy>().is_some()
+            && ctx.request.method == http::Method::POST
+            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
+        {
+            return Ok(
+                super::initial_agentic_budget_rejection(ctx, body.as_deref().unwrap_or_default())
+                    .unwrap_or(FilterAction::Release),
+            );
         }
 
         let Some(matched) = matched_responses_operation(ctx) else {
@@ -318,6 +356,12 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
                 "bodyless Responses operation, publishing operation identity only"
             );
             return publish_bodyless_operation(ctx, &self.config.shared);
+        }
+
+        // Preflight the raw body against the request-wide retained budget before
+        // the first parser allocates, on both the cache-reuse and fresh paths.
+        if let Some(action) = super::initial_agentic_budget_rejection(ctx, body.as_deref().unwrap_or_default()) {
+            return Ok(action);
         }
 
         // A managed owner reuses the parse a pre-routing pass cached, so a managed
@@ -585,20 +629,17 @@ fn classify_matched_operation(obj: &serde_json::Map<String, serde_json::Value>) 
 /// Consumed from the typed [`AiOperationMatch`] that `ai_operation` publishes
 /// from the request head, so operation identity, protocol, and body shape all
 /// come from the one head classification rather than a second route lookup here.
-/// `ai_operation` is ordered ahead of this filter in every chain and declares a
-/// read-only body hook, so its match is in `ctx.extensions` even under the
-/// buffered body pre-read this filter's `BodyMode::StreamBuffer` triggers — core
-/// runs that pre-read in pipeline order, so the earlier filter publishes first.
+/// `ai_operation` classifies in core's request-head phase, which runs once
+/// before any filter's buffered body pre-read, so its match is in
+/// `ctx.extensions` even under the pre-read this filter's `BodyMode::StreamBuffer`
+/// triggers.
 ///
 /// Only a match whose protocol is Responses is returned; another protocol's
 /// match (Chat Completions, Anthropic, Conversations), or no match at all, yields
-/// `None` and the request is released untouched. The requirement that
-/// `ai_operation` precede this filter is the AI-only workaround for
-/// praxis-proxy/praxis#1142: core exposes no request-head phase before the
-/// buffered pre-read, so a separate head classifier ordered first supplies the
-/// identity. The limit is stated with that issue: core can still reject an
-/// oversized body with a 413 before the first body hook runs, so this does not
-/// give #1142's guarantee of classification ahead of all pre-read work.
+/// `None` and the request is released untouched. The request-head phase
+/// (praxis-proxy/praxis#1142) is guaranteed ahead of every pre-read step, so the
+/// identity is published before this filter's pre-read — and before an oversized
+/// body could be rejected with a 413.
 ///
 /// Every matched Responses operation is returned, body-bearing or not: the
 /// endpoint is authoritative that the request is Responses even when there is no
@@ -715,8 +756,14 @@ fn enrich_context(
 }
 
 /// Initialize canonical request state, including metadata that must survive IRR steps.
-fn insert_responses_state(ctx: &mut HttpFilterContext<'_>, parsed: serde_json::Value, response_id: &str) {
+fn insert_responses_state(
+    ctx: &mut HttpFilterContext<'_>,
+    parsed: serde_json::Value,
+    response_id: &str,
+    budget: Option<super::agentic_loop::budget::SimpleBudget>,
+) {
     let mut state = ResponsesState::from_request_body(parsed);
     state.response_id = Some(response_id.to_owned());
+    state.simple_budget = budget;
     ctx.extensions.insert(state);
 }

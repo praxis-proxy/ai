@@ -3,6 +3,8 @@
 
 //! `OpenAI` Responses API translation for Chat Completions-compatible providers.
 
+use std::collections::{HashMap, HashSet};
+
 use serde::Deserialize;
 use serde_json::{Map, Number, Value, json};
 use thiserror::Error;
@@ -37,6 +39,8 @@ const DEFAULT_TEXT_FORMAT: &str = "text";
 
 /// Maximum query length accepted by the synthesized web-search function.
 const WEB_SEARCH_QUERY_MAX_LENGTH: usize = 4_096;
+/// Maximum queries accepted in one synthesized web-search call.
+const WEB_SEARCH_MAX_QUERIES: usize = 64;
 
 /// Maximum query length advertised by the synthesized file-search function.
 ///
@@ -652,7 +656,107 @@ fn build_chat_messages(
         append_input_messages(&mut messages, input, reasoning)?;
     }
 
+    keep_tool_answers_adjacent(&mut messages);
     Ok(messages)
+}
+
+/// Call IDs that an assistant `tool_calls` message expects tool answers for.
+///
+/// Returns `None` for messages that do not open a tool-call block. The IDs
+/// are copied into owned `String`s so planning can hold them while scanning
+/// the whole slot list; the cost is one short allocation per expected call
+/// ID, once per translated request.
+fn expected_tool_answers(message: &Value) -> Option<Vec<String>> {
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let calls = message.get("tool_calls")?.as_array()?;
+    let ids: Vec<String> = calls
+        .iter()
+        .filter_map(|call| call.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
+/// Keep each assistant `tool_calls` message adjacent to its tool answers.
+///
+/// Chat Completions backends reject a request where any other message sits
+/// between an assistant `tool_calls` message and the tool messages answering
+/// its call IDs: "An assistant message with `tool_calls` must be followed by
+/// tool messages responding to each `tool_call_id`." Responses input can
+/// legally produce that shape when an orphan output, a plain message, or a
+/// later `function_call` block sits between a call and its linked output, so
+/// the translated list is repaired here: each answer is pulled from anywhere
+/// after its block to directly follow it, and every other message keeps its
+/// relative order. An answer that appears nowhere after its block, or before
+/// it, cannot be repaired by reordering and passes through for the backend
+/// to reject.
+fn keep_tool_answers_adjacent(messages: &mut Vec<Value>) {
+    let mut slots: Vec<Option<Value>> = messages.drain(..).map(Some).collect();
+    let mut consumed: HashSet<usize> = HashSet::new();
+    let pulled_after = plan_answer_pulls(&slots, &mut consumed);
+    let mut order: Vec<usize> = Vec::with_capacity(slots.len());
+    for position in 0..slots.len() {
+        if !consumed.contains(&position) {
+            order.push(position);
+            if let Some(answers) = pulled_after.get(&position) {
+                order.extend(answers.iter().copied());
+            }
+        }
+    }
+    let mut repaired: Vec<Value> = Vec::with_capacity(order.len());
+    for position in order {
+        if let Some(message) = slots.get_mut(position).and_then(Option::take) {
+            repaired.push(message);
+        }
+    }
+    debug_assert_eq!(repaired.len(), slots.len(), "repair must keep every message");
+    *messages = repaired;
+}
+
+/// Positions of the tool answers each assistant block pulls after itself.
+///
+/// Each answer position is assigned to the first block that expects its call
+/// ID, so a block can collect answers that trail a later block. Answers that
+/// appear before their block, or that no block expects, are left in place.
+/// Planning scans the drained slot list once per expected call ID, so its cost
+/// is linear in history length per expected answer and it runs once per
+/// translated request; displacement itself is a single rebuild that moves
+/// each message exactly once.
+fn plan_answer_pulls(slots: &[Option<Value>], consumed: &mut HashSet<usize>) -> HashMap<usize, Vec<usize>> {
+    let mut pulled_after: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (block, slot) in slots.iter().enumerate() {
+        let Some(needed) = slot.as_ref().and_then(expected_tool_answers) else {
+            continue;
+        };
+        for id in &needed {
+            let answer = slots
+                .iter()
+                .enumerate()
+                .skip(block + 1)
+                .find(|&(candidate, candidate_slot)| {
+                    !consumed.contains(&candidate)
+                        && candidate_slot
+                            .as_ref()
+                            .is_some_and(|message| is_tool_answer_for(message, std::slice::from_ref(id)))
+                });
+            if let Some((position, _)) = answer {
+                consumed.insert(position);
+                pulled_after.entry(block).or_default().push(position);
+            }
+        }
+    }
+    pulled_after
+}
+
+/// Whether `message` is a Chat `tool` answer for one of `needed` call IDs.
+fn is_tool_answer_for(message: &Value, needed: &[String]) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("tool")
+        && message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .is_some_and(|answer_id| needed.iter().any(|needed_id| needed_id == answer_id))
 }
 
 /// Append converted input messages to a Chat Completions message list.
@@ -837,20 +941,43 @@ fn function_call_tool_call(obj: &Map<String, Value>) -> Result<Value, Translatio
     }))
 }
 
-/// Convert a `Responses` function call output item into a Chat tool message.
+/// Convert a `Responses` function call output item into a Chat message.
+///
+/// A linked output (string `call_id`) becomes a Chat tool message. An
+/// orphan output (`call_id` absent or null) has no tool call to correlate
+/// with, so its text lowers to a user message instead of failing the
+/// translated request; stored history can legitimately contain such items
+/// after the conversation contract made `call_id` optional. Any other
+/// `call_id` shape stays invalid input and fails closed.
 fn append_tool_output(messages: &mut Vec<Value>, obj: &Map<String, Value>) -> Result<(), TranslationError> {
-    let call_id = required_input_item_string(obj, "function_call_output", "call_id")?;
+    let linked_call_id = match obj.get("call_id") {
+        Some(Value::String(call_id)) => Some(call_id),
+        None | Some(Value::Null) => None,
+        Some(_) => {
+            return Err(TranslationError::InvalidInputItemStringField {
+                item_type: "function_call_output",
+                field: "call_id",
+            });
+        },
+    };
     let output = obj.get("output").ok_or(TranslationError::MissingInputItemField {
         item_type: "function_call_output",
         field: "output",
     })?;
     let content = convert_function_call_output(output)?;
 
-    messages.push(json!({
-        "role": "tool",
-        "tool_call_id": call_id,
-        "content": content
-    }));
+    // The request history is borrowed; the owned Chat request keeps this text.
+    match linked_call_id {
+        Some(call_id) => messages.push(json!({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": content
+        })),
+        None => messages.push(json!({
+            "role": "user",
+            "content": content
+        })),
+    }
     Ok(())
 }
 
@@ -1298,13 +1425,18 @@ fn synthesized_web_search_tool() -> Value {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": WEB_SEARCH_QUERY_MAX_LENGTH
+                    "queries": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": WEB_SEARCH_QUERY_MAX_LENGTH
+                        },
+                        "minItems": 1,
+                        "maxItems": WEB_SEARCH_MAX_QUERIES
                     }
                 },
-                "required": ["query"],
+                "required": ["queries"],
                 "additionalProperties": false
             },
             "strict": true
@@ -1515,7 +1647,7 @@ pub(crate) fn chat_response_to_response_resource(
     let incomplete_details = incomplete_details(finish_reason);
     let output = build_output_items(obj, context, status)?;
     let usage = build_usage(obj);
-    let service_tier = service_tier_value_with_context(obj, context);
+    let service_tier = service_tier_value_with_context(obj.get("service_tier"), context);
     let parts = ResponseResourceParts {
         status,
         incomplete_details: &incomplete_details,
@@ -1528,6 +1660,11 @@ pub(crate) fn chat_response_to_response_resource(
 }
 
 /// Validate the minimum successful Chat Completions shape used by translation.
+///
+/// A Responses resource represents a single assistant turn and has no faithful
+/// representation for independent Chat alternatives, so exactly one choice is
+/// required: translating only the first of several would silently discard the
+/// rest. The streaming converter enforces the same single-choice contract.
 fn validate_chat_response<'a>(
     obj: &'a Map<String, Value>,
     reasoning_options: &ReasoningOptions,
@@ -1536,6 +1673,11 @@ fn validate_chat_response<'a>(
         .get("choices")
         .and_then(Value::as_array)
         .ok_or(TranslationError::InvalidChatResponse("choices must be an array"))?;
+    if choices.len() > 1 {
+        return Err(TranslationError::InvalidChatResponse(
+            "choices must contain exactly one choice",
+        ));
+    }
     let choice = choices
         .first()
         .and_then(Value::as_object)
@@ -1683,11 +1825,15 @@ fn is_supported_function_call(tool_call: &Value) -> bool {
 /// output list, null usage, and `in_progress` status, matching the snapshot
 /// carried by `response.created` and `response.in_progress` streaming events.
 pub(crate) fn in_progress_response_resource(context: &ResponseContext<'_>) -> Result<Value, TranslationError> {
-    let service_tier = context
-        .service_tier
-        .filter(|value| value.is_string())
-        .cloned()
-        .unwrap_or_else(|| Value::String(DEFAULT_SERVICE_TIER.to_owned()));
+    in_progress_response_resource_with_service_tier(context, context.service_tier)
+}
+
+/// Build an `in_progress` snapshot with a provider-observed service tier.
+pub(crate) fn in_progress_response_resource_with_service_tier(
+    context: &ResponseContext<'_>,
+    service_tier: Option<&Value>,
+) -> Result<Value, TranslationError> {
+    let service_tier = service_tier_value_with_context(service_tier, context);
     let parts = ResponseResourceParts {
         status: "in_progress",
         incomplete_details: &Value::Null,
@@ -1782,7 +1928,10 @@ fn insert_request_resource_fields(resource: &mut Value, context: &ResponseContex
     }
 }
 
-/// Extract the first Chat Completions choice.
+/// Extract the single Chat Completions choice.
+///
+/// Response validation rejects any cardinality other than one before output
+/// construction runs, so the first choice is the validated only choice.
 fn first_choice(obj: &Map<String, Value>) -> Option<&Value> {
     obj.get("choices")
         .and_then(Value::as_array)
@@ -1920,8 +2069,8 @@ fn normalize_response_tools(tools: &[Value]) -> Vec<Value> {
 }
 
 /// Build provider service tier, falling back to the request context when absent.
-fn service_tier_value_with_context(obj: &Map<String, Value>, context: &ResponseContext<'_>) -> Value {
-    obj.get("service_tier")
+fn service_tier_value_with_context(service_tier: Option<&Value>, context: &ResponseContext<'_>) -> Value {
+    service_tier
         .filter(|value| value.is_string())
         .or_else(|| context.service_tier.filter(|value| value.is_string()))
         .cloned()
@@ -1941,7 +2090,10 @@ fn number_value(value: f64) -> Value {
     Number::from_f64(value).map_or(Value::Null, Value::Number)
 }
 
-/// Build all `Responses` output items from the first Chat choice.
+/// Build all `Responses` output items from the single Chat choice.
+///
+/// The caller has already validated that the response carries exactly one
+/// choice, so the first choice is the only choice.
 fn build_output_items(
     obj: &Map<String, Value>,
     context: &ResponseContext<'_>,
@@ -2129,7 +2281,7 @@ pub(crate) fn web_search_call_output_item_from_parts(
     if call_id.is_empty() {
         return Err(TranslationError::InvalidWebSearchCall("missing call id"));
     }
-    let query = web_search_query(arguments)?;
+    let action = web_search_action(arguments)?;
     // The response can be incomplete because generation hit a token or content
     // filter limit, but WebSearchToolCall has no `incomplete` item status.
     // Preserve the response-level status and represent the interrupted hosted
@@ -2140,10 +2292,7 @@ pub(crate) fn web_search_call_output_item_from_parts(
         "id": call_id,
         "type": "web_search_call",
         "status": status,
-        "action": {
-            "type": "search",
-            "query": query
-        }
+        "action": action
     }))
 }
 
@@ -2159,25 +2308,58 @@ fn web_search_call_id(tool_call: &Value) -> Result<&str, TranslationError> {
 /// Strict arguments accepted from the private web-search function.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WebSearchFunctionArguments {
-    /// Query to pass to the hosted search executor.
+struct WebSearchQueriesFunctionArguments {
+    /// Queries to pass to the hosted search executor.
+    queries: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Deprecated singular arguments retained for existing Chat backends.
+struct WebSearchQueryFunctionArguments {
+    /// Deprecated query form retained for existing Chat backends.
     query: String,
 }
 
-/// Parse and bound the query emitted by a Chat Completions model.
-fn web_search_query(arguments: &str) -> Result<String, TranslationError> {
+#[derive(Deserialize)]
+#[serde(untagged)]
+/// Arguments accepted from the private web-search function.
+enum WebSearchFunctionArguments {
+    /// Current multi-query form.
+    Queries(WebSearchQueriesFunctionArguments),
+    /// Deprecated single-query form.
+    Query(WebSearchQueryFunctionArguments),
+}
+
+/// Parse and bound the action emitted by a Chat Completions model.
+fn web_search_action(arguments: &str) -> Result<Value, TranslationError> {
     let parsed: WebSearchFunctionArguments = serde_json::from_str(arguments).map_err(|_error| {
-        TranslationError::InvalidWebSearchCall("arguments must contain only a string-valued query")
+        TranslationError::InvalidWebSearchCall("arguments must contain a string-valued query or queries array")
     })?;
-    if parsed.query.is_empty() {
+
+    let queries = match parsed {
+        WebSearchFunctionArguments::Queries(args) => args.queries,
+        WebSearchFunctionArguments::Query(args) => vec![args.query],
+    };
+
+    if queries.is_empty() {
         return Err(TranslationError::InvalidWebSearchCall(
-            "query must be a non-empty string",
+            "queries must contain at least one non-empty string",
         ));
     }
-    if parsed.query.chars().count() > WEB_SEARCH_QUERY_MAX_LENGTH {
-        return Err(TranslationError::InvalidWebSearchCall("query exceeds maximum length"));
+    if queries.len() > WEB_SEARCH_MAX_QUERIES {
+        return Err(TranslationError::InvalidWebSearchCall("queries exceed maximum count"));
     }
-    Ok(parsed.query)
+    if queries
+        .iter()
+        .any(|query| query.is_empty() || query.chars().count() > WEB_SEARCH_QUERY_MAX_LENGTH)
+    {
+        return Err(TranslationError::InvalidWebSearchCall(
+            "each query must be a non-empty string within the maximum length",
+        ));
+    }
+
+    Ok(json!({"type": "search", "queries": queries}))
 }
 
 /// Build one `Responses` function call item from a Chat Completions tool call.

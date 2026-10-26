@@ -492,7 +492,7 @@ fn is_probe_request(method: &str, uri: &str) -> bool {
 /// Format a standard HTTP response payload.
 fn format_http_response(status: u16, resp_body: &str) -> Vec<u8> {
     let reason = reason_phrase(status);
-    let content_type = if resp_body.starts_with("data: ") {
+    let content_type = if is_sse_response_body(resp_body) {
         "text/event-stream"
     } else {
         "application/json"
@@ -570,12 +570,17 @@ fn capture_and_respond(
     let idx = counter.fetch_add(1, Ordering::SeqCst);
     let (status, resp_body) = responses.get(idx).map_or((500, "exhausted"), |(s, b)| (*s, b.as_str()));
 
-    if resp_body.starts_with("data: ") {
+    if is_sse_response_body(resp_body) {
         let _ = write_incremental_sse_response(stream, status, resp_body);
     } else {
         let resp_bytes = format_http_response(status, resp_body);
         let _sent = stream.write_all(&resp_bytes);
     }
+}
+
+/// Recognize provider streams whose first SSE field is `data` or `event`.
+fn is_sse_response_body(resp_body: &str) -> bool {
+    resp_body.starts_with("data: ") || resp_body.starts_with("event: ")
 }
 
 /// Read a full HTTP request (headers + body) from a TCP stream.
@@ -775,6 +780,7 @@ fn build_config(address: &str, clusters: Vec<Cluster>, filters: Vec<FilterEntry>
 
     let chain = FilterChainConfig {
         name: "backend".to_owned(),
+        conditions: Vec::new(),
         filters,
     };
 
@@ -804,6 +810,10 @@ fn start_server(mut config: Config) -> u16 {
             l.address.clone_from(&addr);
         }
     }
+
+    // Core `praxis::run_server` refuses UID 0 unless the config opts in. When
+    // the harness itself is root, allow the mock backend to start.
+    crate::allow_root_on_config(&mut config);
 
     std::thread::spawn(move || {
         praxis::run_server(config, None, None);

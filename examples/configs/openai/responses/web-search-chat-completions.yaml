@@ -1,5 +1,5 @@
 # Responses Web Search with a Chat Completions Backend
-# Requires `--features openai-responses` because these filters are opt-in.
+# Requires `--features openai-agentic-loop,openai-responses` because these filters are opt-in.
 #
 # Accepts OpenAI Responses requests with hosted web search while targeting a
 # backend that only implements /v1/chat/completions. Serves both finite
@@ -89,7 +89,8 @@ filter_chains:
 
               - filter: openai_web_search_dispatch
                 provider: brave
-                api_key: ${WEB_SEARCH_API_KEY}
+                api_key:
+                  env_var: WEB_SEARCH_API_KEY
                 # Each provider callout executes through this outbound chain; the
                 # filtered-subrequest executor enforces destination authority,
                 # DNS/SSRF, TLS/SNI, and Host centrally.

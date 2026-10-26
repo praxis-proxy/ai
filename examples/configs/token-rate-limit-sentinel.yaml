@@ -1,0 +1,46 @@
+# Sentinel HA example for either official Redis or Red Hat Valkey.
+# Add credentials through complete `${ENV_VAR}` references when the deployment
+# requires ACLs; the example stays parseable in the repository test harness.
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path: "/v1/chat/completions"
+            cluster: backend
+
+      - filter: token_rate_limit
+        backend:
+          kind: valkey # use `redis` for the Redis qualification lane
+          sentinel:
+            endpoints:
+              - "redis://127.0.0.1:36379"
+              - "redis://127.0.0.1:36380"
+              - "redis://127.0.0.1:36381"
+            service_name: mymaster
+            # redis_password: "${TOKEN_RATE_LIMIT_REDIS_PASSWORD}"
+            # sentinel_password: "${TOKEN_RATE_LIMIT_SENTINEL_PASSWORD}"
+            discovery_timeout: 5s
+          connect_timeout: 2s
+          operation_timeout: 2s
+        rules:
+          - name: default
+            algorithm: sliding_window
+            window: 1h
+            capacity: 100000
+            reserved_tokens: 500
+      - filter: token_count
+        provider: openai
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:9000"
+
+insecure_options:
+  allow_private_endpoints: true

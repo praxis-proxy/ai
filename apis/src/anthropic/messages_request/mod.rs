@@ -256,9 +256,11 @@ impl HttpFilter for AnthropicMessagesRequestFilter {
 /// The Anthropic Messages operation the request head resolves to, if any.
 ///
 /// The registry is consulted directly rather than through the published
-/// [`AiOperationMatch`] extension, because a head-phase extension is not visible
-/// during `StreamBuffer` pre-read. Both read the same registry, so the operation
-/// identity is identical either way.
+/// [`AiOperationMatch`] extension. The extension is visible here — `ai_operation`
+/// publishes it from core's request-head phase, which runs before this filter's
+/// `StreamBuffer` pre-read — but re-deriving from the same registry is an
+/// allocation-free pure lookup that avoids re-checking the published protocol,
+/// and yields an identical operation identity either way.
 ///
 /// [`AiOperationMatch`]: crate::operation_classifier::AiOperationMatch
 fn matched_operation(ctx: &HttpFilterContext<'_>) -> Option<AnthropicMessagesOperation> {

@@ -7,6 +7,7 @@ use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use praxis_ai_apis::json_body::replace_json_body;
 #[cfg(feature = "openai-responses")]
 use praxis_ai_apis::openai::{local_tool_guardrail_messages, record_local_tool_guardrail_failure};
 use praxis_core::{
@@ -17,16 +18,21 @@ use praxis_core::{
 use praxis_filter::parse_filter_config;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, FilterPipeline, HttpFilter, HttpFilterContext, IterationState,
-    Rejection, SubrequestRuntime,
+    Rejection, SubrequestRuntime, body::MAX_JSON_BODY_BYTES,
 };
+use serde::Deserialize;
 
 use super::{
     config::{AiGuardrailsConfig, PhaseConfig, ProviderType},
-    providers::{GuardCalloutRuntime, GuardPhase, GuardResult, nemo},
+    providers::{GuardCalloutRuntime, GuardPhase, GuardResult, MessageRedaction, nemo},
 };
 
 /// Maximum request body size to buffer (1 MiB).
 const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
+
+/// Rejection body used when response guardrails cannot inspect streaming output.
+const STREAMING_RESPONSE_GUARDRAIL_ERROR: &str =
+    "ai_guardrails: streaming responses are not supported while a response guardrail is active";
 
 // -----------------------------------------------------------------------------
 // AiGuardrailsFilter
@@ -35,6 +41,20 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 /// Calls an external AI guardrail provider to evaluate request and
 /// response bodies. The provider determines whether content should
 /// be passed, blocked, or redacted.
+///
+/// Registered as a security filter. Pipeline validation rejects
+/// `failure_mode: open` unless `insecure_options.allow_open_security_filters`
+/// is set. `insecure_options.skip_pipeline_validation` also bypasses this
+/// check. With either option, a provider timeout or error can silently skip
+/// screening.
+///
+/// Request `conditions:` are rejected for the same reason: a security filter
+/// must not be skipped for non-matching requests. Body hooks do not run
+/// inside a branch, so a router branch is not a substitute. A non-empty
+/// request body without a Chat Completions `messages` array fails the
+/// request with 500. Serve `/v1/responses` and `/v1/embeddings` from a
+/// listener that does not include this filter; put `ai_guardrails` only on
+/// a listener whose routes are Chat Completions.
 ///
 /// Every provider callout runs through Praxis's filtered-subrequest executor.
 /// The optional `outbound_chain` adds destination-bound authentication,
@@ -56,6 +76,20 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 /// `502 guardrail_error`; sanitized text is not forwarded because it cannot
 /// yet be safely mapped back to the canonical tool-result items. Only a
 /// `passed` verdict permits model re-entry.
+///
+/// A provider `modified` verdict on the request rewrites each targeted user
+/// message and forwards the masked body. A request rewrite that cannot be
+/// applied is rejected with HTTP 502 so the original text is not sent
+/// upstream. On the response, each targeted choice is rebuilt from `index`,
+/// `finish_reason`, and a message containing only `role` and the masked
+/// `content`. A choice whose message has array `content`, `tool_calls`, or
+/// `function_call` cannot be redacted; the client receives the original HTTP
+/// 200 with an `evaluation_failed` error document. `on_response` drops
+/// `Content-Length` so core reframes the buffered body at its natural size.
+///
+/// When `phase.response` is enabled, Chat Completions requests with
+/// `"stream": true` are rejected with HTTP 422 until incremental SSE
+/// response evaluation is supported (see #1108).
 ///
 /// For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail
 /// configurations. When `provider.guardrails` is omitted, the request omits
@@ -88,6 +122,9 @@ pub struct AiGuardrailsFilter {
     outbound: Arc<FilterPipeline>,
     /// Per-callout deadline derived from the provider configuration.
     callout_timeout: std::time::Duration,
+    /// Chosen verdict for tests that must not call `NeMo`.
+    #[cfg(test)]
+    scripted_verdict: Option<GuardResult>,
 }
 
 impl AiGuardrailsFilter {
@@ -120,16 +157,18 @@ impl AiGuardrailsFilter {
             phase: config.phase,
             outbound,
             callout_timeout,
+            #[cfg(test)]
+            scripted_verdict: None,
         }))
     }
 
     /// Create a filter from parsed YAML config.
     ///
-    /// Production pipelines must register `ai_guardrails` through
-    /// [`register_chain_binding`](praxis_filter::FilterRegistry::register_chain_binding)
-    /// so the outbound chain is resolved at construction time. This
-    /// constructor exists for tests and builds a permissive outbound test
-    /// pipeline directly.
+    /// Production pipelines register `ai_guardrails` through
+    /// [`register_chain_binding_with_class`](praxis_filter::FilterRegistry::register_chain_binding_with_class)
+    /// as a security filter, so the outbound chain is resolved at construction
+    /// time. This constructor exists for tests and builds a permissive outbound
+    /// test pipeline directly.
     ///
     /// # Errors
     ///
@@ -155,6 +194,24 @@ impl AiGuardrailsFilter {
         Self::build(cfg, outbound, client)
     }
 
+    /// Test-only constructor so fail-closed redaction can be exercised
+    /// without a live `NeMo` call. `NeMo` skips `/v1/checks` when there
+    /// is no phase-target message, which would otherwise never produce
+    /// [`GuardResult::Redact`].
+    #[cfg(test)]
+    pub(super) fn with_verdict(verdict: GuardResult, phase: PhaseConfig) -> Result<Self, FilterError> {
+        let client = crate::isolated_subrequest_client(4);
+        let config = serde_yaml::from_str("endpoint: \"http://127.0.0.1:9/v1/checks\"")
+            .map_err(|error| -> FilterError { format!("ai_guardrails (nemo): {error}").into() })?;
+        Ok(Self {
+            provider: nemo::NemoProvider::from_config(&config, client)?,
+            phase,
+            outbound: test_outbound_chain()?,
+            callout_timeout: std::time::Duration::from_secs(5),
+            scripted_verdict: Some(verdict),
+        })
+    }
+
     /// Capture downstream identity, nesting, deadline, and the bound chain for a callout.
     fn callout_runtime(&self, ctx: &HttpFilterContext<'_>) -> GuardCalloutRuntime<'_> {
         let now = Instant::now();
@@ -177,6 +234,20 @@ impl AiGuardrailsFilter {
         }
     }
 
+    /// Apply a scripted test verdict, or call the configured `NeMo` provider.
+    async fn evaluate(
+        &self,
+        messages: Vec<serde_json::Value>,
+        phase: GuardPhase,
+        runtime: &GuardCalloutRuntime<'_>,
+    ) -> Result<GuardResult, FilterError> {
+        #[cfg(test)]
+        if let Some(verdict) = &self.scripted_verdict {
+            return Ok(verdict.clone());
+        }
+        self.provider.evaluate(messages, phase, runtime).await
+    }
+
     /// Evaluate the local result suffix and leave terminal response ownership
     /// with `openai_agentic_loop`.
     #[cfg(feature = "openai-responses")]
@@ -186,7 +257,7 @@ impl AiGuardrailsFilter {
         messages: Vec<serde_json::Value>,
     ) -> Result<FilterAction, FilterError> {
         let runtime = self.callout_runtime(ctx);
-        match self.provider.evaluate(messages, GuardPhase::Request, &runtime).await {
+        match self.evaluate(messages, GuardPhase::Request, &runtime).await {
             Ok(result) => record_local_tool_verdict(ctx, result),
             Err(error) => {
                 tracing::error!(%error, phase = "tool_results", "ai_guardrails: evaluation failed");
@@ -210,6 +281,7 @@ fn test_outbound_chain() -> Result<Arc<FilterPipeline>, FilterError> {
     Ok(Arc::new(pipeline))
 }
 
+#[expect(clippy::too_many_lines, reason = "implements the complete filter lifecycle")]
 #[async_trait]
 impl HttpFilter for AiGuardrailsFilter {
     fn name(&self) -> &'static str {
@@ -237,18 +309,27 @@ impl HttpFilter for AiGuardrailsFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        if self.phase.response && !is_event_stream(ctx) {
-            ctx.set_response_body_mode(BodyMode::StreamBuffer {
-                max_bytes: Some(DEFAULT_MAX_BODY_BYTES),
-            });
+        if !self.phase.response {
+            return Ok(FilterAction::Continue);
         }
+
+        if is_event_stream(ctx) {
+            return Ok(FilterAction::Reject(
+                Rejection::status(502).with_body(STREAMING_RESPONSE_GUARDRAIL_ERROR),
+            ));
+        }
+
+        remove_stale_content_length(ctx);
+        ctx.set_response_body_mode(BodyMode::StreamBuffer {
+            max_bytes: Some(DEFAULT_MAX_BODY_BYTES),
+        });
         Ok(FilterAction::Continue)
     }
 
     fn request_body_access(&self) -> BodyAccess {
         if self.phase.request {
             BodyAccess::ReadWrite
-        } else if self.phase.tool_results {
+        } else if self.phase.response || self.phase.tool_results {
             BodyAccess::ReadOnly
         } else {
             BodyAccess::None
@@ -259,6 +340,12 @@ impl HttpFilter for AiGuardrailsFilter {
         if self.phase.request {
             BodyMode::StreamBuffer {
                 max_bytes: Some(DEFAULT_MAX_BODY_BYTES),
+            }
+        } else if self.phase.response {
+            // Response-only guardrails buffer every request up to `MAX_JSON_BODY_BYTES`
+            // before forwarding to inspect `stream`. They do not deserialize request messages.
+            BodyMode::StreamBuffer {
+                max_bytes: Some(MAX_JSON_BODY_BYTES),
             }
         } else {
             // Tool-result evaluation reads canonical Responses state at EOS;
@@ -290,11 +377,6 @@ impl HttpFilter for AiGuardrailsFilter {
                 Ok(_) => {},
             }
         }
-
-        if !self.phase.request {
-            return Ok(FilterAction::Continue);
-        }
-
         let Some(bytes) = body.as_ref() else {
             return Ok(FilterAction::Continue);
         };
@@ -303,9 +385,35 @@ impl HttpFilter for AiGuardrailsFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let messages = extract_messages(bytes)?;
+        if !self.phase.request {
+            // The current response-phase guardrail implementation cannot inspect a
+            // streamed response because SSE responses remain in streaming mode.
+            // Rather than let it stream through unevaluated, reject the request
+            // before the model is invoked.
+            if self.phase.response {
+                match requests_streaming(bytes) {
+                    Ok(true) => {
+                        return Ok(FilterAction::Reject(
+                            Rejection::status(422).with_body(STREAMING_RESPONSE_GUARDRAIL_ERROR),
+                        ));
+                    },
+                    Ok(false) => {},
+                    Err(_) => return Ok(FilterAction::Reject(Rejection::status(400))),
+                }
+            }
+            return Ok(FilterAction::Continue);
+        }
+
+        let request = parse_request(bytes)?;
+        if self.phase.response && stream_requested(request.stream.as_ref()) {
+            return Ok(FilterAction::Reject(
+                Rejection::status(422).with_body(STREAMING_RESPONSE_GUARDRAIL_ERROR),
+            ));
+        }
+
+        let messages = request.into_messages()?;
         let runtime = self.callout_runtime(ctx);
-        let result = self.provider.evaluate(messages, GuardPhase::Request, &runtime).await?;
+        let result = self.evaluate(messages, GuardPhase::Request, &runtime).await?;
         record_verdict(ctx, body, result, GuardPhase::Request)
     }
 
@@ -355,9 +463,7 @@ impl HttpFilter for AiGuardrailsFilter {
             let runtime = self.callout_runtime(ctx);
             // `on_response_body` is sync (Pingora constraint); use `block_in_place`
             // to bridge into async. See #51 for the plan to make this truly async.
-            tokio::task::block_in_place(|| {
-                handle.block_on(self.provider.evaluate(messages, GuardPhase::Response, &runtime))
-            })
+            tokio::task::block_in_place(|| handle.block_on(self.evaluate(messages, GuardPhase::Response, &runtime)))
         });
 
         match evaluation {
@@ -473,12 +579,242 @@ fn record_verdict(
             tracing::debug!(verdict, phase = phase_label, "ai_guardrails: verdict");
             Ok(FilterAction::Continue)
         },
-        GuardResult::Block { reason } => Ok(enforce_block(body, reason, phase, phase_label, verdict)),
-        GuardResult::Redact { reason, .. } => {
-            tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict; forwarding unchanged until #49");
-            Ok(FilterAction::Continue)
+        GuardResult::Block { reason } => Ok(enforce_block(body, reason, phase, verdict)),
+        GuardResult::Redact { replacements, reason } => {
+            tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict");
+            Ok(apply_redaction(body, replacements, phase))
         },
     }
+}
+
+/// Rewrite the buffered body with each `NeMo` masked turn and continue.
+///
+/// Request-phase framing is repaired by core via `mutated_request_body_len`.
+/// A request rewrite that cannot be applied is rejected with HTTP 502.
+/// Returning an error would let `failure_mode: open` forward the original text.
+///
+/// Response headers stay committed, except `Content-Length`, which
+/// `on_response` removes so core reframes the buffered body. A response
+/// rewrite that cannot be applied replaces the body with an `evaluation_failed`
+/// document at its natural size and keeps the original HTTP 200.
+fn apply_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageRedaction>, phase: GuardPhase) -> FilterAction {
+    match phase {
+        GuardPhase::Request => {
+            if let Err(error) = apply_request_redaction(body, replacements) {
+                tracing::error!(%error, "ai_guardrails: request-phase redaction failed");
+                return FilterAction::Reject(
+                    Rejection::status(502).with_body(format!("Guardrail redaction failed: {error}")),
+                );
+            }
+            FilterAction::Continue
+        },
+        GuardPhase::Response => {
+            if let Err(error) = apply_response_redaction(body, replacements) {
+                tracing::error!(%error, "ai_guardrails: response-phase redaction failed");
+                replace_body_with_error(
+                    body,
+                    &format!("Guardrail redaction failed: {error}"),
+                    "guardrail_error",
+                    "evaluation_failed",
+                );
+            }
+            FilterAction::Continue
+        },
+    }
+}
+
+/// Replace each redacted user message's `content` with its masked text.
+fn apply_request_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageRedaction>) -> Result<(), FilterError> {
+    if replacements.is_empty() {
+        return Err("ai_guardrails: cannot redact: no message replacements".into());
+    }
+    let mut value = parse_json_body(body, "request")?;
+    let Some(messages) = value.get_mut("messages").and_then(serde_json::Value::as_array_mut) else {
+        return Err("ai_guardrails: request body does not contain recognizable messages".into());
+    };
+    apply_message_replacements(messages, replacements, "user")?;
+    replace_json_body(body, &value, "ai_guardrails", "messages")
+        .map_err(|e| -> FilterError { format!("ai_guardrails: failed to serialize redacted body: {e}").into() })?;
+    Ok(())
+}
+
+/// Replace each redacted choice with an allowlisted object.
+///
+/// The rewritten document is forwarded at its natural size. `on_response`
+/// already dropped `Content-Length` so core can reframe it.
+fn apply_response_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageRedaction>) -> Result<(), FilterError> {
+    if replacements.is_empty() {
+        return Err("ai_guardrails: cannot redact: no message replacements".into());
+    }
+    let mut value = parse_json_body(body, "response")?;
+    let Some(choices) = value.get_mut("choices").and_then(serde_json::Value::as_array_mut) else {
+        return Err("ai_guardrails: response body does not contain recognizable choices".into());
+    };
+    for replacement in replacements {
+        let index = replacement.index;
+        let Some(choice) = choices.get_mut(index) else {
+            return Err(format!("ai_guardrails: cannot redact: choice index {index} has no message").into());
+        };
+        redact_choice(choice, replacement)?;
+    }
+    let serialized = serde_json::to_string(&value)
+        .map_err(|e| -> FilterError { format!("ai_guardrails: failed to serialize redacted body: {e}").into() })?;
+    *body = Some(Bytes::from(serialized));
+    Ok(())
+}
+
+/// Rebuild one choice from `index`, `finish_reason`, and a message of `role`
+/// plus masked `content`.
+///
+/// `logprobs`, `token_ids`, and `message.reasoning` repeat the original
+/// completion, so they are dropped rather than forwarded.
+fn redact_choice(choice: &mut serde_json::Value, replacement: MessageRedaction) -> Result<(), FilterError> {
+    ensure_redactable_choice(choice, replacement.index)?;
+    write_allowlisted_choice(choice, replacement.modified_text)
+}
+
+/// Confirm the choice is an object whose message has text `content`, a string
+/// `role`, and no tool invocation.
+///
+/// `tool_calls` and `function_call` are not copied onto the rebuilt message.
+/// Keeping `finish_reason` without them would tell the client a tool turn
+/// completed and then omit the calls. Copying them could leak text `NeMo` just
+/// masked, so a message that has either field fails closed.
+fn ensure_redactable_choice(choice: &serde_json::Value, index: usize) -> Result<(), FilterError> {
+    let Some(choice_object) = choice.as_object() else {
+        return Err("ai_guardrails: choice is not a JSON object".into());
+    };
+    let Some(message) = choice_object.get("message") else {
+        return Err(format!("ai_guardrails: cannot redact: choice index {index} has no message").into());
+    };
+    ensure_text_content(message)?;
+    if message_has_tool_invocation(message) {
+        return Err("ai_guardrails: cannot redact: message includes a tool invocation".into());
+    }
+    if message.get("role").is_some_and(serde_json::Value::is_string) {
+        return Ok(());
+    }
+    Err("ai_guardrails: cannot redact: message role is not a string".into())
+}
+
+/// Whether `message` carries `tool_calls` or a legacy `function_call`.
+///
+/// A null field is treated as absent, matching text `content`.
+fn message_has_tool_invocation(message: &serde_json::Value) -> bool {
+    let Some(object) = message.as_object() else {
+        return false;
+    };
+    object.get("tool_calls").is_some_and(|value| !value.is_null())
+        || object.get("function_call").is_some_and(|value| !value.is_null())
+}
+
+/// `index`, `finish_reason`, and message `role` copied from one choice.
+struct AllowlistedChoiceFields {
+    /// Choice `index`, when the upstream object included it.
+    index: Option<serde_json::Value>,
+    /// Choice `finish_reason`, when the upstream object included it.
+    finish_reason: Option<serde_json::Value>,
+    /// Message `role`.
+    role: serde_json::Value,
+}
+
+/// Replace `choice` with `index`, `finish_reason`, and a message of `role` plus `content`.
+fn write_allowlisted_choice(choice: &mut serde_json::Value, modified_text: String) -> Result<(), FilterError> {
+    let fields = allowlisted_choice_fields(choice)?;
+    let mut message = serde_json::Map::new();
+    message.insert("role".to_owned(), fields.role);
+    message.insert("content".to_owned(), serde_json::Value::String(modified_text));
+
+    let mut rebuilt = serde_json::Map::new();
+    if let Some(index) = fields.index {
+        rebuilt.insert("index".to_owned(), index);
+    }
+    rebuilt.insert("message".to_owned(), serde_json::Value::Object(message));
+    if let Some(finish_reason) = fields.finish_reason {
+        rebuilt.insert("finish_reason".to_owned(), finish_reason);
+    }
+    *choice = serde_json::Value::Object(rebuilt);
+    Ok(())
+}
+
+/// Move the allowlisted fields out of `choice`.
+fn allowlisted_choice_fields(choice: &mut serde_json::Value) -> Result<AllowlistedChoiceFields, FilterError> {
+    let Some(choice_object) = choice.as_object_mut() else {
+        return Err("ai_guardrails: choice is not a JSON object".into());
+    };
+    let index = choice_object.remove("index");
+    let finish_reason = choice_object.remove("finish_reason");
+    let Some(role) = choice_object
+        .get_mut("message")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|message| message.remove("role"))
+    else {
+        return Err("ai_guardrails: cannot redact: message role is not a string".into());
+    };
+    Ok(AllowlistedChoiceFields {
+        index,
+        finish_reason,
+        role,
+    })
+}
+
+/// Apply each replacement to `messages[index]`, requiring `expected_role`.
+fn apply_message_replacements(
+    messages: &mut [serde_json::Value],
+    replacements: Vec<MessageRedaction>,
+    expected_role: &str,
+) -> Result<(), FilterError> {
+    for replacement in replacements {
+        let Some(message) = messages.get_mut(replacement.index) else {
+            return Err(format!(
+                "ai_guardrails: cannot redact: message index {} is out of range",
+                replacement.index
+            )
+            .into());
+        };
+        if message.get("role").and_then(serde_json::Value::as_str) != Some(expected_role) {
+            return Err(format!(
+                "ai_guardrails: cannot redact: message {} is not a {expected_role} turn",
+                replacement.index
+            )
+            .into());
+        }
+        set_message_content(message, replacement.modified_text)?;
+    }
+    Ok(())
+}
+
+/// Parse a buffered JSON body, labeling errors as `kind` (`request` or `response`).
+fn parse_json_body(body: &Option<Bytes>, kind: &str) -> Result<serde_json::Value, FilterError> {
+    let Some(raw) = body.as_ref() else {
+        return Err(format!("ai_guardrails: cannot redact a missing {kind} body").into());
+    };
+    serde_json::from_slice(raw)
+        .map_err(|e| -> FilterError { format!("ai_guardrails: {kind} body is not valid JSON: {e}").into() })
+}
+
+/// Set a chat message's `content` field to `modified_text`.
+fn set_message_content(message: &mut serde_json::Value, modified_text: String) -> Result<(), FilterError> {
+    ensure_text_content(message)?;
+    let Some(object) = message.as_object_mut() else {
+        return Err("ai_guardrails: message is not a JSON object".into());
+    };
+    object.insert("content".to_owned(), serde_json::Value::String(modified_text));
+    Ok(())
+}
+
+/// Reject message `content` that is present and neither a string nor null.
+fn ensure_text_content(message: &serde_json::Value) -> Result<(), FilterError> {
+    let Some(object) = message.as_object() else {
+        return Err("ai_guardrails: message is not a JSON object".into());
+    };
+    if object
+        .get("content")
+        .is_some_and(|content| !content.is_string() && !content.is_null())
+    {
+        return Err("ai_guardrails: cannot redact: message content is not a string".into());
+    }
+    Ok(())
 }
 
 /// Publish the guardrail verdict for routing and observability.
@@ -491,13 +827,8 @@ fn set_verdict(ctx: &mut HttpFilterContext<'_>, verdict: &'static str) -> Result
 }
 
 /// Enforce a `Block` verdict for the given phase.
-fn enforce_block(
-    body: &mut Option<Bytes>,
-    reason: String,
-    phase: GuardPhase,
-    phase_label: &str,
-    verdict: &str,
-) -> FilterAction {
+fn enforce_block(body: &mut Option<Bytes>, reason: String, phase: GuardPhase, verdict: &str) -> FilterAction {
+    let phase_label = phase.label();
     match phase {
         GuardPhase::Request => {
             tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict");
@@ -516,61 +847,93 @@ fn enforce_block(
     }
 }
 
-/// Replace the response body with an error JSON payload.
+/// Replace the response body with an error JSON payload at its natural size.
 fn replace_body_with_error(body: &mut Option<Bytes>, message: &str, error_type: &str, code: &str) {
-    let error_json = serde_json::json!({
+    *body = Some(Bytes::from(error_document(message, error_type, code)));
+}
+
+/// OpenAI-style error JSON with `message`, `type`, and `code`.
+fn error_document(message: &str, error_type: &str, code: &str) -> String {
+    serde_json::json!({
         "error": {
             "message": message,
             "type": error_type,
             "code": code,
         }
     })
-    .to_string();
-    *body = Some(fit_to_committed_length(error_json, body));
+    .to_string()
 }
 
-/// Fit `replacement` bytes to the original response body length.
-pub(super) fn fit_to_committed_length(replacement: String, original_body: &Option<Bytes>) -> Bytes {
-    let original_len = original_body.as_ref().map_or(0, Bytes::len);
-    let replacement = replacement.into_bytes();
-    match replacement.len().cmp(&original_len) {
-        std::cmp::Ordering::Equal => Bytes::from(replacement),
-        std::cmp::Ordering::Less => {
-            let mut padded = replacement;
-            padded.resize(original_len, b' ');
-            Bytes::from(padded)
-        },
-        std::cmp::Ordering::Greater => {
-            tracing::warn!(
-                new_len = replacement.len(),
-                original_len,
-                "ai_guardrails: replacement body larger than committed Content-Length; truncating",
-            );
-            let prefix = replacement.get(..original_len).unwrap_or(&replacement);
-            let safe = match std::str::from_utf8(prefix) {
-                Ok(s) => s.len(),
-                Err(e) => e.valid_up_to(),
-            };
-            let mut result = replacement;
-            result.truncate(safe);
-            result.resize(original_len, b' ');
-            Bytes::from(result)
-        },
+/// Remove stale `Content-Length` so core recomputes framing for the buffered body.
+///
+/// The length on the upstream response is not the length the client will see:
+/// compression, or a translator listed ahead of this filter, can drop it later.
+/// The body is fully buffered here, so core can reframe from the bytes this
+/// filter forwards.
+fn remove_stale_content_length(ctx: &mut HttpFilterContext<'_>) {
+    if let Some(response) = &mut ctx.response_header {
+        response.headers.remove(http::header::CONTENT_LENGTH);
+        ctx.response_headers_modified = true;
     }
 }
 
-/// Extract messages from an OpenAI Chat Completion request body.
-fn extract_messages(body: &Bytes) -> Result<Vec<serde_json::Value>, FilterError> {
-    let mut json: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|e| -> FilterError { format!("ai_guardrails: request body is not valid JSON: {e}").into() })?;
+/// Request fields needed by response-only guardrails.
+#[derive(Deserialize)]
+struct StreamingRequest {
+    /// Whether the upstream should stream its response.
+    #[serde(default)]
+    stream: Option<serde_json::Value>,
+}
 
-    if let Some(messages) = json.get_mut("messages").filter(|m| m.is_array())
-        && let serde_json::Value::Array(messages) = std::mem::take(messages)
-    {
-        return Ok(messages);
+/// Request fields needed by request-phase guardrails.
+#[derive(Deserialize)]
+struct GuardrailsRequest {
+    /// Whether the upstream should stream its response.
+    #[serde(default)]
+    stream: Option<serde_json::Value>,
+    /// Chat Completion messages evaluated by request guardrails.
+    messages: Option<serde_json::Value>,
+}
+
+impl GuardrailsRequest {
+    /// Extract the request messages for guardrail evaluation.
+    fn into_messages(self) -> Result<Vec<serde_json::Value>, FilterError> {
+        match self.messages {
+            Some(serde_json::Value::Array(messages)) => Ok(messages),
+            _ => Err("ai_guardrails: request body does not contain recognizable messages".into()),
+        }
     }
+}
 
-    Err("ai_guardrails: request body does not contain recognizable messages".into())
+/// Whether the stream field requests a streamed response.
+fn stream_requested(stream: Option<&serde_json::Value>) -> bool {
+    stream.and_then(serde_json::Value::as_bool).unwrap_or(false)
+}
+
+/// Whether the request asks the upstream for a streamed response via
+/// `"stream": true`.
+///
+/// A malformed body returns an error, allowing the pipeline's failure mode
+/// to handle it consistently with request-phase parsing.
+fn requests_streaming(body: &Bytes) -> Result<bool, FilterError> {
+    let request: StreamingRequest = serde_json::from_slice(body).map_err(|error| request_body_parse_error(&error))?;
+
+    Ok(stream_requested(request.stream.as_ref()))
+}
+
+/// Parse request fields for request-phase guardrails in one pass.
+fn parse_request(body: &Bytes) -> Result<GuardrailsRequest, FilterError> {
+    serde_json::from_slice(body).map_err(|error| request_body_parse_error(&error))
+}
+
+/// Build a parse error without including request body content.
+fn request_body_parse_error(error: &serde_json::Error) -> FilterError {
+    format!(
+        "ai_guardrails: could not parse request body at line {} column {}",
+        error.line(),
+        error.column()
+    )
+    .into()
 }
 
 /// Extract assistant messages from an OpenAI Chat Completion response body.
@@ -611,6 +974,85 @@ fn is_event_stream(ctx: &HttpFilterContext<'_>) -> bool {
                 .next()
                 .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
         })
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
+mod streaming_tests {
+    use bytes::Bytes;
+
+    use super::{parse_request, requests_streaming, stream_requested};
+
+    #[test]
+    fn stream_true_is_detected() {
+        let body = Bytes::from_static(br#"{"model":"m","messages":[],"stream":true}"#);
+        assert!(
+            requests_streaming(&body).unwrap(),
+            "stream=true should request streaming"
+        );
+    }
+
+    #[test]
+    fn stream_false_is_not_streaming() {
+        let body = Bytes::from_static(br#"{"model":"m","messages":[],"stream":false}"#);
+        assert!(
+            !requests_streaming(&body).unwrap(),
+            "stream=false should not request streaming"
+        );
+    }
+
+    #[test]
+    fn absent_stream_is_not_streaming() {
+        let body = Bytes::from_static(br#"{"model":"m","messages":[]}"#);
+        assert!(
+            !requests_streaming(&body).unwrap(),
+            "an absent stream field should not request streaming"
+        );
+    }
+
+    #[test]
+    fn malformed_body_fails_closed() {
+        let body = Bytes::from_static(b"not json");
+        assert!(
+            requests_streaming(&body).is_err(),
+            "malformed JSON should return an error"
+        );
+    }
+
+    #[test]
+    fn request_parse_errors_do_not_include_body_content() {
+        let body = Bytes::from_static(br#""unique-request-secret""#);
+
+        let streaming_error = requests_streaming(&body).unwrap_err();
+        let request_error = parse_request(&body).err().unwrap();
+        for error in [streaming_error, request_error] {
+            let error = error.to_string();
+            assert!(
+                error.contains("line 1 column"),
+                "error should include the parse location: {error}"
+            );
+            assert!(
+                !error.contains("unique-request-secret"),
+                "error must not include request body content: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_phase_parses_stream_and_messages_together() {
+        let body = Bytes::from_static(br#"{"model":"m","messages":[{"role":"user","content":"hello"}],"stream":true}"#);
+        let request = parse_request(&body).unwrap();
+
+        assert!(
+            stream_requested(request.stream.as_ref()),
+            "stream=true should request streaming"
+        );
+        assert_eq!(
+            request.into_messages().unwrap().len(),
+            1,
+            "messages should be available from the same parse"
+        );
+    }
 }
 
 #[cfg(test)]

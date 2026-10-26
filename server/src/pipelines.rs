@@ -8,7 +8,11 @@ use std::{
     sync::Arc,
 };
 
-use praxis_core::config::{ChainRef, Config, FailureMode, FilterEntry, InsecureOptions, Listener};
+#[cfg(feature = "openai-responses")]
+use praxis_ai_apis::openai::AgenticBudgetPolicy;
+use praxis_core::config::{
+    ChainRef, Config, ExpandedFilterChains, FailureMode, FilterEntry, InsecureOptions, Listener,
+};
 use praxis_filter::{FilterPipeline, FilterRegistry};
 use praxis_protocol::ListenerPipelines;
 use praxis_tls::ClientCertMode;
@@ -26,11 +30,16 @@ use praxis_tls::ClientCertMode;
 /// resolution error, body limit conflict, or pipeline ordering violation).
 ///
 /// [`FilterPipeline`]: praxis_filter::FilterPipeline
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads config, registries, and shared services"
+)]
 pub fn resolve_pipelines(
     config: &Config,
     registry: &FilterRegistry,
     health_registry: &praxis_core::health::HealthRegistry,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
+    inflight_registry: &praxis_ai_filters::InFlightRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(feature = "store")]
@@ -40,6 +49,7 @@ pub fn resolve_pipelines(
             registry,
             health_registry,
             kv_stores,
+            inflight_registry,
             subrequest_client,
             &HashMap::new(),
         )
@@ -51,6 +61,7 @@ pub fn resolve_pipelines(
             registry,
             health_registry,
             kv_stores,
+            inflight_registry,
             subrequest_client,
             |_| false,
             |_, _| {},
@@ -69,11 +80,16 @@ pub fn resolve_pipelines(
 ///
 /// Returns an error from store wiring validation or pipeline construction.
 #[cfg(feature = "_store-backend")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads config, registries, and shared services"
+)]
 pub fn validate_pipelines_with_store_wiring(
     config: &Config,
     registry: &FilterRegistry,
     health_registry: &praxis_core::health::HealthRegistry,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
+    inflight_registry: &praxis_ai_filters::InFlightRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (store_registries, _service, _reload, _readiness) = crate::store_provision::build_store_wiring(config)?;
@@ -82,6 +98,7 @@ pub fn validate_pipelines_with_store_wiring(
         registry,
         health_registry,
         kv_stores,
+        inflight_registry,
         subrequest_client,
         &store_registries,
     )?;
@@ -107,6 +124,7 @@ pub(crate) fn resolve_pipelines_with_stores(
     registry: &FilterRegistry,
     health_registry: &praxis_core::health::HealthRegistry,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
+    inflight_registry: &praxis_ai_filters::InFlightRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
     store_registries: &crate::StoreRegistries,
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
@@ -115,6 +133,7 @@ pub(crate) fn resolve_pipelines_with_stores(
         registry,
         health_registry,
         kv_stores,
+        inflight_registry,
         subrequest_client,
         |listener| store_registries.contains_key(&listener.name),
         |listener, pipeline| {
@@ -135,35 +154,37 @@ pub(crate) fn resolve_pipelines_with_stores(
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "threads config, registries, shared services, the policy-connector setup, and a per-listener hook"
+    reason = "threads config, registries, shared services, and a per-listener hook; store gate, budget cap injection, and pipeline assembly form one build"
 )]
 fn build_listener_pipelines(
     config: &Config,
     registry: &FilterRegistry,
     health_registry: &praxis_core::health::HealthRegistry,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
+    inflight_registry: &praxis_ai_filters::InFlightRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
     gate_store_traffic: impl Fn(&Listener) -> bool,
     attach: impl Fn(&Listener, &mut FilterPipeline),
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
-    praxis_filter::set_policy_subrequest_connector(subrequest_client.connector());
-    let chains: HashMap<&str, &[_]> = config
-        .filter_chains
-        .iter()
-        .map(|c| (c.name.as_str(), c.filters.as_slice()))
-        .collect();
+    // Hand the shared sub-request connector to the policy filters this registry
+    // builds. Mirrors praxis core's per-runtime `runtime_registry`: a policy
+    // filter needs the connector while it is constructed by `build_with_chains`,
+    // too early for `FilterPipeline::set_subrequest_client`, and cloning keeps
+    // the caller's registry free of this build's connector.
+    let registry = runtime_registry_with_policy_connector(registry, subrequest_client);
+    // Expand each chain's inherited `conditions:` into its filters before
+    // composition, so a chain-level gate applies to every filter in the chain
+    // (chain gate evaluated first, AND-composed with each filter's own gate).
+    // `as_slices()` borrows the expanded entries for branch/outbound chain
+    // resolution; `for_listener()` concatenates the listener's referenced chains
+    // in declaration order with the same inherited conditions folded in.
+    let expanded_chains = ExpandedFilterChains::new(&config.filter_chains);
+    let chains = expanded_chains.as_slices();
 
     let mut pipelines = HashMap::with_capacity(config.listeners.len());
 
     for listener in &config.listeners {
-        let mut entries = Vec::new();
-        for chain_name in &listener.filter_chains {
-            let chain_filters = chains.get(chain_name.as_str()).ok_or_else(|| {
-                let lname = &listener.name;
-                format!("unknown chain '{chain_name}' for listener '{lname}'")
-            })?;
-            entries.extend_from_slice(chain_filters);
-        }
+        let mut entries = expanded_chains.for_listener(listener)?;
 
         #[cfg(feature = "store")]
         if gate_store_traffic(listener) {
@@ -180,9 +201,42 @@ fn build_listener_pipelines(
         #[cfg(not(feature = "store"))]
         let _ = &gate_store_traffic;
 
+        // Inject the retained-payload budget caps into the expanded listener
+        // entries and a per-listener owned copy of the expanded branch chains, so
+        // the inherited chain conditions folded in by `ExpandedFilterChains`
+        // survive the rewrite. `chains` shadows the borrowed expanded slices with
+        // the budget-adjusted owned copies for this listener's build.
+        #[cfg(feature = "openai-responses")]
+        let mut owned_chains: HashMap<String, Vec<FilterEntry>> = chains
+            .iter()
+            .map(|(name, filters)| ((*name).to_owned(), filters.to_vec()))
+            .collect();
+        #[cfg(feature = "openai-responses")]
+        let budget_policy = prepare_agentic_budget_entries(&mut entries, &mut owned_chains)?;
+        #[cfg(feature = "openai-responses")]
+        let chains: HashMap<&str, &[_]> = owned_chains
+            .iter()
+            .map(|(name, filters)| (name.as_str(), filters.as_slice()))
+            .collect();
+        #[cfg(feature = "openai-responses")]
+        let request_body_limit = agentic_request_body_cap(config.body_limits.max_request_bytes, budget_policy);
+        #[cfg(not(feature = "openai-responses"))]
+        let request_body_limit = config.body_limits.max_request_bytes;
         let mut pipeline =
-            FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)?;
-        configure_pipeline(&mut pipeline, config, health_registry, kv_stores, subrequest_client)?;
+            FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &config.insecure_options)?;
+        configure_pipeline(
+            &mut pipeline,
+            config,
+            health_registry,
+            kv_stores,
+            inflight_registry,
+            subrequest_client,
+            request_body_limit,
+        )?;
+        #[cfg(feature = "openai-responses")]
+        if let Some(policy) = budget_policy {
+            pipeline.add_pipeline_extension(Box::new(policy));
+        }
         attach(listener, &mut pipeline);
 
         validate_provider_boundary(listener, &entries, &chains)?;
@@ -192,6 +246,300 @@ fn build_listener_pipelines(
     }
 
     Ok(ListenerPipelines::new(pipelines))
+}
+
+/// Clone `registry` and hand it the proxy's shared sub-request `connector` as
+/// its policy connector, so every `policy` filter `build_with_chains`
+/// constructs from the returned registry dials through one runtime's keepalive
+/// pool, admission limit, and circuit breaker instead of opening its own.
+///
+/// Cloning (rather than mutating the caller's registry) keeps the connector
+/// scoped to this build: praxis core's per-runtime `runtime_registry` has the
+/// same shape, and the server sets the connector on its own copy each time it
+/// resolves pipelines.
+fn runtime_registry_with_policy_connector(
+    registry: &FilterRegistry,
+    subrequest_client: &praxis_core::subrequest::SubRequestClient,
+) -> FilterRegistry {
+    let mut runtime = registry.clone();
+    runtime.set_policy_connector(subrequest_client.connector());
+    runtime
+}
+
+/// Prepare the loop budget and IRR response caps before building a listener
+/// pipeline. The integration harness uses this same path as the server.
+///
+/// # Errors
+///
+/// Returns an error for invalid loop configuration or an unbounded loop route.
+#[cfg(feature = "openai-responses")]
+pub fn prepare_agentic_budget_entries(
+    entries: &mut [FilterEntry],
+    chains: &mut HashMap<String, Vec<FilterEntry>>,
+) -> Result<Option<AgenticBudgetPolicy>, Box<dyn std::error::Error + Send + Sync>> {
+    // Scan against a stable snapshot while rewriting both the listener entries
+    // and its named branch chains. The response cap is local to this listener.
+    let original = chains.clone();
+    let original_refs: HashMap<&str, &[_]> = original
+        .iter()
+        .map(|(name, filters)| (name.as_str(), filters.as_slice()))
+        .collect();
+    let policy = agentic_budget_policy(entries, &original_refs)?;
+    if let Some(policy) = policy {
+        cap_agentic_irr_responses(entries, &original_refs, policy)?;
+        for filters in chains.values_mut() {
+            cap_agentic_irr_responses(filters, &original_refs, policy)?;
+        }
+        let rewritten_refs: HashMap<&str, &[_]> = chains
+            .iter()
+            .map(|(name, filters)| (name.as_str(), filters.as_slice()))
+            .collect();
+        validate_agentic_irr_caps(entries, &rewritten_refs, policy)?;
+    }
+    Ok(policy)
+}
+
+/// Clamp the whole listener's raw request-body buffer before any filter sees
+/// a create body. This also constrains other routes on that listener until
+/// core exposes a route-specific transport limit.
+#[cfg(feature = "openai-responses")]
+#[must_use]
+pub fn agentic_request_body_cap(configured: Option<usize>, policy: Option<AgenticBudgetPolicy>) -> Option<usize> {
+    policy.map_or(configured, |policy| {
+        let maximum = policy.max_request_body_bytes();
+        Some(configured.map_or(maximum, |configured| configured.min(maximum)))
+    })
+}
+
+/// Discover nested loop limits at pipeline construction, before the first
+/// request filter can parse or copy a body. Branches are combined by the
+/// smallest reachable limit because their runtime selection is not yet known.
+#[cfg(feature = "openai-responses")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "recursive traversal of nested IRR steps and branch chains"
+)]
+fn agentic_budget_policy(
+    entries: &[FilterEntry],
+    chains: &HashMap<&str, &[FilterEntry]>,
+) -> Result<Option<AgenticBudgetPolicy>, Box<dyn std::error::Error + Send + Sync>> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "recursive traversal of nested IRR steps and branch chains"
+    )]
+    fn visit(
+        entries: &[FilterEntry],
+        chains: &HashMap<&str, &[FilterEntry]>,
+        visited: &mut HashSet<String>,
+        policy: &mut Option<AgenticBudgetPolicy>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for entry in entries {
+            if entry.filter_type == "openai_agentic_loop" {
+                let next = AgenticBudgetPolicy::from_config(&entry.config)?;
+                *policy = Some(policy.map_or(next, |current| current.min(next)));
+            }
+            if entry.filter_type == "iterative_request_router"
+                && let Some(steps) = entry.config.get("steps").and_then(serde_yaml::Value::as_sequence)
+            {
+                for step in steps {
+                    if let Some(filters) = step.get("filters").and_then(serde_yaml::Value::as_sequence) {
+                        let nested: Vec<FilterEntry> = filters
+                            .iter()
+                            .cloned()
+                            .map(serde_yaml::from_value)
+                            .collect::<Result<_, _>>()?;
+                        visit(&nested, chains, visited, policy)?;
+                    }
+                }
+            }
+            if let Some(branches) = &entry.branch_chains {
+                for chain in branches.iter().flat_map(|branch| branch.chains.iter()) {
+                    match chain {
+                        ChainRef::Inline { filters, .. } => visit(filters, chains, visited, policy)?,
+                        ChainRef::Named(name) if visited.insert(name.clone()) => {
+                            if let Some(filters) = chains.get(name.as_str()) {
+                                visit(filters, chains, visited, policy)?;
+                            }
+                        },
+                        ChainRef::Named(_) => {},
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let mut policy = None;
+    visit(entries, chains, &mut HashSet::new(), &mut policy)?;
+    Ok(policy)
+}
+
+/// Lower loop-bearing IRR transport caps before core builds their subpipelines.
+/// Core buffers that response before any AI body hook can reject it.
+#[cfg(feature = "openai-responses")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "rewrites reachable inline and nested IRR configs before core builds them"
+)]
+fn cap_agentic_irr_responses(
+    entries: &mut [FilterEntry],
+    chains: &HashMap<&str, &[FilterEntry]>,
+    policy: AgenticBudgetPolicy,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for entry in entries {
+        if entry.filter_type == "iterative_request_router"
+            && let Some(steps) = entry.config.get("steps").and_then(serde_yaml::Value::as_sequence)
+        {
+            let mut step_entries = Vec::new();
+            for step in steps {
+                if let Some(filters) = step.get("filters").and_then(serde_yaml::Value::as_sequence) {
+                    let parsed: Vec<FilterEntry> = filters
+                        .iter()
+                        .cloned()
+                        .map(serde_yaml::from_value)
+                        .collect::<Result<_, _>>()?;
+                    step_entries.extend(parsed);
+                }
+            }
+            if agentic_budget_policy(&step_entries, chains)?.is_some() {
+                let maximum = policy.max_irr_response_bytes();
+                let configured = configured_irr_response_cap(&entry.config)?;
+                if let Some(mapping) = entry.config.as_mapping_mut() {
+                    mapping.insert(
+                        serde_yaml::Value::String("max_response_bytes".to_owned()),
+                        serde_yaml::to_value(configured.min(maximum))?,
+                    );
+                }
+            }
+            // A step may itself contain an IRR. Rewrite that nested config
+            // before core builds the step's subpipeline.
+            if let Some(steps) = entry
+                .config
+                .get_mut("steps")
+                .and_then(serde_yaml::Value::as_sequence_mut)
+            {
+                for step in steps {
+                    if let Some(filters) = step.get_mut("filters").and_then(serde_yaml::Value::as_sequence_mut) {
+                        for filter in filters {
+                            let mut nested: FilterEntry = serde_yaml::from_value(filter.clone())?;
+                            cap_agentic_irr_responses(std::slice::from_mut(&mut nested), chains, policy)?;
+                            *filter = serde_yaml::to_value(nested)?;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(branches) = &mut entry.branch_chains {
+            for chain in branches.iter_mut().flat_map(|branch| branch.chains.iter_mut()) {
+                if let ChainRef::Inline { filters, .. } = chain {
+                    cap_agentic_irr_responses(filters, chains, policy)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read the effective core IRR response cap while preserving malformed values.
+#[cfg(feature = "openai-responses")]
+fn configured_irr_response_cap(config: &serde_yaml::Value) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    // This is the default in the pinned core IRR. A present invalid value must
+    // retain core's validation error instead of being silently overwritten.
+    const DEFAULT_IRR_RESPONSE_BYTES: usize = 10_485_760;
+    match config.get("max_response_bytes") {
+        None => Ok(DEFAULT_IRR_RESPONSE_BYTES),
+        Some(value) => {
+            let value = value
+                .as_u64()
+                .ok_or("iterative_request_router.max_response_bytes must be a positive integer")?;
+            Ok(usize::try_from(value)?)
+        },
+    }
+}
+
+/// Core 0.7.2 buffers an IRR subresponse before any AI response filter runs.
+/// Require its existing transport cap to fit inside the budget's raw-response
+/// reserve, even when an unrelated IRR on this listener has a larger cap.
+#[cfg(feature = "openai-responses")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "validates the same nested IRR and branch graph as cap preparation"
+)]
+fn validate_agentic_irr_caps(
+    entries: &[FilterEntry],
+    chains: &HashMap<&str, &[FilterEntry]>,
+    policy: AgenticBudgetPolicy,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "walks nested IRR steps and branch chains with cycle protection"
+    )]
+    fn visit(
+        entries: &[FilterEntry],
+        chains: &HashMap<&str, &[FilterEntry]>,
+        visited: &mut HashSet<(String, bool)>,
+        maximum: usize,
+        inside_irr: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for entry in entries {
+            // Only enforce loop placement when the loop can actually be
+            // registered. With `openai-agentic-loop` disabled (but the Responses
+            // budget still active), `openai_agentic_loop` is an unknown filter:
+            // let registration report that rather than pre-empting it with a
+            // placement error here.
+            #[cfg(feature = "openai-agentic-loop")]
+            if entry.filter_type == "openai_agentic_loop" && !inside_irr {
+                return Err("openai_agentic_loop requires a bounded iterative_request_router step".into());
+            }
+            if entry.filter_type == "iterative_request_router"
+                && let Some(steps) = entry.config.get("steps").and_then(serde_yaml::Value::as_sequence)
+            {
+                let mut step_entries = Vec::new();
+                for step in steps {
+                    if let Some(filters) = step.get("filters").and_then(serde_yaml::Value::as_sequence) {
+                        let parsed: Vec<FilterEntry> = filters
+                            .iter()
+                            .cloned()
+                            .map(serde_yaml::from_value)
+                            .collect::<Result<_, _>>()?;
+                        step_entries.extend(parsed);
+                    }
+                }
+                if agentic_budget_policy(&step_entries, chains)?.is_some() {
+                    let cap = configured_irr_response_cap(&entry.config)?;
+                    if cap > maximum {
+                        return Err(format!(
+                            "iterative_request_router with openai_agentic_loop requires max_response_bytes <= {maximum} for the retained-payload budget"
+                        )
+                        .into());
+                    }
+                }
+                visit(&step_entries, chains, visited, maximum, true)?;
+            }
+            if let Some(branches) = &entry.branch_chains {
+                for chain in branches.iter().flat_map(|branch| branch.chains.iter()) {
+                    match chain {
+                        ChainRef::Inline { filters, .. } => visit(filters, chains, visited, maximum, inside_irr)?,
+                        ChainRef::Named(name) if visited.insert((name.clone(), inside_irr)) => {
+                            if let Some(filters) = chains.get(name.as_str()) {
+                                visit(filters, chains, visited, maximum, inside_irr)?;
+                            }
+                        },
+                        ChainRef::Named(_) => {},
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    visit(
+        entries,
+        chains,
+        &mut HashSet::new(),
+        policy.max_irr_response_bytes(),
+        false,
+    )
 }
 
 /// Build the server-owned gate placed before store consumers on a listener
@@ -211,15 +559,21 @@ fn store_readiness_gate_entry() -> FilterEntry {
 
 /// Apply body limits, health registry, KV stores, and insecure options to a
 /// pipeline. Store registries are attached by the caller's `attach` hook.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads config, registries, shared services, and the effective transport cap"
+)]
 fn configure_pipeline(
     pipeline: &mut FilterPipeline,
     config: &Config,
     health_registry: &praxis_core::health::HealthRegistry,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
+    inflight_registry: &praxis_ai_filters::InFlightRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
+    request_body_limit: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     pipeline.apply_body_limits(
-        config.body_limits.max_request_bytes,
+        request_body_limit,
         config.body_limits.max_response_bytes,
         config.insecure_options.allow_unbounded_body,
     )?;
@@ -229,7 +583,7 @@ fn configure_pipeline(
     if !kv_stores.is_empty() {
         pipeline.set_kv_stores(kv_stores.clone());
     }
-    crate::install_pipeline_extensions(pipeline);
+    crate::install_pipeline_extensions(pipeline, inflight_registry);
     pipeline.set_subrequest_client(subrequest_client.clone());
     // Propagate the private-upstream override into the pipeline and its nested
     // callout chains (e.g. `openai_file_resolve`'s and the MCP callouts'
@@ -237,6 +591,9 @@ fn configure_pipeline(
     // every (re)build.
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     pipeline.apply_insecure_options(&config.insecure_options);
+    // Per-filter duration histograms are opt-in; without this the
+    // `metrics.filter_duration` flag would parse but never take effect.
+    pipeline.set_record_filter_duration_metrics(config.metrics.filter_duration);
     Ok(())
 }
 
@@ -444,6 +801,183 @@ mod tests {
     use super::*;
 
     #[test]
+    fn filter_duration_flag_enables_per_filter_histograms() {
+        let yaml = format!("metrics:\n  filter_duration: true\n{VALID_CONFIG_YAML}");
+        let config = Config::from_yaml(&yaml).unwrap();
+        let registry = FilterRegistry::with_builtins();
+        let pipelines = resolve_pipelines(
+            &config,
+            &registry,
+            &empty_health_registry(),
+            &empty_kv_stores(),
+            &empty_inflight_registry(),
+            &test_client(),
+        )
+        .unwrap();
+        assert!(
+            pipelines.get("web").unwrap().load().records_filter_duration_metrics(),
+            "metrics.filter_duration must reach the pipeline"
+        );
+
+        let config = valid_config();
+        let pipelines = resolve_pipelines(
+            &config,
+            &registry,
+            &empty_health_registry(),
+            &empty_kv_stores(),
+            &empty_inflight_registry(),
+            &test_client(),
+        )
+        .unwrap();
+        assert!(
+            !pipelines.get("web").unwrap().load().records_filter_duration_metrics(),
+            "per-filter histograms stay off by default"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "openai-responses")]
+    fn nested_agentic_budget_is_available_before_request_filters() {
+        let entries: Vec<FilterEntry> = serde_yaml::from_str(
+            "
+- filter: openai_responses_format
+- filter: openai_responses_validate
+- filter: iterative_request_router
+  initial_step: inference
+  steps:
+    - name: inference
+      filters:
+        - filter: openai_agentic_loop
+          max_retained_bytes: 8192
+        - filter: openai_agentic_loop
+          max_retained_bytes: 4096
+",
+        )
+        .unwrap();
+        let policy = agentic_budget_policy(&entries, &HashMap::new()).unwrap().unwrap();
+        assert_eq!(policy.max_retained_bytes(), 4096);
+    }
+
+    #[test]
+    #[cfg(feature = "openai-responses")]
+    fn loop_transport_cap_is_lowered_before_core_builds_it() {
+        let mut entries: Vec<FilterEntry> = serde_yaml::from_str(
+            "\n- filter: iterative_request_router\n  initial_step: inference\n  max_response_bytes: 10485760\n  steps:\n    - name: inference\n      filters:\n        - filter: openai_agentic_loop\n          max_retained_bytes: 4096\n",
+        )
+        .unwrap();
+        let policy = agentic_budget_policy(&entries, &HashMap::new()).unwrap().unwrap();
+        cap_agentic_irr_responses(&mut entries, &HashMap::new(), policy).unwrap();
+        validate_agentic_irr_caps(&entries, &HashMap::new(), policy).unwrap();
+        assert_eq!(entries[0].config["max_response_bytes"].as_u64(), Some(512));
+    }
+
+    #[test]
+    #[cfg(feature = "openai-responses")]
+    fn named_branch_irr_receives_the_same_transport_cap() {
+        let mut chains = HashMap::from([(
+            "agentic".to_owned(),
+            serde_yaml::from_str(
+                "- filter: iterative_request_router\n  initial_step: inference\n  steps:\n    - name: inference\n      filters:\n        - filter: openai_agentic_loop\n",
+            )
+            .unwrap(),
+        )]);
+        let mut entries: Vec<FilterEntry> = serde_yaml::from_str(
+            "- filter: request_id\n  branch_chains:\n    - name: go\n      rejoin: terminal\n      chains: [agentic]\n",
+        )
+        .unwrap();
+
+        let policy = prepare_agentic_budget_entries(&mut entries, &mut chains)
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.max_retained_bytes(), 67_108_864);
+        assert_eq!(
+            chains["agentic"][0].config["max_response_bytes"].as_u64(),
+            Some(8_388_608)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "openai-responses")]
+    fn nested_irr_receives_the_same_transport_cap() {
+        let mut entries: Vec<FilterEntry> = serde_yaml::from_str(
+            "- filter: iterative_request_router\n  initial_step: outer\n  steps:\n    - name: outer\n      filters:\n        - filter: iterative_request_router\n          initial_step: inference\n          steps:\n            - name: inference\n              filters:\n                - filter: openai_agentic_loop\n",
+        )
+        .unwrap();
+
+        prepare_agentic_budget_entries(&mut entries, &mut HashMap::new()).unwrap();
+        assert_eq!(entries[0].config["max_response_bytes"].as_u64(), Some(8_388_608));
+        assert_eq!(
+            entries[0].config["steps"][0]["filters"][0]["max_response_bytes"].as_u64(),
+            Some(8_388_608),
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "openai-responses")]
+    fn loop_listener_raw_body_cap_precedes_parsing() {
+        let policy =
+            AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap();
+        assert_eq!(agentic_request_body_cap(Some(10_485_760), Some(policy)), Some(128));
+        assert_eq!(agentic_request_body_cap(None, Some(policy)), Some(128));
+        assert_eq!(agentic_request_body_cap(Some(64), Some(policy)), Some(64));
+        assert_eq!(agentic_request_body_cap(Some(10_485_760), None), Some(10_485_760));
+    }
+
+    #[test]
+    #[cfg(feature = "openai-responses")]
+    fn malformed_loop_transport_cap_is_not_repaired() {
+        let mut entries: Vec<FilterEntry> = serde_yaml::from_str(
+            "\n- filter: iterative_request_router\n  initial_step: inference\n  max_response_bytes: invalid\n  steps:\n    - name: inference\n      filters:\n        - filter: openai_agentic_loop\n",
+        )
+        .unwrap();
+        let policy = agentic_budget_policy(&entries, &HashMap::new()).unwrap().unwrap();
+        assert!(cap_agentic_irr_responses(&mut entries, &HashMap::new(), policy).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "openai-responses")]
+    fn branch_only_agentic_budget_is_discovered_before_branch_consumption() {
+        let config = Config::from_yaml(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: request_id
+        branch_chains:
+          - name: bounded
+            rejoin: terminal
+            chains:
+              - name: bounded-inline
+                filters:
+                  - filter: openai_agentic_loop
+                    max_retained_bytes: 4096
+                  - filter: static_response
+                    status: 200
+      - filter: static_response
+        status: 200
+"#,
+        )
+        .unwrap();
+        let chains: HashMap<&str, &[FilterEntry]> = config
+            .filter_chains
+            .iter()
+            .map(|chain| (chain.name.as_str(), chain.filters.as_slice()))
+            .collect();
+        let entries = &config.filter_chains[0].filters;
+        assert_eq!(
+            agentic_budget_policy(entries, &chains)
+                .unwrap()
+                .unwrap()
+                .max_retained_bytes(),
+            4096,
+        );
+    }
+
+    #[test]
     fn resolve_pipelines_builds_for_each_listener() {
         let config = valid_config();
         let registry = FilterRegistry::with_builtins();
@@ -452,12 +986,84 @@ mod tests {
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         )
         .unwrap();
         assert!(
             pipelines.get("web").is_some(),
             "pipeline should exist for 'web' listener"
+        );
+    }
+
+    #[test]
+    fn build_registry_hands_policy_filters_the_shared_connector() {
+        // Build-time contract for `policy` filters: pipeline construction must
+        // hand the proxy's shared sub-request connector to the registry it
+        // builds filters from, so a `policy` filter's outbound calls (JWKS
+        // fetches, token exchanges) share one runtime's pool rather than each
+        // opening its own. praxis core moved this from a process-global to a
+        // per-registry connector, so the contract is now observable directly on
+        // the build registry instead of through a registered probe filter.
+        let registry = FilterRegistry::with_builtins();
+        assert!(
+            registry.policy_connector().is_none(),
+            "a freshly built registry must not carry a policy connector"
+        );
+
+        let client = test_client();
+        let runtime = runtime_registry_with_policy_connector(&registry, &client);
+
+        let handed = runtime
+            .policy_connector()
+            .expect("pipeline construction must register a policy connector");
+        assert!(
+            std::ptr::eq(handed.connector(), client.connector().connector()),
+            "policy filters must receive the proxy's shared connector"
+        );
+        assert!(
+            registry.policy_connector().is_none(),
+            "cloning must keep the caller's registry free of this build's connector"
+        );
+    }
+
+    #[test]
+    fn resolve_pipelines_does_not_mutate_callers_registry() {
+        // Clone-discipline contract, asserted through the real production entry
+        // point rather than the helper in isolation: `resolve_pipelines` ->
+        // `build_listener_pipelines` hands `build_with_chains` a *cloned* runtime
+        // registry carrying the connector, so the caller's registry must still
+        // have no policy connector after a full build. This catches a regression
+        // that set the connector on the caller's registry (or reordered the clone
+        // so the shared registry is mutated in place) while
+        // `build_registry_hands_policy_filters_the_shared_connector` proves the
+        // cloned registry actually carries it. A built policy filter's own
+        // connector is `pub(super)` in core and cannot be inspected from here, so
+        // the shared-connector contract is asserted at the registry boundary,
+        // exactly as praxis core tests its own `runtime_registry`.
+        let registry = FilterRegistry::with_builtins();
+        assert!(
+            registry.policy_connector().is_none(),
+            "a freshly built registry must not carry a policy connector"
+        );
+
+        let pipelines = resolve_pipelines(
+            &valid_config(),
+            &registry,
+            &empty_health_registry(),
+            &empty_kv_stores(),
+            &empty_inflight_registry(),
+            &test_client(),
+        )
+        .expect("the production build path must succeed");
+        assert!(
+            pipelines.get("web").is_some(),
+            "the build must still produce a pipeline"
+        );
+
+        assert!(
+            registry.policy_connector().is_none(),
+            "resolve_pipelines must build from a clone and never mutate the caller's registry"
         );
     }
 
@@ -502,6 +1108,7 @@ filter_chains:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         )
         .unwrap();
@@ -545,6 +1152,7 @@ insecure_options:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         )
         .unwrap();
@@ -585,6 +1193,7 @@ insecure_options:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         )
         .unwrap();
@@ -654,6 +1263,7 @@ filter_chains:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &client,
         )
         .unwrap();
@@ -692,6 +1302,7 @@ filter_chains:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         );
         assert!(result.is_ok(), "router without LB should be a warning, not an error");
@@ -723,6 +1334,7 @@ filter_chains:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         );
         assert!(result.is_ok(), "skip_pipeline_validation should allow startup");
@@ -903,6 +1515,7 @@ insecure_options:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         );
         assert!(result.is_err(), "misaligned clusters should fail validation");
@@ -946,6 +1559,7 @@ insecure_options:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         );
         assert!(result.is_err(), "open security filter should fail validation");
@@ -990,6 +1604,7 @@ filter_chains:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &test_client(),
         );
         assert!(result.is_ok(), "allow_open_security_filters should permit open ip_acl");
@@ -1000,7 +1615,15 @@ filter_chains:
         let config = valid_config();
         let registry = FilterRegistry::with_builtins();
         let kv = make_kv_registry();
-        let pipelines = resolve_pipelines(&config, &registry, &empty_health_registry(), &kv, &test_client()).unwrap();
+        let pipelines = resolve_pipelines(
+            &config,
+            &registry,
+            &empty_health_registry(),
+            &kv,
+            &empty_inflight_registry(),
+            &test_client(),
+        )
+        .unwrap();
         let pipeline = pipelines.get("web").unwrap().load();
         assert!(pipeline.kv_stores().is_some(), "pipeline should have kv_stores set");
     }
@@ -1010,7 +1633,15 @@ filter_chains:
         let config = valid_config();
         let registry = FilterRegistry::with_builtins();
         let kv = empty_kv_stores();
-        let pipelines = resolve_pipelines(&config, &registry, &empty_health_registry(), &kv, &test_client()).unwrap();
+        let pipelines = resolve_pipelines(
+            &config,
+            &registry,
+            &empty_health_registry(),
+            &kv,
+            &empty_inflight_registry(),
+            &test_client(),
+        )
+        .unwrap();
         let pipeline = pipelines.get("web").unwrap().load();
         assert!(
             pipeline.kv_stores().is_none(),
@@ -1028,6 +1659,7 @@ filter_chains:
             &registry,
             &empty_health_registry(),
             &empty_kv_stores(),
+            &empty_inflight_registry(),
             &client,
         )
         .unwrap();
@@ -1052,6 +1684,11 @@ filter_chains:
         praxis_core::kv::KvStoreRegistry::new()
     }
 
+    /// Throwaway in-flight registry for tests that don't exercise it.
+    fn empty_inflight_registry() -> praxis_ai_filters::InFlightRegistry {
+        praxis_ai_filters::InFlightRegistry::new()
+    }
+
     /// Minimal sub-request client for tests. The connector builds a rustls
     /// config, which needs the process-wide crypto provider first (the binary
     /// installs it at startup; a no-op after the first call).
@@ -1068,9 +1705,7 @@ filter_chains:
     }
 
     /// Minimal valid config with one listener for pipeline tests.
-    fn valid_config() -> Config {
-        Config::from_yaml(
-            r#"
+    const VALID_CONFIG_YAML: &str = r#"
 listeners:
   - name: web
     address: "127.0.0.1:8080"
@@ -1088,9 +1723,10 @@ filter_chains:
             endpoints: ["10.0.0.1:80"]
 insecure_options:
   allow_private_endpoints: true
-"#,
-        )
-        .unwrap()
+"#;
+
+    fn valid_config() -> Config {
+        Config::from_yaml(VALID_CONFIG_YAML).unwrap()
     }
 
     /// Parse one listener and return its resolved top-level filter entries.

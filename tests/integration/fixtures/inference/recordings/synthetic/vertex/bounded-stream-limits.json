@@ -11,7 +11,8 @@
   "normalization": {
     "version": 1,
     "linked_ids": {
-      "chatcmpl-vertex": "chatcmpl-recorded-0001"
+      "chatcmpl-vertex-synthetic-candidate-overflow": "chatcmpl-recorded-0001",
+      "chatcmpl-vertex-synthetic-tool-slot-overflow": "chatcmpl-recorded-0002"
     }
   },
   "turns": [
@@ -162,769 +163,769 @@
             "frames": [
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-0\",\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-0\",\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-1\",\"index\":1,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-1\",\"index\":1,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-2\",\"index\":2,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-2\",\"index\":2,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-3\",\"index\":3,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-3\",\"index\":3,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-4\",\"index\":4,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-4\",\"index\":4,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-5\",\"index\":5,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-5\",\"index\":5,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-6\",\"index\":6,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-6\",\"index\":6,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-7\",\"index\":7,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-7\",\"index\":7,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-8\",\"index\":8,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-8\",\"index\":8,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-9\",\"index\":9,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-9\",\"index\":9,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-10\",\"index\":10,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-10\",\"index\":10,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-11\",\"index\":11,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-11\",\"index\":11,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-12\",\"index\":12,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-12\",\"index\":12,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-13\",\"index\":13,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-13\",\"index\":13,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-14\",\"index\":14,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-14\",\"index\":14,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-15\",\"index\":15,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-15\",\"index\":15,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-16\",\"index\":16,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-16\",\"index\":16,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-17\",\"index\":17,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-17\",\"index\":17,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-18\",\"index\":18,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-18\",\"index\":18,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-19\",\"index\":19,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-19\",\"index\":19,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-20\",\"index\":20,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-20\",\"index\":20,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-21\",\"index\":21,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-21\",\"index\":21,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-22\",\"index\":22,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-22\",\"index\":22,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-23\",\"index\":23,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-23\",\"index\":23,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-24\",\"index\":24,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-24\",\"index\":24,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-25\",\"index\":25,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-25\",\"index\":25,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-26\",\"index\":26,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-26\",\"index\":26,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-27\",\"index\":27,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-27\",\"index\":27,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-28\",\"index\":28,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-28\",\"index\":28,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-29\",\"index\":29,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-29\",\"index\":29,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-30\",\"index\":30,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-30\",\"index\":30,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-31\",\"index\":31,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-31\",\"index\":31,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-32\",\"index\":32,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-32\",\"index\":32,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-33\",\"index\":33,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-33\",\"index\":33,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-34\",\"index\":34,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-34\",\"index\":34,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-35\",\"index\":35,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-35\",\"index\":35,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-36\",\"index\":36,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-36\",\"index\":36,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-37\",\"index\":37,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-37\",\"index\":37,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-38\",\"index\":38,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-38\",\"index\":38,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-39\",\"index\":39,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-39\",\"index\":39,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-40\",\"index\":40,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-40\",\"index\":40,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-41\",\"index\":41,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-41\",\"index\":41,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-42\",\"index\":42,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-42\",\"index\":42,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-43\",\"index\":43,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-43\",\"index\":43,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-44\",\"index\":44,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-44\",\"index\":44,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-45\",\"index\":45,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-45\",\"index\":45,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-46\",\"index\":46,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-46\",\"index\":46,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-47\",\"index\":47,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-47\",\"index\":47,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-48\",\"index\":48,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-48\",\"index\":48,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-49\",\"index\":49,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-49\",\"index\":49,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-50\",\"index\":50,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-50\",\"index\":50,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-51\",\"index\":51,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-51\",\"index\":51,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-52\",\"index\":52,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-52\",\"index\":52,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-53\",\"index\":53,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-53\",\"index\":53,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-54\",\"index\":54,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-54\",\"index\":54,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-55\",\"index\":55,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-55\",\"index\":55,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-56\",\"index\":56,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-56\",\"index\":56,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-57\",\"index\":57,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-57\",\"index\":57,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-58\",\"index\":58,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-58\",\"index\":58,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-59\",\"index\":59,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-59\",\"index\":59,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-60\",\"index\":60,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-60\",\"index\":60,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-61\",\"index\":61,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-61\",\"index\":61,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-62\",\"index\":62,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-62\",\"index\":62,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-63\",\"index\":63,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-63\",\"index\":63,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-64\",\"index\":64,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-64\",\"index\":64,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-65\",\"index\":65,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-65\",\"index\":65,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-66\",\"index\":66,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-66\",\"index\":66,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-67\",\"index\":67,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-67\",\"index\":67,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-68\",\"index\":68,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-68\",\"index\":68,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-69\",\"index\":69,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-69\",\"index\":69,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-70\",\"index\":70,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-70\",\"index\":70,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-71\",\"index\":71,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-71\",\"index\":71,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-72\",\"index\":72,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-72\",\"index\":72,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-73\",\"index\":73,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-73\",\"index\":73,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-74\",\"index\":74,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-74\",\"index\":74,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-75\",\"index\":75,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-75\",\"index\":75,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-76\",\"index\":76,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-76\",\"index\":76,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-77\",\"index\":77,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-77\",\"index\":77,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-78\",\"index\":78,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-78\",\"index\":78,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-79\",\"index\":79,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-79\",\"index\":79,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-80\",\"index\":80,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-80\",\"index\":80,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-81\",\"index\":81,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-81\",\"index\":81,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-82\",\"index\":82,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-82\",\"index\":82,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-83\",\"index\":83,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-83\",\"index\":83,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-84\",\"index\":84,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-84\",\"index\":84,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-85\",\"index\":85,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-85\",\"index\":85,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-86\",\"index\":86,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-86\",\"index\":86,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-87\",\"index\":87,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-87\",\"index\":87,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-88\",\"index\":88,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-88\",\"index\":88,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-89\",\"index\":89,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-89\",\"index\":89,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-90\",\"index\":90,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-90\",\"index\":90,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-91\",\"index\":91,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-91\",\"index\":91,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-92\",\"index\":92,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-92\",\"index\":92,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-93\",\"index\":93,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-93\",\"index\":93,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-94\",\"index\":94,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-94\",\"index\":94,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-95\",\"index\":95,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-95\",\"index\":95,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-96\",\"index\":96,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-96\",\"index\":96,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-97\",\"index\":97,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-97\",\"index\":97,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-98\",\"index\":98,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-98\",\"index\":98,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-99\",\"index\":99,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-99\",\"index\":99,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-100\",\"index\":100,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-100\",\"index\":100,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-101\",\"index\":101,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-101\",\"index\":101,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-102\",\"index\":102,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-102\",\"index\":102,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-103\",\"index\":103,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-103\",\"index\":103,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-104\",\"index\":104,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-104\",\"index\":104,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-105\",\"index\":105,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-105\",\"index\":105,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-106\",\"index\":106,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-106\",\"index\":106,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-107\",\"index\":107,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-107\",\"index\":107,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-108\",\"index\":108,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-108\",\"index\":108,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-109\",\"index\":109,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-109\",\"index\":109,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-110\",\"index\":110,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-110\",\"index\":110,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-111\",\"index\":111,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-111\",\"index\":111,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-112\",\"index\":112,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-112\",\"index\":112,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-113\",\"index\":113,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-113\",\"index\":113,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-114\",\"index\":114,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-114\",\"index\":114,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-115\",\"index\":115,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-115\",\"index\":115,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-116\",\"index\":116,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-116\",\"index\":116,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-117\",\"index\":117,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-117\",\"index\":117,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-118\",\"index\":118,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-118\",\"index\":118,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-119\",\"index\":119,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-119\",\"index\":119,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-120\",\"index\":120,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-120\",\"index\":120,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-121\",\"index\":121,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-121\",\"index\":121,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-122\",\"index\":122,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-122\",\"index\":122,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-123\",\"index\":123,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-123\",\"index\":123,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-124\",\"index\":124,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-124\",\"index\":124,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-125\",\"index\":125,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-125\",\"index\":125,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-126\",\"index\":126,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-126\",\"index\":126,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },
               {
                 "event": null,
-                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-127\",\"index\":127,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0001\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"f\"},\"id\":\"id-127\",\"index\":127,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"synthetic-vertex-model\",\"object\":\"chat.completion.chunk\"}",
                 "id": null,
                 "retry": null
               },

@@ -3,6 +3,10 @@
 
 //! SQL storage backends for praxis-ai: Postgres and Sqlite.
 //!
+//! Internal, unstable implementation crate: unpublished (`publish = false`), a
+//! first-party workspace detail with no external API surface and no semver
+//! promise.
+//!
 //! The concrete [`ResponseStore`] backends, their connection pool, TLS and URL
 //! validation, schema management, and the [`StoreBackendFactory`] provisioning.
 //! This is the only crate that carries the SQL client crypto, so a consumer
@@ -38,12 +42,56 @@ pub use postgres_tls::PgTlsConfig;
 pub(crate) use praxis_ai_store::PoolConfig;
 #[cfg(feature = "_postgres")]
 pub(crate) use praxis_ai_store::SslMode;
+/// Measure work that an append actually adds. Existing item rows are not read
+/// or rebuilt by append-back and therefore do not consume this operation's
+/// allowance again.
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
+fn conversation_append_charge(
+    conversation_id: &str,
+    items: &[ConversationItemRecord],
+    max_charge_bytes: usize,
+) -> Result<usize, StoreError> {
+    let mut charge = json_values_charge(std::iter::empty(), &[conversation_id], max_charge_bytes)?;
+    for item in items {
+        let item_charge = json_values_charge([&item.item_data], &[&item.item_id], max_charge_bytes - charge)?;
+        charge = charge.checked_add(item_charge).ok_or(StoreError::PayloadTooLarge)?;
+    }
+    Ok(charge)
+}
+
+/// Reconstruct the history from a lazy snapshot and ordered item rows.
+///
+/// A snapshot array is authoritative only when the item table has no rows. Once
+/// item rows exist, only the explicitly wrapped legacy prefix is retained.
+#[cfg(any(feature = "sqlite", feature = "_postgres"))]
+fn reconstruct_conversation_history(
+    snapshot: serde_json::Value,
+    mut item_rows: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let prefix = match snapshot {
+        serde_json::Value::Array(messages) if item_rows.is_empty() => return messages,
+        serde_json::Value::Object(mut object) => match object.remove("legacy_messages") {
+            Some(serde_json::Value::Array(messages)) => messages,
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    if prefix.is_empty() {
+        item_rows
+    } else {
+        let mut messages = prefix;
+        messages.append(&mut item_rows);
+        messages
+    }
+}
+
 #[cfg(any(feature = "sqlite", feature = "_postgres"))]
 pub(crate) use praxis_ai_store::compression;
 #[cfg(any(feature = "sqlite", feature = "_postgres"))]
 use praxis_ai_store::{
-    ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-    ResponseEventRecord, ResponseRecord, ResponseStore, StoreError,
+    BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
+    PendingApprovalRecord, ResponseEventRecord, ResponseRecord, ResponseStore, StoreError, json_payload_charge,
+    json_values_charge, json_values_fit, retained_charge,
 };
 #[cfg(any(feature = "sqlite", feature = "_postgres"))]
 pub use provisioning::store_backend_factories;
@@ -71,5 +119,30 @@ pub(crate) fn redact_connection_error(url: &str, message: &str) -> String {
     match rest.split_once('@') {
         Some((_userinfo, after_at)) => format!("{before}://<redacted credentials>@{after_at}"),
         None => format!("{before}://{rest}"),
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+mod tests {
+    #[cfg(any(feature = "sqlite", feature = "_postgres"))]
+    use super::{ConversationItemRecord, conversation_append_charge};
+
+    #[cfg(any(feature = "sqlite", feature = "_postgres"))]
+    #[test]
+    fn append_admission_counts_new_items_without_existing_history() {
+        let owner = praxis_ai_store::StateOwner::from_trusted_parts("tenant", "issuer", "subject").unwrap();
+        let item = ConversationItemRecord {
+            item_id: "new".to_owned(),
+            owner,
+            conversation_id: "conversation".to_owned(),
+            item_data: serde_json::json!({"text": "new turn"}),
+            created_at: 0,
+            position: 0,
+        };
+        let charge = conversation_append_charge("conversation", std::slice::from_ref(&item), 64 * 1024 * 1024).unwrap();
+        assert!(charge < 64 * 1024 * 1024);
+        assert!(conversation_append_charge("conversation", &[item], charge - 1).is_err());
     }
 }

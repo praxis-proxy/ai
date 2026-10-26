@@ -34,6 +34,11 @@ filter_chains:
       - filter: intelligent_route
         overlay_file: /etc/praxis/routing/routing-overlay.json
         model_header: X-Model
+        # Every cluster the load_balancer below declares. The list is
+        # authoritative: pipeline validation checks it against the
+        # load_balancer, and an overlay revision naming any other cluster is
+        # rejected while the previous snapshot keeps serving.
+        clusters: [granite-local, llama-remote]
         reload:
           enabled: true
           debounce_ms: 500

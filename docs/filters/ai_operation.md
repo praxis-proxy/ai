@@ -9,6 +9,6 @@ Classifies supported AI operations from the request head.
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `headers` | OperationHeaders | no | Header names for the classified operation. |
+| `headers` | object | no | Header names for the classified operation. |
 | `headers.application_protocol` | string | no | Header name for the application protocol. `null` disables the header. |
 | `headers.operation` | string | no | Header name for the operation ID. `null` disables the header. |

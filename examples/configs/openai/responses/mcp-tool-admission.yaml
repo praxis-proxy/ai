@@ -1,0 +1,124 @@
+# MCP Tool Metadata Admission and Read-Only Enforcement
+# Requires `--features openai-mcp-tools,store-sqlite` because these filters are opt-in.
+#
+# Demonstrates operator-owned metadata admission and read-only enforcement for
+# the `openai_mcp_tool_resolve` filter (issue #1724).
+#
+# MCP servers supply tool descriptions, schemas, and annotations. In protected
+# mode, operators choose how each configured connector's tools are admitted.
+#
+# ## Advisory vs operator-enforced
+#
+# The standard client selector `allowed_tools.read_only` remains ADVISORY: it
+# filters using the server-supplied `readOnlyHint` and is preserved for API
+# compatibility. It is NOT an operator guarantee. Operator enforcement is
+# configured under `tool_admission` and connector `tool_policy` fields. Client
+# fields cannot override the operator's selected policy.
+#
+# ## Connector policies
+#
+# `tool_admission.mode: protected` turns on operator enforcement. In protected
+# mode:
+#
+#   * A client-selected direct `server_url` is denied. Its tools are excluded
+#     from the model-visible set, and the endpoint is not contacted.
+#   * A configured connector defaults to `tool_policy: deny`, which excludes it
+#     without contact.
+#   * `tool_policy: allow_all` admits every tool from that connector, including
+#     tools that write. The server's readOnlyHint does not restrict admission.
+#   * `tool_policy: read_only` admits only tools with `readOnlyHint: true` from
+#     that connector. Writable, missing, malformed, or contradictory hints are
+#     excluded.
+#
+# The tool service remains responsible for its catalog, authorization, and
+# actual side effects. A read_only policy depends on the service's classification;
+# preventing writes also requires service enforcement or appropriately scoped
+# credentials.
+#
+# ## Declaring a connector
+#
+# Add a connector and choose one policy:
+#
+#   connectors:
+#     - id: trusted_gateway
+#       server_url: https://gateway.internal/mcp
+#       tool_policy: read_only
+#
+# Requests reference it by `connector_id`:
+#   {"type": "mcp", "server_label": "docs", "connector_id": "trusted_gateway"}
+#
+# This example omits a live connector so it stays self-contained; the configured
+# connector path is exercised in the filter's integration tests.
+#
+# ## Example request
+#
+#   # A client-selected direct URL is denied in protected mode; its endpoint is
+#   # not contacted and its advertised readOnlyHint cannot grant access:
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "hi",
+#       "tools": [{"type": "mcp", "server_label": "x", "server_url": "https://unknown.example/mcp"}]
+#     }'
+#
+# ## Enforcement ownership and failure semantics
+#
+# Praxis applies the configured policy during fresh and deferred discovery,
+# cached listing reuse, and restored conversations. It checks the policy again
+# before dispatch, so a model-generated call to an excluded tool is rejected
+# without sending a `tools/call` request. The tool service remains responsible
+# for authorization and actual side effects; a read_only policy depends on its
+# classification, and preventing writes also requires service enforcement or
+# appropriately scoped credentials.
+#
+# Build:
+#   cargo build -p praxis-ai-proxy --features openai-mcp-tools,store-sqlite
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-pipeline]
+
+filter_chains:
+  - name: responses-pipeline
+    filters:
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      - filter: openai_responses_request
+        initialize_state: false
+        on_invalid: continue
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+          mode: x-praxis-responses-mode
+
+      - filter: openai_tool_parse
+
+      - filter: openai_mcp_tool_resolve
+        timeout_ms: 5000
+        # Operator-owned metadata admission. Defaults to advisory; protected mode
+        # enforces each connector's configured tool_policy (default: deny).
+        tool_admission:
+          mode: protected
+
+      - filter: openai_responses_proxy
+        name: inference
+
+      - filter: router
+        routes:
+          - path: "/v1/responses"
+            headers:
+              x-praxis-ai-format: "openai_responses"
+            cluster: "inference-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "inference-backend"
+            endpoints:
+              - "127.0.0.1:3001"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

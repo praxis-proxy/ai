@@ -20,6 +20,8 @@ pub mod gcp;
 pub mod guardrails;
 mod identity_guard;
 pub mod inference;
+pub mod inflight;
+mod llm_metrics;
 pub mod metering;
 #[cfg(feature = "opentelemetry")]
 mod opentelemetry;
@@ -44,7 +46,10 @@ pub use callout::HttpCalloutFilter;
 pub use gcp::GcpAdcFilter;
 pub use guardrails::AiGuardrailsFilter;
 pub use identity_guard::IdentityHeaderGuardFilter;
-pub use inference::{LlmisvcModelProviderResolverFilter, ModelToHeaderFilter};
+pub use inference::{LlmisvcModelProviderResolverFilter, ModelToHeaderFilter, ModelToProviderFilter};
+pub use inflight::InFlightRegistry;
+#[cfg(feature = "inflight-tracker-filter")]
+pub use inflight::InFlightTrackerFilter;
 pub use metering::ExternalMeteringFilter;
 pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, install_pipeline_extensions, register_ai_filters};
@@ -118,6 +123,7 @@ pub(crate) mod test_utils {
             cluster: None,
             current_filter_id: None,
             downstream_tls: false,
+            hedge_policy: None,
             extensions: RequestExtensions::default(),
             executed_filter_indices: Vec::new(),
             executed_branch_filters: Vec::new(),

@@ -33,6 +33,47 @@ wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"
 
+# FIPS crypto-provider drift guard (#1220). The AI proxy routes ALL TLS and
+# hashing through the system OpenSSL libcrypto — rustls runs on the installed
+# `rustls_openssl` CryptoProvider (custom-provider, no bundled backend) and
+# application hashing goes through `apis::hash` (OpenSSL EVP). The pure-Rust
+# backends must never slip back in through a feature, so each pinned provider
+# crate denies the features that would reroute it off OpenSSL. `cargo deny
+# check` runs on every PR (Supply Chain workflow, dependency-check job) and
+# fails if any is enabled; cargo-deny prints the full feature-activation path.
+#
+# This is the feature-level half of the guard. The complementary "no non-OpenSSL
+# crypto backend crate in the FIPS image" check lives in `cargo xtask fips`
+# (xtask/src/fips/graph.rs::DENIED — ring, aws-lc-rs, aws-lc-sys, boring, …),
+# run per-PR via `make lint` (fips-deps) and the FIPS workflow. Together they
+# cover both profiles: cargo-deny the full/superset graph, cargo xtask fips the
+# reduced FIPS graph. The human-readable operation/provider inventory is
+# docs/architecture/cryptographic-inventory.md.
+[[bans.features]]
+crate = "rustls"
+deny = ["ring", "aws_lc_rs", "fips"]
+reason = "rustls must stay on the installed OpenSSL CryptoProvider (custom-provider); its bundled ring/aws-lc-rs backends must never be enabled. The `fips` feature pulls aws-lc-rs' fips build, which is not the validated module here."
+
+[[bans.features]]
+crate = "openssl"
+deny = ["vendored", "aws-lc", "aws-lc-fips", "unstable_boringssl"]
+reason = "EVP must execute in the system libcrypto (OPENSSL_NO_VENDOR=1). `vendored` ships a bundled OpenSSL; `aws-lc`/`aws-lc-fips` reroute openssl-sys onto AWS-LC; `unstable_boringssl` onto BoringSSL — each moves crypto off the validated module."
+
+[[bans.features]]
+crate = "openssl-sys"
+deny = ["vendored", "openssl-src", "aws-lc", "aws-lc-fips", "bssl-sys", "unstable_boringssl"]
+reason = "openssl-sys is the FFI seam to libcrypto; its backend-selecting features must stay off so every EVP call lands in the system OpenSSL. `vendored`/`openssl-src` bundle OpenSSL; `aws-lc`/`aws-lc-fips` link AWS-LC; `bssl-sys`/`unstable_boringssl` link BoringSSL."
+
+[[bans.features]]
+crate = "aws-lc-rs"
+deny = ["fips"]
+reason = "aws-lc-rs runs only JWT signature verification in the full profile; its `fips` feature would pull aws-lc-fips-sys and misrepresent the compliance story (the FIPS module is OpenSSL, not aws-lc-fips)."
+
+[[bans.features]]
+crate = "quixotic-plecostomus-rustls-openssl"
+deny = ["fips"]
+reason = "FIPS is host-activated (docs/fips.md), not a build feature; this crate's `fips` feature is a no-op and must stay unset so the compliance posture is not asserted by the build."
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

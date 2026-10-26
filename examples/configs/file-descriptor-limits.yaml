@@ -9,8 +9,10 @@
 # Usage:
 #   cargo run -p praxis-ai-proxy -- -c examples/configs/file-descriptor-limits.yaml
 
+# The health and metrics endpoints (/healthy, /ready, /metrics) bind here;
+# scrape descriptor gauges and overload counters from /metrics.
 admin:
-  address: "127.0.0.1:9901"
+  metrics_address: "127.0.0.1:9901"
 
 runtime:
   # Soft RLIMIT_NOFILE set at startup, clamped to the hard limit. Leave it

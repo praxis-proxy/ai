@@ -39,6 +39,10 @@ pub use conversations::{
 pub use conversations::{OpenaiConversationsFilter, implementation_openapi_json as conversations_openapi_json};
 pub use files::routes::{FilesOperation, FilesOperationSpec, operation_specs as files_operation_specs};
 pub use operation::OpenAiOperationSpec;
+#[cfg(feature = "openai-responses")]
+pub use responses::AgenticBudgetPolicy;
+#[cfg(feature = "openai-agentic-loop")]
+pub use responses::AgenticLoopFilter;
 #[cfg(feature = "openai-compact")]
 pub use responses::CompactFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
@@ -47,10 +51,10 @@ pub use responses::FileResolveFilter;
 pub use responses::implementation_openapi_json as responses_openapi_json;
 #[cfg(feature = "openai-responses")]
 pub use responses::{
-    AgenticLoopFilter, ClientToolCompatFilter, DocExtractFilter, FileSearchDispatchFilter,
-    OpenaiResponsesRequestFilter, WebSearchDispatchFilter, local_tool_guardrail_messages,
-    record_local_tool_guardrail_failure, responses_proxy::ResponsesProxyFilter,
-    responses_to_chat_completions::ResponsesToChatCompletionsFilter, stream_events::StreamEventsFilter,
+    ClientToolCompatFilter, DocExtractFilter, FileSearchDispatchFilter, OpenaiResponsesRequestFilter,
+    WebSearchDispatchFilter, local_tool_guardrail_messages, record_local_tool_guardrail_failure,
+    responses_proxy::ResponsesProxyFilter, responses_to_chat_completions::ResponsesToChatCompletionsFilter,
+    stream_events::StreamEventsFilter,
 };
 #[cfg(feature = "openai-mcp-tools")]
 pub use responses::{McpDispatchFilter, McpToolResolveFilter};

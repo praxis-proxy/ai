@@ -16,6 +16,7 @@ use praxis_filter::{
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
     parse_filter_config,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, trace, warn};
 
@@ -27,12 +28,19 @@ use super::{
 };
 use crate::{
     is_event_stream_content_type,
-    openai::responses::{bound_body_outcome, state::ResponsesState},
+    openai::responses::{
+        AgenticBudgetPolicy,
+        agentic_loop::budget::input_charge,
+        bound_body_outcome,
+        error::{responses_error_rejection, responses_error_sse_payload},
+        fs_end_stream_with_error_ctx,
+        state::ResponsesState,
+    },
     operation::Transport,
     operation_classifier::AiOperationMatch,
     service::conversations::build_item_records,
     state_owner::{StateOwner, require_state_owner},
-    store::{OwnerScopedResponseStore, ResponseStoreRegistry},
+    store::{OwnerScopedResponseStore, ResponseStoreRegistry, StoreError, json_values_charge},
 };
 
 // -----------------------------------------------------------------------------
@@ -52,7 +60,9 @@ use crate::{
 /// state without buffering SSE. With the default fail-closed policy, it persists
 /// before `response.completed` is released; `failure_mode: open` opts out of that
 /// guarantee. Incomplete or failed streams do not append a turn. The provider
-/// owns history on a direct OpenAI passthrough route.
+/// owns history on a direct OpenAI passthrough route. Place this filter after
+/// `openai_response_store` in the request chain so reverse response hooks append
+/// the conversation turn before storing its successful response.
 ///
 /// # YAML
 ///
@@ -357,12 +367,21 @@ impl OpenaiConversationsFilter {
         conversation_id: &str,
         ctx: &HttpFilterContext<'_>,
         items: Vec<Value>,
+        max_append_charge_bytes: Option<usize>,
     ) -> Result<(), FilterError> {
         let store = resolve_store(ctx, owner)
             .ok_or_else(|| FilterError::from("openai_conversations: store unavailable for append-back"))?;
 
         let handle = tokio::runtime::Handle::current();
-        tokio::task::block_in_place(|| handle.block_on(persist_items(&store, conversation_id, ctx, items)))
+        tokio::task::block_in_place(|| {
+            handle.block_on(persist_items(
+                &store,
+                conversation_id,
+                ctx,
+                items,
+                max_append_charge_bytes,
+            ))
+        })
     }
 }
 
@@ -540,6 +559,10 @@ impl HttpFilter for OpenaiConversationsFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "terminal eligibility, bounded append, and failure handling share one callback"
+    )]
     fn on_response_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -573,10 +596,25 @@ impl HttpFilter for OpenaiConversationsFilter {
             return Ok(FilterAction::Continue);
         };
 
+        if !budgeted_response_is_completed(ctx, body, streaming) {
+            return Ok(FilterAction::Continue);
+        }
+
+        let max_append_charge_bytes = match reserve_budgeted_append(ctx, body) {
+            Ok(limit) => limit,
+            Err(error) if streaming => {
+                return replace_stream_completion_with_error(ctx, body, error.code(), error.message());
+            },
+            Err(error) => return Ok(error.rejection()),
+        };
+
+        // A malformed buffered success body is an extraction failure, not a
+        // no-op: releasing it would report success while dropping the turn
+        // (#950). It propagates here so the failure mode below governs it.
         let items = if streaming {
             extract_streaming_append_back_items(ctx, append_owner)
         } else {
-            extract_append_back_items(ctx, body, append_owner)
+            extract_append_back_items(ctx, body, append_owner)?
         };
         let Some(items) = items else {
             return Ok(FilterAction::Continue);
@@ -589,12 +627,32 @@ impl HttpFilter for OpenaiConversationsFilter {
         // return a clean 500 if headers are unflushed, or reset a committed 2xx.
         // `failure_mode: open` is an explicit operator opt-out of that guarantee:
         // the pipeline logs this error and releases the terminal even though
-        // items were lost. Item insertion and cache rebuild are transactional.
+        // items were lost. Item insertion and any legacy-prefix migration are
+        // transactional.
         if let Some(state) = ctx.get_filter_state_mut::<ConversationResponseState>() {
             state.append_attempted = true;
         }
-        Self::append_items_blocking(&items.owner, &conv_id, ctx, items.all_items)
-            .inspect_err(|e| warn!(error = %e, conversation_id = %conv_id, "conversation append-back failed"))?;
+        if let Err(error) =
+            Self::append_items_blocking(&items.owner, &conv_id, ctx, items.all_items, max_append_charge_bytes)
+        {
+            warn!(error = %error, conversation_id = %conv_id, "conversation append-back failed");
+            if error
+                .downcast_ref::<StoreError>()
+                .is_some_and(|store| matches!(store, StoreError::PayloadTooLarge))
+            {
+                return if streaming {
+                    replace_stream_completion_with_error(
+                        ctx,
+                        body,
+                        AppendBudgetError::Exceeded.code(),
+                        AppendBudgetError::Exceeded.message(),
+                    )
+                } else {
+                    Ok(reject_append_budget())
+                };
+            }
+            return Err(error);
+        }
 
         Ok(FilterAction::Continue)
     }
@@ -628,6 +686,166 @@ fn contains_completed_terminal(body: &Option<Bytes>) -> bool {
         .is_some_and(|chunk| chunk.windows(EVENT_HEADER.len()).any(|window| window == EVENT_HEADER))
 }
 
+/// Inspect only the response status before charging append-only owners. The
+/// stream composer already owns a canonical response; buffered JSON is read
+/// with Serde without materializing the provider's output tree.
+fn budgeted_response_is_completed(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>, streaming: bool) -> bool {
+    #[derive(Deserialize)]
+    struct Status {
+        status: Option<String>,
+    }
+    if ctx.extensions.get::<AgenticBudgetPolicy>().is_none() {
+        return true;
+    }
+    if streaming {
+        return ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.response_object.get("status").and_then(Value::as_str) == Some("completed"));
+    }
+    body.as_deref()
+        .and_then(|bytes| serde_json::from_slice::<Status>(bytes).ok())
+        .is_some_and(|response| response.status.as_deref() == Some("completed"))
+}
+
+/// Reserve the response-side item copies and the complete transactional cache
+/// rebuild before parsing or cloning append-back items. The Store checks the
+/// latter allowance under its append transaction, including concurrent items.
+fn reserve_budgeted_append(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &Option<Bytes>,
+) -> Result<Option<usize>, AppendBudgetError> {
+    if ctx.extensions.get::<AgenticBudgetPolicy>().is_none() {
+        return Ok(None);
+    }
+    let Some(bytes) = body.as_deref() else {
+        return Err(AppendBudgetError::Exceeded);
+    };
+    let current_input_charge = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .ok_or(AppendBudgetError::Missing)
+        .and_then(|state| {
+            json_values_charge(state.input.iter(), &[], usize::MAX)
+                .map_err(|_charge_overflow| AppendBudgetError::Exceeded)
+        })?;
+    let item_charge = input_charge(bytes)
+        .and_then(|charge| charge.checked_add(current_input_charge))
+        .ok_or(AppendBudgetError::Exceeded)?;
+    let budget = ctx
+        .extensions
+        .get_mut::<ResponsesState>()
+        .and_then(|state| state.simple_budget.as_mut())
+        .ok_or(AppendBudgetError::Missing)?;
+    if !budget.reserve_additional_input(item_charge) {
+        return Err(AppendBudgetError::Exceeded);
+    }
+    let cache_allowance = budget.remaining_bytes().ok_or(AppendBudgetError::Exceeded)?;
+    if !budget.reserve_additional_input(cache_allowance) {
+        return Err(AppendBudgetError::Exceeded);
+    }
+    Ok(Some(cache_allowance))
+}
+
+/// Return a client-visible size failure before append-back allocates items.
+fn reject_append_budget() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        413,
+        "invalid_request_error",
+        AppendBudgetError::Exceeded.message(),
+    ))
+}
+
+/// Missing shared state is a pipeline error, not a request-size violation.
+fn reject_missing_append_budget() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        500,
+        "server_error",
+        AppendBudgetError::Missing.message(),
+    ))
+}
+
+/// Why append admission failed before any conversation items were copied.
+enum AppendBudgetError {
+    /// The request-wide ledger cannot admit the append payload.
+    Exceeded,
+    /// A budgeted exchange did not carry its shared ledger into this filter.
+    Missing,
+}
+
+impl AppendBudgetError {
+    /// Return the Responses error code for this failure.
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Exceeded => "invalid_request_error",
+            Self::Missing => "server_error",
+        }
+    }
+
+    /// Return the stable client-facing explanation.
+    fn message(&self) -> &'static str {
+        match self {
+            Self::Exceeded => "Conversation append exceeds a processing limit set by the platform administrator.",
+            Self::Missing => {
+                "Conversation processing is unavailable because of a platform configuration problem. Contact the platform administrator."
+            },
+        }
+    }
+
+    /// Build the HTTP rejection used before response headers commit.
+    fn rejection(&self) -> FilterAction {
+        match self {
+            Self::Exceeded => reject_append_budget(),
+            Self::Missing => reject_missing_append_budget(),
+        }
+    }
+}
+
+/// A completed SSE frame has already passed the inner stream composer. Core
+/// discards response-body `Reject` actions after headers commit, so replace
+/// that unreleased frame with an error before the outer Store hook sees it.
+fn replace_stream_completion_with_error(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    code: &str,
+    message: &str,
+) -> Result<FilterAction, FilterError> {
+    let replaced_events = body.as_deref().map_or(0, |chunk| {
+        chunk
+            .split(|&byte| byte == b'\n')
+            .filter(|line| line.starts_with(b"event: "))
+            .count()
+    });
+    // Release the withheld success frame before allocating the fixed-size
+    // control event. As with stream_events' overflow error, a terminal error
+    // needs no new payload allowance after the request limit has been hit.
+    *body = None;
+    if let Some(state) = ctx.get_filter_state_mut::<ConversationResponseState>() {
+        state.append_attempted = true;
+    }
+    fs_end_stream_with_error_ctx(ctx, code, message);
+    let sequence_number = ctx.extensions.get::<ResponsesState>().map_or(0, |state| {
+        // The composer consumed sequence numbers for every event in the
+        // withheld chunk. Reuse the first so the delivered prefix stays
+        // contiguous even when local tool events shared the terminal chunk.
+        state
+            .logical_stream_sequence
+            .saturating_sub(replaced_events.max(1) as u64)
+    });
+    let mut payload = responses_error_sse_payload(code, message);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("sequence_number".to_owned(), Value::from(sequence_number));
+    }
+    let encoded = serde_json::to_vec(&payload)
+        .map_err(|error| FilterError::from(format!("openai_conversations: encode stream error: {error}")))?;
+    let mut frame = Vec::with_capacity(b"event: error\ndata: \n\n".len() + encoded.len());
+    frame.extend_from_slice(b"event: error\ndata: ");
+    frame.extend_from_slice(&encoded);
+    frame.extend_from_slice(b"\n\n");
+    *body = Some(Bytes::from(frame));
+    Ok(FilterAction::Continue)
+}
+
 // -----------------------------------------------------------------------------
 // Append-Back
 // -----------------------------------------------------------------------------
@@ -643,22 +861,32 @@ struct AppendBackItems {
 }
 
 /// Extract and merge input+output items from the response body for
-/// append-back. Returns `None` when there is nothing to persist.
+/// append-back.
+///
+/// `Ok(None)` is reserved for a well-formed exchange that intentionally has
+/// nothing to persist. A body that cannot be parsed is `Err`, so the caller's
+/// fail-closed path withholds the success instead of dropping the items.
 fn extract_append_back_items(
     ctx: &HttpFilterContext<'_>,
     body: &Option<Bytes>,
     owner: StateOwner,
-) -> Option<AppendBackItems> {
-    let bytes = body.as_ref().filter(|b| !b.is_empty())?;
-    let conv_id = ctx.get_metadata("responses.conversation_id")?.to_owned();
+) -> Result<Option<AppendBackItems>, FilterError> {
+    let Some(bytes) = body.as_ref().filter(|b| !b.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(conv_id) = ctx.get_metadata("responses.conversation_id").map(str::to_owned) else {
+        return Ok(None);
+    };
 
-    let all_items = merge_input_output_items(ctx, bytes)?;
+    let Some(all_items) = merge_input_output_items(ctx, bytes)? else {
+        return Ok(None);
+    };
 
-    Some(AppendBackItems {
+    Ok(Some(AppendBackItems {
         conversation_id: conv_id,
         owner,
         all_items,
-    })
+    }))
 }
 
 /// Use the stream composer's canonical terminal resource. The event bytes stay
@@ -685,23 +913,21 @@ fn extract_streaming_append_back_items(ctx: &HttpFilterContext<'_>, owner: State
     })
 }
 
-/// Parse the response body and combine request input items with
-/// response output items. Returns `None` when both are empty.
-fn merge_input_output_items(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option<Vec<Value>> {
-    let mut response_json: Value = match serde_json::from_slice(bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "conversation append-back: invalid response JSON");
-            return None;
-        },
-    };
+/// Parse the response body and combine request input items with response
+/// output items.
+///
+/// Returns `Ok(None)` when the response is not completed or both item lists
+/// are empty, and `Err` when the body is not valid JSON.
+fn merge_input_output_items(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Result<Option<Vec<Value>>, FilterError> {
+    let mut response_json: Value = serde_json::from_slice(bytes).map_err(|e| {
+        warn!(error = %e, "conversation append-back: invalid response JSON");
+        FilterError::from(format!("conversation append-back: invalid response JSON: {e}"))
+    })?;
 
-    {
-        let status = response_json.get("status").and_then(Value::as_str).unwrap_or_default();
-        if status != "completed" {
-            trace!(status, "conversation append-back skipped (response not completed)");
-            return None;
-        }
+    let status = response_json.get("status").and_then(Value::as_str).unwrap_or_default();
+    if status != "completed" {
+        trace!(status, "conversation append-back skipped (response not completed)");
+        return Ok(None);
     }
 
     let output_items = match response_json.get_mut("output").map(Value::take) {
@@ -716,15 +942,15 @@ fn merge_input_output_items(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option
         .unwrap_or_default();
 
     if input_items.is_empty() && output_items.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let mut all_items = input_items;
     all_items.extend(output_items);
-    Some(all_items)
+    Ok(Some(all_items))
 }
 
-/// Persist items and refresh the denormalized message cache.
+/// Persist items and preserve a cache-only legacy prefix when required.
 ///
 /// Records are built with the handle's bound owner, so the owner-scoped write
 /// path accepts them; a record under any other owner would be rejected.
@@ -733,6 +959,7 @@ async fn persist_items(
     conversation_id: &str,
     ctx: &HttpFilterContext<'_>,
     items: Vec<Value>,
+    max_append_charge_bytes: Option<usize>,
 ) -> Result<(), FilterError> {
     let created_at = handlers::current_timestamp(ctx);
 
@@ -746,10 +973,14 @@ async fn persist_items(
     }
 
     let count = records.len();
-    store
-        .create_items_and_sync_messages(conversation_id, &records)
-        .await
-        .map_err(|e| -> FilterError { Box::new(e) })?;
+    let result = if let Some(limit) = max_append_charge_bytes {
+        store
+            .create_items_and_sync_messages_bounded(conversation_id, &records, limit)
+            .await
+    } else {
+        store.create_items_and_sync_messages(conversation_id, &records).await
+    };
+    result.map_err(|e| -> FilterError { Box::new(e) })?;
 
     debug!(conversation_id, count, "conversation items appended from response");
 

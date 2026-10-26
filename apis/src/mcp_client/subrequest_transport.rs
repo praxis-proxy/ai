@@ -7,7 +7,7 @@
 //! This is the `#957` seam: instead of dialing the MCP server with an inline
 //! `reqwest` client, the [`rmcp`] [`StreamableHttpClient`] adapter here targets
 //! the dynamic MCP URL through praxis's URL-aware target preparation
-//! ([`prepare_url_target`]) and runs the request through a bound outbound
+//! ([`prepare_url_target_with_policy`]) and runs the request through a bound outbound
 //! [`FilteredSubrequestExecutor`] chain. The chain reuses praxis's own SSRF/DNS
 //! validation, TLS/SNI handling, Host binding, deadline, and response-size
 //! guardrails rather than reimplementing them per call.
@@ -30,7 +30,7 @@ use futures::stream::BoxStream;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use praxis_core::{
     config::ChainRef,
-    connectivity::{UrlTargetError, prepare_url_target},
+    connectivity::{UrlResolutionPolicy, UrlTargetError, prepare_url_target_with_policy},
     subrequest::{DEPTH_HEADER, SubRequestClient},
 };
 use praxis_filter::{
@@ -50,8 +50,11 @@ use rmcp::{
 };
 use sse_stream::{Error as SseError, Sse};
 
-use super::{McpClientError, McpDisplayUrl};
-use crate::{StateOwner, callout_target::AddressPolicy};
+use super::{McpBudgetedCallLimits, McpClientError, McpDisplayUrl};
+use crate::{
+    StateOwner, callout_target::AddressPolicy, is_event_stream_content_type,
+    openai::responses::agentic_loop::budget::output_charge,
+};
 
 /// Wire byte ceiling for a control-plane MCP response.
 ///
@@ -550,6 +553,8 @@ pub(crate) struct McpSubrequestClient {
     /// bounded to [`MAX_CONTROL_RESPONSE_BYTES`]; only `tools/call` responses use
     /// this configured, JSON-expansion-adjusted ceiling (see [`Self::response_limit`]).
     tool_result_bytes: usize,
+    /// Optional per-call wire and preparse ceilings from the Responses owner.
+    budgeted_limits: Option<McpBudgetedCallLimits>,
     /// Cumulative wire-byte ceiling for a server-initiated GET SSE stream.
     ///
     /// An intentionally coarse raw-wire `DoS` backstop, not decoded parity: for a
@@ -559,6 +564,12 @@ pub(crate) struct McpSubrequestClient {
     stream_cumulative_cap: usize,
     /// Per-exchange duration ceiling.
     step_timeout: Duration,
+    /// DNS resolution policy for the dial target, chosen by the target's
+    /// provenance: [`UrlResolutionPolicy::OperatorCached`] for an operator-
+    /// configured connector, [`UrlResolutionPolicy::ClientPerCall`] for a
+    /// client-selected `server_url` so a client cannot prime or probe the
+    /// shared operator DNS cache.
+    resolution_policy: UrlResolutionPolicy,
     /// Trusted owner projected only for configured connector exchanges.
     owner: Option<StateOwner>,
     /// Replaceable out-of-band record of a typed classification observed on a
@@ -581,14 +592,36 @@ impl McpSubrequestClient {
     ///
     /// No `tools/call` result flows over this transport, so every response is
     /// bounded to [`MAX_CONTROL_RESPONSE_BYTES`] before deserialization.
-    pub(crate) fn control(callout: McpCallout, step_timeout: Duration, owner: Option<StateOwner>) -> Self {
+    pub(crate) fn control(
+        callout: McpCallout,
+        step_timeout: Duration,
+        resolution_policy: UrlResolutionPolicy,
+        owner: Option<StateOwner>,
+    ) -> Self {
         Self::with_wire_cap(
             callout,
             step_timeout,
             MAX_CONTROL_RESPONSE_BYTES,
             crate::mcp_client::MAX_LISTING_RESPONSE_BYTES.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+            resolution_policy,
             owner,
         )
+    }
+
+    /// Use a fresh control session whose wire and parser limits were reserved
+    /// by the owning Responses request before MCP discovery starts.
+    pub(crate) fn control_with_budget(
+        callout: McpCallout,
+        step_timeout: Duration,
+        resolution_policy: UrlResolutionPolicy,
+        owner: Option<StateOwner>,
+        limits: McpBudgetedCallLimits,
+    ) -> Self {
+        let mut client = Self::control(callout, step_timeout, resolution_policy, owner);
+        client.tool_result_bytes = client.tool_result_bytes.min(limits.wire_limit);
+        client.stream_cumulative_cap = client.stream_cumulative_cap.min(limits.wire_limit);
+        client.budgeted_limits = Some(limits);
+        client
     }
 
     /// Build a client for
@@ -600,36 +633,68 @@ impl McpSubrequestClient {
     /// `step_timeout` bounds each individual HTTP exchange; the `callout` carries
     /// the parent transport and the bound outbound pipeline whose finalized
     /// posture decides whether loopback destinations are permitted.
+    #[cfg(test)]
     pub(crate) fn for_tool(
         callout: McpCallout,
         step_timeout: Duration,
         max_result_bytes: usize,
+        resolution_policy: UrlResolutionPolicy,
+        owner: Option<StateOwner>,
+    ) -> Self {
+        Self::for_tool_with_budget(callout, step_timeout, max_result_bytes, resolution_policy, None, owner)
+    }
+
+    /// Build a tool transport with a request-wide budgeted preparse ceiling.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "budgeted tool transport threads callout, timeout, result cap, policy, limits, and owner"
+    )]
+    pub(crate) fn for_tool_with_budget(
+        callout: McpCallout,
+        step_timeout: Duration,
+        max_result_bytes: usize,
+        resolution_policy: UrlResolutionPolicy,
+        budgeted_limits: Option<McpBudgetedCallLimits>,
         owner: Option<StateOwner>,
     ) -> Self {
         let wire = tool_result_wire_cap(max_result_bytes);
-        Self::with_wire_cap(
+        let mut client = Self::with_wire_cap(
             callout,
             step_timeout,
             wire,
             wire.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+            resolution_policy,
             owner,
-        )
+        );
+        if let Some(limits) = budgeted_limits {
+            client.tool_result_bytes = client.tool_result_bytes.min(limits.wire_limit);
+            client.stream_cumulative_cap = client.stream_cumulative_cap.min(limits.wire_limit);
+            client.budgeted_limits = Some(limits);
+        }
+        client
     }
 
     /// Shared constructor: move in the callout and pin the `tools/call` wire
     /// ceiling.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor threads the callout, both byte ceilings, the target's resolution policy, and the optional state owner"
+    )]
     fn with_wire_cap(
         callout: McpCallout,
         step_timeout: Duration,
         tool_result_bytes: usize,
         stream_cumulative_cap: usize,
+        resolution_policy: UrlResolutionPolicy,
         owner: Option<StateOwner>,
     ) -> Self {
         Self {
             callout,
             tool_result_bytes,
+            budgeted_limits: None,
             step_timeout,
             stream_cumulative_cap,
+            resolution_policy,
             owner,
             signal_state: Arc::new(TransportSignalState::new()),
         }
@@ -674,8 +739,28 @@ impl McpSubrequestClient {
             ClientJsonRpcMessage::Request(request) if matches!(request.request, ClientRequest::CallToolRequest(_)) => {
                 self.tool_result_bytes
             },
-            _ => MAX_CONTROL_RESPONSE_BYTES,
+            _ => self.control_response_limit(),
         }
+    }
+
+    /// Shared control-plane bound for POST replies and session DELETE cleanup.
+    fn control_response_limit(&self) -> usize {
+        self.budgeted_limits.map_or(MAX_CONTROL_RESPONSE_BYTES, |limits| {
+            MAX_CONTROL_RESPONSE_BYTES.min(limits.wire_limit)
+        })
+    }
+
+    /// Reject compact JSON trees before rmcp allocates parsed nodes.
+    fn admit_json_parse(
+        &self,
+        bytes: &[u8],
+        signal: &Arc<OnceLock<TransportSignal>>,
+    ) -> Result<(), StreamableHttpError<McpTransportError>> {
+        admit_json_parse_charge(
+            bytes,
+            self.budgeted_limits.map(|limits| limits.parse_charge_limit),
+            signal,
+        )
     }
 
     /// Prepare and validate the dial for `uri` — SSRF/DNS validation, upstream
@@ -703,7 +788,14 @@ impl McpSubrequestClient {
     > {
         let deadline = self.callout.deadline(Instant::now(), self.step_timeout);
         let allow_private = self.callout.allow_private;
-        let target = match prepare_url_target(uri, deadline, move |addrs| ssrf_validate(addrs, allow_private)).await {
+        let target = match prepare_url_target_with_policy(
+            uri,
+            deadline,
+            move |addrs| ssrf_validate(addrs, allow_private),
+            self.resolution_policy,
+        )
+        .await
+        {
             Ok(target) => target,
             Err(error) => {
                 if let Some(classification) = prepare_error_signal(&error) {
@@ -754,7 +846,7 @@ impl McpSubrequestClient {
     /// Prepare, validate, and dial `uri`, returning the buffered response.
     ///
     /// SSRF/DNS validation, TLS/SNI, Host binding, and the response-size ceiling
-    /// are enforced by [`prepare_url_target`] and the executor.
+    /// are enforced by [`prepare_url_target_with_policy`] and the executor.
     #[expect(clippy::large_stack_frames, reason = "rmcp/executor futures are inherently large")]
     #[expect(
         clippy::too_many_arguments,
@@ -907,7 +999,7 @@ impl McpSubrequestClient {
             return Err(StreamableHttpError::ServerDoesNotSupportSse);
         };
 
-        Ok(crate::mcp_client::sse_adapter::sse_stream_from_body(
+        Ok(crate::mcp_client::sse_adapter::sse_stream_from_body_with_budget(
             body,
             self.wire_cap(),
             self.stream_cumulative_cap(),
@@ -916,6 +1008,7 @@ impl McpSubrequestClient {
             // can never clamp the authoritative per-event bound below `wire_cap()`.
             max_sse_event_size.max(self.wire_cap()),
             signal,
+            self.budgeted_limits.map(|limits| limits.parse_charge_limit),
         ))
     }
 
@@ -1027,7 +1120,11 @@ impl McpSubrequestClient {
             // spurious 413 (see collect_capped). Exactly one of the two branches
             // cancels the body.
             if content_type.as_deref().is_some_and(is_json_content_type) {
-                if let Some(bytes) = collect_capped(&mut body, MAX_CONTROL_RESPONSE_BYTES).await
+                if let Some(bytes) = collect_capped(&mut body, MAX_CONTROL_RESPONSE_BYTES.min(per_event_cap)).await
+                    && error_body_fits_parse_charge(
+                        &bytes,
+                        self.budgeted_limits.map(|limits| limits.parse_charge_limit),
+                    )
                     && let Some(message) = parse_json_rpc_error(&String::from_utf8_lossy(&bytes))
                 {
                     return Ok(StreamableHttpPostResponse::Json(message, session_id_out));
@@ -1042,7 +1139,7 @@ impl McpSubrequestClient {
 
         match content_type.as_deref() {
             Some(ct) if is_event_stream_content_type(ct) => {
-                let sse = crate::mcp_client::sse_adapter::sse_stream_from_body(
+                let sse = crate::mcp_client::sse_adapter::sse_stream_from_body_with_budget(
                     body,
                     per_event_cap,
                     per_event_cap, // POST cumulative == per-message ceiling (F3: both from response_limit)
@@ -1050,6 +1147,7 @@ impl McpSubrequestClient {
                     // the per-message cap so it never clamps the per-event bound below it.
                     max_sse_event_size.max(per_event_cap),
                     Arc::clone(&signal).into(),
+                    self.budgeted_limits.map(|limits| limits.parse_charge_limit),
                 );
                 Ok(StreamableHttpPostResponse::Sse(sse, session_id_out))
             },
@@ -1060,6 +1158,7 @@ impl McpSubrequestClient {
                 // unparseable body is a typed UnexpectedServerResponse, never an
                 // Accepted ack (which is reserved for one-way messages).
                 let buffered = collect_body(&mut body, per_event_cap, &signal).await?;
+                self.admit_json_parse(&buffered, &signal)?;
                 match serde_json::from_slice::<ServerJsonRpcMessage>(&buffered) {
                     Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id_out)),
                     Err(_error) => Err(StreamableHttpError::UnexpectedServerResponse(
@@ -1101,7 +1200,13 @@ impl StreamableHttpClient for McpSubrequestClient {
             &signal,
         ))
         .await?;
-        classify_buffered_post_response(response, &message, session_was_attached)
+        classify_buffered_post_response(
+            response,
+            &message,
+            session_was_attached,
+            self.budgeted_limits.map(|limits| limits.parse_charge_limit),
+            &signal,
+        )
     }
 
     async fn delete_session(
@@ -1122,7 +1227,7 @@ impl StreamableHttpClient for McpSubrequestClient {
             &uri,
             Bytes::new(),
             headers,
-            MAX_CONTROL_RESPONSE_BYTES,
+            self.control_response_limit(),
             &signal,
         ))
         .await?;
@@ -1240,7 +1345,13 @@ impl StreamableHttpClient for McpSubrequestClient {
             .await?;
         match maybe_body {
             // Blocker 5: praxis buffered anyway; classify the full buffered response.
-            None => classify_buffered_post_response(response, &message, session_was_attached),
+            None => classify_buffered_post_response(
+                response,
+                &message,
+                session_was_attached,
+                self.budgeted_limits.map(|limits| limits.parse_charge_limit),
+                &signal,
+            ),
             Some(streaming_body) => {
                 self.classify_streaming_post_response(
                     response,
@@ -1260,6 +1371,35 @@ impl StreamableHttpClient for McpSubrequestClient {
 // Helpers
 // -----------------------------------------------------------------------------
 
+/// Reject a JSON payload before rmcp builds its object tree.
+fn admit_json_parse_charge(
+    bytes: &[u8],
+    parse_charge_limit: Option<usize>,
+    signal: &Arc<OnceLock<TransportSignal>>,
+) -> Result<(), StreamableHttpError<McpTransportError>> {
+    if let Some(limit) = parse_charge_limit
+        && output_charge(bytes).is_none_or(|charge| charge > limit)
+    {
+        signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit });
+        return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
+    }
+    Ok(())
+}
+
+/// Whether a non-2xx error body is small enough to attempt JSON-RPC error
+/// parsing under the budgeted parse-charge limit.
+///
+/// Unlike [`admit_json_parse_charge`], a body over the limit is NOT a 413 and
+/// records NO size signal: an oversize (or `output_charge`-incomputable) error
+/// body is simply left unparsed so the response falls back to its upstream HTTP
+/// status, rather than masking that status with a spurious `ResponseTooLarge`.
+fn error_body_fits_parse_charge(bytes: &[u8], parse_charge_limit: Option<usize>) -> bool {
+    match parse_charge_limit {
+        Some(limit) => output_charge(bytes).is_some_and(|charge| charge <= limit),
+        None => true,
+    }
+}
+
 /// Classify a fully buffered POST response into an rmcp post response.
 /// Verbatim the ladder previously inlined in `post_message`.
 #[expect(
@@ -1274,6 +1414,8 @@ fn classify_buffered_post_response(
     response: SubResponse,
     message: &ClientJsonRpcMessage,
     session_was_attached: bool,
+    parse_charge_limit: Option<usize>,
+    signal: &Arc<OnceLock<TransportSignal>>,
 ) -> Result<StreamableHttpPostResponse, StreamableHttpError<McpTransportError>> {
     let status = StatusCode::from_u16(response.status)
         .map_err(|_error| StreamableHttpError::Client(McpTransportError::InvalidStatus))?;
@@ -1320,7 +1462,13 @@ fn classify_buffered_post_response(
     }
 
     if !status.is_success() {
-        if content_type.as_deref().is_some_and(is_json_content_type) {
+        // Unlike the success drain, a non-2xx error body never records a size
+        // signal or 413s: when it exceeds the parse-charge limit it is left
+        // unparsed and the response falls back to its HTTP status (mirrors the
+        // streaming arm).
+        if content_type.as_deref().is_some_and(is_json_content_type)
+            && error_body_fits_parse_charge(&response.body, parse_charge_limit)
+        {
             let body = String::from_utf8_lossy(&response.body);
             if let Some(message) = parse_json_rpc_error(&body) {
                 return Ok(StreamableHttpPostResponse::Json(message, session_id_out));
@@ -1333,7 +1481,7 @@ fn classify_buffered_post_response(
 
     match content_type.as_deref() {
         Some(content_type) if is_event_stream_content_type(content_type) => {
-            match parse_buffered_sse_terminal(&response.body) {
+            match parse_buffered_sse_terminal(&response.body, parse_charge_limit, signal)? {
                 Some(message) => Ok(StreamableHttpPostResponse::Json(message, session_id_out)),
                 None => Err(StreamableHttpError::UnexpectedServerResponse(
                     "buffered SSE stream contained no JSON-RPC message".into(),
@@ -1341,6 +1489,7 @@ fn classify_buffered_post_response(
             }
         },
         Some(content_type) if is_json_content_type(content_type) => {
+            admit_json_parse_charge(&response.body, parse_charge_limit, signal)?;
             match serde_json::from_slice::<ServerJsonRpcMessage>(&response.body) {
                 Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id_out)),
                 // A Request always needs a reply; an unparseable body is a typed
@@ -1364,7 +1513,8 @@ async fn drain_body(body: &mut Box<dyn StreamingResponseBody>) {
 /// Collect a streaming body into a single `Bytes` buffer, failing closed.
 ///
 /// Accumulates chunks into one bounded [`bytes::BytesMut`] and enforces a local
-/// byte `cap`. On overflow (`buf.len() > cap`) the size signal is recorded into
+/// byte `cap`. A chunk that would exceed it is rejected before being copied.
+/// On overflow the size signal is recorded into
 /// `signal` (first wins) so the typed 413 survives rmcp's opaque error mapping,
 /// the body is cancelled, and a typed [`McpTransportError::ResponseTooLarge`] is
 /// returned — never the truncated buffer.
@@ -1386,12 +1536,12 @@ async fn collect_body(
     loop {
         match body.next_chunk().await {
             Ok(Some(chunk)) => {
-                buf.extend_from_slice(&chunk);
-                if buf.len() > cap {
+                if buf.len().checked_add(chunk.len()).is_none_or(|total| total > cap) {
                     signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap });
                     body.cancel().await;
                     return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
                 }
+                buf.extend_from_slice(&chunk);
             },
             Ok(None) => {
                 body.cancel().await;
@@ -1417,7 +1567,7 @@ async fn collect_body(
 /// Distinct from [`collect_body`] on purpose: on the error path an oversize or
 /// truncated body must NOT surface as a 413. This helper takes no signal handle —
 /// so it structurally cannot record [`TransportSignal::ResponseTooLarge`] — and
-/// returns [`None`] on overflow (`buf.len() > cap`) or a `next_chunk()` error,
+/// returns [`None`] before copying an overflowing chunk or on a `next_chunk()` error,
 /// letting the caller fall back to the true HTTP status. The body is cancelled in
 /// every case; a clean EOF within `cap` returns `Some(bytes)`.
 async fn collect_capped(body: &mut Box<dyn StreamingResponseBody>, cap: usize) -> Option<Bytes> {
@@ -1425,11 +1575,11 @@ async fn collect_capped(body: &mut Box<dyn StreamingResponseBody>, cap: usize) -
     loop {
         match body.next_chunk().await {
             Ok(Some(chunk)) => {
-                buf.extend_from_slice(&chunk);
-                if buf.len() > cap {
+                if buf.len().checked_add(chunk.len()).is_none_or(|total| total > cap) {
                     body.cancel().await;
                     return None;
                 }
+                buf.extend_from_slice(&chunk);
             },
             Ok(None) => {
                 body.cancel().await;
@@ -1536,9 +1686,9 @@ pub(crate) fn transport_signal_error(
 ///
 /// On a cache miss the resolved addresses are validated during the actual
 /// callout by [`McpSubrequestClient::execute`] (which runs the same
-/// [`prepare_url_target`] + [`ssrf_validate`] pair), so this is the *only* extra
+/// [`prepare_url_target_with_policy`] + [`ssrf_validate`] pair), so this is the *only* extra
 /// DNS resolution the resolver performs — and only when a cached listing lets it
-/// skip the dial entirely. Reusing [`prepare_url_target`] makes a cache hit
+/// skip the dial entirely. Reusing [`prepare_url_target_with_policy`] makes a cache hit
 /// enforce exactly the policy a live callout would: scheme/userinfo/fragment
 /// rejection, DNS resolution, and the [`ssrf_validate`] address hook.
 ///
@@ -1555,18 +1705,42 @@ pub(crate) async fn validate_mcp_target(
     url: &str,
     timeout: Duration,
     allow_private: bool,
+    resolution_policy: UrlResolutionPolicy,
 ) -> Result<(), McpClientError> {
     let display_url = super::parse_display_url(url);
     let Some(deadline) = Instant::now().checked_add(timeout) else {
         return Err(McpClientError::Connection { url: display_url });
     };
-    match prepare_url_target(url, deadline, move |addrs| ssrf_validate(addrs, allow_private)).await {
+    match prepare_url_target_with_policy(
+        url,
+        deadline,
+        move |addrs| ssrf_validate(addrs, allow_private),
+        resolution_policy,
+    )
+    .await
+    {
         Ok(_target) => Ok(()),
         Err(error) => Err(classify_prepare_error(&error, display_url)),
     }
 }
 
-/// Classify a [`prepare_url_target`] failure into the caller-facing
+/// Select the DNS resolution policy for an MCP dial target by its provenance.
+///
+/// An operator-configured connector (`connector_id` present in the request's MCP
+/// tool entry) targets an operator-managed host, so it resolves through the
+/// shared DNS cache ([`UrlResolutionPolicy::OperatorCached`]). A client-selected
+/// `server_url` resolves per call ([`UrlResolutionPolicy::ClientPerCall`]) so a
+/// client cannot prime or probe the operator cache with a hostname it chose.
+#[must_use]
+pub(crate) fn mcp_resolution_policy(is_connector: bool) -> UrlResolutionPolicy {
+    if is_connector {
+        UrlResolutionPolicy::OperatorCached
+    } else {
+        UrlResolutionPolicy::ClientPerCall
+    }
+}
+
+/// Classify a [`prepare_url_target_with_policy`] failure into the caller-facing
 /// [`McpClientError`], distinguishing permanent target rejections that must fail
 /// hard from transient dial-time failures.
 ///
@@ -1591,7 +1765,7 @@ fn classify_prepare_error(error: &UrlTargetError, url: McpDisplayUrl) -> McpClie
     }
 }
 
-/// Record the out-of-band [`TransportSignal`] for a [`prepare_url_target`]
+/// Record the out-of-band [`TransportSignal`] for a [`prepare_url_target_with_policy`]
 /// failure, if the failure is a permanent hard rejection.
 ///
 /// Mirrors the permanent/transient split in [`classify_prepare_error`]: an SSRF
@@ -1636,12 +1810,12 @@ fn map_prepare_error(error: &UrlTargetError) -> StreamableHttpError<McpTransport
 
 /// Whether a `Content-Type` value denotes JSON.
 fn is_json_content_type(value: &str) -> bool {
-    value.trim_start().starts_with("application/json")
-}
-
-/// Whether a `Content-Type` value denotes an SSE event stream.
-fn is_event_stream_content_type(value: &str) -> bool {
-    value.trim_start().starts_with("text/event-stream")
+    value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("application/json")
 }
 
 /// Parse a JSON-RPC error message from a response body, if it is one.
@@ -1686,19 +1860,26 @@ fn sse_data_events(text: &str) -> Vec<String> {
 ///
 /// Returns the first `Response`/`Error` message (the terminal answer for a
 /// request/response exchange), falling back to the last parseable message.
-fn parse_buffered_sse_terminal(body: &[u8]) -> Option<ServerJsonRpcMessage> {
-    let text = std::str::from_utf8(body).ok()?;
+fn parse_buffered_sse_terminal(
+    body: &[u8],
+    parse_charge_limit: Option<usize>,
+    signal: &Arc<OnceLock<TransportSignal>>,
+) -> Result<Option<ServerJsonRpcMessage>, StreamableHttpError<McpTransportError>> {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Ok(None);
+    };
     let mut last = None;
     for data in sse_data_events(text) {
+        admit_json_parse_charge(data.as_bytes(), parse_charge_limit, signal)?;
         let Ok(message) = serde_json::from_str::<ServerJsonRpcMessage>(&data) else {
             continue;
         };
         if matches!(message, JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_)) {
-            return Some(message);
+            return Ok(Some(message));
         }
         last = Some(message);
     }
-    last
+    Ok(last)
 }
 
 // -----------------------------------------------------------------------------
@@ -1725,6 +1906,18 @@ mod tests {
 
     fn test_signal() -> Arc<OnceLock<TransportSignal>> {
         Arc::new(OnceLock::new())
+    }
+
+    #[test]
+    fn mcp_resolution_policy_follows_target_provenance() {
+        assert!(
+            matches!(mcp_resolution_policy(true), UrlResolutionPolicy::OperatorCached),
+            "an operator-configured connector must resolve through the shared cache"
+        );
+        assert!(
+            matches!(mcp_resolution_policy(false), UrlResolutionPolicy::ClientPerCall),
+            "a client-selected server_url must resolve per call, not through the operator cache"
+        );
     }
 
     #[test]
@@ -1826,33 +2019,87 @@ mod tests {
             "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n",
             "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
         );
-        let message = parse_buffered_sse_terminal(body.as_bytes()).expect("terminal response");
+        let message = parse_buffered_sse_terminal(body.as_bytes(), None, &test_signal())
+            .expect("valid SSE")
+            .expect("terminal response");
         assert!(matches!(message, JsonRpcMessage::Response(_)));
     }
 
     #[test]
     fn parse_buffered_sse_terminal_returns_error_message_as_terminal() {
         let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"boom\"}}\n\n";
-        let message = parse_buffered_sse_terminal(body.as_bytes()).expect("terminal error");
+        let message = parse_buffered_sse_terminal(body.as_bytes(), None, &test_signal())
+            .expect("valid SSE")
+            .expect("terminal error");
         assert!(matches!(message, JsonRpcMessage::Error(_)));
     }
 
     #[test]
     fn parse_buffered_sse_terminal_without_json_is_none() {
-        assert!(parse_buffered_sse_terminal(b"data: not-json\n\n").is_none());
-        assert!(parse_buffered_sse_terminal(b"").is_none());
+        assert!(
+            parse_buffered_sse_terminal(b"data: not-json\n\n", None, &test_signal())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_buffered_sse_terminal(b"", None, &test_signal())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn buffered_sse_checks_data_structure_even_when_comment_masks_raw_scan() {
+        let payload = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"values\":[{}]}}}}",
+            vec!["0"; 100].join(",")
+        );
+        let body = format!(": \"\n\ndata: {payload}\n\n");
+        let limit = output_charge(body.as_bytes()).unwrap();
+        assert!(output_charge(payload.as_bytes()).unwrap() > limit);
+        let signal = test_signal();
+        assert!(matches!(
+            parse_buffered_sse_terminal(body.as_bytes(), Some(limit), &signal),
+            Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+        ));
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: actual }) if *actual == limit
+        ));
     }
 
     // -- Content-type classification -------------------------------------------
 
+    /// [RFC 9110 Section 8.3.1] defines media types as case-insensitive
+    /// type/subtype tokens.
+    ///
+    /// [RFC 9110 Section 8.3.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-8.3.1
     #[test]
-    fn content_type_classification_tolerates_parameters_and_whitespace() {
-        assert!(is_json_content_type("application/json"));
-        assert!(is_json_content_type(" application/json; charset=utf-8"));
-        assert!(!is_json_content_type("text/event-stream"));
-        assert!(is_event_stream_content_type("text/event-stream"));
-        assert!(is_event_stream_content_type(" text/event-stream; charset=utf-8"));
-        assert!(!is_event_stream_content_type("application/json"));
+    fn content_type_classification_is_case_insensitive_and_exact() {
+        for value in [
+            "application/json",
+            " Application/JSON; charset=utf-8",
+            "application/json ; charset=utf-8",
+        ] {
+            assert!(is_json_content_type(value), "expected JSON media type: {value}");
+        }
+        for value in ["application/jsonp", "application/json-patch+json", "text/event-stream"] {
+            assert!(!is_json_content_type(value), "expected non-JSON media type: {value}");
+        }
+
+        for value in [
+            "text/event-stream",
+            " Text/Event-Stream; charset=utf-8",
+            "text/event-stream ; charset=utf-8",
+        ] {
+            assert!(is_event_stream_content_type(value), "expected SSE media type: {value}");
+        }
+        for value in ["text/event-streamish", "text/event-stream+json", "application/json"] {
+            assert!(
+                !is_event_stream_content_type(value),
+                "expected non-SSE media type: {value}"
+            );
+        }
     }
 
     // -- Response-limit tiers (codex finding: response-limit regressions) -------
@@ -1879,6 +2126,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
             2048,
+            UrlResolutionPolicy::OperatorCached,
             None,
         );
         let call: ClientJsonRpcMessage = serde_json::from_str(
@@ -1894,10 +2142,89 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "control cap and structural preparse share one transport probe"
+    )]
+    fn budgeted_tool_transport_caps_control_and_rejects_sparse_json_before_parse() {
+        let limits = McpBudgetedCallLimits {
+            wire_limit: 1_024,
+            parse_charge_limit: 32_768,
+        };
+        let client = McpSubrequestClient::for_tool_with_budget(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(5),
+            2_048,
+            UrlResolutionPolicy::OperatorCached,
+            Some(limits),
+            None,
+        );
+        let call: ClientJsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
+        )
+        .expect("deserialize tools/call");
+        let initialize: ClientJsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
+        )
+        .expect("deserialize initialize");
+        assert_eq!(client.response_limit(&call), limits.wire_limit);
+        assert_eq!(client.response_limit(&initialize), limits.wire_limit);
+
+        let signal = test_signal();
+        assert!(client.admit_json_parse(br#"{"result":"ok"}"#, &signal).is_ok());
+        let sparse = format!("[{}0]", "0,".repeat(100));
+        assert!(matches!(
+            client.admit_json_parse(sparse.as_bytes(), &signal),
+            Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+        ));
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 32_768 })
+        ));
+    }
+
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "end-to-end budgeted DELETE wire-cap assertion")]
+    async fn budgeted_delete_response_uses_reserved_control_wire_cap() {
+        let router = axum::Router::new().route("/mcp", axum::routing::delete(|| async { vec![b'x'; 2_048] }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let uri: Arc<str> = format!("http://{}/mcp", listener.local_addr().expect("server address")).into();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("serve test server");
+        });
+        let limits = McpBudgetedCallLimits {
+            wire_limit: 512,
+            parse_charge_limit: 32_768,
+        };
+        let client = McpSubrequestClient::for_tool_with_budget(
+            McpCallout::fabricated(true).expect("fabricated callout"),
+            Duration::from_secs(5),
+            2_048,
+            UrlResolutionPolicy::OperatorCached,
+            Some(limits),
+            None,
+        );
+        let outcome = client
+            .delete_session(uri, "session-1".into(), None, HashMap::new())
+            .await;
+        server.abort();
+        assert!(
+            matches!(
+                outcome,
+                Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+            ),
+            "DELETE must reject a response larger than the request's reserved wire cap: {outcome:?}"
+        );
+    }
+
+    #[test]
     fn control_client_never_exceeds_the_control_ceiling() {
         let client = McpSubrequestClient::control(
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
+            UrlResolutionPolicy::OperatorCached,
             None,
         );
         let call: ClientJsonRpcMessage = serde_json::from_str(
@@ -1950,7 +2277,12 @@ mod tests {
             .clone();
         let pipeline = build_bare_outbound_pipeline(true).expect("outbound pipeline");
         let callout = McpCallout::from_context(&context, pipeline).expect("MCP callout context");
-        let client = McpSubrequestClient::control(callout, Duration::from_secs(5), None);
+        let client = McpSubrequestClient::control(
+            callout,
+            Duration::from_secs(5),
+            UrlResolutionPolicy::OperatorCached,
+            None,
+        );
         let signal = client.signal_handle();
 
         let (_executor, _request, extensions, _deadline) = client
@@ -2157,6 +2489,7 @@ mod tests {
         let client = McpSubrequestClient::control(
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(1),
+            UrlResolutionPolicy::OperatorCached,
             None,
         );
         // per-event GET cap == the client's tool-result wire cap, which for the
@@ -2177,6 +2510,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(1),
             max_result_bytes,
+            UrlResolutionPolicy::OperatorCached,
             None,
         );
         let expected_wire = tool_result_wire_cap(max_result_bytes);
@@ -2196,6 +2530,7 @@ mod tests {
         }
         SubResponse {
             status,
+            version: http::Version::HTTP_11,
             headers,
             body: Bytes::from_static(body),
         }
@@ -2206,6 +2541,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
             1024,
+            UrlResolutionPolicy::OperatorCached,
             None,
         )
     }
@@ -2298,8 +2634,77 @@ mod tests {
             Some("application/json"),
             br#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
         );
-        let out = classify_buffered_post_response(response, &message, false).unwrap();
+        let out = classify_buffered_post_response(response, &message, false, None, &test_signal()).unwrap();
         assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
+    }
+
+    #[test]
+    fn buffered_post_selects_only_exact_json_and_sse_media_types() {
+        let message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x"}
+        }))
+        .unwrap();
+
+        let json = sub_response(
+            200,
+            Some(" Application/JSON; charset=utf-8"),
+            br#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+        );
+        let out = classify_buffered_post_response(json, &message, false, None, &test_signal()).unwrap();
+        assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
+
+        let sse = sub_response(
+            200,
+            Some(" Text/Event-Stream; charset=utf-8"),
+            b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+        );
+        let out = classify_buffered_post_response(sse, &message, false, None, &test_signal()).unwrap();
+        assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
+
+        for content_type in ["application/jsonp", "text/event-streamish"] {
+            let response = sub_response(200, Some(content_type), br#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+            let error = classify_buffered_post_response(response, &message, false, None, &test_signal()).unwrap_err();
+            assert!(
+                matches!(error, StreamableHttpError::UnexpectedContentType(Some(actual)) if actual == content_type),
+                "expected exact media-type rejection for {content_type}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_post_selects_only_exact_json_and_sse_media_types() {
+        let (body, _) = fake_body([Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#)]);
+        let response = sub_response(200, Some(" Application/JSON; charset=utf-8"), b"");
+        let out = client()
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .await
+            .unwrap();
+        assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
+
+        let (body, cancelled) = fake_body([Bytes::from_static(
+            b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+        )]);
+        let response = sub_response(200, Some(" Text/Event-Stream; charset=utf-8"), b"");
+        let out = client()
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+            .await
+            .unwrap();
+        assert!(matches!(out, StreamableHttpPostResponse::Sse(_, _)));
+        assert!(!cancelled.load(std::sync::atomic::Ordering::SeqCst));
+
+        for content_type in ["application/jsonp", "text/event-streamish"] {
+            let (body, cancelled) = fake_body([Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#)]);
+            let response = sub_response(200, Some(content_type), b"");
+            let error = client()
+                .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, test_signal())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, StreamableHttpError::UnexpectedContentType(Some(actual)) if actual == content_type),
+                "expected exact media-type rejection for {content_type}"
+            );
+            assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        }
     }
 
     // -- collect_body fail-closed (F4) --
@@ -2407,7 +2812,7 @@ mod tests {
         }))
         .unwrap();
         let response = sub_response(200, Some("application/json"), b"{not json");
-        let result = classify_buffered_post_response(response, &message, false);
+        let result = classify_buffered_post_response(response, &message, false, None, &test_signal());
         assert!(
             matches!(result, Err(StreamableHttpError::UnexpectedServerResponse(_))),
             "an unparseable buffered JSON Request response must be a typed error (was Accepted)"
@@ -2424,7 +2829,7 @@ mod tests {
                 .expect("deserialize notification");
         assert!(matches!(notification, ClientJsonRpcMessage::Notification(_)));
         let response = sub_response(200, None, b"");
-        let out = classify_buffered_post_response(response, &notification, false).unwrap();
+        let out = classify_buffered_post_response(response, &notification, false, None, &test_signal()).unwrap();
         assert!(
             matches!(out, StreamableHttpPostResponse::Accepted),
             "an empty-200 notification ack must stay Accepted (R4)"
@@ -2438,7 +2843,7 @@ mod tests {
         }))
         .unwrap();
         let response = sub_response(202, None, b"");
-        let out = classify_buffered_post_response(response, &message, false).unwrap();
+        let out = classify_buffered_post_response(response, &message, false, None, &test_signal()).unwrap();
         assert!(
             matches!(out, StreamableHttpPostResponse::Accepted),
             "a 202 ack must stay Accepted (R4)"
@@ -2531,6 +2936,91 @@ mod tests {
         assert!(
             cancelled.load(std::sync::atomic::Ordering::SeqCst),
             "a non-JSON error body is drained and cancelled"
+        );
+    }
+
+    // -- non-2xx oversized error body falls back to status, never a 413 (F5) --
+
+    #[test]
+    fn classify_buffered_post_non_2xx_oversized_json_falls_back_to_status_without_signal() {
+        // A valid JSON-RPC error whose output charge exceeds the parse-charge limit
+        // must be left unparsed: the reply falls back to its upstream HTTP status and
+        // records no 413 size signal, so a genuine upstream failure is never masked
+        // by a spurious ResponseTooLarge.
+        let message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x"}
+        }))
+        .unwrap();
+        let response = sub_response(
+            500,
+            Some("application/json"),
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}"#,
+        );
+        let signal = test_signal();
+        let out = classify_buffered_post_response(response, &message, false, Some(1), &signal);
+        let Err(StreamableHttpError::UnexpectedServerResponse(msg)) = out else {
+            panic!("an oversized non-2xx error body must fall back to the HTTP status");
+        };
+        assert!(msg.contains("HTTP 500"), "should surface the HTTP status, got {msg}");
+        assert!(
+            signal.get().is_none(),
+            "an oversized error body must record no 413 size signal"
+        );
+    }
+
+    #[test]
+    fn classify_buffered_post_non_2xx_within_limit_surfaces_json_rpc_error() {
+        // The in-limit counterpart still parses and surfaces the structured error.
+        let message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x"}
+        }))
+        .unwrap();
+        let response = sub_response(
+            500,
+            Some("application/json"),
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}"#,
+        );
+        let signal = test_signal();
+        let out = classify_buffered_post_response(response, &message, false, Some(1_000_000), &signal)
+            .expect("a JSON-RPC error within budget is a valid reply");
+        assert!(matches!(
+            out,
+            StreamableHttpPostResponse::Json(JsonRpcMessage::Error(_), _)
+        ));
+        assert!(signal.get().is_none(), "a parsed error body records no size signal");
+    }
+
+    #[tokio::test]
+    async fn streaming_post_non_2xx_oversized_json_falls_back_to_status_without_signal() {
+        // The streaming arm mirrors the buffered one: an oversized non-2xx JSON-RPC
+        // error body is left unparsed and falls back to the HTTP status.
+        let limits = McpBudgetedCallLimits {
+            wire_limit: 1_024,
+            parse_charge_limit: 1,
+        };
+        let client = McpSubrequestClient::for_tool_with_budget(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(5),
+            2_048,
+            UrlResolutionPolicy::OperatorCached,
+            Some(limits),
+            None,
+        );
+        let (body, _cancelled) = fake_body([Bytes::from(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}"#.to_owned(),
+        )]);
+        let response = sub_response(500, Some("application/json"), b"");
+        let signal = test_signal();
+        let result = client
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024, Arc::clone(&signal))
+            .await;
+        let Err(StreamableHttpError::UnexpectedServerResponse(msg)) = result else {
+            panic!("an oversized streaming error body must fall back to the HTTP status");
+        };
+        assert!(msg.contains("HTTP 500"), "should surface the HTTP status, got {msg}");
+        assert!(
+            signal.get().is_none(),
+            "an oversized streaming error body must record no 413 size signal"
         );
     }
 

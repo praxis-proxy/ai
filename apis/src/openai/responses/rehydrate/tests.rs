@@ -4,15 +4,16 @@
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use praxis_filter::{FilterAction, FilterEntry, FilterPipeline};
+use praxis_filter::{FilterAction, FilterEntry, FilterPipeline, SelectedUpstreamBodyOutcome};
 use serde_json::json;
 
-use super::*;
+use super::{super::state::RequestReasoningPresence, *};
 use crate::{
     openai::sse::{SseFrame, SseFrameParser},
     store::{
-        ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-        ResponseEventRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
+        BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
+        PendingApprovalRecord, ResponseEventRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry,
+        SqliteResponseStore, StoreError, json_values_charge, json_values_fit,
     },
 };
 
@@ -164,6 +165,29 @@ async fn skips_cancel_request_without_parsing_empty_body() {
     );
 }
 
+#[tokio::test]
+async fn budgeted_explicit_compact_leaves_store_read_to_compact_filter() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/compact");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","previous_response_id":"resp_stored"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "compact must own the bounded Store read"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "rehydrate must not create another compact history owner"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Passthrough
 // -----------------------------------------------------------------------------
@@ -265,6 +289,244 @@ async fn validates_previous_response_and_sets_metadata() {
         "current input should be last"
     );
     assert_eq!(state.response_id.as_deref(), Some("resp_current"));
+}
+
+fn arm_retained_budget(ctx: &mut HttpFilterContext<'_>, request_body: &str, limit: usize) -> usize {
+    let config: serde_yaml::Value = serde_yaml::from_str(&format!("max_retained_bytes: {limit}")).unwrap();
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).unwrap());
+    let mut state = ResponsesState::from_request_body(serde_json::from_str(request_body).unwrap());
+    let input_charge = super::super::agentic_loop::budget::input_charge(request_body.as_bytes()).unwrap();
+    state.simple_budget = super::super::agentic_loop::budget::SimpleBudget::new_with_store(limit, input_charge, false);
+    let remaining = state.simple_budget.unwrap().remaining_bytes().unwrap();
+    ctx.extensions.insert(state);
+    remaining
+}
+
+#[tokio::test]
+async fn budgeted_previous_response_restores_and_preserves_request_charge() {
+    let store = MockStore::with_completed_response(
+        "resp_prev",
+        json!("First turn"),
+        json!([{"role":"user","content":"First turn"}, {"role":"assistant","content":"Hello"}]),
+    );
+    let registry = setup_registry(store);
+    let request_body = r#"{"model":"gpt-4.1","input":"Next turn","store":false,"previous_response_id":"resp_prev"}"#;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    let before = arm_retained_budget(&mut ctx, request_body, 8_388_608);
+    let mut body = Some(Bytes::from(request_body));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.messages.len(), 3);
+    assert!(state.simple_budget.unwrap().remaining_bytes().unwrap() < before);
+    assert_eq!(body.as_deref(), Some(request_body.as_bytes()));
+}
+
+#[tokio::test]
+async fn budgeted_previous_response_rejects_large_store_row_before_replacement() {
+    let store = MockStore::with_completed_response(
+        "resp_prev",
+        json!("First turn"),
+        json!([{"role":"user","content":"x".repeat(256_000)}]),
+    );
+    let registry = setup_registry(store);
+    let request_body = r#"{"model":"gpt-4.1","input":"Next turn","store":false,"previous_response_id":"resp_prev"}"#;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    arm_retained_budget(&mut ctx, request_body, 8_388_608);
+    let mut body = Some(Bytes::from(request_body));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert!(!ctx.extensions.get::<ResponsesState>().unwrap().history_rehydrated);
+    assert!(ctx.get_metadata("responses.previous_response_id").is_none());
+    assert_eq!(body.as_deref(), Some(request_body.as_bytes()));
+}
+
+#[tokio::test]
+async fn budgeted_restore_rejects_sparse_json_before_store_decode() {
+    // A tiny wire representation can expand into many 72-byte serde_json
+    // Values. The bounded Store read must reject it before deserialization.
+    let atom = format!("{}0{}", "[".repeat(110), "]".repeat(110));
+    let nested: Value = serde_json::from_str(&format!("[{}]", vec![atom; 180].join(","))).unwrap();
+    let messages = json!([{"role":"user","content":"First turn","extra":nested}]);
+    let store = MockStore::with_completed_response("resp_prev", json!("First turn"), messages);
+    let registry = setup_registry(store);
+    let request_body = r#"{"model":"gpt-4.1","input":"Next turn","store":false,"previous_response_id":"resp_prev"}"#;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    arm_retained_budget(&mut ctx, request_body, 8_388_608);
+    let mut body = Some(Bytes::from(request_body));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert!(!ctx.extensions.get::<ResponsesState>().unwrap().history_rehydrated);
+}
+
+#[tokio::test]
+async fn budgeted_restore_admits_file_history_for_metered_expansion() {
+    let store = MockStore::with_completed_response(
+        "resp_prev",
+        json!("First turn"),
+        json!([{"role":"user","content":[{"type":"input_file","file_id":"file_prev"}]}]),
+    );
+    let registry = setup_registry(store);
+    let request_body = r#"{"model":"gpt-4.1","input":"Next turn","store":false,"previous_response_id":"resp_prev"}"#;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    arm_retained_budget(&mut ctx, request_body, 8_388_608);
+    let mut body = Some(Bytes::from(request_body));
+
+    let before = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .simple_budget
+        .unwrap()
+        .remaining_bytes()
+        .unwrap();
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.history_rehydrated);
+    assert_eq!(state.messages[0]["content"][0]["file_id"], "file_prev");
+    assert!(state.simple_budget.unwrap().remaining_bytes().unwrap() < before);
+}
+
+#[tokio::test]
+async fn budgeted_conversation_restores_file_history_for_metered_expansion() {
+    let store = MockStore::with_conversation(
+        "conv_prev",
+        json!([{"role":"user","content":[{"type":"input_file","file_data":"YQ=="}]}]),
+    );
+    let registry = setup_registry(store);
+    let request_body = r#"{"model":"gpt-4.1","input":"Next turn","store":false,"conversation":"conv_prev"}"#;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    let before = arm_retained_budget(&mut ctx, request_body, 8_388_608);
+    let mut body = Some(Bytes::from(request_body));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.history_rehydrated);
+    assert_eq!(state.messages[0]["content"][0]["file_data"], "YQ==");
+    assert!(state.simple_budget.unwrap().remaining_bytes().unwrap() < before);
+}
+
+#[tokio::test]
+async fn budgeted_conversation_restores_plain_history_with_shared_charge() {
+    let store = MockStore::with_conversation(
+        "conv_prev",
+        json!([{"role":"user","content":"First turn"}, {"role":"assistant","content":"Hello"}]),
+    );
+    let registry = setup_registry(store);
+    let request_body = r#"{"model":"gpt-4.1","input":"Next turn","store":false,"conversation":"conv_prev"}"#;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    let before = arm_retained_budget(&mut ctx, request_body, 8_388_608);
+    let mut body = Some(Bytes::from(request_body));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.messages.len(), 3);
+    assert!(state.simple_budget.unwrap().remaining_bytes().unwrap() < before);
+}
+
+#[tokio::test]
+async fn budgeted_conversation_rejects_large_row_before_replay() {
+    let store = MockStore::with_conversation("conv_prev", json!([{"role":"user","content":"x".repeat(256_000)}]));
+    let registry = setup_registry(store);
+    let request_body = r#"{"model":"gpt-4.1","input":"Next turn","store":false,"conversation":"conv_prev"}"#;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    arm_retained_budget(&mut ctx, request_body, 8_388_608);
+    let mut body = Some(Bytes::from(request_body));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert!(!ctx.extensions.get::<ResponsesState>().unwrap().history_rehydrated);
+}
+
+#[tokio::test]
+async fn budget_policy_does_not_require_create_state_for_input_tokens() {
+    let store = MockStore::with_completed_response("resp_prev", json!("First turn"), json!([]));
+    let registry = setup_registry(store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":"Next turn","previous_response_id":"resp_prev"}"#,
+    ));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Release));
+}
+
+#[tokio::test]
+async fn budgeted_create_without_budget_state_fails_before_store_read() {
+    let store = MockStore::with_completed_response("resp_prev", json!("First turn"), json!([]));
+    let registry = setup_registry(store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":"Next turn","previous_response_id":"resp_prev"}"#,
+    ));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 500));
 }
 
 // -----------------------------------------------------------------------------
@@ -426,7 +688,10 @@ async fn sqlite_item_history_rehydrates_complete_order_after_delete_and_append_a
             .on_bound_upstream_request_body(&mut ctx, &mut body)
             .await
             .unwrap();
-        assert!(matches!(outcome, BoundUpstreamBodyOutcome::Continue));
+        assert!(
+            matches!(outcome, BoundUpstreamBodyOutcome::Continue),
+            "unexpected bounded upstream body outcome: {outcome:?}"
+        );
         assert_eq!(body.as_ref(), Some(&original));
         let state = ctx.extensions.get::<ResponsesState>().unwrap();
         assert!(state.history_rehydrated);
@@ -518,6 +783,15 @@ async fn pipeline_validates_during_cold_request_body_pre_read() {
     let original = r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_prev"}"#;
     let mut body = Some(Bytes::from(original));
 
+    // Run the request-head phase first so `ai_operation` publishes its match
+    // before the body pre-read, exactly as core sequences the real pipeline.
+    assert!(
+        matches!(
+            pipeline.execute_http_request_head(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "request-head phase should classify before the body pre-read"
+    );
     let action = pipeline
         .execute_http_request_body(&mut ctx, &mut body, true)
         .await
@@ -1377,6 +1651,41 @@ async fn fallback_reconstruction_replays_only_canonical_input_items() {
 }
 
 #[test]
+fn replay_preserves_client_owned_custom_tool_history_without_cloning() {
+    // A stored client-tool continuation holds a correlated custom call/output
+    // pair alongside a hosted item. The client-owned pair must survive replay via
+    // the shared fast path (#1764) so the client-tool-compat adapter can lower it,
+    // while the hosted item stays excluded.
+    let persisted = MessageHistory::from(vec![
+        json!({"type": "message", "role": "user", "content": "Previous turn"}),
+        json!({"type": "custom_tool_call", "call_id": "call_history", "name": "do_work", "input": "Prior invocation"}),
+        json!({"type": "custom_tool_call_output", "call_id": "call_history", "output": "sentinel"}),
+        json!({"type": "web_search_call", "id": "ws_1", "status": "completed"}),
+    ]);
+
+    let replay = replay_messages_from_stored(&persisted);
+
+    assert_eq!(replay.len(), 3, "the hosted web_search_call is excluded: {replay:?}");
+    assert_eq!(replay[1]["type"], "custom_tool_call");
+    assert_eq!(replay[1]["call_id"], "call_history");
+    assert_eq!(replay[2]["type"], "custom_tool_call_output");
+    assert_eq!(replay[2]["output"], "sentinel");
+    assert!(
+        replay.iter().all(|item| item["type"] != "web_search_call"),
+        "hosted output items must not replay as request input: {replay:?}"
+    );
+    for index in 0..replay.len() {
+        // The user message (index 0) and both custom items (1, 2) replay verbatim,
+        // so none is cloned; the excluded hosted item at persisted index 3 shifts
+        // nothing because it is simply skipped.
+        assert!(
+            replay.shares_item_with(index, &persisted, index),
+            "client-owned item {index} must replay via the shared fast path, not a clone"
+        );
+    }
+}
+
+#[test]
 fn replay_canonicalizes_defaulted_item_types_and_excludes_unknown_items() {
     let stored = vec![
         json!({"id":"item-1"}),
@@ -1646,6 +1955,184 @@ async fn rehydrates_from_conversation_object_form() {
         state.messages[2]["content"], "follow up",
         "current input should be last"
     );
+}
+
+#[tokio::test]
+async fn configuration_update_applies_to_native_and_translated_conversation_requests() {
+    for translated in [false, true] {
+        for request_reasoning in [None, Some(json!({})), Some(json!({"effort": "low"}))] {
+            let explicit_effort = request_reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.get("effort"))
+                .and_then(Value::as_str);
+            let stored = json!([
+                {"type": "configuration_update", "id": "cnfu_1", "reasoning": {"effort": "medium"}},
+                {"type": "message", "id": "msg_1", "role": "user", "content": "hello"},
+                {"type": "configuration_update", "id": "cnfu_2", "reasoning": {"effort": "high"}},
+            ]);
+            let registry = setup_registry(MockStore::with_conversation("conv_config", stored.clone()));
+            let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+            let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+            ctx.extensions.insert(registry);
+            ctx.set_metadata("openai_responses_request.format", "openai_responses");
+            let mut request = json!({
+                "model": "gpt-4.1", "input": "continue", "conversation": "conv_config",
+            });
+            if let Some(reasoning) = &request_reasoning {
+                request["reasoning"] = reasoning.clone();
+            }
+            let mut body = Some(Bytes::from(serde_json::to_vec(&request).unwrap()));
+            let action = default_filter()
+                .on_request_body(&mut ctx, &mut body, true)
+                .await
+                .unwrap();
+            assert!(
+                matches!(action, FilterAction::Release),
+                "rehydration must release: translated={translated}, request_reasoning={request_reasoning:?}"
+            );
+            let state = ctx.extensions.get::<ResponsesState>().unwrap();
+            assert!(
+                state
+                    .persisted_messages
+                    .iter()
+                    .take(3)
+                    .zip(stored.as_array().unwrap())
+                    .all(|(actual, expected)| actual == expected),
+                "durable history must preserve configuration: translated={translated}, request_reasoning={request_reasoning:?}"
+            );
+            assert!(
+                state.messages.iter().all(|item| item["type"] != "configuration_update"),
+                "configuration must not become model input: translated={translated}, request_reasoning={request_reasoning:?}"
+            );
+            let filter = if translated {
+                crate::openai::responses::responses_to_chat_completions::ResponsesToChatCompletionsFilter::from_config(
+                    &serde_yaml::Value::Null,
+                )
+                .unwrap()
+            } else {
+                crate::openai::responses::responses_proxy::ResponsesProxyFilter::from_config(&serde_yaml::Value::Null)
+                    .unwrap()
+            };
+            let outcome = filter
+                .on_selected_upstream_request_body(&mut ctx, &mut body)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, SelectedUpstreamBodyOutcome::Continue),
+                "upstream processing must continue: translated={translated}, request_reasoning={request_reasoning:?}"
+            );
+            let upstream: Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+            let effort = if translated {
+                &upstream["reasoning_effort"]
+            } else {
+                &upstream["reasoning"]["effort"]
+            };
+            assert_eq!(
+                effort,
+                explicit_effort.unwrap_or("high"),
+                "explicit effort wins, otherwise latest configuration applies: translated={translated}, request_reasoning={request_reasoning:?}"
+            );
+            assert!(
+                upstream.get("conversation").is_none(),
+                "local conversation reference must not reach upstream: translated={translated}, request_reasoning={request_reasoning:?}"
+            );
+            let input = if translated {
+                &upstream["messages"]
+            } else {
+                &upstream["input"]
+            };
+            assert!(
+                input
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|item| item["type"] != "configuration_update"),
+                "upstream input must exclude configuration items: translated={translated}, request_reasoning={request_reasoning:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn configuration_update_replacement_does_not_resurrect_earlier_effort() {
+    for replacement in [
+        json!({"type": "configuration_update"}),
+        json!({"type": "configuration_update", "reasoning": {}}),
+        json!({"type": "configuration_update", "reasoning": {"effort": null}}),
+    ] {
+        let shape = replacement.to_string();
+        let stored = vec![
+            json!({"type": "configuration_update", "reasoning": {"effort": "high"}}),
+            replacement,
+        ];
+        let state = build_state(json!({"model": "m", "input": "hello"}), stored, vec![], None);
+        assert!(
+            state.request_body["reasoning"]["effort"].is_null(),
+            "replacement {shape} must not resurrect the stored effort"
+        );
+        assert_eq!(
+            state.persisted_messages.len(),
+            3,
+            "configuration remains in durable history"
+        );
+        assert_eq!(state.messages.len(), 1, "configuration is not model input");
+    }
+}
+
+#[test]
+fn configuration_update_preserves_other_request_reasoning_fields() {
+    let state = build_state(
+        json!({"input": "hello", "reasoning": {"summary": "auto"}}),
+        vec![json!({"type": "configuration_update", "reasoning": {"effort": "high"}})],
+        vec![],
+        None,
+    );
+    assert_eq!(
+        state.request_body["reasoning"],
+        json!({"summary": "auto", "effort": "high"}),
+        "request-supplied reasoning fields must survive beside the inherited effort"
+    );
+}
+
+#[test]
+fn build_state_records_request_reasoning_presence() {
+    let config = vec![json!({"type": "configuration_update", "reasoning": {"effort": "high"}})];
+    for (request, expected) in [
+        (
+            json!({"model": "m", "input": "hello"}),
+            RequestReasoningPresence::Absent,
+        ),
+        (
+            json!({"model": "m", "input": "hello", "reasoning": null}),
+            RequestReasoningPresence::OmittedEffort,
+        ),
+        (
+            json!({"model": "m", "input": "hello", "reasoning": {}}),
+            RequestReasoningPresence::OmittedEffort,
+        ),
+        (
+            json!({"model": "m", "input": "hello", "reasoning": {"summary": "auto"}}),
+            RequestReasoningPresence::OmittedEffort,
+        ),
+        (
+            json!({"model": "m", "input": "hello", "reasoning": {"effort": "low"}}),
+            RequestReasoningPresence::ExplicitEffort,
+        ),
+        (
+            json!({"model": "m", "input": "hello", "reasoning": {"effort": null}}),
+            RequestReasoningPresence::ExplicitEffort,
+        ),
+    ] {
+        let state = build_state(request, config.clone(), vec![], None);
+        assert_eq!(
+            state.request_reasoning, expected,
+            "presence must be captured before the stored default merges into the body"
+        );
+    }
+    // The captured presence is provenance only; the merge itself is unchanged.
+    let state = build_state(json!({"model": "m", "input": "hello"}), config, vec![], None);
+    assert_eq!(state.request_reasoning, RequestReasoningPresence::Absent);
+    assert_eq!(state.request_body["reasoning"]["effort"], json!("high"));
 }
 
 #[tokio::test]
@@ -3738,6 +4225,69 @@ impl ResponseStore for MockStore {
             return Err(StoreError::Unavailable("mock failure".to_owned()));
         }
         Ok(self.records.get(id).filter(|r| &r.owner == tenant_id).cloned())
+    }
+
+    async fn get_response_bounded(
+        &self,
+        tenant_id: &StateOwner,
+        id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ResponseRecord>, StoreError> {
+        let record = self.records.get(id).filter(|record| &record.owner == tenant_id);
+        if record.is_some_and(|record| {
+            !json_values_fit(&[&record.response_object, &record.input, &record.messages], max_bytes)
+                || record.model.len() > max_bytes
+        }) {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        self.get_response(tenant_id, id).await
+    }
+
+    async fn get_response_budgeted(
+        &self,
+        tenant_id: &StateOwner,
+        id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ResponseRecord>>, StoreError> {
+        let Some(record) = self.get_response(tenant_id, id).await? else {
+            return Ok(None);
+        };
+        let charge_bytes = json_values_charge(
+            [&record.response_object, &record.input, &record.messages],
+            &[&record.id, &record.model],
+            max_charge_bytes,
+        )?;
+        Ok(Some(BudgetedRecord { record, charge_bytes }))
+    }
+
+    async fn get_conversation_bounded(
+        &self,
+        tenant_id: &StateOwner,
+        id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        let record = self.conversations.get(id).filter(|record| &record.owner == tenant_id);
+        if record.is_some_and(|record| !json_values_fit(&[&record.metadata, &record.messages], max_bytes)) {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        ResponseStore::get_conversation(self, tenant_id, id).await
+    }
+
+    async fn get_conversation_budgeted(
+        &self,
+        tenant_id: &StateOwner,
+        id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ConversationRecord>>, StoreError> {
+        let Some(record) = ResponseStore::get_conversation(self, tenant_id, id).await? else {
+            return Ok(None);
+        };
+        let charge_bytes = json_values_charge(
+            [&record.metadata, &record.messages],
+            &[&record.conversation_id],
+            max_charge_bytes,
+        )?;
+        Ok(Some(BudgetedRecord { record, charge_bytes }))
     }
 
     async fn delete_response(&self, _tenant_id: &StateOwner, _id: &str) -> Result<bool, StoreError> {

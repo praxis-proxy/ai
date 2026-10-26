@@ -5,7 +5,7 @@
 
 use std::{collections::HashMap, io::Write as _};
 
-use praxis_core::config::{ChainRef, Config, FailureMode, FilterEntry};
+use praxis_core::config::{ChainRef, Config, ExpandedFilterChains, FailureMode, FilterEntry};
 use serde::Serialize;
 
 // -----------------------------------------------------------------------------
@@ -78,11 +78,11 @@ pub(crate) fn build_dump(
     config: &Config,
     config_source: &str,
 ) -> Result<EffectiveConfigDump, Box<dyn std::error::Error + Send + Sync>> {
-    let chains: HashMap<&str, &[_]> = config
-        .filter_chains
-        .iter()
-        .map(|c| (c.name.as_str(), c.filters.as_slice()))
-        .collect();
+    // Resolve against expanded entries so the dump reflects the effective
+    // filters that run, with chain-level `conditions:` inherited on both the
+    // listener path and named branch/outbound references.
+    let expanded_chains = ExpandedFilterChains::new(&config.filter_chains);
+    let chains = expanded_chains.as_slices();
 
     Ok(EffectiveConfigDump {
         config_source: config_source.to_owned(),
@@ -181,6 +181,7 @@ const SENSITIVE_FIELD_NAMES: &[&str] = &[
     "api_key",
     "credentials_file",
     "database_url",
+    "internal_auth_token",
     "key_path",
     "password",
     "secret",
@@ -689,6 +690,17 @@ filter_chains:
             Some("[REDACTED]"),
             "api_key field must be redacted in config dumps"
         );
+    }
+
+    #[test]
+    fn redact_sensitive_keys_internal_auth_token() {
+        let mut value: serde_yaml::Value =
+            serde_yaml::from_str("external_metering:\n  internal_auth_token:\n    value: metering-secret-test")
+                .expect("test YAML must parse");
+        redact_sensitive_keys(&mut value);
+        let output = serde_yaml::to_string(&value).unwrap();
+        assert!(!output.contains("metering-secret-test"), "{output}");
+        assert!(output.contains("[REDACTED]"), "{output}");
     }
 
     #[test]

@@ -67,6 +67,7 @@ class QualificationTest(unittest.TestCase):
         self.assertEqual(plugin.profile_for_item(item("openai_client")), "native")
         self.assertEqual(plugin.profile_for_item(item("chat_streaming_client")), "translation")
         self.assertEqual(plugin.profile_for_item(item("reasoning_capture_client")), "supporting")
+        self.assertEqual(plugin.profile_for_item(item("streaming_mcp_failure_client")), "supporting")
         self.assertEqual(plugin.profile_for_item(item("new_gateway_client")), "unclassified")
         self.assertEqual(plugin.profile_for_item(item("openai_client", "chat_streaming_client")), "unclassified")
         self.assertEqual(plugin.profile_for_item(item(override="supporting")), "supporting")
@@ -224,6 +225,28 @@ class QualificationTest(unittest.TestCase):
             wrong_attempt = qualification.acceptance(path, "success", 17, 3, "a" * 40, "Codex")
             self.assertEqual(wrong_attempt["status"], "unreported")
 
+    def test_pi_acceptance_is_reported_beside_the_other_clients(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw = Path(directory) / "raw.json"
+            raw.write_text(json.dumps(report()))
+            pi_raw = Path(directory) / "pi-acceptance.json"
+            pi_raw.write_text(json.dumps({"run_id": 17, "attempt": 2, "checkout_sha": "a" * 40,
+                                          "cases": [{"id": "pi_text", "status": "success"},
+                                                    {"id": "pi_tool_call", "status": "failure"}]}))
+            finished = qualification.finish(raw, True, "success", "success", "skipped", "skipped",
+                                            17, 2, "https://example.test/run", "a" * 40,
+                                            pi_result="failure", pi_raw=pi_raw)
+            omitted = qualification.finish(raw, True, "success", "success", "skipped", "skipped",
+                                           17, 2, "https://example.test/run", "a" * 40)
+        suite = finished["suites"]["pi_acceptance"]
+        self.assertEqual(suite["status"], "failure")
+        self.assertEqual([case["id"] for case in suite["cases"]], ["pi_text", "pi_tool_call"])
+        rendered = qualification.render(finished, detailed=True)
+        self.assertIn("Pi Acceptance: failure (1/2 scenarios succeeded).", rendered)
+        self.assertIn("- `pi_tool_call`: failure", rendered)
+        # A dispatch that predates the pi lane still produces a report.
+        self.assertEqual(omitted["suites"]["pi_acceptance"]["status"], "skipped")
+
     def test_latest_gpu_attempt_does_not_fall_back_to_old_green(self):
         runs = [{"id": 10, "status": "completed"}, {"id": 12, "status": "completed"},
                 {"id": 13, "status": "completed"}]
@@ -231,6 +254,20 @@ class QualificationTest(unittest.TestCase):
                 12: [{"name": "Start ephemeral EC2 GPU runner", "conclusion": "failure"}],
                 13: [{"name": "Run complete live vLLM Responses suite (GPU)", "conclusion": "skipped"}]}
         self.assertEqual(qualification.choose_run(runs, jobs)["id"], 12)
+
+    def test_pi_only_acceptance_run_does_not_hide_older_responses_run(self):
+        runs = [{"id": 20, "status": "completed"}, {"id": 21, "status": "completed"}]
+        acceptance_skipped = [{"name": name, "conclusion": "skipped"} for name in (
+            "Claude Code and Anthropic SDK acceptance on real vLLM (GPU)",
+            "Codex acceptance on real vLLM (GPU)",
+            "OpenCode acceptance on real vLLM (GPU)")]
+        jobs = {20: [{"name": "Start ephemeral EC2 GPU runner", "conclusion": "success"},
+                     {"name": "Run complete live vLLM Responses suite (GPU)", "conclusion": "success"}],
+                21: [{"name": "Start ephemeral EC2 GPU runner", "conclusion": "success"},
+                     {"name": "Run complete live vLLM Responses suite (GPU)", "conclusion": "skipped"},
+                     *acceptance_skipped,
+                     {"name": "pi acceptance on real vLLM (GPU)", "conclusion": "success"}]}
+        self.assertEqual(qualification.choose_run(runs, jobs)["id"], 20)
 
     def test_exact_run_attempt_checkout_and_profile_required(self):
         source = report()
@@ -276,6 +313,25 @@ class QualificationTest(unittest.TestCase):
         self.assertEqual(notes, fixture)
         self.assertIn("OpenAI Python `2.9.0`", notes)
         self.assertIn("Credentialed Tools: skipped", notes)
+
+    def test_backend_image_provenance_is_reported_only_when_recorded(self):
+        # The suite reuses the published GPU image when it matches the checkout
+        # and builds otherwise, so the note has to say which happened -- and a
+        # report captured without the provenance must not claim either.
+        pulled = report()
+        pulled["backend"].update(
+            {"image_source": "registry",
+             "registry_digest": "ghcr.io/praxis-proxy/vllm-gpu@sha256:" + "e" * 64})
+        self.assertIn("(registry, digest `ghcr.io/praxis-proxy/vllm-gpu@sha256:"
+                      + "e" * 64 + "`)", qualification.render(pulled))
+
+        built = report()
+        built["backend"].update({"image_source": "local-build", "registry_digest": None})
+        rendered = qualification.render(built)
+        self.assertIn("(local-build)", rendered)
+        self.assertNotIn("digest", rendered)
+
+        self.assertNotIn("local-build", qualification.render(report()))
 
     def test_qualification_plugin_merges_lanes_and_fails_on_corrupt_results(self):
         with tempfile.TemporaryDirectory() as directory:

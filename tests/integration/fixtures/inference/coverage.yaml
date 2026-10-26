@@ -9,6 +9,8 @@ scope:
   - responses_client_tool_compat
   - openai_chat_completions_to_azureai_chat_completions
   - openai_chat_completions_to_vertexai_gemini
+  - anthropic_messages_to_vertexai_anthropic
+  - openai_chat_completions_to_anthropic_messages
 features:
   - id: bedrock.converse.request.text
     scopes:
@@ -76,6 +78,15 @@ features:
     status: synthetic_only
     scenarios:
       - messages/malformed-tool-arguments
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.response.empty_string_tool_arguments
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/empty-string-tool-arguments
     providers:
       synthetic:
         status: synthetic_only
@@ -202,6 +213,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.model_provider.request_target
+    scopes:
+      - messages_native_passthrough
+    status: synthetic_only
+    scenarios:
+      - messages/model-provider-map
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.native.request
     scopes:
       - responses_native_passthrough
@@ -286,6 +306,24 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.multi_choice_rejected
+    scopes:
+      - openai_responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-multi-choice-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.service_tier
+    scopes:
+      - openai_responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-service-tier-stream
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.web_search
     scopes:
       - openai_responses_to_chat_completions
@@ -329,6 +367,15 @@ features:
     status: synthetic_only
     scenarios:
       - responses/irr-terminal-streaming
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.agentic.committed_stream_budget_overflow
+    scopes:
+      - responses_agentic_loop
+    status: synthetic_only
+    scenarios:
+      - responses/budget-overflow-streaming
     providers:
       synthetic:
         status: synthetic_only
@@ -488,6 +535,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.client_tool_compat.stream_opening_order
+    scopes:
+      - responses_client_tool_compat
+    status: synthetic_only
+    scenarios:
+      - responses/client-tool-compat-stream-shell-order
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.client_tool_compat.chat_lower_restore
     scopes:
       - responses_client_tool_compat
@@ -582,6 +638,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: azure.chat.response.error_status_event_stream
+    scopes:
+      - openai_chat_completions_to_azureai_chat_completions
+    status: synthetic_only
+    scenarios:
+      - azure/error-status-event-stream
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: vertex.gemini.request.invalid_content
     scopes:
       - openai_chat_completions_to_vertexai_gemini
@@ -636,6 +701,24 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: vertex.gemini.response.schema_complete
+    scopes:
+      - openai_chat_completions_to_vertexai_gemini
+    status: synthetic_only
+    scenarios:
+      - vertex/invalid-content
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: vertex.gemini.response.fallback_id
+    scopes:
+      - openai_chat_completions_to_vertexai_gemini
+    status: synthetic_only
+    scenarios:
+      - vertex/fallback-response-id
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: vertex.gemini.streaming.candidate_limit
     scopes:
       - openai_chat_completions_to_vertexai_gemini
@@ -660,6 +743,114 @@ features:
     status: synthetic_only
     scenarios:
       - messages/malformed-success
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: vertex.anthropic.error.google_envelope
+    scopes:
+      - anthropic_messages_to_vertexai_anthropic
+    status: synthetic_only
+    scenarios:
+      - vertex/anthropic-wire-translation
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: vertex.anthropic.streaming.wire_fields
+    scopes:
+      - anthropic_messages_to_vertexai_anthropic
+    status: synthetic_only
+    scenarios:
+      - vertex/anthropic-wire-translation
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: vertex.anthropic.request.resolved_target
+    scopes:
+      - anthropic_messages_to_vertexai_anthropic
+    status: synthetic_only
+    scenarios:
+      - vertex/anthropic-wire-translation
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.request.text
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.response.json
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.response.sse
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.response.cached_usage
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.response.context_window
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.error
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.native.mcp_admission_untrusted_excluded
+    scopes:
+      - responses_native_passthrough
+    status: synthetic_only
+    scenarios:
+      - responses/mcp-tool-admission-untrusted-direct
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: external_model.anthropic.response.null_cache_usage
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.tools.orphan_output_projection
+    scopes:
+      - openai_responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-orphan-tool-output
     providers:
       synthetic:
         status: synthetic_only

@@ -280,8 +280,10 @@ def test_named_tool_choice_stop_reason(live_clients, route):
     )
     calls = [block for block in first.content if block.type == "tool_use"]
     assert len(calls) == 1, first.model_dump_json()
-    if first.stop_reason == "end_turn":
-        pytest.xfail("pinned vLLM v0.29.0 maps a named tool call to end_turn")
+    # Both routes report `tool_use`. Native vLLM supplies that Anthropic stop
+    # reason directly. On the translated route, vLLM can return a populated
+    # `tool_calls` array with `finish_reason="stop"`; Praxis derives the
+    # Anthropic stop reason from the returned tool calls in that case.
     assert first.stop_reason == "tool_use", first.model_dump_json()
 
 

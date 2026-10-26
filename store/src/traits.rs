@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use crate::{
     owner::StateOwner,
     types::{
-        ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,
-        ResponseRecord, StoreError,
+        BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
+        ResponseEventRecord, ResponseRecord, StoreError,
     },
 };
 
@@ -54,6 +54,44 @@ pub trait ResponseStore: Send + Sync {
     /// Returns [`StoreError`] if the database operation fails.
     async fn get_response(&self, owner: &StateOwner, id: &str) -> Result<Option<ResponseRecord>, StoreError>;
 
+    /// Fetch a response only when its encoded and decoded JSON columns fit
+    /// `max_bytes`. Implementations must avoid loading oversized columns into
+    /// the caller process; unsupported backends fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] for an oversized record, or
+    /// [`StoreError::Unavailable`] when the backend has no bounded read.
+    async fn get_response_bounded(
+        &self,
+        _owner: &StateOwner,
+        _id: &str,
+        _max_bytes: usize,
+    ) -> Result<Option<ResponseRecord>, StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement bounded response reads".to_owned(),
+        ))
+    }
+
+    /// Fetch a response admitted against a retained-payload allowance.
+    /// Implementations must inspect JSON structure before constructing Value
+    /// trees and return the exact charge that was admitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] if the measured record exceeds
+    /// `max_charge_bytes`, or [`StoreError::Unavailable`] if unsupported.
+    async fn get_response_budgeted(
+        &self,
+        _owner: &StateOwner,
+        _id: &str,
+        _max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ResponseRecord>>, StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement budgeted response reads".to_owned(),
+        ))
+    }
+
     /// Delete a response by ID, scoped to an exact owner.
     ///
     /// Returns `true` if a record was deleted, `false` if no
@@ -85,6 +123,43 @@ pub trait ResponseStore: Send + Sync {
         owner: &StateOwner,
         conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError>;
+
+    /// Fetch a conversation only when its JSON columns fit `max_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] for an oversized record, or
+    /// [`StoreError::Unavailable`] when the backend has no bounded read.
+    async fn get_conversation_bounded(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement bounded conversation reads".to_owned(),
+        ))
+    }
+
+    /// Fetch a reconstructed conversation admitted against a retained-payload
+    /// allowance. Implementations inspect every source JSON payload before
+    /// constructing Value trees and return the charge measured for the returned
+    /// record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] if the measured history exceeds
+    /// `max_charge_bytes`, or [`StoreError::Unavailable`] if unsupported.
+    async fn get_conversation_budgeted(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ConversationRecord>>, StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement budgeted conversation reads".to_owned(),
+        ))
+    }
 
     /// Record server-owned pending MCP approvals emitted by the proxy.
     ///
@@ -155,6 +230,20 @@ pub trait ResponseStore: Send + Sync {
         Ok(())
     }
 
+    /// Insert a response and its approvals atomically only when its ID is
+    /// unused. A later budget failure may roll back this exchange's row, so
+    /// replacing a prior response is unsafe. Backends without an atomic
+    /// implementation fail closed.
+    async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        _record: &ResponseRecord,
+        _pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement atomic insert-if-absent persistence".to_owned(),
+        ))
+    }
+
     /// Fetch the server-owned pending approvals matching `approval_ids` that
     /// were issued by `response_id`.
     ///
@@ -185,6 +274,21 @@ pub trait ResponseStore: Send + Sync {
         response_id: &str,
         approval_ids: &[&str],
     ) -> Result<Vec<PendingApprovalRecord>, StoreError>;
+
+    /// Return matching approval payload bytes without materializing the rows.
+    /// Unknown backends fail aggregate admission closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend cannot measure the payload.
+    async fn pending_approval_payload_bytes(
+        &self,
+        _owner: &StateOwner,
+        _response_id: &str,
+        _approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        Ok(usize::MAX)
+    }
 
     /// Atomically claim single-use consumption of a batch of pending approvals
     /// issued by `response_id`.
@@ -551,6 +655,28 @@ pub trait ConversationItemStore: Send + Sync {
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError>;
 
+    /// Append items under a bounded retained-payload allowance. Backends charge
+    /// the new items and bound any legacy-prefix read/copy required by this
+    /// append. Existing item rows are not reread or charged a second time; the
+    /// cache is invalidated incrementally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] when this append's work would
+    /// exceed the allowance, or [`StoreError::Unavailable`] when the backend
+    /// has no bounded append.
+    async fn create_items_and_sync_messages_bounded(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _items: &[ConversationItemRecord],
+        _max_append_charge_bytes: usize,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement bounded conversation appends".to_owned(),
+        ))
+    }
+
     /// Atomically delete an item and invalidate the retired message cache.
     ///
     /// The parent-row check and cache invalidation share the item transaction.
@@ -586,3 +712,112 @@ pub trait ConversationItemStore: Send + Sync {
 pub trait PersistedStateBackend: ResponseStore + ConversationItemStore {}
 
 impl<T: ResponseStore + ConversationItemStore> PersistedStateBackend for T {}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test setup uses explicit failure messages")]
+mod tests {
+    use super::{ResponseStore, StateOwner, StoreError};
+    use crate::types::{
+        ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord, ResponseRecord,
+    };
+
+    /// A backend that implements no bounded conversation read, so it exercises the
+    /// `ResponseStore::get_conversation_bounded` default.
+    struct NoBoundedReads;
+
+    #[async_trait::async_trait]
+    impl ResponseStore for NoBoundedReads {
+        async fn upsert_response(&self, _record: &ResponseRecord) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get_response(&self, _owner: &StateOwner, _id: &str) -> Result<Option<ResponseRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn delete_response(&self, _owner: &StateOwner, _id: &str) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn get_conversation(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+        ) -> Result<Option<ConversationRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn record_pending_approvals(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _records: &[PendingApprovalRecord],
+            _created_at: i64,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get_pending_approvals(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _approval_ids: &[&str],
+        ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn consume_approvals(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _approval_ids: &[&str],
+            _consumed_at: i64,
+        ) -> Result<Option<usize>, StoreError> {
+            Ok(None)
+        }
+
+        async fn append_events(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _events: &[ResponseEventRecord],
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn list_events_after(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _after: Option<u64>,
+            _limit: u32,
+        ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn event_log_status(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+        ) -> Result<EventLogStatus, StoreError> {
+            Ok(EventLogStatus::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_bounded_conversation_read_is_unavailable() {
+        // A backend that does not override `get_conversation_bounded` must surface
+        // `Unavailable` rather than silently returning an incomplete history, so a
+        // caller like `rehydrate` fails loudly instead of dropping items.
+        let backend = NoBoundedReads;
+        let owner = StateOwner::from_trusted_parts("t", "i", "s").expect("owner");
+        let err = backend
+            .get_conversation_bounded(&owner, "conv", 1_024)
+            .await
+            .expect_err("a backend without a bounded read must surface an error");
+        assert!(
+            matches!(err, StoreError::Unavailable(_)),
+            "the default bounded read must be Unavailable, got {err:?}"
+        );
+    }
+}

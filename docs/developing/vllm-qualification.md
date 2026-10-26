@@ -10,20 +10,40 @@ output with focused HTTP/SSE failure assertions, and available service logs for
 The release workflow attaches its chosen report to the GitHub Release for
 longer term access.
 
+This is the GPU-specific report. Releases also publish a broader
+[CI evidence report](../release.md#changelog) with exact-commit workflow, job,
+and step outcomes in `release-qualification.md` and `release-qualification.json`.
+An unavailable GPU result does not hide successful unit, integration, SDK,
+security, or other CI results. The CI report never counts simulator or CPU
+jobs as live GPU qualification.
+
 ## Report version and interpretation
 
-The report has `schema_version: 2` and
+The report has `schema_version: 3` and
 `profile: responses-gateway-live-vllm-gpu`. The combined GPU execution records
 native `/v1/responses` and Responses-to-Chat `/v1/chat/completions` results
 separately. `gateway.checkout_sha` comes from `git rev-parse HEAD` inside the
 GPU checkout. The workflow SHA and attempt are
 recorded separately. `gateway.binary_sha256` identifies the locally built
 debug/full gateway binary; it is **not** the separately published release
-container. `backend.local_image_id` is the immutable ID of the locally built
-model-baked vLLM image. Its mutable tag is recorded separately and
-`registry_digest` remains null. The Containerfile hash and model ID are build
-inputs; the resolved model revision is null when the image build cannot expose
-it. Null provenance means unavailable, not an inferred value.
+container.
+
+`backend.local_image_id` is the immutable ID of the model-baked vLLM image the
+suite served, and its mutable tag is recorded separately. The suite reuses the
+build published by `vllm-gpu-container.yaml` when it matches the checkout and
+builds from source otherwise, so the report states which:
+
+| Field | Meaning |
+| --- | --- |
+| `backend.image_source` | `registry` for a pulled image, `local-build` for one built on the runner. |
+| `backend.registry_digest` | The pulled image's digest. Null for a local build, which has none. |
+| `backend.built_from_commit` | Commit the image was built from, read from its `org.opencontainers.image.revision` label. |
+| `backend.containerfile_sha256` | Hash of the `Containerfile` the **image** was built from, read from its label — not a hash of the working tree, which may describe a build that never happened on this runner. |
+| `backend.base_image` | The `FROM` reference the image was built on, read from its label. |
+
+The model ID is a build input; the resolved model revision is null when the
+image build cannot expose it. Null provenance means unavailable, not an
+inferred value.
 
 | Field | Meaning |
 | --- | --- |
@@ -74,7 +94,7 @@ the workflow, build the gateway and run the existing suite with the reporting
 plugin:
 
 ```console
-cargo build -p praxis-ai-proxy --features full
+cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
 PRAXIS_QUALIFICATION_RESULTS=/tmp/responses-cases.json \
   DATABASE_URL=postgres://praxis:praxis@127.0.0.1:5432/praxis \
   VLLM_MODEL=Qwen/Qwen3-8B VLLM_TEST_BACKEND=live \
@@ -120,10 +140,13 @@ If the tag is already pushed, dispatch with `--ref v0.4.2`, wait for the hosted
 summary, then manually rerun the Release workflow on that tag. Replace
 `v0.4.2` and `RUN_ID` with the actual tag and run. The release job uses generated
 changelog text, inserts
-one marked qualification section, attaches `qualification.json`, and verifies
-both. Reruns replace the section and asset; repository release immutability
-settings may reject an update, which is surfaced as a workflow error.
+marked CI and GPU qualification sections, attaches all three reports, and
+verifies their presence. Reruns replace the sections and assets; repository
+release immutability settings may reject an update, which is surfaced as a
+workflow error.
 
 A synthetic, reviewable notes fixture lives in
 `tests/qualification/release-notes.fixture.md`. It demonstrates the rendered
 section and idempotent composition; it is not real GPU qualification evidence.
+The broader CI summary has a separate synthetic fixture at
+`tests/qualification/release-ci-notes.fixture.md`.

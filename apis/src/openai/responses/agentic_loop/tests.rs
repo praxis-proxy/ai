@@ -5,14 +5,20 @@
 
 use bytes::Bytes;
 use http::Method;
-use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode, TrustedHeaderMutation};
+use praxis_filter::{
+    ClientResponseHeadersCommitted, FilterAction, HttpFilter, SubRequestResponseMode, TrustedHeaderMutation,
+};
 use serde_json::{Value, json};
 
-use super::super::state::ResponsesState;
+use super::{super::budget::SimpleBudget, collect_output_items};
+#[cfg(feature = "openai-mcp-tools")]
+use crate::openai::responses::mcp_admission::ConnectorToolPolicy;
 #[cfg(feature = "openai-mcp-tools")]
 use crate::openai::responses::state::DeferredMcpConnector;
 use crate::{
-    openai::responses::state::{DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind},
+    openai::responses::state::{
+        DispatchFailure, FileSearchAssignment, McpApprovalState, ResponsesState, SynthesisKind,
+    },
     test_utils::{make_filter_context, make_request},
 };
 // `service` (and the store-scoped `StateOwner` path) are gated behind `store`, so
@@ -28,7 +34,7 @@ use crate::{
 #[cfg(feature = "store")]
 fn assert_collected_rounds_reconcile(streaming: bool) {
     let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "question"}));
-    let first = json!({"output": [
+    let mut first = json!({"output": [
         {"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "first"}]},
         {"type": "web_search_call", "id": "ws_1", "status": "completed"},
         {"type": "message", "id": "msg_1", "role": "assistant", "content": "searching"}
@@ -37,7 +43,7 @@ fn assert_collected_rounds_reconcile(streaming: bool) {
         state.response_object = first;
         super::collect_streaming_output_items(&mut state);
     } else {
-        super::collect_output_items(&first, &mut state, &[]);
+        collect_output_items(&mut first, &mut state, &[]);
     }
     assert_eq!(state.collected_rounds[0].output_start, 0);
     assert_eq!(state.collected_rounds[0].output_end, 3);
@@ -49,7 +55,7 @@ fn assert_collected_rounds_reconcile(streaming: bool) {
     state.persisted_messages.push(json!({
         "type": "function_call_output", "call_id": "call_1", "output": "result"
     }));
-    let second = json!({"output": [
+    let mut second = json!({"output": [
         {"type": "message", "id": "msg_2", "role": "assistant", "content": "answer"},
         {"type": "reasoning", "id": "rs_2", "content": [{"type": "reasoning_text", "text": "late"}]}
     ]});
@@ -57,7 +63,7 @@ fn assert_collected_rounds_reconcile(streaming: bool) {
         state.response_object = second;
         super::collect_streaming_output_items(&mut state);
     } else {
-        super::collect_output_items(&second, &mut state, &[]);
+        collect_output_items(&mut second, &mut state, &[]);
     }
     assert_eq!(state.collected_rounds[1].output_start, 3);
     assert_eq!(state.collected_rounds[1].output_end, 5);
@@ -124,7 +130,7 @@ fn streaming_collector_provenance_reconciles_stored_rounds() {
 fn assert_collected_compaction_stored_once(streaming: bool) {
     let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "question"}));
     let compaction = json!({"type": "compaction", "id": "cmp_1", "encrypted_content": "provider-state"});
-    let response = json!({"output": [
+    let mut response = json!({"output": [
         compaction.clone(),
         {"type": "message", "id": "msg_1", "role": "assistant", "content": "answer"}
     ]});
@@ -132,7 +138,7 @@ fn assert_collected_compaction_stored_once(streaming: bool) {
         state.response_object = response;
         super::collect_streaming_output_items(&mut state);
     } else {
-        super::collect_output_items(&response, &mut state, &[]);
+        collect_output_items(&mut response, &mut state, &[]);
     }
     assert!(
         state
@@ -181,6 +187,394 @@ fn streaming_collector_stores_compaction_once() {
     assert_collected_compaction_stored_once(true);
 }
 
+#[test]
+fn buffered_round_moves_public_output_payload_without_reallocating_it() {
+    let mut response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "client_tool",
+            "arguments": "x".repeat(256 * 1024),
+            "status": "completed"
+        }]
+    });
+    let payload_ptr = response["output"][0]["arguments"].as_str().unwrap().as_ptr();
+    let mut state = ResponsesState::default();
+    collect_output_items(&mut response, &mut state, &[]);
+
+    assert!(response["output"].as_array().unwrap().is_empty());
+    assert_eq!(
+        state.accumulated_output[0]["arguments"].as_str().unwrap().as_ptr(),
+        payload_ptr
+    );
+    assert_eq!(state.selected_tool_calls()[0]["id"], "fc_1");
+    assert_ne!(state.messages[0]["arguments"].as_str().unwrap().as_ptr(), payload_ptr);
+    assert_ne!(
+        state.persisted_messages[0]["arguments"].as_str().unwrap().as_ptr(),
+        payload_ptr
+    );
+}
+
+#[test]
+fn indexed_buffered_collection_allocates_less_than_payload_dispatch_copies() {
+    let response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_large",
+            "call_id": "call_large",
+            "name": "server__lookup",
+            "arguments": "x".repeat(256 * 1024),
+            "status": "completed"
+        }]
+    });
+    let mut old_response = response.clone();
+    let mut new_response = response;
+    let mut old_state = ResponsesState::default();
+    let mut new_state = ResponsesState::default();
+    let mut old_dispatch = Vec::new();
+
+    let old = allocation_counter::measure(|| {
+        for item in old_response["output"].as_array_mut().unwrap().iter() {
+            old_state.accumulated_output.push(item.clone());
+            old_dispatch.push(item.clone());
+            old_state.messages.push(item.clone());
+            old_state.persisted_messages.push(item.clone());
+        }
+        std::hint::black_box(&old_dispatch);
+    });
+    let new = allocation_counter::measure(|| {
+        collect_output_items(&mut new_response, &mut new_state, &[]);
+        std::hint::black_box(&new_state);
+    });
+
+    assert_eq!(new_state.selected_tool_calls().len(), 1);
+    assert_eq!(new_state.messages, old_state.messages);
+    assert_eq!(new_state.persisted_messages, old_state.persisted_messages);
+    assert_eq!(new_state.accumulated_output, old_state.accumulated_output);
+    assert!(
+        old.bytes_total >= new.bytes_total + 2 * 256 * 1024,
+        "removing the accumulated and dispatch deep copies should save two payloads: old={} new={}",
+        old.bytes_total,
+        new.bytes_total
+    );
+    assert!(
+        old.count_total > new.count_total,
+        "old payload copies allocated {} times; indexed collection allocated {} times",
+        old.count_total,
+        new.count_total
+    );
+    assert!(
+        old.bytes_max >= new.bytes_max + 2 * 256 * 1024,
+        "old retained copies peaked at {} bytes; indexed collection peaked at {} bytes",
+        old.bytes_max,
+        new.bytes_max
+    );
+}
+
+#[test]
+fn indexed_collection_saves_copies_for_many_small_items() {
+    // Companion to the single-long-string probe above: the same total payload
+    // (256 KiB) split across many small items. Indexed dispatch must still avoid
+    // the per-item accumulated and dispatch deep copies, so all three metrics
+    // (allocation count, cumulative bytes, peak live bytes) improve.
+    const ITEMS: usize = 256;
+    const ITEM_BYTES: usize = 1024;
+    let total_payload = (ITEMS * ITEM_BYTES) as u64;
+    let output: Vec<Value> = (0..ITEMS)
+        .map(|i| {
+            json!({
+                "type": "function_call",
+                "id": format!("fc_{i}"),
+                "call_id": format!("call_{i}"),
+                "name": "server__lookup",
+                "arguments": "x".repeat(ITEM_BYTES),
+                "status": "completed"
+            })
+        })
+        .collect();
+    let response = json!({ "object": "response", "output": output });
+    let mut old_response = response.clone();
+    let mut new_response = response;
+    let mut old_state = ResponsesState::default();
+    let mut new_state = ResponsesState::default();
+    let mut old_dispatch = Vec::new();
+
+    let old = allocation_counter::measure(|| {
+        for item in old_response["output"].as_array_mut().unwrap().iter() {
+            old_state.accumulated_output.push(item.clone());
+            old_dispatch.push(item.clone());
+            old_state.messages.push(item.clone());
+            old_state.persisted_messages.push(item.clone());
+        }
+        std::hint::black_box(&old_dispatch);
+    });
+    let new = allocation_counter::measure(|| {
+        collect_output_items(&mut new_response, &mut new_state, &[]);
+        std::hint::black_box(&new_state);
+    });
+
+    assert_eq!(
+        new_state.selected_tool_calls().len(),
+        ITEMS,
+        "indexed collection must preserve every selected tool call"
+    );
+    assert_eq!(
+        new_state.messages, old_state.messages,
+        "indexed collection must preserve messages"
+    );
+    assert_eq!(
+        new_state.persisted_messages, old_state.persisted_messages,
+        "indexed collection must preserve persisted messages"
+    );
+    assert_eq!(
+        new_state.accumulated_output, old_state.accumulated_output,
+        "indexed collection must preserve accumulated output"
+    );
+    assert!(
+        old.bytes_total >= new.bytes_total + 2 * total_payload,
+        "removing the accumulated and dispatch deep copies should save two payloads: old={} new={}",
+        old.bytes_total,
+        new.bytes_total
+    );
+    assert!(
+        old.count_total > new.count_total,
+        "old payload copies allocated {} times; indexed collection allocated {} times",
+        old.count_total,
+        new.count_total
+    );
+    assert!(
+        old.bytes_max >= new.bytes_max + 2 * total_payload,
+        "old retained copies peaked at {} bytes; indexed collection peaked at {} bytes",
+        old.bytes_max,
+        new.bytes_max
+    );
+}
+
+#[test]
+fn streamed_round_moves_public_output_payload_without_reallocating_it() {
+    let mut state = ResponsesState {
+        response_object: json!({
+            "object": "response",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "client_tool",
+                "arguments": "x".repeat(256 * 1024),
+                "status": "completed"
+            }]
+        }),
+        ..ResponsesState::default()
+    };
+    let payload_ptr = state.response_object["output"][0]["arguments"]
+        .as_str()
+        .unwrap()
+        .as_ptr();
+    super::collect_streaming_output_items(&mut state);
+
+    assert!(state.output_items().is_empty());
+    assert_eq!(
+        state.accumulated_output[0]["arguments"].as_str().unwrap().as_ptr(),
+        payload_ptr
+    );
+    assert_eq!(state.selected_tool_calls()[0]["id"], "fc_1");
+}
+
+#[test]
+fn buffered_round_assignments_keep_output_and_history_order_across_rounds() {
+    let mut state = ResponsesState::default();
+    let mut first = json!({"object": "response", "output": [
+        {"type": "reasoning", "id": "r_1", "summary": []},
+        {"type": "function_call", "id": "fc_1", "call_id": "c_1", "name": "server__lookup", "arguments": "{}", "status": "completed"},
+        {"type": "function_call", "id": "fc_partial", "call_id": "c_partial", "name": "client", "status": "in_progress"},
+        {"type": "web_search_call", "id": "ws_1", "action": {"type": "search", "query": "q"}},
+        {"type": "tool_search_call", "id": "ts_1", "status": "completed"}
+    ]});
+    collect_output_items(&mut first, &mut state, &[]);
+    assert_eq!(state.selected_tool_calls().len(), 1);
+    assert_eq!(state.selected_web_search_calls().len(), 1);
+    assert_eq!(state.selected_tool_search_calls().len(), 1);
+    let first_assignment = state.tool_calls[0].clone();
+
+    let tool_output = json!({"type": "function_call_output", "call_id": "c_1", "output": "found"});
+    state.messages.push(tool_output.clone());
+    state.persisted_messages.push(tool_output);
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    super::prepare_iteration(&mut ctx, &mut state);
+    let mut second = json!({"object": "response", "output": [
+        {"type": "reasoning", "id": "r_2", "summary": []},
+        {"type": "function_call", "id": "fc_2", "call_id": "c_2", "name": "client", "arguments": "{}", "status": "completed"}
+    ]});
+    collect_output_items(&mut second, &mut state, &[]);
+
+    let ids: Vec<_> = state
+        .accumulated_output
+        .iter()
+        .map(|item| item["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            Some("r_1"),
+            Some("fc_1"),
+            Some("fc_partial"),
+            Some("ws_1"),
+            Some("ts_1"),
+            Some("r_2"),
+            Some("fc_2")
+        ]
+    );
+    let message_types: Vec<_> = state.messages.iter().map(|item| item["type"].as_str()).collect();
+    assert_eq!(
+        message_types,
+        vec![
+            Some("reasoning"),
+            Some("function_call"),
+            Some("function_call_output"),
+            Some("reasoning"),
+            Some("function_call")
+        ]
+    );
+    let persisted_types: Vec<_> = state
+        .persisted_messages
+        .iter()
+        .map(|item| item["type"].as_str())
+        .collect();
+    assert_eq!(
+        persisted_types,
+        vec![
+            Some("reasoning"),
+            Some("function_call"),
+            Some("web_search_call"),
+            Some("tool_search_call"),
+            Some("function_call_output"),
+            Some("reasoning"),
+            Some("function_call")
+        ]
+    );
+    assert_eq!(state.selected_tool_calls().len(), 1);
+    assert_eq!(state.selected_tool_calls()[0]["id"], "fc_2");
+    assert!(
+        first_assignment
+            .resolve(
+                &state.accumulated_output,
+                state.current_round_output_start.unwrap_or(0),
+                "function_call"
+            )
+            .is_none()
+    );
+}
+
+#[test]
+fn streamed_round_assignments_keep_one_output_owner_across_rounds() {
+    let mut state = ResponsesState {
+        response_object: json!({"object": "response", "status": "completed", "output": [
+            {"type": "function_call", "id": "fc_1", "call_id": "c_1", "name": "server__lookup", "arguments": "{}", "status": "completed"},
+            {"type": "web_search_call", "id": "ws_1", "action": {"type": "search", "query": "first"}}
+        ]}),
+        ..ResponsesState::default()
+    };
+    super::collect_streaming_output_items(&mut state);
+    assert!(state.output_items().is_empty());
+    assert_eq!(state.selected_tool_calls()[0]["id"], "fc_1");
+    assert_eq!(state.selected_web_search_calls()[0]["id"], "ws_1");
+    let first_assignment = state.tool_calls[0].clone();
+
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    super::prepare_iteration(&mut ctx, &mut state);
+    state.response_object = json!({"object": "response", "status": "completed", "output": [
+        {"type": "reasoning", "id": "r_2", "summary": []},
+        {"type": "function_call", "id": "fc_2", "call_id": "c_2", "name": "client", "arguments": "{}", "status": "completed"},
+        {"type": "tool_search_call", "id": "ts_2", "status": "completed"}
+    ]});
+    super::collect_streaming_output_items(&mut state);
+
+    assert_eq!(state.current_round_output_start, Some(2));
+    assert!(state.output_items().is_empty());
+    assert_eq!(state.selected_tool_calls().len(), 1);
+    assert_eq!(state.selected_tool_calls()[0]["id"], "fc_2");
+    assert!(state.selected_web_search_calls().is_empty());
+    assert_eq!(state.selected_tool_search_calls()[0]["id"], "ts_2");
+    assert_eq!(
+        state
+            .accumulated_output
+            .iter()
+            .map(|item| item["id"].as_str())
+            .collect::<Vec<_>>(),
+        [Some("fc_1"), Some("ws_1"), Some("r_2"), Some("fc_2"), Some("ts_2")]
+    );
+    assert_eq!(
+        state
+            .messages
+            .iter()
+            .map(|item| item["id"].as_str())
+            .collect::<Vec<_>>(),
+        [Some("fc_1"), Some("r_2"), Some("fc_2")]
+    );
+    assert_eq!(
+        state
+            .persisted_messages
+            .iter()
+            .map(|item| item["id"].as_str())
+            .collect::<Vec<_>>(),
+        [Some("fc_1"), Some("ws_1"), Some("r_2"), Some("fc_2"), Some("ts_2")]
+    );
+    state.tool_calls.push(first_assignment);
+    assert_eq!(
+        state.selected_tool_calls().len(),
+        1,
+        "a stale prior-round selection cannot dispatch"
+    );
+}
+
+#[test]
+fn stale_tool_search_selection_cannot_rewrite_prior_output_or_history() {
+    let prior = json!({"type": "tool_search_call", "id": "ts_duplicate", "status": "completed", "action": "prior"});
+    let current = json!({"type": "tool_search_call", "id": "ts_duplicate", "status": "completed", "action": "current"});
+    let mut state = ResponsesState {
+        accumulated_output: vec![prior.clone(), current.clone()],
+        persisted_messages: vec![prior.clone(), current].into(),
+        max_tool_calls: Some(0),
+        ..ResponsesState::default()
+    };
+    state.select_test_output("tool_search_call", vec![state.accumulated_output[1].clone()]);
+    state.accumulated_output[1] = json!({"type": "function_call", "id": "ts_duplicate"});
+
+    super::mark_over_budget_tool_searches_incomplete(&mut state);
+
+    assert!(state.tool_search_calls.is_empty());
+    assert_eq!(state.accumulated_output[0], prior);
+    assert_eq!(state.persisted_messages[0]["status"], "completed");
+    assert_eq!(state.persisted_messages[1]["status"], "completed");
+}
+
+#[test]
+fn over_budget_tool_search_reusing_prior_id_marks_only_current_round() {
+    let prior = json!({"type": "tool_search_call", "id": "ts_duplicate", "status": "completed", "action": "prior"});
+    let current = json!({"type": "tool_search_call", "id": "ts_duplicate", "status": "completed", "action": "current"});
+    let mut state = ResponsesState {
+        accumulated_output: vec![prior.clone(), current.clone()],
+        persisted_messages: vec![prior.clone(), current.clone()].into(),
+        current_round_output_start: Some(1),
+        max_tool_calls: Some(0),
+        ..ResponsesState::default()
+    };
+    state.select_test_output("tool_search_call", vec![current]);
+
+    super::mark_over_budget_tool_searches_incomplete(&mut state);
+
+    assert!(state.tool_search_calls.is_empty());
+    assert_eq!(state.accumulated_output[0], prior);
+    assert_eq!(state.persisted_messages[0], prior);
+    assert_eq!(state.accumulated_output[1]["status"], "incomplete");
+    assert_eq!(state.persisted_messages[1]["status"], "incomplete");
+}
+
 // -----------------------------------------------------------------------------
 // Config Parsing
 // -----------------------------------------------------------------------------
@@ -218,6 +612,270 @@ fn from_config_rejects_zero_max_infer_iters() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_infer_iters: 0").unwrap();
     let result = super::AgenticLoopFilter::from_config(&yaml);
     assert!(result.is_err(), "max_infer_iters=0 should be rejected");
+}
+
+#[tokio::test]
+async fn budgeted_loop_rejects_missing_initializer_before_dispatch() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions
+        .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 500));
+}
+
+#[tokio::test]
+async fn budgeted_loop_leaves_non_create_requests_alone() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions
+        .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test]
+async fn budgeted_loop_rejects_compact_without_earlier_handler() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses/compact");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions
+        .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Reject(rejection) if rejection.status == 400),
+        "a missing compact handler must reject before IRR dispatch"
+    );
+}
+
+#[test]
+fn budgeted_buffered_output_rejects_before_json_parse() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input":"hello","store":false}));
+    state.simple_budget = Some(SimpleBudget::new(4_096, 0).unwrap());
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "object":"response", "output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}]
+        }))
+        .unwrap(),
+    ));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn streaming_round_boundary_overflow_emits_terminal_sse_error() {
+    // A streaming request has already committed `text/event-stream` by the time a
+    // mid-loop round completes, so a retained-output overflow at the round boundary
+    // must terminate the committed stream with one terminal SSE `error` event
+    // (handed to `openai_stream_events`) and `Continue` — never a JSON 502 reject.
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input": "hi", "stream": true}));
+    state.simple_budget = Some(SimpleBudget::new(64, 0).unwrap());
+    let overflow = "X".repeat(512);
+    state.accumulated_output = vec![json!({
+        "type": "message",
+        "content": [{"type": "output_text", "text": overflow}],
+    })];
+    state.current_round_output_start = Some(0);
+
+    let action = super::release_completed_round(&mut ctx, &mut state)
+        .unwrap()
+        .expect("retained overflow must terminate the round");
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a committed stream cannot be rejected; the terminal error rides the stream"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        Some("server_error"),
+        "stream exhaustion must be reported as a server_error"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some("The request exceeds a processing limit set by the platform administrator."),
+        "the terminal error must use the sanitized client-facing message"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "an exhausted stream must not persist a successful response"
+    );
+    assert_eq!(
+        ctx.filter_results["openai_agentic_loop"].get("action"),
+        Some("done"),
+        "the stream must end the agentic loop after exhaustion"
+    );
+}
+
+#[test]
+fn buffered_round_boundary_overflow_rejects_with_json_502() {
+    // The buffered path has committed nothing, so the same round-boundary overflow
+    // still surfaces the JSON 502 error envelope and sets no stream-error metadata.
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input": "hi"}));
+    state.simple_budget = Some(SimpleBudget::new(64, 0).unwrap());
+    let overflow = "X".repeat(512);
+    state.accumulated_output = vec![json!({
+        "type": "message",
+        "content": [{"type": "output_text", "text": overflow}],
+    })];
+    state.current_round_output_start = Some(0);
+
+    let action = super::release_completed_round(&mut ctx, &mut state)
+        .unwrap()
+        .expect("retained overflow must terminate the round");
+    assert!(
+        matches!(action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "buffered round exhaustion must reject with HTTP 502"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        None,
+        "a buffered rejection must not set streaming error metadata"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "an exhausted buffered response must not be persisted as successful"
+    );
+    assert_eq!(
+        ctx.filter_results["openai_agentic_loop"].get("action"),
+        Some("done"),
+        "the agentic loop must end after buffered exhaustion"
+    );
+}
+
+#[test]
+fn preparse_filter_reserves_against_existing_responses_state() {
+    let policy =
+        super::super::AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 65536").unwrap())
+            .unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input":"hello","store":false}));
+    state.simple_budget = Some(SimpleBudget::new(65_536, 1_000).unwrap());
+    ctx.extensions.insert(state);
+    let raw = br#"{"model":"gpt-4.1","input":"hello","messages":[]}"#;
+    let charge = super::super::AgenticBudgetPolicy::input_charge(raw).unwrap() + 2_000;
+    let before = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .simple_budget
+        .unwrap()
+        .remaining_bytes()
+        .unwrap();
+
+    assert!(policy.has_body_headroom(&ctx, raw, 0));
+    assert!(policy.reserve_body_projection(&mut ctx, raw, 2_000));
+    let after = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .simple_budget
+        .unwrap()
+        .remaining_bytes()
+        .unwrap();
+    assert_eq!(before - after, charge);
+    assert!(!policy.reserve_body_projection(&mut ctx, raw, before));
+
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().simple_budget = None;
+    assert!(!policy.has_body_headroom(&ctx, raw, 0));
+    assert!(!policy.reserve_body_projection(&mut ctx, raw, 0));
+}
+
+#[test]
+fn budgeted_typed_model_output_preserves_response() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input":"hello","store":false}));
+    state.simple_budget = Some(SimpleBudget::new(1_048_576, 0).unwrap());
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "object":"response", "status":"completed", "output":[
+                {"type":"message","content":[{"type":"output_audio","audio":"YQ=="}]},
+                {"type":"image_generation_call","status":"completed","result":"YQ=="}
+            ]
+        }))
+        .unwrap(),
+    ));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+    let response: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(response["output"][0]["content"][0]["audio"], "YQ==");
+    assert_eq!(response["output"][1]["result"], "YQ==");
+}
+
+#[test]
+fn budgeted_plain_buffered_response_succeeds() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input":"hello","store":false}));
+    state.simple_budget = Some(SimpleBudget::new(1_048_576, 0).unwrap());
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&json!({
+        "object":"response", "status":"completed", "output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}]
+    })).unwrap()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+    let response: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(response["output"][0]["content"][0]["text"], "hello");
+}
+
+#[test]
+fn budgeted_reasoning_and_refusal_response_succeeds() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input":"hello","store":false}));
+    state.simple_budget = Some(SimpleBudget::new(1_048_576, 0).unwrap());
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "object":"response", "status":"completed", "output":[
+                {"type":"reasoning","id":"rs_1","summary":[]},
+                {"type":"message","id":"msg_1","content":[{"type":"refusal","refusal":"I cannot help with that"}]}
+            ]
+        }))
+        .unwrap(),
+    ));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "reasoning and refusal are valid plain output"
+    );
+    let response: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(response["output"][0]["type"], "reasoning");
+    assert_eq!(response["output"][1]["content"][0]["type"], "refusal");
+}
+
+#[test]
+fn from_config_matches_router_iteration_ceiling() {
+    let ceiling = praxis_core::config::MAX_ITERATIONS_CEILING;
+    for (value, accepted) in [(1, true), (ceiling, true), (ceiling.saturating_add(1), false)] {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("max_infer_iters: {value}")).unwrap();
+        assert_eq!(
+            super::AgenticLoopFilter::from_config(&yaml).is_ok(),
+            accepted,
+            "max_infer_iters={value}"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -820,23 +1478,14 @@ fn incomplete_stream_does_not_dispatch_accumulated_tool_call() {
         "input": "test",
         "stream": true
     }));
-    state.tool_calls.push(json!({
-        "type": "function_call",
-        "call_id": "call_partial",
-        "name": "must_not_run",
-        "arguments": "{}",
-        "status": "completed"
-    }));
-    state.tool_search_calls.push(json!({
-        "type": "tool_search_call",
-        "id": "tsc_partial",
-        "status": "completed"
-    }));
     state.response_object = json!({
         "id": "resp_incomplete",
         "object": "response",
         "status": "incomplete",
-        "output": [{
+        "output": [
+        {"type": "function_call", "call_id": "call_partial", "name": "must_not_run", "arguments": "{}", "status": "completed"},
+        {"type": "tool_search_call", "id": "tsc_partial", "status": "completed"},
+        {
             "type": "message",
             "id": "msg_partial",
             "status": "incomplete",
@@ -844,13 +1493,6 @@ fn incomplete_stream_does_not_dispatch_accumulated_tool_call() {
             "content": [{"type": "output_text", "text": "partial"}]
         }]
     });
-    let partial_output = state
-        .response_object
-        .get("output")
-        .and_then(Value::as_array)
-        .expect("incomplete response should have output")
-        .clone();
-    state.output_items_mut().clone_from(&partial_output);
     ctx.set_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
@@ -873,7 +1515,7 @@ fn incomplete_stream_does_not_dispatch_accumulated_tool_call() {
         "a tool_search_call from a truncated stream must not remain dispatchable"
     );
     assert_eq!(
-        ctx.extensions.get::<ResponsesState>().unwrap().accumulated_output[0]["id"],
+        ctx.extensions.get::<ResponsesState>().unwrap().accumulated_output[2]["id"],
         "msg_partial",
         "partial output from an incomplete response must remain client-visible"
     );
@@ -890,18 +1532,13 @@ fn failed_stream_does_not_dispatch_accumulated_tool_call() {
         "input": "test",
         "stream": true
     }));
-    state.tool_calls.push(json!({
-        "type": "function_call",
-        "call_id": "call_failed",
-        "name": "must_not_run",
-        "arguments": "{}",
-        "status": "completed"
-    }));
     state.response_object = json!({
         "id": "resp_failed",
         "object": "response",
         "status": "failed",
-        "output": [{
+        "output": [
+        {"type": "function_call", "call_id": "call_failed", "name": "must_not_run", "arguments": "{}", "status": "completed"},
+        {
             "type": "message",
             "id": "msg_before_failure",
             "status": "incomplete",
@@ -909,13 +1546,6 @@ fn failed_stream_does_not_dispatch_accumulated_tool_call() {
             "content": [{"type": "output_text", "text": "before failure"}]
         }]
     });
-    let partial_output = state
-        .response_object
-        .get("output")
-        .and_then(Value::as_array)
-        .expect("failed response should retain partial output")
-        .clone();
-    state.output_items_mut().clone_from(&partial_output);
     ctx.set_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
@@ -930,7 +1560,7 @@ fn failed_stream_does_not_dispatch_accumulated_tool_call() {
         "a provider-failed response must not authorize tool execution"
     );
     assert_eq!(
-        ctx.extensions.get::<ResponsesState>().unwrap().accumulated_output[0]["id"],
+        ctx.extensions.get::<ResponsesState>().unwrap().accumulated_output[1]["id"],
         "msg_before_failure",
         "partial output preceding a provider failure must remain client-visible"
     );
@@ -995,11 +1625,10 @@ fn multiple_streamed_client_function_calls_end_done() {
         "input": "test",
         "stream": true
     }));
-    state.tool_calls = vec![
-        json!({"type": "function_call", "call_id": "call_1", "name": "first", "status": "completed"}),
-        json!({"type": "function_call", "call_id": "call_2", "name": "second", "status": "completed"}),
-    ];
-    state.response_object = json!({"id": "resp_multiple", "object": "response", "status": "completed", "output": []});
+    state.response_object = json!({"id": "resp_multiple", "object": "response", "status": "completed", "output": [
+        {"type": "function_call", "call_id": "call_1", "name": "first", "status": "completed"},
+        {"type": "function_call", "call_id": "call_2", "name": "second", "status": "completed"}
+    ]});
     ctx.set_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
@@ -1031,15 +1660,14 @@ fn mixed_streamed_function_call_ownership_fails_before_dispatch() {
         "input": "test",
         "stream": true
     }));
-    state.tool_calls = vec![
-        json!({"type": "function_call", "call_id": "call_1", "name": "server__lookup", "status": "completed"}),
-        json!({"type": "function_call", "call_id": "call_2", "name": "client", "status": "completed"}),
-    ];
     state.mcp_tool_map.insert(
         ("server".to_owned(), "lookup".to_owned()),
         json!({"server_label":"server", "server_url":"http://example.com", "require_approval":"never"}),
     );
-    state.response_object = json!({"id": "resp_multiple", "object": "response", "status": "completed", "output": []});
+    state.response_object = json!({"id": "resp_multiple", "object": "response", "status": "completed", "output": [
+        {"type": "function_call", "call_id": "call_1", "name": "server__lookup", "status": "completed"},
+        {"type": "function_call", "call_id": "call_2", "name": "client", "status": "completed"}
+    ]});
     ctx.set_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
@@ -1076,18 +1704,10 @@ fn streaming_iteration_limit_ends_with_sse_error() {
         ("server".to_owned(), "lookup".to_owned()),
         json!({"server_label": "server", "server_url": "http://example.com", "require_approval": "never"}),
     );
-    state.tool_calls = vec![json!({
-        "type": "function_call",
-        "call_id": "call_limit",
-        "name": "server__lookup",
-        "status": "completed"
-    })];
-    state.tool_search_calls = vec![json!({
-        "type": "tool_search_call",
-        "id": "tsc_limit",
-        "status": "completed"
-    })];
-    state.response_object = json!({"id": "resp_limit", "object": "response", "status": "completed", "output": []});
+    state.response_object = json!({"id": "resp_limit", "object": "response", "status": "completed", "output": [
+        {"type": "function_call", "call_id": "call_limit", "name": "server__lookup", "status": "completed"},
+        {"type": "tool_search_call", "id": "tsc_limit", "status": "completed"}
+    ]});
     ctx.set_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
@@ -1303,7 +1923,11 @@ fn any_dispatchable_call_type_sets_loop() {
     let mcp = make_state_with_mcp_tool_calls(vec![mcp_tool_call("call_1")]);
 
     let mut web = make_state_with_tool_calls(vec![]);
-    web.web_search_calls = vec![json!({"type": "web_search_call", "id": "ws_1", "status": "completed"})];
+    web.response_object = json!({
+        "object": "response",
+        "status": "completed",
+        "output": [{"type": "web_search_call", "id": "ws_1", "status": "completed"}],
+    });
 
     // A pending hosted file_search_call is recorded by the parse owner as a
     // `FileSearchAssignment` (issue #1046), so drive it through the response
@@ -1368,7 +1992,7 @@ fn default_config_has_max_infer_iters_ten() {
 
     let mut state = ctx.extensions.remove::<ResponsesState>().unwrap();
     assert_eq!(state.iteration, 10, "iteration should have incremented to 10");
-    state.tool_calls = vec![mcp_tool_call("call_2")];
+    state.response_object["output"] = json!([mcp_tool_call("call_2")]);
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -1399,7 +2023,7 @@ fn max_infer_iters_one_allows_exactly_one_loop() {
     let mut state = ctx.extensions.remove::<ResponsesState>().unwrap();
     assert_eq!(state.iteration, 1, "should have incremented to 1");
 
-    state.tool_calls = vec![mcp_tool_call("call_2")];
+    state.response_object["output"] = json!([mcp_tool_call("call_2")]);
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -1568,7 +2192,7 @@ fn all_client_executed_call_types_conflict_with_mcp_dispatch() {
         // the streamed round out of `response_object` before the check runs), so
         // the client-owned call must sit in `accumulated_output` from index
         // the explicit `current_round_output_start` onward.
-        state.accumulated_output = vec![client_call.clone()];
+        state.accumulated_output.push(client_call.clone());
         state.current_round_output_start = Some(0);
 
         assert!(
@@ -1590,10 +2214,10 @@ fn hosted_container_shell_call_does_not_conflict_with_mcp_dispatch() {
     // A container-referenced shell_call is hosted, not client-executed, so even
     // in this round's accumulated output it must not trip the mixed-ownership
     // guard.
-    state.accumulated_output = vec![json!({
+    state.accumulated_output.push(json!({
         "type":"shell_call", "call_id":"c2",
         "environment":{"type":"container_reference", "container_id":"cntr_1"}
-    })];
+    }));
     state.current_round_output_start = Some(0);
 
     assert!(
@@ -1607,9 +2231,12 @@ fn hosted_tool_search_conflicts_with_client_function_call() {
     let mut state = make_state_with_tool_calls(vec![json!({
         "type":"function_call", "call_id":"c1", "name":"get_weather", "status":"completed"
     })]);
-    state.tool_search_calls = vec![json!({
-        "type":"tool_search_call", "id":"tsc_1", "status":"completed"
-    })];
+    state.select_test_output(
+        "tool_search_call",
+        vec![json!({
+            "type":"tool_search_call", "id":"tsc_1", "status":"completed"
+        })],
+    );
 
     assert!(
         super::has_mixed_function_call_ownership(&state),
@@ -1620,9 +2247,12 @@ fn hosted_tool_search_conflicts_with_client_function_call() {
 #[test]
 fn hosted_tool_search_alone_is_not_mixed_ownership() {
     let mut state = make_state_with_tool_calls(vec![]);
-    state.tool_search_calls = vec![json!({
-        "type":"tool_search_call", "id":"tsc_1", "status":"completed"
-    })];
+    state.select_test_output(
+        "tool_search_call",
+        vec![json!({
+            "type":"tool_search_call", "id":"tsc_1", "status":"completed"
+        })],
+    );
 
     assert!(
         !super::has_mixed_function_call_ownership(&state),
@@ -1859,6 +2489,33 @@ fn filter_results_schema_for_irr_consumers() {
 // -----------------------------------------------------------------------------
 
 #[test]
+fn buffered_output_moves_into_canonical_owner_without_copying_payload() {
+    let mut response = json!({
+        "id": "resp_1",
+        "output": [{
+            "type": "message",
+            "id": "msg_1",
+            "content": [{"type": "output_text", "text": "large answer".repeat(1024)}]
+        }]
+    });
+    let text_before = response["output"][0]["content"][0]["text"].as_str().unwrap().as_ptr();
+    let mut state = ResponsesState::default();
+
+    collect_output_items(&mut response, &mut state, &[]);
+
+    assert_eq!(response["output"], json!([]));
+    assert_eq!(state.accumulated_output.len(), 1);
+    assert_eq!(
+        state.accumulated_output[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .as_ptr(),
+        text_before,
+        "the parsed payload allocation should move into accumulated output"
+    );
+}
+
+#[test]
 fn extracts_tool_calls_from_non_streaming_body() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
@@ -1890,7 +2547,11 @@ fn extracts_tool_calls_from_non_streaming_body() {
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.tool_calls.len(), 1);
-    assert_eq!(state.tool_calls[0]["call_id"], "call_1");
+    assert_eq!(state.tool_calls[0].item_id, "fc_1");
+    assert_eq!(
+        serde_json::from_slice::<Value>(body.as_ref().unwrap()).unwrap()["output"][0]["call_id"],
+        "call_1"
+    );
 }
 
 #[test]
@@ -2200,7 +2861,7 @@ fn web_search_call_extracted_to_web_search_calls_not_tool_calls() {
         1,
         "web_search_call must appear in web_search_calls"
     );
-    assert_eq!(state.web_search_calls[0]["id"], "ws_1");
+    assert_eq!(state.selected_web_search_calls()[0]["id"], "ws_1");
 }
 
 #[test]
@@ -2210,11 +2871,11 @@ fn web_search_call_triggers_loop() {
     let mut ctx = make_filter_context(&req);
 
     let mut state = make_state_with_tool_calls(vec![]);
-    state.web_search_calls = vec![json!({
+    state.response_object = json!({"object": "response", "status": "completed", "output": [{
         "type": "web_search_call",
         "id": "ws_1",
         "action": {"type": "search", "query": "test"}
-    })];
+    }]});
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -2229,11 +2890,11 @@ fn web_search_call_alone_increments_iteration() {
     let mut ctx = make_filter_context(&req);
 
     let mut state = make_state_with_tool_calls(vec![]);
-    state.web_search_calls = vec![json!({
+    state.response_object = json!({"object": "response", "status": "completed", "output": [{
         "type": "web_search_call",
         "id": "ws_1",
         "action": {"type": "search", "query": "test"}
-    })];
+    }]});
     ctx.extensions.insert(state);
 
     drop(filter.on_response_body(&mut ctx, &mut None, true).unwrap());
@@ -2350,11 +3011,11 @@ fn web_search_call_subject_to_iteration_limit() {
     let mut ctx = make_filter_context(&req);
 
     let mut state = make_state_with_tool_calls(vec![]);
-    state.web_search_calls = vec![json!({
+    state.response_object = json!({"object": "response", "status": "completed", "output": [{
         "type": "web_search_call",
         "id": "ws_1",
         "action": {"type": "search", "query": "test"}
-    })];
+    }]});
     state.iteration = 2;
     ctx.extensions.insert(state);
 
@@ -2372,11 +3033,14 @@ async fn web_search_calls_cleared_on_prepare() {
     let mut ctx = make_filter_context(&req);
 
     let mut state = make_state_with_tool_calls(vec![]);
-    state.web_search_calls = vec![json!({
-        "type": "web_search_call",
-        "id": "ws_stale",
-        "action": {"type": "search", "query": "old query"}
-    })];
+    state.select_test_output(
+        "web_search_call",
+        vec![json!({
+            "type": "web_search_call",
+            "id": "ws_stale",
+            "action": {"type": "search", "query": "old query"}
+        })],
+    );
     ctx.extensions.insert(state);
 
     drop(filter.on_request_body(&mut ctx, &mut None, true).await.unwrap());
@@ -2427,7 +3091,7 @@ fn web_search_call_excluded_from_messages_but_persisted() {
 
     assert!(
         state
-            .web_search_calls
+            .selected_web_search_calls()
             .iter()
             .any(|item| item.get("id").and_then(Value::as_str) == Some("ws_1")),
         "web_search_call should be queued in web_search_calls for dispatch"
@@ -3032,7 +3696,7 @@ fn model_output_ordering_survives_all_three_dispatchers() {
 
     // Each dispatcher's target is recorded against its absolute index.
     assert_eq!(state.web_search_calls.len(), 1, "web_search dispatcher target recorded");
-    assert_eq!(state.web_search_calls[0]["id"], "ws_1");
+    assert_eq!(state.selected_web_search_calls()[0]["id"], "ws_1");
     assert_eq!(
         state.file_search_assignments.len(),
         1,
@@ -3048,13 +3712,13 @@ fn model_output_ordering_survives_all_three_dispatchers() {
         "a normalized private call records the private synthesis origin"
     );
     assert_eq!(state.tool_calls.len(), 1, "MCP dispatcher target recorded");
-    assert_eq!(state.tool_calls[0]["name"], "server__lookup");
+    assert_eq!(state.selected_tool_calls()[0]["name"], "server__lookup");
 }
 
 #[test]
 fn buffered_and_streamed_history_share_payloads_and_detach_on_mutation() {
     for streaming in [false, true] {
-        let response = json!({"output": [
+        let mut response = json!({"output": [
             {"type": "function_call", "id": "fc_shared", "call_id": "call_shared",
              "name": "lookup", "arguments": "{}", "status": "completed"},
             {"type": "reasoning", "id": "rs_shared", "summary": []}
@@ -3064,7 +3728,7 @@ fn buffered_and_streamed_history_share_payloads_and_detach_on_mutation() {
             state.response_object = response;
             super::collect_streaming_output_items(&mut state);
         } else {
-            super::collect_output_items(&response, &mut state, &[]);
+            collect_output_items(&mut response, &mut state, &[]);
         }
         assert_eq!(state.messages.len(), 2, "both replay items collected");
         assert_eq!(state.persisted_messages.len(), 2, "both persisted items collected");
@@ -3221,10 +3885,17 @@ async fn dispatch_failure_buffered_rejects_with_json_envelope() {
 
     let mut state = ResponsesState::from_request_body(json!({"model": "gpt-4o", "input": "test"}));
     // Stale per-round bookkeeping the conversion must drop.
-    state.tool_calls = vec![json!({"type": "function_call", "name": "server__lookup", "status": "completed"})];
-    state.web_search_calls = vec![json!({"type": "web_search_call", "id": "ws_1"})];
+    state.select_test_output(
+        "function_call",
+        vec![json!({"type": "function_call", "name": "server__lookup", "status": "completed"})],
+    );
+    state.select_test_output(
+        "web_search_call",
+        vec![json!({"type": "web_search_call", "id": "ws_1"})],
+    );
     state.file_search_assignments = vec![FileSearchAssignment {
         output_index: 0,
+        item_id: "fs_stale".to_owned(),
         synthesis: SynthesisKind::Native,
     }];
     state.dispatch_failure = Some(DispatchFailure {
@@ -3267,6 +3938,7 @@ async fn dispatch_failure_streaming_emits_sse_error_frame() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ClientResponseHeadersCommitted);
 
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4o",
@@ -3304,6 +3976,31 @@ async fn dispatch_failure_streaming_emits_sse_error_frame() {
         Some("true"),
         "the failed streamed round must not be persisted"
     );
+}
+
+#[tokio::test]
+async fn dispatch_failure_before_stream_commit_preserves_http_error_status() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o", "input": "test", "stream": true
+    }));
+    state.dispatch_failure = Some(DispatchFailure {
+        status: 502,
+        code: "server_error",
+        message: "vector store search failed".to_owned(),
+    });
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    let FilterAction::Reject(response) = action else {
+        panic!("a pre-commit failure must reject the request");
+    };
+    assert_eq!(response.status, 502);
+    let body: Value = serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["message"], "vector store search failed");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
 /// A locally-detected security-context failure preempts a generic dispatch failure:
@@ -3353,7 +4050,7 @@ fn make_filter() -> Box<dyn HttpFilter> {
 fn make_state_with_tool_calls(tool_calls: Vec<Value>) -> ResponsesState {
     let body = json!({"model": "gpt-4o", "input": "test"});
     let mut state = ResponsesState::from_request_body(body);
-    state.tool_calls = tool_calls;
+    state.select_test_output("function_call", tool_calls);
     state
 }
 
@@ -3370,7 +4067,70 @@ fn pending_deferred_connector() -> DeferredMcpConnector {
         server_label: "drive".to_owned(),
         server_url: "https://drive.example.com/mcp".to_owned(),
         timeout: std::time::Duration::from_secs(5),
+        tool_policy: ConnectorToolPolicy::default(),
     }
+}
+
+/// A call to a tool denied by operator admission (#1724) is not in
+/// `mcp_tool_map`, but the denied verdict keeps it recognized as MCP-owned so
+/// the loop dispatches it (to be rejected) instead of returning it to the client
+/// as an unresolved function.
+#[cfg(feature = "openai-mcp-tools")]
+#[test]
+fn denied_mcp_call_is_dispatchable_and_server_owned() {
+    use crate::openai::responses::mcp_admission::{
+        McpAdmissionDecisions, McpAdmissionMode, McpAdmissionPolicy, McpDenyReason, McpToolVerdict,
+    };
+
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "x"}));
+    let mut admission = McpAdmissionDecisions::new(McpAdmissionPolicy {
+        mode: McpAdmissionMode::Protected,
+    });
+    admission.record("gw", "delete_repo", McpToolVerdict::Denied(McpDenyReason::Writable));
+    state.mcp_admission = admission;
+    // The denied tool is absent from the dispatch map, exactly as discovery left it.
+    state.select_test_output(
+        "function_call",
+        vec![json!({
+            "type": "function_call",
+            "name": "gw__delete_repo",
+            "call_id": "c1",
+            "arguments": "{}",
+        })],
+    );
+
+    assert!(
+        super::has_dispatchable_mcp_work(&state),
+        "a denied MCP call must keep the loop dispatching so the dispatcher can reject it"
+    );
+    let (has_server, has_client) = super::mcp_call_ownership(&state);
+    assert!(
+        has_server && !has_client,
+        "a denied MCP call must be server-owned, not treated as a client function"
+    );
+}
+
+/// A genuine client-owned function (no admission verdict, not in the map) stays
+/// client-owned and is not forced into MCP dispatch.
+#[cfg(feature = "openai-mcp-tools")]
+#[test]
+fn client_function_stays_client_owned() {
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "x"}));
+    state.select_test_output(
+        "function_call",
+        vec![json!({
+            "type": "function_call",
+            "name": "my_client_fn",
+            "call_id": "c1",
+        })],
+    );
+
+    let (has_server, has_client) = super::mcp_call_ownership(&state);
+    assert!(!has_server && has_client, "a client function must remain client-owned");
+    assert!(
+        !super::has_dispatchable_mcp_work(&state),
+        "a client-only round has no dispatchable MCP work"
+    );
 }
 
 /// A completed `function_call` whose encoded name (`server__lookup`) resolves to
@@ -3398,7 +4158,12 @@ fn mcp_tool_call(call_id: &str) -> Value {
 /// Client (non-MCP) `function_call`s resolve to no dispatcher and signal `done`;
 /// tests that need the loop to continue must drive it with a dispatchable call.
 fn make_state_with_mcp_tool_calls(tool_calls: Vec<Value>) -> ResponsesState {
-    let mut state = make_state_with_tool_calls(tool_calls);
+    let mut state = make_state_with_tool_calls(vec![]);
+    state.response_object = json!({
+        "object": "response",
+        "status": "completed",
+    });
+    state.response_object["output"] = Value::Array(tool_calls);
     state.mcp_tool_map.insert(
         ("server".to_owned(), "lookup".to_owned()),
         json!({"server_label": "server", "server_url": "http://example.com", "require_approval": "never"}),

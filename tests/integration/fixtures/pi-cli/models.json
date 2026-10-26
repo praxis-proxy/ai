@@ -1,0 +1,15 @@
+{
+  "$schema": "https://pi.dev/schemas/models.schema.json",
+  "providers": {
+    "praxis": {
+      "name": "Praxis",
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "local-pi-client-key",
+      "headers": { "Authorization": "Basic ${PRAXIS_GATEWAY_BASIC_TOKEN}" },
+      "models": [
+        { "id": "qwen3-8b", "name": "Qwen3 8B", "contextWindow": 32768, "maxTokens": 8192 }
+      ]
+    }
+  }
+}

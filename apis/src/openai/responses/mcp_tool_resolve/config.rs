@@ -44,6 +44,70 @@ pub(crate) struct ConnectorConfig {
     pub id: String,
     /// MCP server URL for this connector.
     pub server_url: String,
+    /// Operator policy for tools from this connector. Defaults to `deny` and is
+    /// enforced in protected mode: `allow_all` admits every tool, while
+    /// `read_only` admits only tools the service affirmatively classifies as
+    /// read-only. This classification does not itself prevent side effects;
+    /// enforce write restrictions at the service or with scoped credentials.
+    #[serde(default)]
+    pub tool_policy: ConnectorToolPolicyConfig,
+}
+
+/// Operator policy for tools supplied by one connector. Defaults to `deny`.
+#[derive(Debug, Default, Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConnectorToolPolicyConfig {
+    /// Exclude the connector without contacting it. This is the default.
+    #[default]
+    Deny,
+    /// Admit all tools from the connector, including tools that write.
+    AllowAll,
+    /// Admit only tools affirmatively classified as read-only by the connector.
+    ReadOnly,
+}
+
+impl ConnectorToolPolicyConfig {
+    /// Snapshot as the request-scoped admission policy.
+    pub(crate) fn snapshot(self) -> crate::openai::responses::mcp_admission::ConnectorToolPolicy {
+        use crate::openai::responses::mcp_admission::ConnectorToolPolicy;
+        match self {
+            Self::Deny => ConnectorToolPolicy::Deny,
+            Self::AllowAll => ConnectorToolPolicy::AllowAll,
+            Self::ReadOnly => ConnectorToolPolicy::ReadOnly,
+        }
+    }
+}
+
+/// Operator admission mode for MCP tool metadata.
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ToolAdmissionMode {
+    /// Standard advisory behavior; unchanged. This is the default.
+    #[default]
+    Advisory,
+    /// Operator-enforced protection.
+    Protected,
+}
+
+/// Operator metadata-admission policy for the `openai_mcp_tool_resolve` filter.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolAdmissionConfig {
+    /// Admission mode (`advisory` default, or `protected`).
+    #[serde(default)]
+    pub mode: ToolAdmissionMode,
+}
+
+impl ToolAdmissionConfig {
+    /// Snapshot as the request-scoped admission policy type.
+    pub(crate) fn snapshot(&self) -> crate::openai::responses::mcp_admission::McpAdmissionPolicy {
+        crate::openai::responses::mcp_admission::McpAdmissionPolicy {
+            mode: match self.mode {
+                ToolAdmissionMode::Advisory => crate::openai::responses::mcp_admission::McpAdmissionMode::Advisory,
+                ToolAdmissionMode::Protected => crate::openai::responses::mcp_admission::McpAdmissionMode::Protected,
+            },
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -63,6 +127,14 @@ pub(crate) struct McpToolResolveConfig {
     /// the corresponding `openai_mcp_dispatch` setting.
     #[serde(default)]
     pub authorization_assertion: Option<String>,
+
+    /// Require MCP tool entries to reference an operator-configured connector.
+    ///
+    /// When false, client-selected direct `server_url` entries remain allowed for
+    /// deployments that intentionally mix public direct servers with scoped
+    /// connector traffic.
+    #[serde(default)]
+    pub require_connector: bool,
 
     /// Trusted request headers forwarded to connector-backed MCP `initialize`
     /// and `tools/list` requests.
@@ -115,6 +187,11 @@ pub(crate) struct McpToolResolveConfig {
     /// Named connectors mapping connector IDs to server URLs.
     #[serde(default)]
     pub connectors: Vec<ConnectorConfig>,
+
+    /// Operator metadata-admission policy. Defaults to advisory (unchanged
+    /// behavior), so existing non-protected deployments are not affected.
+    #[serde(default)]
+    pub tool_admission: ToolAdmissionConfig,
 }
 
 /// Default max rewritten body bytes (64 MiB): a post-expansion backstop.
@@ -143,6 +220,13 @@ pub(crate) fn build_config(mut cfg: McpToolResolveConfig) -> Result<McpToolResol
     reject_mcp_sensitive_forward_headers(&cfg.forward_headers)?;
     validate_context_slot("user_credential", cfg.user_credential.as_deref())?;
     validate_context_slot("authorization_assertion", cfg.authorization_assertion.as_deref())?;
+    if !cfg.require_connector && (cfg.user_credential.is_some() || cfg.authorization_assertion.is_some()) {
+        tracing::warn!(
+            user_credential = ?cfg.user_credential,
+            authorization_assertion = ?cfg.authorization_assertion,
+            "openai_mcp_tool_resolve: per-user MCP authorization is configured without require_connector; direct server_url entries remain allowed"
+        );
+    }
     validate_size_limit(
         "openai_mcp_tool_resolve",
         "max_rewritten_body_bytes",

@@ -16,16 +16,18 @@ name = "praxis_ai_apis"
 default = []
 # Stateful OpenAI Responses subsystem: request state kernel, validation, body
 # rebuild, stream composition, Chat Completions translation filter, document
-# extraction, client-tool compatibility, agentic loop, file search and web
-# search dispatch. Adds no crates; gated because of its size and coupling.
-openai-responses = []
+# extraction, client-tool compatibility, file search and web search dispatch.
+# Experimental and off by default because of its size and coupling.
+openai-responses = ["experimental"]
+# Ephemeral agent orchestration, separately opted in from the Responses API.
+openai-agentic-loop = ["openai-responses", "experimental"]
 # Generated OpenAPI description and utoipa contract schemas for Responses API.
 openai-responses-openapi = ["openai-responses", "dep:utoipa"]
 # openai_file_resolve: downloads referenced files via SubRequestClient.
 openai-file-resolve-filter = ["openai-responses"]
 # Response and conversation storage. The SQL backends live in praxis-ai-store-backends
 # so a build without a backend carries no SQL client or crypto.
-store = ["openai-responses", "praxis-ai-store/compression"]
+store = ["openai-responses", "praxis-ai-store/compression", "dep:praxis-ai-store-lifecycle"]
 # Internal implementation marker shared by both PostgreSQL profiles. Do not
 # enable directly; select one of the public features below.
 _store-postgres = ["store", "dep:praxis-ai-store-backends"]
@@ -39,17 +41,24 @@ openai-conversations = ["store", "dep:jsonschema", "dep:utoipa"]
 # Context compaction with tiktoken token estimation.
 openai-compact = ["store", "dep:tiktoken-rs"]
 # MCP tool resolution and dispatch through the rmcp client (approvals persist).
-openai-mcp-tools = ["store", "dep:rmcp", "dep:sse-stream"]
-# Every OpenAI group, without choosing a store backend.
-openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools", "openai-responses-openapi"]
-# Every non-experimental opt-in; equals the pre-feature-split capability.
-full = ["openai-all", "store-postgres"]
+openai-mcp-tools = ["store", "dep:rmcp", "dep:sse-stream", "dep:jsonschema"]
+# Every OpenAI group, including experimental capabilities, without a backend.
+openai-all = ["openai-agentic-loop", "openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools", "openai-responses-openapi"]
+# Every non-experimental capability. Experimental OpenAI groups stay opt-in.
+full = []
+# Passive marker activated by experimental capabilities; enables none itself.
+experimental = []
+# Experimental: the anthropic_messages_to_vertexai_anthropic translation filter
+# (Anthropic Messages to Vertex AI rawPredict). Work in progress; the config
+# surface may change. Enabled through praxis-ai-filters' vertex-anthropic-filter.
+vertex-anthropic = []
 praxis-main = []
 
 [lints]
 workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
@@ -58,14 +67,16 @@ futures = { workspace = true }
 http = { workspace = true }
 jsonschema = { workspace = true, optional = true }
 metrics = { workspace = true }
+notify = { workspace = true }
 openssl = { workspace = true }
 percent-encoding = { workspace = true }
-pingora-core = { workspace = true }
 praxis-ai-store = { workspace = true }
-# Transitional: apis re-exports the SQL backends at crate::store::* so the
-# conversations and responses filters keep compiling. Removed once #1259b and
-# #1262 take those filters off concrete-store construction. default-features off
-# so a per-backend apis build forwards only the backend it selects.
+praxis-ai-store-lifecycle = { workspace = true, optional = true }
+# apis uses the SQL backends directly in the responses and conversations store
+# config (URL, TLS, and table-identifier validation) and re-exports the concrete
+# stores and provisioning factory at crate::store::* for the server provisioning
+# bridge and the store test suites. default-features off so a per-backend apis
+# build forwards only the backend it selects.
 praxis-ai-store-backends = { path = "../store-backends", optional = true, default-features = false }
 praxis-core = { workspace = true }
 # iterative-request-router: IterationState / NextIterationBody (agentic loop,
@@ -88,6 +99,7 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
 tracing = { workspace = true }
 url = { workspace = true }
 utoipa = { workspace = true, optional = true }
+zeroize = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 allocation-counter = { workspace = true }

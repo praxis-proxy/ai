@@ -1,56 +1,78 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Focused request-translation benchmarks. Run with:
-//! `cargo bench -p praxis-ai-apis --bench translation_overhead`.
+//! Focused request-translation benchmarks with allocation evidence.
+//!
+//! Run with:
+//!
+//! ```console
+//! cargo bench -p praxis-ai-apis --bench translation_overhead
+//! ```
+//!
+//! Each benchmark first prints one `allocation_report,<label>,count=…,bytes=…`
+//! line to stderr (via `allocation_counter::measure`) so allocation counts
+//! can be compared across translator changes, then reports wall time.
+
+#![expect(
+    clippy::print_stderr,
+    reason = "allocation reports are consumed from benchmark stderr"
+)]
+#![expect(clippy::unwrap_used, reason = "benchmark fixtures are valid by construction")]
 
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use serde_json::{Value, json};
 
-#[expect(
-    clippy::allow_attributes,
-    reason = "the path-imported test modules have expectations that are inactive in a benchmark harness"
-)]
-#[allow(
-    unfulfilled_lint_expectations,
-    reason = "path-imported test-only lint expectations may not apply in benchmark mode"
-)]
-#[expect(
-    dead_code,
-    unused_imports,
-    clippy::missing_docs_in_private_items,
-    reason = "benchmark imports the private translator without exposing it publicly"
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        clippy::missing_docs_in_private_items,
+        reason = "bench target includes the cfg(test) module whose fixtures are dead in a benchmark harness"
+    )
 )]
 #[path = "../src/bedrock/converse/request.rs"]
 mod bedrock_request;
+
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        clippy::missing_docs_in_private_items,
+        reason = "bench target includes the cfg(test) module whose fixtures are dead in a benchmark harness"
+    )
+)]
+// The path-imported module carries test-only lint expectations. In a
+// benchmark harness some of them cannot fire, so allow rather than expect
+// the unfulfilled case here instead of weakening the module's own attributes.
 #[expect(
     clippy::allow_attributes,
-    reason = "the path-imported test modules have expectations that are inactive in a benchmark harness"
+    reason = "the path-imported test module has expectations that are inactive in a benchmark harness"
 )]
 #[allow(
     unfulfilled_lint_expectations,
     reason = "path-imported test-only lint expectations may not apply in benchmark mode"
-)]
-#[expect(
-    dead_code,
-    unused_imports,
-    clippy::missing_docs_in_private_items,
-    reason = "benchmark imports the private translator without exposing it publicly"
 )]
 #[path = "../src/vertex/gemini/request.rs"]
 mod gemini_request;
 
+/// Number of tools in the large-schema fixture.
+const LARGE_TOOL_COUNT: usize = 4;
+
+/// Size of each nested schema description string, in bytes.
+const SCHEMA_DESCRIPTION_BYTES: usize = 16 * 1024;
+
+/// Number of stop sequences in the large fixture.
+const STOP_SEQUENCE_COUNT: usize = 16;
+
 /// Run Bedrock request translation on an opaque benchmark input.
-#[expect(clippy::unwrap_used, reason = "benchmark fixture is valid")]
 fn translate_bedrock(body: &[u8]) {
     let result = bedrock_request::transform_request(std::hint::black_box(body)).unwrap();
     std::hint::black_box((&result.body, &result.model, result.stream, result.include_usage));
 }
 
 /// Run Gemini request translation on an opaque benchmark input.
-#[expect(clippy::unwrap_used, reason = "benchmark fixture is valid")]
 fn translate_gemini(body: &[u8]) {
     let result = gemini_request::transform_request(std::hint::black_box(body)).unwrap();
     std::hint::black_box((
@@ -62,11 +84,11 @@ fn translate_gemini(body: &[u8]) {
     ));
 }
 
-/// Build a Bedrock request with large tool schemas and stop sequences.
-#[expect(clippy::unwrap_used, reason = "benchmark fixture serializes valid JSON")]
+/// Build a Bedrock request with several large nested tool schemas and a stop
+/// array, the shapes whose ownership the translator moves.
 fn bedrock_large_tool_request() -> Vec<u8> {
-    let description = "s".repeat(16 * 1024);
-    let tools: Vec<Value> = (0..4)
+    let description = "s".repeat(SCHEMA_DESCRIPTION_BYTES);
+    let tools: Vec<Value> = (0..LARGE_TOOL_COUNT)
         .map(|index| {
             json!({
                 "type": "function",
@@ -83,7 +105,7 @@ fn bedrock_large_tool_request() -> Vec<u8> {
             })
         })
         .collect();
-    let stops: Vec<String> = (0..16)
+    let stops: Vec<String> = (0..STOP_SEQUENCE_COUNT)
         .map(|index| format!("stop_{index}_{}", "x".repeat(256)))
         .collect();
 
@@ -97,7 +119,6 @@ fn bedrock_large_tool_request() -> Vec<u8> {
 }
 
 /// Build a Gemini request with matched tool-call and tool-result messages.
-#[expect(clippy::unwrap_used, reason = "benchmark fixture serializes valid JSON")]
 fn gemini_call_result_request(call_result_pairs: usize) -> Vec<u8> {
     let mut calls = Vec::with_capacity(call_result_pairs);
     let mut results = Vec::with_capacity(call_result_pairs);
@@ -124,7 +145,6 @@ fn gemini_call_result_request(call_result_pairs: usize) -> Vec<u8> {
 }
 
 /// Build a Gemini request with large image, schema, stop, and result fields.
-#[expect(clippy::unwrap_used, reason = "benchmark fixture serializes valid JSON")]
 fn gemini_large_request() -> Vec<u8> {
     let image_data = format!("data:image/png;base64,{}", "A".repeat(512 * 1024));
     let schema_description = "d".repeat(16 * 1024);
@@ -159,10 +179,6 @@ fn gemini_large_request() -> Vec<u8> {
 }
 
 /// Report allocator activity for one translation fixture.
-#[expect(
-    clippy::print_stderr,
-    reason = "allocation reports are consumed from benchmark stderr"
-)]
 fn report_allocation(label: &str, translation: impl FnOnce()) {
     let allocations = allocation_counter::measure(translation);
     eprintln!(
@@ -174,6 +190,9 @@ fn report_allocation(label: &str, translation: impl FnOnce()) {
 /// Benchmark Bedrock translation for several large tool schemas.
 fn bedrock_large_tools(c: &mut Criterion) {
     let body = bedrock_large_tool_request();
+    // Warm up once outside the measurement so one-time lazy state (the
+    // compiled model-ID regex) is excluded from the allocation evidence.
+    translate_bedrock(&body);
     report_allocation("bedrock_large_tools", || translate_bedrock(&body));
 
     let mut group = c.benchmark_group("bedrock_large_tools");
@@ -195,6 +214,8 @@ fn gemini_lookup_scaling(c: &mut Criterion) {
 
     for call_result_pairs in [8, 16, 32, 64, 128, 256] {
         let body = gemini_call_result_request(call_result_pairs);
+        // Warm up lazy regex state.
+        translate_gemini(&body);
         report_allocation(&format!("gemini_lookup_pairs_{call_result_pairs}"), || {
             translate_gemini(&body);
         });
@@ -209,6 +230,7 @@ fn gemini_lookup_scaling(c: &mut Criterion) {
 /// Benchmark Gemini translation with large multimodal and schema fields.
 fn gemini_large_fields(c: &mut Criterion) {
     let body = gemini_large_request();
+    translate_gemini(&body);
     report_allocation("gemini_large_fields", || translate_gemini(&body));
 
     let mut group = c.benchmark_group("gemini_large_fields");
