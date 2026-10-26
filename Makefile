@@ -391,6 +391,7 @@ setup-lint-toolchains:
 # isolates that build from the clippy passes so the two halves run in parallel.
 lint-xtask: lint-license-headers
 	cargo xtask lint-deps
+	cargo xtask check-pins
 	$(MAKE) fips-deps
 	cargo xtask lint-separators
 	cargo xtask lint-filter-docs
