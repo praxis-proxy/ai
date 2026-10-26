@@ -406,22 +406,44 @@ fn convert_user_message(contents: &mut Vec<Value>, msg: &mut Value) -> Result<()
     Ok(())
 }
 
+/// Allocation-free discriminator for OpenAI content-part `type` values.
+///
+/// Reading the discriminator as a borrowed `&str` would keep `part`
+/// immutably borrowed across the `match`, blocking the `get_mut` calls each
+/// arm needs. Copying the small string just to select an arm allocates per
+/// content part, so classify into this `Copy` enum instead and re-read the
+/// raw string only on the error path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UserPartKind {
+    /// A `text` part.
+    Text,
+    /// An `image_url` part.
+    ImageUrl,
+}
+
+impl UserPartKind {
+    /// Classify a content part, or return its raw `type` for the error message.
+    fn classify(part: &Value) -> Result<Self, String> {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => Ok(Self::Text),
+            Some("image_url") => Ok(Self::ImageUrl),
+            other => Err(format!(
+                "unsupported user content part type `{}`",
+                other.unwrap_or("<missing>")
+            )),
+        }
+    }
+}
+
 /// Convert OpenAI multipart content array to Gemini parts.
 ///
 /// Handles `text`, `image_url` (both URLs and base64 data URIs).
-#[expect(clippy::too_many_lines, reason = "handling multiple match arms in one place")]
 fn convert_multipart_content(content_parts: &mut [Value]) -> Result<Vec<Value>, String> {
     let mut parts = Vec::new();
 
     for part in content_parts.iter_mut() {
-        let part_type = part
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("<missing>")
-            .to_owned();
-
-        match part_type.as_str() {
-            "text" => {
+        match UserPartKind::classify(part)? {
+            UserPartKind::Text => {
                 let text = part
                     .get_mut("text")
                     .ok_or("text content part is missing `text`")?
@@ -433,7 +455,7 @@ fn convert_multipart_content(content_parts: &mut [Value]) -> Result<Vec<Value>, 
                 map.insert("text".to_owned(), text);
                 parts.push(Value::Object(map));
             },
-            "image_url" => {
+            UserPartKind::ImageUrl => {
                 if part
                     .get("image_url")
                     .and_then(|image| image.get("detail"))
@@ -443,7 +465,6 @@ fn convert_multipart_content(content_parts: &mut [Value]) -> Result<Vec<Value>, 
                 }
                 parts.push(convert_image_url(part.take()).ok_or("image_url part requires a supported URL")?);
             },
-            _ => return Err(format!("unsupported user content part type `{part_type}`")),
         }
     }
 
@@ -676,12 +697,14 @@ fn is_tool_result_continuation(prior: &[Value]) -> bool {
 fn convert_tool_result(
     contents: &mut Vec<Value>,
     tool_call_names: &ToolCallNameIndex,
-    msg: &Value,
+    msg: &mut Value,
     append_to_last: bool,
 ) -> Result<(), String> {
+    // Resolve the name first: it reads sibling fields of `content`, which is
+    // moved out below.
     let name = resolve_tool_function_name(tool_call_names, msg)?;
 
-    let content = tool_result_content(msg.get("content"))?;
+    let content = tool_result_content(msg)?;
 
     let response: Value = if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&content) {
         Value::Object(map)
@@ -715,13 +738,18 @@ fn convert_tool_result(
     Ok(())
 }
 
-/// Flatten OpenAI tool-result text parts while borrowing the common string form.
-fn tool_result_content(content: Option<&Value>) -> Result<Cow<'_, str>, String> {
-    match content {
-        Some(Value::String(text)) => Ok(Cow::Borrowed(text)),
+/// Flatten an OpenAI tool-result into the text Gemini can carry.
+///
+/// The common single-string form is *moved* out of the disposable message
+/// with [`std::mem::take`], so a large tool result is never copied. The
+/// array form still has to join its parts, which is one unavoidable
+/// allocation; a borrow of that joined text cannot outlive the local.
+fn tool_result_content(msg: &mut Value) -> Result<Cow<'static, str>, String> {
+    match msg.get_mut("content") {
+        Some(Value::String(text)) => Ok(Cow::Owned(std::mem::take(text))),
         Some(Value::Array(parts)) => {
             let mut text_parts = Vec::with_capacity(parts.len());
-            for part in parts {
+            for part in parts.iter() {
                 if part.get("type").and_then(Value::as_str) != Some("text") {
                     return Err("unsupported tool result content part".to_owned());
                 }
@@ -891,16 +919,16 @@ fn convert_response_format(config: &mut Map<String, Value>, obj: &mut Map<String
         return;
     };
 
-    let format_type = rf.get("type").and_then(Value::as_str).unwrap_or("").to_owned();
-
-    match format_type.as_str() {
-        "json_object" => {
+    // `rf.remove("type")` moves the discriminator out, so selecting the arm
+    // never allocates a copy of a request string.
+    match rf.remove("type").as_ref().and_then(Value::as_str) {
+        Some("json_object") => {
             config.insert(
                 "responseMimeType".to_owned(),
                 Value::String("application/json".to_owned()),
             );
         },
-        "json_schema" => {
+        Some("json_schema") => {
             config.insert(
                 "responseMimeType".to_owned(),
                 Value::String("application/json".to_owned()),

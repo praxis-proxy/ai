@@ -43,16 +43,18 @@ mod bedrock_request;
         reason = "bench target includes the cfg(test) module whose fixtures are dead in a benchmark harness"
     )
 )]
-// The path-imported module carries test-only lint expectations. In a
-// benchmark harness some of them cannot fire, so allow rather than expect
-// the unfulfilled case here instead of weakening the module's own attributes.
+// `request.rs` carries a module-wide `#[expect(clippy::indexing_slicing)]`
+// for its tests. That expectation is fulfilled when the module is compiled as
+// a lib test but not in a benchmark harness, and no single `#[expect]` can
+// express "fulfilled in one target, not the other". Suppress the unfulfilled
+// case only for this path import; do not weaken the module's own attribute.
 #[expect(
     clippy::allow_attributes,
-    reason = "the path-imported test module has expectations that are inactive in a benchmark harness"
+    reason = "target-dependent expectation cannot be expressed with #[expect] alone"
 )]
 #[allow(
     unfulfilled_lint_expectations,
-    reason = "path-imported test-only lint expectations may not apply in benchmark mode"
+    reason = "request.rs test expectations are unfulfilled only in the benchmark harness"
 )]
 #[path = "../src/vertex/gemini/request.rs"]
 mod gemini_request;
