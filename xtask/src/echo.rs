@@ -60,6 +60,7 @@ fn build_config(args: &Args) -> Config {
 
     let chain = FilterChainConfig {
         name: "echo".into(),
+        conditions: Vec::new(),
         filters: vec![entry],
     };
 
@@ -79,6 +80,7 @@ fn echo_listener(address: &str) -> Listener {
     Listener {
         address: address.into(),
         cluster: None,
+        downstream_keepalive_timeout_ms: None,
         downstream_read_timeout_ms: None,
         filter_chains: vec!["echo".into()],
         max_connections: None,

@@ -86,28 +86,24 @@ mod tests {
     }
 
     #[test]
-    fn prompt_template_is_rejected_rather_than_silently_dropped() {
-        let error = map_error(&json!({
+    fn moderation_is_rejected_until_results_can_be_translated() {
+        let request = json!({
             "model": "m",
             "input": "hello",
-            "prompt": {"id": "pmpt_123", "version": "2", "variables": {"name": "Ada"}}
-        }));
-        assert_eq!(
-            error,
-            "Responses `prompt` has no Chat Completions representation: got object, \
-             this adapter supports only `prompt` null",
-            "a non-null prompt must fail instead of disappearing from the Chat request"
-        );
-    }
-
-    #[test]
-    fn null_prompt_is_treated_as_absent() {
-        let chat = map(&json!({"model": "m", "input": "hello", "prompt": Value::Null}));
-        assert_eq!(chat["model"], "m", "null prompt must not disturb mapped fields");
-        assert!(
-            !chat.as_object().unwrap().contains_key("prompt"),
-            "null prompt is semantically absent and has no Chat representation"
-        );
+            "moderation": {"model": "omni-moderation-latest"}
+        });
+        let expected = "Responses `moderation` has no Chat Completions representation: got object, \
+                        this adapter supports only `moderation` null";
+        assert_eq!(map_error(&request), expected);
+        let error = super::chat_completions::responses_state_to_chat_request(
+            &request,
+            &[json!({"role": "user", "content": "hello"})],
+            &[],
+            &json!("auto"),
+            &ReasoningOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), expected);
     }
 
     #[test]
@@ -161,7 +157,6 @@ mod tests {
         for request in [
             json!({"model": "m", "input": "hello", "background": true}),
             json!({"model": "m", "input": "hello", "truncation": "auto"}),
-            json!({"model": "m", "input": "hello", "prompt": {"id": "pmpt_123"}}),
         ] {
             assert!(
                 super::chat_completions::responses_request_to_chat_request(&request, &ReasoningOptions::default())
@@ -302,6 +297,94 @@ mod tests {
                     "parameters": {"type": "object", "properties": {"memory": {"type": "string"}}, "required": ["memory"]}
                 }
             })
+        );
+    }
+
+    #[test]
+    fn shared_safety_cache_and_verbosity_controls_reach_chat_completions() {
+        let request = json!({
+            "model": "m",
+            "input": "hello",
+            "safety_identifier": "tenant-user",
+            "user": "legacy-user",
+            "prompt_cache_key": "cache-key",
+            "prompt_cache_retention": "24h",
+            "prompt_cache_options": {"ttl": "30m", "mode": "explicit"},
+            "text": {"format": {"type": "text"}, "verbosity": "high"}
+        });
+
+        for mapped in [
+            map(&request),
+            map_state(
+                &request,
+                &[json!({"role": "user", "content": "hello"})],
+                &[],
+                &json!("auto"),
+            ),
+        ] {
+            for field in [
+                "safety_identifier",
+                "user",
+                "prompt_cache_key",
+                "prompt_cache_retention",
+                "prompt_cache_options",
+            ] {
+                assert_eq!(mapped[field], request[field], "{field} must reach the Chat backend");
+            }
+            assert_eq!(mapped["verbosity"], request["text"]["verbosity"]);
+            assert!(mapped.get("text").is_none(), "Responses text must map to Chat fields");
+        }
+    }
+
+    #[test]
+    fn explicit_cache_breakpoints_survive_content_conversion() {
+        let input = json!({
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "prefix", "prompt_cache_breakpoint": {"mode": "explicit"}},
+                {"type": "input_text", "text": "suffix"},
+                {"type": "input_image", "image_url": "https://example.com/image.png", "prompt_cache_breakpoint": {"mode": "explicit"}},
+                {"type": "input_file", "file_id": "file_123", "prompt_cache_breakpoint": {"mode": "explicit"}}
+            ]
+        });
+        let request = json!({
+            "model": "m",
+            "input": [input],
+            "prompt_cache_options": {"mode": "explicit"}
+        });
+
+        for mapped in [
+            map(&request),
+            map_state(&request, request["input"].as_array().unwrap(), &[], &json!("auto")),
+        ] {
+            let parts = mapped["messages"][0]["content"].as_array().unwrap();
+            assert_eq!(parts.len(), 4);
+            assert_eq!(
+                parts[0],
+                json!({"type": "text", "text": "prefix", "prompt_cache_breakpoint": {"mode": "explicit"}})
+            );
+            assert_eq!(parts[1], json!({"type": "text", "text": "suffix"}));
+            assert_eq!(parts[2]["type"], "image_url");
+            assert_eq!(parts[2]["prompt_cache_breakpoint"], json!({"mode": "explicit"}));
+            assert_eq!(parts[3]["type"], "file");
+            assert_eq!(parts[3]["prompt_cache_breakpoint"], json!({"mode": "explicit"}));
+        }
+    }
+
+    #[test]
+    fn text_only_breakpoint_prevents_string_collapse() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": "prefix", "prompt_cache_breakpoint": {"mode": "explicit"}},
+                {"type": "input_text", "text": "suffix"}
+            ]}],
+            "prompt_cache_options": {"mode": "explicit"}
+        }));
+        assert_eq!(mapped["messages"][0]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            mapped["messages"][0]["content"][0]["prompt_cache_breakpoint"],
+            json!({"mode": "explicit"})
         );
     }
 
@@ -594,14 +677,14 @@ mod tests {
             assert_eq!(mapped["tools"][0]["function"]["name"], "web_search");
             assert_eq!(
                 mapped["tools"][0]["function"]["parameters"]["required"],
-                json!(["query"])
+                json!(["queries"])
             );
             assert_eq!(
-                mapped["tools"][0]["function"]["parameters"]["properties"]["query"]["minLength"],
+                mapped["tools"][0]["function"]["parameters"]["properties"]["queries"]["items"]["minLength"],
                 1
             );
             assert_eq!(
-                mapped["tools"][0]["function"]["parameters"]["properties"]["query"]["maxLength"],
+                mapped["tools"][0]["function"]["parameters"]["properties"]["queries"]["items"]["maxLength"],
                 4096
             );
             assert_eq!(
@@ -1461,7 +1544,7 @@ mod tests {
                 "id": "call_search_1",
                 "type": "web_search_call",
                 "status": "completed",
-                "action": {"type": "search", "query": "Praxis Proxy"}
+                "action": {"type": "search", "queries": ["Praxis Proxy"]}
             })
         );
         assert_eq!(mapped["tools"], request["tools"]);
@@ -1474,11 +1557,20 @@ mod tests {
             super::chat_completions::ResponseContext::from_responses_request(&request, "resp_ws".to_owned(), 0);
 
         let oversized = serde_json::to_string(&json!({"query": "x".repeat(4097)})).unwrap();
+        let oversized_queries = serde_json::to_string(&json!({"queries": ["x".repeat(4097)]})).unwrap();
+        let too_many_queries = serde_json::to_string(&json!({"queries": vec!["q".to_owned(); 65]})).unwrap();
+        let both_query_shapes = serde_json::to_string(&json!({"query": "ok", "queries": ["ok"]})).unwrap();
         let cases = [
             "{}",
             "{\"query\":\"\"}",
             "{\"query\":42}",
             "{\"query\":\"ok\",\"extra\":true}",
+            "{\"queries\":[]}",
+            "{\"queries\":[\"\"]}",
+            "{\"queries\":[42]}",
+            both_query_shapes.as_str(),
+            too_many_queries.as_str(),
+            oversized_queries.as_str(),
             "not json",
             oversized.as_str(),
         ];
@@ -1501,6 +1593,31 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn private_web_search_call_accepts_the_maximum_query_count() {
+        let arguments = serde_json::to_string(&json!({"queries": vec!["q".to_owned(); 64]})).unwrap();
+        let response = json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {"role": "assistant", "tool_calls": [{
+                    "id": "call_ws",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": arguments}
+                }]}
+            }]
+        });
+        let request = json!({"model": "m", "tools": [{"type": "web_search"}]});
+        let context =
+            super::chat_completions::ResponseContext::from_responses_request(&request, "resp_ws".to_owned(), 0);
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(
+            mapped["output"][0]["action"],
+            json!({"type": "search", "queries": vec!["q".to_owned(); 64]})
+        );
     }
 
     #[test]
@@ -1850,16 +1967,80 @@ mod tests {
     }
 
     #[test]
-    fn function_call_output_with_non_string_output_serializes() {
+    fn function_call_output_string_passes_through() {
         let mapped = map(&json!({
             "model": "m",
             "input": [
                 {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
-                {"type": "function_call_output", "call_id": "c1", "output": 42}
+                {"type": "function_call_output", "call_id": "c1", "output": "result"}
             ]
         }));
 
-        assert_eq!(mapped["messages"][1]["content"], "42");
+        assert_eq!(mapped["messages"][1]["content"], "result");
+    }
+
+    #[test]
+    fn function_call_output_text_parts_become_tool_text() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": [
+                    {"type": "input_text", "text": "first "},
+                    {"type": "input_text", "text": "result"}
+                ]}
+            ]
+        }));
+
+        assert_eq!(
+            mapped["messages"][1],
+            json!({
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": "first result"
+            })
+        );
+    }
+
+    #[test]
+    fn function_call_output_unsupported_shapes_fail_closed() {
+        for output in [json!(42), json!({"result": 42}), json!(true), Value::Null] {
+            let error = map_error(&json!({
+                "model": "m",
+                "input": [{"type": "function_call_output", "call_id": "c1", "output": output}]
+            }));
+            assert_eq!(
+                error,
+                "Responses function_call_output input item field `output` must be a string or array of input_text parts"
+            );
+        }
+
+        for (output, reason) in [
+            (
+                json!([{"type": "input_image", "image_url": "data:image/png;base64,AA=="}]),
+                "input_image",
+            ),
+            (json!([{"type": "input_file", "file_id": "file_123"}]), "input_file"),
+            (
+                json!([{"type": "input_text"}]),
+                "input_text requires a string `text` field",
+            ),
+            (
+                json!([{"type": "input_text", "text": 42}]),
+                "input_text requires a string `text` field",
+            ),
+            (json!([{"type": "output_text", "text": "result"}]), "output_text"),
+            (json!([null]), "unknown"),
+        ] {
+            let error = map_error(&json!({
+                "model": "m",
+                "input": [{"type": "function_call_output", "call_id": "c1", "output": output}]
+            }));
+            assert_eq!(
+                error,
+                format!("unsupported Responses function_call_output part for Chat Completions translation: {reason}")
+            );
+        }
     }
 
     #[test]
@@ -1879,15 +2060,160 @@ mod tests {
     }
 
     #[test]
-    fn function_call_output_without_call_id_returns_error() {
+    fn function_call_output_without_call_id_becomes_user_text() {
+        for item in [
+            json!({"type": "function_call_output", "output": "done"}),
+            json!({"type": "function_call_output", "call_id": null, "output": "done"}),
+            json!({"type": "function_call_output", "output": [{"type": "input_text", "text": "done"}]}),
+        ] {
+            let mapped = map(&json!({"model": "m", "input": [item]}));
+            assert_eq!(
+                mapped["messages"],
+                json!([{"role": "user", "content": "done"}]),
+                "an uncorrelated output retains its text without inventing a Chat tool-call relationship"
+            );
+        }
+    }
+
+    #[test]
+    fn function_call_output_with_invalid_call_id_still_returns_error() {
         let error = map_error(&json!({
             "model": "m",
-            "input": [{"type": "function_call_output", "output": "done"}]
+            "input": [{"type": "function_call_output", "call_id": 42, "output": "done"}]
         }));
-
         assert_eq!(
-            error,
-            "Responses function_call_output input item is missing required field `call_id`"
+            error, "Responses function_call_output input item field `call_id` must be a string",
+            "only absent or null call IDs may be lowered to uncorrelated text"
+        );
+    }
+
+    #[test]
+    fn orphan_output_between_call_and_linked_output_follows_tool_result() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "output": "orphan result"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "linked result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "linked result"},
+                {"role": "user", "content": "orphan result"},
+            ]),
+            "an orphan between a call and its linked output must not split the tool answer from its call"
+        );
+    }
+
+    #[test]
+    fn message_between_call_and_output_follows_tool_result() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"role": "user", "content": "interlude"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "linked result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "linked result"},
+                {"role": "user", "content": "interlude"},
+            ]),
+            "a message between a call and its output must not split the tool answer from its call"
+        );
+    }
+
+    #[test]
+    fn orphan_outputs_between_call_and_output_keep_their_relative_order() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "output": "orphan one"},
+                {"type": "function_call_output", "output": "orphan two"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "linked result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "linked result"},
+                {"role": "user", "content": "orphan one"},
+                {"role": "user", "content": "orphan two"},
+            ]),
+            "multiple orphans deferred past a tool answer keep their input order"
+        );
+    }
+
+    #[test]
+    fn linked_output_after_a_later_call_block_stays_with_its_call() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "output": "orphan result"},
+                {"type": "function_call", "call_id": "call_2", "name": "search", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "first result"},
+                {"type": "function_call_output", "call_id": "call_2", "output": "second result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "first result"},
+                {"role": "user", "content": "orphan result"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_2", "content": "second result"},
+            ]),
+            "an answer that trails a later call block must still directly follow its own call"
         );
     }
 
@@ -1964,14 +2290,20 @@ mod tests {
     }
 
     #[test]
-    fn non_object_tool_entries_are_skipped() {
-        let mapped = map(&json!({
+    fn non_object_tool_entries_are_rejected() {
+        let error = map_error(&json!({
             "model": "m",
             "input": "hello",
             "tools": ["not_an_object"]
         }));
 
-        assert!(mapped.get("tools").is_none());
+        assert!(error.contains("unsupported Responses tool type"), "{error}");
+    }
+
+    #[test]
+    fn non_array_tools_field_is_rejected() {
+        let error = map_error(&json!({"model": "m", "input": "hello", "tools": "function"}));
+        assert!(error.contains("`tools` must be an array"), "{error}");
     }
 
     // -------------------------------------------------------------------------
@@ -3010,6 +3342,52 @@ mod tests {
         let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
 
         assert!(error.to_string().contains("choices must contain an object"));
+    }
+
+    #[test]
+    fn response_with_multiple_valid_choices_is_rejected() {
+        let request = json!({"model": "m", "input": "hello"});
+        let context = make_response_context(&request);
+        let response = json!({
+            "id": "chatcmpl-multi",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "choices": [
+                {"finish_reason": "stop", "index": 0, "message": {"role": "assistant", "content": "first"}},
+                {"finish_reason": "stop", "index": 1, "message": {"role": "assistant", "content": "second"}}
+            ]
+        });
+
+        let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
+
+        assert!(
+            error.to_string().contains("choices must contain exactly one choice"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn response_with_one_valid_and_one_invalid_choice_is_rejected() {
+        let request = json!({"model": "m", "input": "hello"});
+        let context = make_response_context(&request);
+        let response = json!({
+            "id": "chatcmpl-multi",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "choices": [
+                {"finish_reason": "stop", "index": 0, "message": {"role": "assistant", "content": "first"}},
+                {"finish_reason": null, "index": 1, "message": {"role": "assistant", "content": "second"}}
+            ]
+        });
+
+        let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
+
+        assert!(
+            error.to_string().contains("choices must contain exactly one choice"),
+            "{error}"
+        );
     }
 
     #[test]

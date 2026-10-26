@@ -20,6 +20,7 @@ use serde::Deserialize;
 /// phase:
 ///   request: true
 ///   response: false
+///   tool_results: false
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,9 +72,13 @@ pub(crate) struct ProviderConfig {
     pub config: serde_yaml::Value,
 }
 
-/// Controls which phases (request/response) the filter evaluates.
+/// Controls which phases the filter evaluates.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "request, response, and tool-result checks are independently selectable phases"
+)]
 pub(crate) struct PhaseConfig {
     /// Evaluate client requests before forwarding to the upstream.
     #[serde(default = "default_true")]
@@ -82,6 +87,12 @@ pub(crate) struct PhaseConfig {
     /// Evaluate upstream responses before forwarding to the client.
     #[serde(default)]
     pub response: bool,
+
+    /// Evaluate newly produced local Responses tool results before the next
+    /// inference round. Intended for placement inside an IRR step after its
+    /// local dispatchers and before `openai_agentic_loop`.
+    #[serde(default)]
+    pub tool_results: bool,
 }
 
 impl Default for PhaseConfig {
@@ -89,6 +100,7 @@ impl Default for PhaseConfig {
         Self {
             request: true,
             response: false,
+            tool_results: false,
         }
     }
 }

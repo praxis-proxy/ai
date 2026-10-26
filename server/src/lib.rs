@@ -3,19 +3,48 @@
 
 //! Server bootstrap for Praxis AI.
 
+mod fd_limit;
 pub(crate) mod pipelines;
+#[cfg(feature = "_store-backend")]
+pub mod readiness;
 pub(crate) mod reload;
 mod server;
+#[cfg(feature = "_store-backend")]
+pub mod store_provision;
 mod subrequest;
 pub(crate) mod watcher;
 pub use pipelines::resolve_pipelines;
-pub use praxis_ai_filters::install_pipeline_extensions;
+#[cfg(feature = "_store-backend")]
+pub use pipelines::validate_pipelines_with_store_wiring;
+#[cfg(feature = "openai-responses")]
+pub use pipelines::{agentic_request_body_cap, prepare_agentic_budget_entries};
+pub use praxis_ai_filters::{InFlightRegistry, install_pipeline_extensions};
 pub use praxis_core::logging::init_tracing;
 pub use server::{
     check_root_privilege, fatal, fips_blocker, install_crypto_provider, resolve_config_path, run_server,
     run_server_with_registry,
 };
 pub use subrequest::create_subrequest_client;
+
+/// Per-listener response-store registries threaded through serve, reload, and
+/// pipeline resolution.
+#[cfg(feature = "store")]
+pub(crate) type StoreRegistries = std::collections::HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry>;
+
+/// Serving-runtime command handle used to provision store generations during
+/// config reload. Backend-free builds carry a placeholder because they have no
+/// concrete factory or pool lifecycle to drive.
+#[cfg(feature = "_store-backend")]
+pub(crate) type StoreReloadHandle = store_provision::StoreReloadHandle;
+/// Feature-off placeholder for [`StoreReloadHandle`].
+#[cfg(not(feature = "_store-backend"))]
+#[derive(Clone, Default)]
+pub(crate) struct StoreReloadHandle(std::marker::PhantomData<()>);
+
+/// A shared, swappable handle to the current cluster health registry. Reload
+/// stores a freshly built registry here so the readiness endpoint reads current
+/// cluster health rather than the snapshot captured at startup.
+pub(crate) type SharedHealthRegistry = std::sync::Arc<std::sync::Mutex<praxis_core::health::HealthRegistry>>;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -68,6 +97,10 @@ pub fn build_full_registry(
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
 ) -> praxis_filter::FilterRegistry {
     let mut registry = praxis_filter::FilterRegistry::with_builtins();
+    // Hand the shared sub-request connector to the registry's `policy` filters so
+    // their outbound calls share this runtime's keepalive pool and admission
+    // limit (praxis 0.7.4 moved this off a process-global onto the registry).
+    registry.set_policy_connector(subrequest_client.connector());
     praxis_ai_filters::register_ai_filters(&mut registry, Some(subrequest_client));
     register_llmd_ext_proc(&mut registry);
     register_external_filters(&mut registry);

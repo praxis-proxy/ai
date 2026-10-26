@@ -7,7 +7,7 @@ Transforms streaming SSE responses between the Chat Completions and Anthropic Me
 
 ## Configuration Notes
 
-Arms automatically when an upstream classifier or transform filter sets `anthropic_messages_format.stream` or `anthropic_messages_to_chat_completions.streaming` metadata to `"true"` and the backend response has `Content-Type: text/event-stream` (with or without parameters such as `charset=utf-8`) and does not carry a `Content-Encoding` header. No `response_conditions` configuration is needed.
+Arms automatically when an upstream classifier or transform filter sets `anthropic_messages_request.stream` or `anthropic_messages_to_chat_completions.streaming` metadata to `"true"` and the backend response has `Content-Type: text/event-stream` (with or without parameters such as `charset=utf-8`) and does not carry a `Content-Encoding` header. No `response_conditions` configuration is needed.
 
 ## Configuration
 

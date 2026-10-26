@@ -48,8 +48,12 @@ pub(super) enum StreamError {
     MalformedEvent,
     /// A managed `WebSearch` call was malformed (empty id or query).
     InvalidManagedCall,
-    /// A managed `WebSearch` query exceeded the configured size bound.
-    QueryTooLong,
+    /// A managed `WebSearch` query exceeded the configured size bound, carried
+    /// so the client-facing error names the operator's actual limit.
+    QueryTooLong {
+        /// Configured per-query byte bound the query exceeded.
+        max_bytes: usize,
+    },
     /// A `WebSearch` block was suppressed but the round did not classify as a
     /// managed call, so forwarding it would silently drop a tool call.
     SuppressionMismatch,
@@ -62,6 +66,12 @@ pub(super) enum StreamError {
     /// round would fail, so the loop is terminated with a coherent error rather
     /// than an abrupt EOF.
     DeadlineExceeded,
+    /// Re-entering inference would send a rebuilt request larger than the
+    /// configured body-size bound — the appended search result pushed it over the
+    /// limit. On a committed streaming response the buffered path's request-phase
+    /// 413 cannot replace the open SSE lifecycle, so the loop terminates with one
+    /// coherent error event instead of forwarding an oversized round.
+    ReentryTooLarge,
     /// A later round returned a non-2xx status or a content-encoded body after
     /// the client-visible SSE lifecycle had already started, so it cannot be
     /// transformed and its raw bytes must not corrupt the open stream.
@@ -356,12 +366,24 @@ struct RoundState {
     suppressed_web_search: Option<usize>,
     /// Stop reason captured from this round's `message_delta`.
     stop_reason: Option<String>,
+    /// Matched stop sequence captured from this round's `message_delta`.
+    stop_sequence: Option<String>,
+    /// Container metadata captured from this round's `message_delta`.
+    container: Option<Value>,
+    /// Stop details captured from this round's `message_delta`.
+    stop_details: Option<Value>,
     /// Output tokens captured from this round's `message_delta`.
     round_output_tokens: u64,
     /// Input tokens captured from this round's `message_start` / `message_delta`.
     round_input_tokens: Option<u64>,
     /// Cache-read input tokens captured from this round's usage.
     round_cache_read: Option<u64>,
+    /// Cache-creation input tokens captured from this round's usage.
+    round_cache_creation: Option<u64>,
+    /// Output-token details captured from this round's usage.
+    round_output_tokens_details: Option<Value>,
+    /// Server-tool usage captured from this round's usage.
+    round_server_tool_use: Option<Value>,
     /// Cumulative bytes of streamed text/tool-input fragments this round.
     ///
     /// Bounds attacker-controlled fragment growth before the round message is
@@ -408,6 +430,8 @@ pub(super) struct LogicalStream {
     max_body_bytes: usize,
     /// Maximum retained partial-event bytes for the SSE parser.
     max_partial_event_bytes: usize,
+    /// Configured per-query UTF-8 bound for managed search queries.
+    max_query_bytes: usize,
     /// Whether the client-visible `message_start` has been emitted.
     message_started: bool,
     /// Next client-visible content-block index to assign (monotonic across rounds).
@@ -418,6 +442,12 @@ pub(super) struct LogicalStream {
     input_tokens_total: Option<u64>,
     /// Aggregated cache-read input tokens across rounds, `None` until reported.
     cache_read_total: Option<u64>,
+    /// Aggregated cache-creation input tokens across rounds.
+    cache_creation_total: Option<u64>,
+    /// Aggregated output-token details across rounds.
+    output_tokens_details_total: Option<Value>,
+    /// Aggregated server-tool usage across rounds.
+    server_tool_use_total: Option<Value>,
     /// Reconstructed managed-round message bytes retained for IRR re-entry.
     ///
     /// A streamed round leaves the IRR buffered response body empty, so re-entry
@@ -430,17 +460,22 @@ pub(super) struct LogicalStream {
 }
 
 impl LogicalStream {
-    /// Create a logical stream bounded by the loop's body and partial-event caps.
-    pub(super) fn new(max_body_bytes: usize, max_partial_event_bytes: usize) -> Self {
+    /// Create a logical stream bounded by the loop's body, partial-event, and
+    /// per-query caps.
+    pub(super) fn new(max_body_bytes: usize, max_partial_event_bytes: usize, max_query_bytes: usize) -> Self {
         Self {
             parser: SseParser::default(),
             max_body_bytes,
             max_partial_event_bytes,
+            max_query_bytes,
             message_started: false,
             next_output_index: 0,
             output_tokens_total: 0,
             input_tokens_total: None,
             cache_read_total: None,
+            cache_creation_total: None,
+            output_tokens_details_total: None,
+            server_tool_use_total: None,
             reconstructed: None,
             failed: false,
             round: RoundState::default(),
@@ -579,6 +614,15 @@ impl LogicalStream {
         if let Some(cache_read) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
             self.round.round_cache_read = Some(cache_read);
         }
+        if let Some(cache_creation) = usage.get("cache_creation_input_tokens").and_then(Value::as_u64) {
+            self.round.round_cache_creation = Some(cache_creation);
+        }
+        if let Some(output_tokens_details) = usage.get("output_tokens_details") {
+            self.round.round_output_tokens_details = Some(output_tokens_details.clone());
+        }
+        if let Some(server_tool_use) = usage.get("server_tool_use") {
+            self.round.round_server_tool_use = Some(server_tool_use.clone());
+        }
     }
 
     /// Assign a client output index to a content block and forward its start.
@@ -660,12 +704,19 @@ impl LogicalStream {
 
     /// Capture the round's stop reason and output-token count; do not forward.
     fn on_message_delta(&mut self, data: &Value) {
-        if let Some(stop_reason) = data
-            .get("delta")
-            .and_then(|delta| delta.get("stop_reason"))
-            .and_then(Value::as_str)
-        {
-            self.round.stop_reason = Some(stop_reason.to_owned());
+        if let Some(delta) = data.get("delta") {
+            if let Some(stop_reason) = delta.get("stop_reason").and_then(Value::as_str) {
+                self.round.stop_reason = Some(stop_reason.to_owned());
+            }
+            if let Some(stop_sequence) = delta.get("stop_sequence") {
+                self.round.stop_sequence = stop_sequence.as_str().map(ToOwned::to_owned);
+            }
+            if let Some(container) = delta.get("container") {
+                self.round.container = Some(container.clone());
+            }
+            if let Some(stop_details) = delta.get("stop_details") {
+                self.round.stop_details = Some(stop_details.clone());
+            }
         }
         if let Some(usage) = data.get("usage") {
             if let Some(tokens) = usage.get("output_tokens").and_then(Value::as_u64) {
@@ -809,7 +860,7 @@ impl LogicalStream {
         let bytes = self.reconstruct_round_message()?;
         self.output_tokens_total = self.output_tokens_total.saturating_add(self.round.round_output_tokens);
         self.aggregate_round_usage();
-        match super::classify_response(&bytes) {
+        match super::classify_response(&bytes, self.max_query_bytes) {
             super::ResponseDecision::Managed(_) => self.finish_managed_round(bytes),
             // A suppressed WebSearch block on a non-managed round would silently
             // drop a tool call from the client-visible stream: fail closed.
@@ -818,7 +869,9 @@ impl LogicalStream {
             },
             super::ResponseDecision::Done => self.finish_terminal_round(),
             super::ResponseDecision::InvalidManagedCall => Err(StreamError::InvalidManagedCall),
-            super::ResponseDecision::QueryTooLong => Err(StreamError::QueryTooLong),
+            super::ResponseDecision::QueryTooLong => Err(StreamError::QueryTooLong {
+                max_bytes: self.max_query_bytes,
+            }),
         }
     }
 
@@ -873,6 +926,14 @@ impl LogicalStream {
         if let Some(cache_read) = self.round.round_cache_read {
             self.cache_read_total = Some(self.cache_read_total.unwrap_or(0).saturating_add(cache_read));
         }
+        if let Some(cache_creation) = self.round.round_cache_creation {
+            self.cache_creation_total = Some(self.cache_creation_total.unwrap_or(0).saturating_add(cache_creation));
+        }
+        aggregate_usage_value(
+            &mut self.output_tokens_details_total,
+            self.round.round_output_tokens_details.take(),
+        );
+        aggregate_usage_value(&mut self.server_tool_use_total, self.round.round_server_tool_use.take());
     }
 
     /// Build the terminal `message_delta` and `message_stop` frames.
@@ -882,11 +943,14 @@ impl LogicalStream {
     /// identical to the non-streaming translator, and usage is aggregated across
     /// every IRR round rather than reporting only the final round's output.
     fn build_terminal(&self, stop_reason: &str) -> Vec<u8> {
-        let usage = super::super::wire::MessageDeltaUsage::new(
-            self.output_tokens_total,
-            self.input_tokens_total,
-            self.cache_read_total,
-        );
+        let usage = super::super::wire::MessageDeltaUsage {
+            cache_creation_input_tokens: self.cache_creation_total,
+            cache_read_input_tokens: self.cache_read_total,
+            input_tokens: self.input_tokens_total,
+            output_tokens: self.output_tokens_total,
+            output_tokens_details: self.output_tokens_details_total.clone(),
+            server_tool_use: self.server_tool_use_total.clone(),
+        };
         let mut out = Vec::new();
         emit_event(
             &mut out,
@@ -894,16 +958,42 @@ impl LogicalStream {
             &json!({
                 "type": "message_delta",
                 "delta": {
-                    "container": null,
-                    "stop_details": null,
+                    "container": self.round.container.clone().unwrap_or(Value::Null),
+                    "stop_details": self.round.stop_details.clone().unwrap_or(Value::Null),
                     "stop_reason": stop_reason,
-                    "stop_sequence": null
+                    "stop_sequence": self.round.stop_sequence
                 },
                 "usage": usage
             }),
         );
         emit_event(&mut out, "message_stop", &json!({"type": "message_stop"}));
         out
+    }
+}
+
+/// Aggregate a usage object whose fields are cumulative counters.
+fn aggregate_usage_value(total: &mut Option<Value>, incoming: Option<Value>) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+    if incoming.is_null() {
+        return;
+    }
+    let Value::Object(incoming_object) = incoming else {
+        *total = Some(incoming);
+        return;
+    };
+    let Some(Value::Object(total_object)) = total.as_mut() else {
+        *total = Some(Value::Object(incoming_object));
+        return;
+    };
+    for (key, value) in incoming_object {
+        let Some(incoming_number) = value.as_u64() else {
+            total_object.insert(key, value);
+            continue;
+        };
+        let current_number = total_object.get(&key).and_then(Value::as_u64).unwrap_or(0);
+        total_object.insert(key, Value::from(current_number.saturating_add(incoming_number)));
     }
 }
 
@@ -1006,7 +1096,7 @@ fn remap_index(data: &mut Value, output_index: u64) {
 /// so no raw upstream bytes leak into the transformed stream.
 pub(super) fn error_event_bytes(error: &StreamError) -> Vec<u8> {
     let (error_type, message) = anthropic_error(error);
-    let body = super::super::wire::error_body(error_type, message, None);
+    let body = super::super::wire::error_body(error_type, message.as_ref(), None);
     let mut out = Vec::with_capacity(body.len() + 20);
     out.extend_from_slice(b"event: error\ndata: ");
     out.extend_from_slice(&body);
@@ -1015,29 +1105,49 @@ pub(super) fn error_event_bytes(error: &StreamError) -> Vec<u8> {
 }
 
 /// Map a [`StreamError`] to an Anthropic error type and client-safe message.
-fn anthropic_error(error: &StreamError) -> (&'static str, &'static str) {
+#[expect(
+    clippy::too_many_lines,
+    reason = "each stream failure has an explicit client-safe message"
+)]
+fn anthropic_error(error: &StreamError) -> (super::super::wire::ErrorType, Cow<'static, str>) {
     match error {
         StreamError::InvalidManagedCall => (
-            "invalid_request_error",
-            "WebSearch tool use requires a non-empty id and input.query",
+            super::super::wire::ErrorType::InvalidRequest,
+            Cow::Borrowed("WebSearch tool use requires a non-empty id and input.query"),
         ),
-        StreamError::QueryTooLong => (
-            "invalid_request_error",
-            "WebSearch input.query must not exceed 8192 bytes",
+        StreamError::QueryTooLong { max_bytes } => (
+            super::super::wire::ErrorType::InvalidRequest,
+            Cow::Owned(format!("WebSearch input.query must not exceed {max_bytes} bytes")),
         ),
         StreamError::IterationLimit => (
-            "api_error",
-            "web search exceeded the maximum number of search iterations",
+            super::super::wire::ErrorType::Api,
+            Cow::Borrowed("web search exceeded the maximum number of search iterations"),
         ),
-        StreamError::DeadlineExceeded => ("api_error", "web search exceeded the configured deadline"),
-        StreamError::IncompleteStream => ("api_error", "web search response stream ended before completion"),
-        StreamError::UpstreamTerminated => ("api_error", "web search stream terminated before completion"),
+        StreamError::DeadlineExceeded => (
+            super::super::wire::ErrorType::Api,
+            Cow::Borrowed("web search exceeded the configured deadline"),
+        ),
+        StreamError::ReentryTooLarge => (
+            super::super::wire::ErrorType::Api,
+            Cow::Borrowed("Web search request body exceeds a size limit set by the platform administrator."),
+        ),
+        StreamError::IncompleteStream => (
+            super::super::wire::ErrorType::Api,
+            Cow::Borrowed("web search response stream ended before completion"),
+        ),
+        StreamError::UpstreamTerminated => (
+            super::super::wire::ErrorType::Api,
+            Cow::Borrowed("web search stream terminated before completion"),
+        ),
         StreamError::MalformedUtf8
         | StreamError::MalformedEvent
         | StreamError::OversizedPartialEvent
         | StreamError::Oversized
         | StreamError::SuppressionMismatch
-        | StreamError::UpstreamUnprocessable => ("api_error", "web search stream could not be processed"),
+        | StreamError::UpstreamUnprocessable => (
+            super::super::wire::ErrorType::Api,
+            Cow::Borrowed("web search stream could not be processed"),
+        ),
     }
 }
 
@@ -1093,6 +1203,7 @@ mod tests {
 
     const MAX_PARTIAL: usize = 64 * 1024;
     const MAX_BODY: usize = 1 << 20;
+    const MAX_QUERY: usize = crate::web_search::config::MAX_SEARCH_QUERY_BYTES;
 
     /// Encode one native Messages SSE event as raw bytes.
     fn sse(event_type: &str, data: &Value) -> Vec<u8> {
@@ -1132,6 +1243,11 @@ mod tests {
                 "usage": {"output_tokens": output_tokens}
             }),
         )
+    }
+
+    /// A terminal `message_delta` carrying metadata and usage counters.
+    fn message_delta_with_metadata(data: &Value) -> Vec<u8> {
+        sse("message_delta", data)
     }
 
     /// A `message_stop` frame.
@@ -1397,7 +1513,7 @@ mod tests {
 
     #[test]
     fn round_zero_message_start_is_forwarded_with_stable_id() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
 
         let out = text_output(&mut stream, &message_start("msg_1"), false);
 
@@ -1499,7 +1615,7 @@ mod tests {
 
     #[test]
     fn managed_round_exposes_reconstructed_message_for_reentry() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         text_output(&mut stream, &web_search_block(0, "toolu_ws", "rust proxy"), false);
         text_output(&mut stream, &message_delta("tool_use", 5), false);
@@ -1526,7 +1642,7 @@ mod tests {
 
     #[test]
     fn done_round_does_not_retain_reconstructed_message() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         text_output(&mut stream, &text_block(0, "Hello"), false);
         text_output(&mut stream, &message_delta("end_turn", 7), false);
@@ -1570,9 +1686,42 @@ mod tests {
     }
 
     #[test]
+    fn error_event_bytes_map_query_too_long_to_invalid_request_with_limit() {
+        let text = String::from_utf8(error_event_bytes(&StreamError::QueryTooLong { max_bytes: 1_024 })).unwrap();
+
+        assert!(
+            text.contains("\"type\":\"invalid_request_error\""),
+            "an oversized query is a request error"
+        );
+        assert!(
+            text.contains("must not exceed 1024 bytes"),
+            "the client-safe reason names the configured limit"
+        );
+    }
+
+    #[test]
+    fn error_event_bytes_map_reentry_too_large_to_api_error() {
+        // An oversized rebuilt re-entry request on a committed streaming response
+        // fails closed to one terminal SSE `error` event, mirroring the buffered
+        // path's 413 reason under the api_error envelope the open stream requires.
+        let text = String::from_utf8(error_event_bytes(&StreamError::ReentryTooLarge)).unwrap();
+
+        assert!(text.starts_with("event: error\n"), "a terminal error event is emitted");
+        assert!(
+            text.contains("\"type\":\"api_error\""),
+            "an oversized re-entry maps to api_error on the committed stream"
+        );
+        assert!(
+            text.contains("size limit set by the platform administrator"),
+            "the client-safe reason attributes the size limit to the platform administrator"
+        );
+        assert!(text.ends_with("\n\n"), "the SSE event is framed");
+    }
+
+    #[test]
     fn finish_round_fails_closed_on_oversized_reconstruction() {
         // A tiny body bound forces the reconstructed message over the limit.
-        let mut stream = LogicalStream::new(64, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(64, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         text_output(
             &mut stream,
@@ -1592,7 +1741,7 @@ mod tests {
 
     #[test]
     fn finish_round_fails_closed_on_invalid_managed_call() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         text_output(&mut stream, &web_search_block(0, "toolu_ws", ""), false);
         text_output(&mut stream, &message_delta("tool_use", 5), false);
@@ -1608,7 +1757,7 @@ mod tests {
 
     #[test]
     fn finish_round_fails_closed_on_oversized_query() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         let long_query = "a".repeat(9 * 1024);
         text_output(&mut stream, &web_search_block(0, "toolu_ws", &long_query), false);
@@ -1616,12 +1765,16 @@ mod tests {
 
         let error = stream.finish_round().unwrap_err();
 
-        assert_eq!(error, StreamError::QueryTooLong, "an oversized query fails closed");
+        assert_eq!(
+            error,
+            StreamError::QueryTooLong { max_bytes: MAX_QUERY },
+            "an oversized query fails closed"
+        );
     }
 
     #[test]
     fn finish_round_fails_closed_when_suppressed_search_is_not_managed() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         // A managed WebSearch plus a second (client) tool_use makes the round
         // non-managed, yet the WebSearch block was already suppressed.
@@ -1636,7 +1789,7 @@ mod tests {
 
     #[test]
     fn suppresses_managed_web_search_tool_use_block() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
 
         let out = text_output(&mut stream, &web_search_block(0, "toolu_1", "rust proxy"), false);
@@ -1649,7 +1802,7 @@ mod tests {
 
     #[test]
     fn output_index_is_monotonic_across_rounds() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         // Round 0: a text block (output index 0) then a suppressed WebSearch call.
         text_output(&mut stream, &text_block(0, "Searching"), false);
@@ -1668,7 +1821,7 @@ mod tests {
 
     #[test]
     fn forwards_text_content_block_frames() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
 
         let out = text_output(&mut stream, &text_block(0, "Hello"), false);
@@ -1682,7 +1835,7 @@ mod tests {
 
     #[test]
     fn forwards_ping_keepalive() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
 
         let out = text_output(&mut stream, &sse("ping", &json!({"type": "ping"})), false);
@@ -1695,7 +1848,7 @@ mod tests {
 
     #[test]
     fn finish_round_emits_terminal_for_done_message() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         text_output(&mut stream, &text_block(0, "Hello"), false);
         text_output(&mut stream, &message_delta("end_turn", 7), false);
@@ -1728,7 +1881,7 @@ mod tests {
 
     #[test]
     fn finish_round_loops_on_managed_web_search() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         text_output(&mut stream, &web_search_block(0, "toolu_1", "rust proxy"), false);
         text_output(&mut stream, &message_delta("tool_use", 5), false);
@@ -1748,7 +1901,7 @@ mod tests {
 
     #[test]
     fn finish_round_aggregates_output_tokens_across_rounds() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         text_output(&mut stream, &web_search_block(0, "toolu_1", "rust proxy"), false);
         text_output(&mut stream, &message_delta("tool_use", 5), false);
@@ -1770,7 +1923,7 @@ mod tests {
 
     #[test]
     fn finish_round_fails_closed_when_stop_reason_missing() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         text_output(&mut stream, &text_block(0, "Hello"), false);
         // The upstream stream ended before delivering a `message_delta`, so no
@@ -1787,7 +1940,7 @@ mod tests {
 
     #[test]
     fn finish_round_fails_closed_when_message_stop_missing() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         text_output(&mut stream, &text_block(0, "Hello"), false);
         // The stop reason arrived, but the upstream body ended before the closing
@@ -1806,7 +1959,7 @@ mod tests {
 
     #[test]
     fn finish_round_fails_closed_when_content_block_left_open() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         // A text block starts and streams a delta but never receives its
         // `content_block_stop`: the answer was truncated mid-block.
@@ -1825,7 +1978,7 @@ mod tests {
 
     #[test]
     fn finish_round_fails_closed_when_managed_round_missing_message_stop() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         text_output(&mut stream, &web_search_block(0, "toolu_ws", "rust proxy"), false);
         // A managed round is also a complete Messages response: without the
@@ -1844,7 +1997,7 @@ mod tests {
 
     #[test]
     fn stray_content_block_stop_for_unopened_index_fails_closed() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         text_output(&mut stream, &open_text_block(0, "Half an ans"), false);
         // A `content_block_stop` for an index that was never started must not
@@ -1864,7 +2017,7 @@ mod tests {
 
     #[test]
     fn duplicate_content_block_stop_fails_closed() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         text_output(&mut stream, &open_text_block(0, "first"), false);
         text_output(&mut stream, &open_text_block(1, "second"), false);
@@ -1885,7 +2038,7 @@ mod tests {
 
     #[test]
     fn finish_round_saturates_output_token_aggregate_on_overflow() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         text_output(&mut stream, &text_block(0, "Hi"), false);
         text_output(&mut stream, &message_delta("end_turn", 5), false);
@@ -1904,7 +2057,7 @@ mod tests {
 
     #[test]
     fn on_chunk_is_silent_after_a_failure() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         // A `content_block_start` without an index is malformed.
         let malformed = sse(
@@ -1930,7 +2083,7 @@ mod tests {
 
     #[test]
     fn later_round_message_start_is_suppressed() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         assert!(
             !text_output(&mut stream, &message_start("msg_1"), false).is_empty(),
             "round 0 forwards message_start"
@@ -2010,7 +2163,7 @@ mod tests {
 
     #[test]
     fn on_block_start_rejects_non_sequential_index() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         // A backend-controlled index that skips ahead would force an unbounded
         // sparse allocation; the dense-sequential invariant fails closed instead.
@@ -2036,7 +2189,7 @@ mod tests {
     fn accumulate_delta_fails_closed_on_cumulative_text_overflow() {
         // A tiny body bound is exceeded by streamed text fragments long before
         // any reconstruction: the cumulative bound must fail closed mid-stream.
-        let mut stream = LogicalStream::new(64, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(64, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         let start = sse(
             "content_block_start",
@@ -2067,7 +2220,7 @@ mod tests {
 
     #[test]
     fn accumulate_delta_fails_closed_on_cumulative_json_overflow() {
-        let mut stream = LogicalStream::new(64, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(64, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         let start = sse(
             "content_block_start",
@@ -2098,7 +2251,7 @@ mod tests {
 
     #[test]
     fn reconstructs_multi_delta_text_across_a_managed_round() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         text_output(
             &mut stream,
@@ -2120,7 +2273,7 @@ mod tests {
 
     #[test]
     fn reconstructs_thinking_and_signature_for_reentry() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         // An extended-thinking block precedes the managed WebSearch call. Its
         // reasoning text and signature must be reconstructed so the assistant
@@ -2150,7 +2303,7 @@ mod tests {
 
     #[test]
     fn forwards_upstream_error_event_without_synthesizing_success() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         text_output(&mut stream, &text_block(0, "Partial"), false);
         let error_event = sse(
@@ -2185,12 +2338,31 @@ mod tests {
     }
 
     #[test]
-    fn terminal_message_delta_matches_schema_and_aggregates_usage() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+    #[expect(clippy::too_many_lines, reason = "focused metadata preservation regression coverage")]
+    fn terminal_message_delta_preserves_metadata_and_aggregates_usage() {
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         // Round 0: a managed WebSearch call; usage input=10, cache_read=2.
         text_output(&mut stream, &message_start_with_usage("msg_1", 10, 2), false);
         text_output(&mut stream, &web_search_block(0, "toolu_1", "rust proxy"), false);
-        text_output(&mut stream, &message_delta("tool_use", 5), false);
+        text_output(
+            &mut stream,
+            &message_delta_with_metadata(&json!({
+                "type": "message_delta",
+                "delta": {
+                    "container": null,
+                    "stop_details": null,
+                    "stop_reason": "tool_use",
+                    "stop_sequence": null
+                },
+                "usage": {
+                    "cache_creation_input_tokens": 4,
+                    "output_tokens": 5,
+                    "output_tokens_details": {"thinking_tokens": 2},
+                    "server_tool_use": {"web_search_requests": 1}
+                }
+            })),
+            false,
+        );
         text_output(&mut stream, &message_stop(), false);
         assert!(matches!(stream.finish_round().unwrap().action, RoundAction::Loop));
 
@@ -2198,27 +2370,64 @@ mod tests {
         stream.begin_round();
         text_output(&mut stream, &message_start_with_usage("msg_2", 8, 3), false);
         text_output(&mut stream, &text_block(0, "Answer"), false);
-        text_output(&mut stream, &message_delta("end_turn", 9), false);
+        text_output(
+            &mut stream,
+            &message_delta_with_metadata(&json!({
+                "type": "message_delta",
+                "delta": {
+                    "container": {"id": "container_1", "expires_at": "2026-10-06T00:00:00Z"},
+                    "stop_details": {"type": "refusal", "category": "general_harms", "explanation": "policy"},
+                    "stop_reason": "stop_sequence",
+                    "stop_sequence": "STOP"
+                },
+                "usage": {
+                    "cache_creation_input_tokens": 6,
+                    "output_tokens": 9,
+                    "output_tokens_details": {"thinking_tokens": 7},
+                    "server_tool_use": {"web_search_requests": 2}
+                }
+            })),
+            false,
+        );
         text_output(&mut stream, &message_stop(), false);
         let terminal = stream.finish_round().unwrap().terminal;
 
         let event = parse_event(&terminal, "message_delta");
         assert_eq!(
             event["delta"]["container"],
-            Value::Null,
-            "schema-complete delta.container"
+            json!({"id": "container_1", "expires_at": "2026-10-06T00:00:00Z"}),
+            "terminal container metadata is preserved"
         );
         assert_eq!(
             event["delta"]["stop_details"],
-            Value::Null,
-            "schema-complete delta.stop_details"
+            json!({"type": "refusal", "category": "general_harms", "explanation": "policy"}),
+            "terminal stop details are preserved"
         );
-        assert_eq!(event["delta"]["stop_reason"], "end_turn", "final stop reason carried");
+        assert_eq!(
+            event["delta"]["stop_reason"], "stop_sequence",
+            "final stop reason carried"
+        );
+        assert_eq!(
+            event["delta"]["stop_sequence"], "STOP",
+            "matched stop sequence is preserved"
+        );
         assert_eq!(event["usage"]["output_tokens"], 14, "output tokens aggregate 5 + 9");
         assert_eq!(event["usage"]["input_tokens"], 18, "input tokens aggregate 10 + 8");
         assert_eq!(
             event["usage"]["cache_read_input_tokens"], 5,
             "cache-read tokens aggregate 2 + 3"
+        );
+        assert_eq!(
+            event["usage"]["cache_creation_input_tokens"], 10,
+            "cache-creation tokens aggregate 4 + 6"
+        );
+        assert_eq!(
+            event["usage"]["output_tokens_details"]["thinking_tokens"], 9,
+            "output-token details aggregate 2 + 7"
+        );
+        assert_eq!(
+            event["usage"]["server_tool_use"]["web_search_requests"], 3,
+            "server-tool usage aggregates 1 + 2"
         );
     }
 
@@ -2293,7 +2502,7 @@ mod tests {
 
     #[test]
     fn forwarded_ping_bytes_match_canonical_sse() {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         let payload = json!({"type": "ping"});
         let out = stream.on_chunk(&sse("ping", &payload), false).unwrap();
@@ -2307,7 +2516,7 @@ mod tests {
     }
 
     fn stream_ready_for_second_round_text() -> LogicalStream {
-        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL, MAX_QUERY);
         text_output(&mut stream, &message_start("msg_1"), false);
         text_output(&mut stream, &text_block(0, "first"), false);
         stream.begin_round();

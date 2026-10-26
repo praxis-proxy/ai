@@ -284,12 +284,12 @@ fn validate_versions(
     }
 
     for v in supported_versions {
-        if !protocol::is_supported_version(v) {
+        if !protocol::SUPPORTED_VERSIONS.contains(&v.as_str()) {
             return Err(
                 format!("mcp: supported_versions contains '{v}' which is not implemented by this build").into(),
             );
         }
-        if !protocol::is_supported_version_for_profile(profile, v) {
+        if !protocol::supported_versions_for_profile(profile).contains(&v.as_str()) {
             return Err(format!(
                 "mcp: version '{v}' is not compatible with protocol_profile '{}'",
                 profile.as_str()

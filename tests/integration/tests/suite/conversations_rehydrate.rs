@@ -11,7 +11,8 @@
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    Backend, free_port, http_send, json_post, parse_body, parse_status, start_echo_backend, start_proxy,
+    Backend, StatefulCapturingBackend, free_port, http_send, json_post, parse_body, parse_status, start_echo_backend,
+    start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -160,6 +161,216 @@ async fn request_without_conversation_passes_through() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preserves_provider_compaction_during_native_rehydration() {
+    let provider_response = serde_json::json!({
+        "id": "resp_provider_compaction",
+        "object": "response",
+        "created_at": 1,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "compaction",
+            "id": "cmp_provider",
+            "encrypted_content": "provider-opaque-state",
+            "provider_field": {"opaque": true}
+        }]
+    })
+    .to_string();
+    let backend = StatefulCapturingBackend::new(vec![(200, provider_response.clone()), (200, provider_response)])
+        .start_with_shutdown();
+    let db = TempDb::new();
+    let proxy_port = free_port();
+    let config = Config::from_yaml(&pipeline_yaml(proxy_port, backend.port(), &db.url())).unwrap();
+    let proxy = start_proxy(&config);
+
+    let first = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"first turn"}"#),
+    );
+    assert_eq!(parse_status(&first), 200, "initial response should persist");
+
+    let second = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"continue","previous_response_id":"resp_provider_compaction"}"#,
+        ),
+    );
+    assert_eq!(parse_status(&second), 200, "rehydrated response should succeed");
+
+    let requests = backend.requests();
+    let response_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| request.uri == "/v1/responses")
+        .collect();
+    assert!(
+        response_requests.len() >= 2,
+        "backend should receive both response requests, got {} captured requests",
+        requests.len()
+    );
+    let forwarded: serde_json::Value = serde_json::from_str(&response_requests[1].body).unwrap();
+    let input = forwarded["input"]
+        .as_array()
+        .expect("forwarded input should be an array");
+    assert!(
+        input.iter().any(|item| {
+            item == &serde_json::json!({
+                "type": "compaction",
+                "id": "cmp_provider",
+                "encrypted_content": "provider-opaque-state",
+                "provider_field": {"opaque": true}
+            })
+        }),
+        "native OpenAI Responses backends must receive provider compaction state unchanged; forwarded={forwarded}"
+    );
+    assert_eq!(
+        input.last().and_then(|item| item.get("content")),
+        Some(&serde_json::json!("continue"))
+    );
+    assert!(
+        forwarded.get("previous_response_id").is_none(),
+        "local rehydration should still consume previous_response_id"
+    );
+}
+
+/// Script a provider compaction followed by a forced tool call, then prove the
+/// conversation continuation rehydrates the compaction item through Praxis.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conversation_compaction_continuation_reaches_scripted_provider_tool_call() {
+    let compaction_response = serde_json::json!({
+        "id": "resp_conversation_compaction",
+        "object": "response",
+        "created_at": 1,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "compaction",
+            "id": "cmp_conversation",
+            "encrypted_content": "provider-opaque-state"
+        }]
+    })
+    .to_string();
+    let tool_call_response = serde_json::json!({
+        "id": "resp_after_compaction",
+        "object": "response",
+        "created_at": 2,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_after_compaction",
+            "call_id": "call_after_compaction",
+            "name": "read_next_step",
+            "arguments": "{}",
+            "status": "completed"
+        }]
+    })
+    .to_string();
+    let backend = StatefulCapturingBackend::new(vec![(200, compaction_response), (200, tool_call_response)])
+        .start_with_shutdown();
+    let db = TempDb::new();
+    let proxy_port = free_port();
+    let config = Config::from_yaml(&pipeline_yaml(proxy_port, backend.port(), &db.url())).unwrap();
+    let proxy = start_proxy(&config);
+    let conversation_id = create_conversation(&proxy, r#"{"metadata":{},"items":[]}"#);
+
+    let first = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "first turn",
+        "conversation": conversation_id
+    });
+    let first = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&first).unwrap()),
+    );
+    assert_eq!(parse_status(&first), 200, "initial compaction response should succeed");
+
+    // Conversation append-back can finish just after the response is returned.
+    let mut compaction_was_appended = false;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let raw = http_send(
+            proxy.addr(),
+            &format!(
+                "GET /v1/conversations/{conversation_id}/items?order=asc HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        if parse_status(&raw) == 200 {
+            let items: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+            compaction_was_appended = items["data"].as_array().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["id"] == "cmp_conversation"
+                        && item["type"] == "compaction"
+                        && item["encrypted_content"] == "provider-opaque-state"
+                })
+            });
+            if compaction_was_appended {
+                break;
+            }
+        }
+    }
+    assert!(
+        compaction_was_appended,
+        "the provider compaction item should be appended to the conversation"
+    );
+
+    let continuation = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "continue after compaction",
+        "conversation": conversation_id,
+        "tools": [{
+            "type": "function",
+            "name": "read_next_step",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&continuation).unwrap()),
+    );
+    assert_eq!(parse_status(&raw), 200, "post-compaction request should succeed");
+
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        response["output"][0]["type"], "function_call",
+        "the scripted provider's post-compaction tool call should reach the client"
+    );
+    assert_eq!(response["output"][0]["call_id"], "call_after_compaction");
+
+    let requests = backend.requests();
+    let response_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| request.uri == "/v1/responses")
+        .collect();
+    assert_eq!(
+        response_requests.len(),
+        2,
+        "the scripted provider should receive the initial and continuation requests"
+    );
+    let forwarded: serde_json::Value = serde_json::from_str(&response_requests[1].body).unwrap();
+    let input = forwarded["input"]
+        .as_array()
+        .expect("rehydrated input should be an array");
+    assert!(
+        input.iter().any(|item| {
+            item["id"] == "cmp_conversation"
+                && item["type"] == "compaction"
+                && item["encrypted_content"] == "provider-opaque-state"
+        }),
+        "Praxis should rehydrate the stored compaction item before forwarding: {forwarded}"
+    );
+    assert_eq!(
+        input.last().and_then(|item| item.get("content")),
+        Some(&serde_json::json!("continue after compaction"))
+    );
+    assert!(forwarded.get("conversation").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_back_persists_items_after_response() {
     let response_body = serde_json::json!({
         "id": "resp_test123",
@@ -288,7 +499,7 @@ filter_chains:
         mode: single_tenant
         tenant_id: default
 
-      - filter: openai_operation
+      - filter: ai_operation
 
       - filter: openai_conversations
         backend: sqlite
@@ -296,19 +507,23 @@ filter_chains:
         conversations_table: test_conversations
         items_table: test_conversation_items
 
-      - filter: openai_responses_format
+      - filter: openai_responses_request
+        initialize_state: false
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
 
-      - filter: openai_responses_validate
-
-      - filter: openai_response_store
+      - filter: openai_responses_store
         backend: sqlite
         database_url: "{db_url}"
         responses_table: test_responses
         conversations_table: test_conversations
 
       - filter: openai_responses_rehydrate
-
-      - filter: openai_responses_proxy
 
       - filter: router
         routes:
@@ -318,8 +533,13 @@ filter_chains:
       - filter: load_balancer
         clusters:
           - name: "backend"
+            http:
+              application_protocol: "openai_responses"
+              application_provider: "openai"
             endpoints:
               - "127.0.0.1:{backend_port}"
+
+      - filter: openai_responses_proxy
 insecure_options:
   allow_private_endpoints: true
 "#

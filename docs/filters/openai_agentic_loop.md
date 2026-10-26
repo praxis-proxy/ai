@@ -7,6 +7,8 @@ Agentic loop controller for the Responses API pipeline.
 
 ## Configuration Notes
 
+Enable Cargo feature `openai-agentic-loop` to compile and register this experimental filter. It also enables `openai-responses` and the `experimental` marker; default and `full` builds exclude the loop.
+
 Manages iteration bookkeeping in `on_request_body`, extracts tool calls from non-streaming response bodies, and evaluates loop control in `on_response_body` (end-of-stream), writing `filter_results` for `iterative_request_router` transitions.
 
 Also extracts `tool_search_call` items into `ResponsesState.tool_search_calls` so `openai_mcp_dispatch` can load deferred connectors on the next iteration without forwarding those items to the inference backend.
@@ -15,7 +17,8 @@ Also extracts `tool_search_call` items into `ResponsesState.tool_search_calls` s
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `max_infer_iters` | integer | no | Maximum number of inference loop iterations (Praxis-only, not part of the OpenAI API spec). When the iteration counter reaches this limit, the loop returns a 508 Loop Detected error. |
+| `max_infer_iters` | integer | no | Maximum number of inference loop iterations (Praxis-only, not part of the OpenAI API spec). When the iteration counter reaches this limit, the loop returns a 508 Loop Detected error. Must be between 1 and 100 (the core IRR iteration ceiling); defaults to 10. |
+| `max_retained_bytes` | integer | no | Conservative request-wide retained-payload ceiling. Valid from 4 `KiB` through 256 `MiB`, defaults to a non-disableable 64 `MiB`, and uses the smallest limit when several loop instances are reachable. It covers typed input, history restore, compaction, file and document expansion, Store persistence, buffered and streaming output, Responses-to-Chat translation, MCP dispatch, and hosted tools across inference rounds. Initial payloads are conservatively charged at 32 times raw bytes plus a per-node reserve; each round's buffered provider output is charged at 64 times its wire bytes plus a larger per-node reserve. Store persistence doubles those conservative charges for its independent request input snapshot and response persistence projection. Finite Chat translation reserves its additional request and response JSON owners before allocating them. Streaming reserves raw chunks, parsed frames, terminal output, and separately retained tool results. When a create restores history, Store reads are capped before decoding; stored JSON is charged once at 32 times its serialized bytes plus 8 `KiB` per JSON node. Conversation append-back charges new items and any one-time legacy-prefix migration; existing item rows are not reread or recharged. The listener also clamps its raw request body limit to at most one thirty-second of this ceiling and its buffered IRR response limit to at most one eighth. These reserves can reject a request well below the configured ceiling. Budgeted MCP calls use fresh sessions so each call applies its current transport limit. Initial budget overflow returns HTTP 413; buffered provider overflow returns HTTP 502; a committed stream emits one SSE error on overflow. |
 
 ## Examples
 

@@ -7,12 +7,15 @@ Transforms Anthropic Messages API requests to Chat Completions-compatible reques
 
 ## Configuration Notes
 
-Request fields the translation does not map are forwarded untouched for the backend to validate. Fields whose effect the translated response could not report truthfully (`service_tier`, `container`, `inference_geo`, `mcp_servers`, and Chat Completions fields such as `n` or `logprobs` whose output the translated response would discard) are rejected with a 400. `thinking` and `context_management` are dropped with a warning.
+Request fields the translation does not map are forwarded untouched for the backend to validate. Fields whose effect the translated response could not report truthfully (`service_tier`, `container`, `inference_geo`, `mcp_servers`, and Chat Completions fields such as `n` or `logprobs` whose output the translated response would discard) are rejected with a 400. Unsupported semantic content is rejected because Chat Completions cannot represent it faithfully.
+
+`allow_lossy_features` opts specific Anthropic-only features into operator-approved degradation instead of that 400. A listed feature's wire markers are validated and then stripped so an unmodified client (for example Claude Code, which always sends `cache_control` and `thinking`) can still drive a Chat Completions backend. Each degradation is reported to the operator — one `WARN` log per request, a `praxis_anthropic_messages_to_chat_completions_degraded_total` counter per feature, and an `x-degraded-features` response header — because the request succeeds but the feature was silently dropped. `prompt_caching` removes `cache_control` markers (prompt and tool content are preserved, but explicit cache breakpoints are not honored, so cost and latency may differ); `extended_thinking` removes `thinking` and thinking-only `context_management` edits (the translated response carries no thinking blocks). Features absent from the allowlist, malformed markers, and other `context_management` edits are still rejected with a 400.
 
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
+| `allow_lossy_features` | (`extended_thinking` \| `prompt_caching`)[] | no | Anthropic features the operator allows the translator to degrade. Empty by default, which keeps the strict reject behavior for every feature. Unknown names fail config loading (`deny_unknown_fields` plus the validated `LossyFeature` enum), so a typo cannot silently widen what the translator will drop. |
 | `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer` mode. |
 
 ## Examples
@@ -28,4 +31,7 @@ filter: anthropic_messages_to_chat_completions
 ```yaml
 filter: anthropic_messages_to_chat_completions
 max_body_bytes: 1048576
+allow_lossy_features:
+  - prompt_caching
+  - extended_thinking
 ```

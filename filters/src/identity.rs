@@ -19,11 +19,17 @@ pub(crate) const DEFAULT_IDENTITY_METADATA_NAMESPACE: &str = "identity";
 /// Tenant identity resolved from metadata or request headers.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct TenantIdentity {
+    /// Value of `{prefix}cost-center`.
+    pub cost_center: String,
+
     /// Value of `{prefix}group`.
     pub group: String,
 
     /// Value of `{prefix}model`.
     pub model: String,
+
+    /// Value of `{prefix}organization-id`.
+    pub organization_id: String,
 
     /// Value of `{prefix}subscription`.
     pub subscription: String,
@@ -35,7 +41,12 @@ pub(crate) struct TenantIdentity {
 impl TenantIdentity {
     /// Whether every identity field is empty.
     pub(crate) fn is_empty(&self) -> bool {
-        self.username.is_empty() && self.group.is_empty() && self.subscription.is_empty() && self.model.is_empty()
+        self.username.is_empty()
+            && self.group.is_empty()
+            && self.subscription.is_empty()
+            && self.model.is_empty()
+            && self.organization_id.is_empty()
+            && self.cost_center.is_empty()
     }
 }
 
@@ -112,6 +123,18 @@ fn read_metadata_identity(
     }
     if let Some(val) = ctx
         .filter_metadata
+        .get(&format!("{namespace}{prefix_lower}cost-center"))
+    {
+        identity.cost_center.clone_from(val);
+    }
+    if let Some(val) = ctx
+        .filter_metadata
+        .get(&format!("{namespace}{prefix_lower}organization-id"))
+    {
+        identity.organization_id.clone_from(val);
+    }
+    if let Some(val) = ctx
+        .filter_metadata
         .get(&format!("{namespace}{prefix_lower}subscription"))
     {
         identity.subscription.clone_from(val);
@@ -135,8 +158,10 @@ fn read_header_identity(ctx: &mut HttpFilterContext<'_>, prefix_lower: &str, ide
         let val = value.to_str().unwrap_or_default();
 
         match suffix {
+            "cost-center" if identity.cost_center.is_empty() => val.clone_into(&mut identity.cost_center),
             "group" if identity.group.is_empty() => val.clone_into(&mut identity.group),
             "model" if identity.model.is_empty() => val.clone_into(&mut identity.model),
+            "organization-id" if identity.organization_id.is_empty() => val.clone_into(&mut identity.organization_id),
             "subscription" if identity.subscription.is_empty() => val.clone_into(&mut identity.subscription),
             "username" if identity.username.is_empty() => val.clone_into(&mut identity.username),
             _ => {},

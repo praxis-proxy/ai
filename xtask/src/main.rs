@@ -22,6 +22,14 @@ mod echo;
 mod filter_docs;
 mod fips;
 #[cfg(feature = "dev")]
+mod flow_generator;
+#[cfg(feature = "dev")]
+mod flow_graph;
+#[cfg(feature = "dev")]
+mod flow_visualizer;
+#[cfg(feature = "dev")]
+mod html;
+#[cfg(feature = "dev")]
 mod inference_fixtures;
 #[cfg(feature = "dev")]
 mod lint_deps;
@@ -47,6 +55,10 @@ mod sync_example_readme;
 mod sync_inference_readme;
 #[cfg(feature = "dev")]
 mod sync_responses_readme;
+#[cfg(feature = "dev")]
+mod translation_matrix;
+#[cfg(feature = "dev")]
+mod visualize_config;
 
 use clap::{Parser, Subcommand};
 
@@ -70,6 +82,11 @@ enum Command {
     #[cfg(feature = "dev")]
     CheckInference(inference_fixtures::CheckArgs),
 
+    /// Check the runtime Anthropic Messages operation registry
+    /// against the pinned Anthropic specification.
+    #[cfg(feature = "dev")]
+    CheckAnthropicMessagesRegistry,
+
     /// Check the runtime Responses operation registry against
     /// the pinned OpenAI specification.
     #[cfg(feature = "dev")]
@@ -79,6 +96,16 @@ enum Command {
     /// the pinned OpenAI specification.
     #[cfg(feature = "dev")]
     CheckChatCompletionsRegistry,
+
+    /// Check the runtime Files operation registry against
+    /// the pinned OpenAI specification.
+    #[cfg(feature = "dev")]
+    CheckFilesRegistry,
+
+    /// Check the runtime Vector Stores operation registry against
+    /// the pinned OpenAI specification.
+    #[cfg(feature = "dev")]
+    CheckVectorStoresRegistry,
 
     /// Start a quick HTTP test server returning a static
     /// response to every request.
@@ -125,6 +152,16 @@ enum Command {
     #[cfg(feature = "dev")]
     SyncInferenceReadme(sync_inference_readme::Args),
 
+    /// Verify (and later regenerate) the checked-in flow-visualizer HTML
+    /// against the config it documents.
+    #[cfg(feature = "dev")]
+    SyncFlowVisualizers(flow_visualizer::Args),
+
+    /// Render an arbitrary Praxis config as a self-contained, offline HTML
+    /// document (structure from the parser, semantics only for known filters).
+    #[cfg(feature = "dev")]
+    VisualizeConfig(visualize_config::Args),
+
     /// Generate per-filter documentation under `docs/filters/`.
     #[cfg(feature = "dev")]
     GenerateFilterDocs(filter_docs::GenerateArgs),
@@ -158,6 +195,11 @@ enum Command {
     #[cfg(feature = "dev")]
     RecordInference(inference_fixtures::RecordArgs),
 
+    /// Validate the translation support matrix manifest and regenerate or
+    /// verify the rendered matrix document.
+    #[cfg(feature = "dev")]
+    TranslationMatrix(translation_matrix::Args),
+
     /// Generate the pipeline-overview table in
     /// `apis/src/openai/responses/README.md`.
     #[cfg(feature = "dev")]
@@ -186,9 +228,12 @@ fn main() {
 #[cfg(feature = "dev")]
 fn run_dev(command: Command) {
     match command {
+        Command::CheckAnthropicMessagesRegistry => openai_conformance::run_anthropic_messages_registry_check(),
         Command::CheckInference(args) => inference_fixtures::run_check(&args),
         Command::CheckResponsesRegistry => openai_conformance::run_responses_registry_check(),
         Command::CheckChatCompletionsRegistry => openai_conformance::run_chat_completions_registry_check(),
+        Command::CheckFilesRegistry => openai_conformance::run_files_registry_check(),
+        Command::CheckVectorStoresRegistry => openai_conformance::run_vector_stores_registry_check(),
         Command::Echo(args) => echo::run(args),
         Command::Debug(args) => debug::run(&args),
         Command::LintDeps(args) => lint_deps::run(args),
@@ -197,6 +242,14 @@ fn run_dev(command: Command) {
         Command::LintSeparators(args) => lint_separators::run(args),
         Command::ImportInference(args) => inference_fixtures::run_import(args),
         Command::MakeReplayFixture(args) => make_replay_fixture::run(args),
+        command => run_dev_continued(command),
+    }
+}
+
+/// Continuation of development subcommand dispatch.
+#[cfg(feature = "dev")]
+fn run_dev_continued(command: Command) {
+    match command {
         Command::SyncExampleReadme(args) => sync_example_readme::run(&args),
         Command::GenerateFilterDocs(args) => filter_docs::generate(args),
         Command::LintFilterDocs(args) => filter_docs::lint(args),
@@ -206,9 +259,13 @@ fn run_dev(command: Command) {
         Command::OpenaiConformanceGate(args) => openai_conformance_gate::run(&args),
         Command::OpenresponsesCoverage(args) => openresponses_coverage::run(&args),
         Command::RecordInference(args) => inference_fixtures::run_record(args),
+        Command::TranslationMatrix(args) => translation_matrix::run(&args),
         Command::SyncInferenceReadme(args) => sync_inference_readme::run(&args),
+        Command::SyncFlowVisualizers(args) => flow_visualizer::run(&args),
+        Command::VisualizeConfig(args) => visualize_config::run(&args),
         Command::SyncResponsesReadme(args) => sync_responses_readme::run(&args),
         Command::Fips(args) => fips::run(args),
+        _ => unreachable!(),
     }
 }
 

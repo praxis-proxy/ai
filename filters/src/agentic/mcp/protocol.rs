@@ -81,19 +81,9 @@ pub(crate) fn supported_versions_for_profile(profile: ProtocolProfile) -> &'stat
     }
 }
 
-/// Returns `true` when `version` is supported by the given profile.
-pub(crate) fn is_supported_version_for_profile(profile: ProtocolProfile, version: &str) -> bool {
-    supported_versions_for_profile(profile).contains(&version)
-}
-
 // -----------------------------------------------------------------------------
 // Global Helpers
 // -----------------------------------------------------------------------------
-
-/// Returns `true` when `version` appears in [`SUPPORTED_VERSIONS`].
-pub(crate) fn is_supported_version(version: &str) -> bool {
-    SUPPORTED_VERSIONS.contains(&version)
-}
 
 // -----------------------------------------------------------------------------
 // Tests
@@ -116,34 +106,10 @@ mod tests {
         for profile in [ProtocolProfile::Current, ProtocolProfile::Stateless] {
             let version = default_version_for_profile(profile);
             assert!(
-                is_supported_version(version),
+                SUPPORTED_VERSIONS.contains(&version),
                 "default version for {profile:?} must appear in SUPPORTED_VERSIONS"
             );
         }
-    }
-
-    #[test]
-    fn current_version_is_supported() {
-        assert!(
-            is_supported_version(PROTOCOL_VERSION_CURRENT),
-            "PROTOCOL_VERSION_CURRENT must be supported"
-        );
-    }
-
-    #[test]
-    fn stateless_version_is_supported() {
-        assert!(
-            is_supported_version(PROTOCOL_VERSION_STATELESS_2026_07_28),
-            "PROTOCOL_VERSION_STATELESS_2026_07_28 must be supported"
-        );
-    }
-
-    #[test]
-    fn unknown_version_is_not_supported() {
-        assert!(
-            !is_supported_version("9999-12-31"),
-            "arbitrary version should not be supported"
-        );
     }
 
     #[test]
@@ -233,18 +199,6 @@ mod tests {
     }
 
     #[test]
-    fn is_supported_version_for_current_profile() {
-        assert!(
-            is_supported_version_for_profile(ProtocolProfile::Current, PROTOCOL_VERSION_CURRENT),
-            "2025-03-26 should be supported by current profile"
-        );
-        assert!(
-            !is_supported_version_for_profile(ProtocolProfile::Current, PROTOCOL_VERSION_STATELESS_2026_07_28),
-            "2026-07-28 should not be supported by current profile"
-        );
-    }
-
-    #[test]
     fn supported_versions_equals_union_of_all_profiles() {
         let mut union: Vec<&str> = Vec::new();
         union.extend_from_slice(SUPPORTED_VERSIONS_CURRENT);
@@ -264,18 +218,6 @@ mod tests {
             global.len(),
             union.len(),
             "SUPPORTED_VERSIONS must not contain duplicates or extras"
-        );
-    }
-
-    #[test]
-    fn is_supported_version_for_stateless_profile() {
-        assert!(
-            is_supported_version_for_profile(ProtocolProfile::Stateless, PROTOCOL_VERSION_STATELESS_2026_07_28),
-            "2026-07-28 should be supported by stateless profile"
-        );
-        assert!(
-            !is_supported_version_for_profile(ProtocolProfile::Stateless, PROTOCOL_VERSION_CURRENT),
-            "2025-03-26 should not be supported by stateless profile"
         );
     }
 }

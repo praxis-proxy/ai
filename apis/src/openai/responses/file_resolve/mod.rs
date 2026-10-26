@@ -87,8 +87,9 @@ use self::{
     resolve_url::{FileUrlResolver, NormalizedOrigin},
 };
 use super::{
-    body_limits::reject_rewritten_body_too_large, bound_body_outcome,
-    openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
+    AgenticBudgetPolicy, agentic_loop::budget::output_charge, body_limits::reject_rewritten_body_too_large,
+    bound_body_outcome, content_parts::content_parts, error::responses_error_rejection, history::MessageHistory,
+    responses_proxy::serialized_outbound_body_len, state::ResponsesState,
 };
 use crate::{
     callout_headers::effective_body_callout_headers,
@@ -198,8 +199,8 @@ impl FileResolveFilter {
     /// Create a filter from parsed YAML config.
     ///
     /// Uses an isolated [`SubRequestClient`] with a default pool
-    /// size of 4. Prefer [`from_config_with_client`] when a shared
-    /// client is available.
+    /// size of 4. Production registration uses [`Self::from_config_with_outbound`]
+    /// with the selected client and a bound outbound chain.
     ///
     /// # Errors
     ///
@@ -207,28 +208,9 @@ impl FileResolveFilter {
     /// callout client cannot be constructed.
     ///
     /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
-    /// [`from_config_with_client`]: Self::from_config_with_client
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let client = crate::subrequest::isolated_client(4);
-        Self::build(config, client, None)
-    }
-
-    /// Create a filter using the shared [`SubRequestClient`].
-    ///
-    /// The shared client inherits the server-level pool size and
-    /// connection limits from the runtime configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FilterError`] if the YAML config is invalid or the
-    /// callout client cannot be constructed.
-    ///
-    /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
-    pub fn from_config_with_client(
-        config: &serde_yaml::Value,
-        client: SubRequestClient,
-    ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        Self::build(config, client, None)
+        Self::build(config, &client, None)
     }
 
     /// Create a filter with a pre-bound outbound filter chain.
@@ -246,7 +228,7 @@ impl FileResolveFilter {
     /// [`ChainBindingContext::bind_chain`]: praxis_filter::ChainBindingContext::bind_chain
     pub fn from_config_with_outbound(
         config: &serde_yaml::Value,
-        client: SubRequestClient,
+        client: &SubRequestClient,
         outbound: Arc<FilterPipeline>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         Self::build(config, client, Some(outbound))
@@ -276,7 +258,7 @@ impl FileResolveFilter {
     #[expect(clippy::too_many_lines, reason = "filter construction boilerplate")]
     fn build(
         config: &serde_yaml::Value,
-        subrequest_client: SubRequestClient,
+        subrequest_client: &SubRequestClient,
         outbound: Option<Arc<FilterPipeline>>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: FileResolveConfig = parse_filter_config("openai_file_resolve", config)?;
@@ -292,7 +274,7 @@ impl FileResolveFilter {
 
         let api_client = ApiClient::new(ApiClientConfig {
             api_base_url: validated.files_api_url.clone(),
-            client: subrequest_client,
+            client: subrequest_client.clone(),
             timeout: std::time::Duration::from_millis(validated.timeout_ms),
             max_response_bytes: 1_048_576,
             forward_header_names,
@@ -321,6 +303,7 @@ impl FileResolveFilter {
                 .map_err(|e| -> FilterError { format!("openai_file_resolve: {e}").into() })?;
             Some(FileUrlResolver {
                 allowed_private_origins: origins,
+                client: subrequest_client.clone(),
             })
         } else {
             None
@@ -374,6 +357,10 @@ impl HttpFilter for FileResolveFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "budget preflight and file resolution share one body hook"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -389,7 +376,7 @@ impl HttpFilter for FileResolveFilter {
             return Ok(FilterAction::Release);
         }
 
-        if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
+        if ctx.get_metadata("openai_responses_request.format") != Some("openai_responses") {
             trace!("skipping non-responses request");
             return Ok(FilterAction::Release);
         }
@@ -398,6 +385,21 @@ impl HttpFilter for FileResolveFilter {
             trace!("no body, releasing");
             return Ok(FilterAction::Release);
         };
+
+        if ctx.extensions.get::<AgenticBudgetPolicy>().is_some() {
+            if budgeted_plain_input_without_references(ctx) {
+                return Ok(FilterAction::Continue);
+            }
+            let charge = output_charge(raw);
+            let admitted = ctx
+                .extensions
+                .get_mut::<ResponsesState>()
+                .and_then(|state| state.simple_budget.as_mut())
+                .is_some_and(|budget| charge.is_some_and(|charge| budget.reserve_additional_input(charge)));
+            if !admitted {
+                return Ok(reject_retained_file_budget());
+            }
+        }
 
         let parsed: serde_json::Value = match serde_json::from_slice(raw) {
             Ok(v) => v,
@@ -446,6 +448,44 @@ impl HttpFilter for FileResolveFilter {
     }
 }
 
+/// A text input and file-free retained history need no second parse or rewrite.
+fn budgeted_plain_input_without_references(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
+        state.simple_budget.is_some()
+            && super::text_only_input(state.request_body.get("input"))
+            && state.messages.iter().all(|item| !history_needs_file_resolution(item))
+            && state
+                .persisted_messages
+                .iter()
+                .all(|item| !history_needs_file_resolution(item))
+    })
+}
+
+/// Detect file-bearing history without allocating another JSON projection.
+fn history_needs_file_resolution(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(items) => items.iter().any(history_needs_file_resolution),
+        serde_json::Value::Object(fields) => {
+            matches!(
+                fields.get("type").and_then(serde_json::Value::as_str),
+                Some("input_file")
+            ) || (fields.get("type").and_then(serde_json::Value::as_str) == Some("input_image")
+                && (fields.contains_key("file_id") || fields.contains_key("file_url")))
+                || fields.values().any(history_needs_file_resolution)
+        },
+        _ => false,
+    }
+}
+
+/// Reject before parsing or dispatch when file ownership would exceed the request budget.
+fn reject_retained_file_budget() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        413,
+        "invalid_request_error",
+        "File resolution exceeds a processing limit set by the platform administrator.",
+    ))
+}
+
 /// Run resolution and rewrite the body if any references were resolved.
 ///
 /// Takes ownership of the parsed body so the resolved value can be moved
@@ -464,7 +504,11 @@ async fn resolve_and_rewrite(
     let max_bytes = filter.config.max_rewritten_body_bytes;
     let needs_files_api = body_has_file_id_reference(&parsed)
         || ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
-            items_have_file_id_reference(&state.messages) || items_have_file_id_reference(&state.persisted_messages)
+            state
+                .messages
+                .iter()
+                .chain(state.persisted_messages.iter())
+                .any(|item| items_have_file_id_reference(std::slice::from_ref(item)))
         });
     let identity = if needs_files_api {
         match stage_callout_identity(ctx, filter.user_credential_slot.as_deref()) {
@@ -479,19 +523,26 @@ async fn resolve_and_rewrite(
     let mut budget = filter
         .client
         .resolution_budget(identity.and_then(|identity| build_outbound_execution(filter, ctx, identity)));
+    budget.set_simple_budget(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .and_then(|state| state.simple_budget),
+    );
     // Body pre-read mutations have not reached `ctx.request` yet. Materialize
     // their effective view once so every Files API call observes trusted
     // removals and projections while `ctx` is subsequently mutated.
     let request_headers = effective_body_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers)).into_owned();
     let count = match resolve_current_input(filter, &request_headers, &mut parsed, &mut budget).await {
         Ok(count) => count,
+        Err(ResolveError::RetainedBudget) => return Ok(reject_retained_file_budget()),
         Err(e) => return Ok(reject_resolve_error(&e)),
     };
     if count == 0 {
         trace!("no file_id references found");
         if let Err(e) = update_state(filter, ctx, &request_headers, None, &mut budget).await {
-            return Ok(reject_resolve_error(&e));
+            return Ok(reject_file_resolution_error(&e));
         }
+        sync_simple_budget(ctx, &budget);
         if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes)? {
             return Ok(rejection);
         }
@@ -503,13 +554,30 @@ async fn resolve_and_rewrite(
         return Ok(rejection);
     }
     if let Err(e) = update_state(filter, ctx, &request_headers, Some(parsed), &mut budget).await {
-        return Ok(reject_resolve_error(&e));
+        return Ok(reject_file_resolution_error(&e));
     }
+    sync_simple_budget(ctx, &budget);
     if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes)? {
         return Ok(rejection);
     }
 
     Ok(FilterAction::Continue)
+}
+
+/// Publish file owner reservations before downstream filters resume.
+fn sync_simple_budget(ctx: &mut HttpFilterContext<'_>, budget: &ResolutionBudget) {
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.simple_budget = budget.simple_budget();
+    }
+}
+
+/// Budget exhaustion is terminal even when missing file policy is permissive.
+fn reject_file_resolution_error(error: &ResolveError) -> FilterAction {
+    if matches!(error, ResolveError::RetainedBudget) {
+        reject_retained_file_budget()
+    } else {
+        reject_resolve_error(error)
+    }
 }
 
 /// Snapshot the downstream request context and build the outbound
@@ -543,11 +611,7 @@ fn build_outbound_execution(
 /// agentic and ordinary Responses pipelines without relying on a later loop owner.
 fn reject_missing_callout_context(slot: &str) -> FilterAction {
     let message = format!("file resolution requires the '{slot}' per-user credential, which was not provided");
-    FilterAction::Reject(super::error::responses_error_rejection(
-        401,
-        MISSING_CALLOUT_CONTEXT,
-        &message,
-    ))
+    FilterAction::Reject(responses_error_rejection(401, MISSING_CALLOUT_CONTEXT, &message))
 }
 
 /// Enforce the resolver's body limit against the exact request shape
@@ -645,6 +709,10 @@ fn rewrite_body(
 ///
 /// Takes `resolved_body` by value and moves it into `request_body`
 /// rather than deep-cloning a tree that may carry inlined file data.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "history resolution embeds the policy-aware subrequest executor future, which exceeds the stack threshold"
+)]
 async fn sync_state_with_budget(
     ctx: &mut HttpFilterContext<'_>,
     resolved_body: serde_json::Value,
@@ -694,6 +762,10 @@ async fn sync_state(
 
 /// Resolve file references in rehydrated history when the
 /// current input did not require a body rewrite.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "history resolution embeds the policy-aware subrequest executor future, which exceeds the stack threshold"
+)]
 async fn resolve_state_history(
     ctx: &mut HttpFilterContext<'_>,
     resolver: HistoryResolver<'_>,
@@ -724,7 +796,7 @@ struct HistoryResolver<'a> {
 /// Resolve the persistence mirror with independent count and byte
 /// accounting while reusing the request-wide cache and deadline.
 async fn sync_persisted_history(
-    messages: &mut [serde_json::Value],
+    messages: &mut MessageHistory,
     input_len: usize,
     resolved_input: Option<&[serde_json::Value]>,
     resolver: HistoryResolver<'_>,
@@ -739,7 +811,7 @@ async fn sync_persisted_history(
 /// Update the current-input tail, when provided, then resolve the
 /// independently sized history prefix.
 async fn sync_message_history(
-    messages: &mut [serde_json::Value],
+    messages: &mut MessageHistory,
     input_len: usize,
     resolved_input: Option<&[serde_json::Value]>,
     resolver: HistoryResolver<'_>,
@@ -756,8 +828,11 @@ async fn sync_message_history(
 
 /// Copy resolved input items into the current-input tail of a
 /// message vector, starting at `history_end`.
-fn replace_tail(messages: &mut [serde_json::Value], history_end: usize, resolved_input: &[serde_json::Value]) {
+fn replace_tail(messages: &mut MessageHistory, history_end: usize, resolved_input: &[serde_json::Value]) {
     for (i, item) in resolved_input.iter().enumerate() {
+        if messages.get(history_end + i) == Some(item) {
+            continue;
+        }
         if let Some(slot) = messages.get_mut(history_end + i) {
             *slot = item.clone();
         }
@@ -766,28 +841,45 @@ fn replace_tail(messages: &mut [serde_json::Value], history_end: usize, resolved
 
 /// Resolve file references in history messages (the prefix
 /// before the current input).
+#[expect(
+    clippy::too_many_lines,
+    reason = "check borrowed references before detaching only items needing resolution"
+)]
 async fn resolve_history(
-    messages: &mut [serde_json::Value],
+    messages: &mut MessageHistory,
     history_end: usize,
     resolver: HistoryResolver<'_>,
     budget: &mut ResolutionBudget,
 ) -> Result<(), ResolveError> {
-    if history_end == 0 {
-        return Ok(());
+    for index in 0..history_end {
+        let needs_resolution = messages.get(index).is_some_and(|item| {
+            items_have_file_id_reference(std::slice::from_ref(item))
+                || (resolver.url_resolver.is_some()
+                    && content_parts(item).is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part.get("type").and_then(serde_json::Value::as_str) == Some("input_file")
+                                && part.get("file_url").and_then(serde_json::Value::as_str).is_some()
+                                && part.get("file_data").is_none_or(serde_json::Value::is_null)
+                                && part.get("file_id").is_none_or(serde_json::Value::is_null)
+                        })
+                    }))
+        });
+        if !needs_resolution {
+            continue;
+        }
+        if let Some(item) = messages.get_mut(index) {
+            resolve_items(
+                std::slice::from_mut(item),
+                resolver.client,
+                resolver.on_missing,
+                resolver.request_headers,
+                resolver.url_resolver,
+                budget,
+            )
+            .await?;
+        }
     }
-    let Some(history) = messages.get_mut(..history_end) else {
-        return Ok(());
-    };
-    resolve_items(
-        history,
-        resolver.client,
-        resolver.on_missing,
-        resolver.request_headers,
-        resolver.url_resolver,
-        budget,
-    )
-    .await
-    .map(|_count| ())
+    Ok(())
 }
 
 /// Map one resolution error to an HTTP status and safe client message.
@@ -797,6 +889,7 @@ fn resolve_error_response(err: &ResolveError) -> (u16, String) {
         ResolveError::InvalidFileId { file_id, detail } => invalid_id_error_response(file_id, detail),
         ResolveError::TooManyReferences { limit } => too_many_error_response(*limit),
         ResolveError::TooLarge { reference, limit } => too_large_error_response(reference, *limit),
+        ResolveError::RetainedBudget => (413, "file resolution exceeded retained payload budget".to_owned()),
         ResolveError::FileUrlBlocked { label } => file_url_blocked_response(label),
         ResolveError::FileUrlFailed { label, detail } => file_url_failed_response(label, detail),
     }
@@ -835,13 +928,13 @@ fn too_large_error_response(reference: &str, limit: usize) -> (u16, String) {
 /// Report a file URL blocked by SSRF policy to the caller.
 fn file_url_blocked_response(label: &str) -> (u16, String) {
     warn!(url = %label, "file URL blocked by security policy");
-    (403, format!("file URL '{label}' blocked by security policy"))
+    (403, "file URL blocked by security policy".to_owned())
 }
 
 /// Report a file URL fetch failure to the caller.
 fn file_url_failed_response(label: &str, detail: &str) -> (u16, String) {
     warn!(url = %label, detail, "file URL fetch failed");
-    (502, format!("failed to fetch file URL '{label}': request failed"))
+    (502, "failed to fetch file URL: request failed".to_owned())
 }
 
 /// Build a rejection response from a resolution error.

@@ -124,13 +124,13 @@ exception - see below).
 In scope when the diff touches OpenAI-format code
 under `apis/src/openai/` or a related cross-cutting
 filter in `filters/src/`. Representative filters:
-`openai_responses_format`, `openai_responses_validate`,
+`openai_responses_request`,
 `openai_responses_proxy`, `openai_responses_rehydrate`,
 `openai_responses_model_rewrite`,
-`openai_responses_compact`, `openai_response_store`,
-`responses_to_chat_completions`, `openai_conversations`,
+`openai_responses_compact`, `openai_responses_store`,
+`openai_responses_to_chat_completions`, `openai_conversations`,
 `openai_stream_events`, `openai_tool_parse`,
-`openai_web_search`, `openai_agentic_loop`, and
+`openai_web_search_dispatch`, `openai_agentic_loop`, and
 `openai_mcp_dispatch`.
 
 Source of truth:
@@ -162,17 +162,18 @@ flag code that matches a recorded exception.
 
 In scope when the diff touches Anthropic-format code
 under `apis/src/anthropic/`. Representative filters:
-`anthropic_messages_format`,
+`anthropic_messages_request`,
 `anthropic_messages_protocol`, `anthropic_stream_events`,
-`anthropic_to_openai`, `anthropic_validate`, and
-`anthropic_web_search`.
+`anthropic_to_openai`, and `anthropic_web_search`.
 
 Source of truth:
 `docs/conformance/specs/anthropic-spec.json` (see
 `docs/conformance/README.md`, "Anthropic Messages
-Reference Spec"). There is no automated Anthropic gate,
-so this manual cross-reference is the only conformance
-check for these surfaces.
+Reference Spec"). A registry drift check
+(`check-anthropic-messages-registry` in `make lint`)
+covers method, path, and operation ID alignment; this
+manual cross-reference is the conformance check for
+schemas, field names, types, enums, and optionality.
 
 Today the only Anthropic path Praxis handles is
 `/v1/messages` and its subpaths (`/v1/messages`,

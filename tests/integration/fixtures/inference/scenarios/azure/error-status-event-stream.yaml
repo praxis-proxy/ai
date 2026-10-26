@@ -1,0 +1,31 @@
+version: 1
+id: azure/error-status-event-stream
+description: Normalize an Azure error that incorrectly carries an event-stream content type.
+protocol: openai_chat_completions
+example_config: azure/chat-completions-to-openai-fixture.yaml
+upstream_authority: 127.0.0.1:3000
+features:
+  - azure.chat.response.error_status_event_stream
+turns:
+  - name: event-stream-error
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: user
+              content: Hi
+          stream: false
+    expect:
+      client_status: 404
+      client_body_kind: json
+      upstream_path: /openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

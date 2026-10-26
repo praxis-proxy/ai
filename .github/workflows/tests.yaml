@@ -30,11 +30,32 @@ env:
   V: ${{ inputs.debug && '1' || '' }}
 
 jobs:
+  release-qualification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Test CI and GPU qualification reporting
+        run: python3 -m unittest discover -s tests/qualification
+
   # ----------------------------------------------------------------------------
   # Lint (fmt + clippy)
+  #
+  # Split into lint-clippy and lint-xtask so the workspace clippy passes and the
+  # xtask meta-lint build run in parallel. They share no build artifacts (clippy
+  # output is unusable by `cargo run`, and xtask's `dev` feature resolves a
+  # distinct dependency graph), so serially the xtask build recompiled the tree a
+  # second time — ~26m end to end. As two jobs the wall-clock collapses to the
+  # heavier half. Each job takes its own cache-suffix; local `make lint` still
+  # runs both serially.
   # ----------------------------------------------------------------------------
 
-  lint:
+  lint-clippy:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -51,15 +72,33 @@ jobs:
         run: actionlint
 
       - name: Setup Rust (lint)
-        uses: praxis-proxy/conventions/.github/actions/setup-rust-lint@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust-lint@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
-          cache-suffix: lint-cargo
+          cache-suffix: lint-clippy-cargo
 
       - name: Install cargo-machete
         run: cargo install cargo-machete --locked
 
-      - name: Lint
-        run: make lint
+      - name: Lint (clippy + fmt + deps)
+        run: make lint-clippy
+
+  lint-xtask:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust (lint)
+        uses: praxis-proxy/conventions/.github/actions/setup-rust-lint@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: lint-xtask-cargo
+
+      - name: Lint (xtask meta lints)
+        run: make lint-xtask
 
   # ----------------------------------------------------------------------------
   # Unit tests
@@ -83,7 +122,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           cache-suffix: test-unit-apis-cargo
 
@@ -92,7 +131,7 @@ jobs:
 
   test-filters:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -101,12 +140,15 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           cache-suffix: test-unit-filters-cargo
 
       - name: Unit tests (filters)
         run: make test-unit-filters
+
+      - name: Model-to-provider latency benchmark (release)
+        run: make bench-model-to-provider
 
   test-proxy:
     runs-on: ubuntu-24.04
@@ -119,7 +161,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           cache-suffix: test-unit-proxy-cargo
 
@@ -138,9 +180,10 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           cache-suffix: store-features-cargo
 
       - name: Store backend feature matrix
         run: make test-store-features
+

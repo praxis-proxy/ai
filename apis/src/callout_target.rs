@@ -8,12 +8,10 @@
 //! before the validated socket addresses are handed to the transport.  This
 //! closes the DNS-rebinding gap left by startup-only URL validation.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use praxis_core::connectivity::normalize_mapped_ipv4;
+use praxis_core::connectivity::{classify_ip, normalize_mapped_ipv4};
 use praxis_filter::FilterError;
-
-use crate::openai::url_security::is_non_public_ip;
 
 /// Whether a configured callout may connect to non-public addresses.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -24,10 +22,17 @@ pub enum AddressPolicy {
     /// Private, loopback, link-local, and other non-public addresses are
     /// accepted because the operator explicitly opted in.
     AllowPrivate,
+    /// Google's metadata endpoints are accepted for the GCP credential
+    /// provider whose target authority is independently restricted.
+    ///
+    /// This is not exposed as a generic configuration opt-in. Unspecified and
+    /// multicast destinations remain forbidden.
+    AllowGoogleMetadata,
 }
 
 impl AddressPolicy {
-    /// Build a policy from a filter's explicit private-target opt-in.
+    /// Keep the generic private-target opt-in separate from protocol-owned
+    /// credential endpoints.
     #[must_use]
     pub const fn from_allow_private(allow_private: bool) -> Self {
         if allow_private {
@@ -37,10 +42,37 @@ impl AddressPolicy {
         }
     }
 
-    /// Return whether non-public addresses are allowed.
+    /// Dedicated protocol exceptions must not inherit generic private access.
     #[must_use]
     pub const fn allows_private(self) -> bool {
         matches!(self, Self::AllowPrivate)
+    }
+
+    /// Google metadata access is isolated from the operator's generic opt-in.
+    #[must_use]
+    pub const fn allows_google_metadata(self) -> bool {
+        matches!(self, Self::AllowGoogleMetadata)
+    }
+
+    /// Return whether this policy blocks an outbound address.
+    ///
+    /// Cloud metadata, unspecified, and multicast destinations remain blocked
+    /// even when the operator explicitly permits private targets. All other
+    /// non-public destinations follow the private-target opt-in.
+    #[must_use]
+    pub fn blocks(self, ip: &IpAddr) -> bool {
+        let ip = normalize_mapped_ipv4(*ip);
+        let class = classify_ip(&ip);
+        if self.allows_google_metadata() {
+            const GOOGLE_METADATA_IPV4: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
+            const GOOGLE_METADATA_IPV6: Ipv6Addr = Ipv6Addr::new(0xFD20, 0xCE, 0, 0, 0, 0, 0, 0x254);
+            return !matches!(ip, IpAddr::V4(ip) if ip == GOOGLE_METADATA_IPV4)
+                && !matches!(ip, IpAddr::V6(ip) if ip == GOOGLE_METADATA_IPV6);
+        }
+        class.is_cloud_metadata()
+            || class.is_unspecified()
+            || class.is_multicast()
+            || (!self.allows_private() && class.is_non_public())
     }
 }
 
@@ -205,9 +237,19 @@ pub fn validate_resolved_addrs(
 /// [`AddressPolicy::PublicOnly`].
 pub fn validate_ip(filter_name: &str, ip: IpAddr, policy: AddressPolicy) -> Result<(), FilterError> {
     let ip = normalize_mapped_ipv4(ip);
-    if !policy.allows_private() && is_non_public_ip(&ip) {
+    let class = classify_ip(&ip);
+    if policy.blocks(&ip) {
+        if policy.allows_google_metadata() {
+            return Err(format!("{filter_name}: dedicated metadata target resolved to disallowed address {ip}").into());
+        }
+        if !class.is_cloud_metadata() && !class.is_unspecified() && !class.is_multicast() {
+            return Err(format!(
+                "{filter_name}: target resolved to blocked non-public address {ip}; set the filter's private-target opt-in to true to allow"
+            )
+            .into());
+        }
         return Err(format!(
-            "{filter_name}: target resolved to blocked non-public address {ip}; set the filter's private-target opt-in to true to allow"
+            "{filter_name}: target resolved to blocked non-public address {ip}; cloud metadata, unspecified, and multicast destinations cannot be enabled by a private-target opt-in"
         )
         .into());
     }
@@ -266,11 +308,76 @@ mod tests {
 
     #[test]
     fn private_opt_in_accepts_private_answers() {
-        let addrs = ["127.0.0.1:8080".parse().unwrap(), "10.0.0.1:8080".parse().unwrap()];
+        let addrs = [
+            "127.0.0.1:8080".parse().unwrap(),
+            "10.0.0.1:8080".parse().unwrap(),
+            "169.254.1.1:8080".parse().unwrap(),
+            "[fc00::1]:8080".parse().unwrap(),
+            "192.0.2.1:8080".parse().unwrap(),
+            "[64:ff9b::c0a8:1]:8080".parse().unwrap(),
+        ];
         assert_eq!(
             validate_resolved_addrs("test", &addrs, AddressPolicy::AllowPrivate).unwrap(),
             addrs
         );
+    }
+
+    #[test]
+    fn private_opt_in_rejects_permanently_sensitive_answers() {
+        for address in [
+            "169.254.169.254:80",
+            "169.254.170.2:80",
+            "169.254.170.23:80",
+            "169.254.0.23:80",
+            "169.254.10.10:80",
+            "100.100.100.200:80",
+            "[fd00:ec2::254]:80",
+            "[fd00:ec2::23]:80",
+            "[fd20:ce::254]:80",
+            "[fe80::a9fe:a9fe]:80",
+            "[64:ff9b::a9fe:a9fe]:80",
+            "0.0.0.0:80",
+            "[::]:80",
+            "224.0.0.1:80",
+            "[ff02::1]:80",
+        ] {
+            let addrs = [address.parse().unwrap()];
+            assert!(
+                validate_resolved_addrs("test", &addrs, AddressPolicy::AllowPrivate).is_err(),
+                "{address} must remain blocked after the private-target opt-in"
+            );
+        }
+    }
+
+    #[test]
+    fn dedicated_metadata_policy_allows_google_metadata() {
+        for address in ["169.254.169.254", "fd20:ce::254"] {
+            assert!(
+                validate_ip("test", address.parse().unwrap(), AddressPolicy::AllowGoogleMetadata).is_ok(),
+                "Google metadata address {address} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn dedicated_metadata_policy_rejects_other_destinations() {
+        for address in [
+            "8.8.8.8",
+            "10.0.0.1",
+            "127.0.0.1",
+            "169.254.170.2",
+            "100.100.100.200",
+            "fd00:ec2::254",
+            "0.0.0.0",
+            "::",
+            "224.0.0.1",
+            "ff02::1",
+        ] {
+            assert!(
+                validate_ip("test", address.parse().unwrap(), AddressPolicy::AllowGoogleMetadata).is_err(),
+                "{address} must remain blocked under the dedicated metadata policy"
+            );
+        }
     }
 
     #[test]

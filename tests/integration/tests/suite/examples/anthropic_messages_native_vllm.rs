@@ -32,8 +32,9 @@ use std::{
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    basic_auth_header, free_port, http_send, json_post_with_header, parse_body, parse_status, start_capturing_backend,
-    start_header_echo_backend, start_proxy, start_uri_echo_backend,
+    assert_error_is_anthropic_shaped, assert_error_is_openai_shaped, basic_auth_header, free_port, http_send,
+    json_post_with_header, parse_body, parse_status, start_capturing_backend, start_header_echo_backend, start_proxy,
+    start_uri_echo_backend,
 };
 
 use super::load_example_config;
@@ -114,8 +115,8 @@ fn native_vllm_chain_is_native_passthrough_not_translation() {
         types,
         [
             "basic_auth",
-            "anthropic_messages_format",
-            "anthropic_validate",
+            "ai_operation",
+            "anthropic_messages_request",
             "anthropic_messages_protocol",
             "headers",
             "router",
@@ -132,7 +133,7 @@ fn native_vllm_chain_is_native_passthrough_not_translation() {
         "anthropic_messages_to_chat_completions",
         "anthropic_messages_to_chat_completions_stream",
         "anthropic_web_search",
-        "responses_to_chat_completions",
+        "openai_responses_to_chat_completions",
         "openai_agentic_loop",
         "openai_mcp_dispatch",
         "mcp",
@@ -146,20 +147,22 @@ fn native_vllm_chain_is_native_passthrough_not_translation() {
 }
 
 #[test]
-fn native_vllm_validate_is_scoped_to_messages() {
-    // `anthropic_validate` rejects bodyless requests, so it must be gated to
-    // `/v1/messages` — otherwise the bodyless `GET /v1/models` startup probe
-    // would be rejected with 400.
+fn native_vllm_request_processing_needs_no_path_condition() {
+    // The processor is keyed to the create-message operation, so the bodyless
+    // `GET /v1/models` startup probe is released untouched. The separate
+    // validator this replaced rejected bodyless requests and had to be gated to
+    // `/v1/messages` to avoid a 400 on that probe; carrying such a condition
+    // forward would now be redundant scoping that hides where the rule lives.
     let config = load_example_config(CONFIG, 29924, HashMap::from([("127.0.0.1:8000", 29925_u16)]));
-    let validate = config.filter_chains[0]
+    let processor = config.filter_chains[0]
         .filters
         .iter()
-        .find(|f| f.filter_type == "anthropic_validate")
-        .expect("chain should contain anthropic_validate");
+        .find(|f| f.filter_type == "anthropic_messages_request")
+        .expect("chain should contain anthropic_messages_request");
 
     assert!(
-        !validate.conditions.is_empty(),
-        "anthropic_validate must be gated by a path condition, not run unconditionally"
+        processor.conditions.is_empty(),
+        "the operation keys the processor, so no path condition should be needed"
     );
 }
 
@@ -222,11 +225,50 @@ fn native_vllm_routes_count_tokens_natively() {
     );
 }
 
+/// A malformed create-message body is refused at the gateway, not forwarded.
+///
+/// The separate validator this chain used to carry rejected malformed bodies,
+/// and `on_invalid: reject` keeps that. Asserted against the backend rather than
+/// only the status, because forwarding a malformed body to a native Anthropic
+/// backend is the regression worth catching.
+#[test]
+fn native_vllm_rejects_a_malformed_create_message_body() {
+    let backend = start_uri_echo_backend();
+    let proxy_port = free_port();
+    let config = native_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &format!(
+            "POST /v1/messages HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             {}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 9\r\n\
+             Connection: close\r\n\r\n\
+             {{not json",
+            gateway_auth_line()
+        ),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "a malformed create-message body must be refused at the gateway: {raw}"
+    );
+    let body = parse_body(&raw);
+    assert!(
+        body.contains("\"type\":\"error\"") || body.contains("\"type\": \"error\""),
+        "the refusal must use the Anthropic error envelope: {body}"
+    );
+}
+
 #[test]
 fn native_vllm_passes_bodyless_models_probe() {
-    // `GET /v1/models` carries no body; because `anthropic_validate` is scoped
-    // to `/v1/messages`, the probe must route through to the backend unchanged
-    // rather than being rejected for an empty body.
+    // `GET /v1/models` carries no body. The processor is keyed to the
+    // create-message operation, so the probe routes through to the backend
+    // unchanged rather than being rejected for an empty body.
     let backend = start_uri_echo_backend();
     let proxy_port = free_port();
     let config = native_vllm_config(proxy_port, backend.port());
@@ -327,6 +369,267 @@ fn native_vllm_rejects_unauthenticated_gateway_request() {
 }
 
 // -----------------------------------------------------------------------------
+// OpenCode / Chat Completions path
+//
+// OpenCode speaks native OpenAI Chat Completions, so it enters this same
+// gateway at `/v1/chat/completions` rather than `/v1/messages`. vLLM serves
+// both surfaces, so the chat path is the same untranslated passthrough: only
+// the credential boundary and routing apply. These tests cover what the
+// `/v1/messages` tests above cannot — that a FOREIGN request schema survives
+// the Anthropic-shaped filters in this chain untouched.
+// -----------------------------------------------------------------------------
+
+/// The OpenAI Chat Completions path OpenCode posts to.
+const CHAT_PATH: &str = "/v1/chat/completions";
+
+/// A realistic OpenCode request body: streaming, with a tool schema attached.
+fn opencode_chat_body() -> serde_json::Value {
+    serde_json::json!({
+        "model": "qwen3-8b",
+        "stream": true,
+        "messages": [{"role": "user", "content": "List the files here."}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Run a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }],
+        "tool_choice": "auto",
+    })
+}
+
+#[test]
+fn native_vllm_routes_chat_completions_explicitly() {
+    // OpenCode's primary traffic must match a declared route, not fall through
+    // the catch-all that exists for health checks and startup probes. Route
+    // matching is ordered, so an explicit route declared AFTER the catch-all
+    // would never match — assert the position, not just the presence.
+    let config = load_example_config(CONFIG, 29926, HashMap::from([("127.0.0.1:8000", 29927_u16)]));
+    let router = config.filter_chains[0]
+        .filters
+        .iter()
+        .find(|f| f.filter_type == "router")
+        .expect("chain should contain router");
+    let routes = router.config["routes"]
+        .as_sequence()
+        .expect("router config should carry a routes sequence");
+
+    let chat = routes
+        .iter()
+        .position(|route| route["path"].as_str() == Some(CHAT_PATH))
+        .expect("router must declare an explicit /v1/chat/completions route for OpenCode");
+    let catch_all = routes
+        .iter()
+        .position(|route| route["path_prefix"].as_str() == Some("/"))
+        .expect("router should retain the catch-all for startup probes");
+
+    assert!(
+        chat < catch_all,
+        "the explicit chat-completions route must precede the catch-all, or it never matches"
+    );
+}
+
+#[test]
+fn native_vllm_protocol_is_scoped_to_messages() {
+    // `anthropic-version` is meaningless on the OpenAI Chat Completions path.
+    // Leaving `anthropic_messages_protocol` unconditioned would stamp it onto
+    // every OpenCode request, putting a wrong header on the wire.
+    let config = load_example_config(CONFIG, 29928, HashMap::from([("127.0.0.1:8000", 29929_u16)]));
+    let protocol = config.filter_chains[0]
+        .filters
+        .iter()
+        .find(|f| f.filter_type == "anthropic_messages_protocol")
+        .expect("chain should contain anthropic_messages_protocol");
+
+    let condition = protocol.conditions.first().expect(
+        "anthropic_messages_protocol must be gated by a path condition so it does not \
+         inject anthropic-version onto the chat-completions path",
+    );
+    let praxis_core::config::Condition::When(predicate) = condition else {
+        panic!("the protocol filter must be gated by a `when` condition, got {condition:?}");
+    };
+    assert_eq!(
+        predicate.path_prefix.as_deref(),
+        Some("/v1/messages"),
+        "anthropic_messages_protocol must be scoped to the native Anthropic path, not the \
+         chat-completions path OpenCode uses"
+    );
+}
+
+#[test]
+fn native_vllm_forwards_chat_body_unchanged() {
+    let backend = start_capturing_backend(r#"{"id":"chatcmpl-1","object":"chat.completion","choices":[]}"#);
+    let proxy_port = free_port();
+    let config = native_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let body = opencode_chat_body().to_string();
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header(CHAT_PATH, &body, &gateway_auth_line()),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "chat-completions request should return 200");
+    // Compare the raw captured bytes, not reparsed JSON: a Value round-trip would
+    // mask any whitespace or key-order rewrite, which is exactly the translation
+    // this native-passthrough config must never perform.
+    assert_eq!(
+        backend.body(),
+        body,
+        "backend must receive the Chat Completions body byte-for-byte, with no translation"
+    );
+
+    drop(proxy);
+}
+
+#[test]
+fn native_vllm_chat_body_is_not_rejected_by_anthropic_validate() {
+    // This body is deliberately invalid *as Anthropic Messages*: no `max_tokens`,
+    // and `messages[].content` is a bare string rather than a block array. The
+    // existing bodyless-probe test only proves the scoping spares an EMPTY body;
+    // this proves it also spares a well-formed body of a FOREIGN schema, which is
+    // what OpenCode actually sends.
+    let backend = start_uri_echo_backend();
+    let proxy_port = free_port();
+    let config = native_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"qwen3-8b","messages":[{"role":"user","content":"Hi"}]}"#;
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header(CHAT_PATH, body, &gateway_auth_line()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "an OpenAI Chat Completions body must not be validated against the Anthropic envelope: {raw}"
+    );
+    assert_eq!(
+        parse_body(&raw),
+        CHAT_PATH,
+        "the chat-completions path must reach the backend unchanged"
+    );
+}
+
+#[test]
+fn native_vllm_does_not_inject_anthropic_version_on_chat() {
+    // The contrast is the point: the header belongs on `/v1/messages` and must
+    // not leak onto the chat path. Asserting both in one test keeps the two
+    // halves of the scoping decision from drifting apart.
+    let backend = start_header_echo_backend();
+    let proxy_port = free_port();
+    let config = native_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let chat = parse_body(&http_send(
+        proxy.addr(),
+        &json_post_with_header(
+            CHAT_PATH,
+            r#"{"model":"qwen3-8b","messages":[{"role":"user","content":"Hi"}]}"#,
+            &gateway_auth_line(),
+        ),
+    ));
+    assert!(
+        !chat.to_ascii_lowercase().contains("anthropic-version"),
+        "anthropic-version must not be injected onto the chat-completions path: {chat}"
+    );
+
+    let messages = parse_body(&http_send(
+        proxy.addr(),
+        &json_post_with_header(
+            "/v1/messages",
+            r#"{"model":"claude-opus-4-8","max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#,
+            &gateway_auth_line(),
+        ),
+    ));
+    assert!(
+        messages.to_ascii_lowercase().contains("anthropic-version"),
+        "anthropic-version must still be supplied on the Anthropic Messages path: {messages}"
+    );
+}
+
+#[test]
+fn native_vllm_chat_strips_client_credentials_and_injects_backend_bearer() {
+    // Credential isolation is path-independent, but OpenCode presents its
+    // gateway credential on a path the `/v1/messages` test never exercises, and
+    // the chat path reaches the router through a different route entry.
+    let injected = std::env::var("CARGO_PKG_NAME").expect("CARGO_PKG_NAME is always set by cargo test");
+    let backend = start_header_echo_backend();
+    let proxy_port = free_port();
+    let config = native_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let gateway = basic_auth_header(GATEWAY_USER, gateway_password());
+    let gateway_secret = gateway.trim_start_matches("Basic ").to_owned();
+    let body = r#"{"model":"qwen3-8b","messages":[{"role":"user","content":"Hi"}]}"#;
+    let raw = http_send(
+        proxy.addr(),
+        &format!(
+            "POST {CHAT_PATH} HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Type: application/json\r\n\
+             x-api-key: client-openai-secret\r\n\
+             Authorization: {gateway}\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n\
+             {body}",
+            body.len()
+        ),
+    );
+    let echoed = parse_body(&raw);
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "credential-injected chat request should return 200"
+    );
+    assert!(
+        !echoed.contains("client-openai-secret"),
+        "client x-api-key must be stripped before reaching the backend: {echoed}"
+    );
+    assert!(
+        !echoed.contains(&gateway_secret),
+        "the gateway Basic credential must be stripped before reaching the backend: {echoed}"
+    );
+    assert!(
+        echoed.contains(&format!("Bearer {injected}")),
+        "backend must receive the injected server-owned Bearer token: {echoed}"
+    );
+}
+
+#[test]
+fn native_vllm_rejects_unauthenticated_chat_request() {
+    // `basic_auth` runs before routing, so the chat path is gated too. An
+    // unauthenticated OpenCode is the documented cause of a 401 here.
+    let backend = start_header_echo_backend();
+    let proxy_port = free_port();
+    let config = native_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header(
+            CHAT_PATH,
+            r#"{"model":"qwen3-8b","messages":[{"role":"user","content":"Hi"}]}"#,
+            "X-Unused: 1",
+        ),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        401,
+        "an unauthenticated caller must be rejected on the chat path too"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Native streaming (incremental SSE forwarding, not buffering)
 // -----------------------------------------------------------------------------
 
@@ -377,6 +680,7 @@ fn native_vllm_streams_sse_incrementally_before_upstream_eof() {
     let client = thread::spawn(move || {
         let raw = read_sse_incrementally(
             &proxy_addr,
+            "/v1/messages",
             r#"{"model":"claude-opus-4-8","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"Hi"}]}"#,
             "message_start",
             &observed_tx,
@@ -415,6 +719,146 @@ fn native_vllm_streams_sse_incrementally_before_upstream_eof() {
 
     client.join().expect("client thread should not panic");
     backend_thread.join().expect("backend thread should not panic");
+}
+
+/// The opening OpenAI Chat Completions stream chunks the gated backend flushes first.
+const CHAT_STREAM_FIRST_EVENTS: &str = concat!(
+    "data: {\"id\":\"chatcmpl-native\",\"object\":\"chat.completion.chunk\",\"model\":\"qwen3-8b\",",
+    "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"chatcmpl-native\",\"object\":\"chat.completion.chunk\",\"model\":\"qwen3-8b\",",
+    "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
+);
+
+/// The terminal OpenAI Chat Completions chunks sent only after the test releases the backend.
+const CHAT_STREAM_FINAL_EVENTS: &str = concat!(
+    "data: {\"id\":\"chatcmpl-native\",\"object\":\"chat.completion.chunk\",\"model\":\"qwen3-8b\",",
+    "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],",
+    "\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3,\"total_tokens\":11}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+#[test]
+fn native_vllm_streams_chat_sse_incrementally_before_upstream_eof() {
+    // The only body-reading AI filter on this chain is `anthropic_messages_request`,
+    // which declares `BodyMode::StreamBuffer` for the *request* body. The SSE risk is
+    // the response direction: if that filter — or anything else on this chain — ever
+    // buffered a chat *response* to completion, OpenCode's TUI would hang with no other
+    // symptom — no error, no log, just a stalled turn. Same gated-backend technique as
+    // the Anthropic streaming test: the backend only sends EOF AFTER the client reports
+    // seeing a frame, so a buffering proxy deadlocks and the `observed` receive times out.
+    let (backend_port, first_sent, release, backend_thread) = start_gated_sse_backend(
+        vec![CHAT_STREAM_FIRST_EVENTS.to_owned()],
+        vec![CHAT_STREAM_FINAL_EVENTS.to_owned()],
+    );
+    let proxy_port = free_port();
+    let config = native_vllm_config(proxy_port, backend_port);
+    let proxy = start_proxy(&config);
+
+    let (observed_tx, observed_rx) = mpsc::channel();
+    let (complete_tx, complete_rx) = mpsc::channel();
+    let proxy_addr = proxy.addr().to_owned();
+
+    let client = thread::spawn(move || {
+        let raw = read_sse_incrementally(
+            &proxy_addr,
+            CHAT_PATH,
+            r#"{"model":"qwen3-8b","stream":true,"messages":[{"role":"user","content":"Hi"}]}"#,
+            "chat.completion.chunk",
+            &observed_tx,
+        );
+        complete_tx.send(raw).expect("test receiver should remain available");
+    });
+
+    first_sent
+        .recv_timeout(Duration::from_secs(2))
+        .expect("backend should flush the opening stream chunks");
+    observed_rx.recv_timeout(Duration::from_secs(2)).expect(
+        "client must observe a chat chunk while the upstream is still gated; \
+         a timeout here means the chat response was buffered, not streamed, \
+         which hangs a real OpenCode client",
+    );
+    release
+        .send(())
+        .expect("backend release receiver should remain available");
+
+    let raw = complete_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("client should receive the completed stream");
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "chat streaming response should return 200: {raw}"
+    );
+    let body = parse_body(&raw);
+    assert!(
+        body.contains(r#""content":"hel""#),
+        "the content delta must pass through natively, unmodified: {body}"
+    );
+    assert!(
+        body.contains("[DONE]"),
+        "the terminal [DONE] sentinel must reach the client: {body}"
+    );
+
+    client.join().expect("client thread should not panic");
+    backend_thread.join().expect("backend thread should not panic");
+}
+
+// -----------------------------------------------------------------------------
+// Error shape
+// -----------------------------------------------------------------------------
+
+/// OpenCode speaks Chat Completions over this same gateway and parses
+/// OpenAI-shaped errors, so a proxy-generated failure must not fall back to RFC
+/// 9457 problem details.
+///
+/// `anthropic_messages_request` installs the Anthropic formatter only on the
+/// Anthropic Messages surface and leaves everything else entirely alone, so
+/// without a head-driven classifier this chain carries no formatter at all for
+/// `/v1/chat/completions` and core returns problem details.
+#[test]
+fn chat_completions_failure_keeps_the_openai_error_shape() {
+    // Nothing listens on this port, so the failure is generated by the proxy
+    // rather than returned by a backend.
+    let dead_port = free_port();
+    let proxy_port = free_port();
+    let config = native_vllm_config(proxy_port, dead_port);
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header(
+            CHAT_PATH,
+            r#"{"model":"qwen3-8b","messages":[{"role":"user","content":"Hi"}]}"#,
+            &gateway_auth_line(),
+        ),
+    );
+
+    assert_error_is_openai_shaped(&raw);
+
+    drop(proxy);
+}
+
+/// Claude Code keeps Anthropic-shaped errors on the same chain. Guards the
+/// head-driven classifier against regressing the protocol it already served.
+#[test]
+fn messages_failure_keeps_the_anthropic_error_shape() {
+    let dead_port = free_port();
+    let proxy_port = free_port();
+    let config = native_vllm_config(proxy_port, dead_port);
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header(
+            "/v1/messages",
+            r#"{"model":"qwen3-8b","max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#,
+            &gateway_auth_line(),
+        ),
+    );
+
+    assert_error_is_anthropic_shaped(&raw);
+
+    drop(proxy);
 }
 
 /// Starts a backend that flushes `first_chunks`, holds the connection open until
@@ -489,16 +933,22 @@ fn write_chunk(stream: &mut TcpStream, chunk: &str) {
     write!(stream, "{:x}\r\n{chunk}\r\n", chunk.len()).expect("response chunk should be written");
 }
 
-/// Sends a native streaming `POST /v1/messages` and reads the response
+/// Sends a native streaming `POST` to `path` and reads the response
 /// incrementally, firing `observed` the moment `needle` first appears — which,
 /// under a streaming proxy, happens before the upstream sends EOF.
-fn read_sse_incrementally(proxy_addr: &str, body: &str, needle: &str, observed: &mpsc::Sender<()>) -> String {
+fn read_sse_incrementally(
+    proxy_addr: &str,
+    path: &str,
+    body: &str,
+    needle: &str,
+    observed: &mpsc::Sender<()>,
+) -> String {
     let mut stream = TcpStream::connect(proxy_addr).expect("client should connect to proxy");
     stream
         .set_read_timeout(Some(Duration::from_secs(4)))
         .expect("client read timeout should be set");
     stream
-        .write_all(json_post_with_header("/v1/messages", body, &gateway_auth_line()).as_bytes())
+        .write_all(json_post_with_header(path, body, &gateway_auth_line()).as_bytes())
         .expect("client request should be written");
 
     let mut raw = Vec::new();

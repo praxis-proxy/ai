@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use praxis_filter::builtins::http::value_safety::contains_control_chars;
+use praxis_ai_apis::promotion::contains_control_chars;
 use serde_json::Value;
 
 use super::config::TaskRoutingConfig;

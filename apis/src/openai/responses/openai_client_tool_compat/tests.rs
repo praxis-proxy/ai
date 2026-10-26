@@ -9,7 +9,10 @@ use praxis_filter::body::MAX_JSON_BODY_BYTES;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::test_utils::{make_filter_context, make_request};
+use crate::{
+    openai::responses::agentic_loop::budget::SimpleBudget,
+    test_utils::{make_filter_context, make_request},
+};
 
 // -----------------------------------------------------------------------------
 // Test helpers
@@ -136,6 +139,54 @@ fn namespace_member_name_hashed_form_is_disjoint_from_verbatim() {
 }
 
 #[test]
+fn namespace_member_name_hashes_pairs_whose_verbatim_split_is_ambiguous() {
+    // A component that embeds the `__` delimiter — or abuts it with a boundary `_` —
+    // makes the verbatim `agentic_ns__{namespace}__{member}` form re-split into two
+    // distinct pairs. Such a pair takes the hashed branch, whose input is an injective
+    // encoding of the pair, so the two alternative splits land on different wires.
+    for (left, right) in [(("a", "b__c"), ("a__b", "c")), (("a_", "b"), ("a", "_b"))] {
+        let left_flat = namespace_member_name(left.0, left.1);
+        let right_flat = namespace_member_name(right.0, right.1);
+        assert_eq!(
+            format!("{NAMESPACE_MEMBER_PREFIX}{}__{}", left.0, left.1),
+            format!("{NAMESPACE_MEMBER_PREFIX}{}__{}", right.0, right.1),
+            "the two pairs share a verbatim flattening, which is what makes them ambiguous"
+        );
+        assert_ne!(
+            left_flat, right_flat,
+            "the ambiguous pairs must not collapse onto one wire name"
+        );
+        for flat in [&left_flat, &right_flat] {
+            assert!(
+                flat.contains("___"),
+                "an ambiguous pair takes the hashed branch: {flat}"
+            );
+            assert!(
+                is_valid_function_name(flat),
+                "the hashed name stays schema-valid: {flat}"
+            );
+        }
+    }
+}
+
+#[test]
+fn namespace_member_name_keeps_codex_mcp_groups_readable() {
+    // Codex names an MCP tool namespace `mcp__{server}`, so the delimiter is routine in
+    // real client traffic. The pair is ambiguous and therefore hashed, but the readable
+    // prefix is retained so the model still sees which group a member belongs to. The
+    // exact wire name is pinned here because the integration suite asserts it verbatim.
+    let flat = namespace_member_name("mcp__codex_tui", "read_file");
+    assert_eq!(
+        flat, "agentic_ns__mcp__codex_tui__read_file___68857b231df97733",
+        "the readable prefix survives the hashed branch and the hash is stable"
+    );
+    assert!(
+        is_valid_function_name(&flat),
+        "the hashed name stays schema-valid: {flat}"
+    );
+}
+
+#[test]
 fn custom_public_item_id_prefixes_and_hashes() {
     assert_eq!(custom_public_item_id("ctc_keep"), "ctc_keep");
     assert_eq!(custom_public_item_id("fc_abc"), "ctc_abc");
@@ -177,7 +228,6 @@ fn is_valid_function_name_enforces_schema() {
         "a name longer than the schema limit is rejected"
     );
 }
-
 
 // -----------------------------------------------------------------------------
 // Custom tool lowering
@@ -1050,6 +1100,115 @@ fn plain_function_call_history_item_is_unchanged() {
     assert_eq!(item["name"], "f");
 }
 
+#[test]
+fn history_item_is_lowered_matches_the_lowering_pass() {
+    let no_ids = HashSet::new();
+    // Only entries `lower_history_items` rewrites count toward the lowering reserve.
+    assert!(history_item_is_lowered(&json!({"type": "custom_tool_call"}), &no_ids));
+    assert!(history_item_is_lowered(
+        &json!({"type": "custom_tool_call_output"}),
+        &no_ids
+    ));
+    assert!(
+        history_item_is_lowered(
+            &json!({"type": "function_call", "namespace": "ns", "name": "m"}),
+            &no_ids,
+        ),
+        "a namespaced function_call is flattened, so it is charged"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "function_call", "name": "f"}), &no_ids),
+        "a plain function_call is never lowered, so it is not charged"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "function_call", "namespace": "", "name": "f"}), &no_ids,),
+        "an empty namespace is not a namespaced call"
+    );
+    assert!(
+        history_item_is_lowered(
+            &json!({"type": "shell_call", "call_id": "c1", "action": {"type": "exec"}, "environment": {"type": "local"}}),
+            &no_ids,
+        ),
+        "a client-executed shell_call is lowered"
+    );
+    assert!(
+        !history_item_is_lowered(
+            &json!({"type": "shell_call", "call_id": "c2", "action": {"type": "exec"}}),
+            &no_ids,
+        ),
+        "a container/server shell_call is left untouched"
+    );
+    let lowered = lowered_ids(&["c1"]);
+    assert!(
+        history_item_is_lowered(&json!({"type": "shell_call_output", "call_id": "c1"}), &lowered),
+        "an output whose call was lowered is charged"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "shell_call_output", "call_id": "c2"}), &lowered),
+        "an output whose call was not lowered is left untouched"
+    );
+    assert!(
+        history_item_is_lowered(
+            &json!({"type": "tool_search_call", "call_id": "t1", "execution": "client"}),
+            &no_ids,
+        ),
+        "a client-executed tool_search_call is lowered"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "tool_search_call", "call_id": "t2"}), &no_ids),
+        "a tool_search_call without client execution is left untouched"
+    );
+    assert!(
+        !history_item_is_lowered(
+            &json!({"type": "tool_search_call", "call_id": "t3", "execution": "server"}),
+            &no_ids,
+        ),
+        "a server-executed tool_search_call is left untouched"
+    );
+    let lowered_search = lowered_ids(&["t1"]);
+    assert!(
+        history_item_is_lowered(&json!({"type": "tool_search_output", "call_id": "t1"}), &lowered_search),
+        "a tool_search_output whose call was lowered is charged"
+    );
+    assert!(
+        !history_item_is_lowered(&json!({"type": "tool_search_output", "call_id": "t2"}), &lowered_search),
+        "a tool_search_output whose call was not lowered is left untouched"
+    );
+}
+
+#[test]
+fn budgeted_plain_function_history_reserves_no_lowering() {
+    // A budgeted request whose only tools are plain `function` tools and whose
+    // history holds only plain (non-namespaced) `function_call` items reserves
+    // nothing: the lowering pass rewrites none of them, so there is no owned
+    // lowered copy to charge. With the previous predicate every `function_call`
+    // was charged and this request would 413 against a saturated budget.
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m",
+        "input": "hi",
+        "tools": [{"type": "function", "name": "f", "parameters": {"type": "object"}}],
+    }));
+    state.messages = (0..64)
+        .map(|i| json!({"type": "function_call", "call_id": format!("call_{i}"), "name": "f", "arguments": "{}"}))
+        .collect();
+    // Saturate the budget so any lowering reservation at all would fail.
+    let mut budget = SimpleBudget::new(4_096, 0).unwrap();
+    let spare = budget.remaining_bytes().unwrap();
+    assert!(budget.reserve_additional_input(spare), "saturate the budget");
+    assert_eq!(budget.remaining_bytes(), Some(0), "no headroom remains");
+    state.simple_budget = Some(budget);
+
+    assert!(
+        reserve_client_tool_lowering(&mut state),
+        "plain function tools and plain function_call history must proceed without a lowering reserve"
+    );
+    assert_eq!(
+        state.simple_budget.unwrap().remaining_bytes(),
+        Some(0),
+        "no lowering reservation may be charged when nothing is lowered"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Response restoration
 // -----------------------------------------------------------------------------
@@ -1559,6 +1718,102 @@ fn tool_search_call_with_malformed_arguments_fails_closed() {
     assert_eq!(reject_parts(&action).0, 502);
 }
 
+// -----------------------------------------------------------------------------
+// Allocation evidence
+// -----------------------------------------------------------------------------
+
+#[test]
+fn tool_search_lowered_function_moves_large_parameters() {
+    let parameters = json!({
+        "properties": {"query": {"type": "string", "description": "x".repeat(8192)}}
+    });
+    let clone_info = allocation_counter::measure(|| {
+        std::hint::black_box(parameters.clone());
+    });
+    let move_info = allocation_counter::measure(|| {
+        std::hint::black_box(tool_search_lowered_function("Search tools", parameters));
+    });
+
+    assert!(
+        clone_info.bytes_total >= 8192,
+        "the deep-copy baseline must copy the large schema: {clone_info:?}"
+    );
+    assert!(
+        move_info.bytes_total < clone_info.bytes_total,
+        "lowering must move the owned schema: move={move_info:?} clone={clone_info:?}"
+    );
+}
+
+#[test]
+fn restore_shell_call_moves_large_parsed_action() {
+    let arguments = serde_json::to_string(&json!({"commands": ["x".repeat(8192)]})).unwrap();
+    let item = json!({
+        "type": "function_call",
+        "id": "fc_shell",
+        "call_id": "call_shell",
+        "name": "shell",
+        "arguments": arguments,
+        "status": "completed",
+    });
+    let restored = restore_shell_call(&item).expect("shell call restores");
+    assert_eq!(
+        restored["action"]["commands"][0].as_str().expect("large command").len(),
+        8192,
+        "the large action must remain structurally equivalent"
+    );
+
+    let parse_info = allocation_counter::measure(|| {
+        std::hint::black_box(parse_shell_action(&arguments).expect("action parses"));
+    });
+    let restore_info = allocation_counter::measure(|| {
+        std::hint::black_box(restore_shell_call(&item).expect("shell call restores"));
+    });
+    assert!(
+        parse_info.bytes_total >= 8192,
+        "the parse baseline must allocate the large command: {parse_info:?}"
+    );
+    assert!(
+        restore_info.bytes_total.saturating_sub(parse_info.bytes_total) < 8192,
+        "restoration must move the parsed action instead of copying it: \
+         restore={restore_info:?} parse={parse_info:?}"
+    );
+}
+
+#[test]
+fn restore_tool_search_call_moves_large_parsed_arguments() {
+    let arguments = serde_json::to_string(&json!({"query": "x".repeat(8192)})).unwrap();
+    let item = json!({
+        "type": "function_call",
+        "id": "fc_search",
+        "call_id": "call_search",
+        "name": "tool_search",
+        "arguments": arguments,
+        "status": "completed",
+    });
+    let restored = restore_tool_search_call(&item).expect("tool search restores");
+    assert_eq!(
+        restored["arguments"]["query"].as_str().expect("large query").len(),
+        8192,
+        "the large arguments must remain structurally equivalent"
+    );
+
+    let parse_info = allocation_counter::measure(|| {
+        std::hint::black_box(serde_json::from_str::<Value>(&arguments).expect("arguments parse"));
+    });
+    let restore_info = allocation_counter::measure(|| {
+        std::hint::black_box(restore_tool_search_call(&item).expect("tool search restores"));
+    });
+    assert!(
+        parse_info.bytes_total >= 8192,
+        "the parse baseline must allocate the large query: {parse_info:?}"
+    );
+    assert!(
+        restore_info.bytes_total.saturating_sub(parse_info.bytes_total) < 8192,
+        "restoration must move parsed arguments instead of copying them: \
+         restore={restore_info:?} parse={parse_info:?}"
+    );
+}
+
 #[test]
 fn unrelated_function_calls_are_left_untouched() {
     let state = state_with_custom_lowered();
@@ -2032,7 +2287,7 @@ fn oversized_lowered_request_is_rejected_and_rolled_back() {
 fn lower_history_items_lowers_only_client_owned_calls() {
     // A local shell_call and its output are lowered together; a container-owned
     // call and its output keep their wire semantics across the continuation turn.
-    let mut messages = vec![
+    let messages = vec![
         json!({
             "type": "shell_call", "call_id": "local_1", "action": {"commands": ["ls"]},
             "environment": {"type": "local"}, "id": "sh_1", "status": "completed"
@@ -2044,9 +2299,20 @@ fn lower_history_items_lowers_only_client_owned_calls() {
         }),
         json!({"type": "shell_call_output", "call_id": "cont_1", "output": "ok"}),
     ];
+    let mut messages = super::super::history::MessageHistory::from(messages);
+    let snapshot = messages.clone();
     assert!(
         lower_history_items(&mut messages).expect("supported history lowers without error"),
         "at least one client-owned item is lowered"
+    );
+    assert_eq!(snapshot[0]["type"], "shell_call", "shared snapshot stays canonical");
+    assert!(
+        std::ptr::eq(&snapshot[2], &messages[2]),
+        "untouched calls remain shared"
+    );
+    assert!(
+        std::ptr::eq(&snapshot[3], &messages[3]),
+        "untouched outputs remain shared"
     );
     assert_eq!(messages[0]["type"], "function_call", "the local shell_call is lowered");
     assert_eq!(
@@ -2068,13 +2334,14 @@ fn local_shell_call_history_item_is_rejected() {
     // A `local_shell` declaration fails closed on the request; its typed history
     // item must fail closed too, so a prior turn's unsupported call cannot reach a
     // function-only backend unchanged on a continuation.
-    let mut messages = vec![json!({
+    let messages = vec![json!({
         "type": "local_shell_call",
         "call_id": "call_1",
         "id": "lsh_1",
         "action": {"type": "exec", "command": ["ls"]},
         "status": "completed"
     })];
+    let mut messages = super::super::history::MessageHistory::from(messages);
     let action = lower_history_items(&mut messages).expect_err("a prior local_shell_call must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "an unsupported history item is a bad request");
@@ -2088,11 +2355,12 @@ fn local_shell_call_history_item_is_rejected() {
 fn local_shell_call_output_history_item_is_rejected() {
     // The output half of an unsupported `local_shell` call is rejected on the same
     // grounds, even when the matching call is not present in this window.
-    let mut messages = vec![json!({
+    let messages = vec![json!({
         "type": "local_shell_call_output",
         "call_id": "call_1",
         "output": "listing"
     })];
+    let mut messages = super::super::history::MessageHistory::from(messages);
     let action = lower_history_items(&mut messages).expect_err("a prior local_shell_call_output must fail closed");
     let (status, message) = reject_parts(&action);
     assert_eq!(status, 400, "an unsupported history item is a bad request");
@@ -3549,7 +3817,7 @@ fn legitimate_namespace_member_is_not_rejected_by_the_reserved_prefix() {
 fn top_level_tool_named_a_reserved_hosted_tool_fails_closed() {
     // `file_search` and `web_search` are function-call NAMES downstream filters
     // silently re-route: a `function_call` named `file_search` is rewritten into a
-    // hosted `file_search_call` (agentic_loop → file_search_callout), and
+    // hosted `file_search_call` (agentic_loop → file_search_dispatch), and
     // `web_search` both trips the Chat-Completions `WebSearchFunctionNameCollision`
     // reject and aliases the proxy's synthesized web-search bridge. A client tool
     // lowered to either bare name would be misclassified as hosted, so the filter
@@ -3639,40 +3907,47 @@ fn client_tool_named_a_near_miss_of_a_hosted_tool_is_not_rejected() {
 }
 
 #[test]
-fn namespace_name_embedding_the_reserved_delimiter_fails_closed() {
-    // A `namespace` group name or member name carrying the `__` flattening delimiter
-    // would make its flattened wire name ambiguous with a distinct namespace/member
-    // pair, so both fail closed up front on either lowering path.
-    for tool in [
-        json!({
-            "type": "namespace",
-            "name": "a__b",
-            "description": "Ambiguous group name.",
-            "tools": [{"type": "function", "name": "c", "parameters": {"type": "object"}}]
-        }),
-        json!({
-            "type": "namespace",
-            "name": "a",
-            "description": "Ambiguous member name.",
-            "tools": [{"type": "function", "name": "b__c", "parameters": {"type": "object"}}]
-        }),
+fn namespace_name_embedding_the_delimiter_lowers_through_the_hashed_branch() {
+    // Codex names an MCP tool namespace `mcp__{server}` and its members
+    // `mcp__{server}__{tool}`, so the `__` flattening delimiter is routine in real
+    // client traffic and must not fail closed. The verbatim wire name would re-split
+    // ambiguously, so such a pair is flattened through the hashed branch instead — on
+    // both lowering paths.
+    for (tool, namespace, member) in [
+        (
+            json!({
+                "type": "namespace",
+                "name": "mcp__codex_tui",
+                "description": "Codex MCP tools.",
+                "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}]
+            }),
+            "mcp__codex_tui",
+            "shell",
+        ),
+        (
+            json!({
+                "type": "namespace",
+                "name": "utils",
+                "description": "Delimiter in the member name.",
+                "tools": [{"type": "function", "name": "mcp__read", "parameters": {"type": "object"}}]
+            }),
+            "utils",
+            "mcp__read",
+        ),
     ] {
+        let flat = namespace_member_name(namespace, member);
+
         // Declaration path.
         let mut state = ResponsesState::from_request_body(json!({ "tools": [tool.clone()] }));
-        let action = filter()
+        filter()
             .lower_request(&mut state, false, false)
-            .expect_err("a namespace name embedding the reserved delimiter fails closed");
-        let (status, message) = reject_parts(&action);
-        assert_eq!(
-            status, 400,
-            "the reserved delimiter is rejected on the declaration path"
-        );
+            .expect("a namespace embedding the delimiter lowers on the declaration path");
         assert!(
-            message.contains("delimiter") && message.contains(NAMESPACE_NAME_DELIMITER),
-            "the rejection names the reserved delimiter: {message}"
+            state.client_tool_lowering.contains_key(&flat),
+            "the declared member is registered under its hashed wire name"
         );
 
-        // Discovery path: the same reservation applies to a hoisted namespace.
+        // Discovery path: a hoisted namespace flattens the same way.
         let mut state = ResponsesState::from_request_body(json!({
             "tools": [{"type": "tool_search"}],
             "input": [
@@ -3681,34 +3956,75 @@ fn namespace_name_embedding_the_reserved_delimiter_fails_closed() {
                 {"type": "tool_search_output", "call_id": "call_1", "tools": [tool]}
             ],
         }));
-        let action = filter()
+        filter()
             .lower_request(&mut state, false, false)
-            .expect_err("a discovered namespace embedding the reserved delimiter fails closed");
-        let (status, message) = reject_parts(&action);
-        assert_eq!(status, 400, "the reserved delimiter is rejected on the discovery path");
+            .expect("a namespace embedding the delimiter lowers on the discovery path");
         assert!(
-            message.contains("delimiter"),
-            "the discovery-path rejection names the reserved delimiter: {message}"
+            state.client_tool_lowering.contains_key(&flat),
+            "the discovered member is registered under its hashed wire name"
         );
     }
 }
 
 #[test]
-fn deferred_namespace_member_colliding_via_reserved_delimiter_fails_closed() {
-    // The namespace-internal analogue of the top-level cap bypass: a deferred member
-    // `a`/`b__c` and a genuinely distinct discovered member `a__b`/`c` both flatten to
-    // `agentic_ns__a__b__c`. The deferred member is withheld (never claimed), so without
-    // the delimiter reservation the discovery-path reclaim would credit the discovered
-    // member against the withheld one, admitting two logical tools under a cap of one.
-    // Reserving the delimiter fails the deferred declaration closed before it is withheld.
+fn codex_mcp_namespace_member_round_trips_through_lowering_and_restoration() {
+    // End-to-end shape of the Codex traffic the delimiter reservation used to reject: a
+    // `mcp__{server}` group lowers to a flat private function, and the backend's
+    // `function_call` restores to the original namespaced member.
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{
+            "type": "namespace",
+            "name": "mcp__codex_tui",
+            "description": "Codex MCP tools.",
+            "tools": [{"type": "function", "name": "read_file", "parameters": {"type": "object"}}]
+        }],
+    }));
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("a Codex MCP namespace lowers");
+    let flat = namespace_member_name("mcp__codex_tui", "read_file");
+    let tools = state.request_body["tools"].as_array().expect("outbound tools");
+    assert_eq!(tools.len(), 1, "the group flattens to its single member");
+    assert_eq!(tools[0]["type"], "function", "the member lowers to a function");
+    assert_eq!(tools[0]["name"], flat, "the member carries its flat wire name");
+
+    let response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": flat,
+            "arguments": "{}",
+            "status": "completed"
+        }],
+    });
+    let item = &restore(&state, &response)["output"][0];
+    assert_eq!(item["name"], "read_file", "the original member name is restored");
     assert_eq!(
+        item["namespace"], "mcp__codex_tui",
+        "the group name is restored verbatim"
+    );
+}
+
+#[test]
+fn deferred_and_discovered_members_sharing_a_verbatim_split_both_count_against_the_cap() {
+    // The namespace-internal cap bypass the delimiter reservation used to prevent: a
+    // deferred member `a`/`b__c` and a genuinely distinct discovered member `a__b`/`c`
+    // share a verbatim flattening. The deferred member is withheld (never claimed), so a
+    // shared wire name would slip past `claim_lowered` and let the discovery-path reclaim
+    // credit the discovered member against the withheld one, admitting two logical tools
+    // under a cap that holds one. Hashing the ambiguous pairs separates the wires, so the
+    // reclaim no longer fires and the second member trips the cap.
+    assert_ne!(
         namespace_member_name("a", "b__c"),
         namespace_member_name("a__b", "c"),
-        "the two distinct members flatten to the same wire name absent the reservation"
+        "the two distinct members must not flatten to one wire name"
     );
+    // A cap of two admits {tool_search, one member}; a correctly counted second member trips it.
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
-        max_client_tools: 1,
+        max_client_tools: 2,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [
@@ -3728,12 +4044,15 @@ fn deferred_namespace_member_colliding_via_reserved_delimiter_fails_closed() {
     }));
     let action = capped
         .lower_request(&mut state, false, false)
-        .expect_err("a deferred member colliding via the reserved delimiter fails closed");
+        .expect_err("two members that share a verbatim split must both count against the cap");
     let (status, message) = reject_parts(&action);
-    assert_eq!(status, 400, "the collision is rejected rather than admitting the pair");
+    assert_eq!(
+        status, 400,
+        "the cap fails closed rather than crediting two tools as one"
+    );
     assert!(
-        message.contains("delimiter"),
-        "the rejection names the reserved delimiter: {message}"
+        message.contains("client tools"),
+        "the rejection names the client-tool cap: {message}"
     );
 }
 
@@ -3761,23 +4080,24 @@ fn namespace_names_with_single_underscores_are_accepted() {
 }
 
 #[test]
-fn namespace_boundary_underscore_colliding_pair_fails_closed() {
-    // The subtler namespace-flattening collision the `__`-substring guard alone misses:
-    // a boundary single `_` merges with the fixed `__` separator into `___`, so distinct
-    // pairs re-split to the same wire name. `a_`/`b` and `a`/`_b` both flatten to
-    // `agentic_ns__a___b`, yet none of the components contains `__`. A deferred member of
+fn namespace_boundary_underscore_pair_both_count_against_the_cap() {
+    // The subtler namespace-flattening collision a `__`-substring rule alone misses: a
+    // boundary single `_` merges with the fixed `__` separator into `___`, so distinct
+    // pairs re-split to the same verbatim wire name. `a_`/`b` and `a`/`_b` both flatten
+    // to `agentic_ns__a___b`, yet neither component contains `__`. A deferred member of
     // one pair (withheld, never claimed) and a discovered member of the other would let
-    // the discovery-path reclaim credit two distinct tools as one — a cap bypass — unless
-    // the boundary underscore is reserved too. Confirm the collision exists, then that it
-    // fails closed at a cap of one.
-    assert_eq!(
+    // the discovery-path reclaim credit two distinct tools as one — a cap bypass — so the
+    // boundary underscore routes to the hashed branch too. Confirm the wires differ, then
+    // that both members count.
+    assert_ne!(
         namespace_member_name("a_", "b"),
         namespace_member_name("a", "_b"),
-        "the boundary underscore makes the two distinct pairs flatten identically"
+        "the boundary-underscore pairs must not flatten identically"
     );
+    // A cap of two admits {tool_search, one member}; a correctly counted second member trips it.
     let capped = ClientToolCompatFilter {
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
-        max_client_tools: 1,
+        max_client_tools: 2,
     };
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [
@@ -3797,15 +4117,15 @@ fn namespace_boundary_underscore_colliding_pair_fails_closed() {
     }));
     let action = capped
         .lower_request(&mut state, false, false)
-        .expect_err("a boundary-underscore collision must fail closed rather than reclaim");
+        .expect_err("a boundary-underscore pair must count as two tools rather than reclaim");
     let (status, message) = reject_parts(&action);
     assert_eq!(
         status, 400,
-        "the collision is rejected rather than admitting the pair as one tool"
+        "the cap fails closed rather than admitting the pair as one tool"
     );
     assert!(
-        message.contains("delimiter"),
-        "the rejection names the reserved delimiter: {message}"
+        message.contains("client tools"),
+        "the rejection names the client-tool cap: {message}"
     );
 }
 
@@ -3914,37 +4234,57 @@ fn hash_colliding_deferred_and_discovered_members_both_count_against_the_cap() {
 }
 
 #[test]
-fn namespace_component_leading_or_trailing_underscore_fails_closed() {
-    // Keeping the flattening injective means reserving any boundary `_` that could abut
-    // the `__` separator; the rule is applied symmetrically to both the group name and
-    // member names, on the declaration path, so the behavior is pinned.
-    for tool in [
-        json!({
-            "type": "namespace", "name": "_utils", "description": "Leading-underscore group.",
-            "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]
-        }),
-        json!({
-            "type": "namespace", "name": "utils_", "description": "Trailing-underscore group.",
-            "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]
-        }),
-        json!({
-            "type": "namespace", "name": "utils", "description": "Leading-underscore member.",
-            "tools": [{"type": "function", "name": "_read", "parameters": {"type": "object"}}]
-        }),
-        json!({
-            "type": "namespace", "name": "utils", "description": "Trailing-underscore member.",
-            "tools": [{"type": "function", "name": "read_", "parameters": {"type": "object"}}]
-        }),
+fn namespace_component_leading_or_trailing_underscore_lowers_through_the_hashed_branch() {
+    // A boundary `_` that could abut the `__` separator makes the verbatim flattening
+    // ambiguous, so it routes to the hashed branch rather than failing closed. The rule
+    // is applied symmetrically to both the group name and member names, so the behavior
+    // is pinned on each.
+    for (tool, namespace, member) in [
+        (
+            json!({
+                "type": "namespace", "name": "_utils", "description": "Leading-underscore group.",
+                "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]
+            }),
+            "_utils",
+            "read",
+        ),
+        (
+            json!({
+                "type": "namespace", "name": "utils_", "description": "Trailing-underscore group.",
+                "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]
+            }),
+            "utils_",
+            "read",
+        ),
+        (
+            json!({
+                "type": "namespace", "name": "utils", "description": "Leading-underscore member.",
+                "tools": [{"type": "function", "name": "_read", "parameters": {"type": "object"}}]
+            }),
+            "utils",
+            "_read",
+        ),
+        (
+            json!({
+                "type": "namespace", "name": "utils", "description": "Trailing-underscore member.",
+                "tools": [{"type": "function", "name": "read_", "parameters": {"type": "object"}}]
+            }),
+            "utils",
+            "read_",
+        ),
     ] {
         let mut state = ResponsesState::from_request_body(json!({ "tools": [tool] }));
-        let action = filter()
+        filter()
             .lower_request(&mut state, false, false)
-            .expect_err("a boundary underscore in a namespace component fails closed");
-        let (status, message) = reject_parts(&action);
-        assert_eq!(status, 400, "a boundary underscore is a bad request");
+            .expect("a boundary underscore in a namespace component lowers");
+        let flat = namespace_member_name(namespace, member);
         assert!(
-            message.contains("begin or end with '_'"),
-            "the rejection explains the boundary-underscore rule: {message}"
+            flat.contains("___"),
+            "the boundary-underscore pair takes the hashed branch: {flat}"
+        );
+        assert!(
+            state.client_tool_lowering.contains_key(&flat),
+            "the member is registered under its hashed wire name"
         );
     }
 }
@@ -4732,7 +5072,7 @@ fn lowering_history_preserves_incomplete_status() {
     // `apply_message_status` must preserve all three `FunctionCallStatus` values; an
     // `incomplete` historical client-owned call must reach the backend with its
     // terminal state, not as a status-less call.
-    let mut messages = vec![
+    let messages = vec![
         json!({
             "type": "shell_call", "call_id": "s1", "action": {"commands": ["ls"]},
             "environment": {"type": "local"}, "id": "sh_1", "status": "incomplete"
@@ -4746,6 +5086,7 @@ fn lowering_history_preserves_incomplete_status() {
             "input": "patch", "id": "ctc_1", "status": "incomplete"
         }),
     ];
+    let mut messages = super::super::history::MessageHistory::from(messages);
     assert!(
         lower_history_items(&mut messages).expect("supported history lowers without error"),
         "client-owned items are lowered"
@@ -5627,6 +5968,163 @@ async fn lowering_arms_response_buffer_and_strips_accept_encoding() {
 }
 
 #[tokio::test]
+async fn budgeted_client_tool_lowering_rejects_before_mutating_request() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "store": false,
+        "tools": [{"type":"custom","name":"run_python","description":"Run Python"}]
+    }));
+    let original = state.request_body.clone();
+    state.simple_budget = SimpleBudget::new_with_store(4_096, 100, false);
+    ctx.extensions.insert(state);
+
+    let action = filter().on_request_body(&mut ctx, &mut None, true).await.unwrap();
+
+    let (status, message) = reject_parts(&action);
+    assert_eq!(status, 413);
+    assert!(message.contains("limit set by the platform administrator"));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.request_body, original);
+    assert!(state.client_tool_echo.is_none());
+}
+
+#[tokio::test]
+async fn budgeted_client_tool_lowering_arms_bounded_restoration() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(
+        AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 1048576").unwrap()).unwrap(),
+    );
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "store": false,
+        "tools": [{"type":"custom","name":"run_python","description":"Run Python"}]
+    }));
+    state.simple_budget = SimpleBudget::new_with_store(1_048_576, 2_000, false);
+    ctx.extensions.insert(state);
+
+    let action = filter().on_request_body(&mut ctx, &mut None, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .client_tool_echo
+            .is_some()
+    );
+    assert_eq!(
+        ctx.response_body_mode,
+        BodyMode::StreamBuffer {
+            max_bytes: Some(131_072)
+        }
+    );
+}
+
+#[test]
+fn budgeted_discovered_namespace_fanout_rejects_before_lowering() {
+    let members: Vec<Value> = (0..512)
+        .map(|index| json!({"type":"function", "name":format!("member_{index}")}))
+        .collect();
+    let discovered = json!([{
+        "type":"namespace", "name":"group", "description":"x".repeat(65_536), "tools":members
+    }]);
+    let mut state = state_with_discovered_tools(&discovered, false);
+    let original = state.request_body.clone();
+    state.simple_budget = SimpleBudget::new_with_store(67_108_864, 100, false);
+
+    assert!(!reserve_client_tool_lowering(&mut state));
+    assert_eq!(state.request_body, original);
+    assert!(state.client_tool_echo.is_none());
+}
+
+#[test]
+fn budgeted_restoration_accounts_repeated_namespace_names() {
+    let namespace = "n".repeat(32_768);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model":"m", "store":false, "input":"hi",
+        "tools":[{"type":"namespace", "name":namespace, "description":"group",
+            "tools":[{"type":"function", "name":"member"}]}]
+    }));
+    state.simple_budget = SimpleBudget::new_with_store(16_777_216, 100, false);
+    assert!(reserve_client_tool_lowering(&mut state));
+    filter().lower_request(&mut state, false, false).unwrap();
+    let lowered = namespace_member_name(&namespace, "member");
+    let output: Vec<Value> = (0..128)
+        .map(|index| {
+            json!({
+                "type":"function_call", "id":format!("fc_{index}"),
+                "call_id":format!("call_{index}"), "name":lowered, "arguments":"{}"
+            })
+        })
+        .collect();
+    let response = serde_json::to_vec(&json!({"object":"response", "output":output})).unwrap();
+
+    assert!(!reserve_client_tool_restoration(&mut state, &response));
+}
+
+#[test]
+fn budgeted_restoration_accounts_embedded_arguments_json() {
+    let mut state = ResponsesState::from_request_body(json!({"tools":[{"type":"tool_search"}]}));
+    filter().lower_request(&mut state, false, false).unwrap();
+    state.simple_budget = SimpleBudget::new_with_store(8_388_608, 100, false);
+    let deep = format!("{}0{}", "[".repeat(110), "]".repeat(110));
+    let arguments = format!("{{\"query\":[{}]}}", vec![deep; 180].join(","));
+    let response = serde_json::to_vec(&json!({
+        "object":"response", "output":[{
+            "type":"function_call", "id":"fc_1", "call_id":"call_1",
+            "name":"tool_search", "arguments":arguments
+        }]
+    }))
+    .unwrap();
+
+    assert!(!reserve_client_tool_restoration(&mut state, &response));
+}
+
+#[test]
+fn budgeted_client_tool_restoration_rejects_before_parsing_response() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m", "input": "hi", "store": false,
+        "tools": [{"type":"custom","name":"run_python"}]
+    }));
+    filter().lower_request(&mut state, false, false).unwrap();
+    state.simple_budget = SimpleBudget::new_with_store(65_536, 2_000, false);
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(vec![b'x'; 5_000]));
+
+    let action = filter().on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    let (status, message) = reject_parts(&action);
+    assert_eq!(status, 502);
+    assert!(message.contains("limit set by the platform administrator"));
+    assert!(body.is_none());
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn budgeted_client_tool_restoration_preserves_typed_output_when_in_budget() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = state_with_custom_lowered();
+    state.simple_budget = SimpleBudget::new_with_store(1_048_576, 2_000, false);
+    ctx.extensions.insert(state);
+    let response = json!({
+        "object": "response",
+        "output": [{"type":"function_call","id":"fc_1","call_id":"call_1","name":"run_python","arguments":"{\"input\":\"print(1)\"}"}]
+    });
+    let mut body = Some(Bytes::from(response.to_string()));
+
+    let action = filter().on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let restored: Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(restored["output"][0]["type"], "custom_tool_call");
+    assert_eq!(restored["tools"][0]["type"], "custom");
+}
+
+#[tokio::test]
 async fn passthrough_request_does_not_arm_buffering_or_strip_encoding() {
     // A native function-only request lowers nothing rich and records no echo, so it
     // must not pay to buffer the response or strip Accept-Encoding.
@@ -5672,7 +6170,7 @@ async fn streaming_rich_request_rejects_without_arming() {
     let filter = filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.extensions.insert(ResponsesState::from_request_body(json!({
         "stream": true,
         "tools": [{"type": "custom", "name": "run_python", "description": "d", "format": {"type": "text"}}],

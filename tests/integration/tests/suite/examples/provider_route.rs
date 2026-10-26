@@ -17,9 +17,16 @@ fn resolve(yaml: &str) -> Result<(), String> {
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
     let subrequest_client = praxis_test_utils::test_subrequest_client();
     let registry = praxis_ai::build_full_registry(&subrequest_client);
-    praxis_ai::resolve_pipelines(&config, &registry, &health, &kv_stores, &subrequest_client)
-        .map(|_pipelines| ())
-        .map_err(|error| error.to_string())
+    praxis_ai::resolve_pipelines(
+        &config,
+        &registry,
+        &health,
+        &kv_stores,
+        &praxis_ai::InFlightRegistry::new(),
+        &subrequest_client,
+    )
+    .map(|_pipelines| ())
+    .map_err(|error| error.to_string())
 }
 
 /// Load `provider-route.yaml` and replace its mounted credentials with

@@ -1,0 +1,1229 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
+//! Deterministic in-memory backend implementing both persistence traits.
+//!
+//! Used for service unit tests and as the reference the SQL backends
+//! contract-test against. A single mutex guards all state, so the multi-step
+//! trait methods that SQL backends run in a transaction (approval consumption,
+//! compare-and-swap, create/delete-items-and-sync) are atomic here too.
+
+#![expect(
+    clippy::significant_drop_tightening,
+    reason = "each method is one short locked critical section; holding the guard is what keeps the multi-step ops atomic"
+)]
+
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
+
+use async_trait::async_trait;
+
+use crate::{
+    json_values_charge, json_values_fit,
+    owner::StateOwner,
+    retained_charge,
+    traits::{ConversationItemStore, ResponseStore},
+    types::{
+        BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
+        ResponseEventRecord, ResponseRecord, StoreError,
+    },
+};
+
+/// Owner-qualified key for owner-scoped rows.
+type OwnerKey = (StateOwner, String);
+
+/// A stored pending approval plus its single-use consumption stamp.
+#[derive(Clone)]
+struct StoredApproval {
+    /// The persisted approval record.
+    record: PendingApprovalRecord,
+    /// Epoch-ms consumption time; `None` while outstanding.
+    consumed_at: Option<i64>,
+}
+
+/// All in-memory state behind one mutex.
+#[derive(Default)]
+struct Inner {
+    /// `response_id` -> response record, carrying its owner. Globally keyed
+    /// like the SQL `PRIMARY KEY (id)`, so a colliding id owned by another
+    /// principal is rejected rather than shadowed.
+    responses: HashMap<String, ResponseRecord>,
+    /// `(owner, conversation_id)` -> conversation record.
+    conversations: HashMap<OwnerKey, ConversationRecord>,
+    /// Globally unique conversation IDs and the owner currently holding each.
+    conversation_ids: HashMap<String, StateOwner>,
+    /// `(owner, conversation_id)` -> its items (unordered; sorted on read).
+    items: HashMap<OwnerKey, Vec<ConversationItemRecord>>,
+    /// `(owner, item_id)` keys, matching the owner-qualified SQL primary key.
+    item_ids: HashSet<OwnerKey>,
+    /// `(owner, response_id, approval_id)` -> approval + consumption stamp.
+    approvals: HashMap<(StateOwner, String, String), StoredApproval>,
+    /// `(owner, response_id)` -> durable SSE event log (unordered; sorted on
+    /// read). A `response_id` is globally unique with exactly one owner, so this
+    /// owner-qualified key mirrors the SQL `PRIMARY KEY (response_id,
+    /// sequence_number)` plus the owner-gated `WHERE EXISTS` insert guard.
+    events: HashMap<OwnerKey, Vec<ResponseEventRecord>>,
+}
+
+/// In-memory implementation of [`ResponseStore`] and [`ConversationItemStore`].
+#[derive(Default)]
+pub struct InMemoryStore {
+    /// Guarded state.
+    inner: Mutex<Inner>,
+}
+
+impl InMemoryStore {
+    /// Create an empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lock the state, mapping poisoning to an unavailable error.
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>, StoreError> {
+        self.inner
+            .lock()
+            .map_err(|err| StoreError::Unavailable(format!("in-memory store mutex poisoned: {err}")))
+    }
+}
+
+/// Read owned history from the memory backend; copies occur only at the read
+/// ownership boundary, never to refresh a second cache on mutations.
+fn ordered_messages(items: &[ConversationItemRecord]) -> Vec<serde_json::Value> {
+    let mut sorted: Vec<&ConversationItemRecord> = items.iter().collect();
+    sorted.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.item_id.cmp(&b.item_id)));
+    sorted.into_iter().map(|item| item.item_data.clone()).collect()
+}
+
+/// Preserve cache-only history at the first append, without creating item rows.
+fn preserve_legacy_history(inner: &mut Inner, key: &(StateOwner, String)) -> Result<(), StoreError> {
+    let has_items = inner.items.get(key).is_some_and(|items| !items.is_empty());
+    if let Some(record) = inner.conversations.get_mut(key) {
+        if record
+            .messages
+            .get("legacy_messages")
+            .is_some_and(serde_json::Value::is_array)
+        {
+            return Ok(());
+        }
+        if !has_items && !record.messages.is_null() && !record.messages.is_array() {
+            return Err(StoreError::Serialization(
+                "invalid legacy conversation history".to_owned(),
+            ));
+        }
+        if !has_items && record.messages.as_array().is_some_and(|messages| !messages.is_empty()) {
+            let messages = std::mem::take(&mut record.messages);
+            record.messages = serde_json::json!({"legacy_messages": messages});
+        } else {
+            record.messages = serde_json::json!([]);
+        }
+    }
+    Ok(())
+}
+
+/// Cache writers may not replace an authoritative legacy prefix.
+fn replaces_legacy_history(current: &serde_json::Value, replacement: &serde_json::Value) -> bool {
+    current.get("legacy_messages").is_some_and(serde_json::Value::is_array) && current != replacement
+}
+
+/// Upsert a response, rejecting an id already owned by another principal.
+///
+/// Mirrors the SQL owner-guarded `ON CONFLICT (id)` upsert: a same-id write from
+/// a different owner fails instead of overwriting the existing row.
+fn upsert_response_into(inner: &mut Inner, record: &ResponseRecord) -> Result<(), StoreError> {
+    if let Some(existing) = inner.responses.get(&record.id)
+        && existing.owner != record.owner
+    {
+        return Err(StoreError::Database("response id collision".to_owned()));
+    }
+    inner.responses.insert(record.id.clone(), record.clone());
+    Ok(())
+}
+
+/// Reject a batch that reuses an item id for the same owner, within itself or
+/// against stored rows.
+///
+/// The owned key copies are required because the set outlives this call and
+/// mirrors the SQL `(owner, item_id)` primary key.
+fn reject_duplicate_item_ids(inner: &Inner, items: &[ConversationItemRecord]) -> Result<(), StoreError> {
+    let mut seen: HashSet<OwnerKey> = HashSet::with_capacity(items.len());
+    for item in items {
+        let key = (item.owner.clone(), item.item_id.clone());
+        if !seen.insert(key.clone()) || inner.item_ids.contains(&key) {
+            return Err(StoreError::InvalidInput(format!(
+                "conversation item '{}' already exists",
+                item.item_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Reject a batch that reuses an owner-scoped conversation position, within
+/// itself or against stored rows.
+fn reject_duplicate_item_positions(inner: &Inner, items: &[ConversationItemRecord]) -> Result<(), StoreError> {
+    let mut seen = HashSet::with_capacity(items.len());
+    for item in items {
+        let key = (item.owner.clone(), item.conversation_id.clone(), item.position);
+        let stored_collision = inner
+            .items
+            .get(&(item.owner.clone(), item.conversation_id.clone()))
+            .is_some_and(|stored| stored.iter().any(|existing| existing.position == item.position));
+        if !seen.insert(key) || stored_collision {
+            return Err(StoreError::InvalidInput(format!(
+                "conversation position '{}' already exists",
+                item.position
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Reject items that leave the authorized scope or whose parent is absent.
+///
+/// Mirrors the SQL `require_matching_item_scope` guard plus the rebuild update
+/// that matches no row when the conversation is gone.
+fn require_conversation_scope(
+    inner: &Inner,
+    owner: &StateOwner,
+    conversation_id: &str,
+    items: &[ConversationItemRecord],
+) -> Result<(), StoreError> {
+    if !items
+        .iter()
+        .all(|item| &item.owner == owner && item.conversation_id == conversation_id)
+    {
+        return Err(StoreError::InvalidInput(
+            "conversation item scope does not match its parent".to_owned(),
+        ));
+    }
+    if !inner
+        .conversations
+        .contains_key(&(owner.clone(), conversation_id.to_owned()))
+    {
+        return Err(StoreError::Database(format!(
+            "conversation disappeared during message sync: {conversation_id}"
+        )));
+    }
+    Ok(())
+}
+
+/// Record approvals insert-if-absent, so a re-emit never resets a consumed row.
+fn record_approvals_into(inner: &mut Inner, owner: &StateOwner, response_id: &str, records: &[PendingApprovalRecord]) {
+    if !inner
+        .responses
+        .get(response_id)
+        .is_some_and(|response| &response.owner == owner)
+    {
+        return;
+    }
+    for record in records {
+        let key = (owner.clone(), response_id.to_owned(), record.approval_id.clone());
+        inner.approvals.entry(key).or_insert_with(|| StoredApproval {
+            record: record.clone(),
+            consumed_at: None,
+        });
+    }
+}
+
+/// Append events insert-if-absent on `sequence_number`, gated on the parent
+/// response existing under `owner`.
+///
+/// Mirrors the SQL `WHERE EXISTS(... responses ... owner triple)` gate plus
+/// `ON CONFLICT (response_id, sequence_number) DO NOTHING`: events for an absent
+/// or cross-owner response are dropped, and a re-released chunk never overwrites
+/// an already-stored sequence.
+fn append_events_into(inner: &mut Inner, owner: &StateOwner, response_id: &str, events: &[ResponseEventRecord]) {
+    if !inner
+        .responses
+        .get(response_id)
+        .is_some_and(|response| &response.owner == owner)
+    {
+        return;
+    }
+    let log = inner.events.entry((owner.clone(), response_id.to_owned())).or_default();
+    for event in events {
+        if log.iter().any(|stored| stored.sequence_number == event.sequence_number) {
+            continue;
+        }
+        log.push(event.clone());
+    }
+}
+
+#[async_trait]
+impl ResponseStore for InMemoryStore {
+    async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError> {
+        let mut inner = self.lock()?;
+        upsert_response_into(&mut inner, record)
+    }
+
+    async fn get_response(&self, owner: &StateOwner, id: &str) -> Result<Option<ResponseRecord>, StoreError> {
+        let inner = self.lock()?;
+        Ok(inner.responses.get(id).filter(|record| &record.owner == owner).cloned())
+    }
+
+    async fn get_response_bounded(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ResponseRecord>, StoreError> {
+        let inner = self.lock()?;
+        let Some(record) = inner.responses.get(id).filter(|record| &record.owner == owner) else {
+            return Ok(None);
+        };
+        let Some(json_allowance) = max_bytes.checked_sub(record.model.len()) else {
+            return Err(StoreError::PayloadTooLarge);
+        };
+        if !json_values_fit(
+            &[&record.response_object, &record.input, &record.messages],
+            json_allowance,
+        ) {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        Ok(Some(record.clone()))
+    }
+
+    async fn get_response_budgeted(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ResponseRecord>>, StoreError> {
+        let inner = self.lock()?;
+        let Some(record) = inner.responses.get(id).filter(|record| &record.owner == owner) else {
+            return Ok(None);
+        };
+        let charge = json_values_charge(
+            [&record.response_object, &record.input, &record.messages],
+            &[&record.id, &record.model],
+            max_charge_bytes,
+        )?;
+        Ok(Some(BudgetedRecord {
+            record: record.clone(),
+            charge_bytes: charge,
+        }))
+    }
+
+    async fn delete_response(&self, owner: &StateOwner, id: &str) -> Result<bool, StoreError> {
+        let mut inner = self.lock()?;
+        let removed = inner.responses.get(id).is_some_and(|record| &record.owner == owner);
+        if removed {
+            inner.responses.remove(id);
+        }
+        // Deleting a response removes the pending approvals it issued, so no
+        // consumable approval (and no tool arguments) survive it.
+        inner
+            .approvals
+            .retain(|(row_owner, response_id, _), _| !(row_owner == owner && response_id == id));
+        // The durable SSE event log is removed with the response so nothing
+        // stays replayable after a DELETE.
+        inner.events.remove(&(owner.clone(), id.to_owned()));
+        Ok(removed)
+    }
+
+    async fn get_conversation(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        let inner = self.lock()?;
+        Ok(inner
+            .conversations
+            .get(&(owner.clone(), conversation_id.to_owned()))
+            .cloned())
+    }
+
+    async fn get_conversation_bounded(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        let inner = self.lock()?;
+        let key = (owner.clone(), conversation_id.to_owned());
+        let Some(record) = inner.conversations.get(&key) else {
+            return Ok(None);
+        };
+        // Post-#1509 the `messages` column is a lazy snapshot, so reconstruct the
+        // full history (legacy prefix + items) before enforcing the byte ceiling.
+        let items = inner.items.get(&key).map_or(&[][..], Vec::as_slice);
+        let mut history = record
+            .messages
+            .get("legacy_messages")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if items.is_empty() && history.is_empty() {
+            history = record.messages.as_array().cloned().unwrap_or_default();
+        }
+        history.extend(ordered_messages(items));
+        let messages = serde_json::Value::Array(history);
+        if !json_values_fit(&[&record.metadata, &messages], max_bytes) {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        let mut record = record.clone();
+        record.messages = messages;
+        Ok(Some(record))
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "legacy/item reconstruction and charge accounting share one locked snapshot"
+    )]
+    async fn get_conversation_budgeted(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        max_charge_bytes: usize,
+    ) -> Result<Option<BudgetedRecord<ConversationRecord>>, StoreError> {
+        let inner = self.lock()?;
+        let key = (owner.clone(), conversation_id.to_owned());
+        let Some(record) = inner.conversations.get(&key) else {
+            return Ok(None);
+        };
+        let items = inner.items.get(&key).map_or(&[][..], Vec::as_slice);
+        let mut legacy = record
+            .messages
+            .get("legacy_messages")
+            .and_then(serde_json::Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        if items.is_empty() && legacy.is_empty() {
+            legacy = record.messages.as_array().map_or(&[][..], Vec::as_slice);
+        }
+        let item_count = legacy
+            .len()
+            .checked_add(items.len())
+            .ok_or(StoreError::PayloadTooLarge)?;
+        let array_syntax_bytes = if item_count == 0 {
+            2
+        } else {
+            item_count.checked_add(1).ok_or(StoreError::PayloadTooLarge)?
+        };
+        let projection_overhead = retained_charge(array_syntax_bytes, 1).ok_or(StoreError::PayloadTooLarge)?;
+        let values = std::iter::once(&record.metadata)
+            .chain(legacy.iter())
+            .chain(items.iter().map(|item| &item.item_data));
+        let charge = json_values_charge(values, &[&record.conversation_id], max_charge_bytes)?
+            .checked_add(projection_overhead)
+            .filter(|charge| *charge <= max_charge_bytes)
+            .ok_or(StoreError::PayloadTooLarge)?;
+
+        let mut history = legacy.to_vec();
+        history.extend(ordered_messages(items));
+        Ok(Some(BudgetedRecord {
+            record: ConversationRecord {
+                conversation_id: record.conversation_id.clone(),
+                owner: record.owner.clone(),
+                created_at: record.created_at,
+                metadata: record.metadata.clone(),
+                messages: serde_json::Value::Array(history),
+            },
+            charge_bytes: charge,
+        }))
+    }
+
+    async fn record_pending_approvals(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        records: &[PendingApprovalRecord],
+        _created_at: i64,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock()?;
+        record_approvals_into(&mut inner, owner, response_id, records);
+        Ok(())
+    }
+
+    async fn persist_response_with_pending_approvals(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<(), StoreError> {
+        // One lock spans the upsert and the approval writes so a concurrent
+        // delete cannot interleave and orphan an approval. The default
+        // sequential impl locks twice and leaves that window open.
+        let mut inner = self.lock()?;
+        upsert_response_into(&mut inner, record)?;
+        record_approvals_into(&mut inner, &record.owner, &record.id, pending_approvals);
+        Ok(())
+    }
+
+    async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.lock()?;
+        if inner.responses.contains_key(&record.id) {
+            return Ok(false);
+        }
+        upsert_response_into(&mut inner, record)?;
+        record_approvals_into(&mut inner, &record.owner, &record.id, pending_approvals);
+        Ok(true)
+    }
+
+    async fn get_pending_approvals(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        approval_ids: &[&str],
+    ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
+        let inner = self.lock()?;
+        let found = approval_ids
+            .iter()
+            .filter_map(|approval_id| {
+                inner
+                    .approvals
+                    .get(&(owner.clone(), response_id.to_owned(), (*approval_id).to_owned()))
+                    .map(|stored| stored.record.clone())
+            })
+            .collect();
+        Ok(found)
+    }
+
+    async fn pending_approval_payload_bytes(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        let inner = self.lock()?;
+        inner
+            .approvals
+            .iter()
+            .filter(|((stored_owner, stored_response, stored_id), _)| {
+                stored_owner == owner && stored_response == response_id && approval_ids.contains(&stored_id.as_str())
+            })
+            .try_fold(0_usize, |used, (_, stored)| {
+                let record = &stored.record;
+                used.checked_add(record.approval_id.len())
+                    .and_then(|bytes| bytes.checked_add(record.server_label.len()))
+                    .and_then(|bytes| bytes.checked_add(record.tool_name.len()))
+                    .and_then(|bytes| bytes.checked_add(record.arguments.len()))
+                    .and_then(|bytes| bytes.checked_add(record.target_fingerprint.len()))
+                    .ok_or_else(|| StoreError::Database("pending approval payload size overflow".to_owned()))
+            })
+    }
+
+    async fn consume_approvals(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        approval_ids: &[&str],
+        consumed_at: i64,
+    ) -> Result<Option<usize>, StoreError> {
+        let mut inner = self.lock()?;
+        // Validate the whole batch before mutating anything (all-or-nothing):
+        // a missing row, an already-consumed row, or a duplicate earlier in the
+        // batch aborts the claim and leaves every row untouched.
+        let mut seen: HashSet<&str> = HashSet::with_capacity(approval_ids.len());
+        for (index, approval_id) in approval_ids.iter().enumerate() {
+            if !seen.insert(approval_id) {
+                return Ok(Some(index));
+            }
+            let key = (owner.clone(), response_id.to_owned(), (*approval_id).to_owned());
+            match inner.approvals.get(&key) {
+                Some(stored) if stored.consumed_at.is_none() => {},
+                _ => return Ok(Some(index)),
+            }
+        }
+        for approval_id in approval_ids {
+            let key = (owner.clone(), response_id.to_owned(), (*approval_id).to_owned());
+            if let Some(stored) = inner.approvals.get_mut(&key) {
+                stored.consumed_at = Some(consumed_at);
+            }
+        }
+        Ok(None)
+    }
+
+    async fn append_events(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        events: &[ResponseEventRecord],
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock()?;
+        append_events_into(&mut inner, owner, response_id, events);
+        Ok(())
+    }
+
+    async fn list_events_after(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+        let inner = self.lock()?;
+        let Some(log) = inner.events.get(&(owner.clone(), response_id.to_owned())) else {
+            return Ok(Vec::new());
+        };
+        // Filter and order references first, then clone only the bounded page so
+        // one replay page copies at most `limit` events, not the full tail.
+        let mut ordered: Vec<&ResponseEventRecord> = log
+            .iter()
+            .filter(|event| after.is_none_or(|cursor| event.sequence_number > cursor))
+            .collect();
+        ordered.sort_unstable_by_key(|event| event.sequence_number);
+        Ok(ordered.into_iter().take(limit as usize).cloned().collect())
+    }
+
+    async fn event_log_status(&self, owner: &StateOwner, response_id: &str) -> Result<EventLogStatus, StoreError> {
+        let inner = self.lock()?;
+        let Some(log) = inner.events.get(&(owner.clone(), response_id.to_owned())) else {
+            return Ok(EventLogStatus::Absent);
+        };
+        let Some(max_sequence) = log.iter().map(|event| event.sequence_number).max() else {
+            return Ok(EventLogStatus::Absent);
+        };
+        if log.iter().any(|event| event.terminal) {
+            Ok(EventLogStatus::Replayable { max_sequence })
+        } else {
+            Ok(EventLogStatus::Incomplete { max_sequence })
+        }
+    }
+}
+
+#[async_trait]
+impl ConversationItemStore for InMemoryStore {
+    async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError> {
+        let mut inner = self.lock()?;
+        if let Some(existing_owner) = inner.conversation_ids.get(&record.conversation_id)
+            && existing_owner != &record.owner
+        {
+            return Err(StoreError::Database("conversation id collision".to_owned()));
+        }
+        let key = (record.owner.clone(), record.conversation_id.clone());
+        if inner
+            .conversations
+            .get(&key)
+            .is_some_and(|existing| replaces_legacy_history(&existing.messages, &record.messages))
+        {
+            return Err(StoreError::Database(
+                "conversation upsert would replace legacy history".to_owned(),
+            ));
+        }
+        // Preserve the original creation time on update; refreshes of metadata
+        // or messages must not rewrite created_at.
+        let created_at = inner
+            .conversations
+            .get(&key)
+            .map_or(record.created_at, |existing| existing.created_at);
+        let mut stored = record.clone();
+        stored.created_at = created_at;
+        inner
+            .conversation_ids
+            .insert(record.conversation_id.clone(), record.owner.clone());
+        inner.conversations.insert(key, stored);
+        Ok(())
+    }
+
+    async fn update_conversation_messages(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        messages: &serde_json::Value,
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.lock()?;
+        match inner
+            .conversations
+            .get_mut(&(owner.clone(), conversation_id.to_owned()))
+        {
+            Some(record) if !replaces_legacy_history(&record.messages, messages) => {
+                record.messages = messages.clone();
+                Ok(true)
+            },
+            _ => Ok(false),
+        }
+    }
+
+    async fn update_conversation_metadata(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.lock()?;
+        match inner
+            .conversations
+            .get_mut(&(owner.clone(), conversation_id.to_owned()))
+        {
+            Some(record) => {
+                record.metadata = metadata.clone();
+                Ok(true)
+            },
+            None => Ok(false),
+        }
+    }
+
+    async fn compare_and_swap_conversation_messages(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        expected_messages: &serde_json::Value,
+        messages: &serde_json::Value,
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.lock()?;
+        match inner
+            .conversations
+            .get_mut(&(owner.clone(), conversation_id.to_owned()))
+        {
+            Some(record)
+                if &record.messages == expected_messages && !replaces_legacy_history(&record.messages, messages) =>
+            {
+                record.messages = messages.clone();
+                Ok(true)
+            },
+            _ => Ok(false),
+        }
+    }
+
+    async fn get_conversation(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        let inner = self.lock()?;
+        Ok(inner
+            .conversations
+            .get(&(owner.clone(), conversation_id.to_owned()))
+            .cloned())
+    }
+
+    async fn delete_conversation(&self, owner: &StateOwner, conversation_id: &str) -> Result<bool, StoreError> {
+        let mut inner = self.lock()?;
+        // Matches the OpenAI API: deleting a conversation leaves item rows.
+        let removed = inner
+            .conversations
+            .remove(&(owner.clone(), conversation_id.to_owned()))
+            .is_some();
+        if removed {
+            inner.conversation_ids.remove(conversation_id);
+        }
+        Ok(removed)
+    }
+
+    async fn create_conversation_items(&self, items: &[ConversationItemRecord]) -> Result<(), StoreError> {
+        let mut inner = self.lock()?;
+        // Validate the whole batch before mutating (all-or-nothing). The parent
+        // conversation must exist under the item's own owner, rejecting an
+        // orphan and a cross-owner parent alike.
+        for item in items {
+            if !inner
+                .conversations
+                .contains_key(&(item.owner.clone(), item.conversation_id.clone()))
+            {
+                return Err(StoreError::InvalidInput(
+                    "conversation item scope does not match its parent".to_owned(),
+                ));
+            }
+        }
+        reject_duplicate_item_ids(&inner, items)?;
+        reject_duplicate_item_positions(&inner, items)?;
+        for item in items {
+            inner.item_ids.insert((item.owner.clone(), item.item_id.clone()));
+            inner
+                .items
+                .entry((item.owner.clone(), item.conversation_id.clone()))
+                .or_default()
+                .push(item.clone());
+        }
+        Ok(())
+    }
+
+    async fn list_conversation_items(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        after_item_id: Option<&str>,
+        limit: u32,
+        ascending: bool,
+    ) -> Result<Vec<ConversationItemRecord>, StoreError> {
+        let inner = self.lock()?;
+        let mut ordered: Vec<ConversationItemRecord> = inner
+            .items
+            .get(&(owner.clone(), conversation_id.to_owned()))
+            .cloned()
+            .unwrap_or_default();
+        ordered.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.item_id.cmp(&b.item_id)));
+        if !ascending {
+            ordered.reverse();
+        }
+        let start = match after_item_id {
+            Some(cursor) => match ordered.iter().position(|item| item.item_id == cursor) {
+                Some(index) => index + 1,
+                None => return Ok(Vec::new()),
+            },
+            None => 0,
+        };
+        Ok(ordered.into_iter().skip(start).take(limit as usize).collect())
+    }
+
+    async fn get_existing_conversation_item_ids(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        item_ids: &[&str],
+    ) -> Result<Vec<String>, StoreError> {
+        let inner = self.lock()?;
+        let Some(items) = inner.items.get(&(owner.clone(), conversation_id.to_owned())) else {
+            return Ok(Vec::new());
+        };
+        let present: HashSet<&str> = items.iter().map(|item| item.item_id.as_str()).collect();
+        Ok(item_ids
+            .iter()
+            .filter(|id| present.contains(**id))
+            .map(|id| (*id).to_owned())
+            .collect())
+    }
+
+    async fn get_conversation_item(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<Option<ConversationItemRecord>, StoreError> {
+        let inner = self.lock()?;
+        Ok(inner
+            .items
+            .get(&(owner.clone(), conversation_id.to_owned()))
+            .and_then(|items| items.iter().find(|item| item.item_id == item_id).cloned()))
+    }
+
+    async fn delete_conversation_item(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.lock()?;
+        let Some(items) = inner.items.get_mut(&(owner.clone(), conversation_id.to_owned())) else {
+            return Ok(false);
+        };
+        let Some(index) = items.iter().position(|item| item.item_id == item_id) else {
+            return Ok(false);
+        };
+        items.remove(index);
+        inner.item_ids.remove(&(owner.clone(), item_id.to_owned()));
+        Ok(true)
+    }
+
+    async fn conversation_item_position(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        let inner = self.lock()?;
+        Ok(inner
+            .items
+            .get(&(owner.clone(), conversation_id.to_owned()))
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.item_id == item_id)
+                    .map(|item| item.position)
+            }))
+    }
+
+    async fn max_item_position(&self, owner: &StateOwner, conversation_id: &str) -> Result<i64, StoreError> {
+        let inner = self.lock()?;
+        Ok(inner
+            .items
+            .get(&(owner.clone(), conversation_id.to_owned()))
+            .and_then(|items| items.iter().map(|item| item.position).max())
+            .unwrap_or(0))
+    }
+
+    async fn conversation_history(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, StoreError> {
+        let inner = self.lock()?;
+        let key = (owner.clone(), conversation_id.to_owned());
+        let Some(record) = inner.conversations.get(&key) else {
+            return Ok(None);
+        };
+        let items = inner.items.get(&key).map_or(&[][..], Vec::as_slice);
+        let mut history = record
+            .messages
+            .get("legacy_messages")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if items.is_empty() && history.is_empty() {
+            history = record.messages.as_array().cloned().unwrap_or_default();
+        }
+        history.extend(ordered_messages(items));
+        Ok(Some(history))
+    }
+
+    async fn create_items_and_sync_messages(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, None)
+    }
+
+    async fn create_items_and_sync_messages_bounded(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_append_charge_bytes: usize,
+    ) -> Result<(), StoreError> {
+        self.create_items_and_sync_messages_with_limit(owner, conversation_id, items, Some(max_append_charge_bytes))
+    }
+
+    async fn delete_item_and_sync_messages(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.lock()?;
+        let key = (owner.clone(), conversation_id.to_owned());
+        let Some(index) = inner
+            .items
+            .get(&key)
+            .and_then(|items| items.iter().position(|item| item.item_id == item_id))
+        else {
+            return Ok(false);
+        };
+        if !inner.conversations.contains_key(&key) {
+            return Err(StoreError::Database(format!(
+                "conversation disappeared during message sync: {conversation_id}"
+            )));
+        }
+        preserve_legacy_history(&mut inner, &key)?;
+        let items = inner
+            .items
+            .get_mut(&key)
+            .ok_or_else(|| StoreError::Database("conversation items disappeared during message sync".to_owned()))?;
+        items.remove(index);
+        inner.item_ids.remove(&(owner.clone(), item_id.to_owned()));
+        Ok(true)
+    }
+}
+
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "bounded cache helper sits beside its trait implementation"
+)]
+impl InMemoryStore {
+    /// Validate bounded new append work before updating items.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "preflight and the mutex-protected commit form one atomic operation"
+    )]
+    fn create_items_and_sync_messages_with_limit(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_append_charge_bytes: Option<usize>,
+    ) -> Result<(), StoreError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.lock()?;
+        let key = (owner.clone(), conversation_id.to_owned());
+        require_conversation_scope(&inner, owner, conversation_id, items)?;
+        reject_duplicate_item_ids(&inner, items)?;
+        if let Some(max_append_charge_bytes) = max_append_charge_bytes {
+            let mut charge = json_values_charge(std::iter::empty(), &[conversation_id], max_append_charge_bytes)?;
+            for item in items {
+                let item_charge =
+                    json_values_charge([&item.item_data], &[&item.item_id], max_append_charge_bytes - charge)?;
+                charge = charge.checked_add(item_charge).ok_or(StoreError::PayloadTooLarge)?;
+            }
+            let has_items = inner.items.get(&key).is_some_and(|existing| !existing.is_empty());
+            if !has_items
+                && inner
+                    .conversations
+                    .get(&key)
+                    .and_then(|record| record.messages.as_array())
+                    .is_some_and(|messages| !messages.is_empty())
+            {
+                let remaining = max_append_charge_bytes
+                    .checked_sub(charge)
+                    .ok_or(StoreError::PayloadTooLarge)?;
+                let cached = &inner.conversations.get(&key).ok_or(StoreError::NotFound)?.messages;
+                let cached_charge = json_values_charge([cached], &[], remaining)?;
+                charge = charge.checked_add(cached_charge).ok_or(StoreError::PayloadTooLarge)?;
+                // The first append wraps a cache-only array as an explicit legacy
+                // prefix; reserve the wrapper before moving it into the record.
+                let wrapper_charge = retained_charge(20, 2).ok_or(StoreError::PayloadTooLarge)?;
+                charge
+                    .checked_add(wrapper_charge)
+                    .filter(|total| *total <= max_append_charge_bytes)
+                    .ok_or(StoreError::PayloadTooLarge)?;
+            }
+        }
+        // Invalidate the denormalized message cache incrementally (#1509): snapshot
+        // the current projection as legacy history, then append without an eager
+        // rebuild. Reads reconstruct the cache lazily from the retired snapshot.
+        preserve_legacy_history(&mut inner, &key)?;
+        let mut next = inner
+            .items
+            .get(&key)
+            .and_then(|items| items.iter().map(|i| i.position).max())
+            .unwrap_or(0);
+        for item in items {
+            next += 1;
+            // Positions are assigned within the "transaction"; the input
+            // position field is ignored.
+            let mut stored = item.clone();
+            stored.position = next;
+            inner.item_ids.insert((stored.owner.clone(), stored.item_id.clone()));
+            inner.items.entry(key.clone()).or_default().push(stored);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests")]
+mod tests {
+    use super::*;
+
+    fn owner(tenant: &str) -> StateOwner {
+        StateOwner::from_trusted_parts(tenant, "issuer", "subject").expect("owner")
+    }
+
+    fn item(owner: &StateOwner, conversation_id: &str, item_id: &str, position: i64) -> ConversationItemRecord {
+        ConversationItemRecord {
+            item_id: item_id.to_owned(),
+            owner: owner.clone(),
+            conversation_id: conversation_id.to_owned(),
+            item_data: serde_json::json!({ "id": item_id }),
+            created_at: 0,
+            position,
+        }
+    }
+
+    fn approval(id: &str) -> PendingApprovalRecord {
+        PendingApprovalRecord {
+            approval_id: id.to_owned(),
+            server_label: "srv".to_owned(),
+            tool_name: "tool".to_owned(),
+            arguments: "{}".to_owned(),
+            target_fingerprint: "fp".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_isolation_hides_other_owners() {
+        let store = InMemoryStore::new();
+        let a = owner("a");
+        let b = owner("b");
+        store
+            .upsert_response(&ResponseRecord {
+                id: "r1".to_owned(),
+                owner: a.clone(),
+                created_at: 1,
+                model: "m".to_owned(),
+                response_object: serde_json::json!({}),
+                input: serde_json::json!({}),
+                messages: serde_json::json!([]),
+            })
+            .await
+            .unwrap();
+        assert!(store.get_response(&a, "r1").await.unwrap().is_some());
+        assert!(store.get_response(&b, "r1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_response_counts_model_before_cloning() {
+        let store = InMemoryStore::new();
+        let owner = owner("a");
+        store
+            .upsert_response(&ResponseRecord {
+                id: "r1".to_owned(),
+                owner: owner.clone(),
+                created_at: 1,
+                model: "m".repeat(16_384),
+                response_object: serde_json::json!({}),
+                input: serde_json::json!({}),
+                messages: serde_json::json!([]),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.get_response_bounded(&owner, "r1", 4_096).await,
+            Err(StoreError::PayloadTooLarge)
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_conversation_append_keeps_prior_cache_on_overflow() {
+        let store = InMemoryStore::new();
+        let o = owner("a");
+        store
+            .upsert_conversation(&ConversationRecord {
+                conversation_id: "c1".to_owned(),
+                owner: o.clone(),
+                created_at: 1,
+                metadata: serde_json::json!({}),
+                messages: serde_json::json!([]),
+            })
+            .await
+            .unwrap();
+        store
+            .create_items_and_sync_messages(&o, "c1", &[item(&o, "c1", "prior", 0)])
+            .await
+            .unwrap();
+        let rejected = store
+            .create_items_and_sync_messages_bounded(&o, "c1", &[item(&o, "c1", "new", 0)], 1)
+            .await;
+        assert!(matches!(rejected, Err(StoreError::PayloadTooLarge)));
+        let listed = store.list_conversation_items(&o, "c1", None, 10, true).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed.first().map(|item| item.item_id.as_str()), Some("prior"));
+        // Post-#1509 the plain `messages` cache is lazy, so the reconstructed
+        // bounded view is what proves the prior item survived the rejected append.
+        let conversation = ResponseStore::get_conversation_bounded(&store, &o, "c1", 65_536)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(conversation.messages.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "linear all-or-nothing assertions")]
+    async fn consume_approvals_is_all_or_nothing() {
+        let store = InMemoryStore::new();
+        let o = owner("a");
+        store
+            .upsert_response(&ResponseRecord {
+                id: "r1".to_owned(),
+                owner: o.clone(),
+                created_at: 1,
+                model: "m".to_owned(),
+                response_object: serde_json::json!({}),
+                input: serde_json::json!({}),
+                messages: serde_json::json!([]),
+            })
+            .await
+            .unwrap();
+        store
+            .record_pending_approvals(&o, "r1", &[approval("x"), approval("y")], 10)
+            .await
+            .unwrap();
+        // Consume x alone.
+        assert_eq!(store.consume_approvals(&o, "r1", &["x"], 20).await.unwrap(), None);
+        // A batch containing the already-consumed x aborts wholesale, leaving y outstanding.
+        assert_eq!(
+            store.consume_approvals(&o, "r1", &["y", "x"], 30).await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(store.consume_approvals(&o, "r1", &["y"], 40).await.unwrap(), None);
+        // A duplicate id within one batch aborts at the second occurrence.
+        store
+            .record_pending_approvals(&o, "r1", &[approval("z")], 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.consume_approvals(&o, "r1", &["z", "z"], 50).await.unwrap(),
+            Some(1)
+        );
+        // z stays outstanding after the aborted duplicate batch.
+        assert_eq!(store.consume_approvals(&o, "r1", &["z"], 60).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn cas_messages_guards_concurrent_update() {
+        let store = InMemoryStore::new();
+        let o = owner("a");
+        store
+            .upsert_conversation(&ConversationRecord {
+                conversation_id: "c1".to_owned(),
+                owner: o.clone(),
+                created_at: 1,
+                metadata: serde_json::json!({}),
+                messages: serde_json::json!(["v0"]),
+            })
+            .await
+            .unwrap();
+        let expected = serde_json::json!(["v0"]);
+        let stale = serde_json::json!(["nope"]);
+        assert!(
+            store
+                .compare_and_swap_conversation_messages(&o, "c1", &expected, &serde_json::json!(["v1"]))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .compare_and_swap_conversation_messages(&o, "c1", &stale, &serde_json::json!(["v2"]))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_items_and_sync_assigns_positions_and_invalidates() {
+        let store = InMemoryStore::new();
+        let o = owner("a");
+        store
+            .upsert_conversation(&ConversationRecord {
+                conversation_id: "c1".to_owned(),
+                owner: o.clone(),
+                created_at: 1,
+                metadata: serde_json::json!({}),
+                messages: serde_json::json!([]),
+            })
+            .await
+            .unwrap();
+        // Input positions are ignored and assigned from max+1.
+        store
+            .create_items_and_sync_messages(&o, "c1", &[item(&o, "c1", "i1", 999), item(&o, "c1", "i2", 999)])
+            .await
+            .unwrap();
+        assert_eq!(store.conversation_item_position(&o, "c1", "i1").await.unwrap(), Some(1));
+        assert_eq!(store.conversation_item_position(&o, "c1", "i2").await.unwrap(), Some(2));
+        assert_eq!(store.max_item_position(&o, "c1").await.unwrap(), 2);
+        let conversation = ConversationItemStore::get_conversation(&store, &o, "c1")
+            .await
+            .unwrap()
+            .expect("conversation");
+        assert_eq!(conversation.messages, serde_json::json!([]));
+        assert_eq!(store.conversation_history(&o, "c1").await.unwrap().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_item_id_is_allowed_across_owners() {
+        let store = InMemoryStore::new();
+        let a = owner("a");
+        let b = owner("b");
+        for (o, conversation_id) in [(&a, "c1"), (&b, "c2")] {
+            store
+                .upsert_conversation(&ConversationRecord {
+                    conversation_id: conversation_id.to_owned(),
+                    owner: o.clone(),
+                    created_at: 1,
+                    metadata: serde_json::json!({}),
+                    messages: serde_json::json!([]),
+                })
+                .await
+                .unwrap();
+        }
+        store
+            .create_conversation_items(&[item(&a, "c1", "shared", 1)])
+            .await
+            .unwrap();
+        store
+            .create_conversation_items(&[item(&b, "c2", "shared", 1)])
+            .await
+            .unwrap();
+        assert!(store.get_conversation_item(&a, "c1", "shared").await.unwrap().is_some());
+        assert!(store.get_conversation_item(&b, "c2", "shared").await.unwrap().is_some());
+    }
+}

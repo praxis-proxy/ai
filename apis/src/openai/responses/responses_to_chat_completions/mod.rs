@@ -9,7 +9,7 @@ mod config;
 mod error;
 
 /// Incremental Chat Completions SSE to Responses SSE conversion.
-mod stream;
+pub(crate) mod stream;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -29,7 +29,6 @@ use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     SelectedUpstreamBodyOutcome, SubRequestResponseMode, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
-use serde::Deserialize;
 use tracing::{debug, trace, warn};
 
 use self::{
@@ -38,8 +37,12 @@ use self::{
     stream::{SnapshotInputs, StreamConverter},
 };
 use super::{
+    agentic_loop::{
+        AgenticBudgetPolicy,
+        budget::{input_charge, output_charge},
+    },
     body_limits::rewritten_body_too_large_rejection,
-    enforce_agentic_stream_guard,
+    bounded_json_size, enforce_agentic_stream_guard,
     error::{responses_error_body, responses_error_rejection},
     state::ResponsesState,
 };
@@ -52,16 +55,16 @@ use crate::{
 };
 
 /// Metadata recording that request translation completed successfully.
-const ARMED_KEY: &str = "responses_to_chat_completions.armed";
+const ARMED_KEY: &str = "openai_responses_to_chat_completions.armed";
 
 /// Metadata recording the Responses resource creation timestamp.
-const CREATED_AT_KEY: &str = "responses_to_chat_completions.created_at";
+const CREATED_AT_KEY: &str = "openai_responses_to_chat_completions.created_at";
 
 /// Metadata recording the upstream response status while headers are mutable.
-const RESPONSE_STATUS_KEY: &str = "responses_to_chat_completions.response_status";
+const RESPONSE_STATUS_KEY: &str = "openai_responses_to_chat_completions.response_status";
 
 /// Metadata selecting the finite response transformation.
-const RESPONSE_TRANSFORM_KEY: &str = "responses_to_chat_completions.response_transform";
+const RESPONSE_TRANSFORM_KEY: &str = "openai_responses_to_chat_completions.response_transform";
 
 /// Marker for a successful Chat Completions response.
 const RESPONSE_TRANSFORM_SUCCESS: &str = "success";
@@ -72,16 +75,40 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 /// Marker for a streaming Chat Completions SSE response.
 const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 
+/// Conservative allowance for the owned Chat request tree and its serialized body.
+const CHAT_REQUEST_SOURCE_MULTIPLIER: usize = 8;
+/// Map, message, and serializer capacity needed even for a short text input.
+const CHAT_REQUEST_FIXED_RESERVE: usize = 4_096;
+/// Request-phase admission error before any translated body is built.
+const CHAT_REQUEST_OVERFLOW: &str =
+    "Chat request translation exceeds a processing limit set by the platform administrator.";
+/// Response-phase admission error before a buffered Chat body is parsed.
+const CHAT_RESPONSE_OVERFLOW: &str =
+    "Chat response translation exceeds a processing limit set by the platform administrator.";
+/// Reserve client-owned request fields cloned into opening and terminal snapshots.
+const CHAT_STREAM_ECHO_MULTIPLIER: usize = 16;
+/// Part of that reserve covers encoded opening and terminal snapshots in flight.
+const CHAT_STREAM_OUTPUT_ECHO_MULTIPLIER: usize = 4;
+/// Fixed share of the error reserve available for one encoded SSE callback.
+const CHAT_STREAM_OUTPUT_BASE_ALLOWANCE: usize = 8_192;
+/// Capacity for the one bounded error terminal if a stream exhausts its ledger.
+const CHAT_STREAM_ERROR_RESERVE: usize = 16_384;
+/// Vec growth on a one-byte partial frame can exceed the wire multiplier.
+const CHAT_STREAM_MIN_TRANSIENT_CHARGE: usize = 256;
+/// Marker that stops processing provider callbacks after an aggregate overflow.
+const CHAT_STREAM_BUDGET_FAILED: &str = "responses_to_chat_completions.budget_failed";
+
+/// Final emitted bytes stay charged through downstream response filters and
+/// can be released if another Chat inference round starts on this request.
+struct ChatStreamOutputHandoff(usize);
+
 /// Translates canonical Responses create requests for a Chat Completions backend.
 ///
 /// The filter consumes the classification metadata and `ResponsesState`
-/// produced by `openai_responses_format` and `openai_responses_validate`.
+/// produced by `openai_responses_request`.
 /// It converts the enriched request to Chat Completions wire format, converts
 /// finite successful Chat responses back to Responses resources, and
 /// normalizes finite provider errors while preserving their HTTP status.
-/// OpenAI-managed `prompt` template references fail closed because Chat
-/// Completions has no equivalent field and silently dropping them would change
-/// the requested prompt.
 /// Supported hosted web-search tools are exposed to the Chat backend as a
 /// private, bounded `web_search` function. Returned calls are restored to
 /// canonical `web_search_call` output before downstream agentic filters run.
@@ -93,10 +120,10 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// change from `/v1/responses` to `/v1/chat/completions`.
 ///
 /// Requests using `previous_response_id` require
-/// `openai_response_store` and `openai_responses_rehydrate` earlier in the
+/// `openai_responses_store` and `openai_responses_rehydrate` earlier in the
 /// request pipeline. The filter fails closed if stored history has not been
 /// resolved, preventing a continuation from silently losing prior turns.
-/// For finite web-search loops, place `openai_web_search` and
+/// For finite web-search loops, place `openai_web_search_dispatch` and
 /// `openai_agentic_loop` before this filter in an iterative-router step. The
 /// reverse response order then restores the hosted call before those filters
 /// inspect it.
@@ -110,13 +137,13 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// `content` is `reasoning_text`. Raw reasoning is never placed in the item
 /// summary, which is reserved for safe summaries. No current dialect can
 /// generate a safe summary, so a client that requests `reasoning.summary` (or
-/// the deprecated `reasoning.generate_summary`) is rejected. Streaming reasoning
-/// translation is not yet implemented, so a streaming request is rejected when
-/// valid reasoning dialect is configured. On continuation, raw reasoning
-/// is replayed into the following assistant turn's `reasoning` field, preserving
-/// its ordinary `content`. Reasoning-only output becomes a standalone assistant
-/// message at a turn boundary or end of input. Reasoning input requires an
-/// enabled dialect and non-empty raw `reasoning_text` content; encrypted,
+/// the deprecated `reasoning.generate_summary`) is rejected. Streaming responses
+/// translate `delta.reasoning` (or `delta.reasoning_content`) incrementally into
+/// `response.reasoning_text.delta` events under the same byte limit. On continuation,
+/// raw reasoning is replayed into the following assistant turn's `reasoning` field,
+/// preserving its ordinary `content`. Reasoning-only output becomes a standalone
+/// assistant message at a turn boundary or end of input. Reasoning input requires
+/// an enabled dialect and non-empty raw `reasoning_text` content; encrypted,
 /// summary-only, and malformed items are rejected before forwarding.
 ///
 /// To emit translated SSE events incrementally, this filter forces the
@@ -124,9 +151,9 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// protocol layer reconciles a single chain-wide response body mode with no
 /// per-filter provenance, so this downgrade cannot be scoped to one neighbor: it
 /// overrides every response filter's `StreamBuffer` requirement, not only
-/// `openai_response_store`'s. Only compose response-body filters after this one
+/// `openai_responses_store`'s. Only compose response-body filters after this one
 /// that tolerate incremental fragments; `openai_stream_events` and
-/// `openai_response_store` are compatible because they persist streamed turns
+/// `openai_responses_store` are compatible because they persist streamed turns
 /// from the accumulator, not a buffered body, whereas any other response-body
 /// rewriter needing the complete buffered body would instead receive fragments.
 ///
@@ -140,24 +167,24 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// to the router instead of delivering the whole upstream SSE body to
 /// `openai_agentic_loop` as one buffered blob — a blob is not a Responses
 /// resource, so the loop could not detect a returned `web_search_call` and would
-/// terminate before any search dispatches. With streaming, `openai_web_search`
+/// terminate before any search dispatches. With streaming, `openai_web_search_dispatch`
 /// dispatches the search, inference resumes, and `openai_stream_events` (placed
 /// first in the step) composes one client-facing Responses SSE lifecycle across
 /// the model, search, and resumed model output.
 /// Every response filter co-located in a step with this one must therefore use
 /// `BodyMode::Stream`; a static `StreamBuffer` filter in the same step must
-/// instead buffer dynamically (see `openai_file_search_callout`).
+/// instead buffer dynamically (see `openai_file_search_dispatch`).
 ///
 /// # YAML
 ///
 /// ```yaml
-/// filter: responses_to_chat_completions
+/// filter: openai_responses_to_chat_completions
 /// ```
 ///
 /// # Full YAML
 ///
 /// ```yaml
-/// filter: responses_to_chat_completions
+/// filter: openai_responses_to_chat_completions
 /// max_rewritten_body_bytes: 67108864
 /// reasoning:
 ///   dialect: vllm
@@ -167,6 +194,10 @@ pub struct ResponsesToChatCompletionsFilter {
     /// Parsed and validated body limits.
     config: ResponsesToChatCompletionsConfig,
 }
+
+/// Serialized outbound Chat Completions body paired with its effective `stream`
+/// bit, captured during translation so transport selection never re-parses it.
+type TranslatedRequest = (Vec<u8>, bool);
 
 impl ResponsesToChatCompletionsFilter {
     /// Create the filter from YAML configuration.
@@ -179,24 +210,41 @@ impl ResponsesToChatCompletionsFilter {
         let parsed = if config.is_null() {
             ResponsesToChatCompletionsConfig::default()
         } else {
-            parse_filter_config("responses_to_chat_completions", config)?
+            parse_filter_config("openai_responses_to_chat_completions", config)?
         };
         Ok(Box::new(Self {
             config: build_config(parsed)?,
         }))
     }
 
-    /// Build and size-check the owned Chat Completions request body.
+    /// Build and size-check the owned Chat Completions request body, returning
+    /// it alongside the effective outbound `stream` bit.
+    ///
+    /// The `stream` flag is read once from the in-memory translated value rather
+    /// than re-deserializing the serialized bytes: translation copies `stream`
+    /// verbatim from the client request (`map_stream_options`), so this is the
+    /// same bit the backend sees, and the outbound body can carry multi-MB of
+    /// rehydrated history we must not parse twice.
     fn translated_request_bytes(
         &self,
-        ctx: &HttpFilterContext<'_>,
-    ) -> Result<Result<Vec<u8>, SelectedUpstreamBodyOutcome>, FilterError> {
+        ctx: &mut HttpFilterContext<'_>,
+    ) -> Result<Result<TranslatedRequest, SelectedUpstreamBodyOutcome>, FilterError> {
+        if !reserve_chat_request_source(ctx) {
+            return Ok(Err(chat_request_budget_rejection()));
+        }
         let translated = match translate_canonical_state(ctx, &self.config.reasoning) {
             Ok(value) => value,
             Err(outcome) => return Ok(Err(outcome)),
         };
+        let stream = translated
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !reserve_chat_request_wire(ctx, &translated) {
+            return Ok(Err(chat_request_budget_rejection()));
+        }
         let serialized = serde_json::to_vec(&translated)
-            .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;
+            .map_err(|error| -> FilterError { format!("openai_responses_to_chat_completions: {error}").into() })?;
         if serialized.len() > self.config.max_rewritten_body_bytes {
             debug!(
                 body_bytes = serialized.len(),
@@ -207,7 +255,7 @@ impl ResponsesToChatCompletionsFilter {
                 rewritten_body_too_large_rejection(serialized.len(), self.config.max_rewritten_body_bytes),
             )));
         }
-        Ok(Ok(serialized))
+        Ok(Ok((serialized, stream)))
     }
 
     /// Transform one fully buffered finite provider response.
@@ -222,7 +270,7 @@ impl ResponsesToChatCompletionsFilter {
                 Ok(())
             },
             Some(RESPONSE_TRANSFORM_SUCCESS) => self.transform_success_response(ctx, body),
-            _ => Err("responses_to_chat_completions: missing finite response transform state".into()),
+            _ => Err("openai_responses_to_chat_completions: missing finite response transform state".into()),
         }
     }
 
@@ -243,11 +291,11 @@ impl ResponsesToChatCompletionsFilter {
                     max_bytes = self.config.max_rewritten_body_bytes,
                     "translated response body exceeds maximum size"
                 );
-                Err("responses_to_chat_completions: translated response exceeds maximum size".into())
+                Err("openai_responses_to_chat_completions: translated response exceeds maximum size".into())
             },
             Err(error) => {
                 warn!(error = %error, "upstream provider returned an invalid Chat Completions response");
-                Err(format!("responses_to_chat_completions: invalid Chat Completions response: {error}").into())
+                Err(format!("openai_responses_to_chat_completions: invalid Chat Completions response: {error}").into())
             },
         }
     }
@@ -260,6 +308,10 @@ impl ResponsesToChatCompletionsFilter {
     #[expect(
         clippy::unnecessary_wraps,
         reason = "mirrors the fallible response dispatch handlers so on_response can return every branch uniformly with `?`/`return`"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "response setup keeps validation, budget admission, and converter installation in order"
     )]
     fn install_stream_converter(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let streaming_requested = request_is_streaming(ctx);
@@ -279,9 +331,17 @@ impl ResponsesToChatCompletionsFilter {
         let Some((response_id, created_at)) = stream_identity(ctx) else {
             return Ok(FilterAction::Reject(missing_pipeline_state()));
         };
+        let Some(output_allowance) = reserve_chat_stream_snapshots(ctx) else {
+            ctx.set_metadata("responses.skip_persist", "true");
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                502,
+                "server_error",
+                CHAT_RESPONSE_OVERFLOW,
+            )));
+        };
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_STREAM);
         // Downgrade the reconciled pipeline body mode to `Stream`. A downstream
-        // `openai_response_store` declares `StreamBuffer`, so without this the
+        // `openai_responses_store` declares `StreamBuffer`, so without this the
         // protocol layer buffers the raw first chunk and, when the store
         // releases the stream, flushes that raw chunk verbatim — discarding this
         // filter's translation of it. Opting out of buffering lets each
@@ -289,7 +349,7 @@ impl ResponsesToChatCompletionsFilter {
         // turns from the `openai_stream_events` accumulator, not the body buffer.
         //
         // This body mode is reconciled chain-wide with no per-filter provenance,
-        // so the downgrade cannot be scoped to `openai_response_store`: it applies
+        // so the downgrade cannot be scoped to `openai_responses_store`: it applies
         // to every response filter. Composing any other downstream response-body
         // rewriter that needs the complete buffered body is therefore unsupported
         // (see the filter's "Response body mode" documentation).
@@ -300,11 +360,14 @@ impl ResponsesToChatCompletionsFilter {
         // opt-out as always memory-safe.
         ctx.response_body_mode = BodyMode::Stream;
         prepare_transformed_stream_headers(ctx);
-        ctx.insert_filter_state(StreamConverter::new(
+        let mut converter = StreamConverter::new(
             response_id,
             created_at,
             self.config.stream_limits(),
-        ));
+            self.config.reasoning,
+        );
+        converter.budget_output_allowance = output_allowance;
+        ctx.insert_filter_state(converter);
         Ok(FilterAction::Continue)
     }
 
@@ -314,24 +377,65 @@ impl ResponsesToChatCompletionsFilter {
     /// partial provider framing is never forwarded. Recoverable translation
     /// failures surface as a `response.failed` event from the converter, so only
     /// internal serialization failures propagate as [`FilterError`].
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one callback reserves, converts, settles, and publishes a single stream chunk"
+    )]
     fn transform_stream_response(
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        if ctx.get_metadata(CHAT_STREAM_BUDGET_FAILED) == Some("true") {
+            *body = None;
+            return Ok(FilterAction::Continue);
+        }
         let Some(mut converter) = ctx.remove_filter_state::<StreamConverter>() else {
             return Ok(FilterAction::Continue);
         };
+        // The converter owns incomplete Chat SSE framing before it produces a
+        // Responses event for the downstream accumulator to charge. Reserve the
+        // source chunk first, including JSON-node and semantic-state headroom.
+        let budgeted = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.simple_budget.is_some());
+        if budgeted && !release_chat_stream_output_handoff(ctx, &mut converter) {
+            return Ok(chat_stream_budget_error(ctx, body));
+        }
+        let transient_charge = if budgeted {
+            let charge = body
+                .as_deref()
+                .map_or(Some(0), |bytes| {
+                    input_charge(bytes)?
+                        .max(CHAT_STREAM_MIN_TRANSIENT_CHARGE)
+                        .checked_add(converter.budget_framing_growth_charge()?)
+                })
+                .and_then(|source| source.checked_add(converter.budget_closeout_growth_charge()?));
+            let admitted = ctx
+                .extensions
+                .get_mut::<ResponsesState>()
+                .and_then(|state| state.simple_budget.as_mut())
+                .is_some_and(|budget| charge.is_some_and(|charge| budget.reserve_additional_input(charge)));
+            if !admitted {
+                return Ok(chat_stream_budget_error(ctx, body));
+            }
+            charge.unwrap_or(0)
+        } else {
+            0
+        };
         let now = ctx.time_source.now().as_secs();
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
-            return Err("responses_to_chat_completions: missing Responses state for streaming translation".into());
+            return Err(
+                "openai_responses_to_chat_completions: missing Responses state for streaming translation".into(),
+            );
         };
         let inputs = SnapshotInputs {
             request_body: &state.request_body,
             tools: &state.tools,
             // The effective client-visible choice: the agentic-preserved original
             // when set, otherwise the canonical request choice. Both retain the
-            // hosted form even after openai_file_search_callout lowers
+            // hosted form even after openai_file_search_dispatch lowers
             // request_body for the backend.
             original_tool_choice: state.original_tool_choice.as_ref().or(Some(&state.tool_choice)),
             now,
@@ -347,6 +451,58 @@ impl ResponsesToChatCompletionsFilter {
             out.extend_from_slice(&events);
         }
 
+        record_stream_reasoning_replay(ctx, &mut converter);
+        if budgeted {
+            let Some(mut reserved) = converter.budget_retained_charge.checked_add(transient_charge) else {
+                return Ok(chat_stream_budget_error(ctx, body));
+            };
+            let Some(live) = (if end_of_stream {
+                Some(0)
+            } else {
+                converter.budget_live_charge()
+            }) else {
+                return Ok(chat_stream_budget_error(ctx, body));
+            };
+            // The initial echo reserve already includes a bounded output
+            // projection. Keep any excess charged across the downstream handoff.
+            let output_charge = if out.is_empty() {
+                0
+            } else {
+                out.capacity().saturating_sub(converter.budget_output_allowance)
+            };
+            let Some(retained) = live.checked_add(output_charge) else {
+                return Ok(chat_stream_budget_error(ctx, body));
+            };
+            // The projection was reserved before conversion. Actual Vec
+            // capacity can be higher; charge any remainder before handing the
+            // translated body to downstream filters.
+            let additional = retained.saturating_sub(reserved);
+            if additional != 0 {
+                let admitted = ctx
+                    .extensions
+                    .get_mut::<ResponsesState>()
+                    .and_then(|state| state.simple_budget.as_mut())
+                    .is_some_and(|budget| budget.reserve_additional_input(additional));
+                if !admitted {
+                    return Ok(chat_stream_budget_error(ctx, body));
+                }
+                reserved = retained;
+            }
+            let settled = ctx
+                .extensions
+                .get_mut::<ResponsesState>()
+                .and_then(|state| state.simple_budget.as_mut())
+                .is_some_and(|budget| budget.settle_additional_input(reserved, retained));
+            if !settled {
+                return Ok(chat_stream_budget_error(ctx, body));
+            }
+            converter.budget_retained_charge = retained;
+            converter.budget_output_handoff_charge = output_charge;
+            if end_of_stream && output_charge != 0 {
+                ctx.extensions.insert(ChatStreamOutputHandoff(output_charge));
+            }
+        }
+
         *body = (!out.is_empty()).then(|| Bytes::from(out));
         if !end_of_stream {
             ctx.insert_filter_state(converter);
@@ -355,10 +511,178 @@ impl ResponsesToChatCompletionsFilter {
     }
 }
 
+/// Reserve the request fields cloned into the opening pair and terminal
+/// snapshots before the first Chat callback can create either resource.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one atomic reservation keeps snapshot measurement and ledger admission together"
+)]
+fn reserve_chat_stream_snapshots(ctx: &mut HttpFilterContext<'_>) -> Option<usize> {
+    if let Some(handoff) = ctx.extensions.remove::<ChatStreamOutputHandoff>()
+        && !ctx
+            .extensions
+            .get_mut::<ResponsesState>()
+            .and_then(|state| state.simple_budget.as_mut())
+            .is_some_and(|budget| budget.settle_additional_input(handoff.0, 0))
+    {
+        return None;
+    }
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return ctx.extensions.get::<AgenticBudgetPolicy>().is_none().then_some(0);
+    };
+    if state.simple_budget.is_none() {
+        return ctx.extensions.get::<AgenticBudgetPolicy>().is_none().then_some(0);
+    }
+    let charges = (|| {
+        let request = bounded_json_size(&state.request_body, MAX_JSON_BODY_BYTES)
+            .ok()
+            .flatten()?;
+        let tools = bounded_json_size(&state.tools, MAX_JSON_BODY_BYTES).ok().flatten()?;
+        let choice = bounded_json_size(
+            state.original_tool_choice.as_ref().unwrap_or(&state.tool_choice),
+            MAX_JSON_BODY_BYTES,
+        )
+        .ok()
+        .flatten()?;
+        let source = request.checked_add(tools)?.checked_add(choice)?;
+        let reserve = source
+            .checked_mul(CHAT_STREAM_ECHO_MULTIPLIER)?
+            .checked_add(CHAT_STREAM_ERROR_RESERVE)?;
+        let output_allowance = source
+            .checked_mul(CHAT_STREAM_OUTPUT_ECHO_MULTIPLIER)?
+            .checked_add(CHAT_STREAM_OUTPUT_BASE_ALLOWANCE)?;
+        Some((reserve, output_allowance))
+    })();
+    let (charge, output_allowance) = charges?;
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .and_then(|state| state.simple_budget.as_mut())
+        .and_then(|budget| budget.reserve_additional_input(charge).then_some(output_allowance))
+}
+
+/// The previous translated chunk has passed the downstream filters before
+/// this callback begins, so its handoff charge can leave this owner's ledger.
+fn release_chat_stream_output_handoff(ctx: &mut HttpFilterContext<'_>, converter: &mut StreamConverter) -> bool {
+    let charge = converter.budget_output_handoff_charge;
+    let Some(retained) = converter.budget_retained_charge.checked_sub(charge) else {
+        return false;
+    };
+    if charge != 0
+        && !ctx
+            .extensions
+            .get_mut::<ResponsesState>()
+            .and_then(|state| state.simple_budget.as_mut())
+            .is_some_and(|budget| budget.settle_additional_input(charge, 0))
+    {
+        return false;
+    }
+    converter.budget_retained_charge = retained;
+    converter.budget_output_handoff_charge = 0;
+    true
+}
+
+/// The streaming body runs inside IRR, which discards response-body rejections.
+/// Publish a sticky error and let the downstream stream owner emit it at EOS.
+fn chat_stream_budget_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) -> FilterAction {
+    *body = None;
+    ctx.set_metadata(CHAT_STREAM_BUDGET_FAILED, "true");
+    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.set_metadata("responses.stream_error_message", CHAT_RESPONSE_OVERFLOW);
+    ctx.set_metadata("responses.skip_persist", "true");
+    super::fs_arm_stream_stop(ctx);
+    FilterAction::Continue
+}
+
+/// Reserve the independently owned Chat tree before request translation builds it.
+/// The source consists of the canonical request plus enriched conversation turns;
+/// the fixed allowance covers the new map and message wrappers for a short input.
+fn reserve_chat_request_source(ctx: &mut HttpFilterContext<'_>) -> bool {
+    let charge = {
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            return true;
+        };
+        if state.simple_budget.is_none() {
+            return true;
+        }
+        (|| {
+            bounded_json_size(&state.request_body, MAX_JSON_BODY_BYTES)
+                .ok()
+                .flatten()?
+                .checked_add(bounded_json_size(&state.messages, MAX_JSON_BODY_BYTES).ok().flatten()?)?
+                .checked_mul(CHAT_REQUEST_SOURCE_MULTIPLIER)?
+                .checked_add(CHAT_REQUEST_FIXED_RESERVE)
+        })()
+    };
+    charge.is_some_and(|charge| {
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .and_then(|state| state.simple_budget.as_mut())
+            .is_some_and(|budget| budget.reserve_additional_input(charge))
+    })
+}
+
+/// The translated tree is still live when its outbound wire Vec is allocated.
+fn reserve_chat_request_wire(ctx: &mut HttpFilterContext<'_>, translated: &serde_json::Value) -> bool {
+    if ctx
+        .extensions
+        .get::<ResponsesState>()
+        .is_none_or(|state| state.simple_budget.is_none())
+    {
+        return true;
+    }
+    let charge = bounded_json_size(translated, MAX_JSON_BODY_BYTES)
+        .ok()
+        .flatten()
+        .and_then(|bytes| bytes.checked_mul(2));
+    charge.is_some_and(|charge| {
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .and_then(|state| state.simple_budget.as_mut())
+            .is_some_and(|budget| budget.reserve_additional_input(charge))
+    })
+}
+
+/// Reject a Chat request whose additional translation owners cannot be reserved.
+fn chat_request_budget_rejection() -> SelectedUpstreamBodyOutcome {
+    SelectedUpstreamBodyOutcome::Reject(responses_error_rejection(
+        413,
+        "invalid_request_error",
+        CHAT_REQUEST_OVERFLOW,
+    ))
+}
+
+/// Reserve a parsed Chat tree and the derived Responses tree before JSON parse.
+/// The loop subsequently charges the translated Responses wire independently.
+fn reserve_finite_chat_response(ctx: &mut HttpFilterContext<'_>, body: &[u8]) -> bool {
+    let echo_charge = {
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            return true;
+        };
+        if state.simple_budget.is_none() {
+            return true;
+        }
+        bounded_json_size(&state.request_body, MAX_JSON_BODY_BYTES)
+            .ok()
+            .flatten()
+            .and_then(|bytes| bytes.checked_mul(4))
+    };
+    let charge = echo_charge.and_then(|echo| output_charge(body)?.checked_add(echo));
+    charge.is_some_and(|charge| {
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .and_then(|state| state.simple_budget.as_mut())
+            .is_some_and(|budget| budget.reserve_additional_input(charge))
+    })
+}
+
 #[async_trait]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the adapter owns request transport selection and finite and streaming response translation"
+)]
 impl HttpFilter for ResponsesToChatCompletionsFilter {
     fn name(&self) -> &'static str {
-        "responses_to_chat_completions"
+        "openai_responses_to_chat_completions"
     }
 
     fn selected_upstream_request_body_access(&self) -> BodyAccess {
@@ -425,11 +749,17 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
 
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, transform);
         ctx.set_metadata(RESPONSE_STATUS_KEY, status.as_u16().to_string());
-        // Buffer the finite response up to the absolute ceiling; the
-        // pipeline's body_limits decides the real raw cap.
-        ctx.set_response_body_mode(BodyMode::StreamBuffer {
-            max_bytes: Some(MAX_JSON_BODY_BYTES),
-        });
+        // Cap core's raw response buffer before the body callback can preflight
+        // the Chat parse tree and translated Responses resource.
+        if let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() {
+            ctx.response_body_mode = BodyMode::StreamBuffer {
+                max_bytes: Some(policy.max_irr_response_bytes().min(MAX_JSON_BODY_BYTES)),
+            };
+        } else {
+            ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                max_bytes: Some(MAX_JSON_BODY_BYTES),
+            });
+        }
         prepare_transformed_response_headers(ctx);
 
         Ok(FilterAction::Continue)
@@ -449,6 +779,15 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
             Some(RESPONSE_TRANSFORM_STREAM) => Self::transform_stream_response(ctx, body, end_of_stream),
             Some(_) => {
                 if end_of_stream {
+                    if !reserve_finite_chat_response(ctx, body.as_deref().unwrap_or_default()) {
+                        *body = None;
+                        ctx.set_metadata("responses.skip_persist", "true");
+                        return Ok(FilterAction::Reject(responses_error_rejection(
+                            502,
+                            "server_error",
+                            CHAT_RESPONSE_OVERFLOW,
+                        )));
+                    }
                     self.transform_finite_response(ctx, body)?;
                 }
                 Ok(FilterAction::Continue)
@@ -465,15 +804,14 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         if let Some(outcome) = request_disposition(ctx) {
             return Ok(outcome);
         }
-
-        let serialized = match self.translated_request_bytes(ctx)? {
-            Ok(bytes) => bytes,
+        let (serialized, stream) = match self.translated_request_bytes(ctx)? {
+            Ok(result) => result,
             Err(outcome) => return Ok(outcome),
         };
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         *body = Some(Bytes::from(serialized));
         ctx.set_metadata(ARMED_KEY, "true");
-        select_terminal_response_mode(ctx, body);
+        select_terminal_response_mode(ctx, stream);
         if let Some(rejection) = enforce_agentic_stream_guard(ctx) {
             return Ok(SelectedUpstreamBodyOutcome::Reject(rejection));
         }
@@ -488,33 +826,20 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
     }
 }
 
-/// Narrow deserialization target for the provider-visible stream bit.
+/// Align the typed Praxis response transport with the effective outbound
+/// `stream` bit.
 ///
-/// Only `stream` participates in transport selection; every other translated
-/// request field is intentionally ignored.
-#[derive(Deserialize)]
-struct EffectiveResponseMode {
-    /// Whether the translated outbound Chat Completions request asks for SSE.
-    #[serde(default)]
-    stream: bool,
-}
-
-/// Align the typed Praxis response transport with the translated outbound body.
-///
-/// The translated Chat Completions body carries the effective `stream` bit
-/// copied from the client Responses request, so this selects the transport
-/// matching the bytes it leaves for the backend: incremental typed streaming for
-/// an SSE request, buffered otherwise. Selecting streaming is what keeps each
-/// translated per-round stream internal to the iterative router — buffering it
-/// would deliver the whole SSE body to `openai_agentic_loop` as an opaque blob
-/// it cannot parse as a Responses resource, so the loop would terminate before
-/// `openai_web_search` ever dispatches.
-fn select_terminal_response_mode(ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>) {
-    let mode = if body
-        .as_deref()
-        .and_then(|bytes| serde_json::from_slice::<EffectiveResponseMode>(bytes).ok())
-        .is_some_and(|selection| selection.stream)
-    {
+/// `stream` is the bit copied verbatim from the client Responses request into
+/// the translated Chat Completions body, captured during translation instead of
+/// re-deserializing the (potentially multi-MB) outbound body. It selects the
+/// transport matching the bytes left for the backend: incremental typed
+/// streaming for an SSE request, buffered otherwise. Selecting streaming is what
+/// keeps each translated per-round stream internal to the iterative router —
+/// buffering it would deliver the whole SSE body to `openai_agentic_loop` as an
+/// opaque blob it cannot parse as a Responses resource, so the loop would
+/// terminate before `openai_web_search_dispatch` ever dispatches.
+fn select_terminal_response_mode(ctx: &mut HttpFilterContext<'_>, stream: bool) {
+    let mode = if stream {
         SubRequestResponseMode::Streaming
     } else {
         SubRequestResponseMode::Buffered
@@ -528,7 +853,7 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<SelectedUpstreamBo
     if !is_responses_create(&ctx.request.method, ctx.request.uri.path()) {
         return Some(SelectedUpstreamBodyOutcome::Continue);
     }
-    match ctx.get_metadata("openai_responses_format.format") {
+    match ctx.get_metadata("openai_responses_request.format") {
         Some("openai_responses") => None,
         Some(format) => {
             trace!(
@@ -547,7 +872,7 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<SelectedUpstreamBo
         },
         None => {
             warn!(
-                prerequisite = "openai_responses_format",
+                prerequisite = "openai_responses_request",
                 "request pipeline state is unavailable"
             );
             Some(SelectedUpstreamBodyOutcome::Reject(missing_pipeline_state()))
@@ -555,20 +880,20 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<SelectedUpstreamBo
     }
 }
 
-/// Convert the validator-owned canonical state to a Chat request value.
+/// Convert the request filter's canonical state to a Chat request value.
 fn translate_canonical_state(
     ctx: &HttpFilterContext<'_>,
     reasoning: &ReasoningOptions,
 ) -> Result<serde_json::Value, SelectedUpstreamBodyOutcome> {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         warn!(
-            prerequisite = "openai_responses_validate",
+            prerequisite = "openai_responses_request",
             "request pipeline state is unavailable"
         );
         return Err(SelectedUpstreamBodyOutcome::Reject(missing_pipeline_state()));
     };
     ensure_previous_response_rehydrated(state)?;
-    reject_incompatible_reasoning(&state.request_body, reasoning, request_is_streaming(ctx))?;
+    reject_incompatible_reasoning(&state.request_body, reasoning)?;
     // Read the *outbound* tools/tool_choice through the accessor so a
     // `openai_client_tool_compat`-lowered request (rich client tools rewritten to
     // private `function` tools in `request_body` only) translates the lowered view
@@ -596,20 +921,10 @@ fn translate_canonical_state(
 fn reject_incompatible_reasoning(
     request_body: &serde_json::Value,
     reasoning: &ReasoningOptions,
-    streaming: bool,
 ) -> Result<(), SelectedUpstreamBodyOutcome> {
     let Some(request) = request_body.as_object() else {
         return Ok(());
     };
-    // Streaming reasoning translation is not yet implemented.
-    if streaming && reasoning.dialect.is_enabled() {
-        debug!("streaming reasoning translation is unsupported for the configured dialect");
-        return Err(SelectedUpstreamBodyOutcome::Reject(responses_error_rejection(
-            400,
-            "invalid_request_error",
-            "streaming is not supported when a reasoning dialect is configured",
-        )));
-    }
     validate_requested_reasoning(request, reasoning).map_err(|error| {
         debug!(error = %error, "reasoning request rejected before forwarding");
         SelectedUpstreamBodyOutcome::Reject(responses_error_rejection(
@@ -634,7 +949,7 @@ fn ensure_previous_response_rehydrated(state: &ResponsesState) -> Result<(), Sel
 
 /// Return the client stream preference captured by the classifier.
 fn request_is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.stream").map_or_else(
+    ctx.get_metadata("openai_responses_request.stream").map_or_else(
         || {
             ctx.extensions
                 .get::<ResponsesState>()
@@ -666,13 +981,15 @@ fn is_non_sse_streaming_success(ctx: &HttpFilterContext<'_>) -> bool {
 fn captured_response_status(ctx: &HttpFilterContext<'_>) -> Result<http::StatusCode, FilterError> {
     let status = ctx
         .get_metadata(RESPONSE_STATUS_KEY)
-        .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing captured response status".into() })?
+        .ok_or_else(|| -> FilterError {
+            "openai_responses_to_chat_completions: missing captured response status".into()
+        })?
         .parse::<u16>()
         .map_err(|error| -> FilterError {
-            format!("responses_to_chat_completions: invalid captured response status: {error}").into()
+            format!("openai_responses_to_chat_completions: invalid captured response status: {error}").into()
         })?;
     http::StatusCode::from_u16(status).map_err(|error| -> FilterError {
-        format!("responses_to_chat_completions: invalid captured response status: {error}").into()
+        format!("openai_responses_to_chat_completions: invalid captured response status: {error}").into()
     })
 }
 
@@ -690,7 +1007,7 @@ fn transform_provider_error(
         transformed = responses_error_body(&fallback.code, &fallback.message);
     }
     if transformed.len() > max_rewritten_body_bytes {
-        return Err("responses_to_chat_completions: normalized provider error exceeds maximum size".into());
+        return Err("openai_responses_to_chat_completions: normalized provider error exceeds maximum size".into());
     }
     *body = Some(transformed);
     Ok(())
@@ -743,6 +1060,18 @@ fn prepare_transformed_response_headers(ctx: &mut HttpFilterContext<'_>) {
     }
 }
 
+/// Retain the translator's turn boundary for stored replay across IRR re-entry.
+fn record_stream_reasoning_replay(ctx: &mut HttpFilterContext<'_>, converter: &mut StreamConverter) {
+    if let Some(reasoning_index) = converter.take_replay_reasoning_index()
+        && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+    {
+        // Match the stream accumulator's output offset. Request extensions
+        // survive IRR re-entry and are visible to the outer response store.
+        let start = state.accumulated_output.len();
+        state.translated_reasoning_replay.push(start..=start + reasoning_index);
+    }
+}
+
 /// Read the response id and creation timestamp needed to seed the converter.
 fn stream_identity(ctx: &HttpFilterContext<'_>) -> Option<(String, u64)> {
     let state = ctx.extensions.get::<ResponsesState>();
@@ -785,32 +1114,32 @@ fn translate_success_response(
     let state = ctx
         .extensions
         .get::<ResponsesState>()
-        .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing Responses state".into() })?;
+        .ok_or_else(|| -> FilterError { "openai_responses_to_chat_completions: missing Responses state".into() })?;
     let response_id = ctx
         .get_metadata("responses.response_id")
         .or(state.response_id.as_deref())
-        .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing response id".into() })?;
+        .ok_or_else(|| -> FilterError { "openai_responses_to_chat_completions: missing response id".into() })?;
     let created_at = ctx
         .get_metadata(CREATED_AT_KEY)
         .and_then(|value| value.parse::<u64>().ok())
         .or(state.response_created_at)
-        .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing creation timestamp".into() })?;
+        .ok_or_else(|| -> FilterError { "openai_responses_to_chat_completions: missing creation timestamp".into() })?;
     let mut response_context =
         ResponseContext::from_responses_request(&state.request_body, response_id.to_owned(), created_at)
             .with_completed_at(ctx.time_source.now().as_secs())
-            .with_reasoning_options(reasoning.clone());
+            .with_reasoning_options(*reasoning);
     // Echo the client's canonical tool declarations, not the backend-lowered forms
-    // that openai_file_search_callout writes into request_body (e.g. a hosted
+    // that openai_file_search_dispatch writes into request_body (e.g. a hosted
     // `file_search` tool lowered to a private `function`). This mirrors how the
     // outbound request is built from `state.tools`/`state.tool_choice`.
     response_context.tools = &state.tools;
     response_context.tool_choice = state.original_tool_choice.as_ref().or(Some(&state.tool_choice));
     let provider_response: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;
+        .map_err(|error| -> FilterError { format!("openai_responses_to_chat_completions: {error}").into() })?;
     let translated = chat_response_to_response_resource(&provider_response, &response_context)
-        .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;
+        .map_err(|error| -> FilterError { format!("openai_responses_to_chat_completions: {error}").into() })?;
     let serialized = serde_json::to_vec(&translated)
-        .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;
+        .map_err(|error| -> FilterError { format!("openai_responses_to_chat_completions: {error}").into() })?;
     Ok(Bytes::from(serialized))
 }
 

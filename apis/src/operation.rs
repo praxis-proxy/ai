@@ -212,16 +212,6 @@ pub(crate) struct OperationSpec {
 }
 
 impl OperationSpec {
-    /// Whether this operation consumes a request body.
-    ///
-    /// Answers the runtime question directly rather than inferring it from
-    /// contract ownership, so proxied operations report their real body shape.
-    #[must_use]
-    #[cfg(all(test, feature = "openai-conversations"))]
-    pub(crate) const fn has_request_body(&self) -> bool {
-        self.request_body.is_present()
-    }
-
     /// Number of literal segments in the runtime path template.
     ///
     /// Used to rank candidates so a literal segment always outranks a
@@ -523,9 +513,10 @@ mod tests {
         },
     ];
 
-    /// The slice below is hand-built. It shows the matcher does not branch on
-    /// protocol; it is not evidence that two shipped registries share it. Only
-    /// OpenAI registries exist today.
+    /// The slice below is hand-built, so it proves only that the matcher does
+    /// not branch on protocol. That the shipped OpenAI and Anthropic registries
+    /// actually share one matcher is covered by the `ai_operation` classifier
+    /// tests, which drive the real registries.
     #[test]
     fn the_matcher_does_not_branch_on_protocol() {
         let responses = match_operation(SPECS, "POST", "/v1/responses", Transport::Http).unwrap();

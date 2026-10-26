@@ -35,7 +35,7 @@ jobs:
           persist-credentials: false
 
       - name: Supply chain audit
-        uses: praxis-proxy/conventions/.github/actions/supply-chain-audit@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/supply-chain-audit@e1d0ff870a1abb514acc3616624824773cc767b6 # v0.1.0
         with:
           run-deny: "false"
 
@@ -54,4 +54,4 @@ jobs:
           persist-credentials: false
 
       - name: Supply chain audit
-        uses: praxis-proxy/conventions/.github/actions/supply-chain-audit@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/supply-chain-audit@e1d0ff870a1abb514acc3616624824773cc767b6 # v0.1.0

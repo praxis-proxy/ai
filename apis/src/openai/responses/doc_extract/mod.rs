@@ -60,11 +60,20 @@ use tracing::{debug, trace, warn};
 
 use self::{
     config::{DocExtractConfig, validate_config},
-    extract::{ExtractError, ExtractionBudget, extract_input_file},
+    extract::{ExtractError, ExtractionBudget, extract_input_file, parse_data_uri},
 };
 use super::{
-    body_limits::reject_rewritten_body_too_large, bound_body_outcome, content_parts::content_parts_mut,
-    openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
+    agentic_loop::{
+        AgenticBudgetPolicy,
+        budget::{SimpleBudget, input_charge},
+    },
+    body_limits::reject_rewritten_body_too_large,
+    bound_body_outcome,
+    content_parts::{content_parts, content_parts_mut, infer_mime_from_filename},
+    error::responses_error_rejection,
+    history::MessageHistory,
+    responses_proxy::serialized_outbound_body_len,
+    state::ResponsesState,
 };
 use crate::{classifier::is_responses_create, json_body::serialize_json_body};
 
@@ -150,7 +159,7 @@ impl HttpFilter for DocExtractFilter {
             return Ok(FilterAction::Release);
         }
 
-        if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
+        if ctx.get_metadata("openai_responses_request.format") != Some("openai_responses") {
             trace!("skipping non-responses request");
             return Ok(FilterAction::Release);
         }
@@ -158,6 +167,14 @@ impl HttpFilter for DocExtractFilter {
         let Some(raw) = body.as_ref() else {
             trace!("no body, releasing");
             return Ok(FilterAction::Release);
+        };
+
+        // The ingress charge covers the canonical request owners. This filter
+        // parses a second tree while those owners remain live, so check that
+        // temporary projection before serde allocates it.
+        let doc_budget = match preflight_doc_parse(ctx, raw) {
+            Ok(budget) => budget,
+            Err(action) => return Ok(action),
         };
 
         let parsed: serde_json::Value = match serde_json::from_slice(raw) {
@@ -168,7 +185,7 @@ impl HttpFilter for DocExtractFilter {
             },
         };
 
-        extract_and_rewrite(self, ctx, body, parsed)
+        extract_and_rewrite(self, ctx, body, parsed, doc_budget)
     }
 
     async fn on_bound_upstream_request_body(
@@ -191,9 +208,15 @@ fn extract_and_rewrite(
     ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
     mut parsed: serde_json::Value,
+    doc_budget: Option<SimpleBudget>,
 ) -> Result<FilterAction, FilterError> {
     let max_bytes = filter.config.max_rewritten_body_bytes;
     let mut budget = ExtractionBudget::new(&filter.config);
+
+    let next_budget = match reserve_document_growth(ctx, &parsed, body.as_deref(), doc_budget) {
+        Ok(budget) => budget,
+        Err(action) => return Ok(action),
+    };
 
     let count = match extract_current_input(&mut parsed, &mut budget) {
         Ok(count) => count,
@@ -201,14 +224,7 @@ fn extract_and_rewrite(
     };
 
     if count == 0 {
-        trace!("no input_file parts to extract");
-        if let Err(e) = extract_state_history(ctx, &mut budget) {
-            return Ok(reject_extract_error(&e));
-        }
-        if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes)? {
-            return Ok(rejection);
-        }
-        return Ok(FilterAction::Continue);
+        return finish_history_only(ctx, &mut budget, max_bytes, next_budget);
     }
 
     debug!(count, "extracted input_file parts");
@@ -222,7 +238,156 @@ fn extract_and_rewrite(
         return Ok(rejection);
     }
 
+    commit_document_budget(ctx, next_budget);
+
     Ok(FilterAction::Continue)
+}
+
+/// Process restored documents when the current input has no inline file.
+fn finish_history_only(
+    ctx: &mut HttpFilterContext<'_>,
+    budget: &mut ExtractionBudget,
+    max_bytes: usize,
+    next_budget: Option<SimpleBudget>,
+) -> Result<FilterAction, FilterError> {
+    trace!("no input_file parts to extract");
+    if let Err(e) = extract_state_history(ctx, budget) {
+        return Ok(reject_extract_error(&e));
+    }
+    if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes)? {
+        return Ok(rejection);
+    }
+    commit_document_budget(ctx, next_budget);
+    Ok(FilterAction::Continue)
+}
+
+/// Reject a budgeted pipeline that has no admitted request owner, and bound
+/// the extra JSON tree before parsing the body again.
+fn preflight_doc_parse(ctx: &HttpFilterContext<'_>, raw: &[u8]) -> Result<Option<SimpleBudget>, FilterAction> {
+    if ctx.extensions.get::<AgenticBudgetPolicy>().is_none() {
+        return Ok(None);
+    }
+    let Some(shared) = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|state| state.simple_budget)
+    else {
+        // A configured budget policy with no admitted Responses state is a
+        // server-side wiring failure (the managed classifier never minted the
+        // retained-payload budget), not malformed client input. Keep the 500
+        // server error while avoiding internal wiring details in the response.
+        return Err(FilterAction::Reject(responses_error_rejection(
+            500,
+            "server_error",
+            "Document extraction is unavailable because of a platform configuration problem. Contact the platform administrator.",
+        )));
+    };
+    let parsed = input_charge(raw).unwrap_or(usize::MAX);
+    if shared.remaining_bytes().is_none_or(|remaining| parsed > remaining) {
+        return Err(reject_retained_document_budget());
+    }
+    Ok(Some(shared))
+}
+
+/// Keep the temporary parse and the replacement owners within the same
+/// request budget before decoding or cloning any document content.
+fn reserve_document_growth(
+    ctx: &HttpFilterContext<'_>,
+    parsed: &serde_json::Value,
+    raw: Option<&[u8]>,
+    budget: Option<SimpleBudget>,
+) -> Result<Option<SimpleBudget>, FilterAction> {
+    let Some(mut shared) = budget else { return Ok(None) };
+    let growth = projected_document_growth(ctx, parsed).ok_or_else(reject_retained_document_budget)?;
+    let parse_charge = raw.and_then(input_charge).unwrap_or(usize::MAX);
+    let peak = parse_charge.saturating_add(growth);
+    if shared.remaining_bytes().is_none_or(|remaining| peak > remaining) || !shared.reserve_additional_input(growth) {
+        return Err(reject_retained_document_budget());
+    }
+    Ok(Some(shared))
+}
+
+/// Reserve each independently rewritten document before base64 decode. The
+/// source tree, decoded buffer, new text, serialized body, request state, and
+/// two message projections overlap. Sixfold JSON escaping can enlarge decoded
+/// control characters, so 64 bytes per possible text byte covers those copies
+/// and the temporary serializer capacity. A fixed part charge covers maps and
+/// Vec spare capacity even for a one-byte document.
+fn projected_document_growth(ctx: &HttpFilterContext<'_>, parsed: &serde_json::Value) -> Option<usize> {
+    let mut growth = parsed
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .map_or(Some(0), parts_growth)?;
+    if let Some(state) = ctx.extensions.get::<ResponsesState>() {
+        let history_end = state.messages.len().checked_sub(state.input.len())?;
+        let persisted_end = state.persisted_messages.len().checked_sub(state.input.len())?;
+        growth = growth
+            .checked_add(parts_growth(state.messages.iter().take(history_end))?)?
+            .checked_add(parts_growth(state.persisted_messages.iter().take(persisted_end))?)?;
+    }
+    Some(growth)
+}
+
+/// Sum charges for every independently rewritten part in one message vector.
+#[expect(
+    single_use_lifetimes,
+    reason = "borrows message parts from a slice or MessageHistory iterator"
+)]
+fn parts_growth<'a>(items: impl IntoIterator<Item = &'a serde_json::Value>) -> Option<usize> {
+    let mut charge = 0_usize;
+    for item in items {
+        let Some(parts) = content_parts(item) else { continue };
+        for part in parts {
+            charge = charge.checked_add(part_growth(part)?)?;
+        }
+    }
+    Some(charge)
+}
+
+/// Conservatively charge decoded text and serialized JSON projections.
+fn part_growth(part: &serde_json::Value) -> Option<usize> {
+    const TEXT_OWNER_MULTIPLIER: usize = 64;
+    const PART_NODE_RESERVE: usize = 8_192;
+    if part.get("type").and_then(serde_json::Value::as_str) != Some("input_file") {
+        return Some(0);
+    }
+    let Some(data) = part.get("file_data").and_then(serde_json::Value::as_str) else {
+        return Some(0);
+    };
+    let filename = part.get("filename").and_then(serde_json::Value::as_str);
+    let mime = parse_data_uri(data)
+        .map(|uri| uri.mime)
+        .or_else(|| infer_mime_from_filename(filename))
+        .unwrap_or("application/octet-stream");
+    if !config::is_text_safe_mime(mime) {
+        return Some(0);
+    }
+    let prefix = filename
+        .filter(|name| !name.is_empty())
+        .map_or(0, str::len)
+        .checked_add(11)?;
+    data.len()
+        .checked_add(prefix)?
+        .checked_mul(TEXT_OWNER_MULTIPLIER)?
+        .checked_add(PART_NODE_RESERVE)
+}
+
+/// Publish the growth reservation only after every rewrite and size check succeeds.
+fn commit_document_budget(ctx: &mut HttpFilterContext<'_>, budget: Option<SimpleBudget>) {
+    if let Some(budget) = budget
+        && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+    {
+        state.simple_budget = Some(budget);
+    }
+}
+
+/// Return one consistent request-wide overflow response for this filter.
+fn reject_retained_document_budget() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        413,
+        "invalid_request_error",
+        "Document extraction exceeds a processing limit set by the platform administrator.",
+    ))
 }
 
 /// Walk the current request input and extract text-safe `input_file` parts.
@@ -343,7 +508,7 @@ fn extract_state_history(ctx: &mut HttpFilterContext<'_>, budget: &mut Extractio
 /// Sync the persisted-messages mirror with independent count and
 /// byte accounting.
 fn sync_persisted_history(
-    messages: &mut [serde_json::Value],
+    messages: &mut MessageHistory,
     input_len: usize,
     resolved_input: Option<&[serde_json::Value]>,
     budget: &mut ExtractionBudget,
@@ -357,7 +522,7 @@ fn sync_persisted_history(
 /// Replace the current-input tail, then extract text-safe
 /// `input_file` parts from the history prefix.
 fn sync_message_history(
-    messages: &mut [serde_json::Value],
+    messages: &mut MessageHistory,
     input_len: usize,
     resolved_input: Option<&[serde_json::Value]>,
     budget: &mut ExtractionBudget,
@@ -373,8 +538,11 @@ fn sync_message_history(
 
 /// Copy resolved input items into the current-input tail of a
 /// message vector, starting at `history_end`.
-fn replace_tail(messages: &mut [serde_json::Value], history_end: usize, resolved_input: &[serde_json::Value]) {
+fn replace_tail(messages: &mut MessageHistory, history_end: usize, resolved_input: &[serde_json::Value]) {
     for (i, item) in resolved_input.iter().enumerate() {
+        if messages.get(history_end + i) == Some(item) {
+            continue;
+        }
         if let Some(slot) = messages.get_mut(history_end + i) {
             *slot = item.clone();
         }
@@ -384,17 +552,36 @@ fn replace_tail(messages: &mut [serde_json::Value], history_end: usize, resolved
 /// Extract text-safe `input_file` parts from history messages (the
 /// prefix before the current input).
 fn extract_history(
-    messages: &mut [serde_json::Value],
+    messages: &mut MessageHistory,
     history_end: usize,
     budget: &mut ExtractionBudget,
 ) -> Result<(), ExtractError> {
-    if history_end == 0 {
-        return Ok(());
+    for index in 0..history_end {
+        let Some(parts) = messages.get(index).and_then(content_parts) else {
+            continue;
+        };
+        // Decode from the borrowed item first. Unsupported documents still
+        // consume their normal budget, but don't detach unchanged history.
+        let mut replacements = Vec::new();
+        for (part_index, part) in parts.iter().enumerate() {
+            if part.get("type").and_then(serde_json::Value::as_str) == Some("input_file")
+                && let Some(text) = extract_input_file(part, budget)?
+            {
+                replacements.push((part_index, text));
+            }
+        }
+        if replacements.is_empty() {
+            continue;
+        }
+        if let Some(parts) = messages.get_mut(index).and_then(content_parts_mut) {
+            for (part_index, text) in replacements {
+                if let Some(part) = parts.get_mut(part_index) {
+                    *part = serde_json::json!({"type": "input_text", "text": text});
+                }
+            }
+        }
     }
-    let Some(history) = messages.get_mut(..history_end) else {
-        return Ok(());
-    };
-    extract_items(history, budget).map(|_count| ())
+    Ok(())
 }
 
 /// Enforce the body limit against the exact request shape that

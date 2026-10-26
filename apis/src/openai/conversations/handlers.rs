@@ -3,9 +3,10 @@
 
 //! Request handlers for the `/v1/conversations` endpoints.
 
-use std::{borrow::Cow, collections::HashSet, fmt, marker::PhantomData};
+use std::{borrow::Cow, fmt, marker::PhantomData};
 
 use percent_encoding::percent_decode_str;
+use praxis_ai_store::{ConversationItemRecord, ConversationRecord, StoreError};
 use praxis_filter::{FilterAction, FilterError, HttpFilterContext, Rejection};
 use serde::{
     Deserializer as _, Serialize,
@@ -13,39 +14,23 @@ use serde::{
 };
 use serde_json::{Map, Value};
 use tracing::debug;
-#[cfg(test)]
-#[cfg(feature = "store-sqlite")]
-use tracing::warn;
 
 use super::{
     contracts::{
         ConversationItem, ConversationItemList, ConversationResource, CreateConversationItemsRequest,
-        CreateConversationRequest, DeletedConversationResource, InputItem, ItemOrder, MAX_ITEMS_PER_REQUEST, Metadata,
+        CreateConversationRequest, DeletedConversationResource, InputItem, ItemOrder, Metadata,
         UpdateConversationRequest,
     },
-    item_schema::validate_output_item,
     validate::{MetadataError, validate_metadata},
 };
 use crate::{
-    openai::{
-        include::{IncludeFields, decode_query_component_strict, parse_include, project_item},
-        responses::store::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT},
+    openai::include::{IncludeFields, decode_query_component_strict, parse_include, project_item},
+    service::{
+        conversations::{build_item_records, duplicate_item_id, normalize_legacy_mcp_error, validate_item_count},
+        responses::{MAX_PAGE_LIMIT, input_items::DEFAULT_PAGE_LIMIT},
     },
-    state_owner::{StateOwner, require_state_owner},
-    store::{ConversationItemRecord, ConversationItemStore, ConversationRecord, StoreError},
+    store::OwnerScopedResponseStore,
 };
-
-// -----------------------------------------------------------------------------
-// Constants
-// -----------------------------------------------------------------------------
-
-/// Maximum compare-and-swap retries before [`sync_conversation_messages`] gives
-/// up on refreshing the cache. Each failed swap means another writer refreshed
-/// the cache first from the same authoritative rows, so a small bound absorbs
-/// realistic append contention.
-#[cfg(test)]
-#[cfg(feature = "store-sqlite")]
-const MAX_SYNC_ATTEMPTS: usize = 8;
 
 // -----------------------------------------------------------------------------
 // ItemListParams
@@ -74,7 +59,6 @@ impl Default for ItemListParams {
     }
 }
 
-
 // -----------------------------------------------------------------------------
 // Conversation Lifecycle
 // -----------------------------------------------------------------------------
@@ -83,13 +67,10 @@ impl Default for ItemListParams {
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
 pub(super) async fn handle_create_conversation(
     ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    store: &OwnerScopedResponseStore,
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
+    let owner = store.owner();
     let input = if body.is_empty() {
         CreateConversationRequest::default()
     } else {
@@ -111,13 +92,15 @@ pub(super) async fn handle_create_conversation(
     let raw_id = ctx.id_generator.generate(ctx.time_source);
     let conversation_id = format!("conv_{raw_id}");
     let created_at = current_timestamp(ctx);
-    if let Err(msg) = validate_item_count(input.items.len()) {
-        return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
+    if let Err(e) = validate_item_count(input.items.len()) {
+        return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
     let item_values = input.items.into_iter().map(InputItem::into_value);
-    let item_records = match build_item_records(ctx, owner, &conversation_id, created_at, 0, item_values) {
+    let item_records = match build_item_records(owner, &conversation_id, created_at, 0, item_values, || {
+        generated_item_id(ctx)
+    }) {
         Ok(records) => records,
-        Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+        Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     };
     if let Some(item_id) = duplicate_item_id(&item_records) {
         return Ok(FilterAction::Reject(invalid_input_response(
@@ -138,7 +121,7 @@ pub(super) async fn handle_create_conversation(
     }
     if !item_records.is_empty()
         && let Err(e) = store
-            .create_items_and_sync_messages(owner, &conversation_id, &item_records)
+            .create_items_and_sync_messages(&conversation_id, &item_records)
             .await
     {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
@@ -151,21 +134,16 @@ pub(super) async fn handle_create_conversation(
 
 /// Handle `GET /v1/conversations/{id}` — retrieve a conversation.
 pub(super) async fn handle_get_conversation(
-    ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    store: &OwnerScopedResponseStore,
     conversation_id: &str,
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
     };
     let conversation_id = conversation_id.as_ref();
 
-    match store.get_conversation(owner, conversation_id).await {
+    match store.get_conversation(conversation_id).await {
         Ok(Some(record)) => {
             let body = conversation_response(record);
             Ok(FilterAction::Reject(json_response(200, &body)?))
@@ -183,15 +161,10 @@ pub(super) async fn handle_get_conversation(
 /// Handle `POST /v1/conversations/{id}` — update a conversation.
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
 pub(super) async fn handle_update_conversation(
-    ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    store: &OwnerScopedResponseStore,
     conversation_id: &str,
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
@@ -219,7 +192,7 @@ pub(super) async fn handle_update_conversation(
         }));
     }
 
-    let existing = match store.get_conversation(owner, conversation_id).await {
+    let existing = match store.get_conversation(conversation_id).await {
         Ok(record) => record,
         Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     };
@@ -238,10 +211,7 @@ pub(super) async fn handle_update_conversation(
     // meantime and dropping those committed items from conversation-backed
     // rehydration (#1144). `created_at` is immutable, so the read above still
     // supplies it for the response.
-    match store
-        .update_conversation_metadata(owner, conversation_id, &metadata)
-        .await
-    {
+    match store.update_conversation_metadata(conversation_id, &metadata).await {
         Ok(true) => {},
         Ok(false) => {
             // The conversation was deleted between the read above and this write.
@@ -269,21 +239,16 @@ pub(super) async fn handle_update_conversation(
 /// its items; item cleanup belongs to item deletion or a separate retention
 /// policy, not this endpoint.
 pub(super) async fn handle_delete_conversation(
-    ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    store: &OwnerScopedResponseStore,
     conversation_id: &str,
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
     };
     let conversation_id = conversation_id.as_ref();
 
-    match store.delete_conversation(owner, conversation_id).await {
+    match store.delete_conversation(conversation_id).await {
         Ok(true) => {
             debug!(conversation_id, "conversation deleted");
             let body = DeletedConversationResource::deleted(conversation_id);
@@ -307,14 +272,11 @@ pub(super) async fn handle_delete_conversation(
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
 pub(super) async fn handle_create_items(
     ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    store: &OwnerScopedResponseStore,
     conversation_id: &str,
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
+    let owner = store.owner();
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
@@ -328,7 +290,7 @@ pub(super) async fn handle_create_items(
         Ok(includes) => includes,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
-    match store.get_conversation(owner, conversation_id).await {
+    match store.get_conversation(conversation_id).await {
         Ok(Some(_)) => {},
         Ok(None) => {
             debug!(conversation_id, "conversation not found for item create");
@@ -342,14 +304,16 @@ pub(super) async fn handle_create_items(
     let Some(items) = input.items else {
         return Ok(FilterAction::Reject(invalid_input_response("'items' is required")?));
     };
-    if let Err(msg) = validate_item_count(items.len()) {
-        return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
+    if let Err(e) = validate_item_count(items.len()) {
+        return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
     let item_values = items.into_iter().map(InputItem::into_value);
     let created_at = current_timestamp(ctx);
-    let item_records = match build_item_records(ctx, owner, conversation_id, created_at, 0, item_values) {
+    let item_records = match build_item_records(owner, conversation_id, created_at, 0, item_values, || {
+        generated_item_id(ctx)
+    }) {
         Ok(records) => records,
-        Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+        Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     };
     if let Some(item_id) = duplicate_item_id(&item_records) {
         return Ok(FilterAction::Reject(invalid_input_response(
@@ -358,7 +322,7 @@ pub(super) async fn handle_create_items(
     }
     let requested_ids: Vec<&str> = item_records.iter().map(|r| r.item_id.as_str()).collect();
     let already_present = match store
-        .get_existing_conversation_item_ids(owner, conversation_id, &requested_ids)
+        .get_existing_conversation_item_ids(conversation_id, &requested_ids)
         .await
     {
         Ok(ids) => ids,
@@ -370,11 +334,17 @@ pub(super) async fn handle_create_items(
         )?));
     }
 
-    if let Err(e) = store
-        .create_items_and_sync_messages(owner, conversation_id, &item_records)
+    match store
+        .create_items_and_sync_messages(conversation_id, &item_records)
         .await
     {
-        return Ok(FilterAction::Reject(store_error_response(&e)?));
+        Ok(()) => {},
+        Err(StoreError::NotFound) => {
+            return Ok(FilterAction::Reject(not_found_response(
+                &conversation_not_found_message(conversation_id),
+            )?));
+        },
+        Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     }
     debug!(
         conversation_id,
@@ -390,13 +360,9 @@ pub(super) async fn handle_create_items(
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
 pub(super) async fn handle_list_items(
     ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    store: &OwnerScopedResponseStore,
     conversation_id: &str,
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
@@ -410,7 +376,7 @@ pub(super) async fn handle_list_items(
         Ok(params) => params,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
-    match store.get_conversation(owner, conversation_id).await {
+    match store.get_conversation(conversation_id).await {
         Ok(Some(_)) => {},
         Ok(None) => {
             debug!(conversation_id, "conversation not found for item list");
@@ -424,7 +390,6 @@ pub(super) async fn handle_list_items(
     let limit = params.limit;
     let rows = match store
         .list_conversation_items(
-            owner,
             conversation_id,
             params.after_item_id.as_deref(),
             limit.saturating_add(1),
@@ -447,14 +412,10 @@ pub(super) async fn handle_list_items(
 #[expect(clippy::too_many_lines, reason = "decode both path parameters then look up")]
 pub(super) async fn handle_get_item(
     ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    store: &OwnerScopedResponseStore,
     conversation_id: &str,
     item_id: &str,
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
@@ -469,7 +430,7 @@ pub(super) async fn handle_get_item(
         Err(action) => return action,
     };
     let item_id = item_id.as_ref();
-    match store.get_conversation(owner, conversation_id).await {
+    match store.get_conversation(conversation_id).await {
         Ok(Some(_)) => {},
         Ok(None) => {
             debug!(conversation_id, item_id, "conversation not found for item get");
@@ -479,11 +440,9 @@ pub(super) async fn handle_get_item(
         },
         Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     }
-    match store.get_conversation_item(owner, conversation_id, item_id).await {
+    match store.get_conversation_item(conversation_id, item_id).await {
         Ok(Some(record)) => {
-            let mut item_data = record.item_data;
-            project_item(&mut item_data, includes);
-            let item = ConversationItem::from_value(item_data);
+            let item = conversation_item_response(record.item_data, includes);
             Ok(FilterAction::Reject(json_response(200, &item)?))
         },
         Ok(None) => {
@@ -500,15 +459,10 @@ pub(super) async fn handle_get_item(
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
 #[expect(clippy::cognitive_complexity, reason = "tracing macros inflate complexity")]
 pub(super) async fn handle_delete_item(
-    ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    store: &OwnerScopedResponseStore,
     conversation_id: &str,
     item_id: &str,
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
@@ -519,7 +473,7 @@ pub(super) async fn handle_delete_item(
         Err(action) => return action,
     };
     let item_id = item_id.as_ref();
-    match store.get_conversation(owner, conversation_id).await {
+    match store.get_conversation(conversation_id).await {
         Ok(Some(_)) => {},
         Ok(None) => {
             debug!(conversation_id, item_id, "conversation not found for item delete");
@@ -530,13 +484,10 @@ pub(super) async fn handle_delete_item(
         Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     };
 
-    match store
-        .delete_item_and_sync_messages(owner, conversation_id, item_id)
-        .await
-    {
+    match store.delete_item_and_sync_messages(conversation_id, item_id).await {
         Ok(true) => {
             debug!(conversation_id, item_id, "conversation item deleted");
-            match store.get_conversation(owner, conversation_id).await {
+            match store.get_conversation(conversation_id).await {
                 Ok(Some(record)) => {
                     let body = conversation_response(record);
                     Ok(FilterAction::Reject(json_response(200, &body)?))
@@ -553,6 +504,9 @@ pub(super) async fn handle_delete_item(
                 item_id,
             ))?))
         },
+        Err(StoreError::NotFound) => Ok(FilterAction::Reject(not_found_response(
+            &conversation_not_found_message(conversation_id),
+        )?)),
         Err(e) => Ok(FilterAction::Reject(store_error_response(&e)?)),
     }
 }
@@ -583,156 +537,6 @@ impl<'de, T: DeserializeOwned> Visitor<'de> for JsonObjectVisitor<T> {
 
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
         T::deserialize(MapAccessDeserializer::new(map))
-    }
-}
-
-/// Validate the shared item-count bound after deserialization.
-fn validate_item_count(item_count: usize) -> Result<(), String> {
-    if item_count > MAX_ITEMS_PER_REQUEST {
-        return Err(format!("items may contain at most {MAX_ITEMS_PER_REQUEST} entries"));
-    }
-    Ok(())
-}
-
-/// Return the first duplicate item ID in a create request.
-fn duplicate_item_id(items: &[ConversationItemRecord]) -> Option<&str> {
-    let mut seen = HashSet::new();
-    for item in items {
-        if !seen.insert(item.item_id.as_str()) {
-            return Some(item.item_id.as_str());
-        }
-    }
-    None
-}
-
-/// Build store records for normalized conversation item JSON values.
-#[expect(clippy::too_many_arguments, reason = "factoring into struct would add indirection")]
-pub(super) fn build_item_records(
-    ctx: &HttpFilterContext<'_>,
-    owner: &StateOwner,
-    conversation_id: &str,
-    created_at: i64,
-    start_position: i64,
-    items: impl IntoIterator<Item = Value>,
-) -> Result<Vec<ConversationItemRecord>, String> {
-    items
-        .into_iter()
-        .enumerate()
-        .map(|(index, item)| {
-            let (item_id, item_data) = normalize_item(ctx, item)?;
-            let offset = i64::try_from(index).unwrap_or(i64::MAX);
-            Ok(ConversationItemRecord {
-                item_id,
-                owner: owner.clone(),
-                conversation_id: conversation_id.to_owned(),
-                item_data,
-                created_at,
-                position: start_position.saturating_add(offset),
-            })
-        })
-        .collect()
-}
-
-/// Ensure an item is an object and has a usable ID.
-pub(super) fn normalize_item(ctx: &HttpFilterContext<'_>, item: Value) -> Result<(String, Value), String> {
-    let Value::Object(mut map) = item else {
-        return Err("each item must be a JSON object".to_owned());
-    };
-    let item_id = match map.get("id") {
-        Some(Value::String(id)) if !id.is_empty() => id.clone(),
-        Some(Value::String(_)) => return Err("item id must not be empty".to_owned()),
-        Some(Value::Null) | None => generated_item_id(ctx),
-        Some(_) => return Err("item id must be a string".to_owned()),
-    };
-    map.insert("id".to_owned(), Value::String(item_id.clone()));
-    normalize_message_item(&mut map)?;
-    default_item_status(&mut map);
-    let item = Value::Object(map);
-    validate_output_item(&item)?;
-    Ok((item_id, item))
-}
-
-/// Default a missing or `null` item `status` to `completed`.
-///
-/// The API contract requires a concrete status enum on returned items, but some
-/// backends emit `status: null` (or omit it) on output items such as reasoning.
-/// Treat a present-but-null status the same as an absent one so append-back does
-/// not fail closed on schema validation.
-fn default_item_status(map: &mut Map<String, Value>) {
-    if map.get("status").is_none_or(Value::is_null) {
-        map.insert("status".to_owned(), Value::String("completed".to_owned()));
-    }
-}
-
-/// Normalize easy SDK message inputs into conversation message response objects.
-fn normalize_message_item(map: &mut Map<String, Value>) -> Result<(), String> {
-    if map.get("type").and_then(Value::as_str) != Some("message") {
-        return Ok(());
-    }
-
-    let role = match map.get("role") {
-        Some(Value::String(role)) if !role.is_empty() => role.clone(),
-        Some(Value::String(_)) => return Err("message role must not be empty".to_owned()),
-        Some(_) => return Err("message role must be a string".to_owned()),
-        None => return Err("message role is required".to_owned()),
-    };
-
-    let content = map
-        .remove("content")
-        .ok_or_else(|| "message content is required".to_owned())?;
-    map.insert("content".to_owned(), normalize_message_content(&role, content)?);
-    map.entry("status".to_owned())
-        .or_insert_with(|| Value::String("completed".to_owned()));
-
-    Ok(())
-}
-
-/// Convert string message content to the list-form content returned by the API.
-fn normalize_message_content(role: &str, content: Value) -> Result<Value, String> {
-    match content {
-        Value::String(text) => {
-            let content_item = if role == "assistant" {
-                serde_json::json!({
-                    "type": "output_text",
-                    "text": text,
-                    "annotations": [],
-                    "logprobs": [],
-                })
-            } else {
-                serde_json::json!({
-                    "type": "input_text",
-                    "text": text,
-                })
-            };
-            Ok(Value::Array(vec![content_item]))
-        },
-        Value::Array(mut parts) => {
-            if role == "assistant" {
-                normalize_assistant_content_parts(&mut parts);
-            }
-            Ok(Value::Array(parts))
-        },
-        _ => Err("message content must be a string or array".to_owned()),
-    }
-}
-
-/// Fill in the optional `annotations` and `logprobs` fields that some backends
-/// omit or send as `null` on assistant `output_text` parts, so append-back
-/// matches the API contract.
-fn normalize_assistant_content_parts(parts: &mut [Value]) {
-    for part in parts {
-        let Some(part) = part.as_object_mut() else {
-            continue;
-        };
-        if part.get("type").and_then(Value::as_str) != Some("output_text") {
-            continue;
-        }
-        if part.get("annotations").is_none_or(Value::is_null) {
-            part.insert("annotations".to_owned(), Value::Array(Vec::new()));
-        }
-        if part.get("logprobs").is_none_or(Value::is_null) {
-            part.insert("logprobs".to_owned(), Value::Array(Vec::new()));
-        }
     }
 }
 
@@ -786,12 +590,19 @@ fn conversation_items_response(
         } else if index + 1 == record_count {
             last_id = record.item_id;
         }
-        let mut item_data = record.item_data;
-        project_item(&mut item_data, includes);
-        data.push(ConversationItem::from_value(item_data));
+        data.push(conversation_item_response(record.item_data, includes));
     }
 
     ConversationItemList::new(data, has_more, first_id, last_id)
+}
+
+/// Project stored items for list and retrieve without copying their JSON.
+fn conversation_item_response(mut item: Value, includes: IncludeFields) -> ConversationItem {
+    if let Some(map) = item.as_object_mut() {
+        normalize_legacy_mcp_error(map);
+    }
+    project_item(&mut item, includes);
+    ConversationItem::from_value(item)
 }
 
 /// Parse and validate cursor-based pagination parameters from a query string.
@@ -1008,204 +819,43 @@ fn store_error_response(error: &StoreError) -> Result<Rejection, FilterError> {
     )
 }
 
-/// Refresh the denormalized conversation message cache from item rows.
-///
-/// The cache is rebuilt from the authoritative item rows and written back with
-/// a compare-and-swap so a slower writer cannot clobber a newer cache with a
-/// stale snapshot. Concurrent item appends each insert their rows and then
-/// refresh this cache; without the compare-and-swap a slow writer could commit
-/// an older `messages` snapshot after a newer writer, dropping the newer
-/// writer's items from the denormalized history that rehydration consumes
-/// (#662).
-///
-/// A caller that read the cache just before its row mutation passes that value
-/// as `snapshot` to seed the first swap's expected value, skipping a redundant
-/// reload; the value written is always a fresh rebuild, so the snapshot only
-/// decides whether that first swap lands. Callers without a snapshot (the
-/// response append-back path) pass `None`. On a conflict the snapshot is dropped
-/// and later attempts re-read the live cache, so every committed row is visible
-/// to the retry's rebuild and the cache converges to include all items.
-///
-/// Callers invoke this only after the authoritative item-row mutation is durably
-/// committed, so the cache is a derived view that any later write rebuilds. If
-/// the retries are exhausted under sustained contention this returns `Ok(())`
-/// rather than an error: failing here would report an already-committed
-/// create/delete as failed and drive the client into duplicate-item or
-/// not-found retries. Genuine store errors — including the conversation
-/// disappearing mid-sync — still propagate.
-///
-/// This currently re-reads all items on every mutation. Conversations are not
-/// assumed to be small: the OpenAI contract has no cumulative item or byte
-/// ceiling. Replace this full-history rebuild with incremental processing; do
-/// not add a non-spec conversation limit as a workaround. Tracked in #532.
-#[cfg(test)]
-#[cfg(feature = "store-sqlite")]
-pub(super) async fn sync_conversation_messages(
-    store: &dyn ConversationItemStore,
-    tenant_id: &StateOwner,
-    conversation_id: &str,
-    mut snapshot: Option<Value>,
-) -> Result<(), StoreError> {
-    for _ in 0..MAX_SYNC_ATTEMPTS {
-        if Box::pin(try_sync_conversation_messages(
-            store,
-            tenant_id,
-            conversation_id,
-            snapshot.take(),
-        ))
-        .await?
-        {
-            return Ok(());
-        }
-    }
-
-    // The item-row mutation this refresh follows is already durably committed and
-    // any later write rebuilds the cache, so abandoning the refresh must not fail
-    // the request that already succeeded.
-    warn!(
-        conversation_id,
-        attempts = MAX_SYNC_ATTEMPTS,
-        "conversation message cache refresh abandoned after repeated compare-and-swap \
-         contention; a later write will rebuild it"
-    );
-    Ok(())
-}
-
-/// Attempt one compare-and-swap refresh of the denormalized message cache.
-///
-/// `expected` seeds the swap's expected value: `Some` is the caller's snapshot,
-/// read before its row mutation, which lets this attempt skip reloading the
-/// cache; `None` re-reads the live cache (and reports a disappeared
-/// conversation). Either way the value written is a fresh rebuild from the item
-/// rows, so a stale `expected` only ever loses the swap — it never writes stale
-/// data.
-///
-/// Returns `Ok(true)` when the cache is up to date — either already current or
-/// swapped in this call — and `Ok(false)` when a concurrent writer won the swap
-/// and the caller should retry with a freshly read snapshot.
-#[cfg(test)]
-#[cfg(feature = "store-sqlite")]
-async fn try_sync_conversation_messages(
-    store: &dyn ConversationItemStore,
-    tenant_id: &StateOwner,
-    conversation_id: &str,
-    expected: Option<Value>,
-) -> Result<bool, StoreError> {
-    // Optimistic first pass: the caller's pre-mutation snapshot is the expected
-    // value, so no cache reload is needed. The rebuild below is still fresh, so a
-    // snapshot that no longer matches only costs a lost swap and a retry.
-    if let Some(expected) = expected {
-        let messages = Value::Array(collect_conversation_messages(store, tenant_id, conversation_id).await?);
-        return store
-            .compare_and_swap_conversation_messages(tenant_id, conversation_id, &expected, &messages)
-            .await;
-    }
-
-    // No snapshot: read the live cache as the expected value before rebuilding, so
-    // the rebuilt view is at least as fresh as the cache it replaces and a
-    // successful swap can never drop a committed row.
-    let Some(current) = store.get_conversation(tenant_id, conversation_id).await? else {
-        return Err(StoreError::Database(format!(
-            "conversation disappeared during message sync: {conversation_id}"
-        )));
-    };
-    let messages = Value::Array(collect_conversation_messages(store, tenant_id, conversation_id).await?);
-    if current.messages == messages {
-        return Ok(true);
-    }
-    store
-        .compare_and_swap_conversation_messages(tenant_id, conversation_id, &current.messages, &messages)
-        .await
-}
-
-/// Collect all item JSON values for a conversation in ascending order.
-#[cfg(test)]
-#[cfg(feature = "store-sqlite")]
-async fn collect_conversation_messages(
-    store: &dyn ConversationItemStore,
-    tenant_id: &StateOwner,
-    conversation_id: &str,
-) -> Result<Vec<Value>, StoreError> {
-    let mut after = None;
-    let mut messages = Vec::new();
-    loop {
-        let rows = store
-            .list_conversation_items(tenant_id, conversation_id, after.as_deref(), MAX_PAGE_LIMIT, true)
-            .await?;
-        if rows.is_empty() {
-            break;
-        }
-        after = rows.last().map(|record| record.item_id.clone());
-        let row_count = rows.len();
-        messages.extend(rows.into_iter().map(|record| record.item_data));
-        if row_count < usize::try_from(MAX_PAGE_LIMIT).unwrap_or(usize::MAX) {
-            break;
-        }
-    }
-    Ok(messages)
-}
-
 #[cfg(test)]
 #[cfg(feature = "store-sqlite")]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-    use async_trait::async_trait;
-
     use super::*;
-    use crate::store::SqliteResponseStore;
 
     #[test]
-    fn assistant_output_text_normalizes_nullable_provider_fields() {
-        let normalized = normalize_message_content(
-            "assistant",
-            serde_json::json!([{
-                "type": "output_text",
-                "text": "hello",
-                "annotations": [],
-                "logprobs": null
-            }]),
-        )
-        .unwrap();
+    fn legacy_mcp_errors_normalize_at_the_read_boundary() {
+        let legacy = serde_json::json!({
+            "type": "mcp_call", "id": "mcp_legacy", "status": "failed",
+            "server_label": "weather", "name": "lookup", "arguments": "{}",
+            "output": null, "error": "legacy failure",
+        });
+        let item = conversation_item_response(legacy, IncludeFields::default());
+        let output = serde_json::to_value(item).unwrap();
+        assert_eq!(
+            output["error"],
+            serde_json::json!({
+                "type": "mcp_tool_execution_error", "content": "legacy failure",
+            }),
+            "legacy errors must be tagged before serialization"
+        );
+        assert!(
+            super::super::item_schema::validate_output_item(&output).is_ok(),
+            "normalized legacy MCP output must satisfy the contract"
+        );
 
-        assert_eq!(normalized[0]["annotations"], serde_json::json!([]));
-        assert_eq!(normalized[0]["logprobs"], serde_json::json!([]));
-    }
-
-    #[test]
-    fn reasoning_item_with_null_status_normalizes_and_validates() {
-        // Backends such as vLLM emit `status: null` on reasoning output items;
-        // the status must be defaulted before it satisfies the item contract.
-        let mut map = serde_json::json!({
-            "type": "reasoning",
-            "id": "rs_1",
-            "summary": [],
-            "content": [{"type": "reasoning_text", "text": "\n\n"}],
-            "encrypted_content": null,
-            "status": null
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-
-        assert!(validate_output_item(&Value::Object(map.clone())).is_err());
-
-        default_item_status(&mut map);
-
-        assert_eq!(map["status"], serde_json::json!("completed"));
-        validate_output_item(&Value::Object(map)).unwrap();
-    }
-
-    #[test]
-    fn default_item_status_preserves_existing_status() {
-        let mut map = serde_json::json!({"status": "in_progress"})
-            .as_object()
-            .unwrap()
-            .clone();
-        default_item_status(&mut map);
-        assert_eq!(map["status"], serde_json::json!("in_progress"));
+        for error in [
+            serde_json::json!({"type": "mcp_protocol_error", "code": -1, "message": "failed"}),
+            Value::Null,
+        ] {
+            let input = serde_json::json!({"type": "mcp_call", "error": error});
+            let output =
+                serde_json::to_value(conversation_item_response(input.clone(), IncludeFields::default())).unwrap();
+            assert_eq!(output, input, "structured and null errors must not change");
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1508,507 +1158,5 @@ mod tests {
             result.unwrap_err().contains("conversation id"),
             "error should name the conversation id segment"
         );
-    }
-
-    // -------------------------------------------------------------------------
-    // sync_conversation_messages — denormalized cache consistency (#662)
-    // -------------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn sync_repairs_stale_cache_from_item_rows() {
-        let store = cache_sync_store().await;
-        seed_conversation(&store, "conv_stale", &["a", "b", "c"]).await;
-        // Corrupt the denormalized cache so it omits every item.
-        store
-            .update_conversation_messages(
-                &crate::test_utils::test_owner("tenant_a"),
-                "conv_stale",
-                &Value::Array(vec![]),
-            )
-            .await
-            .expect("stale update should succeed");
-
-        // The append-back path supplies no snapshot, so it re-reads the live cache.
-        sync_conversation_messages(&store, &crate::test_utils::test_owner("tenant_a"), "conv_stale", None)
-            .await
-            .expect("sync should succeed");
-
-        // Sync should rebuild the cache from all item rows.
-        assert_cache_ids(&store, "conv_stale", &["a", "b", "c"]).await;
-    }
-
-    #[tokio::test]
-    async fn sync_does_not_clobber_concurrent_cache_update() {
-        let inner = cache_sync_store().await;
-        // Seed conversation with item "a" and a matching cache.
-        seed_conversation(&inner, "conv_race", &["a"]).await;
-        // Writer A reads the cache (the create path's snapshot) before appending its
-        // own item "x" (rows now [a, x]; cache still [a]).
-        let snapshot = read_cache(&inner, "conv_race").await;
-        inner
-            .create_conversation_items(&[cache_item("x", "conv_race", 2)])
-            .await
-            .expect("append should succeed");
-
-        // A concurrent writer commits item "b" and refreshes the cache during
-        // A's rebuild read.
-        let store = InterferingStore::new(
-            inner,
-            Interference::ConcurrentAppendOnFirstList,
-            Some(cache_item("b", "conv_race", 3)),
-        );
-
-        sync_conversation_messages(
-            &store,
-            &crate::test_utils::test_owner("tenant_a"),
-            "conv_race",
-            Some(snapshot),
-        )
-        .await
-        .expect("sync should converge under contention");
-
-        // The cache must retain both the concurrent writer's item (b) and writer A's (x).
-        assert_cache_ids(&store, "conv_race", &["a", "b", "x"]).await;
-    }
-
-    #[tokio::test]
-    async fn sync_missing_conversation_reports_error() {
-        let store = cache_sync_store().await;
-        let err = sync_conversation_messages(&store, &crate::test_utils::test_owner("tenant_a"), "conv_missing", None)
-            .await
-            .expect_err("sync on a missing conversation should error");
-        assert!(
-            matches!(err, StoreError::Database(_)),
-            "missing conversation should map to a database error, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn sync_reports_success_when_cache_never_converges() {
-        let inner = cache_sync_store().await;
-        seed_conversation(&inner, "conv_contended", &["a", "b"]).await;
-        // Leave the cache stale versus the item rows so every attempt reaches the
-        // compare-and-swap instead of returning early on an already-current cache.
-        inner
-            .update_conversation_messages(
-                &crate::test_utils::test_owner("tenant_a"),
-                "conv_contended",
-                &Value::Array(vec![]),
-            )
-            .await
-            .expect("stale update should succeed");
-
-        // Every compare-and-swap loses the race, so the retry budget is exhausted.
-        let store = InterferingStore::new(inner, Interference::AlwaysLoseCas, None);
-
-        // The item mutation this refresh follows is already durable, so exhausting
-        // retries must not surface as an error — callers turn a sync error into an
-        // HTTP 500 for a committed create/delete, which clients retry into
-        // duplicate-item or not-found responses (#662 review follow-up).
-        sync_conversation_messages(
-            &store,
-            &crate::test_utils::test_owner("tenant_a"),
-            "conv_contended",
-            None,
-        )
-        .await
-        .expect("cache-sync exhaustion must not fail an already-committed mutation");
-
-        assert_eq!(
-            store.cas_attempts.load(Ordering::SeqCst),
-            MAX_SYNC_ATTEMPTS,
-            "every retry should attempt the compare-and-swap before giving up"
-        );
-    }
-
-    #[tokio::test]
-    async fn sync_uses_caller_snapshot_without_reloading_cache() {
-        let inner = cache_sync_store().await;
-        seed_conversation(&inner, "conv_snap", &["a"]).await;
-        // The create path reads the cache before appending, so capture that snapshot.
-        let snapshot = read_cache(&inner, "conv_snap").await;
-        inner
-            .create_conversation_items(&[cache_item("x", "conv_snap", 2)])
-            .await
-            .expect("append should succeed");
-        let store = InterferingStore::new(inner, Interference::PassThrough, None);
-
-        sync_conversation_messages(
-            &store,
-            &crate::test_utils::test_owner("tenant_a"),
-            "conv_snap",
-            Some(snapshot),
-        )
-        .await
-        .expect("sync should succeed on the first attempt");
-
-        assert_eq!(
-            store.read_attempts.load(Ordering::SeqCst),
-            0,
-            "a matching snapshot must satisfy the first swap without reloading the cache"
-        );
-        assert_eq!(
-            store.cas_attempts.load(Ordering::SeqCst),
-            1,
-            "a valid snapshot should land the swap on the first attempt"
-        );
-
-        // The swap should write the freshly rebuilt history.
-        assert_cache_ids(&store, "conv_snap", &["a", "x"]).await;
-    }
-
-    #[tokio::test]
-    async fn sync_falls_back_to_fresh_read_after_snapshot_conflict() {
-        let inner = cache_sync_store().await;
-        seed_conversation(&inner, "conv_fallback", &["a"]).await;
-        inner
-            .create_conversation_items(&[cache_item("x", "conv_fallback", 2)])
-            .await
-            .expect("append should succeed");
-        let store = InterferingStore::new(inner, Interference::PassThrough, None);
-
-        // A stale snapshot (empty) never matches the live cache, so the first swap
-        // loses and the sync must re-read the live cache to converge.
-        sync_conversation_messages(
-            &store,
-            &crate::test_utils::test_owner("tenant_a"),
-            "conv_fallback",
-            Some(Value::Array(vec![])),
-        )
-        .await
-        .expect("sync should converge after falling back to a fresh read");
-
-        assert_eq!(
-            store.cas_attempts.load(Ordering::SeqCst),
-            2,
-            "the stale snapshot should cost one lost swap before the fresh-read retry"
-        );
-        assert_eq!(
-            store.read_attempts.load(Ordering::SeqCst),
-            1,
-            "exactly one fresh cache read should follow the snapshot conflict"
-        );
-
-        // The fallback retry should rebuild the full history.
-        assert_cache_ids(&store, "conv_fallback", &["a", "x"]).await;
-    }
-
-    // -------------------------------------------------------------------------
-    // Test Utilities
-    // -------------------------------------------------------------------------
-
-    /// Build an items-enabled in-memory SQLite store for cache-sync tests.
-    async fn cache_sync_store() -> SqliteResponseStore {
-        SqliteResponseStore::new(
-            "sqlite::memory:",
-            "test_responses",
-            "test_conversations",
-            Some("test_conversation_items"),
-            None,
-            None,
-        )
-        .await
-        .expect("store creation should succeed")
-    }
-
-    /// A conversation item whose `item_data` carries its own id for assertions.
-    fn cache_item(item_id: &str, conversation_id: &str, position: i64) -> ConversationItemRecord {
-        ConversationItemRecord {
-            item_id: item_id.to_owned(),
-            owner: crate::test_utils::test_owner("tenant_a"),
-            conversation_id: conversation_id.to_owned(),
-            item_data: serde_json::json!({
-                "id": item_id,
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": item_id}],
-            }),
-            created_at: 1000,
-            position,
-        }
-    }
-
-    /// Sorted item ids extracted from a denormalized `messages` cache value.
-    fn cache_ids(messages: &Value) -> Vec<String> {
-        let mut ids: Vec<String> = messages
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_owned))
-            .collect();
-        ids.sort();
-        ids
-    }
-
-    /// Read the denormalized `messages` cache for a conversation.
-    async fn read_cache(store: &SqliteResponseStore, conversation_id: &str) -> Value {
-        ConversationItemStore::get_conversation(store, &crate::test_utils::test_owner("tenant_a"), conversation_id)
-            .await
-            .expect("get should succeed")
-            .expect("conversation should exist")
-            .messages
-    }
-
-    /// Assert the denormalized cache holds exactly `expected` item ids (sorted).
-    async fn assert_cache_ids(store: &dyn ConversationItemStore, conversation_id: &str, expected: &[&str]) {
-        let refreshed = store
-            .get_conversation(&crate::test_utils::test_owner("tenant_a"), conversation_id)
-            .await
-            .expect("get should succeed")
-            .expect("conversation should exist");
-        let expected: Vec<String> = expected.iter().copied().map(str::to_owned).collect();
-        assert_eq!(
-            cache_ids(&refreshed.messages),
-            expected,
-            "cache should contain exactly the expected item ids"
-        );
-    }
-
-    /// Seed a conversation record plus its item rows and a matching cache.
-    async fn seed_conversation(store: &SqliteResponseStore, conversation_id: &str, item_ids: &[&str]) {
-        let items: Vec<ConversationItemRecord> = item_ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| cache_item(id, conversation_id, i64::try_from(i + 1).unwrap()))
-            .collect();
-        let messages = Value::Array(items.iter().map(|it| it.item_data.clone()).collect());
-        store
-            .upsert_conversation(&ConversationRecord {
-                conversation_id: conversation_id.to_owned(),
-                owner: crate::test_utils::test_owner("tenant_a"),
-                created_at: 1000,
-                metadata: Value::Object(Map::new()),
-                messages,
-            })
-            .await
-            .expect("seed conversation should succeed");
-        if !items.is_empty() {
-            store
-                .create_conversation_items(&items)
-                .await
-                .expect("seed items should succeed");
-        }
-    }
-
-    /// How an [`InterferingStore`] perturbs an in-flight `sync_conversation_messages`.
-    enum Interference {
-        /// Every compare-and-swap reports a lost race, modeling a conversation under
-        /// sustained contention where this writer never wins the swap.
-        AlwaysLoseCas,
-        /// The first `list_conversation_items` call (the rebuild read) returns the
-        /// pre-injection rows, then commits an extra item row and refreshes the
-        /// denormalized cache to include it — the #662 interleaving where a slower
-        /// writer must not clobber the newer cache with its stale snapshot.
-        ConcurrentAppendOnFirstList,
-        /// No injected fault: delegate every operation. Used to observe the snapshot
-        /// fast path and its cache-read count in isolation.
-        PassThrough,
-    }
-
-    /// Store wrapper that injects a controlled concurrency fault into the cache-sync
-    /// path while delegating every other operation to a real SQLite store.
-    struct InterferingStore {
-        cas_attempts: AtomicUsize,
-        fired: AtomicBool,
-        injected_item: Option<ConversationItemRecord>,
-        inner: SqliteResponseStore,
-        interference: Interference,
-        read_attempts: AtomicUsize,
-    }
-
-    impl InterferingStore {
-        /// Wrap a real store with a controlled fault and zeroed observation counters.
-        fn new(
-            inner: SqliteResponseStore,
-            interference: Interference,
-            injected_item: Option<ConversationItemRecord>,
-        ) -> Self {
-            Self {
-                cas_attempts: AtomicUsize::new(0),
-                fired: AtomicBool::new(false),
-                injected_item,
-                inner,
-                interference,
-                read_attempts: AtomicUsize::new(0),
-            }
-        }
-
-        /// Commit the concurrent writer's item and refresh the cache from all rows.
-        async fn commit_concurrent_writer(
-            &self,
-            tenant_id: &StateOwner,
-            conversation_id: &str,
-        ) -> Result<(), StoreError> {
-            let Some(item) = self.injected_item.as_ref() else {
-                return Ok(());
-            };
-            self.inner.create_conversation_items(std::slice::from_ref(item)).await?;
-            let all = self
-                .inner
-                .list_conversation_items(tenant_id, conversation_id, None, MAX_PAGE_LIMIT, true)
-                .await?;
-            let cache = Value::Array(all.into_iter().map(|r| r.item_data).collect());
-            self.inner
-                .update_conversation_messages(tenant_id, conversation_id, &cache)
-                .await
-                .map(|_updated| ())
-        }
-    }
-
-    #[async_trait]
-    #[expect(
-        clippy::renamed_function_params,
-        reason = "test double still uses the former tenant-oriented names"
-    )]
-    impl ConversationItemStore for InterferingStore {
-        async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError> {
-            self.inner.upsert_conversation(record).await
-        }
-
-        async fn update_conversation_messages(
-            &self,
-            tenant_id: &StateOwner,
-            conversation_id: &str,
-            messages: &Value,
-        ) -> Result<bool, StoreError> {
-            self.inner
-                .update_conversation_messages(tenant_id, conversation_id, messages)
-                .await
-        }
-
-        async fn update_conversation_metadata(
-            &self,
-            tenant_id: &StateOwner,
-            conversation_id: &str,
-            metadata: &Value,
-        ) -> Result<bool, StoreError> {
-            self.inner
-                .update_conversation_metadata(tenant_id, conversation_id, metadata)
-                .await
-        }
-
-        async fn compare_and_swap_conversation_messages(
-            &self,
-            tenant_id: &StateOwner,
-            conversation_id: &str,
-            expected_messages: &Value,
-            messages: &Value,
-        ) -> Result<bool, StoreError> {
-            self.cas_attempts.fetch_add(1, Ordering::SeqCst);
-            if matches!(self.interference, Interference::AlwaysLoseCas) {
-                // Model a writer that is always beaten to the swap.
-                return Ok(false);
-            }
-            self.inner
-                .compare_and_swap_conversation_messages(tenant_id, conversation_id, expected_messages, messages)
-                .await
-        }
-
-        async fn get_conversation(
-            &self,
-            tenant_id: &StateOwner,
-            conversation_id: &str,
-        ) -> Result<Option<ConversationRecord>, StoreError> {
-            self.read_attempts.fetch_add(1, Ordering::SeqCst);
-            ConversationItemStore::get_conversation(&self.inner, tenant_id, conversation_id).await
-        }
-
-        async fn delete_conversation(&self, tenant_id: &StateOwner, conversation_id: &str) -> Result<bool, StoreError> {
-            self.inner.delete_conversation(tenant_id, conversation_id).await
-        }
-
-        async fn create_conversation_items(&self, items: &[ConversationItemRecord]) -> Result<(), StoreError> {
-            self.inner.create_conversation_items(items).await
-        }
-
-        async fn create_items_and_sync_messages(
-            &self,
-            tenant_id: &StateOwner,
-            conversation_id: &str,
-            items: &[ConversationItemRecord],
-        ) -> Result<(), StoreError> {
-            self.inner
-                .create_items_and_sync_messages(tenant_id, conversation_id, items)
-                .await
-        }
-
-        async fn list_conversation_items(
-            &self,
-            tenant_id: &StateOwner,
-            conversation_id: &str,
-            after_item_id: Option<&str>,
-            limit: u32,
-            ascending: bool,
-        ) -> Result<Vec<ConversationItemRecord>, StoreError> {
-            let rows = self
-                .inner
-                .list_conversation_items(tenant_id, conversation_id, after_item_id, limit, ascending)
-                .await?;
-            if matches!(self.interference, Interference::ConcurrentAppendOnFirstList)
-                && !self.fired.swap(true, Ordering::SeqCst)
-            {
-                self.commit_concurrent_writer(tenant_id, conversation_id).await?;
-            }
-            Ok(rows)
-        }
-
-        async fn get_existing_conversation_item_ids(
-            &self,
-            tenant_id: &StateOwner,
-            conversation_id: &str,
-            item_ids: &[&str],
-        ) -> Result<Vec<String>, StoreError> {
-            self.inner
-                .get_existing_conversation_item_ids(tenant_id, conversation_id, item_ids)
-                .await
-        }
-
-        async fn get_conversation_item(
-            &self,
-            tenant_id: &StateOwner,
-            conversation_id: &str,
-            item_id: &str,
-        ) -> Result<Option<ConversationItemRecord>, StoreError> {
-            self.inner
-                .get_conversation_item(tenant_id, conversation_id, item_id)
-                .await
-        }
-
-        async fn delete_conversation_item(
-            &self,
-            tenant_id: &StateOwner,
-            conversation_id: &str,
-            item_id: &str,
-        ) -> Result<bool, StoreError> {
-            self.inner
-                .delete_conversation_item(tenant_id, conversation_id, item_id)
-                .await
-        }
-
-        async fn conversation_item_position(
-            &self,
-            tenant_id: &StateOwner,
-            conversation_id: &str,
-            item_id: &str,
-        ) -> Result<Option<i64>, StoreError> {
-            self.inner
-                .conversation_item_position(tenant_id, conversation_id, item_id)
-                .await
-        }
-
-        async fn max_item_position(&self, tenant_id: &StateOwner, conversation_id: &str) -> Result<i64, StoreError> {
-            self.inner.max_item_position(tenant_id, conversation_id).await
-        }
-
-        async fn delete_item_and_sync_messages(
-            &self,
-            tenant_id: &StateOwner,
-            conversation_id: &str,
-            item_id: &str,
-        ) -> Result<bool, StoreError> {
-            self.inner
-                .delete_item_and_sync_messages(tenant_id, conversation_id, item_id)
-                .await
-        }
     }
 }

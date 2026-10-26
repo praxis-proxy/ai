@@ -140,6 +140,22 @@ pub(super) fn output_text_done(
     )
 }
 
+/// `response.reasoning_text.delta` carrying raw reasoning, never a safe summary.
+pub(super) fn reasoning_text_delta(item_id: &str, output_index: usize, delta: &str) -> StreamEvent {
+    StreamEvent::new(
+        "response.reasoning_text.delta",
+        json!({"item_id": item_id, "output_index": output_index, "content_index": 0, "delta": delta}),
+    )
+}
+
+/// `response.reasoning_text.done` carrying the completed raw reasoning text.
+pub(super) fn reasoning_text_done(item_id: &str, output_index: usize, text: &str) -> StreamEvent {
+    StreamEvent::new(
+        "response.reasoning_text.done",
+        json!({"item_id": item_id, "output_index": output_index, "content_index": 0, "text": text}),
+    )
+}
+
 /// `response.refusal.delta` carrying one incremental refusal fragment.
 pub(super) fn refusal_delta(item_id: &str, output_index: usize, content_index: usize, delta: &str) -> StreamEvent {
     StreamEvent::new(

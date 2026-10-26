@@ -4,30 +4,56 @@
 [![Coverage: ≥95%](https://img.shields.io/badge/Coverage-≥95%25-brightgreen.svg)](https://github.com/praxis-proxy/ai/actions/workflows/coverage.yaml)
 [![MSRV: 1.96](https://img.shields.io/badge/MSRV-1.96-brightgreen.svg)](https://blog.rust-lang.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fai.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fai?ref=badge_shield)
 
-**Praxis AI provides the components to build an AI Gateway.** It extends
-[Praxis](https://github.com/praxis-proxy/praxis) with provider-aware filters,
-agentic protocols, response storage, guardrails, and observability—all
-configured at the proxy layer.
-
-Use it to route requests by model or API format, translate between provider
-protocols, enrich prompts, manage OpenAI Responses state, broker MCP and A2A
-traffic, and expose token usage without coupling those concerns to every
-application.
+**Praxis AI is an AI gateway built on
+[Praxis](https://github.com/praxis-proxy/praxis).** It brings provider-aware
+routing, protocol translation, stateful OpenAI APIs, and agent traffic into a
+configurable proxy. Clients keep their API shape while the gateway selects
+backends and applies policy.
 
 ## What can it do?
 
-- **Route AI traffic** by model, provider format, tool composition, or other
-  facts extracted from a request.
-- **Bridge provider APIs** with support for OpenAI Responses and Conversations,
-  Anthropic Messages, and streaming event translation.
-- **Support agentic workloads** through MCP and A2A classification, brokering,
-  and routing.
-- **Add gateway capabilities** such as credential injection, prompt enrichment,
-  external guardrails, token accounting, and SQLite or PostgreSQL response
-  storage.
-- **Stay extensible** with custom Rust filters built on Praxis's `HttpFilter`
-  interface.
+- **Route by what a request contains.** Classify OpenAI Responses, Chat
+  Completions, and Anthropic Messages traffic; select backends by API format,
+  model, or MCP tool name. See the
+  [unified gateway](examples/configs/anthropic/unified-gateway.yaml) and
+  [intelligent routing](examples/configs/intelligent-route-all-capabilities.yaml)
+  examples.
+- **Proxy or translate provider APIs.** Forward native provider traffic or
+  serve Anthropic Messages and OpenAI Responses clients from Chat
+  Completions-compatible backends, including streaming responses. See the
+  [Anthropic](examples/configs/anthropic/messages-to-openai.yaml)
+  and [Responses](examples/configs/openai/responses/codex-http-chat-translation.yaml)
+  examples.
+- **Reach managed cloud models.** Adapt OpenAI Chat Completions traffic to the
+  managed-provider wire formats of Azure OpenAI, AWS Bedrock Converse, and
+  Google Vertex AI Gemini — streaming included — and authenticate each upstream
+  with AWS SigV4, Entra ID, or Google ADC. See the
+  [Azure](examples/configs/azure/chat-completions-to-openai.yaml),
+  [Bedrock](examples/configs/bedrock/chat-completions-to-converse.yaml), and
+  [Vertex](examples/configs/vertex/chat-completions-to-gemini.yaml) examples.
+- **Code harness support.** Run Codex through OpenAI Responses, Claude Code
+  through Anthropic Messages, and OpenCode and pi through Chat Completions. The
+  [coding client guide](docs/developing/cli-vllm-through-praxis.md) shows each
+  client reaching native vLLM endpoints or Chat Completions through translation.
+- **Manage OpenAI response state.** Persist and rehydrate Responses history,
+  serve Conversations endpoints locally, and use PostgreSQL or SQLite for
+  storage. Fully supports both OpenAI Python SDK 2.x and 3.x client versions. See the [response store guide](docs/architecture/response-store.md)
+  and [Conversations example](examples/configs/openai/conversations/conversations.yaml).
+- **Connect tools and agents.** Run Responses tool loops with MCP, web search,
+  and file search; route stateless MCP calls and A2A task follow-ups. See the
+  [agentic Responses](examples/configs/openai/responses/full-flow-agentic.yaml),
+  [MCP broker](examples/configs/mcp-stateless-broker.yaml), and
+  [A2A routing](examples/configs/a2a-task-routing.yaml) examples.
+- **Apply policy and control cost.** Inject upstream credentials, enrich
+  prompts, call external guardrails, enforce token rate limits and ceilings,
+  expose token usage, and report metering data. See the
+  [token rate limit](examples/configs/token-rate-limit.yaml) and
+  [external metering](examples/configs/external-metering.yaml) examples, and the
+  [feature overview](docs/features.md) for the full list.
+- **Extend the pipeline** with custom Rust filters built on Praxis's
+  `HttpFilter` interface.
 
 See the [complete feature overview](docs/features.md) and
 [filter reference](docs/filters/README.md) for the full list.
@@ -37,29 +63,16 @@ See the [complete feature overview](docs/features.md) and
 Clients keep their provider-native protocols while Praxis AI classifies,
 transforms, and routes traffic through one policy-driven gateway.
 
-![Praxis AI architecture](assets/praxis-ai-architecture.svg)
+![Codex and other OpenAI clients, Claude Code and other Anthropic clients, and MCP and A2A traffic flow through Praxis AI to inference and agent backends, with side services for tools, storage, guardrails, and metering](assets/praxis-ai-architecture.svg)
 
-### Why is this separate from praxis-proxy/praxis?
+### Praxis AI and Praxis
 
-The [praxis-proxy/praxis] repository is considered the "core" framework
-and standard server build for Praxis.
-
-The separation of repositories for clear contiguous themes in the Praxis
-organization is a **very explicit** choice at the core of Praxis architectural
-philosophy. We practice a very diligent separation of concerns. This
-particular separation provides:
-
-* This Cleanly separates different technical domains and competencies for
-  our contributors.
-* The `praxis-proxy/praxis` core repo no need for dependency on `ai`: we
-  explicitly support standard use cases without AI.
-* Reduces the tendency for overreach from one subsystem to another, which
-  encourages cleaner APIs and library surfaces.
-* AI capabilities generally move and change **much faster** than the standard
-  networking proxy technology in core, as that ecosystem is very mature.
-
-See our [conventions] for more details on our development practices and
-philosophies.
+[Praxis][praxis-proxy/praxis] supplies the proxy runtime, listeners, TLS, load
+balancing, and filter framework. Praxis AI packages the AI-specific filters
+and server on top of it. Keeping them in separate repositories lets the AI
+integrations evolve independently while Praxis remains useful for general
+proxy workloads. See our [conventions] for the project structure and
+development practices.
 
 [praxis-proxy/praxis]:https://github.com/praxis-proxy/praxis
 [conventions]:https://github.com/praxis-proxy/conventions
@@ -73,9 +86,9 @@ make release
 ./target/release/praxis-ai
 ```
 
-`make release` builds the `full` feature set. A plain
-`cargo build -p praxis-ai-proxy` builds the smaller `standard` set, which
-leaves out the stateful OpenAI filter groups and their dependencies; see
+`make release` and `cargo build -p praxis-ai-proxy` build `full`, which excludes
+experimental Responses, Conversations, and the agentic loop. Opt in with
+`--features openai-all,store-sqlite` to run their examples; see
 [Cargo features](docs/features.md#cargo-features).
 
 Then check that it is running:
@@ -130,7 +143,7 @@ with a `-fips` suffix (for example `latest-fips`); see
 
 Contributions are welcome, from bug reports and documentation fixes to new
 filters and protocol support. Before opening a pull request, please read the
-[contributing guide](.github/CONTRIBUTING.md) and
+[contributing guide](CONTRIBUTING.md) and
 [development setup](docs/developing/getting-started.md).
 
 For larger changes, open a [feature request] and follow the
@@ -148,6 +161,18 @@ For larger changes, open a [feature request] and follow the
 [release documentation]: docs/release.md
 [security policy]: .github/SECURITY.md
 
+## Community
+
+Read [GOVERNANCE.md](GOVERNANCE.md) to see how our community works.
+
+Feel free to join our [discussion forums] to ask questions or share ideas.
+
+Or please join us in our Slack channel on [CNCF Slack]: [#praxis] channel
+
+[discussion forums]:https://github.com/praxis-proxy/praxis/discussions
+
 ## License
 
 Apache 2.0
+
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fai.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fai?ref=badge_large)

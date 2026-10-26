@@ -7,6 +7,8 @@ Rewrites the `model` field in Responses and Chat Completions request bodies.
 
 ## Configuration Notes
 
+With `openai_agentic_loop`, place this filter before `openai_responses_validate`. The rewrite reserves its parsed input and configured model expansion against the request's retained-payload limit before either allocation.
+
 Quote wildcard alias keys in YAML, such as `"gpt-4.1-*"`, so `*` is parsed as a literal character rather than YAML alias syntax. The examples quote all alias keys for consistency.
 
 One alias table serves both create endpoints: the filter rewrites `POST /v1/responses` and `POST /v1/chat/completions` request bodies and leaves every other path untouched. The filter name keeps its `openai_responses_` prefix for config compatibility.
@@ -16,7 +18,7 @@ One alias table serves both create endpoints: the filter rewrites `POST /v1/resp
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `default_model` | string | no | Model name to inject when the request body has no `model` field or when the field is `null`. |
-| `headers` | ModelRewriteHeaders | no | Header names for promoted model values. `effective_model` and `original_model` must use distinct names. |
+| `headers` | object | no | Header names for promoted model values. `effective_model` and `original_model` must use distinct names. |
 | `headers.effective_model` | string | no | Header name for the effective (post-rewrite) model value. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-effective-model` remains allowed. Must differ from `original_model`. |
 | `headers.original_model` | string | no | Header name for the original (pre-rewrite) model value. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-original-model` remains allowed. Must differ from `effective_model`. |
 | `model_aliases` | object<string, string> | no | Map from client-facing model names or single-wildcard patterns to backend model names. Quote wildcard keys in YAML. Exact aliases win before wildcard aliases; wildcard aliases are matched by literal specificity. |

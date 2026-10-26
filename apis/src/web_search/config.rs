@@ -8,10 +8,13 @@ use praxis_filter::{
     FilterError, body::MAX_JSON_BODY_BYTES,
     builtins::http::payload_processing::config_validation::validate_max_body_bytes,
 };
-use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
-use crate::callout_policy;
+use crate::{
+    callout_policy,
+    credential_source::{self, CredentialSource, DiagnosticContext, SecretHandle, WatchHandle},
+};
 
 /// Default callout timeout (10 seconds — search APIs can be slow).
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
@@ -23,6 +26,56 @@ pub(crate) const DEFAULT_MAX_CALLS_PER_ROUND: usize = 32;
 /// Absolute model-driven web-search calls accepted from one response round.
 #[cfg(feature = "openai-responses")]
 pub(crate) const MAX_CALLS_PER_ROUND: usize = 1_024;
+
+/// Hard safety ceiling on one dispatched search query, in UTF-8 bytes.
+///
+/// Operators may lower the per-filter bound through `max_query_bytes`, but no
+/// configuration may raise it past this cap: `action.query` strings are
+/// model-generated, so without a bound a blank or body-sized query could spend
+/// a paid provider call on a meaningless search or amplify the outbound URI
+/// and JSON-body allocation before the provider request fails (issue #1145).
+pub(crate) const MAX_SEARCH_QUERY_BYTES: usize = 8 * 1024;
+
+// -----------------------------------------------------------------------------
+// MaxQueryBytes
+// -----------------------------------------------------------------------------
+
+/// Per-query UTF-8 byte bound, validated to `1..=`[`MAX_SEARCH_QUERY_BYTES`]
+/// at parse time.
+///
+/// [`MAX_SEARCH_QUERY_BYTES`] is a hard safety ceiling, not just the default:
+/// an operator may lower the bound but never raise it past the cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "u16")]
+pub(crate) struct MaxQueryBytes(usize);
+
+impl MaxQueryBytes {
+    /// The validated bound in bytes.
+    pub(crate) fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for MaxQueryBytes {
+    fn default() -> Self {
+        Self(MAX_SEARCH_QUERY_BYTES)
+    }
+}
+
+impl TryFrom<u16> for MaxQueryBytes {
+    type Error = String;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        let value = usize::from(value);
+        if (1..=MAX_SEARCH_QUERY_BYTES).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(format!(
+                "max_query_bytes must be between 1 and {MAX_SEARCH_QUERY_BYTES}, got {value}"
+            ))
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // SearchProvider
@@ -109,14 +162,17 @@ pub(crate) struct WebSearchFilterConfig {
 
     /// Optional callout-credential slot id. When set, the web-search callout uses the caller's
     /// per-user secret from that slot instead of the shared provider `api_key`. Non-secret (a slot
-    /// name). Only valid for header-authenticated providers (Brave, You); rejected for Tavily,
-    /// which authenticates via the request body.
+    /// name). Supported for every provider: each stages the secret as a destination-bound header
+    /// credential the executor injects after pinning the provider authority (Brave and You.com
+    /// under their provider header, Tavily as an `Authorization: Bearer` token).
     #[serde(default)]
     pub(crate) user_credential: Option<String>,
 
-    /// API key for the search provider (supports `${ENV_VAR}`).
-    /// Wrapped in [`SecretString`] to prevent accidental logging.
-    pub(crate) api_key: SecretString,
+    /// API key credential source for the search provider: exactly one of
+    /// `value`, `env_var`, or `file`. A `file` source is watched for
+    /// restart-free rotation; see [`CredentialSource`]. The token never appears
+    /// in `Debug` output.
+    pub(crate) api_key: CredentialSource,
 
     /// Default search context size when the client omits it.
     #[serde(default)]
@@ -127,9 +183,16 @@ pub(crate) struct WebSearchFilterConfig {
     #[serde(default)]
     pub(crate) timeout_ms: Option<u64>,
 
-    /// Maximum request body bytes to buffer.
+    /// Maximum request and response body bytes buffered per loop round.
     #[serde(default)]
     pub(crate) max_body_bytes: Option<usize>,
+
+    /// Maximum UTF-8 bytes accepted for one model-generated search query, after
+    /// trimming (1..=8192; default: 8192). A blank or oversized query fails the
+    /// call locally instead of reaching the provider. 8192 is a hard ceiling:
+    /// admins may lower the bound but cannot raise it.
+    #[serde(default)]
+    pub(crate) max_query_bytes: MaxQueryBytes,
 
     /// Override the provider's default API base URL.
     #[serde(default)]
@@ -160,14 +223,6 @@ pub(crate) struct WebSearchFilterConfig {
     /// cross-cutting concerns.
     #[serde(default = "default_outbound_chain")]
     pub(crate) outbound_chain: ChainRef,
-
-    /// Select Praxis streaming transport for effective `stream: true`
-    /// Messages requests. When enabled, the terminal inference response is
-    /// streamed incrementally as one coherent client-visible SSE lifecycle
-    /// while intermediate tool/search transitions stay internal. This knob is
-    /// anthropic-only; `openai_web_search` does not accept it.
-    #[serde(default)]
-    pub(crate) terminal_streaming: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -178,7 +233,7 @@ pub(crate) struct WebSearchFilterConfig {
 // the shared `build_config` via `into_shared`. Keep the remaining fields in
 // sync with `WebSearchFilterConfig`.
 
-/// Reads the request body but never rewrites it, so `openai_web_search`
+/// Reads the request body but never rewrites it, so `openai_web_search_dispatch`
 /// exposes no `max_body_bytes` knob: raw request body size is governed by the
 /// pipeline's `body_limits`, not a per-filter limit (which praxis core merges
 /// to the largest sibling buffer and would therefore be bypassable).
@@ -193,9 +248,9 @@ pub(crate) struct OpenAiWebSearchConfig {
     #[serde(default)]
     user_credential: Option<String>,
 
-    /// API key for the search provider (supports `${ENV_VAR}`).
-    /// Wrapped in [`SecretString`] to prevent accidental logging.
-    api_key: SecretString,
+    /// API key credential source for the search provider: exactly one of
+    /// `value`, `env_var`, or `file`; see [`CredentialSource`].
+    api_key: CredentialSource,
 
     /// Default search context size when the client omits it.
     #[serde(default)]
@@ -209,6 +264,13 @@ pub(crate) struct OpenAiWebSearchConfig {
     /// Hard cap on web-search calls processed from one model response (1..=1024; default: 32).
     #[serde(default = "default_max_calls_per_round")]
     pub(crate) max_calls_per_round: usize,
+
+    /// Maximum UTF-8 bytes accepted for one model-generated search query, after
+    /// trimming (1..=8192; default: 8192). A blank or oversized query fails the
+    /// call locally instead of reaching the provider. 8192 is a hard ceiling:
+    /// admins may lower the bound but cannot raise it.
+    #[serde(default)]
+    pub(crate) max_query_bytes: MaxQueryBytes,
 
     /// Override the provider's default API base URL.
     #[serde(default)]
@@ -249,7 +311,7 @@ fn default_outbound_chain() -> ChainRef {
 impl OpenAiWebSearchConfig {
     /// Convert into the shared [`WebSearchFilterConfig`] for validation reuse.
     ///
-    /// `max_body_bytes` is fixed to `None`: `openai_web_search` defers raw
+    /// `max_body_bytes` is fixed to `None`: `openai_web_search_dispatch` defers raw
     /// request body size to the pipeline's `body_limits` and buffers to the
     /// absolute JSON ceiling, so it carries no per-filter raw-body cap.
     pub(crate) fn into_shared(self) -> WebSearchFilterConfig {
@@ -260,12 +322,9 @@ impl OpenAiWebSearchConfig {
             default_context_size: self.default_context_size,
             timeout_ms: self.timeout_ms,
             max_body_bytes: None,
+            max_query_bytes: self.max_query_bytes,
             base_url: self.base_url,
             outbound_chain: self.outbound_chain,
-            // `openai_web_search` has no terminal_streaming knob; its own
-            // deny_unknown_fields config never accepts the field, so the
-            // shared validated form is always off for it.
-            terminal_streaming: false,
         }
     }
 }
@@ -280,8 +339,9 @@ pub(crate) struct ValidatedConfig {
     /// Search backend provider.
     pub provider: SearchProvider,
 
-    /// Resolved API key.
-    pub api_key: SecretString,
+    /// Published handle to the resolved API key. A `None` payload (a post-startup
+    /// rotation gap) must fail the callout closed — never dial unauthenticated.
+    pub api_key: SecretHandle,
 
     /// Default search context size.
     pub default_context_size: SearchContextSize,
@@ -292,14 +352,14 @@ pub(crate) struct ValidatedConfig {
     /// Maximum request body bytes to buffer.
     pub max_body_bytes: usize,
 
+    /// Maximum UTF-8 bytes accepted for one model-generated search query.
+    pub max_query_bytes: usize,
+
     /// Override the provider's default API base URL.
     pub base_url: Option<String>,
 
     /// Configured callout-credential slot id (non-secret), or `None` for the shared key.
     pub user_credential: Option<String>,
-
-    /// Whether to stream the terminal Messages response incrementally.
-    pub terminal_streaming: bool,
 }
 
 impl std::fmt::Debug for ValidatedConfig {
@@ -310,42 +370,53 @@ impl std::fmt::Debug for ValidatedConfig {
             .field("default_context_size", &self.default_context_size)
             .field("timeout_ms", &self.timeout_ms)
             .field("max_body_bytes", &self.max_body_bytes)
+            .field("max_query_bytes", &self.max_query_bytes)
             .field("base_url", &self.base_url)
             .field("user_credential", &self.user_credential)
-            .field("terminal_streaming", &self.terminal_streaming)
             .finish()
     }
 }
 
-/// Validate raw config and apply defaults.
+/// Validate raw config, publish the API key credential, and apply defaults.
+///
+/// The API key is resolved from its [`CredentialSource`] through
+/// [`credential_source::build_one`]: the token is validated as a legal HTTP
+/// header value and published as the payload, an invalid initial token rejects
+/// construction (fail loud at startup), and a `file` source registers a watcher.
+/// The returned [`WatchHandle`] (present only for a `file` source) MUST be
+/// retained by the caller so rotation keeps publishing.
 ///
 /// # Errors
 ///
-/// Returns [`FilterError`] if the API key is empty or cannot be
-/// resolved from environment variables.
+/// Returns [`FilterError`] if the API key source is unreadable, empty, oversized,
+/// or does not form a legal HTTP header value, or if any other field is invalid.
 pub(crate) fn build_config(
     filter_name: &'static str,
     raw: &WebSearchFilterConfig,
-) -> Result<ValidatedConfig, FilterError> {
-    let api_key = resolve_api_key(filter_name, raw.api_key.expose_secret())?;
-    if api_key.is_empty() {
-        return Err(FilterError::from(format!("{filter_name}: api_key must not be empty")));
-    }
-    build_validated_config(filter_name, raw, api_key)
+) -> Result<(ValidatedConfig, Option<WatchHandle>), FilterError> {
+    // Validate that the token forms a legal HTTP header value and publish it,
+    // untransformed, as the payload. The owner-qualified diagnostic names the
+    // filter so an invalid key is attributable at startup.
+    let transform = move |token: &str| -> Result<Zeroizing<String>, FilterError> {
+        http::HeaderValue::from_str(token)
+            .map_err(|e| FilterError::from(format!("{filter_name}: invalid API key header value: {e}")))?;
+        Ok(Zeroizing::new(token.to_owned()))
+    };
+    let ctx = DiagnosticContext {
+        owner: filter_name,
+        reference: None,
+    };
+    let (api_key, watch) = credential_source::build_one(ctx, &raw.api_key, transform)?;
+    let validated = build_validated_config(filter_name, raw, api_key)?;
+    Ok((validated, watch))
 }
 
 /// Apply defaults after resolving and validating the API key.
 fn build_validated_config(
     filter_name: &'static str,
     raw: &WebSearchFilterConfig,
-    api_key: String,
+    api_key: SecretHandle,
 ) -> Result<ValidatedConfig, FilterError> {
-    if raw.user_credential.is_some() && matches!(raw.provider, SearchProvider::Tavily) {
-        return Err(FilterError::from(format!(
-            "{filter_name}: user_credential is not supported for the Tavily provider \
-             (Tavily authenticates via the request body, not a header)"
-        )));
-    }
     if let Some(base_url) = raw.base_url.as_deref() {
         // Structural checks only (scheme, embedded credentials, path). Private-
         // address / SSRF enforcement is deferred to the outbound executor's
@@ -358,13 +429,13 @@ fn build_validated_config(
     }
     Ok(ValidatedConfig {
         provider: raw.provider,
-        api_key: SecretString::from(api_key),
+        api_key,
         default_context_size: validate_context_size(filter_name, raw.default_context_size.as_deref())?,
         timeout_ms: callout_policy::validate_timeout_ms(filter_name, raw.timeout_ms, DEFAULT_TIMEOUT_MS)?,
         max_body_bytes: validate_max_body_bytes_field(filter_name, raw.max_body_bytes)?,
+        max_query_bytes: raw.max_query_bytes.get(),
         base_url: raw.base_url.clone(),
         user_credential: raw.user_credential.clone(),
-        terminal_streaming: raw.terminal_streaming,
     })
 }
 
@@ -389,20 +460,6 @@ fn validate_max_body_bytes_field(filter_name: &'static str, raw: Option<usize>) 
     Ok(value)
 }
 
-/// Resolve `${ENV_VAR}` references in the API key string.
-fn resolve_api_key(filter_name: &'static str, raw: &str) -> Result<String, FilterError> {
-    let trimmed = raw.trim();
-    if let Some(var_name) = trimmed.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
-        std::env::var(var_name).map_err(|e| {
-            FilterError::from(format!(
-                "{filter_name}: environment variable {var_name} not set for api_key: {e}"
-            ))
-        })
-    } else {
-        Ok(trimmed.to_owned())
-    }
-}
-
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -418,7 +475,6 @@ fn resolve_api_key(filter_name: &'static str, raw: &str) -> Result<String, Filte
 )]
 mod tests {
     use praxis_filter::parse_filter_config;
-    use secrecy::{ExposeSecret as _, SecretString};
 
     use super::*;
 
@@ -426,43 +482,40 @@ mod tests {
         WebSearchFilterConfig {
             provider: SearchProvider::Brave,
             user_credential: None,
-            api_key: SecretString::from("test-key-123".to_owned()),
+            api_key: CredentialSource::Value(Zeroizing::new("test-key-123".to_owned())),
             default_context_size: None,
             timeout_ms: None,
             max_body_bytes: None,
+            max_query_bytes: MaxQueryBytes::default(),
             base_url: None,
             outbound_chain: ChainRef::Named("web_search_outbound".to_owned()),
-            terminal_streaming: false,
         }
     }
 
     #[test]
-    fn build_config_defaults_terminal_streaming_off() {
-        let validated = build_config("anthropic_web_search", &base_config()).unwrap();
-        assert!(
-            !validated.terminal_streaming,
-            "terminal_streaming must default to off so non-streaming behavior is unchanged"
-        );
-    }
-
-    #[test]
-    fn parse_config_reads_terminal_streaming() {
+    fn anthropic_web_search_rejects_terminal_streaming() {
+        // `terminal_streaming` was removed: `anthropic_web_search` now selects the
+        // streaming transport per request from the client's `stream` field. The
+        // shared config carries `deny_unknown_fields`, so a stale config that still
+        // sets the flag fails to build — the migration is explicit, never a silent
+        // no-op toggle.
         let yaml = serde_yaml::from_str(
-            "provider: you\napi_key: k\noutbound_chain: web_search_outbound\nterminal_streaming: true",
+            "provider: you\napi_key:\n  value: k\noutbound_chain: web_search_outbound\nterminal_streaming: true",
         )
         .unwrap();
-        let raw = parse_filter_config::<WebSearchFilterConfig>("anthropic_web_search", &yaml).unwrap();
-        let validated = build_config("anthropic_web_search", &raw).unwrap();
-        assert!(validated.terminal_streaming);
+        assert!(
+            parse_filter_config::<WebSearchFilterConfig>("anthropic_web_search", &yaml).is_err(),
+            "the removed terminal_streaming flag must be rejected so operators migrate their config"
+        );
     }
 
     #[test]
     fn parse_config_defaults_missing_outbound_chain_to_empty_inline() {
         // `outbound_chain` is optional: omitting it defaults to an empty inline
-        // chain (pure passthrough), matching `openai_file_search_callout`. The
+        // chain (pure passthrough), matching `openai_file_search_dispatch`. The
         // callout still runs through the shared executor, which enforces
         // destination authority, DNS/SSRF, TLS/SNI, and `Host` centrally.
-        let yaml = serde_yaml::from_str("provider: you\napi_key: k").unwrap();
+        let yaml = serde_yaml::from_str("provider: you\napi_key:\n  value: k").unwrap();
         let raw = parse_filter_config::<WebSearchFilterConfig>("anthropic_web_search", &yaml)
             .expect("omitting outbound_chain must parse via the default");
         match &raw.outbound_chain {
@@ -479,8 +532,8 @@ mod tests {
     fn openai_parse_config_defaults_missing_outbound_chain_to_empty_inline() {
         // The OpenAI-specific config carries its own `#[serde(default)]`, so it
         // must default identically when `outbound_chain` is omitted.
-        let yaml = serde_yaml::from_str("provider: brave\napi_key: k").unwrap();
-        let raw = parse_filter_config::<OpenAiWebSearchConfig>("openai_web_search", &yaml)
+        let yaml = serde_yaml::from_str("provider: brave\napi_key:\n  value: k").unwrap();
+        let raw = parse_filter_config::<OpenAiWebSearchConfig>("openai_web_search_dispatch", &yaml)
             .expect("omitting outbound_chain must parse via the default");
         match &raw.outbound_chain {
             ChainRef::Inline { filters, .. } => assert!(
@@ -493,19 +546,22 @@ mod tests {
 
     #[cfg(feature = "openai-responses")]
     #[test]
-    fn openai_web_search_rejects_terminal_streaming() {
-        let yaml = serde_yaml::from_str("provider: you\napi_key: k\nterminal_streaming: true").unwrap();
+    fn openai_web_search_dispatch_rejects_terminal_streaming() {
+        let yaml = serde_yaml::from_str("provider: you\napi_key:\n  value: k\nterminal_streaming: true").unwrap();
         assert!(
-            parse_filter_config::<OpenAiWebSearchConfig>("openai_web_search", &yaml).is_err(),
-            "terminal_streaming is anthropic-only; openai_web_search must reject the unknown field"
+            parse_filter_config::<OpenAiWebSearchConfig>("openai_web_search_dispatch", &yaml).is_err(),
+            "terminal_streaming was removed; openai_web_search_dispatch must reject the unknown field"
         );
     }
 
     #[test]
     fn build_config_applies_defaults() {
-        let cfg = build_config("openai_web_search", &base_config()).unwrap();
+        let (cfg, _watch) = build_config("openai_web_search_dispatch", &base_config()).unwrap();
         assert_eq!(cfg.provider, SearchProvider::Brave);
-        assert_eq!(cfg.api_key.expose_secret(), "test-key-123");
+        assert_eq!(
+            cfg.api_key.current().payload.as_deref().map(String::as_str),
+            Some("test-key-123")
+        );
         assert_eq!(cfg.default_context_size, SearchContextSize::Medium);
         assert_eq!(cfg.timeout_ms, DEFAULT_TIMEOUT_MS);
         assert_eq!(cfg.max_body_bytes, MAX_JSON_BODY_BYTES);
@@ -514,8 +570,26 @@ mod tests {
     #[test]
     fn build_config_rejects_empty_api_key() {
         let mut cfg = base_config();
-        cfg.api_key = SecretString::from(String::new());
-        assert!(build_config("openai_web_search", &cfg).is_err());
+        cfg.api_key = CredentialSource::Value(Zeroizing::new(String::new()));
+        assert!(build_config("openai_web_search_dispatch", &cfg).is_err());
+    }
+
+    #[test]
+    fn build_config_invalid_api_key_names_owner() {
+        // An initial token that cannot form a legal HTTP header value rejects
+        // construction (fail loud at startup), and the diagnostic names the
+        // owning filter so an operator can attribute the misconfiguration.
+        let mut cfg = base_config();
+        cfg.api_key = CredentialSource::Value(Zeroizing::new("invalid\nkey".to_owned()));
+        let error = build_config("anthropic_web_search", &cfg)
+            .map(|_| ())
+            .expect_err("an invalid API key header value must reject construction");
+        assert!(
+            error
+                .to_string()
+                .contains("anthropic_web_search: invalid API key header value"),
+            "diagnostic should name the owning filter: {error}"
+        );
     }
 
     #[test]
@@ -536,7 +610,7 @@ mod tests {
     fn build_config_rejects_zero_timeout() {
         let mut cfg = base_config();
         cfg.timeout_ms = Some(0);
-        assert!(build_config("openai_web_search", &cfg).is_err());
+        assert!(build_config("openai_web_search_dispatch", &cfg).is_err());
     }
 
     #[test]
@@ -544,7 +618,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.default_context_size = Some("xlarge".into());
         assert!(
-            build_config("openai_web_search", &cfg).is_err(),
+            build_config("openai_web_search_dispatch", &cfg).is_err(),
             "unknown default_context_size should be rejected"
         );
     }
@@ -554,7 +628,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.default_context_size = Some("high".into());
         cfg.timeout_ms = Some(15_000);
-        let validated = build_config("openai_web_search", &cfg).unwrap();
+        let (validated, _watch) = build_config("openai_web_search_dispatch", &cfg).unwrap();
         assert_eq!(validated.default_context_size, SearchContextSize::High);
         assert_eq!(validated.timeout_ms, 15_000);
     }
@@ -563,13 +637,13 @@ mod tests {
     fn build_config_base_url_threaded_through() {
         let mut cfg = base_config();
         cfg.base_url = Some("http://localhost:9999".into());
-        let validated = build_config("openai_web_search", &cfg).unwrap();
+        let (validated, _watch) = build_config("openai_web_search_dispatch", &cfg).unwrap();
         assert_eq!(validated.base_url.as_deref(), Some("http://localhost:9999"));
     }
 
     #[test]
     fn build_config_base_url_none_by_default() {
-        let validated = build_config("openai_web_search", &base_config()).unwrap();
+        let (validated, _watch) = build_config("openai_web_search_dispatch", &base_config()).unwrap();
         assert!(validated.base_url.is_none());
     }
 
@@ -583,13 +657,13 @@ mod tests {
         for url in [
             "http://127.0.0.1:9999",
             "http://localhost:9999",
-            "http://169.254.169.254",
+            "http://169.254.1.1",
             "http://internal.search.example:8080",
         ] {
             let mut cfg = base_config();
             cfg.base_url = Some(url.into());
             assert!(
-                build_config("openai_web_search", &cfg).is_ok(),
+                build_config("openai_web_search_dispatch", &cfg).is_ok(),
                 "private base_url `{url}` must pass structural validation; SSRF is enforced at connect time"
             );
         }
@@ -600,7 +674,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.base_url = Some("file:///etc/passwd".into());
         assert!(
-            build_config("openai_web_search", &cfg).is_err(),
+            build_config("openai_web_search_dispatch", &cfg).is_err(),
             "non-http(s) base_url scheme must be rejected"
         );
     }
@@ -610,7 +684,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.base_url = Some("http://user:pass@8.8.8.8".into());
         assert!(
-            build_config("openai_web_search", &cfg).is_err(),
+            build_config("openai_web_search_dispatch", &cfg).is_err(),
             "base_url with embedded credentials must be rejected (structural check)"
         );
     }
@@ -619,7 +693,7 @@ mod tests {
     fn build_config_allows_public_ip_base_url() {
         let mut cfg = base_config();
         cfg.base_url = Some("https://8.8.8.8".into());
-        let validated = build_config("openai_web_search", &cfg).unwrap();
+        let (validated, _watch) = build_config("openai_web_search_dispatch", &cfg).unwrap();
         assert_eq!(
             validated.base_url.as_deref(),
             Some("https://8.8.8.8"),
@@ -631,32 +705,8 @@ mod tests {
     fn build_config_allows_private_base_url() {
         let mut cfg = base_config();
         cfg.base_url = Some("http://127.0.0.1:9999".into());
-        let validated = build_config("openai_web_search", &cfg).unwrap();
+        let (validated, _watch) = build_config("openai_web_search_dispatch", &cfg).unwrap();
         assert_eq!(validated.base_url.as_deref(), Some("http://127.0.0.1:9999"));
-    }
-
-    #[test]
-    fn resolve_literal_api_key() {
-        let result = resolve_api_key("openai_web_search", "my-literal-key").unwrap();
-        assert_eq!(result, "my-literal-key");
-    }
-
-    #[test]
-    fn resolve_literal_api_key_trimmed() {
-        let result = resolve_api_key("openai_web_search", "  spaced-key  ").unwrap();
-        assert_eq!(result, "spaced-key");
-    }
-
-    #[test]
-    fn resolve_env_var_syntax_detected() {
-        let result = resolve_api_key("openai_web_search", "${DEFINITELY_NOT_SET_KEY_12345}");
-        assert!(result.is_err(), "missing env var should fail");
-    }
-
-    #[test]
-    fn resolve_partial_env_syntax_treated_as_literal() {
-        let result = resolve_api_key("openai_web_search", "${INCOMPLETE").unwrap();
-        assert_eq!(result, "${INCOMPLETE", "unclosed brace should be literal");
     }
 
     #[test]
@@ -664,9 +714,98 @@ mod tests {
         let mut cfg = base_config();
         cfg.max_body_bytes = Some(0);
         assert!(
-            build_config("openai_web_search", &cfg).is_err(),
+            build_config("openai_web_search_dispatch", &cfg).is_err(),
             "max_body_bytes=0 should be rejected"
         );
+    }
+
+    #[test]
+    fn build_config_defaults_max_query_bytes_to_ceiling() {
+        let (validated, _watch) = build_config("openai_web_search_dispatch", &base_config()).unwrap();
+        assert_eq!(
+            validated.max_query_bytes, MAX_SEARCH_QUERY_BYTES,
+            "omitting max_query_bytes must apply the 8 KiB default"
+        );
+    }
+
+    #[test]
+    fn build_config_threads_lower_max_query_bytes() {
+        let mut cfg = base_config();
+        cfg.max_query_bytes = MaxQueryBytes::try_from(1_024).unwrap();
+        let (validated, _watch) = build_config("anthropic_web_search", &cfg).unwrap();
+        assert_eq!(
+            validated.max_query_bytes, 1_024,
+            "admins may lower the per-query bound below the ceiling"
+        );
+    }
+
+    #[test]
+    fn max_query_bytes_try_from_enforces_range() {
+        for accepted in [1, 1_024, 8_192] {
+            assert_eq!(
+                MaxQueryBytes::try_from(accepted).map(MaxQueryBytes::get),
+                Ok(usize::from(accepted)),
+                "max_query_bytes={accepted} is within 1..=8192 and must be accepted"
+            );
+        }
+        for rejected in [0, 8_193, u16::MAX] {
+            let error =
+                MaxQueryBytes::try_from(rejected).expect_err("max_query_bytes outside 1..=8192 must be rejected");
+            assert!(
+                error.contains("max_query_bytes must be between 1 and 8192"),
+                "the diagnostic should name the knob and the ceiling: {error}"
+            );
+        }
+    }
+
+    /// Parse `max_query_bytes` (or its omission) through the given config type.
+    fn parse_max_query_bytes<T: serde::de::DeserializeOwned>(
+        filter_name: &'static str,
+        line: &str,
+        project: impl Fn(T) -> MaxQueryBytes,
+    ) -> Result<usize, FilterError> {
+        let yaml = serde_yaml::from_str(&format!("provider: brave\napi_key:\n  value: k\n{line}")).unwrap();
+        parse_filter_config::<T>(filter_name, &yaml).map(|raw| project(raw).get())
+    }
+
+    fn assert_max_query_bytes_parsing(parse: impl Fn(&str) -> Result<usize, FilterError>) {
+        assert_eq!(
+            parse("").unwrap(),
+            MAX_SEARCH_QUERY_BYTES,
+            "omitting max_query_bytes must default to the 8 KiB ceiling"
+        );
+        for accepted in [1, 1_024, MAX_SEARCH_QUERY_BYTES] {
+            assert_eq!(
+                parse(&format!("max_query_bytes: {accepted}")).unwrap(),
+                accepted,
+                "max_query_bytes={accepted} is within 1..=8192 and must parse"
+            );
+        }
+        for rejected in ["0", "8193", "70000", "-1"] {
+            assert!(
+                parse(&format!("max_query_bytes: {rejected}")).is_err(),
+                "max_query_bytes={rejected} is outside 1..=8192 and must fail at parse time"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_config_validates_max_query_bytes() {
+        assert_max_query_bytes_parsing(|line| {
+            parse_max_query_bytes("anthropic_web_search", line, |raw: WebSearchFilterConfig| {
+                raw.max_query_bytes
+            })
+        });
+    }
+
+    #[cfg(feature = "openai-responses")]
+    #[test]
+    fn openai_parse_config_validates_max_query_bytes() {
+        assert_max_query_bytes_parsing(|line| {
+            parse_max_query_bytes("openai_web_search_dispatch", line, |raw: OpenAiWebSearchConfig| {
+                raw.into_shared().max_query_bytes
+            })
+        });
     }
 
     #[test]
@@ -674,14 +813,14 @@ mod tests {
         let mut cfg = base_config();
         cfg.max_body_bytes = Some(999_999_999_999);
         assert!(
-            build_config("openai_web_search", &cfg).is_err(),
+            build_config("openai_web_search_dispatch", &cfg).is_err(),
             "max_body_bytes above limit should be rejected"
         );
     }
 
     #[test]
     fn debug_impl_redacts_api_key() {
-        let cfg = build_config("openai_web_search", &base_config()).unwrap();
+        let (cfg, _watch) = build_config("openai_web_search_dispatch", &base_config()).unwrap();
         let debug_output = format!("{cfg:?}");
         assert!(
             debug_output.contains("[REDACTED]"),
@@ -730,7 +869,7 @@ mod tests {
     fn brave_accepts_user_credential_slot() {
         let mut cfg = base_config(); // provider = Brave
         cfg.user_credential = Some("brave".to_owned());
-        let validated = build_config("anthropic_web_search", &cfg).unwrap();
+        let (validated, _watch) = build_config("anthropic_web_search", &cfg).unwrap();
         assert_eq!(validated.user_credential.as_deref(), Some("brave"));
     }
 
@@ -739,29 +878,29 @@ mod tests {
         let mut cfg = base_config();
         cfg.provider = SearchProvider::Tavily;
         cfg.user_credential = None;
-        let validated = build_config("anthropic_web_search", &cfg).unwrap();
+        let (validated, _watch) = build_config("anthropic_web_search", &cfg).unwrap();
         assert!(validated.user_credential.is_none());
     }
 
     #[test]
-    fn tavily_rejects_user_credential_slot() {
+    fn tavily_accepts_user_credential_slot() {
+        // Tavily now authenticates with an `Authorization: Bearer` header
+        // credential (issue #1389), so a per-user slot is supported just as it is
+        // for the other header-authenticated providers.
         let mut cfg = base_config();
         cfg.provider = SearchProvider::Tavily;
         cfg.user_credential = Some("tav".to_owned());
-        let err = build_config("anthropic_web_search", &cfg).unwrap_err();
-        assert!(
-            err.to_string().contains("user_credential"),
-            "Tavily rejection must name the offending field: {err}"
-        );
+        let (validated, _watch) = build_config("anthropic_web_search", &cfg).unwrap();
+        assert_eq!(validated.user_credential.as_deref(), Some("tav"));
     }
 
     #[cfg(feature = "openai-responses")]
     #[test]
     fn openai_config_threads_user_credential_through_into_shared() {
         // Locks that `into_shared` does not drop the slot id on the OpenAI path.
-        let yaml = serde_yaml::from_str("provider: brave\napi_key: k\nuser_credential: brave").unwrap();
-        let raw = parse_filter_config::<OpenAiWebSearchConfig>("openai_web_search", &yaml).unwrap();
-        let validated = build_config("openai_web_search", &raw.into_shared()).unwrap();
+        let yaml = serde_yaml::from_str("provider: brave\napi_key:\n  value: k\nuser_credential: brave").unwrap();
+        let raw = parse_filter_config::<OpenAiWebSearchConfig>("openai_web_search_dispatch", &yaml).unwrap();
+        let (validated, _watch) = build_config("openai_web_search_dispatch", &raw.into_shared()).unwrap();
         assert_eq!(validated.user_credential.as_deref(), Some("brave"));
     }
 }

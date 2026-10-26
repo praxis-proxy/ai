@@ -8,6 +8,8 @@
 //! optionally exposing those counts as downstream response headers, and
 //! optionally emitting per-tenant Prometheus counters.
 
+#[cfg(feature = "token-ceiling-filter")]
+mod ceiling;
 mod count;
 mod headers;
 mod metrics;
@@ -15,6 +17,8 @@ mod providers;
 mod stream_usage;
 mod streaming;
 
+#[cfg(feature = "token-ceiling-filter")]
+pub use ceiling::TokenCeilingFilter;
 pub use count::TokenCountFilter;
 pub use headers::TokenUsageHeadersFilter;
 pub use metrics::TokenUsageMetricsFilter;

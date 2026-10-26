@@ -1,0 +1,94 @@
+version: 1
+id: vertex/anthropic-wire-translation
+description: Controlled model-to-upstream resolution, exact snapshot targets, Google
+  error translation, and streaming public-model restoration preserve SSE wire fields.
+protocol: anthropic_messages
+example_config: vertex/messages-to-anthropic.yaml
+upstream_authority: 127.0.0.1:3000
+replay_upstream_aliases:
+- 127.0.0.1:3001
+features:
+- vertex.anthropic.error.google_envelope
+- vertex.anthropic.streaming.wire_fields
+- vertex.anthropic.request.resolved_target
+turns:
+- name: quota-error
+  request:
+    method: POST
+    path: /v1/messages
+    headers:
+      content-type:
+      - application/json
+    body:
+      kind: json
+      value:
+        model: public-claude
+        max_tokens: 8
+        messages:
+        - role: user
+          content: hi
+  expect:
+    client_status: 429
+    client_body_kind: json
+    upstream_path: /v1/projects/my-gcp-project/locations/global/publishers/anthropic/models/claude-sonnet-4-5@20250929:rawPredict
+    upstream_body_kind: json
+    client_sse_events: []
+    upstream_sse_events: []
+- name: stream-fields
+  request:
+    method: POST
+    path: /v1/messages
+    headers:
+      content-type:
+      - application/json
+    body:
+      kind: json
+      value:
+        model: public-claude-snapshot
+        max_tokens: 8
+        messages:
+        - role: user
+          content: hi
+        stream: true
+  expect:
+    client_status: 200
+    client_body_kind: sse
+    upstream_path: /v1/projects/my-gcp-project/locations/global/publishers/anthropic/models/claude-sonnet-4-5@20250929:streamRawPredict
+    upstream_body_kind: json
+    client_sse_events:
+    - message_start
+    - content_block_start
+    - ping
+    - content_block_delta
+    - content_block_stop
+    - message_delta
+    - message_stop
+    upstream_sse_events:
+    - message_start
+    - content_block_start
+    - ping
+    - content_block_delta
+    - content_block_stop
+    - message_delta
+    - message_stop
+- name: count-snapshot
+  request:
+    method: POST
+    path: /v1/messages/count_tokens
+    headers:
+      content-type:
+      - application/json
+    body:
+      kind: json
+      value:
+        model: public-claude-snapshot
+        messages:
+        - role: user
+          content: hi
+  expect:
+    client_status: 200
+    client_body_kind: json
+    upstream_path: /v1/projects/my-gcp-project/locations/global/publishers/anthropic/models/count-tokens:rawPredict
+    upstream_body_kind: json
+    client_sse_events: []
+    upstream_sse_events: []

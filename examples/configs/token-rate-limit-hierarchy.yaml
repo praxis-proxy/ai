@@ -1,0 +1,85 @@
+# Hierarchical token budgets
+#
+# Optional org, then team, then user budgets on one token_rate_limit
+# admission (ai#125). Each level is its own hard deny. A user who is
+# under their own budget is still rejected when the org or team budget
+# cannot take the same estimate.
+#
+# The rule list includes a catch-all (no match) and reserved_tokens, so
+# every request that reaches the filter is estimated and checked against
+# all three levels. A config that omits the catch-all, or that uses a
+# body estimate with no fallback_estimate, is rejected at load time.
+#
+# Org and team values are headers. This filter hashes whatever value it
+# receives. It does not prove who wrote the header: AuthenticatedIdentity
+# carries the user subject and no org or team claim. A trusted component
+# in front of this proxy must strip a client-supplied x-org-id or
+# x-team-id and set its own. A client that can still set those headers
+# can choose another bucket and can fill max_keys. basic_auth below
+# only establishes the user level.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy --features basic-auth-filter,token-rate-limit-filter -- -c examples/configs/token-rate-limit-hierarchy.yaml
+#   curl -i http://localhost:8080/v1/chat/completions \
+#     -u subject-a:example-password \
+#     -H "x-org-id: acme" \
+#     -H "x-team-id: engineering" \
+#     -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: basic_auth
+        strip_authorization: true
+        credentials:
+          - username: subject-a
+            password: "example-password"
+
+      - filter: token_rate_limit
+        hierarchy:
+          - level: org
+            identity_header: x-org-id
+            algorithm: sliding_window
+            window: 1h
+            capacity: 5000000
+          - level: team
+            identity_header: x-team-id
+            algorithm: sliding_window
+            window: 1h
+            capacity: 1000000
+          - level: user
+            identity: authenticated_subject
+            algorithm: sliding_window
+            window: 1h
+            capacity: 100000
+        rules:
+          - name: default
+            algorithm: sliding_window
+            window: 1h
+            capacity: 10000000
+            reserved_tokens: 500
+
+      - filter: router
+        routes:
+          - path: "/v1/chat/completions"
+            cluster: backend
+
+      - filter: token_count
+        provider: openai
+
+      - filter: access_log
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local backend

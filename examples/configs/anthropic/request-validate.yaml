@@ -12,12 +12,11 @@ listeners:
 filter_chains:
   - name: anthropic-validate
     filters:
-      # anthropic_messages_format wraps the shared AI classifier and applies
-      # /v1/messages plus anthropic-version disambiguation before validation.
-      - filter: anthropic_messages_format
+      # anthropic_messages_request owns the create-message body: the Messages
+      # registry decides the operation from the request head, then the body is
+      # deserialized once for envelope validation and routing facts.
+      - filter: anthropic_messages_request
         on_invalid: reject
-
-      - filter: anthropic_validate
         max_body_bytes: 1048576
 
       - filter: router

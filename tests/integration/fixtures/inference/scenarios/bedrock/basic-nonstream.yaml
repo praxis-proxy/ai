@@ -1,0 +1,151 @@
+version: 1
+id: bedrock/basic-nonstream
+description: OpenAI Chat Completions request, response, and failure handling for Bedrock Converse.
+protocol: openai_chat_completions
+example_config: bedrock/chat-completions-to-converse.yaml
+upstream_authority: 127.0.0.1:3000
+features:
+  - bedrock.converse.request.text
+  - bedrock.converse.response.text
+  - bedrock.converse.request.tool_results
+  - bedrock.converse.request.invalid_types
+  - bedrock.converse.request.invalid_content
+  - bedrock.converse.streaming.malformed_event
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: user
+              content: What is the capital of France?
+          stream: false
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /model/synthetic-bedrock-model/converse
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: multipart-tool-result
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: user
+              content: First question.
+            - role: user
+              content: Second question.
+            - role: assistant
+              content: ""
+              tool_calls:
+                - id: call_weather
+                  type: function
+                  function:
+                    name: get_weather
+                    arguments: '{"city":"Paris"}'
+            - role: tool
+              tool_call_id: call_weather
+              content:
+                - type: text
+                  text: Sunny
+                - type: text
+                  text: 21 C
+          tools:
+            - type: function
+              function:
+                name: get_weather
+                strict: true
+                parameters:
+                  type: object
+                  properties:
+                    city:
+                      type: string
+                  additionalProperties: false
+          stream: false
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /model/synthetic-bedrock-model/converse
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: invalid-temperature-type
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages: []
+          temperature: "0.5"
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ""
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: invalid-user-text
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: user
+              content:
+                - type: text
+                  text: 42
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ""
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: malformed-stream-event
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: user
+              content: Hello
+          stream: true
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /model/synthetic-bedrock-model/converse-stream
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

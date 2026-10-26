@@ -1,5 +1,6 @@
 [alias]
-xtask = "run --package xtask --"
+# Developer commands inspect the complete, explicitly opted-in filter registry.
+xtask = "run --package xtask --features openai-all,store-all --"
 
 [build]
 rustdocflags = ["-D", "warnings"]

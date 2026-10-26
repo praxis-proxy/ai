@@ -13,9 +13,11 @@ Compaction applies in two scenarios:
 
 - **Rehydrated history** - stored history loaded via `previous_response_id` or `conversation`. Only the stored history is summarized; the current turn is preserved.
 
-- **Explicit compact** - `POST /v1/responses/compact` with a required `model` and an inline `input` conversation and/or a `previous_response_id`. Loads any stored history, appends the inline input, summarizes the combined conversation, and returns a `response.compaction` object (with `output` and `usage`) per the OpenAI contract.
+- **Explicit compact** - `POST /v1/responses/compact` with a required `model` and an optional inline `input` conversation and/or `previous_response_id`. Loads any stored history, appends the inline input, summarizes the combined conversation, and returns a `response.compaction` object (with `output` and `usage`) per the OpenAI contract. A schema-valid empty conversation is not rejected: no callout is made and a no-op compaction is persisted (issue #1139).
 
 Direct input requests (full conversation in `input` with no stored history) skip reactive compaction because `state.input == state.messages` - there is no separable "current turn" to preserve after summarization. Requests without rehydrated history are released without compaction.
+
+On listeners with `openai_agentic_loop.max_retained_bytes`, explicit compact uses a bounded Store read and caps the summarization response before it is buffered. Source expansion and persistence are charged to one request-wide budget. An overflow returns 413 before the next payload owner is created.
 
 Praxis runs `StreamBuffer` body hooks before header-phase request filters. This filter therefore requires `allow_pre_security_callout: true` and should only be used behind an outer authentication and authorization boundary.
 
@@ -25,7 +27,7 @@ Praxis runs `StreamBuffer` body hooks before header-phase request filters. This 
 |-------|------|---------|-------------|
 | `allow_pre_security_callout` | bool | no | Allow summarization callouts from the `StreamBuffer` pre-read phase, before header-phase security filters execute. This must be explicitly enabled only when an outer trust boundary authenticates and authorizes requests before they reach this listener. |
 | `inference_url` | string | yes | URL of the inference backend for summarization calls. E.g., `"http://localhost:11434/v1/chat/completions"` |
-| `allow_private_inference_url` | bool | no | Allow the inference target to resolve to non-public addresses. |
+| `allow_private_inference_url` | bool | no | Allow the inference target to resolve to non-public addresses. Cloud metadata, unspecified, and multicast addresses remain blocked. |
 | `default_model` | string | no | Default model for summarization when not overridden in the request's `context_management`. |
 | `tiktoken_encoding` | string | no | Tiktoken encoding name for local token estimation of the conversation text. |
 | `summary_prefix` | string | no | Prefix prepended to the summary when translating compaction items to backend messages. Defaults to `"[Previous conversation summary]\n\n"`. |

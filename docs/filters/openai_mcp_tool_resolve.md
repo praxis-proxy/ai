@@ -9,6 +9,8 @@ Resolves MCP tool entries from the Responses API `tools` array into concrete too
 
 Rejects the request with HTTP 400 before any callouts if two or more resolvable MCP entries share the same `server_label` (including entries that differ only by credentials).
 
+With `require_connector: true`, raw client-selected `server_url` entries are rejected before identity staging or any MCP callout. `openai_mcp_dispatch` needs no duplicate gate: its existing connector-context policy already refuses ambient identity to non-connector entries and round-matches the resolver configuration, making resolve-side rejection the single effective connector-only gate.
+
 Configured `connector_id` entries with `defer_loading: true` are accepted when the request also includes a `tool_search` tool. Those entries are resolved to an internal endpoint without an eager `tools/list` call; `connector_id`, the configured URL, and credentials are stripped from the outbound body. Deferred loading requires `openai_mcp_dispatch` inside an agentic loop. The first inference round keeps a sanitized `type: mcp` stub plus `tool_search` (an OpenAI-shaped hosted-tool backend); any later `tool_search_call` loads every pending deferred connector.
 
 For streaming requests, a runtime or response-processing failure from `tools/list` is returned as a successful SSE transport containing `response.mcp_list_tools.failed` and a terminal `response.failed` event. Local policy failures such as SSRF blocking remain HTTP error responses.
@@ -21,15 +23,19 @@ On successful discovery, one `mcp_list_tools` output item per resolved server (i
 |-------|------|---------|-------------|
 | `user_credential` | string | no | Optional per-user bearer slot from `callout_credentials`. Must match the corresponding `openai_mcp_dispatch` setting. |
 | `authorization_assertion` | string | no | Optional opaque assertion slot from `callout_credentials.assertions`. Must match the corresponding `openai_mcp_dispatch` setting. |
+| `require_connector` | bool | no | Require MCP tool entries to reference an operator-configured connector. When false, client-selected direct `server_url` entries remain allowed for deployments that intentionally mix public direct servers with scoped connector traffic. |
 | `forward_headers` | string[] | no | Trusted request headers forwarded to connector-backed MCP `initialize` and `tools/list` requests. No request headers are forwarded by default. Credential headers such as `authorization` are rejected because MCP destinations are client-selected; use the MCP tool entry's dedicated `authorization` field instead. Direct, client-selected `server_url` targets never receive ambient request headers. |
 | `max_rewritten_body_bytes` | integer | no | Maximum size in bytes of the request body this filter *produces* after expanding `mcp` tool entries into `function` entries. Raw request body size is governed by the pipeline's `body_limits`, not this field. This bounds only the post-expansion body, which can grow larger than the raw input. |
 | `timeout_ms` | integer | no | Per-server timeout in milliseconds for `tools/list` calls. Inside an iterative request router, initialize and listing exchanges are capped by the router's remaining deadline. |
 | `max_servers` | integer | no | Maximum number of distinct MCP servers per request. |
 | `max_tools` | integer | no | Maximum number of tools returned by a single MCP server. |
 | `outbound_chain` | string \| object | no | Outbound filter chain the MCP `tools/list` callout runs through. The chain is bound at build time and carries only operator-configured cross-cutting filters, which observe and can act on the outbound MCP request. The SSRF-validated dial target is staged by the transport, so no upstream-selecting filter is prepended. Both an inline chain and a named reference (resolved against the top-level `filter_chains`) are accepted, because this filter binds at top level. When omitted, the callout runs through an empty chain and dials the staged target directly. Whether loopback/private MCP destinations are permitted is governed by the operator's global insecure posture (which pipeline finalization applies to this bound chain), not a per-filter flag. |
-| `connectors` | ConnectorConfig[] | no | Named connectors mapping connector IDs to server URLs. |
+| `connectors` | object[] | no | Named connectors mapping connector IDs to server URLs. |
 | `connectors[].id` | string | yes | Connector identifier referenced in requests. |
 | `connectors[].server_url` | string | yes | MCP server URL for this connector. |
+| `connectors[].tool_policy` | `deny` \| `allow_all` \| `read_only` | no | Operator policy for tools from this connector. Defaults to `deny` and is enforced in protected mode: `allow_all` admits every tool, while `read_only` admits only tools the service affirmatively classifies as read-only. This classification does not itself prevent side effects; enforce write restrictions at the service or with scoped credentials. |
+| `tool_admission` | object | no | Operator metadata-admission policy. Defaults to advisory (unchanged behavior), so existing non-protected deployments are not affected. |
+| `tool_admission.mode` | `advisory` \| `protected` | no | Admission mode (`advisory` default, or `protected`). |
 
 ## Examples
 
@@ -49,7 +55,14 @@ forward_headers:
 timeout_ms: 5000
 max_rewritten_body_bytes: 67108864
 max_tools: 128
+# Operator-owned metadata admission (issue #1724). Defaults to advisory
+# (unchanged behavior); protected mode enforces the connector tool policy below.
+tool_admission:
+  mode: protected          # advisory (default) | protected
 connectors:
   - id: corp_drive
     server_url: https://drive-mcp.internal/mcp
+    # Connector policy defaults to deny. `allow_all` permits writes;
+    # `read_only` admits only affirmed read-only tools.
+    tool_policy: read_only
 ```

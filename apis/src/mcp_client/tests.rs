@@ -11,6 +11,8 @@ use std::{
     time::Duration,
 };
 
+use praxis_core::connectivity::UrlResolutionPolicy;
+
 use super::{
     session_pool::{MAX_IDLE_PER_KEY, MAX_TOTAL_IDLE, close_sessions},
     *,
@@ -19,7 +21,7 @@ use super::{
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn validate_url(url: &str) -> Result<(), McpClientError> {
-    validate_mcp_target(url, TEST_TIMEOUT, false).await
+    validate_mcp_target(url, TEST_TIMEOUT, false, UrlResolutionPolicy::ClientPerCall).await
 }
 
 fn display_url(url: &str) -> McpDisplayUrl {
@@ -679,23 +681,6 @@ async fn alibaba_metadata_ipv4_mapped_ipv6_is_blocked() {
     );
 }
 
-#[test]
-fn alibaba_metadata_via_dns_is_blocked() {
-    // The upfront DNS classifier is gone: `prepare_url_target` normalizes every
-    // resolved address and then applies the SSRF hook. A hostname that resolves
-    // to the Alibaba metadata endpoint is refused by that hook, so assert the
-    // hook itself rejects the address regardless of the private-upstream flag.
-    let ip = "100.100.100.200".parse::<IpAddr>().unwrap();
-    assert!(
-        is_ssrf_blocked_ip(&ip, false),
-        "a hostname resolving to Alibaba metadata must be blocked after DNS"
-    );
-    assert!(
-        is_ssrf_blocked_ip(&ip, true),
-        "cloud-metadata addresses stay blocked even when private upstreams are permitted"
-    );
-}
-
 #[tokio::test]
 async fn ssrf_blocks_invalid_url() {
     assert!(validate_url("not-a-url").await.is_err());
@@ -841,14 +826,24 @@ async fn ssrf_blocks_private_rfc1918_by_default() {
 #[tokio::test]
 async fn ssrf_allows_private_rfc1918_when_private_permitted() {
     assert!(
-        validate_mcp_target("http://10.0.0.5/mcp", TEST_TIMEOUT, true)
-            .await
-            .is_ok()
+        validate_mcp_target(
+            "http://10.0.0.5/mcp",
+            TEST_TIMEOUT,
+            true,
+            UrlResolutionPolicy::ClientPerCall
+        )
+        .await
+        .is_ok()
     );
     assert!(
-        validate_mcp_target("http://192.168.1.100/mcp", TEST_TIMEOUT, true)
-            .await
-            .is_ok()
+        validate_mcp_target(
+            "http://192.168.1.100/mcp",
+            TEST_TIMEOUT,
+            true,
+            UrlResolutionPolicy::ClientPerCall
+        )
+        .await
+        .is_ok()
     );
 }
 
@@ -903,20 +898,6 @@ async fn ssrf_blocks_aws_imds_ipv6() {
 }
 
 #[test]
-fn aws_imds_v6_detected_by_is_always_sensitive() {
-    let ip = "fd00:ec2::254".parse::<IpAddr>().unwrap();
-    assert!(is_always_sensitive(&ip), "fd00:ec2::254 should be SSRF-sensitive");
-}
-
-#[test]
-fn unspecified_ip_detected_by_is_always_sensitive() {
-    let v4 = "0.0.0.0".parse::<IpAddr>().unwrap();
-    assert!(is_always_sensitive(&v4), "0.0.0.0 should be SSRF-sensitive");
-    let v6 = "::".parse::<IpAddr>().unwrap();
-    assert!(is_always_sensitive(&v6), ":: should be SSRF-sensitive");
-}
-
-#[test]
 fn no_authorization_field_injects_no_auth_header() {
     let headers = serde_json::json!({"x-custom": "val"});
     let config = build_transport_config("http://api.example.com/mcp", Some(&headers), None).unwrap();
@@ -926,30 +907,10 @@ fn no_authorization_field_injects_no_auth_header() {
     );
 }
 
-#[test]
-fn ipv6_link_local_detected_by_is_always_sensitive() {
-    let fe80 = "fe80::1".parse::<IpAddr>().unwrap();
-    assert!(is_always_sensitive(&fe80), "fe80::1 should be SSRF-sensitive");
-    let febf = "febf::1".parse::<IpAddr>().unwrap();
-    assert!(is_always_sensitive(&febf), "febf::1 should be SSRF-sensitive");
-    let fe00 = "fe00::1".parse::<IpAddr>().unwrap();
-    assert!(!is_always_sensitive(&fe00), "fe00::1 is not link-local");
-}
-
 #[tokio::test]
 async fn ssrf_blocks_ipv6_unique_local() {
     assert!(validate_url("http://[fc00::1]/mcp").await.is_err());
     assert!(validate_url("http://[fd00:ec2::23]/mcp").await.is_err());
-}
-
-#[test]
-fn ipv6_unique_local_detected_by_is_always_sensitive() {
-    let fc00 = "fc00::1".parse::<IpAddr>().unwrap();
-    assert!(is_always_sensitive(&fc00), "fc00::1 should be SSRF-sensitive");
-    let fd00 = "fd00:ec2::23".parse::<IpAddr>().unwrap();
-    assert!(is_always_sensitive(&fd00), "fd00:ec2::23 should be SSRF-sensitive");
-    let fb00 = "fb00::1".parse::<IpAddr>().unwrap();
-    assert!(!is_always_sensitive(&fb00), "fb00::1 is not unique-local");
 }
 
 // =========================================================================
@@ -959,36 +920,86 @@ fn ipv6_unique_local_detected_by_is_always_sensitive() {
 #[tokio::test]
 async fn allow_loopback_permits_ipv4_loopback() {
     assert!(
-        validate_mcp_target("http://127.0.0.1/mcp", TEST_TIMEOUT, true)
-            .await
-            .is_ok()
+        validate_mcp_target(
+            "http://127.0.0.1/mcp",
+            TEST_TIMEOUT,
+            true,
+            UrlResolutionPolicy::ClientPerCall
+        )
+        .await
+        .is_ok()
     );
 }
 
 #[tokio::test]
 async fn allow_loopback_permits_localhost_hostname() {
     assert!(
-        validate_mcp_target("http://localhost/mcp", TEST_TIMEOUT, true)
-            .await
-            .is_ok()
+        validate_mcp_target(
+            "http://localhost/mcp",
+            TEST_TIMEOUT,
+            true,
+            UrlResolutionPolicy::ClientPerCall
+        )
+        .await
+        .is_ok()
     );
 }
 
 #[tokio::test]
-async fn allow_loopback_still_blocks_link_local() {
+async fn allow_private_still_blocks_metadata() {
     assert!(
-        validate_mcp_target("http://169.254.169.254/mcp", TEST_TIMEOUT, true)
-            .await
-            .is_err()
+        validate_mcp_target(
+            "http://169.254.169.254/mcp",
+            TEST_TIMEOUT,
+            true,
+            UrlResolutionPolicy::ClientPerCall
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn allow_private_permits_ipv6_unique_local() {
+    assert!(
+        validate_mcp_target(
+            "http://[fc00::1]/mcp",
+            TEST_TIMEOUT,
+            true,
+            UrlResolutionPolicy::ClientPerCall
+        )
+        .await
+        .is_ok(),
+        "an explicit private-target opt-in should permit IPv6 unique-local addresses"
+    );
+}
+
+#[tokio::test]
+async fn allow_private_permits_non_metadata_link_local() {
+    assert!(
+        validate_mcp_target(
+            "http://169.254.1.1/mcp",
+            TEST_TIMEOUT,
+            true,
+            UrlResolutionPolicy::ClientPerCall
+        )
+        .await
+        .is_ok(),
+        "an explicit private-target opt-in should permit non-metadata link-local addresses"
     );
 }
 
 #[tokio::test]
 async fn allow_loopback_still_blocks_unspecified() {
     assert!(
-        validate_mcp_target("http://0.0.0.0/mcp", TEST_TIMEOUT, true)
-            .await
-            .is_err()
+        validate_mcp_target(
+            "http://0.0.0.0/mcp",
+            TEST_TIMEOUT,
+            true,
+            UrlResolutionPolicy::ClientPerCall
+        )
+        .await
+        .is_err()
     );
 }
 
@@ -2364,6 +2375,73 @@ async fn pool_drain_explicitly_closes_idle_server_session() {
 }
 
 #[tokio::test]
+async fn budgeted_session_close_waits_for_delayed_delete_after_deadline() {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+    let service: StreamableHttpService<TestMcpServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(TestMcpServer::new()), StdArc::default(), config);
+    let delete_completed = StdArc::new(AtomicUsize::new(0));
+    let completion = StdArc::clone(&delete_completed);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let completion = StdArc::clone(&completion);
+                async move {
+                    if request.method() == http::Method::DELETE {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let response = next.run(request).await;
+                        completion.store(1, Ordering::SeqCst);
+                        response
+                    } else {
+                        next.run(request).await
+                    }
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+
+    let limits = McpBudgetedCallLimits {
+        wire_limit: 4_096,
+        parse_charge_limit: 262_144,
+    };
+    let callout = McpCallout::fabricated(true).unwrap();
+    let session = open_tool_session(
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        TEST_MAX_RESULT_BYTES,
+        Some(limits),
+        &callout,
+        &parse_display_url(&url),
+    )
+    .await
+    .unwrap();
+    close_fresh_session(session, tokio::time::Instant::now(), Some(limits)).await;
+    assert_eq!(
+        delete_completed.load(Ordering::SeqCst),
+        1,
+        "the request cannot settle its callout reservation while rmcp still holds the transport"
+    );
+    ct.cancel();
+}
+
+#[tokio::test]
 async fn dispatcher_namespaces_prevent_cross_filter_session_reuse() {
     let (url, ct, methods) = start_method_recording_mcp_server().await;
     let pool = McpSessionPool::new();
@@ -2413,6 +2491,7 @@ async fn open_pooled_session(url: &str, callout: &McpCallout) -> PooledSession {
         None,
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
+        None,
         callout,
         &parse_display_url(url),
     )
@@ -2839,6 +2918,34 @@ async fn list_tools_rejects_oversized_cumulative_pagination() {
     assert!(
         matches!(err, McpClientError::ListingTooLarge { .. }),
         "aggregate overflow should surface as ListingTooLarge, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn budgeted_listing_rejects_at_request_specific_cumulative_cap() {
+    let (url, ct) = start_multi_page_list_mcp_server(1_024, 3).await;
+    let limits = McpBudgetedCallLimits {
+        wire_limit: 1_024 * 1_024,
+        parse_charge_limit: 1_024 * 1_024,
+    };
+    let result = list_tools_with_forwarded_headers_budgeted(
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+        Some((limits, 2 * 1_024)),
+    )
+    .await;
+    ct.cancel();
+
+    assert!(
+        matches!(result, Err(McpClientError::ListingTooLarge { .. })),
+        "a request cap below the ordinary 4 MiB limit must stop pagination: {result:?}"
     );
 }
 

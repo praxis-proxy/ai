@@ -51,7 +51,8 @@ pub(crate) struct FileResolveConfig {
     /// filters observe and can mutate the outbound callout before it is
     /// dialed. SSRF protection for `files_api_url` derives from the
     /// pipeline's `allow_private_upstreams`, enforced both when the
-    /// callout target is pinned and at connect time.
+    /// callout target is pinned and at connect time. Cloud metadata,
+    /// unspecified, and multicast addresses remain blocked.
     ///
     /// Client-controlled `file_url` downloads never traverse this
     /// chain; they stay on the credential-free hardened resolver.
@@ -60,7 +61,7 @@ pub(crate) struct FileResolveConfig {
     /// bound outbound pipeline; this chain only adds filters along the
     /// way. When omitted it defaults to an empty inline chain (pure
     /// passthrough) via `default_outbound_chain`, so registration never
-    /// fails for a missing chain — matching `openai_file_search_callout`.
+    /// fails for a missing chain — matching `openai_file_search_dispatch`.
     /// Provide it only to attach cross-cutting concerns such as
     /// credential injection, tracing, or request tagging.
     ///
@@ -323,7 +324,7 @@ allow_pre_security_callout: true
     fn config_defaults_omitted_outbound_chain_to_empty_inline() {
         // `outbound_chain` is optional: omitting it yields an empty inline chain
         // (pure passthrough) rather than a config error, matching
-        // `openai_file_search_callout`. Registration binds this empty chain, so a
+        // `openai_file_search_dispatch`. Registration binds this empty chain, so a
         // missing `outbound_chain` never fails the build.
         let cfg: FileResolveConfig = serde_yaml::from_str(MINIMAL_YAML).unwrap();
         assert!(

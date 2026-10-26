@@ -126,6 +126,7 @@ pub(crate) fn synthesize_private_complete(item: &Value, output_index: u64) -> Ve
 
 /// Synthesize the tail of a native complete `file_search` (2 events: completed → done).
 /// Reuses the opening's `output_index`. Clone is necessary — synthesis payload.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 pub(crate) fn synthesize_native_complete_tail(item: &Value, output_index: u64) -> Vec<(&'static str, Value)> {
     let idx = || Value::Number(output_index.into());
 
@@ -234,7 +235,7 @@ pub(crate) fn synthesize_incomplete_tail(item: &Value, output_index: u64, privat
 ///
 /// The parse owner (`openai_agentic_loop`) queues each `file_search_call` by its
 /// absolute `accumulated_output` index during the round it *parses* the call, but
-/// the request-phase dispatcher (`openai_file_search_callout`) does not execute
+/// the request-phase dispatcher (`openai_file_search_dispatch`) does not execute
 /// and reconcile that call until the *next* IRR re-entry's request-body EOS. So at
 /// the round-N finalize where the owner first queued it, the indexed item is still
 /// pending and its lifecycle cannot be synthesized. This finalizer runs at every
@@ -333,6 +334,7 @@ fn select_builder(item: &Value, output_index: u64, kind: SynthesisKind) -> Vec<(
     let completed = item.get("status").and_then(Value::as_str) == Some("completed");
     match (kind, completed) {
         (SynthesisKind::Private, true) => synthesize_private_complete(item, output_index),
+        #[cfg(any(test, feature = "openai-agentic-loop"))]
         (SynthesisKind::Native, true) => synthesize_native_complete_tail(item, output_index),
         // Incomplete (terminalized / open-failure) tail; private replays its opening.
         (kind, false) => synthesize_incomplete_tail(item, output_index, kind == SynthesisKind::Private),

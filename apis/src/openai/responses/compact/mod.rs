@@ -20,7 +20,8 @@
 //!   requests that include `previous_response_id` or `conversation`. Single-turn requests (no stored history, even with
 //!   `context_management` set) are released without compaction because there is no prior history to summarize.
 //! - **Explicit** — `POST /v1/responses/compact`, which summarizes any previously stored response (plus optional inline
-//!   `input`) regardless of rehydration, returning a `response.compaction` object.
+//!   `input`) regardless of rehydration, returning a `response.compaction` object. `model` is the only required field,
+//!   so a schema-valid empty conversation is compacted as a no-op (issue #1139).
 //!
 //! See [`CompactFilter`] for the full description of both scenarios.
 //!
@@ -43,24 +44,34 @@ pub(super) mod config;
 )]
 mod tests;
 
-use std::{borrow::Cow, time::Duration};
+use std::{borrow::Cow, io, time::Duration};
 
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
-    parse_filter_config,
+    BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, warn};
 
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
-use super::{error::responses_error_rejection, is_explicit_compact_request, state::ResponsesState};
+use super::{
+    agentic_loop::{
+        AgenticBudgetPolicy,
+        budget::{SimpleBudget, input_charge},
+    },
+    bound_body_outcome,
+    error::responses_error_rejection,
+    history::MessageHistory,
+    is_explicit_compact_request,
+    state::{ResponsesState, mark_local_compaction_item},
+};
 use crate::{
     callout_policy::OnFailure,
     state_owner::{StateOwner, require_state_owner},
-    store::{OwnerScopedResponseStore, ResponseRecord, ResponseStoreRegistry},
+    store::{OwnerScopedResponseStore, ResponseRecord, ResponseStoreRegistry, StoreError},
     subrequest::{self, SubRequest, SubRequestClient},
 };
 
@@ -70,6 +81,23 @@ use crate::{
 
 /// Maximum response body size for summarization callouts (1 MiB).
 const MAX_SUMMARIZATION_RESPONSE_BYTES: usize = 1_048_576;
+
+/// Account for tokenization, rendered text, callout JSON, and the replacement
+/// history while the original decoded history remains live.
+const COMPACTION_SOURCE_MULTIPLIER: usize = 128;
+
+/// A buffered callout can contain one JSON node per byte. Reserve space for
+/// its transport, parsed tree, summary, base64 item, and history copies before
+/// allowing the subrequest to read that many bytes.
+const COMPACTION_RESPONSE_MULTIPLIER: usize = 320;
+
+/// Store decoding can expand each raw JSON byte into a map or Vec node. This
+/// allowance also covers the decoded record and subsequent history copies.
+const COMPACTION_STORE_MULTIPLIER: usize = 512;
+
+/// Reserve response-object assembly, Store serialization, and the returned
+/// body before creating another owned projection of the compaction result.
+const COMPACTION_PERSIST_MULTIPLIER: usize = 512;
 
 /// Minimum allowed `compact_threshold` for compaction (1,000 tokens).
 const MIN_COMPACT_THRESHOLD: u64 = 1_000; // 1,000 tokens
@@ -121,13 +149,20 @@ struct Summarization {
 /// - **Rehydrated history** - stored history loaded via `previous_response_id` or `conversation`. Only the stored
 ///   history is summarized; the current turn is preserved.
 ///
-/// - **Explicit compact** - `POST /v1/responses/compact` with a required `model` and an inline `input` conversation
-///   and/or a `previous_response_id`. Loads any stored history, appends the inline input, summarizes the combined
-///   conversation, and returns a `response.compaction` object (with `output` and `usage`) per the OpenAI contract.
+/// - **Explicit compact** - `POST /v1/responses/compact` with a required `model` and an optional inline `input`
+///   conversation and/or `previous_response_id`. Loads any stored history, appends the inline input, summarizes the
+///   combined conversation, and returns a `response.compaction` object (with `output` and `usage`) per the OpenAI
+///   contract. A schema-valid empty conversation is not rejected: no callout is made and a no-op compaction is
+///   persisted (issue #1139).
 ///
 /// Direct input requests (full conversation in `input` with no stored history) skip reactive compaction because
 /// `state.input == state.messages` - there is no separable "current turn" to preserve after summarization.
 /// Requests without rehydrated history are released without compaction.
+///
+/// On listeners with `openai_agentic_loop.max_retained_bytes`, explicit compact
+/// uses a bounded Store read and caps the summarization response before it is
+/// buffered. Source expansion and persistence are charged to one request-wide
+/// budget. An overflow returns 413 before the next payload owner is created.
 ///
 /// Praxis runs `StreamBuffer` body hooks before header-phase request
 /// filters. This filter therefore requires
@@ -202,7 +237,7 @@ impl CompactFilter {
     /// Run the summarization callout and return the summary text.
     async fn execute_compaction(
         &self,
-        state: &ResponsesState,
+        state: &mut ResponsesState,
         params: &CompactionParams,
         conversation_text: &str,
     ) -> Result<Option<String>, FilterAction> {
@@ -210,16 +245,58 @@ impl CompactFilter {
         let instructions = state.request_body.get("instructions").and_then(Value::as_str);
         let request = build_summarization_request(conversation_text, instructions, model);
         let timeout = Duration::from_millis(self.config.callout.timeout_ms);
-        let result = subrequest::execute_url(
-            &self.client,
-            &self.config.inference_url,
-            request,
-            MAX_SUMMARIZATION_RESPONSE_BYTES,
-            timeout,
-            self.config.address_policy,
-        )
-        .await;
+        let response_limit = compaction_response_limit(state.simple_budget)?;
+        let result = self
+            .execute_summarization_callout(request, response_limit, timeout)
+            .await;
+        if let Some(budget) = state.simple_budget.as_mut() {
+            match &result {
+                Ok(response) => {
+                    let charge = input_charge(&response.body)
+                        .and_then(|charge| response.body.len().checked_mul(16)?.checked_add(charge))
+                        .ok_or_else(reject_compaction_budget)?;
+                    if !budget.reserve_additional_input(charge) {
+                        return Err(reject_compaction_budget());
+                    }
+                },
+                Err(subrequest::SubRequestError::ResponseTooLarge { .. })
+                    if response_limit < MAX_SUMMARIZATION_RESPONSE_BYTES =>
+                {
+                    return Err(reject_compaction_budget());
+                },
+                _ => {},
+            }
+        }
         Ok(self.handle_subrequest_result(result)?.map(|s| s.content))
+    }
+
+    /// Dial the operator-configured inference endpoint for a summarization.
+    ///
+    /// The destination is `inference_url` from the filter config, so it resolves
+    /// through the shared DNS cache ([`UrlResolutionPolicy::OperatorCached`]).
+    /// The result is mapped back to [`SubRequestError`] so both callout callers
+    /// share [`handle_subrequest_result`](Self::handle_subrequest_result).
+    ///
+    /// [`UrlResolutionPolicy::OperatorCached`]: subrequest::UrlResolutionPolicy::OperatorCached
+    /// [`SubRequestError`]: subrequest::SubRequestError
+    async fn execute_summarization_callout(
+        &self,
+        request: SubRequest,
+        response_limit: usize,
+        timeout: Duration,
+    ) -> Result<subrequest::SubResponse, subrequest::SubRequestError> {
+        self.client
+            .execute_url(
+                &self.config.inference_url,
+                request,
+                subrequest::address_policy_hook(self.config.address_policy),
+                subrequest::UrlResolutionPolicy::OperatorCached,
+                timeout,
+                response_limit,
+                None,
+            )
+            .await
+            .map_err(subrequest::map_url_error)
     }
 
     /// Map a subrequest result to a parsed summarization or a filter action.
@@ -250,19 +327,26 @@ impl CompactFilter {
         &self,
         req: &ExplicitCompactRequest,
         messages: &[Value],
+        budget: &mut Option<SimpleBudget>,
     ) -> Result<Option<Summarization>, FilterAction> {
         let conversation_text = build_conversation_text(messages);
         let request = build_summarization_request(&conversation_text, req.instructions.as_deref(), &req.model);
         let timeout = Duration::from_millis(self.config.callout.timeout_ms);
-        let result = subrequest::execute_url(
-            &self.client,
-            &self.config.inference_url,
-            request,
-            MAX_SUMMARIZATION_RESPONSE_BYTES,
-            timeout,
-            self.config.address_policy,
-        )
-        .await;
+        let response_limit = compaction_response_limit(*budget)?;
+        let result = self
+            .execute_summarization_callout(request, response_limit, timeout)
+            .await;
+        if let Some(budget) = budget.as_mut() {
+            match &result {
+                Ok(response) => reserve_compact_bytes(budget, response.body.len(), COMPACTION_RESPONSE_MULTIPLIER)?,
+                Err(subrequest::SubRequestError::ResponseTooLarge { .. })
+                    if response_limit < MAX_SUMMARIZATION_RESPONSE_BYTES =>
+                {
+                    return Err(reject_compaction_budget());
+                },
+                _ => {},
+            }
+        }
         self.handle_subrequest_result(result)
     }
 
@@ -289,20 +373,37 @@ impl CompactFilter {
         };
         replace_messages(
             state,
-            build_compaction_item(&compaction_id, summary, &self.config.summary_prefix),
+            &build_compaction_item(&compaction_id, summary, &self.config.summary_prefix),
         );
     }
 
     /// Check the threshold and run summarization if it is exceeded.
-    async fn check_and_summarize(&self, state: &ResponsesState) -> Result<Option<String>, FilterAction> {
-        let (params, conversation_text) = match should_compact(state, &self.config.tiktoken_encoding) {
-            Ok(Some(pair)) => pair,
-            Ok(None) => return Ok(None),
-            Err(msg) => {
-                let rej = responses_error_rejection(400, "invalid_request_error", &msg);
-                return Err(FilterAction::Reject(rej));
-            },
+    async fn check_and_summarize(&self, state: &mut ResponsesState) -> Result<Option<String>, FilterAction> {
+        let config = extract_compaction_config(&state.context_management)
+            .map_err(|message| reject_compact(400, "invalid_request_error", &message))?;
+        let Some(config) = config else {
+            return Ok(None);
         };
+        if previous_usage_total(state).is_some_and(|total| !exceeds_threshold(total, &config)) {
+            return Ok(None);
+        }
+        if let Some(budget) = state.simple_budget.as_mut() {
+            let bytes = count_json_bytes(&state.messages)
+                .and_then(|history| count_json_bytes(&state.request_body)?.checked_add(history))
+                .ok_or_else(reject_compaction_budget)?;
+            let charge = bytes
+                .checked_mul(COMPACTION_SOURCE_MULTIPLIER)
+                .ok_or_else(reject_compaction_budget)?;
+            if !budget.reserve_additional_input(charge) {
+                return Err(reject_compaction_budget());
+            }
+        }
+        let Some((params, conversation_text)) = should_compact(state, &self.config.tiktoken_encoding)
+            .map_err(|msg| FilterAction::Reject(responses_error_rejection(400, "invalid_request_error", &msg)))?
+        else {
+            return Ok(None);
+        };
+        validate_reactive_compaction_source(state)?;
         self.execute_compaction(state, &params, &conversation_text).await
     }
 
@@ -327,9 +428,40 @@ impl CompactFilter {
         ctx: &HttpFilterContext<'_>,
         body: &Option<Bytes>,
     ) -> Result<FilterAction, FilterAction> {
-        let req = parse_compact_request_body(body)?;
+        let mut budget = explicit_compact_budget(ctx, body)?;
+        let mut req = parse_compact_request_body(body)?;
         let (store, owner) = resolve_store_and_owner(ctx)?;
-        let messages = collect_compact_messages(&store, &req).await?;
+        let messages = collect_compact_messages(&store, &mut req, &mut budget).await?;
+        let collected = CollectedExplicitCompact {
+            store,
+            owner,
+            req,
+            messages,
+            budget,
+        };
+        Box::pin(self.finish_explicit_compact(ctx, collected)).await
+    }
+
+    /// Validate an already collected compact request, then summarize and
+    /// persist it via [`Self::persist_explicit_compaction`].
+    ///
+    /// Keeping the phases separate prevents the callout and persistence
+    /// futures from sharing one stack frame with the stored-history lookup
+    /// future.
+    async fn finish_explicit_compact(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        collected: CollectedExplicitCompact,
+    ) -> Result<FilterAction, FilterAction> {
+        let CollectedExplicitCompact {
+            store,
+            owner,
+            req,
+            messages,
+            mut budget,
+        } = collected;
+        validate_compaction_source(messages.iter())?;
+        reserve_explicit_compact_source(budget.as_mut(), &messages)?;
         let writer = CompactionWriter {
             filter: self,
             ctx,
@@ -338,12 +470,9 @@ impl CompactFilter {
             req: &req,
             messages: &messages,
         };
-        let response_object = if let Some(summary) = self.summarize_messages(&req, &messages).await? {
-            writer.persist_compacted(&summary).await?
-        } else {
-            warn!("fail-open compaction: summarization callout failed; persisting uncompacted no-op");
-            writer.persist_uncompacted().await?
-        };
+        // The callout future carries a buffered response. Keep it off the
+        // request filter's stack while the source messages remain live.
+        let response_object = Box::pin(self.persist_explicit_compaction(&writer, &mut budget)).await?;
         let body_bytes = serde_json::to_vec(&response_object).unwrap_or_default();
         Ok(FilterAction::Reject(
             praxis_filter::Rejection::status(200)
@@ -351,6 +480,121 @@ impl CompactFilter {
                 .with_body(Bytes::from(body_bytes)),
         ))
     }
+
+    /// Summarize the collected conversation and persist the matching
+    /// compaction result.
+    ///
+    /// Kept as a separate pinned phase so its callout and persistence futures
+    /// stay off the request filter's stack (see [`Self::finish_explicit_compact`]).
+    /// A schema-valid empty conversation (issue #1139) skips the callout —
+    /// there is nothing to summarize — and persists a no-op compaction, the
+    /// same result shape a fail-open callout failure produces.
+    async fn persist_explicit_compaction(
+        &self,
+        writer: &CompactionWriter<'_>,
+        budget: &mut Option<SimpleBudget>,
+    ) -> Result<Value, FilterAction> {
+        // `model` is the only required field, so a schema-valid request can
+        // carry an empty conversation (issue #1139). There is nothing to
+        // summarize, so no callout is made and the empty conversation is
+        // persisted as a no-op compaction below.
+        let summary = if writer.messages.is_empty() {
+            debug!("explicit compact of an empty conversation; persisting no-op compaction");
+            None
+        } else {
+            Box::pin(self.summarize_messages(writer.req, writer.messages, budget)).await?
+        };
+        if let Some(summary) = summary {
+            writer.persist_compacted(&summary, budget).await
+        } else {
+            if !writer.messages.is_empty() {
+                warn!("fail-open compaction: summarization callout failed; persisting uncompacted no-op");
+            }
+            writer.persist_uncompacted(budget).await
+        }
+    }
+}
+
+/// Start a request-wide ledger before explicit compact parses its JSON body.
+fn explicit_compact_budget(
+    ctx: &HttpFilterContext<'_>,
+    body: &Option<Bytes>,
+) -> Result<Option<SimpleBudget>, FilterAction> {
+    let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() else {
+        return Ok(None);
+    };
+    let bytes = body.as_deref().unwrap_or_default();
+    let charge = input_charge(bytes).ok_or_else(reject_compaction_budget)?;
+    SimpleBudget::new_for_local_response(policy.max_retained_bytes(), charge)
+        .map(Some)
+        .ok_or_else(reject_compaction_budget)
+}
+
+/// Charge already owned JSON before copying it into another independent owner.
+fn reserve_compact_json<T: serde::Serialize>(
+    budget: &mut SimpleBudget,
+    value: &T,
+    multiplier: usize,
+) -> Result<(), FilterAction> {
+    let bytes = count_json_bytes(value).ok_or_else(reject_compaction_budget)?;
+    reserve_compact_bytes(budget, bytes, multiplier)
+}
+
+/// Apply a checked worst-case multiplier to an independently owned payload.
+fn reserve_compact_bytes(budget: &mut SimpleBudget, bytes: usize, multiplier: usize) -> Result<(), FilterAction> {
+    let charge = bytes.checked_mul(multiplier).ok_or_else(reject_compaction_budget)?;
+    if budget.reserve_additional_input(charge) {
+        Ok(())
+    } else {
+        Err(reject_compaction_budget())
+    }
+}
+
+/// Determine a transport cap before the callout can buffer a response. The
+/// later charge uses its actual JSON shape, while this worst-case allowance
+/// ensures even an unusually dense JSON tree fits before parsing begins.
+fn compaction_response_limit(budget: Option<SimpleBudget>) -> Result<usize, FilterAction> {
+    let Some(budget) = budget else {
+        return Ok(MAX_SUMMARIZATION_RESPONSE_BYTES);
+    };
+    let bytes = budget.remaining_bytes().unwrap_or(0) / COMPACTION_RESPONSE_MULTIPLIER;
+    if bytes == 0 {
+        return Err(reject_compaction_budget());
+    }
+    Ok(bytes.min(MAX_SUMMARIZATION_RESPONSE_BYTES))
+}
+
+/// Count already parsed JSON without building another serialized payload.
+fn count_json_bytes<T: serde::Serialize>(value: &T) -> Option<usize> {
+    let mut counter = JsonByteCounter(0);
+    serde_json::to_writer(&mut counter, value).ok()?;
+    Some(counter.0)
+}
+
+/// Counts encoded JSON bytes without retaining the serialized payload.
+struct JsonByteCounter(usize);
+
+impl io::Write for JsonByteCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(buf.len())
+            .ok_or_else(|| io::Error::other("compaction JSON size overflow"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Budget failures always terminate the request, including fail-open callouts.
+fn reject_compaction_budget() -> FilterAction {
+    reject_compact(
+        413,
+        "invalid_request_error",
+        "Compaction exceeds a processing limit set by the platform administrator.",
+    )
 }
 
 #[async_trait]
@@ -360,6 +604,21 @@ impl HttpFilter for CompactFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
+    /// Also offer the bound-upstream phase so a chain may defer compaction until
+    /// the router has bound a logical provider.
+    ///
+    /// Declaring both hooks is what lets an operator gate this filter with a
+    /// `bound_upstream` condition: core schedules the bound-upstream hook when
+    /// that condition is present and the pre-read hook otherwise, never both.
+    /// The managed-responses barrier needs the deferred phase because
+    /// `ResponsesState` — which carries the parsed `context_management` this
+    /// filter validates and the rehydrated history it summarizes — is only
+    /// minted once the body is bound. A standalone chain with no such condition
+    /// still runs the pre-read hook.
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
         BodyAccess::ReadOnly
     }
 
@@ -373,6 +632,10 @@ impl HttpFilter for CompactFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "reactive and explicit admission share the body hook"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -394,10 +657,18 @@ impl HttpFilter for CompactFilter {
         if !ensure_compactable_state(ctx) {
             return Ok(FilterAction::Release);
         }
-        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        let budgeted = ctx.extensions.get::<AgenticBudgetPolicy>().is_some();
+        let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             warn!("ResponsesState missing after ensure_compactable_state");
             return Ok(FilterAction::Release);
         };
+        if budgeted && state.simple_budget.is_none() {
+            return Ok(reject_compact(
+                500,
+                "server_error",
+                "retained-payload budget state is missing",
+            ));
+        }
         let summary = match self.check_and_summarize(state).await {
             Ok(Some(summary)) => summary,
             Ok(None) | Err(FilterAction::Release) => return Ok(FilterAction::Release),
@@ -406,6 +677,26 @@ impl HttpFilter for CompactFilter {
         self.apply_compaction(ctx, &summary);
         ctx.set_metadata("responses.compacted", "true");
         Ok(FilterAction::Release)
+    }
+
+    /// Same processing, deferred until a logical provider is bound.
+    ///
+    /// Shares one implementation with the pre-read hook so the two phases
+    /// cannot diverge. A chain that gates compaction on `bound_upstream`
+    /// metadata (the managed-responses barrier) schedules this filter in the
+    /// bound phase, where `ResponsesState` is already minted, so
+    /// `reject_invalid_compaction_config` observes the parsed
+    /// `context_management` and summarization sees rehydrated history. A chain
+    /// with no such condition still runs the pre-read hook above.
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        // The bound-upstream phase receives the complete body, so end-of-stream
+        // is always reached.
+        let action = self.on_request_body(ctx, body, true).await?;
+        bound_body_outcome(action)
     }
 }
 
@@ -537,7 +828,7 @@ fn previous_usage_total(state: &ResponsesState) -> Option<u64> {
 
 /// Check whether this is an OpenAI Responses API request.
 fn is_responses_request(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+    ctx.get_metadata("openai_responses_request.format") == Some("openai_responses")
 }
 
 // -----------------------------------------------------------------------------
@@ -556,14 +847,33 @@ struct ExplicitCompactRequest {
     instructions: Option<String>,
 }
 
+/// Owned inputs for the post-lookup explicit compaction phase.
+struct CollectedExplicitCompact {
+    /// Owner-scoped destination store.
+    store: OwnerScopedResponseStore,
+    /// Authenticated owner recorded with the compacted response.
+    owner: StateOwner,
+    /// Parsed explicit compaction request.
+    req: ExplicitCompactRequest,
+    /// Stored and inline source messages in conversation order.
+    messages: Vec<Value>,
+    /// Request-wide allocation budget, when configured.
+    budget: Option<SimpleBudget>,
+}
+
 /// Parse and validate the `POST /v1/responses/compact` body.
-#[expect(clippy::too_many_lines, reason = "linear field parsing and validation")]
+///
+/// Fields are validated for type before any summarization callout or store
+/// write, so a wrong-typed `input` or `instructions` is rejected with HTTP 400
+/// rather than silently dropped to absence/empty (see issue #1403). The scalar
+/// fields are moved out of the parsed body (rather than cloned) so the
+/// potentially large `input` array is never copied just to own it.
 fn parse_compact_request_body(body: &Option<Bytes>) -> Result<ExplicitCompactRequest, FilterAction> {
     let bytes = body
         .as_ref()
         .filter(|b| !b.is_empty())
         .ok_or_else(|| reject_compact(400, "invalid_request_error", "request body is empty"))?;
-    let parsed: Value = serde_json::from_slice(bytes).map_err(|e| {
+    let mut parsed: Value = serde_json::from_slice(bytes).map_err(|e| {
         debug!(error = %e, "compact request body parse failed");
         reject_compact(400, "invalid_request_error", "invalid JSON body")
     })?;
@@ -573,41 +883,327 @@ fn parse_compact_request_body(body: &Option<Bytes>) -> Result<ExplicitCompactReq
         .filter(|s| !s.is_empty())
         .ok_or_else(|| reject_compact(400, "invalid_request_error", "missing required field: model"))?
         .to_owned();
-    let input = parse_compact_input(parsed.get("input"));
-    let previous_response_id = parsed
-        .get("previous_response_id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned);
-    if input.is_empty() && previous_response_id.is_none() {
-        return Err(reject_compact(
-            400,
-            "invalid_request_error",
-            "request must include input or previous_response_id",
-        ));
-    }
+    let instructions = parse_compact_instructions(parsed.get_mut("instructions").map(Value::take))?;
+    let previous_response_id =
+        parse_compact_previous_response_id(parsed.get_mut("previous_response_id").map(Value::take))?;
+    let input = parse_compact_input(parsed.get_mut("input").map(Value::take))?;
     Ok(ExplicitCompactRequest {
         model,
         input,
         previous_response_id,
-        instructions: parsed
-            .get("instructions")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+        instructions,
     })
 }
 
-/// Normalize the `input` field into a list of conversation items.
+/// Validate and own the optional `instructions` field.
 ///
-/// A bare string is coerced into a single `user` message, matching the
-/// contract where a string is equivalent to a text user input.
-fn parse_compact_input(input: Option<&Value>) -> Vec<Value> {
+/// Absent or explicit `null` yields `None` (legitimate omission). A string is
+/// kept as-is. Any other JSON type is a wrong-typed field and is rejected with
+/// HTTP 400 rather than silently treated as absent (issue #1403).
+fn parse_compact_instructions(instructions: Option<Value>) -> Result<Option<String>, FilterAction> {
+    match instructions {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(_) => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            "instructions must be a string",
+        )),
+    }
+}
+
+/// Validate and own the optional `previous_response_id` field.
+///
+/// Absent, explicit `null`, or an empty string yields `None`. A non-empty
+/// string is kept. Any other JSON type is rejected with HTTP 400. In the
+/// recommended pipeline `rehydrate` already rejects a wrong-typed prior id
+/// ahead of compact; this is defense-in-depth for chains without it.
+fn parse_compact_previous_response_id(previous_response_id: Option<Value>) -> Result<Option<String>, FilterAction> {
+    match previous_response_id {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok((!s.is_empty()).then_some(s)),
+        Some(_) => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            "previous_response_id must be a string",
+        )),
+    }
+}
+
+/// Normalize and validate the `input` field into a list of conversation items.
+///
+/// Accepts:
+/// - absent or explicit `null`: an empty list (a request may legitimately carry no conversation; an empty collected
+///   conversation is compacted as a no-op, issue #1139),
+/// - a non-empty string: coerced into a single `user` message (an empty string contributes no content, matching the
+///   prior behavior),
+/// - an array: each item must be a JSON object whose consumed fields are well-typed (see
+///   [`validate_compact_input_item`]).
+///
+/// Any other JSON type (number, bool, object) is rejected with HTTP 400, and a
+/// malformed array item (e.g. `[123]`, or a message whose `content` is a number)
+/// is rejected rather than accepted into the list where it would be silently
+/// formatted into empty text and summarized/stored anyway (issue #1403).
+/// Schema-valid emptiness is not rejected: a request whose collected
+/// conversation is empty compacts to a no-op (issue #1139).
+fn parse_compact_input(input: Option<Value>) -> Result<Vec<Value>, FilterAction> {
     match input {
-        Some(Value::String(s)) if !s.is_empty() => {
-            vec![serde_json::json!({"role": "user", "content": s})]
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => {
+            if s.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![serde_json::json!({"role": "user", "content": s})])
+            }
         },
-        Some(Value::Array(arr)) => arr.clone(),
-        _ => Vec::new(),
+        Some(Value::Array(arr)) => {
+            for (idx, item) in arr.iter().enumerate() {
+                validate_compact_input_item(idx, item)?;
+            }
+            Ok(arr)
+        },
+        Some(_) => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            "input must be a string or an array of items",
+        )),
+    }
+}
+
+/// Validate the fields that [`append_item`] consumes from one inline `input`
+/// item, so a wrong-typed field is rejected with HTTP 400 rather than silently
+/// formatted into empty text and summarized/stored anyway (issue #1403).
+///
+/// The discriminant mirrors [`append_item`] exactly: a `function_call`,
+/// `function_call_output`, or `compaction` item consumes its own named fields,
+/// and every other kind — an explicit or untyped `message`, an `item_reference`,
+/// or any unrecognized type — reaches the catch-all arm that reads `role` and
+/// `content` (see [`validate_compact_message_like`]). A message's `content` and
+/// a function output's `output` are required `string | content-list` values, so
+/// absent/null/scalar values are rejected; an empty string or empty array is
+/// schema-valid emptiness and is accepted, contributing to a conversation that
+/// may compact to a no-op (issue #1139). The
+/// schema-required string fields are required here too, since the formatter would
+/// otherwise silently default them: `name`/`arguments` on a function call,
+/// `encrypted_content` on a compaction, and `role` on a message. The optional
+/// item `type`, when present, must be a concrete string, except that a null
+/// `type` is tolerated for a reference-shaped item (see
+/// [`validate_item_type_field`]).
+fn validate_compact_input_item(idx: usize, item: &Value) -> Result<(), FilterAction> {
+    if !item.is_object() {
+        return Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}] must be an object"),
+        ));
+    }
+    // A non-string `type` would be ignored by `append_item` and the item
+    // silently reinterpreted as a message, so reject it up front. A `null` is
+    // tolerated only for a reference-shaped item (see `validate_item_type_field`).
+    validate_item_type_field(idx, item)?;
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => {
+            // `name` and `arguments` are required strings in the Responses schema;
+            // `append_item` would otherwise silently default them ("unknown"/""),
+            // losing the call identity, so require a well-typed value (issue #1403).
+            require_string_item_field(idx, item, "name")?;
+            require_string_item_field(idx, item, "arguments")?;
+        },
+        Some("function_call_output") => {
+            // `output` is a required `string | content-list` in the Responses
+            // API; a missing, null, or scalar value would be summarized as empty
+            // text, so require a well-typed value here.
+            validate_required_text_field(idx, "output", item.get("output"))?;
+        },
+        Some("compaction") => {
+            // `encrypted_content` is a required string in the Responses compaction
+            // item; a missing or null value would be summarized as empty text and
+            // persisted as an empty compaction, so require it (issue #1403).
+            require_string_item_field(idx, item, "encrypted_content")?;
+        },
+        // Every other item — an explicit `message`, an untyped message, an
+        // `item_reference`, or any unrecognized type — is formatted by
+        // `append_item`'s catch-all arm, which reads `role` and `content`. Validate
+        // those consumed fields so a malformed value is rejected rather than
+        // silently dropped into an empty summary (issue #1403).
+        _ => validate_compact_message_like(idx, item)?,
+    }
+    Ok(())
+}
+
+/// Validate the `role`/`content` fields that [`append_item`]'s catch-all arm
+/// consumes for every item that is not a function call, function-call output, or
+/// compaction.
+///
+/// A genuine message — an explicit `type: "message"` or the untyped
+/// `EasyInputMessage` shorthand (no `type`, but a `role`) — requires a string
+/// `role` and a `string | content-list` `content`; a missing, null, or
+/// wrong-typed value for either would otherwise be silently defaulted (`role` to
+/// "unknown", `content` to empty text) and summarized/stored (issue #1403). An
+/// explicitly typed non-message item (`additional_tools`, `item_reference`,
+/// reasoning, …) is NOT a message even when it carries a `role`: it has no
+/// required `content`, and `append_item` emits nothing for it when `content` is
+/// empty, so it passes through. A `content` field present on any such item must
+/// still be well-typed, since `append_item` would drop a malformed value just the
+/// same.
+fn validate_compact_message_like(idx: usize, item: &Value) -> Result<(), FilterAction> {
+    let type_str = item.get("type").and_then(Value::as_str);
+    let is_message = matches!(type_str, Some("message")) || (type_str.is_none() && item.get("role").is_some());
+    if is_message {
+        // A message's `role` is a required string; `append_item` would otherwise
+        // default it to "unknown", losing the speaker (issue #1403).
+        require_string_item_field(idx, item, "role")?;
+    }
+    match item.get("content") {
+        Some(content) => validate_text_field_value(idx, "content", content),
+        None if is_message => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}].content must be a string or an array"),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Validate the item-level `type` discriminator against the two shapes the
+/// Responses schema allows it to be absent or null for. A non-string, non-null
+/// value is always rejected. An absent `type` is the untyped-message /
+/// item-reference shorthand and is tolerated. A `null` `type` is tolerated only
+/// for a reference-shaped item: one that carries a string `id` and neither
+/// `role` nor `content` (`ItemReferenceParam` requires a string `id` and allows
+/// `type` to be `anyOf: [enum "item_reference", null]`). A null `type` on
+/// anything else — a message-shaped item (one with a `role` or `content`) or an
+/// item with no `id` — is rejected, since the message type must be a string when
+/// present and `append_item` would otherwise read the null as absent and
+/// silently reinterpret the item as a defaulted, empty message (issue #1403).
+fn validate_item_type_field(idx: usize, item: &Value) -> Result<(), FilterAction> {
+    match item.get("type") {
+        None | Some(Value::String(_)) => Ok(()),
+        Some(Value::Null)
+            if item.get("id").and_then(Value::as_str).is_some()
+                && item.get("role").is_none()
+                && item.get("content").is_none() =>
+        {
+            Ok(())
+        },
+        Some(_) => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}].type must be a string"),
+        )),
+    }
+}
+
+/// Reject with HTTP 400 unless `field` is present on `item` as a string. Unlike
+/// [`validate_item_type_field`], which tolerates an absent (and, for a reference
+/// shape, null) `type`, a missing or null value is also rejected here, for a
+/// field the Responses schema requires and that `append_item` would otherwise
+/// silently replace with a default (issue #1403).
+fn require_string_item_field(idx: usize, item: &Value, field: &str) -> Result<(), FilterAction> {
+    match item.get(field) {
+        Some(Value::String(_)) => Ok(()),
+        _ => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}].{field} must be a string"),
+        )),
+    }
+}
+
+/// Validate a required `content`/`output` field against what the formatter
+/// reads: it must be present and be a string or a content-list (array of part
+/// objects), never absent or null. Both fields are required `string |
+/// content-list` in the Responses schema, so a missing or null value would
+/// otherwise be silently formatted into empty text and summarized/stored
+/// (issue #1403). An empty string or empty array is schema-valid emptiness and
+/// is accepted; a request whose collected conversation is empty compacts to a
+/// no-op (issue #1139).
+fn validate_required_text_field(idx: usize, field: &str, value: Option<&Value>) -> Result<(), FilterAction> {
+    match value {
+        Some(value) => validate_text_field_value(idx, field, value),
+        None => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}].{field} must be a string or an array"),
+        )),
+    }
+}
+
+/// Validate that a present `content`/`output` value is a string or a content-list
+/// (array of part objects). An explicit `null` or any scalar is rejected, since
+/// `append_item` would otherwise collapse it to empty text (issue #1403).
+fn validate_text_field_value(idx: usize, field: &str, value: &Value) -> Result<(), FilterAction> {
+    match value {
+        Value::String(_) => Ok(()),
+        Value::Array(parts) => validate_content_parts(idx, field, parts),
+        _ => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}].{field} must be a string or an array"),
+        )),
+    }
+}
+
+/// Validate the parts of a `content`/`output` array: each part must be an object,
+/// and a text part (`input_text` / `output_text` / `text`) must carry a string `text`,
+/// since the Responses schema requires it and `append_item` would otherwise
+/// silently drop a missing, null, or wrong-typed value to empty (issue #1403). A
+/// part of any other kind (image, file, refusal) carries no `text` and is left
+/// alone, matching the formatter; a stray `text` on such a part must still be a
+/// string if present.
+fn validate_content_parts(idx: usize, field: &str, parts: &[Value]) -> Result<(), FilterAction> {
+    for (part_idx, part) in parts.iter().enumerate() {
+        validate_content_part(idx, field, part_idx, part)?;
+    }
+    Ok(())
+}
+
+/// Validate a single content/output part. See [`validate_content_parts`].
+fn validate_content_part(idx: usize, field: &str, part_idx: usize, part: &Value) -> Result<(), FilterAction> {
+    if !part.is_object() {
+        return Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}].{field}[{part_idx}] must be an object"),
+        ));
+    }
+    // A content part's `type` discriminator is required and must be a concrete
+    // string. Without it (absent, null, or non-string) a text part's required
+    // `text` escapes validation and is silently dropped, and the translator would
+    // fail the part closed anyway (issue #1403).
+    if !matches!(part.get("type"), Some(Value::String(_))) {
+        return Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}].{field}[{part_idx}].type must be a string"),
+        ));
+    }
+    validate_part_text(idx, field, part_idx, part)
+}
+
+/// Validate a content part's `text` against its kind: the text kinds the
+/// translator collapses (`input_text` / `output_text` / `text`) require a string,
+/// other kinds may omit it, and a present non-string is always malformed
+/// (issue #1403). Keep the text-kind set in sync with
+/// `ConvertedContentParts::push` in the Chat translator.
+fn validate_part_text(idx: usize, field: &str, part_idx: usize, part: &Value) -> Result<(), FilterAction> {
+    let text_required = matches!(
+        part.get("type").and_then(Value::as_str),
+        Some("input_text" | "output_text" | "text")
+    );
+    let text_ok = match part.get("text") {
+        Some(Value::String(_)) => true,
+        None | Some(Value::Null) => !text_required,
+        Some(_) => false,
+    };
+    if text_ok {
+        Ok(())
+    } else {
+        Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("input[{idx}].{field}[{part_idx}].text must be a string"),
+        ))
     }
 }
 
@@ -627,28 +1223,58 @@ fn resolve_store_and_owner(
 /// Assemble the conversation to compact from stored history and inline input.
 ///
 /// When `previous_response_id` is set, its stored messages are loaded
-/// first and the inline `input` items are appended after.
+/// first and the inline `input` items are appended after. The result may be
+/// empty — `model` is the only required field, so a schema-valid request can
+/// carry no conversation at all — and an empty conversation is compacted as a
+/// no-op by the caller (issue #1139).
 async fn collect_compact_messages(
     store: &OwnerScopedResponseStore,
-    req: &ExplicitCompactRequest,
+    req: &mut ExplicitCompactRequest,
+    budget: &mut Option<SimpleBudget>,
 ) -> Result<Vec<Value>, FilterAction> {
     let mut messages = Vec::new();
     if let Some(prev) = req.previous_response_id.as_deref() {
-        let record = fetch_response(store, prev).await?;
+        let record = fetch_response(store, prev, budget).await?;
         messages.extend(stored_message_array(record.messages));
     }
-    messages.extend(req.input.iter().cloned());
-    if messages.is_empty() {
-        return Err(reject_compact(400, "invalid_request_error", "no messages to compact"));
-    }
+    messages.append(&mut req.input);
     Ok(messages)
 }
 
 /// Fetch a stored response by id.
-async fn fetch_response(store: &OwnerScopedResponseStore, response_id: &str) -> Result<ResponseRecord, FilterAction> {
-    match store.get_response(response_id).await {
-        Ok(Some(r)) => Ok(r),
+#[expect(
+    clippy::too_many_lines,
+    reason = "bounded Store lookup and post-read charge form one admission step"
+)]
+async fn fetch_response(
+    store: &OwnerScopedResponseStore,
+    response_id: &str,
+    budget: &mut Option<SimpleBudget>,
+) -> Result<ResponseRecord, FilterAction> {
+    let result = match budget {
+        Some(budget) => {
+            let remaining = budget.remaining_bytes().unwrap_or(0);
+            store
+                .get_response_bounded(response_id, remaining / COMPACTION_STORE_MULTIPLIER)
+                .await
+        },
+        None => store.get_response(response_id).await,
+    };
+    match result {
+        Ok(Some(r)) => {
+            if let Some(budget) = budget.as_mut() {
+                let bytes = count_json_bytes(&r.response_object)
+                    .and_then(|size| size.checked_add(count_json_bytes(&r.input)?))
+                    .and_then(|size| size.checked_add(count_json_bytes(&r.messages)?))
+                    .and_then(|size| size.checked_add(r.model.len()))
+                    .and_then(|size| size.checked_add(r.id.len()))
+                    .ok_or_else(reject_compaction_budget)?;
+                reserve_compact_bytes(budget, bytes, COMPACTION_STORE_MULTIPLIER)?;
+            }
+            Ok(r)
+        },
         Ok(None) => Err(reject_compact(404, "not_found_error", "response not found")),
+        Err(StoreError::PayloadTooLarge) if budget.is_some() => Err(reject_compaction_budget()),
         Err(e) => {
             warn!(error = %e, "failed to fetch response for compact");
             Err(reject_compact(500, "server_error", "failed to fetch response"))
@@ -664,6 +1290,252 @@ fn stored_message_array(messages: Value) -> Vec<Value> {
     }
 }
 
+/// Reject source items the text-only summarizer cannot safely represent.
+///
+/// Syntax validation deliberately accepts all Responses content kinds. This
+/// separate check runs only once compaction will replace the source, preventing
+/// images, files, audio, and other non-text items from being silently discarded.
+/// Reasoning items have explicit handling below: safe summaries are rendered,
+/// while raw reasoning text is deliberately omitted and encrypted state fails closed.
+fn validate_compaction_source<I>(messages: I) -> Result<(), FilterAction>
+where
+    I: IntoIterator,
+    I::Item: std::ops::Deref<Target = Value>,
+{
+    for (idx, item) in messages.into_iter().enumerate() {
+        let item = &*item;
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {},
+            Some("compaction") if decode_compaction_summary(item).is_some() => {},
+            Some("compaction") => return Err(reject_unrepresentable_item(idx, "compaction")),
+            Some("function_call_output") => {
+                validate_representable_text_field(idx, "output", item.get("output"))?;
+            },
+            Some("reasoning") => validate_compactable_reasoning_item(idx, item)?,
+            Some("message") => {
+                validate_representable_text_field(idx, "content", item.get("content"))?;
+            },
+            None if item.get("role").is_some() => {
+                validate_representable_text_field(idx, "content", item.get("content"))?;
+            },
+            Some(kind) => return Err(reject_unrepresentable_item(idx, kind)),
+            None if item.get("id").is_some() => return Err(reject_unrepresentable_item(idx, "item_reference")),
+            None => return Err(reject_unrepresentable_item(idx, "untyped non-message")),
+        }
+    }
+    Ok(())
+}
+
+/// Validate the reasoning fields that compaction can safely retain.
+///
+/// A reasoning item's `summary` is safe text and is included in the
+/// summarization prompt. Raw `reasoning_text` is intentionally omitted and is
+/// discarded with the compacted source, so chain-of-thought is not sent to the
+/// summarizer. Provider-encrypted reasoning is opaque and cannot be represented
+/// by the text-only compaction item, so it remains fail-closed.
+fn validate_compactable_reasoning_item(item_idx: usize, item: &Value) -> Result<(), FilterAction> {
+    validate_reasoning_item_fields(item_idx, item)?;
+    validate_reasoning_item_metadata(item_idx, item)?;
+    validate_reasoning_summary(item_idx, item)?;
+    validate_reasoning_content(item_idx, item)
+}
+
+/// Reject reasoning fields that the compaction prompt cannot represent.
+fn validate_reasoning_item_fields(item_idx: usize, item: &Value) -> Result<(), FilterAction> {
+    const ALLOWED_FIELDS: &[&str] = &["type", "id", "status", "summary", "content", "encrypted_content"];
+
+    if let Some(object) = item.as_object() {
+        for key in object.keys() {
+            if !ALLOWED_FIELDS.contains(&key.as_str()) {
+                return Err(reject_reasoning_compaction(
+                    item_idx,
+                    &format!("reasoning.{key} cannot be represented in the summary"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate reasoning identifiers, status, and opaque provider state.
+fn validate_reasoning_item_metadata(item_idx: usize, item: &Value) -> Result<(), FilterAction> {
+    if item.get("encrypted_content").is_some_and(|value| !value.is_null()) {
+        return Err(reject_reasoning_compaction(
+            item_idx,
+            "encrypted reasoning cannot be represented in the summary",
+        ));
+    }
+    if !item.get("id").is_some_and(Value::is_string) {
+        return Err(reject_reasoning_compaction(item_idx, "reasoning.id must be a string"));
+    }
+    if let Some(status) = item.get("status")
+        && !status.is_null()
+        && !matches!(status.as_str(), Some("in_progress" | "completed" | "incomplete"))
+    {
+        return Err(reject_reasoning_compaction(
+            item_idx,
+            "reasoning.status is not representable",
+        ));
+    }
+    Ok(())
+}
+
+/// Require the reasoning summary to contain only plain summary text.
+fn validate_reasoning_summary(item_idx: usize, item: &Value) -> Result<(), FilterAction> {
+    let Some(Value::Array(summary)) = item.get("summary") else {
+        return Err(reject_reasoning_compaction(
+            item_idx,
+            "reasoning.summary must be an array",
+        ));
+    };
+    for (part_idx, part) in summary.iter().enumerate() {
+        if !is_reasoning_text_part(part, "summary_text") {
+            return Err(reject_reasoning_compaction(
+                item_idx,
+                &format!("reasoning.summary[{part_idx}] is not representable"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate optional raw reasoning content without including it in compaction.
+fn validate_reasoning_content(item_idx: usize, item: &Value) -> Result<(), FilterAction> {
+    let Some(content) = item.get("content") else {
+        return Ok(());
+    };
+    let Value::Array(parts) = content else {
+        return Err(reject_reasoning_compaction(
+            item_idx,
+            "reasoning.content must be an array",
+        ));
+    };
+    for (part_idx, part) in parts.iter().enumerate() {
+        if !is_reasoning_text_part(part, "reasoning_text") {
+            return Err(reject_reasoning_compaction(
+                item_idx,
+                &format!("reasoning.content[{part_idx}] is not representable"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check that a reasoning part contains only its expected type and text fields.
+fn is_reasoning_text_part(part: &Value, expected_type: &str) -> bool {
+    part.get("type").and_then(Value::as_str) == Some(expected_type)
+        && part.get("text").is_some_and(Value::is_string)
+        && part.as_object().is_some_and(|object| object.len() == 2)
+}
+
+/// Build a fail-closed rejection for a reasoning item that cannot be compacted.
+fn reject_reasoning_compaction(item_idx: usize, detail: &str) -> FilterAction {
+    reject_compact(
+        400,
+        "invalid_request_error",
+        &format!("compaction cannot replace source item {item_idx}: {detail}"),
+    )
+}
+
+/// Validate only the prefix that [`replace_messages`] will discard.
+fn validate_reactive_compaction_source(state: &ResponsesState) -> Result<(), FilterAction> {
+    let replaced_len = state.messages.len().saturating_sub(state.input.len());
+    validate_compaction_source(state.messages.iter().take(replaced_len))
+}
+
+/// Charge the explicit endpoint for retaining its validated source history.
+fn reserve_explicit_compact_source(budget: Option<&mut SimpleBudget>, messages: &[Value]) -> Result<(), FilterAction> {
+    if let Some(budget) = budget {
+        reserve_compact_json(budget, &messages, COMPACTION_SOURCE_MULTIPLIER)?;
+    }
+    Ok(())
+}
+
+/// A compaction text field is representable only when every part is textual.
+fn validate_representable_text_field(item_idx: usize, field: &str, value: Option<&Value>) -> Result<(), FilterAction> {
+    match value {
+        Some(Value::String(_)) => Ok(()),
+        Some(Value::Array(parts)) => {
+            for (part_idx, part) in parts.iter().enumerate() {
+                let kind = part.get("type").and_then(Value::as_str).unwrap_or("unknown");
+                if !matches!(kind, "input_text" | "output_text" | "text")
+                    || !matches!(part.get("text"), Some(Value::String(_)))
+                {
+                    return Err(reject_compact(
+                        400,
+                        "invalid_request_error",
+                        &format!(
+                            "compaction cannot replace source item {item_idx}: {field}[{part_idx}] has non-text type `{kind}` that cannot be represented in the summary"
+                        ),
+                    ));
+                }
+                validate_text_part_metadata(item_idx, field, part_idx, kind, part)?;
+            }
+            Ok(())
+        },
+        _ => Err(reject_compact(
+            400,
+            "invalid_request_error",
+            &format!("compaction cannot replace source item {item_idx}: {field} cannot be represented in the summary"),
+        )),
+    }
+}
+
+/// Reject text-part fields that the summary renderer would silently omit.
+///
+/// OpenAI output text commonly carries empty `annotations` and `logprobs`
+/// arrays, which contain no information and remain safe to collapse to text.
+/// Non-empty values and unknown extension fields are semantic metadata and
+/// therefore make the source unrepresentable.
+fn validate_text_part_metadata(
+    item_idx: usize,
+    field: &str,
+    part_idx: usize,
+    kind: &str,
+    part: &Value,
+) -> Result<(), FilterAction> {
+    let Some(object) = part.as_object() else {
+        return Err(reject_unrepresentable_part_metadata(
+            item_idx,
+            field,
+            part_idx,
+            "non-object part",
+        ));
+    };
+    for (key, value) in object {
+        let represented = matches!(key.as_str(), "type" | "text");
+        let empty_output_metadata = kind == "output_text"
+            && matches!(key.as_str(), "annotations" | "logprobs")
+            && (value.is_null() || value.as_array().is_some_and(Vec::is_empty));
+        if !represented && !empty_output_metadata {
+            return Err(reject_unrepresentable_part_metadata(item_idx, field, part_idx, key));
+        }
+    }
+    Ok(())
+}
+
+/// Build a rejection for semantic content-part metadata omitted by rendering.
+fn reject_unrepresentable_part_metadata(item_idx: usize, field: &str, part_idx: usize, key: &str) -> FilterAction {
+    reject_compact(
+        400,
+        "invalid_request_error",
+        &format!(
+            "compaction cannot replace source item {item_idx}: {field}[{part_idx}].{key} cannot be represented in the summary"
+        ),
+    )
+}
+
+/// Build the fail-closed rejection for a non-text conversation item.
+fn reject_unrepresentable_item(item_idx: usize, kind: &str) -> FilterAction {
+    reject_compact(
+        400,
+        "invalid_request_error",
+        &format!(
+            "compaction cannot replace source item {item_idx}: item type `{kind}` cannot be represented in the summary"
+        ),
+    )
+}
+
 /// Borrows everything needed to build and persist an explicit compaction
 /// result, so the persist paths read as methods rather than long argument lists.
 struct CompactionWriter<'a> {
@@ -671,7 +1543,7 @@ struct CompactionWriter<'a> {
     filter: &'a CompactFilter,
     /// Request context, used for id and timestamp generation.
     ctx: &'a HttpFilterContext<'a>,
-    /// Response store the compaction record is persisted to.
+    /// Responses store the compaction record is persisted through.
     store: &'a OwnerScopedResponseStore,
     /// Immutable owner the record is scoped to.
     owner: &'a StateOwner,
@@ -685,42 +1557,77 @@ impl CompactionWriter<'_> {
     /// Persist the compaction result for a successful summarization. The
     /// response `output` and the persisted history are the same single
     /// compaction item.
-    async fn persist_compacted(&self, summary: &Summarization) -> Result<Value, FilterAction> {
+    async fn persist_compacted(
+        &self,
+        summary: &Summarization,
+        budget: &mut Option<SimpleBudget>,
+    ) -> Result<Value, FilterAction> {
+        if let Some(budget) = budget.as_mut() {
+            let size = summary
+                .content
+                .len()
+                .checked_add(self.filter.config.summary_prefix.len())
+                .and_then(|size| size.checked_add(1_024))
+                .ok_or_else(reject_compaction_budget)?;
+            reserve_compact_bytes(budget, size, COMPACTION_PERSIST_MULTIPLIER)?;
+        }
         let compaction_id = format!("compact_{}", self.ctx.id_generator.generate(self.ctx.time_source));
-        let item = Value::Array(vec![build_compaction_item(
-            &compaction_id,
-            &summary.content,
-            &self.filter.config.summary_prefix,
-        )]);
+        let item = build_compaction_item(&compaction_id, &summary.content, &self.filter.config.summary_prefix);
+        let stored_item = mark_local_compaction_item(&item);
         let usage = build_compaction_usage(self.messages, Some(summary), &self.filter.config.tiktoken_encoding);
-        self.persist_response(item.clone(), item, usage).await
+        self.persist_response(Value::Array(vec![item]), Value::Array(vec![stored_item]), usage, budget)
+            .await
     }
 
-    /// Persist an uncompacted no-op when the summarization callout fails under
-    /// `on_failure: open`.
+    /// Persist an uncompacted no-op: either the summarization callout failed
+    /// under `on_failure: open`, or the collected conversation is schema-valid
+    /// but empty (issue #1139), in which case there was nothing to summarize.
     ///
     /// The response `output` is an empty array: there is no summary, so no
     /// `compaction` item is emitted, and its absence is the caller's no-op
     /// signal. Returning the raw `{role, content}` messages instead would
     /// violate the Responses output schema (items require `type`/`id`/`status`).
     /// The intact conversation is still persisted as the record's history so a
-    /// follow-up request referencing this response id rehydrates it in full.
-    async fn persist_uncompacted(&self) -> Result<Value, FilterAction> {
+    /// follow-up request referencing this response id rehydrates it in full
+    /// (an empty conversation persists an empty history).
+    async fn persist_uncompacted(&self, budget: &mut Option<SimpleBudget>) -> Result<Value, FilterAction> {
+        if let Some(budget) = budget.as_mut() {
+            reserve_compact_json(budget, &self.messages, COMPACTION_PERSIST_MULTIPLIER)?;
+        }
         let usage = build_compaction_usage(self.messages, None, &self.filter.config.tiktoken_encoding);
-        self.persist_response(Value::Array(Vec::new()), Value::Array(self.messages.to_vec()), usage)
-            .await
+        self.persist_response(
+            Value::Array(Vec::new()),
+            Value::Array(self.messages.to_vec()),
+            usage,
+            budget,
+        )
+        .await
     }
 
     /// Assemble the `response.compaction` object, persist the record, and return
     /// the object. `output` is the API-facing output array; `stored_messages` is
     /// the history persisted for rehydration continuity (the two differ on
     /// fail-open).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "response assembly and Store persistence share one reserved projection"
+    )]
     async fn persist_response(
         &self,
         output: Value,
         stored_messages: Value,
         usage: Value,
+        budget: &mut Option<SimpleBudget>,
     ) -> Result<Value, FilterAction> {
+        if let Some(budget) = budget.as_mut() {
+            let bytes = count_json_bytes(&output)
+                .and_then(|size| size.checked_add(count_json_bytes(&stored_messages)?))
+                .and_then(|size| size.checked_add(count_json_bytes(&usage)?))
+                .and_then(|size| size.checked_add(self.req.model.len()))
+                .and_then(|size| size.checked_add(1_024))
+                .ok_or_else(reject_compaction_budget)?;
+            reserve_compact_bytes(budget, bytes, COMPACTION_PERSIST_MULTIPLIER)?;
+        }
         let resp_id = format!("resp_{}", self.ctx.id_generator.generate(self.ctx.time_source));
         let created_at = i64::try_from(self.ctx.time_source.now().as_secs()).unwrap_or(i64::MAX);
         let response_object = serde_json::json!({
@@ -1001,22 +1908,26 @@ fn build_compaction_item(id: &str, summary: &str, summary_prefix: &str) -> Value
 /// matches `state.input`. File resolution and document extraction
 /// rewrite that tail in place and leave `state.input` as the original
 /// client payload, so compaction must not rebuild from `state.input`.
-fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {
+fn replace_messages(state: &mut ResponsesState, compaction_item: &Value) {
     let input_len = state.input.len();
-    let message_tail = split_current_turn(&mut state.messages, input_len);
-    let persisted_tail = split_current_turn(&mut state.persisted_messages, input_len);
+    let mut message_tail = split_current_turn(&mut state.messages, input_len);
+    let mut persisted_tail = split_current_turn(&mut state.persisted_messages, input_len);
+    // The replay view carries the unmarked compaction item while the persisted
+    // copy is marked, so the two views genuinely differ and cannot share one
+    // payload. Rehydration strips the marker from the replay projection.
+    let persisted_compaction_item = mark_local_compaction_item(compaction_item);
 
     state.messages.clear();
     state.messages.push(compaction_item.clone());
-    state.messages.extend(message_tail);
+    state.messages.append(&mut message_tail);
 
     state.persisted_messages.clear();
-    state.persisted_messages.push(compaction_item);
-    state.persisted_messages.extend(persisted_tail);
+    state.persisted_messages.push(persisted_compaction_item);
+    state.persisted_messages.append(&mut persisted_tail);
 }
 
 /// Move the current-turn tail off `items`, leaving history behind to drop.
-fn split_current_turn(items: &mut Vec<Value>, input_len: usize) -> Vec<Value> {
+fn split_current_turn(items: &mut MessageHistory, input_len: usize) -> MessageHistory {
     let start = items.len().saturating_sub(input_len);
     items.split_off(start)
 }
@@ -1045,9 +1956,10 @@ fn build_context_overhead_text(request_body: &Value) -> String {
 /// Format a message array as readable text for the summarization prompt.
 ///
 /// Each message becomes `<label>: <text>`, separated by blank lines.
-/// Handles regular messages, tool calls, tool outputs, and prior compaction items.
-fn build_conversation_text(messages: &[Value]) -> String {
-    let mut buf = String::with_capacity(messages.len() * 100);
+/// Handles regular messages, tool calls, tool outputs, reasoning summaries, and prior compaction items.
+fn build_conversation_text<'a>(messages: impl IntoIterator<Item = &'a Value> + 'a) -> String {
+    let messages = messages.into_iter();
+    let mut buf = String::with_capacity(messages.size_hint().0 * 100);
     for msg in messages {
         append_item(&mut buf, msg);
     }
@@ -1058,15 +1970,18 @@ fn build_conversation_text(messages: &[Value]) -> String {
 fn append_item(buf: &mut String, msg: &Value) {
     match msg.get("type").and_then(Value::as_str) {
         Some("compaction") => append_compaction_summary(buf, msg),
+        Some("reasoning") => append_reasoning_summary(buf, msg),
         Some("function_call") => {
             let name = msg.get("name").and_then(Value::as_str).unwrap_or("unknown");
             let args = msg.get("arguments").and_then(Value::as_str).unwrap_or("");
             append_function_call(buf, name, args);
         },
         Some("function_call_output") => {
-            let output = msg.get("output").and_then(Value::as_str).unwrap_or("");
+            // `output` is `string | content-list`; join the parts' text the same
+            // way message content is handled so an array output is not dropped.
+            let output = extract_text_parts(msg.get("output"));
             if !output.is_empty() {
-                append_line(buf, "function_call_output", output);
+                append_line(buf, "function_call_output", &output);
             }
         },
         _ => {
@@ -1076,6 +1991,22 @@ fn append_item(buf: &mut String, msg: &Value) {
                 append_line(buf, role, &content);
             }
         },
+    }
+}
+
+/// Append only the safe summary from a reasoning item, never raw reasoning text.
+fn append_reasoning_summary(buf: &mut String, msg: &Value) {
+    let Some(parts) = msg.get("summary").and_then(Value::as_array) else {
+        return;
+    };
+    let mut summary = String::new();
+    for part in parts {
+        if let Some(text) = part.get("text").and_then(Value::as_str) {
+            summary.push_str(text);
+        }
+    }
+    if !summary.is_empty() {
+        append_line(buf, "assistant reasoning summary", &summary);
     }
 }
 
@@ -1089,21 +2020,20 @@ fn append_line(buf: &mut String, label: &str, text: &str) {
     buf.push_str(text);
 }
 
-/// Append a compaction item's summary to the buffer.
+/// Decode a non-empty UTF-8 compaction summary from `encrypted_content`.
 ///
-/// Decodes `encrypted_content` and borrows the result as `&str` directly,
-/// avoiding the `String::from_utf8` conversion that would copy the buffer.
+/// `String::from_utf8` reuses the decoded byte allocation, so validation and
+/// rendering share one definition of representability without another copy.
+fn decode_compaction_summary(msg: &Value) -> Option<String> {
+    let encoded = msg.get("encrypted_content").and_then(Value::as_str)?;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    String::from_utf8(decoded).ok().filter(|summary| !summary.is_empty())
+}
+
+/// Append a representable compaction item's summary to the buffer.
 fn append_compaction_summary(buf: &mut String, msg: &Value) {
-    let Some(encoded) = msg.get("encrypted_content").and_then(Value::as_str) else {
-        return;
-    };
-    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
-        return;
-    };
-    if let Ok(summary) = std::str::from_utf8(&decoded)
-        && !summary.is_empty()
-    {
-        append_line(buf, "[previous context summary]", summary);
+    if let Some(summary) = decode_compaction_summary(msg) {
+        append_line(buf, "[previous context summary]", &summary);
     }
 }
 
@@ -1120,26 +2050,34 @@ fn append_function_call(buf: &mut String, name: &str, args: &str) {
 }
 
 /// Extract text content from a message's `content` field.
+fn extract_content(msg: &Value) -> Cow<'_, str> {
+    extract_text_parts(msg.get("content"))
+}
+
+/// Extract text from a `content` or `output` field value.
 ///
-/// Content can be a plain string, an array of content parts
+/// The value can be a plain string, an array of content parts
 /// (each with a `"text"` field), or absent/null.
 ///
-/// Returns `Cow::Borrowed` for plain strings (zero-copy) and
-/// `Cow::Owned` for array content that must be joined.
-fn extract_content(msg: &Value) -> Cow<'_, str> {
-    let Some(content) = msg.get("content") else {
+/// Returns `Cow::Borrowed` for plain strings (zero-copy) and `Cow::Owned` for
+/// array content that must be joined. Adjacent text parts are concatenated with
+/// no separator, matching how the Responses-to-Chat translation joins text
+/// (`convert_function_call_output` and the text-only content collapse, both
+/// joined with no separator), so `"pass"` + `"word"` reads as `"password"` just
+/// as the backend would see it. The renderer itself remains text-only; callers
+/// must validate every item they will replace and may omit non-text content only
+/// from a current-turn tail that remains preserved verbatim.
+fn extract_text_parts(value: Option<&Value>) -> Cow<'_, str> {
+    let Some(value) = value else {
         return Cow::Borrowed("");
     };
-    if let Some(s) = content.as_str() {
+    if let Some(s) = value.as_str() {
         return Cow::Borrowed(s);
     }
-    if let Some(arr) = content.as_array() {
+    if let Some(arr) = value.as_array() {
         let mut joined = String::new();
         for part in arr {
             if let Some(text) = part.get("text").and_then(Value::as_str) {
-                if !joined.is_empty() {
-                    joined.push(' ');
-                }
                 joined.push_str(text);
             }
         }

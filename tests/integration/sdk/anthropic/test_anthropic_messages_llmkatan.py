@@ -100,7 +100,7 @@ def _write_config(proxy_port: int) -> str:
 
     Exercises the real example config (per repo test requirements) with
     only retargeting — listener at a free port, backend at llm-katan —
-    mirroring _write_file_search_chat_config in the OpenAI SDK tests.
+    mirroring the shipped-example retargeting the OpenAI SDK tests apply.
     The example's format+validate chain is what
     test_malformed_json_rejected asserts: the proxy, not the backend,
     rejects malformed bodies with invalid_request_error.
@@ -329,7 +329,7 @@ class TestAnthropicMessagesLLMKatan:
 
 
     def test_malformed_json_rejected(self, anthropic_client, praxis_proxy):
-        """Verify anthropic_validate rejects malformed JSON end-to-end."""
+        """Verify anthropic_messages_request rejects malformed JSON end-to-end."""
         import httpx
 
         resp = httpx.post(

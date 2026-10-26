@@ -13,10 +13,15 @@ on:
   push:
     branches: [main]
     paths:
+      - "store/**"
+      - "store-backends/**"
+      - "store-lifecycle/**"
       - "apis/src/openai/responses/**"
+      - "apis/src/openai/translation/**"
       - "apis/src/openai/conversations/**"
       - "apis/src/openai/sse/**"
       - "apis/src/store/**"
+      - "apis/src/service/**"
       - "server/**"
       - "tests/integration/sdk/openai/**"
       - "tests/utils/examples/conversations_tenant_proxy.rs"
@@ -25,6 +30,13 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "Makefile"
+      - "vllm/Containerfile"
+      - "vllm/images.json"
+      - ".github/scripts/vllm_qualification.py"
+      - "tests/integration/sdk/openai/qualification_plugin.py"
+      - ".github/actions/build-vllm-gpu/**"
+      - ".github/actions/resolve-vllm-gpu-image/**"
+      - ".github/actions/vllm-image-spec/**"
       - ".github/actions/start-vllm/**"
       - ".github/actions/wait-vllm/**"
       - ".github/workflows/vllm-integration.yaml"
@@ -53,11 +65,49 @@ on:
         required: false
         default: false
         type: boolean
+      run_degradation_acceptance:
+        description: >-
+          Run only the two translated Claude Code cases (acceptEdits and
+          client-classified auto mode) that exercise operator-approved
+          degradation: a default-feature pinned client sends thinking and
+          cache_control, and the translator strips them so the loop completes
+          against vLLM's Chat Completions surface. When this is the only
+          selected input it skips the native, planning, and Anthropic SDK steps
+          and the complete Responses SDK suite.
+        required: false
+        default: false
+        type: boolean
       run_codex_acceptance:
         description: >-
           Run pinned Codex through native Responses and translated Chat paths
           against real Qwen3-8B. When run_live_vllm is false, this skips the
           complete Responses SDK suite.
+        required: false
+        default: false
+        type: boolean
+      run_opencode_acceptance:
+        description: >-
+          Run pinned OpenCode 1.x and 2.x through the native Chat Completions
+          path against real Qwen3-8B. When run_live_vllm is false, this skips the complete
+          Responses SDK suite.
+        required: false
+        default: false
+        type: boolean
+      run_pi_acceptance:
+        description: >-
+          Run pinned pi through the native Chat Completions path against real
+          Qwen3-8B. When run_live_vllm is false, this skips the complete
+          Responses SDK suite.
+        required: false
+        default: false
+        type: boolean
+      run_compaction_only:
+        description: >-
+          Debug fast path: run ONLY the two self-compaction acceptance tests
+          (Claude Code and Codex) on a GPU runner. Skips the complete Responses
+          SDK suite and every other acceptance step so iterations are quick.
+          Implies both acceptance jobs regardless of run_claude_acceptance and
+          run_codex_acceptance.
         required: false
         default: false
         type: boolean
@@ -79,10 +129,15 @@ env:
   CARGO_TERM_COLOR: always
   VLLM_IMAGE: "quay.io/opendatahub/vllm-cpu:Qwen3-0.6B-granite-embedding-125m-english@sha256:0212dc82981178033cb71c7477ba8ad1998fb6c0b1ee40646119fb9724ac951b"
   VLLM_MODEL: "Qwen/Qwen3-0.6B"
-  # CUDA image used by the GPU full-suite jobs on the ephemeral EC2 runner.
-  # The model is downloaded from Hugging Face at container start (not baked in),
-  # unlike the CPU image above.
-  VLLM_GPU_IMAGE: "docker.io/vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2"
+  # Use the CUDA 13 default image. The v0.32.0-cu129 image resolves a CUDA 13
+  # torchcodec wheel, which fails to import because libnvrtc.so.13 is absent.
+  VLLM_GPU_IMAGE: "docker.io/vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34"
+  # The full suite's model-baked image is NOT pinned here: it is described by
+  # vllm/images.json and published by vllm-gpu-container.yaml. The job reads the
+  # manifest, reuses the published build when it matches this checkout, and
+  # exports the resolved reference as VLLM_BUILT_GPU_IMAGE for the qualification
+  # record.
+  #
   # Model served on the GPU runner. A capable model is required for reliable
   # tool-calling (file_search, MCP) — the 0.6B CPU model above is not. Qwen3-8B
   # fits the A10G (24GB) used by the g5.xlarge GPU runner with FlashAttention-2.
@@ -91,7 +146,7 @@ env:
   # capability 8.6, so FlashAttention-2 is available).
   GPU_INSTANCE_TYPE: "g5.xlarge"
   # The custom GPU runner service does not guarantee HOME is exported. Keep the
-  # model cache at an explicit instance-local path shared by sequential jobs.
+  # model cache at an explicit instance-local path shared by the acceptance jobs.
   GPU_HF_CACHE_DIR: /tmp/praxis-huggingface
   # llm-d-inference-sim v0.11.2 multi-architecture image index.
   INFERENCE_SIM_IMAGE: "ghcr.io/llm-d/llm-d-inference-sim@sha256:32144df791330a0006b747edfdf2b114a0fe728e023a9d1b3463eeb48d32abb9"
@@ -130,10 +185,15 @@ jobs:
           HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- \
+            'store/' \
+            'store-backends/' \
+            'store-lifecycle/' \
             'apis/src/openai/responses/' \
+            'apis/src/openai/translation/' \
             'apis/src/openai/conversations/' \
             'apis/src/openai/sse/' \
             'apis/src/store/' \
+            'apis/src/service/' \
             'server/' \
             'tests/integration/sdk/openai/' \
             'tests/utils/examples/conversations_tenant_proxy.rs' \
@@ -142,6 +202,13 @@ jobs:
             'Cargo.toml' \
             'Cargo.lock' \
             'Makefile' \
+            'vllm/Containerfile' \
+            'vllm/images.json' \
+            '.github/scripts/vllm_qualification.py' \
+            'tests/integration/sdk/openai/qualification_plugin.py' \
+            '.github/actions/build-vllm-gpu/' \
+            '.github/actions/resolve-vllm-gpu-image/' \
+            '.github/actions/vllm-image-spec/' \
             '.github/actions/start-vllm/' \
             '.github/actions/wait-vllm/' \
             '.github/workflows/vllm-integration.yaml')
@@ -161,7 +228,7 @@ jobs:
       always() &&
       github.event_name != 'schedule' &&
       (github.event_name != 'pull_request' || github.event.action != 'labeled') &&
-      (github.event_name != 'workflow_dispatch' || !inputs.run_live_vllm) &&
+      (github.event_name != 'workflow_dispatch' || (!inputs.run_live_vllm && !inputs.run_degradation_acceptance)) &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -176,10 +243,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every
@@ -249,12 +316,19 @@ jobs:
             exit 1
           fi
 
-      - name: Run Conversations SDK integration tests
+      - name: Run Conversations SDK integration tests (SDK 2.x)
         env:
           PRAXIS_TENANT_TEST_BIN: target/debug/examples/conversations_tenant_proxy
           VLLM_MODEL: ${{ env.INFERENCE_SIM_MODEL }}
         run: |
-          uv run tests/integration/sdk/openai/test_openai_conversations.py -s
+          uv run --with "openai<3" tests/integration/sdk/openai/test_openai_conversations.py -s --sdk-version=2.x
+
+      - name: Run Conversations SDK integration tests (SDK 3.x)
+        env:
+          PRAXIS_TENANT_TEST_BIN: target/debug/examples/conversations_tenant_proxy
+          VLLM_MODEL: ${{ env.INFERENCE_SIM_MODEL }}
+        run: |
+          uv run --with "openai>=3,<4" tests/integration/sdk/openai/test_openai_conversations.py -s --sdk-version=3.x
 
       - name: Wait for OGX readiness
         run: |
@@ -285,14 +359,32 @@ jobs:
           done
           echo "OGX is ready"
 
-      - name: Run simulated Responses integration tests
+      - name: Run simulated Responses integration tests (SDK 2.x)
         env:
           VLLM_MODEL: ${{ env.INFERENCE_SIM_MODEL }}
           VLLM_TEST_BACKEND: simulator
         run: |
           test_cmd=(
-            uv run tests/integration/sdk/openai/test_openai_responses_vllm.py
-            -s -m "not real_inference and not vllm_compat"
+            uv run --with "openai<3" tests/integration/sdk/openai/test_openai_responses_vllm.py
+            -s -m "not real_inference and not vllm_compat" --sdk-version=2.x
+          )
+          if "${test_cmd[@]}"; then
+            exit 0
+          fi
+          if [ "$GITHUB_EVENT_NAME" != "merge_group" ]; then
+            exit 1
+          fi
+          echo "::warning::Retrying failed simulator tests once for the merge queue"
+          "${test_cmd[@]}" --last-failed --last-failed-no-failures none
+
+      - name: Run simulated Responses integration tests (SDK 3.x)
+        env:
+          VLLM_MODEL: ${{ env.INFERENCE_SIM_MODEL }}
+          VLLM_TEST_BACKEND: simulator
+        run: |
+          test_cmd=(
+            uv run --with "openai>=3,<4" tests/integration/sdk/openai/test_openai_responses_vllm.py
+            -s -m "not real_inference and not vllm_compat" --sdk-version=3.x
           )
           if "${test_cmd[@]}"; then
             exit 0
@@ -333,7 +425,7 @@ jobs:
     if: |
       always() &&
       github.event_name != 'schedule' &&
-      (github.event_name != 'workflow_dispatch' || !inputs.run_live_vllm) &&
+      (github.event_name != 'workflow_dispatch' || (!inputs.run_live_vllm && !inputs.run_degradation_acceptance)) &&
       (github.event_name != 'pull_request' || github.event.action != 'labeled') &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
@@ -349,10 +441,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -436,7 +528,7 @@ jobs:
   # ----------------------------------------------------------------------------
 
   pins:
-    name: Load Claude Code + vLLM acceptance pins
+    name: Load Claude Code + OpenCode + pi + vLLM acceptance pins
     if: >-
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
@@ -455,6 +547,19 @@ jobs:
       vllm_image: ${{ steps.load.outputs.vllm_image }}
       vllm_served_model: ${{ steps.load.outputs.vllm_served_model }}
       vllm_flags: ${{ steps.load.outputs.vllm_flags }}
+      opencode_version: ${{ steps.load.outputs.opencode_version }}
+      opencode_install: ${{ steps.load.outputs.opencode_install }}
+      opencode_npm_package: ${{ steps.load.outputs.opencode_npm_package }}
+      opencode_url: ${{ steps.load.outputs.opencode_url }}
+      opencode_sha256: ${{ steps.load.outputs.opencode_sha256 }}
+      opencode_model: ${{ steps.load.outputs.opencode_model }}
+      opencode_vllm_image: ${{ steps.load.outputs.opencode_vllm_image }}
+      opencode_vllm_flags: ${{ steps.load.outputs.opencode_vllm_flags }}
+      opencode_v2_version: ${{ steps.load.outputs.opencode_v2_version }}
+      opencode_v2_platform: ${{ steps.load.outputs.opencode_v2_platform }}
+      pi_version: ${{ steps.load.outputs.pi_version }}
+      pi_platform: ${{ steps.load.outputs.pi_platform }}
+      pi_model: ${{ steps.load.outputs.pi_model }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -462,7 +567,7 @@ jobs:
         id: load
         run: |
           python3 - "$GITHUB_OUTPUT" <<'PY'
-          import pathlib, sys, tomllib
+          import json, pathlib, sys, tomllib
 
           manifest = pathlib.Path("tests/integration/fixtures/claude-code-cli/pin.toml")
           data = tomllib.loads(manifest.read_text())
@@ -486,6 +591,44 @@ jobs:
               raise SystemExit(
                   f"vLLM context {context} is below Claude client context {client_context}"
               )
+          # The compaction scenario deliberately runs the client with a LOWERED
+          # window so it auto-compacts mid-task. That window must stay positive
+          # and strictly below the real backend window; otherwise the client
+          # never crosses its threshold and the scenario proves nothing.
+          compaction_context = int(launch["compaction"]["max_context_tokens"])
+          if not 0 < compaction_context < context:
+              raise SystemExit(
+                  f"compaction window {compaction_context} must be in (0, {context})"
+              )
+          # Pinned Claude Code 2.1.267 reserves 2,048 output + 13,000 compaction
+          # tokens, so its effective auto-compaction threshold is
+          # `compaction_context - 15048`. A single ballast read must fit well
+          # under that headroom, or one post-compaction read immediately
+          # re-crosses the threshold and the client's rapid-refill breaker aborts
+          # the run. Total ballast must still exceed the threshold so compaction
+          # fires mid-task. Use ~4 bytes/token to approximate from the pinned
+          # byte sizes.
+          reserved = 15048
+          headroom = compaction_context - reserved
+          if headroom <= 0:
+              raise SystemExit(
+                  f"compaction window {compaction_context} must exceed the "
+                  f"{reserved}-token Claude Code reserve so the client has usable headroom"
+              )
+          ballast_bytes = int(launch["compaction"]["ballast_bytes"])
+          ballast_chapters = int(launch["compaction"]["ballast_chapters"])
+          per_chapter_tokens = ballast_bytes / 4
+          total_ballast_tokens = per_chapter_tokens * ballast_chapters
+          if per_chapter_tokens * 2 >= headroom:
+              raise SystemExit(
+                  f"a single ballast chapter (~{per_chapter_tokens:.0f} tokens) must be well "
+                  f"under the ~{headroom}-token post-compaction headroom to avoid the rapid-refill breaker"
+              )
+          if total_ballast_tokens <= headroom:
+              raise SystemExit(
+                  f"total ballast (~{total_ballast_tokens:.0f} tokens) must exceed the "
+                  f"~{headroom}-token threshold so compaction fires mid-task"
+              )
           exported = {
               "claude_url": claude["url"],
               "claude_sha256": claude["sha256"],
@@ -495,6 +638,200 @@ jobs:
               "vllm_served_model": vllm["served_model_name"],
               "vllm_flags": " ".join(flags),
           }
+
+          # ---- OpenCode -------------------------------------------------
+          # Exported so the acceptance job carries no hardcoded version
+          # strings. Scattering them is exactly how the Codex pins drifted.
+          # Each OpenCode major has its own manifest and its own credential
+          # recipe (1.x: provider options.headers; 2.x: a plugin). Every
+          # manifest is validated against the major it declares AND the major
+          # its path is reserved for, so a 2.x version dropped into the 1.x
+          # manifest (or the reverse) still fails here: crossing the boundary
+          # needs a rewritten client configuration and a re-validated
+          # manifest, not a bump.
+          oc_manifests = {
+              1: pathlib.Path("tests/integration/fixtures/opencode-cli/pin.toml"),
+              2: pathlib.Path("tests/integration/fixtures/opencode-cli-v2/pin.toml"),
+          }
+          oc_by_major = {}
+          for lane_major, path in oc_manifests.items():
+              manifest_data = tomllib.loads(path.read_text())
+              client = manifest_data["opencode"]
+              declared_major = int(client["major_series"])
+              actual_major = int(client["version"].split(".")[0])
+              if declared_major != actual_major:
+                  raise SystemExit(
+                      f"{path}: opencode.major_series {declared_major} disagrees with version "
+                      f"{client['version']}"
+                  )
+              if actual_major != lane_major:
+                  raise SystemExit(
+                      f"{path}: the OpenCode acceptance lane is pinned to the {lane_major}.x client "
+                      f"configuration; version {client['version']} needs its own manifest and a "
+                      "rewritten client configuration"
+                  )
+              # The prompt is positional on both majors; the flag that would
+              # swallow it differs (-p was the 1.x server password).
+              if client["launch"]["prompt_is_positional"] is not True:
+                  raise SystemExit(f"{path}: opencode.launch.prompt_is_positional must stay true")
+              oc_by_major[lane_major] = manifest_data
+
+          oc = oc_by_major[1]
+          opencode, oc_provider, oc_vllm = oc["opencode"], oc["opencode"]["provider"], oc["vllm"]
+          oc_flags = oc_vllm["launch"]["flags"]
+
+          # The client window, the manifest, and the server flag must agree, or
+          # the client advertises a context the backend will not honor.
+          oc_context = int(oc_provider["context"])
+          oc_vllm_context = int(oc_vllm["context_length"])
+          oc_flag_context = int(oc_flags[oc_flags.index("--max-model-len") + 1])
+          if not oc_context == oc_vllm_context == oc_flag_context:
+              raise SystemExit(
+                  f"OpenCode context {oc_context}, vllm.context_length {oc_vllm_context}, and "
+                  f"--max-model-len {oc_flag_context} must all agree"
+              )
+          if int(oc_provider["output"]) >= oc_context:
+              raise SystemExit("opencode.provider.output must be below the context window")
+
+          # Tool-calling must be served, or the tool-call scenario silently
+          # degrades to a plain text turn and proves nothing.
+          if not oc_vllm["tool_call_parser"] or "--enable-auto-tool-choice" not in oc_flags:
+              raise SystemExit(
+                  "the OpenCode backend must serve tool calls: set vllm.tool_call_parser "
+                  "and pass --enable-auto-tool-choice"
+              )
+
+          # A github-release install is only reproducible with both pins.
+          if opencode["install"] == "github-release":
+              for key in ("url", "sha256"):
+                  if not opencode[key] or "TBD" in opencode[key]:
+                      raise SystemExit(f"install=github-release requires a concrete opencode.{key}")
+
+          # Bind the manifest to the example config: every prefix the client is
+          # allowed to reach must have an explicit route, so the OpenCode path
+          # can never silently regress onto the catch-all that exists for
+          # health checks and startup probes.
+          for manifest_data in oc_by_major.values():
+              example = pathlib.Path("examples/configs") / manifest_data["gateway"]["example_config"]
+              example_text = example.read_text()
+              for prefix in manifest_data["startup_matrix"]["allowed_prefixes"]:
+                  if f'- path: "{prefix}"' not in example_text:
+                      raise SystemExit(
+                          f"{example} must declare an explicit route for {prefix}; "
+                          "relying on the catch-all is not a supported client path"
+                      )
+
+          # ---- OpenCode 2.x ---------------------------------------------
+          # The 2.x scenarios run in the same job against the SAME vLLM
+          # container, so the backend pins live once, in the 1.x manifest. The
+          # 2.x client must address the model that container serves and must
+          # not advertise a window it will not honor.
+          oc2 = oc_by_major[2]
+          opencode2, oc2_provider = oc2["opencode"], oc2["opencode"]["provider"]
+          if "vllm" in oc2:
+              raise SystemExit(
+                  f"{oc_manifests[2]} must not declare [vllm]: the 2.x scenarios share the 1.x "
+                  "lane's vLLM container, whose pins live in the 1.x manifest"
+              )
+          if oc2_provider["model_id"] != oc_provider["model_id"]:
+              raise SystemExit(
+                  f"OpenCode 2.x model {oc2_provider['model_id']} must match the served model "
+                  f"{oc_provider['model_id']}"
+              )
+          if int(oc2_provider["context"]) != oc_vllm_context:
+              raise SystemExit(
+                  f"OpenCode 2.x context {oc2_provider['context']} must equal vllm.context_length "
+                  f"{oc_vllm_context}"
+              )
+          if int(oc2_provider["output"]) >= oc_vllm_context:
+              raise SystemExit("OpenCode 2.x provider.output must be below the context window")
+          # Both 2.x lanes stage the registry tarball verified against the
+          # committed checksum; that is what makes them byte-identical.
+          if opencode2["install"] != "registry-tarball":
+              raise SystemExit("OpenCode 2.x must install from the verified registry tarball")
+          oc2_checksum = (
+              oc_manifests[2].parent / f"{opencode2['version']}-{opencode2['platform']}.sha256"
+          )
+          if not oc2_checksum.is_file():
+              raise SystemExit(f"OpenCode 2.x needs a checksum fixture at {oc2_checksum}")
+
+          exported.update({
+              "opencode_v2_version": opencode2["version"],
+              "opencode_v2_platform": opencode2["platform"],
+          })
+
+          # ---- pi -------------------------------------------------------
+          # pi runs in its own job but against the same Chat Completions
+          # backend as OpenCode, so its backend pins live once, in the 1.x
+          # OpenCode manifest. The client must address the model that backend
+          # serves and must not advertise a window it will not honor.
+          pi_manifest = pathlib.Path("tests/integration/fixtures/pi-cli/pin.toml")
+          pi_data = tomllib.loads(pi_manifest.read_text())
+          pi, pi_provider = pi_data["pi"], pi_data["pi"]["provider"]
+          if "vllm" in pi_data or pi_data["gateway"]["backend_pins"] != "opencode-cli/pin.toml":
+              raise SystemExit(
+                  f"{pi_manifest} must not declare [vllm]: pi shares the backend pins in "
+                  "opencode-cli/pin.toml, and gateway.backend_pins must say so"
+              )
+          if int(pi["version"].split(".")[0]) != int(pi["major_series"]):
+              raise SystemExit(
+                  f"{pi_manifest}: pi.major_series {pi['major_series']} disagrees with version "
+                  f"{pi['version']}; crossing a major must re-validate the manifest"
+              )
+          if pi_provider["api"] != "openai-completions":
+              raise SystemExit("pi is supported over openai-completions only")
+          if pi_provider["model_id"] != oc_provider["model_id"]:
+              raise SystemExit(
+                  f"pi model {pi_provider['model_id']} must match the served model "
+                  f"{oc_provider['model_id']}"
+              )
+          if int(pi_provider["context_window"]) != oc_vllm_context:
+              raise SystemExit(
+                  f"pi context_window {pi_provider['context_window']} must equal "
+                  f"vllm.context_length {oc_vllm_context}"
+              )
+          if int(pi_provider["max_tokens"]) >= oc_vllm_context:
+              raise SystemExit("pi.provider.max_tokens must be below the context window")
+          # Both lanes stage the release archive verified against the
+          # committed checksum; that is what makes them byte-identical.
+          pi_url = (
+              f"https://github.com/earendil-works/pi/releases/download/"
+              f"v{pi['version']}/pi-{pi['platform']}.tar.gz"
+          )
+          if pi["install"] != "github-release" or pi["url"] != pi_url:
+              raise SystemExit(f"pi must install from the verified release archive {pi_url}")
+          pi_checksum = pi_manifest.parent / f"{pi['version']}-{pi['platform']}.sha256"
+          if not pi_checksum.is_file():
+              raise SystemExit(f"pi needs a checksum fixture at {pi_checksum}")
+          # The documented models.json is what both lanes run; it must agree.
+          pi_models = json.loads((pi_manifest.parent / pi["auth"]["fixture"]).read_text())
+          pi_model = pi_models["providers"][pi_provider["id"]]["models"][0]
+          if (pi_model["id"], pi_model["contextWindow"], pi_model["maxTokens"]) != (
+              pi_provider["model_id"], int(pi_provider["context_window"]), int(pi_provider["max_tokens"])
+          ):
+              raise SystemExit(f"{pi['auth']['fixture']} disagrees with {pi_manifest}")
+          pi_example = pathlib.Path("examples/configs") / pi_data["gateway"]["example_config"]
+          for prefix in pi_data["startup_matrix"]["allowed_prefixes"]:
+              if f'- path: "{prefix}"' not in pi_example.read_text():
+                  raise SystemExit(f"{pi_example} must declare an explicit route for {prefix}")
+
+          exported.update({
+              "pi_version": pi["version"],
+              "pi_platform": pi["platform"],
+              "pi_model": pi_provider["model_id"],
+          })
+
+          exported.update({
+              "opencode_version": opencode["version"],
+              "opencode_install": opencode["install"],
+              "opencode_npm_package": opencode["npm_package"],
+              "opencode_url": opencode["url"],
+              "opencode_sha256": opencode["sha256"],
+              "opencode_model": oc_provider["model_id"],
+              "opencode_vllm_image": oc_vllm["image"],
+              "opencode_vllm_flags": " ".join(oc_flags),
+          })
+
           with open(sys.argv[1], "a", encoding="utf-8") as out:
               for key, value in exported.items():
                   out.write(f"{key}={value}\n")
@@ -507,7 +844,10 @@ jobs:
   # A pinned real Claude Code executable completes a deterministic coding task
   # against a pinned real vLLM backend over two Praxis paths and two permission
   # modes, producing four scenarios run sequentially against one shared vLLM
-  # container:
+  # container. A fifth scenario (issue #1418) drives a read-only planning turn
+  # over the native path against the same container, asserting it converges and
+  # leaks no reasoning text into the answer; it is the nightly guard on the
+  # vLLM reasoning flags pinned in the manifest. The two paths:
   #   - NATIVE: Anthropic Messages traffic (/v1/messages,
   #     /v1/messages/count_tokens, /v1/models) is forwarded straight to vLLM's
   #     native Anthropic surface — with NO translation.
@@ -515,18 +855,20 @@ jobs:
   #     Completions (anthropic_messages_to_chat_completions) and forwarded to
   #     vLLM's /v1/chat/completions surface.
   # Each path runs under the deterministic acceptEdits baseline and under auto
-  # mode with CLAUDE_CODE_AUTO_MODE_SERVER=0. The four runs are sequential (not
+  # mode with CLAUDE_CODE_AUTO_MODE_SERVER=0. All five runs are sequential (not
   # parallel) so they never contend for the runner's CPU while a model is
   # generating.
   #
   # Runs on the SAME ephemeral EC2 GPU runner as the full suite (machulav
   # v2.3.9 registers a non-ephemeral runner, so a second job runs on the same
   # instance), sequentially AFTER it (`needs: vllm-gpu-full-suite`), reusing the
-  # Qwen3-8B weights the full suite already downloaded via a shared on-disk HF
-  # cache. It starts its OWN vLLM container WITH --api-key (the full suite's is
-  # keyless and torn down first): the credential-isolation proof requires the
-  # backend to REJECT an un-injected bearer, and two Qwen3-8B cannot coexist on
-  # the 24GB A10G, so a separate sequential keyed container is mandatory.
+  # Qwen3-8B weights from a shared on-disk HF cache when another acceptance job
+  # already downloaded them. The full suite uses baked weights in a separate
+  # image. This job starts its OWN vLLM container WITH --api-key (the full
+  # suite's is keyless and torn down first): the credential-isolation proof
+  # requires the backend to REJECT an un-injected bearer. Two Qwen3-8B
+  # containers cannot coexist on the 24GB A10G, so a separate sequential
+  # keyed container is mandatory.
   #
   # Reproducibility-critical: depends on the pins recorded in
   # tests/integration/fixtures/claude-code-cli/pin.toml (consumed via the `pins`
@@ -541,7 +883,7 @@ jobs:
   # ----------------------------------------------------------------------------
 
   vllm-gpu-claude-acceptance:
-    name: Claude Code acceptance on real vLLM (GPU)
+    name: Claude Code and Anthropic SDK acceptance on real vLLM (GPU)
     needs: [gpu-start-runner, vllm-gpu-full-suite, pins]
     # Reuse the GPU runner started for the full suite. `!cancelled()` lets this
     # run even when the full suite was skipped (a run_claude_acceptance-only
@@ -554,7 +896,7 @@ jobs:
       (
         (
           github.event_name == 'workflow_dispatch' &&
-          (inputs.run_live_vllm || inputs.run_claude_acceptance)
+          (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_degradation_acceptance || inputs.run_compaction_only)
         ) ||
         (
           github.event_name == 'pull_request' &&
@@ -564,14 +906,19 @@ jobs:
         github.event_name == 'schedule'
       )
     runs-on: ${{ needs.gpu-start-runner.outputs.label }}
-    # Comfortable on the nightly (the full suite already warmed the on-disk HF
-    # cache), but a run_claude_acceptance-only dispatch hits a COLD cache and
-    # must download ~16GB of Qwen3-8B before serving. Allow enough headroom for
-    # that path (still under the 90-minute instance budget the full suite uses).
+    # The pinned upstream image downloads ~16GB of Qwen3-8B on a cold cache;
+    # the full suite's baked image does not populate this cache. A previous
+    # acceptance job on the same instance may have warmed it.
     timeout-minutes: 60
     permissions:
       contents: read
     env:
+      # True only for a dispatch that requests the focused degradation cases and
+      # nothing broader. The two translated steps below always run on any
+      # acceptance trigger; this flag skips the native, planning, and Anthropic
+      # SDK steps so the focused run validates operator-approved degradation
+      # without paying for the full acceptance matrix.
+      DEGRADE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.run_degradation_acceptance && !inputs.run_claude_acceptance && !inputs.run_live_vllm }}
       # Pins resolved by the `pins` job (parsed on ubuntu; the GPU AMI's Python
       # 3.9 lacks tomllib).
       CLAUDE_URL: ${{ needs.pins.outputs.claude_url }}
@@ -599,7 +946,17 @@ jobs:
           fi
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+
+      - name: Install uv for Anthropic SDK acceptance
+        id: anthropic_sdk_uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: |
+            tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py
+            tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py
 
       - name: Verify pins are resolvable
         run: |
@@ -661,11 +1018,9 @@ jobs:
           if [ "$CONTAINER_RUNTIME" = "podman" ]; then
             cache_mount="${cache_mount}:Z"
           fi
-          # Reuse the Qwen3-8B weights the full-suite job downloaded earlier on
-          # this same ephemeral instance via a shared on-disk HF cache, so this
-          # keyed container only pays CUDA init + weight load, not a ~16GB
-          # re-download. On a run_claude_acceptance-only dispatch (no full suite)
-          # the cache is cold and vLLM downloads the weights itself.
+          # The full suite uses baked weights, so this pinned upstream image
+          # downloads Qwen3-8B into the host cache unless an earlier acceptance
+          # job on the same instance already populated it.
           mkdir -p "$GPU_HF_CACHE_DIR"
           "$CONTAINER_RUNTIME" pull "$VLLM_IMAGE_PIN"
           # Native Anthropic Messages serving (/v1/messages,
@@ -689,8 +1044,8 @@ jobs:
         run: |
           set -euo pipefail
           echo "Waiting for vLLM..."
-          # Allow a generous deadline: on a cold cache (run_claude_acceptance-only
-          # dispatch) vLLM downloads ~16GB of Qwen3-8B weights before serving.
+          # Allow a generous deadline when the pinned image must download the
+          # weights into a cold host cache before serving.
           deadline=$((SECONDS + 1200))
           until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; do
             if ! "$CONTAINER_RUNTIME" inspect --format='{{.State.Running}}' vllm 2>/dev/null | grep -q true; then
@@ -721,7 +1076,7 @@ jobs:
 
       - name: Build Praxis and acceptance test
         run: |
-          cargo build -p praxis-ai-proxy --features full
+          cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
           cargo test -p praxis-tests-integration --test suite --no-run
 
       - name: Create restricted network namespace
@@ -798,8 +1153,8 @@ jobs:
         id: claude_test_binary
         run: |
           set -uo pipefail
-          # Locate the already-built suite binary without recompiling; all four
-          # acceptance runs below reuse it. Parse cargo's JSON with python3
+          # Locate the already-built suite binary without recompiling; every
+          # acceptance run below reuses it. Parse cargo's JSON with python3
           # (stdlib `json`, 3.9-safe) rather than jq, which the GPU AMI may lack.
           TEST_BIN=$(cargo test -p praxis-tests-integration --test suite --no-run \
               --message-format=json 2>/dev/null \
@@ -811,6 +1166,12 @@ jobs:
           echo "TEST_BIN=$TEST_BIN" >> "$GITHUB_ENV"
 
       - name: Run Claude Code native-vLLM acceptance test (once, no retry)
+        id: claude_native_edits
+        # Keep the original success()-gating (run only when setup succeeded) and
+        # additionally skip on a focused degradation-only or compaction-only
+        # dispatch; the two translated steps below carry the degradation run, and
+        # the compaction steps carry the compaction-only run.
+        if: ${{ success() && env.DEGRADE_ONLY != 'true' && !inputs.run_compaction_only }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -834,7 +1195,8 @@ jobs:
           exit "${PIPESTATUS[0]}"
 
       - name: Run Claude Code transformed-vLLM acceptance test (once, no retry)
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        id: claude_translated_edits
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -855,7 +1217,8 @@ jobs:
           exit "${PIPESTATUS[0]}"
 
       - name: Run Claude Code auto-mode native-vLLM acceptance test (once, no retry)
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        id: claude_native_auto
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -875,7 +1238,8 @@ jobs:
           exit "${PIPESTATUS[0]}"
 
       - name: Run Claude Code auto-mode transformed-vLLM acceptance test (once, no retry)
-        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        id: claude_translated_auto
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -893,13 +1257,177 @@ jobs:
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/acceptance-auto-transformed.log"
           exit "${PIPESTATUS[0]}"
 
+      - name: Run Claude Code planning-turn regression (once, no retry)
+        id: claude_planning
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_CLAUDE_CODE_NETNS: ${{ env.NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.200.0.1
+          PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          # Issue #1418 regression. A read-only planning turn over the native
+          # path must converge on an answer rather than exhaust its turn budget,
+          # and must carry no reasoning-channel text in the user-visible plan.
+          # This is the nightly guard on the vLLM reasoning pins in
+          # tests/integration/fixtures/claude-code-cli/pin.toml: serving this
+          # model with a parser for another family, or with thinking on, turns
+          # it red. Shares the same vLLM container and namespace, sequentially
+          # after the four acceptance runs. Runs once, no retry.
+          sudo --preserve-env=PRAXIS_TEST_CLAUDE_CODE_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_CLAUDE_CODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            claude_code_vllm::pinned_claude_code_planning_turn_converges_without_reasoning_leakage_on_native_vllm \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/acceptance-planning.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Run Claude Code server-side web-search acceptance test (once, no retry)
+        id: claude_web_search
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_CLAUDE_CODE_NETNS: ${{ env.NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.200.0.1
+          PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+          # The real search-provider key. Praxis inlines it into the agentic
+          # config at runtime and points the managed web-search callout at a
+          # loopback capture-relay that forwards to real Tavily; the secret is
+          # never written to disk or printed with the config.
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          # Scheduled/manual full runs are controlled environments and must prove
+          # the real Tavily path. Labeled fork PRs do not receive secrets, so they
+          # retain deterministic coverage and skip only this credentialed test.
+          PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH: ${{ github.event_name != 'pull_request' && '1' || '0' }}
+        run: |
+          set -uo pipefail
+          # Proves the client's built-in WebSearch tool is resolved SERVER-SIDE by
+          # Praxis's managed anthropic_web_search loop against real Tavily, over the
+          # agentic config routed onto the Chat Completions backend. The capture
+          # relay runs on the host (where Praxis runs its outbound calls), so client
+          # egress isolation is unaffected. Shares the same vLLM container and
+          # namespace, sequentially after the other acceptance runs. Runs once, no
+          # retry.
+          sudo --preserve-env=PRAXIS_TEST_CLAUDE_CODE_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_CLAUDE_CODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION,TAVILY_API_KEY,PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH \
+            "$TEST_BIN" \
+            claude_code_vllm::pinned_claude_code_resolves_server_side_web_search_through_tavily \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/acceptance-web-search.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Run Claude Code compaction acceptance test (once, no retry)
+        id: claude_compaction
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_CLAUDE_CODE_NETNS: ${{ env.NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.200.0.1
+          PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          # Grow accepted context over many tool turns until Claude Code crosses
+          # its own (lowered CLAUDE_CODE_MAX_CONTEXT_TOKENS) auto-compaction
+          # threshold mid-task. The run asserts the client emits a
+          # compact_boundary(trigger=auto) event, then issues a further tool call
+          # that lands an Edit using the pre-compaction marker. Summarization and
+          # every post-compaction request traverse ANTHROPIC_BASE_URL; the egress
+          # namespace guarantees Praxis is the client's only route. Runs once, no
+          # retry.
+          sudo --preserve-env=PRAXIS_TEST_CLAUDE_CODE_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_CLAUDE_CODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            claude_code_vllm::pinned_claude_code_compaction_crosses_context_window_on_native_vllm \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/acceptance-compaction.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Run Anthropic SDK Messages against real vLLM
+        id: anthropic_messages
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        timeout-minutes: 15
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_REQUIRE_LIVE: "1"
+          PYTHONPATH: tests/integration/sdk/openai
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/anthropic-messages-cases.json
+        run: |
+          uv run tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py \
+            -s -p qualification_plugin -k "not image"
+
+      - name: Run Anthropic SDK web search against real vLLM (stubbed provider)
+        id: anthropic_stubbed_web_search
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        timeout-minutes: 15
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_REQUIRE_LIVE: "1"
+          PYTHONPATH: tests/integration/sdk/openai
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/anthropic-stubbed-web-search-cases.json
+        run: |
+          # The live model forces a WebSearch call answered by a local body-auth
+          # stub, so this mode is deterministic and needs no external secret.
+          uv run tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py -s \
+            -p qualification_plugin -k "not live_tavily"
+
+      - name: Run credentialed live Tavily web search against real vLLM
+        id: anthropic_credentialed_web_search
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        timeout-minutes: 15
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_REQUIRE_LIVE: "1"
+          # The generated YAML keeps the `env_var: WEB_SEARCH_API_KEY` source, so
+          # the secret is consumed only by this one-test process and is never
+          # written into or printed with the config.
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          # Scheduled/manual full runs are controlled environments and must prove
+          # the real provider path. Labeled fork PRs do not receive secrets, so
+          # they retain deterministic coverage and skip only this credentialed test.
+          PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH: ${{ github.event_name != 'pull_request' && '1' || '0' }}
+          PYTHONPATH: tests/integration/sdk/openai
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/anthropic-credentialed-web-search-cases.json
+        run: |
+          uv run tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py -s \
+            -p qualification_plugin -k live_tavily
+
+      - name: Run selected-Anthropic OpenAI-chat translation against real vLLM
+        id: selected_anthropic_openai_chat
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        timeout-minutes: 15
+        env:
+          # Reuse the praxis-ai binary built by "Build Praxis and acceptance test".
+          PRAXIS_AI_BIN: ${{ github.workspace }}/target/debug/praxis-ai
+          # Reuse the keyed vLLM container already serving native /v1/messages.
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_REQUIRE_LIVE: "1"
+          # Record per-case results (digest / shim / live json / streaming / tool)
+          # like the other SDK steps so the qualification report shows which case
+          # failed, not just the overall step outcome.
+          PYTHONPATH: tests/integration/sdk/openai
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/selected-anthropic-openai-chat-cases.json
+        run: |
+          # An official OpenAI Chat Completions client drives the selected-provider
+          # routing + translation (openai_chat_completions_to_anthropic[_stream])
+          # through Praxis to vLLM's native Anthropic Messages surface. The backend
+          # bearer is injected by the core credential_injection filter from
+          # VLLM_API_KEY (already in the job env), keyed on the intelligent_route-
+          # selected cluster, matching the shipped messages-native-vllm.yaml.
+          uv run tests/integration/sdk/openai/test_selected_anthropic_chat_completions_vllm.py -s \
+            -p qualification_plugin
+
       - name: Acceptance log tail on failure
         if: failure()
         run: |
           # Interleaved client and Praxis diagnostics for each run. The gateway
           # and native secrets are test constants, and Praxis does not emit auth
           # headers at the default log level, so these logs are safe to surface.
-          for log in acceptance-native acceptance-transformed acceptance-auto-native acceptance-auto-transformed; do
+          for log in acceptance-native acceptance-transformed acceptance-auto-native acceptance-auto-transformed acceptance-planning acceptance-web-search acceptance-compaction; do
             echo "=== $log ==="
             tail -n 400 "$RUNNER_TEMP/$log.log" 2>/dev/null || echo "no $log log captured"
           done
@@ -911,9 +1439,9 @@ jobs:
           "$CONTAINER_RUNTIME" logs vllm > "$RUNNER_TEMP/vllm.log" 2>&1 || true
           tail -n 400 "$RUNNER_TEMP/vllm.log" 2>/dev/null || true
 
-      - name: Upload acceptance diagnostics on failure
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - name: Upload acceptance diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: claude-code-vllm-diagnostics
           # The gateway and native secrets are test constants and Praxis does not
@@ -924,9 +1452,65 @@ jobs:
             ${{ runner.temp }}/acceptance-transformed.log
             ${{ runner.temp }}/acceptance-auto-native.log
             ${{ runner.temp }}/acceptance-auto-transformed.log
+            ${{ runner.temp }}/acceptance-planning.log
+            ${{ runner.temp }}/acceptance-web-search.log
+            ${{ runner.temp }}/acceptance-compaction.log
             ${{ runner.temp }}/vllm.log
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 30
+          overwrite: true
+
+      - name: Capture Claude and Anthropic acceptance scenarios
+        if: always()
+        env:
+          CLAUDE_NATIVE_EDITS: ${{ steps.claude_native_edits.outcome }}
+          CLAUDE_TRANSLATED_EDITS: ${{ steps.claude_translated_edits.outcome }}
+          CLAUDE_NATIVE_AUTO: ${{ steps.claude_native_auto.outcome }}
+          CLAUDE_TRANSLATED_AUTO: ${{ steps.claude_translated_auto.outcome }}
+          CLAUDE_PLANNING: ${{ steps.claude_planning.outcome }}
+          CLAUDE_WEB_SEARCH: ${{ steps.claude_web_search.outcome }}
+          CLAUDE_COMPACTION: ${{ steps.claude_compaction.outcome }}
+          ANTHROPIC_MESSAGES: ${{ steps.anthropic_messages.outcome }}
+          ANTHROPIC_STUBBED_WEB_SEARCH: ${{ steps.anthropic_stubbed_web_search.outcome }}
+          ANTHROPIC_CREDENTIALED_WEB_SEARCH: ${{ steps.anthropic_credentialed_web_search.outcome }}
+          SELECTED_ANTHROPIC_OPENAI_CHAT: ${{ steps.selected_anthropic_openai_chat.outcome }}
+        run: |
+          python3 - "$RUNNER_TEMP/claude-acceptance.json" <<'PY'
+          import json, os, pathlib, subprocess, sys
+          names = ("CLAUDE_NATIVE_EDITS", "CLAUDE_TRANSLATED_EDITS", "CLAUDE_NATIVE_AUTO",
+                   "CLAUDE_TRANSLATED_AUTO", "CLAUDE_PLANNING", "CLAUDE_WEB_SEARCH",
+                   "CLAUDE_COMPACTION",
+                   "ANTHROPIC_MESSAGES", "ANTHROPIC_STUBBED_WEB_SEARCH",
+                   "ANTHROPIC_CREDENTIALED_WEB_SEARCH",
+                   "SELECTED_ANTHROPIC_OPENAI_CHAT")
+          cases = [{"id": name.lower(), "status": os.environ[name] or "unexecuted"} for name in names]
+          for case, filename in (
+              ("anthropic_messages", "anthropic-messages-cases.json"),
+              ("anthropic_stubbed_web_search", "anthropic-stubbed-web-search-cases.json"),
+              ("anthropic_credentialed_web_search", "anthropic-credentialed-web-search-cases.json"),
+              ("selected_anthropic_openai_chat", "selected-anthropic-openai-chat-cases.json"),
+          ):
+              path = pathlib.Path(os.environ["RUNNER_TEMP"]) / filename
+              if path.exists():
+                  next(item for item in cases if item["id"] == case)["pytest"] = json.loads(path.read_text())
+          data = {
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "checkout_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "cases": cases,
+          }
+          pathlib.Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n")
+          PY
+
+      - name: Upload Claude and Anthropic acceptance results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: claude-vllm-acceptance-results
+          path: ${{ runner.temp }}/claude-acceptance.json
+          if-no-files-found: warn
+          retention-days: 30
+          overwrite: true
 
       - name: Tear down network namespace
         if: always()
@@ -980,7 +1564,7 @@ jobs:
         github.event_name == 'schedule' ||
         (
           github.event_name == 'workflow_dispatch' &&
-          (inputs.run_live_vllm || inputs.run_codex_acceptance)
+          (inputs.run_live_vllm || inputs.run_codex_acceptance || inputs.run_compaction_only)
         ) ||
         (
           github.event_name == 'pull_request' &&
@@ -1017,7 +1601,7 @@ jobs:
           fi
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
         with:
           cache-suffix: codex-gpu-acceptance-cargo
 
@@ -1139,8 +1723,8 @@ jobs:
 
       - name: Build Praxis and Codex acceptance test
         run: |
-          cargo build -p praxis-ai-proxy --features full
-          cargo test -p praxis-tests-integration --test suite --no-run
+          cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
+          cargo test -p praxis-tests-integration --features openai-all,store-postgres --test suite --no-run
 
       - name: Create restricted Codex network namespace
         id: codex_namespace
@@ -1199,16 +1783,28 @@ jobs:
         id: codex_test_binary
         run: |
           set -uo pipefail
-          TEST_BIN=$(cargo test -p praxis-tests-integration --test suite --no-run \
+          TEST_BIN=$(cargo test -p praxis-tests-integration --features openai-all,store-postgres --test suite --no-run \
               --message-format=json 2>/dev/null \
             | python3 -c 'import json,sys; objs=[json.loads(l) for l in sys.stdin if l.lstrip().startswith("{")]; paths=[o["executable"] for o in objs if o.get("executable") and o.get("target",{}).get("name")=="suite"]; print(paths[-1] if paths else "")')
           if [ -z "$TEST_BIN" ]; then
             echo "::error::could not locate the compiled suite test binary"
             exit 1
           fi
+          # An exact libtest selector otherwise succeeds when no test is compiled.
+          for test_name in \
+            codex_http::pinned_codex_completes_native_vllm_coding_workflow_over_http \
+            codex_http::pinned_codex_completes_translated_vllm_coding_workflow_over_http \
+            codex_http::pinned_codex_compaction_crosses_context_window_over_http; do
+            if ! "$TEST_BIN" "$test_name" --list --exact | grep -Fx "$test_name: test"; then
+              echo "::error::missing Codex acceptance test: $test_name"
+              exit 1
+            fi
+          done
           echo "TEST_BIN=$TEST_BIN" >> "$GITHUB_ENV"
 
       - name: Run Codex native-Responses vLLM acceptance test (once, no retry)
+        id: codex_native
+        if: ${{ !inputs.run_compaction_only }}
         env:
           PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
@@ -1223,10 +1819,16 @@ jobs:
             "$TEST_BIN" \
             codex_http::pinned_codex_completes_native_vllm_coding_workflow_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-native.log"
-          exit "${PIPESTATUS[0]}"
+          test_status=${PIPESTATUS[0]}
+          if [ "$test_status" -ne 0 ]; then
+            exit "$test_status"
+          fi
+          grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;" \
+            "$RUNNER_TEMP/codex-acceptance-native.log"
 
       - name: Run Codex translated-Chat vLLM acceptance test (once, no retry)
-        if: ${{ always() && !cancelled() && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
+        id: codex_translated
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
@@ -1241,14 +1843,49 @@ jobs:
             "$TEST_BIN" \
             codex_http::pinned_codex_completes_translated_vllm_coding_workflow_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-translated.log"
-          exit "${PIPESTATUS[0]}"
+          test_status=${PIPESTATUS[0]}
+          if [ "$test_status" -ne 0 ]; then
+            exit "$test_status"
+          fi
+          grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;" \
+            "$RUNNER_TEMP/codex-acceptance-translated.log"
+
+      - name: Run Codex native-Responses compaction acceptance test (once, no retry)
+        id: codex_compaction
+        if: ${{ always() && !cancelled() && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
+        env:
+          PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
+          PRAXIS_TEST_CODEX_DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
+          PRAXIS_TEST_CODEX_NETNS: ${{ env.CODEX_NS }}
+          PRAXIS_TEST_CODEX_LISTEN_ADDRESS: 10.201.0.1
+          PRAXIS_TEST_CODEX_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          # Grow accepted context over many turns until Codex crosses its own
+          # (lowered) auto-compaction threshold and runs inline compaction,
+          # which POSTs the summarization prompt through Praxis to vLLM. A
+          # test-local HTTP observer between Codex and Praxis captures the
+          # compaction request on the wire; the egress namespace guarantees the
+          # client's only route is Praxis.
+          sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            codex_http::pinned_codex_compaction_crosses_context_window_over_http \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-compaction.log"
+          test_status=${PIPESTATUS[0]}
+          if [ "$test_status" -ne 0 ]; then
+            exit "$test_status"
+          fi
+          grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;" \
+            "$RUNNER_TEMP/codex-acceptance-compaction.log"
 
       - name: Capture diagnostics on failure
         if: failure()
         run: |
           "$CONTAINER_RUNTIME" logs vllm > "$RUNNER_TEMP/codex-vllm.log" 2>&1 || true
           "$CONTAINER_RUNTIME" logs praxis-postgres > "$RUNNER_TEMP/codex-postgres.log" 2>&1 || true
-          for log in codex-acceptance-native codex-acceptance-translated; do
+          for log in codex-acceptance-native codex-acceptance-translated codex-acceptance-compaction; do
             echo "=== $log ==="
             tail -n 400 "$RUNNER_TEMP/$log.log" 2>/dev/null || true
           done
@@ -1257,18 +1894,49 @@ jobs:
           echo "=== PostgreSQL ==="
           tail -n 200 "$RUNNER_TEMP/codex-postgres.log" 2>/dev/null || true
 
-      - name: Upload Codex acceptance diagnostics on failure
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - name: Upload Codex acceptance diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: codex-vllm-gpu-diagnostics
           path: |
             ${{ runner.temp }}/codex-acceptance-native.log
             ${{ runner.temp }}/codex-acceptance-translated.log
+            ${{ runner.temp }}/codex-acceptance-compaction.log
             ${{ runner.temp }}/codex-vllm.log
             ${{ runner.temp }}/codex-postgres.log
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 30
+          overwrite: true
+
+      - name: Capture Codex acceptance scenarios
+        if: always()
+        env:
+          CODEX_NATIVE: ${{ steps.codex_native.outcome }}
+          CODEX_TRANSLATED: ${{ steps.codex_translated.outcome }}
+          CODEX_COMPACTION: ${{ steps.codex_compaction.outcome }}
+        run: |
+          python3 - "$RUNNER_TEMP/codex-acceptance.json" <<'PY'
+          import json, os, pathlib, subprocess, sys
+          names = ("CODEX_NATIVE", "CODEX_TRANSLATED", "CODEX_COMPACTION")
+          data = {
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "checkout_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "cases": [{"id": name.lower(), "status": os.environ[name] or "unexecuted"} for name in names],
+          }
+          pathlib.Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n")
+          PY
+
+      - name: Upload Codex acceptance results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: codex-vllm-acceptance-results
+          path: ${{ runner.temp }}/codex-acceptance.json
+          if-no-files-found: warn
+          retention-days: 30
+          overwrite: true
 
       - name: Tear down Codex network namespace
         if: always()
@@ -1305,11 +1973,875 @@ jobs:
           "${CONTAINER_RUNTIME:-docker}" rm -f praxis-postgres || true
 
   # ----------------------------------------------------------------------------
-  # Complete live vLLM Responses suite on a real GPU. Runs nightly, on a
+  # Build the model-baked image from this checkout and run the complete live
+  # Responses suite against it on a real GPU. Runs nightly, on a
   # `run_live_vllm` dispatch, and on a vllm-full-suite PR label. An ephemeral
-  # EC2 g4dn.xlarge runner is provisioned for the run and torn down
-  # unconditionally afterwards.
+  # EC2 GPU runner is provisioned for the run and torn down afterwards.
   # ----------------------------------------------------------------------------
+
+  # ----------------------------------------------------------------------------
+  # Pinned OpenCode drives Chat Completions to real vLLM
+  #
+  # The third documented coding client, and the only one on the OpenAI Chat
+  # Completions wire format:
+  #
+  #   OpenCode -> Praxis (anthropic/messages-native-vllm.yaml) -> vLLM /v1/chat/completions
+  #
+  # Nothing on that path translates a body, so this job deliberately does NOT
+  # re-prove wire fidelity — `examples::anthropic_messages_native_vllm` does
+  # that deterministically on every PR, and the `opencode-cpu` and
+  # `opencode-v2-cpu` jobs in integration.yaml prove each major's documented
+  # credential recipes against a scripted backend. What only a real model shows is that a multi-turn
+  # tool-calling conversation survives the round trip under real token timing,
+  # with streamed `tool_calls` deltas crossing arbitrary chunk boundaries.
+  #
+  # Hence two scenarios, not seven: one plain text turn (which also guards the
+  # reasoning-parser pairing, as the Claude planning scenario does) and one
+  # tool-call round trip, which is the scenario that earns GPU time.
+  #
+  # Both scenarios run twice: once with the pinned 1.x client and once with
+  # the pinned 2.x client (`opencode_v2_vllm`), against the SAME vLLM container
+  # and namespace. Each major keeps its own manifest and checksum, and its own
+  # cases in the results artifact.
+  #
+  # Every pin comes from the `pins` job, so this file contains no hardcoded
+  # version string. Reproducibility-critical values live in
+  # tests/integration/fixtures/opencode-cli/pin.toml and
+  # tests/integration/fixtures/opencode-cli-v2/pin.toml.
+  # ----------------------------------------------------------------------------
+
+  vllm-gpu-opencode-acceptance:
+    name: OpenCode acceptance on real vLLM (GPU)
+    needs: [pins, gpu-start-runner, vllm-gpu-full-suite]
+    if: |
+      !cancelled() &&
+      needs.gpu-start-runner.result == 'success' &&
+      (
+        github.event_name == 'schedule' ||
+        (
+          github.event_name == 'workflow_dispatch' &&
+          (inputs.run_live_vllm || inputs.run_opencode_acceptance)
+        ) ||
+        (
+          github.event_name == 'pull_request' &&
+          github.event.action == 'labeled' &&
+          github.event.label.name == 'vllm-full-suite'
+        )
+      )
+    runs-on: ${{ needs.gpu-start-runner.outputs.label }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      OPENCODE_VERSION: ${{ needs.pins.outputs.opencode_version }}
+      OPENCODE_NPM_PACKAGE: ${{ needs.pins.outputs.opencode_npm_package }}
+      OPENCODE_VLLM_MODEL: ${{ needs.pins.outputs.opencode_model }}
+      OPENCODE_VLLM_IMAGE: ${{ needs.pins.outputs.opencode_vllm_image }}
+      OPENCODE_VLLM_FLAGS: ${{ needs.pins.outputs.opencode_vllm_flags }}
+      OPENCODE_V2_VERSION: ${{ needs.pins.outputs.opencode_v2_version }}
+      OPENCODE_V2_PLATFORM: ${{ needs.pins.outputs.opencode_v2_platform }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify GPU and container runtime
+        run: |
+          nvidia-smi
+          if command -v docker >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=docker" >> "$GITHUB_ENV"
+            docker info >/dev/null
+          elif command -v podman >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=podman" >> "$GITHUB_ENV"
+            podman info >/dev/null
+          else
+            echo "Neither docker nor podman is available on this runner" >&2
+            exit 1
+          fi
+
+      - name: Fail on unset pins
+        run: |
+          set -euo pipefail
+          # The pins job validates the manifest; this guards against an output
+          # silently arriving empty, which would otherwise install `opencode-ai@`
+          # and fail much later with a confusing error.
+          for name in OPENCODE_VERSION OPENCODE_NPM_PACKAGE OPENCODE_VLLM_MODEL OPENCODE_VLLM_IMAGE OPENCODE_VLLM_FLAGS \
+              OPENCODE_V2_VERSION OPENCODE_V2_PLATFORM; do
+            value="${!name}"
+            if [ -z "$value" ] || case "$value" in *TBD*) true ;; *) false ;; esac; then
+              echo "::error::pin $name is empty or TBD: '$value'"
+              exit 1
+            fi
+          done
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: opencode-gpu-acceptance
+
+      - name: Install pinned OpenCode CLI
+        run: |
+          set -euo pipefail
+          # The ephemeral GPU AMI ships no Node/npm, so the CPU lane's
+          # `npm install -g` is unavailable here. Fetch the SAME self-contained
+          # platform binary the CPU lane stages — the `opencode-linux-x64`
+          # optionalDependency of `opencode-ai@<version>`, matching pin.toml
+          # `platform` — directly from the npm registry with curl, mirroring the
+          # Codex download step. Only curl and tar are required, both present on
+          # the AMI; the fetched binary is byte-identical to what npm resolves,
+          # so both lanes exercise the same client.
+          platform="linux-x64"
+          pkg="opencode-$platform"
+          tarball="$pkg-$OPENCODE_VERSION.tgz"
+          work="$RUNNER_TEMP/opencode-$OPENCODE_VERSION"
+          mkdir -p "$work"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            --output "$work/$tarball" \
+            "https://registry.npmjs.org/$pkg/-/$tarball"
+          (
+            cd "$work"
+            sha256sum --check \
+              "$GITHUB_WORKSPACE/tests/integration/fixtures/opencode-cli/$OPENCODE_VERSION-$platform.sha256"
+          )
+          tar --extract --gzip --file "$work/$tarball" --directory "$work"
+          # Resolve the NATIVE executable. The platform binary is self-contained,
+          # so it can be staged beside the Rust artifacts; the npm launcher
+          # cannot, because it resolves its payload relative to the npm root.
+          native="$work/package/bin/opencode"
+          if [ ! -x "$native" ]; then
+            echo "::error::expected the native OpenCode binary at $native; tarball layout changed"
+            tar tzf "$work/$tarball" | head -n 20 || true
+            exit 1
+          fi
+          # The GPU AMI denies exec from the Actions _temp mount after entering
+          # a network namespace. Install beside the executable Rust artifacts.
+          dest="$GITHUB_WORKSPACE/target/acceptance-bin/opencode"
+          mkdir -p "$(dirname "$dest")"
+          install -m 0755 "$native" "$dest"
+          # The client prints the bare version with no product prefix.
+          test "$("$dest" --version)" = "${OPENCODE_VERSION}"
+          echo "PRAXIS_TEST_OPENCODE_BIN=$dest" >> "$GITHUB_ENV"
+
+      - name: Install pinned OpenCode 2.x CLI
+        run: |
+          set -euo pipefail
+          # Byte-identical to the `opencode-v2-cpu` lane in integration.yaml:
+          # the scoped `@opencode/cli-<platform>` registry tarball, verified
+          # against the committed checksum. Staged under a distinct name so it
+          # can never shadow the 1.x binary above.
+          tarball="cli-$OPENCODE_V2_PLATFORM-$OPENCODE_V2_VERSION.tgz"
+          work="$RUNNER_TEMP/opencode-v2-$OPENCODE_V2_VERSION"
+          mkdir -p "$work"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            --output "$work/$tarball" \
+            "https://registry.npmjs.org/@opencode/cli-$OPENCODE_V2_PLATFORM/-/$tarball"
+          (
+            cd "$work"
+            sha256sum --check \
+              "$GITHUB_WORKSPACE/tests/integration/fixtures/opencode-cli-v2/$OPENCODE_V2_VERSION-$OPENCODE_V2_PLATFORM.sha256"
+          )
+          tar --extract --gzip --file "$work/$tarball" --directory "$work"
+          native="$work/package/bin/opencode"
+          if [ ! -x "$native" ]; then
+            echo "::error::expected the native OpenCode 2.x binary at $native; tarball layout changed"
+            tar tzf "$work/$tarball" | head -n 20 || true
+            exit 1
+          fi
+          dest="$GITHUB_WORKSPACE/target/acceptance-bin/opencode2"
+          mkdir -p "$(dirname "$dest")"
+          install -m 0755 "$native" "$dest"
+          # 2.x prints `opencode v<version>`, unlike the bare 1.x version.
+          test "$("$dest" --version)" = "opencode v${OPENCODE_V2_VERSION}"
+          echo "PRAXIS_TEST_OPENCODE_V2_BIN=$dest" >> "$GITHUB_ENV"
+
+      - name: Generate ephemeral vLLM backend credential
+        run: |
+          set -euo pipefail
+          # The "praxis-" prefix guarantees the value never starts with "-",
+          # which vLLM's argparse would read as a flag.
+          token="praxis-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          echo "::add-mask::$token"
+          echo "VLLM_API_KEY=$token" >> "$GITHUB_ENV"
+
+      - name: Start keyed vLLM for OpenCode
+        env:
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Keyed deliberately: the credential-isolation proof requires the
+          # backend to REJECT a request that Praxis did not inject into.
+          gpu_args=()
+          cache_mount="${GPU_HF_CACHE_DIR}:/root/.cache/huggingface"
+          if [ "$CONTAINER_RUNTIME" = "podman" ]; then
+            gpu_args=(--device nvidia.com/gpu=all)
+            cache_mount="${cache_mount}:Z"
+          else
+            gpu_args=(--gpus all)
+          fi
+          mkdir -p "${GPU_HF_CACHE_DIR}"
+          "$CONTAINER_RUNTIME" pull "${OPENCODE_VLLM_IMAGE}"
+          # shellcheck disable=SC2086
+          "$CONTAINER_RUNTIME" run -d --name vllm-opencode \
+            "${gpu_args[@]}" --ipc=host -p 8000:8000 \
+            -v "$cache_mount" \
+            -e HUGGING_FACE_HUB_TOKEN \
+            -e VLLM_API_KEY="${VLLM_API_KEY}" \
+            "${OPENCODE_VLLM_IMAGE}" \
+            ${OPENCODE_VLLM_FLAGS} \
+            --served-model-name "${OPENCODE_VLLM_MODEL}"
+
+      - name: Preflight vLLM Chat Completions
+        id: opencode_vllm_preflight
+        run: |
+          set -uo pipefail
+          for _ in $(seq 1 240); do
+            if curl -fsS -H "Authorization: Bearer ${VLLM_API_KEY}" \
+                 http://127.0.0.1:8000/v1/models >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "${ready:-0}" != 1 ]; then
+            echo "::error::vLLM did not become ready"
+            "$CONTAINER_RUNTIME" logs vllm-opencode --tail 200 || true
+            exit 1
+          fi
+          # Prove the surface the client actually uses, before any test runs.
+          curl -fsS -X POST http://127.0.0.1:8000/v1/chat/completions \
+            -H "Authorization: Bearer ${VLLM_API_KEY}" \
+            -H 'content-type: application/json' \
+            -d "{\"model\":\"${OPENCODE_VLLM_MODEL}\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"ping /no_think\"}]}" \
+            >/dev/null
+
+      - name: Build Praxis and OpenCode acceptance test
+        run: |
+          set -euo pipefail
+          cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
+          cargo test -p praxis-tests-integration --features openai-all,store-all --test suite --no-run
+
+      - name: Create restricted OpenCode network namespace
+        id: opencode_namespace
+        run: |
+          set -euo pipefail
+          # 10.202.0.0/24 — distinct from the Claude (10.200) and Codex (10.201)
+          # namespaces so the three acceptance jobs never collide on the shared
+          # instance. SELinux on this AMI otherwise blocks the staged CLI.
+          if command -v getenforce >/dev/null 2>&1; then
+            if [ "$(getenforce)" = Enforcing ]; then
+              sudo setenforce 0
+              echo "OPENCODE_RESTORE_SELINUX=1" >> "$GITHUB_ENV"
+            fi
+          fi
+          NS=praxis-opencode-ns
+          sudo ip netns add "$NS"
+          sudo ip link add oc-veth-host type veth peer name oc-veth-ns
+          sudo ip link set oc-veth-ns netns "$NS"
+          sudo ip addr add 10.202.0.1/24 dev oc-veth-host
+          sudo ip link set oc-veth-host up
+          sudo ip -n "$NS" addr add 10.202.0.2/24 dev oc-veth-ns
+          sudo ip -n "$NS" link set oc-veth-ns up
+          sudo ip -n "$NS" link set lo up
+          sudo iptables -I INPUT 1 -i oc-veth-host -s 10.202.0.2 -d 10.202.0.1 -j ACCEPT
+          if sudo firewall-cmd --state >/dev/null 2>&1; then
+            sudo firewall-cmd --zone=trusted --add-interface=oc-veth-host
+            echo "OPENCODE_FIREWALLD_VETH=1" >> "$GITHUB_ENV"
+          fi
+          if command -v nft >/dev/null 2>&1; then
+            sudo nft -j list ruleset | python3 -c '
+          import json, sys
+          for item in json.load(sys.stdin)["nftables"]:
+              chain = item.get("chain", {})
+              if chain.get("hook") == "input" and chain.get("family") in {"ip", "inet"}:
+                  print(chain["family"], chain["table"], chain["name"], sep="\t")
+          ' | while IFS=$'\t' read -r family table chain; do
+              sudo nft insert rule "$family" "$table" "$chain" \
+                iifname oc-veth-host ip saddr 10.202.0.2 ip daddr 10.202.0.1 \
+                accept comment '"praxis-opencode-veth"'
+            done
+            echo "OPENCODE_NFT_VETH=1" >> "$GITHUB_ENV"
+          fi
+          if sudo ip -n "$NS" route show default | grep -q .; then
+            echo "::error::OpenCode namespace has a default route" >&2
+            exit 1
+          fi
+          if sudo ip -n "$NS" route get 1.1.1.1 >/dev/null 2>&1; then
+            echo "::error::OpenCode namespace can route to the public internet" >&2
+            exit 1
+          fi
+          echo "OPENCODE_NS=$NS" >> "$GITHUB_ENV"
+
+      - name: Locate compiled suite test binary
+        id: opencode_test_binary
+        run: |
+          set -uo pipefail
+          TEST_BIN=$(cargo test -p praxis-tests-integration --features openai-all,store-all --test suite --no-run \
+              --message-format=json 2>/dev/null \
+            | python3 -c 'import json,sys; objs=[json.loads(l) for l in sys.stdin if l.lstrip().startswith("{")]; paths=[o["executable"] for o in objs if o.get("executable") and o.get("target",{}).get("name")=="suite"]; print(paths[-1] if paths else "")')
+          if [ -z "$TEST_BIN" ]; then
+            echo "::error::could not locate the compiled suite test binary"
+            exit 1
+          fi
+          # A Rust test that early-returns reports as PASSED, so assert the gate
+          # variable really points at an executable before trusting any result.
+          test -x "$PRAXIS_TEST_OPENCODE_BIN"
+          test -x "$PRAXIS_TEST_OPENCODE_V2_BIN"
+          echo "TEST_BIN=$TEST_BIN" >> "$GITHUB_ENV"
+
+      - name: Run OpenCode text-turn vLLM acceptance test (once, no retry)
+        id: opencode_text
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.OPENCODE_VLLM_MODEL }}
+          PRAXIS_TEST_OPENCODE_NETNS: ${{ env.OPENCODE_NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.202.0.1
+          PRAXIS_TEST_OPENCODE_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          sudo --preserve-env=PRAXIS_TEST_OPENCODE_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_OPENCODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_OPENCODE_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            opencode_vllm::opencode_vllm_options_headers_auth_completes_text_turn \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/opencode-acceptance-text.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Run OpenCode tool-call vLLM acceptance test (once, no retry)
+        id: opencode_tool_call
+        if: ${{ always() && !cancelled() && steps.opencode_vllm_preflight.outcome == 'success' && steps.opencode_namespace.outcome == 'success' && steps.opencode_test_binary.outcome == 'success' }}
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.OPENCODE_VLLM_MODEL }}
+          PRAXIS_TEST_OPENCODE_NETNS: ${{ env.OPENCODE_NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.202.0.1
+          PRAXIS_TEST_OPENCODE_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          # The scenario that earns GPU time: streamed tool_calls deltas, a
+          # bash execution, and a role:"tool" turn back up, all crossing Praxis
+          # under real token timing.
+          sudo --preserve-env=PRAXIS_TEST_OPENCODE_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_OPENCODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_OPENCODE_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            opencode_vllm::opencode_vllm_tool_call_round_trip_writes_hash_verified_marker \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/opencode-acceptance-tool-call.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Run OpenCode 2.x text-turn vLLM acceptance test (once, no retry)
+        id: opencode_v2_text
+        if: ${{ always() && !cancelled() && steps.opencode_vllm_preflight.outcome == 'success' && steps.opencode_namespace.outcome == 'success' && steps.opencode_test_binary.outcome == 'success' }}
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.OPENCODE_VLLM_MODEL }}
+          PRAXIS_TEST_OPENCODE_NETNS: ${{ env.OPENCODE_NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.202.0.1
+          PRAXIS_TEST_OPENCODE_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          sudo --preserve-env=PRAXIS_TEST_OPENCODE_V2_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_OPENCODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_OPENCODE_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            opencode_v2_vllm::opencode_v2_vllm_plugin_auth_completes_text_turn \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/opencode-acceptance-v2-text.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Run OpenCode 2.x tool-call vLLM acceptance test (once, no retry)
+        id: opencode_v2_tool_call
+        if: ${{ always() && !cancelled() && steps.opencode_vllm_preflight.outcome == 'success' && steps.opencode_namespace.outcome == 'success' && steps.opencode_test_binary.outcome == 'success' }}
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.OPENCODE_VLLM_MODEL }}
+          PRAXIS_TEST_OPENCODE_NETNS: ${{ env.OPENCODE_NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.202.0.1
+          PRAXIS_TEST_OPENCODE_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          # The 2.x client names its shell tool `shell`, not `bash`; the test
+          # prompt reads that name from the 2.x manifest.
+          sudo --preserve-env=PRAXIS_TEST_OPENCODE_V2_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_OPENCODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_OPENCODE_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            opencode_v2_vllm::opencode_v2_vllm_tool_call_round_trip_writes_hash_verified_marker \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/opencode-acceptance-v2-tool-call.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Capture diagnostics on failure
+        if: ${{ always() }}
+        run: |
+          set -uo pipefail
+          "${CONTAINER_RUNTIME:-docker}" logs vllm-opencode --tail 400 > "$RUNNER_TEMP/opencode-vllm.log" 2>&1 || true
+
+      - name: Upload OpenCode acceptance diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: opencode-vllm-gpu-diagnostics
+          path: |
+            ${{ runner.temp }}/opencode-acceptance-*.log
+            ${{ runner.temp }}/opencode-vllm.log
+          if-no-files-found: ignore
+          retention-days: 7
+          # A failed-job re-run keeps GITHUB_RUN_ID and increments the attempt;
+          # without overwrite the action rejects the existing artifact name and
+          # the summary would consume the previous attempt's stale upload.
+          overwrite: true
+
+      - name: Capture OpenCode acceptance scenarios
+        if: ${{ always() }}
+        env:
+          TEXT_OUTCOME: ${{ steps.opencode_text.outcome }}
+          TOOL_CALL_OUTCOME: ${{ steps.opencode_tool_call.outcome }}
+          V2_TEXT_OUTCOME: ${{ steps.opencode_v2_text.outcome }}
+          V2_TOOL_CALL_OUTCOME: ${{ steps.opencode_v2_tool_call.outcome }}
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/opencode-acceptance.json" <<'PY'
+          import json, os, pathlib, subprocess, sys
+          # run_id/attempt must be INTEGERS and checkout_sha must come from the
+          # working tree: vllm_qualification.acceptance() compares all three
+          # against the values finish() is invoked with, and any mismatch
+          # silently degrades the suite to "unreported" rather than failing.
+          names = ("TEXT_OUTCOME", "TOOL_CALL_OUTCOME", "V2_TEXT_OUTCOME", "V2_TOOL_CALL_OUTCOME")
+          ids = ("opencode_text", "opencode_tool_call", "opencode_v2_text", "opencode_v2_tool_call")
+          data = {
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "checkout_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "cases": [
+                  {"id": case_id, "status": os.environ.get(name) or "unexecuted"}
+                  for case_id, name in zip(ids, names)
+              ],
+          }
+          pathlib.Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n")
+          PY
+
+      - name: Upload OpenCode acceptance results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: opencode-vllm-acceptance-results
+          path: ${{ runner.temp }}/opencode-acceptance.json
+          if-no-files-found: ignore
+          retention-days: 7
+          # See the diagnostics upload above: a re-run must replace, not collide
+          # with, the prior attempt's results so the summary reads this attempt.
+          overwrite: true
+
+      - name: Tear down OpenCode network namespace
+        if: ${{ always() }}
+        run: |
+          set -uo pipefail
+          if [ "${OPENCODE_FIREWALLD_VETH:-}" = 1 ]; then
+            sudo firewall-cmd --zone=trusted --remove-interface=oc-veth-host 2>/dev/null || true
+          fi
+          if [ "${OPENCODE_NFT_VETH:-}" = 1 ]; then
+            sudo nft -j -a list ruleset | python3 -c '
+          import json, sys
+          for item in json.load(sys.stdin)["nftables"]:
+              rule = item.get("rule", {})
+              if rule.get("comment") == "praxis-opencode-veth":
+                  print(rule["family"], rule["table"], rule["chain"], rule["handle"], sep="\t")
+          ' | while IFS=$'\t' read -r family table chain handle; do
+              sudo nft delete rule "$family" "$table" "$chain" handle "$handle" 2>/dev/null || true
+            done
+          fi
+          sudo iptables -D INPUT -i oc-veth-host -s 10.202.0.2 -d 10.202.0.1 -j ACCEPT 2>/dev/null || true
+          sudo ip link del oc-veth-host 2>/dev/null || true
+          sudo ip netns del "${OPENCODE_NS:-praxis-opencode-ns}" 2>/dev/null || true
+          if [ "${OPENCODE_RESTORE_SELINUX:-}" = 1 ]; then
+            sudo setenforce 1 || true
+          fi
+
+      - name: Stop vLLM
+        if: ${{ always() }}
+        run: |
+          "${CONTAINER_RUNTIME:-docker}" rm -f vllm-opencode 2>/dev/null || true
+
+  # ----------------------------------------------------------------------------
+  # Pinned pi drives Chat Completions to real vLLM
+  #
+  # The fourth documented coding client, on the same untranslated path as
+  # OpenCode:
+  #
+  #   pi (openai-completions) -> Praxis (anthropic/messages-native-vllm.yaml) -> vLLM /v1/chat/completions
+  #
+  # The `pi-cpu` job in integration.yaml proves the documented `models.json`,
+  # its fail-closed inversions, and a scripted tool round trip on every PR.
+  # This job adds what only a real model shows: the same two scenarios as the
+  # OpenCode job, a plain text turn (which also guards the reasoning-parser
+  # pairing) and a tool-call round trip under real token timing.
+  #
+  # Its own job, container, and namespace, so it is reported and debugged
+  # independently of OpenCode, but it serves the SAME backend pins: the
+  # `[vllm]` block of tests/integration/fixtures/opencode-cli/pin.toml, which
+  # the `pins` job cross-checks against tests/integration/fixtures/pi-cli/pin.toml.
+  # Unlike the OpenCode job, the client is launched INSIDE the namespace with
+  # `ip netns exec`, as the Claude and Codex jobs do.
+  # ----------------------------------------------------------------------------
+
+  vllm-gpu-pi-acceptance:
+    name: pi acceptance on real vLLM (GPU)
+    needs: [pins, gpu-start-runner, vllm-gpu-full-suite]
+    if: |
+      !cancelled() &&
+      needs.gpu-start-runner.result == 'success' &&
+      (
+        github.event_name == 'schedule' ||
+        (
+          github.event_name == 'workflow_dispatch' &&
+          (inputs.run_live_vllm || inputs.run_pi_acceptance)
+        ) ||
+        (
+          github.event_name == 'pull_request' &&
+          github.event.action == 'labeled' &&
+          github.event.label.name == 'vllm-full-suite'
+        )
+      )
+    runs-on: ${{ needs.gpu-start-runner.outputs.label }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      PI_VERSION: ${{ needs.pins.outputs.pi_version }}
+      PI_PLATFORM: ${{ needs.pins.outputs.pi_platform }}
+      PI_VLLM_MODEL: ${{ needs.pins.outputs.pi_model }}
+      PI_VLLM_IMAGE: ${{ needs.pins.outputs.opencode_vllm_image }}
+      PI_VLLM_FLAGS: ${{ needs.pins.outputs.opencode_vllm_flags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify GPU and container runtime
+        run: |
+          nvidia-smi
+          if command -v docker >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=docker" >> "$GITHUB_ENV"
+            docker info >/dev/null
+          elif command -v podman >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=podman" >> "$GITHUB_ENV"
+            podman info >/dev/null
+          else
+            echo "Neither docker nor podman is available on this runner" >&2
+            exit 1
+          fi
+
+      - name: Fail on unset pins
+        run: |
+          set -euo pipefail
+          # The pins job validates the manifests; this guards against an output
+          # silently arriving empty, which would otherwise fetch a release
+          # archive for `v` and fail much later with a confusing error.
+          for name in PI_VERSION PI_PLATFORM PI_VLLM_MODEL PI_VLLM_IMAGE PI_VLLM_FLAGS; do
+            value="${!name}"
+            if [ -z "$value" ] || case "$value" in *TBD*) true ;; *) false ;; esac; then
+              echo "::error::pin $name is empty or TBD: '$value'"
+              exit 1
+            fi
+          done
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: pi-gpu-acceptance
+
+      - name: Install pinned pi CLI
+        run: |
+          set -euo pipefail
+          # Byte-identical to the `pi-cpu` lane in integration.yaml: the
+          # upstream release archive, verified against the committed checksum.
+          # Only curl, sha256sum, and tar are needed; the AMI ships no Node.
+          archive="pi-$PI_PLATFORM.tar.gz"
+          work="$RUNNER_TEMP/pi-$PI_VERSION"
+          mkdir -p "$work"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            --output "$work/$archive" \
+            "https://github.com/earendil-works/pi/releases/download/v$PI_VERSION/$archive"
+          (
+            cd "$work"
+            sha256sum --check \
+              "$GITHUB_WORKSPACE/tests/integration/fixtures/pi-cli/$PI_VERSION-$PI_PLATFORM.sha256"
+          )
+          # The GPU AMI denies exec from the Actions _temp mount after entering
+          # a network namespace, so stage beside the executable Rust artifacts.
+          # The whole directory is staged: the binary reads its version and
+          # assets from beside itself.
+          stage="$GITHUB_WORKSPACE/target/acceptance-bin"
+          rm -rf "$stage/pi"
+          mkdir -p "$stage"
+          tar --extract --gzip --file "$work/$archive" --directory "$stage"
+          pi_bin="$stage/pi/pi"
+          if [ ! -x "$pi_bin" ]; then
+            echo "::error::expected the pi binary at $pi_bin; archive layout changed"
+            tar tzf "$work/$archive" | head -n 20 || true
+            exit 1
+          fi
+          # The client prints the bare version with no product prefix.
+          test "$("$pi_bin" --version < /dev/null)" = "${PI_VERSION}"
+          echo "PRAXIS_TEST_PI_BIN=$pi_bin" >> "$GITHUB_ENV"
+
+      - name: Generate ephemeral vLLM backend credential
+        run: |
+          set -euo pipefail
+          # The "praxis-" prefix guarantees the value never starts with "-",
+          # which vLLM's argparse would read as a flag.
+          token="praxis-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          echo "::add-mask::$token"
+          echo "VLLM_API_KEY=$token" >> "$GITHUB_ENV"
+
+      - name: Start keyed vLLM for pi
+        env:
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Keyed deliberately: the credential-isolation proof requires the
+          # backend to REJECT a request that Praxis did not inject into.
+          gpu_args=()
+          cache_mount="${GPU_HF_CACHE_DIR}:/root/.cache/huggingface"
+          if [ "$CONTAINER_RUNTIME" = "podman" ]; then
+            gpu_args=(--device nvidia.com/gpu=all)
+            cache_mount="${cache_mount}:Z"
+          else
+            gpu_args=(--gpus all)
+          fi
+          mkdir -p "${GPU_HF_CACHE_DIR}"
+          "$CONTAINER_RUNTIME" pull "${PI_VLLM_IMAGE}"
+          # shellcheck disable=SC2086
+          "$CONTAINER_RUNTIME" run -d --name vllm-pi \
+            "${gpu_args[@]}" --ipc=host -p 8000:8000 \
+            -v "$cache_mount" \
+            -e HUGGING_FACE_HUB_TOKEN \
+            -e VLLM_API_KEY="${VLLM_API_KEY}" \
+            "${PI_VLLM_IMAGE}" \
+            ${PI_VLLM_FLAGS} \
+            --served-model-name "${PI_VLLM_MODEL}"
+
+      - name: Preflight vLLM Chat Completions
+        id: pi_vllm_preflight
+        run: |
+          set -uo pipefail
+          for _ in $(seq 1 240); do
+            if curl -fsS -H "Authorization: Bearer ${VLLM_API_KEY}" \
+                 http://127.0.0.1:8000/v1/models >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "${ready:-0}" != 1 ]; then
+            echo "::error::vLLM did not become ready"
+            "$CONTAINER_RUNTIME" logs vllm-pi --tail 200 || true
+            exit 1
+          fi
+          # Prove the surface the client actually uses, with the two request
+          # fields pi sends that a minimal probe would not (`store` and
+          # `max_completion_tokens`), before any test runs.
+          curl -fsS -X POST http://127.0.0.1:8000/v1/chat/completions \
+            -H "Authorization: Bearer ${VLLM_API_KEY}" \
+            -H 'content-type: application/json' \
+            -d "{\"model\":\"${PI_VLLM_MODEL}\",\"store\":false,\"max_completion_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"ping /no_think\"}]}" \
+            >/dev/null
+
+      - name: Build Praxis and pi acceptance test
+        run: |
+          set -euo pipefail
+          cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
+          cargo test -p praxis-tests-integration --features openai-all,store-all --test suite --no-run
+
+      - name: Create restricted pi network namespace
+        id: pi_namespace
+        run: |
+          set -euo pipefail
+          # 10.203.0.0/24 — distinct from the Claude (10.200), Codex (10.201),
+          # and OpenCode (10.202) namespaces so the acceptance jobs never collide
+          # on the shared instance. SELinux on this AMI otherwise blocks the
+          # staged CLI.
+          if command -v getenforce >/dev/null 2>&1; then
+            if [ "$(getenforce)" = Enforcing ]; then
+              sudo setenforce 0
+              echo "PI_RESTORE_SELINUX=1" >> "$GITHUB_ENV"
+            fi
+          fi
+          NS=praxis-pi-ns
+          sudo ip netns add "$NS"
+          sudo ip link add pi-veth-host type veth peer name pi-veth-ns
+          sudo ip link set pi-veth-ns netns "$NS"
+          sudo ip addr add 10.203.0.1/24 dev pi-veth-host
+          sudo ip link set pi-veth-host up
+          sudo ip -n "$NS" addr add 10.203.0.2/24 dev pi-veth-ns
+          sudo ip -n "$NS" link set pi-veth-ns up
+          sudo ip -n "$NS" link set lo up
+          sudo iptables -I INPUT 1 -i pi-veth-host -s 10.203.0.2 -d 10.203.0.1 -j ACCEPT
+          if sudo firewall-cmd --state >/dev/null 2>&1; then
+            sudo firewall-cmd --zone=trusted --add-interface=pi-veth-host
+            echo "PI_FIREWALLD_VETH=1" >> "$GITHUB_ENV"
+          fi
+          if command -v nft >/dev/null 2>&1; then
+            sudo nft -j list ruleset | python3 -c '
+          import json, sys
+          for item in json.load(sys.stdin)["nftables"]:
+              chain = item.get("chain", {})
+              if chain.get("hook") == "input" and chain.get("family") in {"ip", "inet"}:
+                  print(chain["family"], chain["table"], chain["name"], sep="\t")
+          ' | while IFS=$'\t' read -r family table chain; do
+              sudo nft insert rule "$family" "$table" "$chain" \
+                iifname pi-veth-host ip saddr 10.203.0.2 ip daddr 10.203.0.1 \
+                accept comment '"praxis-pi-veth"'
+            done
+            echo "PI_NFT_VETH=1" >> "$GITHUB_ENV"
+          fi
+          if sudo ip -n "$NS" route show default | grep -q .; then
+            echo "::error::pi namespace has a default route" >&2
+            exit 1
+          fi
+          if sudo ip -n "$NS" route get 1.1.1.1 >/dev/null 2>&1; then
+            echo "::error::pi namespace can route to the public internet" >&2
+            exit 1
+          fi
+          echo "PI_NS=$NS" >> "$GITHUB_ENV"
+
+      - name: Locate compiled suite test binary
+        id: pi_test_binary
+        run: |
+          set -uo pipefail
+          TEST_BIN=$(cargo test -p praxis-tests-integration --features openai-all,store-all --test suite --no-run \
+              --message-format=json 2>/dev/null \
+            | python3 -c 'import json,sys; objs=[json.loads(l) for l in sys.stdin if l.lstrip().startswith("{")]; paths=[o["executable"] for o in objs if o.get("executable") and o.get("target",{}).get("name")=="suite"]; print(paths[-1] if paths else "")')
+          if [ -z "$TEST_BIN" ]; then
+            echo "::error::could not locate the compiled suite test binary"
+            exit 1
+          fi
+          # A Rust test that early-returns reports as PASSED, so assert the gate
+          # variable really points at an executable before trusting any result.
+          test -x "$PRAXIS_TEST_PI_BIN"
+          echo "TEST_BIN=$TEST_BIN" >> "$GITHUB_ENV"
+
+      - name: Run pi text-turn vLLM acceptance test (once, no retry)
+        id: pi_text
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.PI_VLLM_MODEL }}
+          PRAXIS_TEST_PI_NETNS: ${{ env.PI_NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.203.0.1
+          PRAXIS_TEST_PI_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          sudo --preserve-env=PRAXIS_TEST_PI_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_PI_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_PI_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            pi_vllm::pi_vllm_documented_config_completes_text_turn \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/pi-acceptance-text.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Run pi tool-call vLLM acceptance test (once, no retry)
+        id: pi_tool_call
+        if: ${{ always() && !cancelled() && steps.pi_vllm_preflight.outcome == 'success' && steps.pi_namespace.outcome == 'success' && steps.pi_test_binary.outcome == 'success' }}
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.PI_VLLM_MODEL }}
+          PRAXIS_TEST_PI_NETNS: ${{ env.PI_NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.203.0.1
+          PRAXIS_TEST_PI_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          # The scenario that earns GPU time: streamed tool_calls deltas, a
+          # bash execution, and a role:"tool" turn back up, all crossing Praxis
+          # under real token timing.
+          sudo --preserve-env=PRAXIS_TEST_PI_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_PI_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_PI_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            pi_vllm::pi_vllm_tool_call_round_trip_writes_hash_verified_marker \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/pi-acceptance-tool-call.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Capture diagnostics on failure
+        if: ${{ always() }}
+        run: |
+          set -uo pipefail
+          "${CONTAINER_RUNTIME:-docker}" logs vllm-pi --tail 400 > "$RUNNER_TEMP/pi-vllm.log" 2>&1 || true
+
+      - name: Upload pi acceptance diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pi-vllm-gpu-diagnostics
+          path: |
+            ${{ runner.temp }}/pi-acceptance-*.log
+            ${{ runner.temp }}/pi-vllm.log
+          if-no-files-found: ignore
+          retention-days: 7
+          # A failed-job re-run keeps GITHUB_RUN_ID and increments the attempt;
+          # without overwrite the action rejects the existing artifact name and
+          # the summary would consume the previous attempt's stale upload.
+          overwrite: true
+
+      - name: Capture pi acceptance scenarios
+        if: ${{ always() }}
+        env:
+          TEXT_OUTCOME: ${{ steps.pi_text.outcome }}
+          TOOL_CALL_OUTCOME: ${{ steps.pi_tool_call.outcome }}
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/pi-acceptance.json" <<'PY'
+          import json, os, pathlib, subprocess, sys
+          # run_id/attempt must be INTEGERS and checkout_sha must come from the
+          # working tree: vllm_qualification.acceptance() compares all three
+          # against the values finish() is invoked with, and any mismatch
+          # silently degrades the suite to "unreported" rather than failing.
+          names = ("TEXT_OUTCOME", "TOOL_CALL_OUTCOME")
+          ids = ("pi_text", "pi_tool_call")
+          data = {
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "checkout_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "cases": [
+                  {"id": case_id, "status": os.environ.get(name) or "unexecuted"}
+                  for case_id, name in zip(ids, names)
+              ],
+          }
+          pathlib.Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n")
+          PY
+
+      - name: Upload pi acceptance results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pi-vllm-acceptance-results
+          path: ${{ runner.temp }}/pi-acceptance.json
+          if-no-files-found: ignore
+          retention-days: 7
+          # See the diagnostics upload above: a re-run must replace, not collide
+          # with, the prior attempt's results so the summary reads this attempt.
+          overwrite: true
+
+      - name: Tear down pi network namespace
+        if: ${{ always() }}
+        run: |
+          set -uo pipefail
+          if [ "${PI_FIREWALLD_VETH:-}" = 1 ]; then
+            sudo firewall-cmd --zone=trusted --remove-interface=pi-veth-host 2>/dev/null || true
+          fi
+          if [ "${PI_NFT_VETH:-}" = 1 ]; then
+            sudo nft -j -a list ruleset | python3 -c '
+          import json, sys
+          for item in json.load(sys.stdin)["nftables"]:
+              rule = item.get("rule", {})
+              if rule.get("comment") == "praxis-pi-veth":
+                  print(rule["family"], rule["table"], rule["chain"], rule["handle"], sep="\t")
+          ' | while IFS=$'\t' read -r family table chain handle; do
+              sudo nft delete rule "$family" "$table" "$chain" handle "$handle" 2>/dev/null || true
+            done
+          fi
+          sudo iptables -D INPUT -i pi-veth-host -s 10.203.0.2 -d 10.203.0.1 -j ACCEPT 2>/dev/null || true
+          sudo ip link del pi-veth-host 2>/dev/null || true
+          sudo ip netns del "${PI_NS:-praxis-pi-ns}" 2>/dev/null || true
+          if [ "${PI_RESTORE_SELINUX:-}" = 1 ]; then
+            sudo setenforce 1 || true
+          fi
+
+      - name: Stop vLLM
+        if: ${{ always() }}
+        run: |
+          "${CONTAINER_RUNTIME:-docker}" rm -f vllm-pi 2>/dev/null || true
 
   gpu-start-runner:
     name: Start ephemeral EC2 GPU runner
@@ -1317,12 +2849,14 @@ jobs:
       github.event_name == 'schedule' ||
       (
         github.event_name == 'workflow_dispatch' &&
-        (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_codex_acceptance)
+        (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_codex_acceptance || inputs.run_opencode_acceptance || inputs.run_pi_acceptance || inputs.run_degradation_acceptance || inputs.run_compaction_only)
       ) ||
       (
         github.event_name == 'pull_request' &&
         github.event.action == 'labeled' &&
-        github.event.label.name == 'vllm-full-suite'
+        github.event.label.name == 'vllm-full-suite' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.user.login != 'dependabot[bot]'
       )
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -1369,25 +2903,94 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
+      packages: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Verify GPU and container runtime
         run: |
           nvidia-smi
-          if command -v docker >/dev/null 2>&1; then
+          if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
             echo "CONTAINER_RUNTIME=docker" >> "$GITHUB_ENV"
-            docker info >/dev/null
-          elif command -v podman >/dev/null 2>&1; then
+            echo "GPU_DEVICE_ARGS=--gpus all" >> "$GITHUB_ENV"
+          elif command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
             echo "CONTAINER_RUNTIME=podman" >> "$GITHUB_ENV"
-            podman info >/dev/null
+            echo "GPU_DEVICE_ARGS=--device nvidia.com/gpu=all" >> "$GITHUB_ENV"
           else
-            echo "Neither docker nor podman is available on this runner" >&2
+            echo "Neither docker nor podman is usable on this runner" >&2
             exit 1
           fi
 
+      - name: Free disk space
+        run: |
+          "$CONTAINER_RUNTIME" system prune -af || true
+          df -h /
+
+      - name: Read text image spec
+        id: spec
+        uses: ./.github/actions/vllm-image-spec
+        with:
+          key: text
+
+      - name: Export resolved image reference
+        env:
+          SPEC_IMAGE: ${{ steps.spec.outputs.image }}
+          SPEC_MODEL: ${{ steps.spec.outputs.model }}
+        run: |
+          set -euo pipefail
+          # VLLM_GPU_MODEL is shared with the acceptance jobs, which serve the
+          # same model from the pinned upstream image rather than this baked
+          # one. Fail loudly on drift instead of silently rebuilding every run
+          # because the manifest and the workflow env disagree.
+          if [ "$SPEC_MODEL" != "$VLLM_GPU_MODEL" ]; then
+            echo "::error::vllm/images.json serves $SPEC_MODEL but VLLM_GPU_MODEL is $VLLM_GPU_MODEL"
+            exit 1
+          fi
+          echo "VLLM_BUILT_GPU_IMAGE=$SPEC_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR (docker)
+        if: env.CONTAINER_RUNTIME == 'docker'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to GHCR (podman)
+        if: env.CONTAINER_RUNTIME == 'podman'
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | podman login ghcr.io \
+            --username "$GHCR_USERNAME" --password-stdin
+
+      - name: Resolve model-baked GPU image
+        id: image
+        uses: ./.github/actions/resolve-vllm-gpu-image
+        with:
+          image: ${{ steps.spec.outputs.image }}
+          model: ${{ steps.spec.outputs.model }}
+          revision: ${{ steps.spec.outputs.revision }}
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+
+      # Only reached when GHCR has no image matching this checkout -- the
+      # vllm-full-suite label on a PR that edits vllm/Containerfile, or a
+      # publish that has not landed yet. Building here is what keeps such a PR
+      # validated against the image it actually describes.
+      - name: Build model-baked GPU image
+        if: steps.image.outputs.build-required == 'true'
+        uses: ./.github/actions/build-vllm-gpu
+        with:
+          model: ${{ steps.spec.outputs.model }}
+          revision: ${{ steps.spec.outputs.revision }}
+          image: ${{ steps.spec.outputs.image }}
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          hugging-face-token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
 
       - name: Start PostgreSQL response store
         run: |
@@ -1415,7 +3018,7 @@ jobs:
           done
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           # The GPU AMI ships Python 3.9; ogx[starter] needs >=3.12, so pin the
           # interpreter setup-uv provisions. Cache is repo-scoped (GH cache
@@ -1426,56 +3029,21 @@ jobs:
             tests/integration/ogx-constraints.txt
 
       - name: Start vLLM on GPU (background)
-        env:
-          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
-        run: |
-          # Background the image pull + container launch so the multi-GB CUDA
-          # image download and model weight load overlap `cargo build` below.
-          # `run -d` needs the image present, so pull and run are chained in one
-          # detached subshell; the readiness wait then joins on the serving port.
-          # Runtime, image, model and GPU flags are passed positionally so they
-          # expand in the inner shell without leaking outer-shell quoting.
-          gpu_args=()
-          if [ "$CONTAINER_RUNTIME" = "podman" ]; then
-            gpu_args=(--device nvidia.com/gpu=all)
-          else
-            gpu_args=(--gpus all)
-          fi
-          # Persist the HF weight cache on the instance so the later Claude Code
-          # acceptance job (a second job on this same ephemeral runner) loads
-          # Qwen3-8B from disk instead of re-downloading ~16GB.
-          mkdir -p "$GPU_HF_CACHE_DIR"
-          cache_mount="$GPU_HF_CACHE_DIR:/root/.cache/huggingface"
-          if [ "$CONTAINER_RUNTIME" = "podman" ]; then
-            # The GPU AMI enforces SELinux; relabel the host directory so the
-            # rootless container can populate and reuse the model cache.
-            cache_mount="${cache_mount}:Z"
-          fi
-          gpu_args+=(-v "$cache_mount")
-
-          # The single-quoted body is the inner script; $1/$runtime/... expand
-          # there, not in this outer shell, which is the whole point.
-          # shellcheck disable=SC2016
-          nohup bash -c '
-            set -euo pipefail
-            runtime="$1"; image="$2"; model="$3"; shift 3
-            "$runtime" pull "$image"
-            "$runtime" run -d --name vllm \
-              "$@" \
-              -p 8000:8000 \
-              -e HUGGING_FACE_HUB_TOKEN \
-              "$image" \
-              --model "$model" \
-              --max-model-len 16384 \
-              --served-model-name "$model" \
-              --enable-auto-tool-choice \
-              --tool-call-parser hermes \
-              --reasoning-parser deepseek_r1 \
-              --gpu-memory-utilization 0.9
-          ' bash "$CONTAINER_RUNTIME" "$VLLM_GPU_IMAGE" "$VLLM_GPU_MODEL" "${gpu_args[@]}" \
-            > /tmp/vllm-launch.log 2>&1 &
-          echo $! > /tmp/vllm-launch.pid
-          echo "vLLM launch (pull + run) started in background, pid $(cat /tmp/vllm-launch.pid)"
+        uses: ./.github/actions/start-vllm
+        with:
+          image: ${{ steps.spec.outputs.image }}
+          model: ${{ steps.spec.outputs.served-model-name }}
+          model-path: ${{ steps.spec.outputs.model-path }}
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          # Resolved above, either pulled or built; nothing left to fetch.
+          pull: "false"
+          device-args: ${{ env.GPU_DEVICE_ARGS }}
+          tool-call-parser: ${{ steps.spec.outputs.tool-call-parser }}
+          reasoning-parser: ${{ steps.spec.outputs.reasoning-parser }}
+          gpu-memory-utilization: "0.9"
+          # Suite-specific: the qualification cases need more context than the
+          # publisher's smoke test, so this overrides the manifest default.
+          max-model-len: "16384"
 
       - name: Pre-install OGX dependencies
         run: |
@@ -1487,47 +3055,18 @@ jobs:
           echo $! > /tmp/ogx.pid
 
       - name: Build Praxis
-        run: cargo build -p praxis-ai-proxy --features full
+        id: qualification_build
+        run: cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
 
       - name: Wait for vLLM readiness
-        run: |
-          # The image pull + container launch run in the background so they can
-          # overlap `cargo build`; join on them here. Model weights download from
-          # Hugging Face on first start, so allow a generous deadline. Poll the
-          # serving endpoints directly (runtime agnostic), but fail fast if the
-          # background launcher exited before the port ever came up (bad pull,
-          # OOM on load) rather than waiting out the whole deadline.
-          dump_launch_log() {
-            echo "----- /tmp/vllm-launch.log -----"
-            cat /tmp/vllm-launch.log 2>/dev/null || echo "No vLLM launch log found"
-          }
-          echo "Waiting for vLLM health and model endpoints..."
-          launch_pid="$(cat /tmp/vllm-launch.pid)"
-          deadline=$((SECONDS + 1200))
-          until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
-                curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
-            if ! kill -0 "$launch_pid" 2>/dev/null; then
-              # `podman run -d` exits successfully as soon as it creates the
-              # container, often before vLLM binds its port. Only fail when the
-              # launcher is gone AND no running container remains.
-              if ! "$CONTAINER_RUNTIME" inspect --format='{{.State.Running}}' vllm 2>/dev/null | grep -q true; then
-                echo "::error::vLLM launcher exited without a running container"
-                dump_launch_log
-                exit 1
-              fi
-            fi
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error::vLLM did not become ready within 1200s"
-              dump_launch_log
-              exit 1
-            fi
-            sleep 5
-          done
-          echo "vLLM is ready"
-          curl -sf http://127.0.0.1:8000/v1/models | head -c 500
-          echo
+        id: qualification_vllm_ready
+        uses: ./.github/actions/wait-vllm
+        with:
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          timeout: "1200"
 
       - name: Wait for OGX readiness
+        id: qualification_ogx_ready
         run: |
           dump_ogx_log() {
             echo "----- /tmp/ogx.log (tail -n 200) -----"
@@ -1550,16 +3089,54 @@ jobs:
           done
           echo "OGX is ready"
 
-      - name: Run complete live vLLM Responses suite
+      - name: Run complete live vLLM Responses suite (SDK 2.x)
         env:
           DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
           VLLM_TEST_BACKEND: live
           VLLM_MODEL: ${{ env.VLLM_GPU_MODEL }}
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/qualification-responses-cases.json
         run: |
-          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s \
-            -k "not live_tavily_web_search_returns_real_sources"
+          set +e
+          uv run --with "openai<3" tests/integration/sdk/openai/test_openai_responses_vllm.py -s \
+            -p qualification_plugin -k "not live_tavily_web_search_returns_real_sources" \
+            --sdk-version=2.x \
+            2>&1 | tee "$RUNNER_TEMP/qualification-responses-sdk2-pytest.log"
+          exit "${PIPESTATUS[0]}"
 
-      - name: Run credentialed live Tavily web search
+      - name: Run complete live vLLM Responses suite (SDK 3.x)
+        if: ${{ always() && !cancelled() && steps.qualification_build.outcome == 'success' && steps.qualification_vllm_ready.outcome == 'success' && steps.qualification_ogx_ready.outcome == 'success' }}
+        env:
+          DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
+          VLLM_TEST_BACKEND: live
+          VLLM_MODEL: ${{ env.VLLM_GPU_MODEL }}
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/qualification-responses-cases.json
+        run: |
+          set +e
+          uv run --with "openai>=3,<4" tests/integration/sdk/openai/test_openai_responses_vllm.py -s \
+            -p qualification_plugin -k "not live_tavily_web_search_returns_real_sources" \
+            --sdk-version=3.x \
+            2>&1 | tee "$RUNNER_TEMP/qualification-responses-pytest.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Run OpenAI Agents SDK live Responses loop (GPU)
+        id: qualification_agents_sdk
+        # The Agents SDK test owns its listener and a forwarding recorder that
+        # relays to live vLLM; it needs only the proxy build and a ready model,
+        # not OGX or PostgreSQL.
+        if: ${{ always() && !cancelled() && steps.qualification_build.outcome == 'success' && steps.qualification_vllm_ready.outcome == 'success' }}
+        env:
+          VLLM_TEST_BACKEND: live
+          VLLM_MODEL: ${{ env.VLLM_GPU_MODEL }}
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_AI_BIN: target/debug/praxis-ai
+        run: |
+          set +e
+          uv run tests/integration/sdk/openai/test_openai_agents_sdk.py -s \
+            2>&1 | tee "$RUNNER_TEMP/qualification-agents-sdk.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Run credentialed live Tavily web search (SDK 2.x)
+        if: ${{ always() && !cancelled() && steps.qualification_ogx_ready.outcome == 'success' }}
         env:
           DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
           # The generated YAML keeps the ${TAVILY_API_KEY} reference, so the
@@ -1572,9 +3149,73 @@ jobs:
           PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH: ${{ github.event_name != 'pull_request' && '1' || '0' }}
           VLLM_TEST_BACKEND: live
           VLLM_MODEL: ${{ env.VLLM_GPU_MODEL }}
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/qualification-credentialed-cases.json
         run: |
-          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s \
-            -k live_tavily_web_search_returns_real_sources
+          set +e
+          uv run --with "openai<3" tests/integration/sdk/openai/test_openai_responses_vllm.py -s \
+            -p qualification_plugin -k live_tavily_web_search_returns_real_sources \
+            --sdk-version=2.x \
+            2>&1 | tee "$RUNNER_TEMP/qualification-credentialed-sdk2-pytest.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Run credentialed live Tavily web search (SDK 3.x)
+        if: ${{ always() && !cancelled() && steps.qualification_ogx_ready.outcome == 'success' }}
+        env:
+          DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
+          # The generated YAML keeps the ${TAVILY_API_KEY} reference, so the
+          # secret is consumed only by this one-test process and is never written
+          # into or printed with the config.
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          # Scheduled/manual full runs are controlled environments and must prove
+          # the real provider path. Labeled fork PRs do not receive secrets, so
+          # they retain deterministic coverage and skip only this credentialed test.
+          PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH: ${{ github.event_name != 'pull_request' && '1' || '0' }}
+          VLLM_TEST_BACKEND: live
+          VLLM_MODEL: ${{ env.VLLM_GPU_MODEL }}
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/qualification-credentialed-cases.json
+        run: |
+          set +e
+          uv run --with "openai>=3,<4" tests/integration/sdk/openai/test_openai_responses_vllm.py -s \
+            -p qualification_plugin -k live_tavily_web_search_returns_real_sources \
+            --sdk-version=3.x \
+            2>&1 | tee "$RUNNER_TEMP/qualification-credentialed-pytest.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Capture Responses gateway GPU qualification and diagnostics
+        if: always()
+        env:
+          QUALIFICATION_SETUP: ${{ steps.qualification_build.outcome == 'success' && steps.qualification_vllm_ready.outcome == 'success' && steps.qualification_ogx_ready.outcome == 'success' && 'passed' || 'failed' }}
+          GPU_INSTANCE_TYPE: ${{ inputs.gpu_instance_type || env.GPU_INSTANCE_TYPE }}
+        run: |
+          python3 .github/scripts/vllm_qualification.py capture \
+            --responses "$RUNNER_TEMP/qualification-responses-cases.json" \
+            --credentialed "$RUNNER_TEMP/qualification-credentialed-cases.json" \
+            --setup "$QUALIFICATION_SETUP" \
+            --output "$RUNNER_TEMP/qualification-raw.json"
+          "${CONTAINER_RUNTIME:-docker}" logs vllm > "$RUNNER_TEMP/qualification-vllm.log" 2>&1 || true
+          "${CONTAINER_RUNTIME:-docker}" logs praxis-postgres > "$RUNNER_TEMP/qualification-postgres.log" 2>&1 || true
+          cp /tmp/ogx.log "$RUNNER_TEMP/qualification-ogx.log" 2>/dev/null || true
+
+      - name: Upload Responses gateway GPU results and diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vllm-gpu-responses-raw
+          path: |
+            ${{ runner.temp }}/qualification-raw.json
+            ${{ runner.temp }}/qualification-responses-cases.json
+            ${{ runner.temp }}/qualification-credentialed-cases.json
+            ${{ runner.temp }}/qualification-responses-sdk2-pytest.log
+            ${{ runner.temp }}/qualification-responses-pytest.log
+            ${{ runner.temp }}/qualification-credentialed-sdk2-pytest.log
+            ${{ runner.temp }}/qualification-credentialed-pytest.log
+            ${{ runner.temp }}/qualification-agents-sdk.log
+            ${{ runner.temp }}/qualification-vllm.log
+            ${{ runner.temp }}/qualification-postgres.log
+            ${{ runner.temp }}/qualification-ogx.log
+          if-no-files-found: warn
+          retention-days: 30
+          overwrite: true
 
       - name: vLLM container logs
         if: failure()
@@ -1607,6 +3248,80 @@ jobs:
             kill "$(cat /tmp/ogx.pid)" 2>/dev/null || true
           fi
 
+  # Runs on a hosted runner so provisioning and GPU runner registration failures
+  # still produce an explicit report and Actions summary.
+  gpu-qualification-summary:
+    name: Summarize vLLM Responses gateway GPU qualification
+    needs: [gpu-start-runner, vllm-gpu-full-suite, vllm-gpu-claude-acceptance, vllm-gpu-codex-acceptance,
+            vllm-gpu-opencode-acceptance, vllm-gpu-pi-acceptance]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download available Responses gateway results
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/vllm-qualification-raw"
+          gh run download "$GITHUB_RUN_ID" --name vllm-gpu-responses-raw \
+            --dir "$RUNNER_TEMP/vllm-qualification-raw" || true
+          mkdir -p "$RUNNER_TEMP/claude-acceptance-raw" "$RUNNER_TEMP/codex-acceptance-raw" \
+            "$RUNNER_TEMP/opencode-acceptance-raw" "$RUNNER_TEMP/pi-acceptance-raw"
+          gh run download "$GITHUB_RUN_ID" --name claude-vllm-acceptance-results \
+            --dir "$RUNNER_TEMP/claude-acceptance-raw" || true
+          gh run download "$GITHUB_RUN_ID" --name codex-vllm-acceptance-results \
+            --dir "$RUNNER_TEMP/codex-acceptance-raw" || true
+          gh run download "$GITHUB_RUN_ID" --name opencode-vllm-acceptance-results \
+            --dir "$RUNNER_TEMP/opencode-acceptance-raw" || true
+          gh run download "$GITHUB_RUN_ID" --name pi-vllm-acceptance-results \
+            --dir "$RUNNER_TEMP/pi-acceptance-raw" || true
+
+      - name: Build report and Actions summary
+        env:
+          GPU_REQUESTED: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_live_vllm) || (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == 'vllm-full-suite') }}
+          GPU_START_RESULT: ${{ needs.gpu-start-runner.result }}
+          GPU_SUITE_RESULT: ${{ needs.vllm-gpu-full-suite.result }}
+          CLAUDE_RESULT: ${{ needs.vllm-gpu-claude-acceptance.result }}
+          CODEX_RESULT: ${{ needs.vllm-gpu-codex-acceptance.result }}
+          OPENCODE_RESULT: ${{ needs.vllm-gpu-opencode-acceptance.result }}
+          PI_RESULT: ${{ needs.vllm-gpu-pi-acceptance.result }}
+        run: |
+          python3 .github/scripts/vllm_qualification.py finish \
+            --raw "$RUNNER_TEMP/vllm-qualification-raw/qualification-raw.json" \
+            --claude-raw "$RUNNER_TEMP/claude-acceptance-raw/claude-acceptance.json" \
+            --codex-raw "$RUNNER_TEMP/codex-acceptance-raw/codex-acceptance.json" \
+            --opencode-raw "$RUNNER_TEMP/opencode-acceptance-raw/opencode-acceptance.json" \
+            --pi-raw "$RUNNER_TEMP/pi-acceptance-raw/pi-acceptance.json" \
+            --requested "$GPU_REQUESTED" \
+            --start-result "$GPU_START_RESULT" \
+            --suite-result "$GPU_SUITE_RESULT" \
+            --claude-result "$CLAUDE_RESULT" \
+            --codex-result "$CODEX_RESULT" \
+            --opencode-result "$OPENCODE_RESULT" \
+            --pi-result "$PI_RESULT" \
+            --run-id "$GITHUB_RUN_ID" \
+            --attempt "$GITHUB_RUN_ATTEMPT" \
+            --url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --sha "$GITHUB_SHA" \
+            --output "$RUNNER_TEMP/qualification.json" \
+            --markdown "$RUNNER_TEMP/qualification-summary.md"
+          cat "$RUNNER_TEMP/qualification-summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload structured qualification report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vllm-qualification
+          path: ${{ runner.temp }}/qualification.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
   gpu-stop-runner:
     name: Stop ephemeral EC2 GPU runner
     # MUST depend on every job that runs on the instance; otherwise the runner
@@ -1616,6 +3331,8 @@ jobs:
       - vllm-gpu-full-suite
       - vllm-gpu-claude-acceptance
       - vllm-gpu-codex-acceptance
+      - vllm-gpu-opencode-acceptance
+      - vllm-gpu-pi-acceptance
     # Always tear down the instance, even on failure/cancel, but skip when the
     # runner was never started (non-GPU triggers).
     if: always() && needs.gpu-start-runner.result != 'skipped'
@@ -1646,7 +3363,7 @@ jobs:
       always() &&
       github.event_name != 'schedule' &&
       (github.event_name != 'pull_request' || github.event.action != 'labeled') &&
-      (github.event_name != 'workflow_dispatch' || !inputs.run_live_vllm) &&
+      (github.event_name != 'workflow_dispatch' || (!inputs.run_live_vllm && !inputs.run_degradation_acceptance)) &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -1675,10 +3392,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every
@@ -1723,8 +3440,8 @@ jobs:
 
       - name: Build Praxis
         run: |
-          cargo build -p praxis-ai-proxy --features full
-          cargo build -p praxis-test-utils --example conversations_tenant_proxy
+          cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
+          cargo build -p praxis-test-utils --example conversations_tenant_proxy --features full,openai-all,store-postgres
 
       - name: Wait for inference simulator readiness
         run: |
@@ -1748,13 +3465,21 @@ jobs:
             exit 1
           fi
 
-      - name: Run Conversations SDK integration tests (PostgreSQL store)
+      - name: Run Conversations SDK integration tests (PostgreSQL store, SDK 2.x)
         env:
           DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
           PRAXIS_TENANT_TEST_BIN: target/debug/examples/conversations_tenant_proxy
           VLLM_MODEL: ${{ env.INFERENCE_SIM_MODEL }}
         run: |
-          uv run tests/integration/sdk/openai/test_openai_conversations.py -s
+          uv run --with "openai<3" tests/integration/sdk/openai/test_openai_conversations.py -s --sdk-version=2.x
+
+      - name: Run Conversations SDK integration tests (PostgreSQL store, SDK 3.x)
+        env:
+          DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
+          PRAXIS_TENANT_TEST_BIN: target/debug/examples/conversations_tenant_proxy
+          VLLM_MODEL: ${{ env.INFERENCE_SIM_MODEL }}
+        run: |
+          uv run --with "openai>=3,<4" tests/integration/sdk/openai/test_openai_conversations.py -s --sdk-version=3.x
 
       - name: Wait for OGX readiness
         run: |
@@ -1785,15 +3510,34 @@ jobs:
           done
           echo "OGX is ready"
 
-      - name: Run simulated Responses integration tests (PostgreSQL store)
+      - name: Run simulated Responses integration tests (PostgreSQL store, SDK 2.x)
         env:
           DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
           VLLM_MODEL: ${{ env.INFERENCE_SIM_MODEL }}
           VLLM_TEST_BACKEND: simulator
         run: |
           test_cmd=(
-            uv run tests/integration/sdk/openai/test_openai_responses_vllm.py
-            -s -m "not real_inference and not vllm_compat"
+            uv run --with "openai<3" tests/integration/sdk/openai/test_openai_responses_vllm.py
+            -s -m "not real_inference and not vllm_compat" --sdk-version=2.x
+          )
+          if "${test_cmd[@]}"; then
+            exit 0
+          fi
+          if [ "$GITHUB_EVENT_NAME" != "merge_group" ]; then
+            exit 1
+          fi
+          echo "::warning::Retrying failed simulator tests once for the merge queue"
+          "${test_cmd[@]}" --last-failed --last-failed-no-failures none
+
+      - name: Run simulated Responses integration tests (PostgreSQL store, SDK 3.x)
+        env:
+          DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
+          VLLM_MODEL: ${{ env.INFERENCE_SIM_MODEL }}
+          VLLM_TEST_BACKEND: simulator
+        run: |
+          test_cmd=(
+            uv run --with "openai>=3,<4" tests/integration/sdk/openai/test_openai_responses_vllm.py
+            -s -m "not real_inference and not vllm_compat" --sdk-version=3.x
           )
           if "${test_cmd[@]}"; then
             exit 0

@@ -26,7 +26,8 @@
 # Tiers must have strictly ascending capacity values. The deny tier (if
 # present) must be last, and its capacity must equal the algorithm's
 # `capacity`. Inject-only tiers (no deny) add headers below the algorithm
-# capacity; requests over capacity are still rejected.
+# capacity; requests over capacity are still rejected unless the rule
+# sets `enforcement: soft` (see token-rate-limit-soft-enforcement.yaml).
 #
 # Supported token_count provider values:
 #   openai | anthropic | google | bedrock | azure

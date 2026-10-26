@@ -142,6 +142,73 @@
           }
         }
       }
+    },
+    {
+      "name": "thinking-control",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "synthetic-unrepresentable-parameters-model",
+              "max_tokens": 2048,
+              "thinking": {
+                "type": "enabled",
+                "budget_tokens": 1024
+              },
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "What is 2+2?"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "type": "error",
+              "error": {
+                "type": "invalid_request_error",
+                "message": "`thinking` cannot be translated to Chat Completions"
+              },
+              "request_id": null
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
     }
   ]
 }
