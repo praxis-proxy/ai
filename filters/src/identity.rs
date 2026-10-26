@@ -84,9 +84,8 @@ pub(crate) fn resolve_tenant_identity(
 
 /// Resolve tenant identity from metadata without consulting raw request headers.
 ///
-/// This is the safe lookup path for observability filters: verified identity
-/// metadata wins over guard-captured metadata, and a partial verified identity
-/// cannot be extended from the lower-trust namespace.
+/// Verified identity metadata wins over guard-captured metadata, and a partial
+/// verified identity cannot be extended from the lower-trust namespace.
 pub(crate) fn resolve_tenant_identity_from_metadata(
     ctx: &HttpFilterContext<'_>,
     prefix: &str,
@@ -174,6 +173,10 @@ fn read_header_identity(ctx: &mut HttpFilterContext<'_>, prefix_lower: &str, ide
 /// Mark every `{prefix}*` header for removal without reading it, so
 /// unused identity headers still never reach the upstream provider.
 fn strip_identity_headers(ctx: &mut HttpFilterContext<'_>, prefix_lower: &str) {
+    // This scan is required even after trusted metadata resolves identity:
+    // otherwise a spoofed lower-trust header with the same prefix would be
+    // forwarded upstream. HeaderMap has no prefix index, so the O(n) pass is
+    // the security boundary; n is the request's bounded header count.
     for (key, _) in &ctx.request.headers {
         if key.as_str().starts_with(prefix_lower) {
             ctx.request_headers_to_remove.push(key.clone());

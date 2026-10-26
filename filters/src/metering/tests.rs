@@ -923,19 +923,6 @@ async fn skips_metering_when_no_identity_and_no_fallback() {
 }
 
 #[tokio::test]
-async fn publishes_resolved_username_for_downstream_filters() {
-    let filter = filter_from_yaml("metering_url: \"http://127.0.0.1:1\"\n");
-    let req = make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("identity.x-tenant-username", "alice");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-
-    assert!(matches!(action, FilterAction::Continue));
-    assert_eq!(ctx.get_metadata(META_METERING_USERNAME), Some("alice"));
-}
-
-#[tokio::test]
 async fn request_body_records_model_in_metadata() {
     let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\n");
     let req = make_request(http::Method::POST, "/v1/chat/completions");

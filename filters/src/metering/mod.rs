@@ -74,9 +74,6 @@ const CE_TYPE_USAGE: &str = "inference.tokens.used";
 /// body phase and read during the response body phase.
 pub(crate) const META_METERING_MODEL: &str = "metering.model";
 
-/// Metadata key for the tenant username resolved by external metering.
-pub(crate) const META_METERING_USERNAME: &str = "metering.username";
-
 /// Counter incremented whenever a usage or error event fails to reach the
 /// metering service (transport failure or non-2xx acknowledgement).
 const METRIC_REPORT_FAILURES: &str = "praxis_ai_metering_report_failures_total";
@@ -435,11 +432,6 @@ impl HttpFilter for ExternalMeteringFilter {
             };
             state.username.clone_from(fallback);
         }
-
-        // Publish the resolved identity for downstream consumers such as
-        // token_usage_metrics. This avoids repeating trust-tier resolution
-        // when external_metering already ran earlier in the pipeline.
-        ctx.set_metadata(META_METERING_USERNAME, state.username.clone());
 
         if !state.model.is_empty() {
             ctx.filter_metadata

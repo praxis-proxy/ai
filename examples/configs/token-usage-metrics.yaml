@@ -1,13 +1,15 @@
-# Token Usage Prometheus Metrics (POC)
+# Token Usage Prometheus Metrics
 #
-# Opt-in per-tenant token counters for small known tenant sets.
-# This is not a production usage dashboard.
+# Opt-in, cardinality-bounded per-tenant token counters.
 #
 # Emits praxis_ai_tokens_total{tenant, model, kind} after token_count
-# extracts usage. Tenant identity uses the same 3-tier resolution as
-# external_metering (verified metadata or identity_header_guard metadata).
-# Raw request headers are never used directly. Distinct tenant labels are bounded by
-# max_tenants; further tenants share overflow_tenant (default: other).
+# extracts usage. A production authentication filter must populate the exact
+# unnamespaced x-tenant-username metadata key from verified credentials.
+# identity_header_guard only strips/captures client headers; its namespaced
+# metadata is deliberately not trusted by token_usage_metrics.
+#
+# Both tenant and model labels use explicit allowlists. Authenticated values
+# outside an allowlist map to the fixed `other` buckets.
 #
 # Usage:
 #   cargo run -p praxis-ai-proxy -- -c examples/configs/token-usage-metrics.yaml
@@ -15,6 +17,10 @@
 #     -H "Content-Type: application/json" \
 #     -H "x-tenant-username: alice" \
 #     -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
+#
+# The raw header above is intentionally insufficient to create a tenant
+# series. Add the deployment's authentication filter before
+# token_usage_metrics to populate trusted metadata.
 #
 # Grafana: import examples/dashboards/token-usage-metrics.json
 # Prometheus scrape endpoint: http://127.0.0.1:9901/metrics
@@ -36,18 +42,20 @@ filter_chains:
           - path_prefix: "/"
             cluster: backend
 
-      # Capture identity into FilterContext metadata and strip the raw header.
-      # In a pipeline with external_metering, token_usage_metrics can instead
-      # reuse the resolved metering.username metadata that filter publishes.
+      # Defense in depth: strip raw identity headers before proxying. The
+      # resulting namespaced metadata is unverified and is not used by metrics.
       - filter: identity_header_guard
         prefix: "x-tenant-"
         metadata_namespace: "identity"
 
       - filter: token_usage_metrics
-        identity_header_prefix: "x-tenant-"
-        identity_metadata_namespace: "identity"
-        max_tenants: 32
+        tenant_metadata_key: "x-tenant-username"
+        allowed_tenants:
+          - token-metrics-example-alice
+        allowed_models:
+          - gpt-4o
         overflow_tenant: other
+        overflow_model: other
 
       - filter: token_count
         provider: openai

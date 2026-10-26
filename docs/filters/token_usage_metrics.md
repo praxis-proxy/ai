@@ -3,29 +3,22 @@
 
 # `token_usage_metrics`
 
-Emits per-tenant Prometheus token counters from `token.*` metadata.
+Emits bounded per-tenant Prometheus token counters from `token.*` metadata.
 
 ## Configuration Notes
 
-Opt-in POC for small known tenant sets. Off unless declared in YAML. Distinct tenant labels are bounded by `max_tenants`; additional tenants share `overflow_tenant`. Tenant identity must already be in filter metadata, normally from `external_metering` or `identity_header_guard`; raw request headers are never consumed directly. Place either identity-producing filter before this one in the request pipeline.
+The filter fails configuration unless tenant and model allowlists are explicit. Requests without authenticated tenant metadata are skipped. Values outside either allowlist map to fixed overflow labels.
+
+The admin `/metrics` endpoint remains an operator boundary: protect it with network policy and authentication. Prometheus labels do not provide tenant authorization or billing-grade accounting.
+
+Declare this filter **before** `token_count` so response hooks (which run in reverse order) extract counts first.
 
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `identity_header_prefix` | string | no | Prefix of tenant identity metadata keys. Must match `identity_header_guard` / `external_metering` when those filters run in the same pipeline. |
-| `identity_metadata_namespace` | string | no | Metadata namespace `identity_header_guard` writes captured identity under (tier 2 of identity resolution). |
-| `default_tenant` | string | no | Fallback tenant label when no identity is resolved. When unset, requests without identity are not counted. |
-| `max_tenants` | integer | no | Maximum distinct tenant labels before overflow aggregation. |
-| `overflow_tenant` | string | no | Label used for tenants beyond `max_tenants`. |
-
-## Example
-
-```yaml
-filter: token_usage_metrics
-identity_header_prefix: "x-tenant-"
-identity_metadata_namespace: "identity"
-default_tenant: "unknown"
-max_tenants: 32
-overflow_tenant: other
-```
+| `tenant_metadata_key` | string | no | Exact unnamespaced metadata key populated from verified credentials by an authentication filter. Namespaced keys are rejected because `identity_header_guard` stores unverified client headers there. |
+| `allowed_tenants` | string[] | yes | Tenant labels admitted as their own Prometheus series. |
+| `allowed_models` | string[] | yes | Model labels admitted as their own Prometheus series. |
+| `overflow_tenant` | string | no | Label for an authenticated tenant not in `allowed_tenants`. |
+| `overflow_model` | string | no | Label for a model not in `allowed_models`. |

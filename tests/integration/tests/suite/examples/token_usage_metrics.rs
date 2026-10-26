@@ -3,7 +3,8 @@
 
 //! Integration tests for the `token_usage_metrics` example config.
 //!
-//! Verifies both transparent proxying and the exported Prometheus series.
+//! Verifies transparent proxying and that unverified client identity cannot
+//! create a tenant Prometheus series.
 
 use std::collections::HashMap;
 
@@ -31,7 +32,7 @@ fn json_post_with_headers(path: &str, body: &str, headers: &[(&str, &str)]) -> S
 }
 
 #[test]
-fn example_config_token_usage_metrics_passthrough() {
+fn example_config_rejects_unverified_tenant_metrics() {
     let backend = Backend::fixed(OPENAI_JSON)
         .header("content-type", "application/json")
         .start_with_shutdown();
@@ -43,7 +44,7 @@ fn example_config_token_usage_metrics_passthrough() {
         HashMap::from([("127.0.0.1:3000", backend.port())]),
     );
     let admin_addr = format!("127.0.0.1:{admin_port}");
-    config.admin.address = Some(admin_addr.clone());
+    config.admin.metrics_address = Some(admin_addr.clone());
     let proxy = start_proxy(&config);
     wait_for_http(&admin_addr);
 
@@ -65,11 +66,7 @@ fn example_config_token_usage_metrics_passthrough() {
     assert_eq!(parse_status(&metrics), 200, "metrics endpoint should return 200");
     let metrics_body = parse_body(&metrics);
     assert!(
-        metrics_body.lines().any(|line| {
-            line.starts_with("praxis_ai_tokens_total{")
-                && line.contains("tenant=\"token-metrics-example-alice\"")
-                && line.contains("kind=\"total\"")
-        }),
-        "metrics should contain the per-tenant total-token series: {metrics_body}"
+        !metrics_body.contains("tenant=\"token-metrics-example-alice\""),
+        "raw client identity must not create a tenant metric series: {metrics_body}"
     );
 }

@@ -1,6 +1,6 @@
 # Example dashboards
 
-## Per-tenant token usage (POC)
+## Per-tenant token usage
 
 [`token-usage-metrics.json`](token-usage-metrics.json) visualizes the opt-in
 `praxis_ai_tokens_total{tenant, model, kind}` counter emitted by the
@@ -12,8 +12,10 @@
 3. Import `token-usage-metrics.json` into Grafana and select that Prometheus
    datasource.
 
-This dashboard is intended for POCs or deployments with a small, known tenant
-set. It does not enforce tenant access control. Production tenant isolation and
-durable usage/cost reporting are separate concerns tracked by
+The filter requires authenticated tenant metadata plus explicit tenant/model
+allowlists, so client headers cannot create or expand metric series. Protect
+the admin endpoint and Grafana/Prometheus with operator authentication and
+network policy: labels do not enforce tenant access control. Durable
+usage/cost reporting remains a separate concern tracked by
 [`ai#301`](https://github.com/praxis-proxy/ai/issues/301) and
 [`ai#211`](https://github.com/praxis-proxy/ai/issues/211).

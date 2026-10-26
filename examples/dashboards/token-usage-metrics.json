@@ -36,7 +36,7 @@
           "refId": "A"
         }
       ],
-      "title": "Token rate by tenant (POC)",
+      "title": "Token rate by tenant",
       "type": "timeseries"
     },
     {
@@ -53,7 +53,7 @@
           "refId": "A"
         }
       ],
-      "title": "Input vs output by tenant (POC)",
+      "title": "Input vs output by tenant",
       "type": "timeseries"
     },
     {
@@ -70,7 +70,7 @@
           "refId": "A"
         }
       ],
-      "title": "Token rate by tenant and model (POC)",
+      "title": "Token rate by tenant and model",
       "type": "timeseries"
     }
   ],
@@ -94,7 +94,7 @@
   },
   "time": { "from": "now-1h", "to": "now" },
   "timezone": "browser",
-  "title": "Praxis AI Token Usage (POC)",
+  "title": "Praxis AI Token Usage",
   "uid": "praxis-ai-token-usage-poc",
   "version": 1
 }
