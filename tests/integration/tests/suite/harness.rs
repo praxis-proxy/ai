@@ -33,6 +33,14 @@ pub(crate) const OPENCODE_PINNED_VERSION: &str = "1.19.3";
 /// `opencode_v2::pin_toml_version_matches_harness_const`.
 pub(crate) const OPENCODE_V2_PINNED_VERSION: &str = "2.1.2";
 
+/// Pinned version of the pi coding agent executable used for E2E acceptance tests.
+///
+/// `pi --version` prints the bare version with no product prefix, so this is
+/// compared for equality against the trimmed output. Kept in sync with
+/// `tests/integration/fixtures/pi-cli/pin.toml` by
+/// `pi::pin_toml_version_matches_harness_const`.
+pub(crate) const PI_PINNED_VERSION: &str = "1.4.0";
+
 /// Portable shell fragment that reads bytes on stdin and prints their lowercase
 /// sha256 hex digest (no filename column). GNU coreutils ships `sha256sum`, but
 /// macOS (where this suite's precompute and the CLI clients' fixed PATH run) ships

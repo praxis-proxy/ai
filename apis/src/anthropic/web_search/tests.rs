@@ -21,6 +21,7 @@ use crate::{
     CalloutCredentials,
     callout_identity::CalloutIdentity,
     test_utils::{make_filter_context, make_request, make_response},
+    web_search::config::MAX_SEARCH_QUERY_BYTES,
 };
 
 /// A callout identity with no owner and no per-user credential (shared-key path).
@@ -72,6 +73,7 @@ outbound_chain: web_search_outbound
     AnthropicWebSearchFilter {
         default_context_size: validated.default_context_size,
         max_body_bytes: validated.max_body_bytes,
+        max_query_bytes: validated.max_query_bytes,
         search_client,
         outbound: Arc::new(outbound),
         user_credential_slot: validated.user_credential,
@@ -360,7 +362,7 @@ async fn sole_web_search_tool_use_signals_loop() {
 
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(result_action(&ctx).as_deref(), Some("loop"));
-    let ResponseDecision::Managed(pending) = classify_response(body.as_ref().unwrap()) else {
+    let ResponseDecision::Managed(pending) = classify_response(body.as_ref().unwrap(), MAX_SEARCH_QUERY_BYTES) else {
         panic!("expected managed search");
     };
     assert_eq!(pending.query, "potato");
@@ -379,7 +381,7 @@ async fn vllm_end_turn_web_search_signals_loop() {
 
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(result_action(&ctx).as_deref(), Some("loop"));
-    let ResponseDecision::Managed(pending) = classify_response(body.as_ref().unwrap()) else {
+    let ResponseDecision::Managed(pending) = classify_response(body.as_ref().unwrap(), MAX_SEARCH_QUERY_BYTES) else {
         panic!("expected vLLM WebSearch response to be managed");
     };
     assert_eq!(pending.query, "potato");
@@ -446,7 +448,7 @@ async fn escaped_managed_query_signals_loop_with_decoded_text() {
 
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(result_action(&ctx).as_deref(), Some("loop"));
-    let ResponseDecision::Managed(pending) = classify_response(body.as_ref().unwrap()) else {
+    let ResponseDecision::Managed(pending) = classify_response(body.as_ref().unwrap(), MAX_SEARCH_QUERY_BYTES) else {
         panic!("expected managed search");
     };
     assert_eq!(pending.query, "potato\ncultivation");
@@ -1490,7 +1492,7 @@ fn accounted_previous_response_recovers_complete_assistant_content() {
     ]);
     let response = message_response(content.clone(), "tool_use");
 
-    let (pending, recovered) = managed_search_from_response(&response).unwrap();
+    let (pending, recovered) = managed_search_from_response(&response, MAX_SEARCH_QUERY_BYTES).unwrap();
 
     assert_eq!(pending.id, "toolu_search_1");
     assert_eq!(pending.query, "potato");
@@ -1508,7 +1510,7 @@ fn managed_reentry_large_content_avoids_second_parse_allocations() {
     // The previous implementation classifies the complete response and then
     // deserializes it again to recover owned assistant content.
     let legacy = allocation_counter::measure(|| {
-        let ResponseDecision::Managed(pending) = classify_response(&response) else {
+        let ResponseDecision::Managed(pending) = classify_response(&response, MAX_SEARCH_QUERY_BYTES) else {
             panic!("expected managed search");
         };
         let mut value: Value = serde_json::from_slice(&response).unwrap();
@@ -1516,7 +1518,7 @@ fn managed_reentry_large_content_avoids_second_parse_allocations() {
         std::hint::black_box((pending, recovered));
     });
     let current = allocation_counter::measure(|| {
-        std::hint::black_box(managed_search_from_response(&response).unwrap());
+        std::hint::black_box(managed_search_from_response(&response, MAX_SEARCH_QUERY_BYTES).unwrap());
     });
 
     assert!(
@@ -1643,14 +1645,14 @@ fn managed_reentry_matches_borrowed_response_classification() {
     ];
 
     for (name, bytes, expected) in cases {
-        let decision = match classify_response(bytes) {
+        let decision = match classify_response(bytes, MAX_SEARCH_QUERY_BYTES) {
             ResponseDecision::Done => "done",
             ResponseDecision::Managed(_) => "managed",
             ResponseDecision::InvalidManagedCall => "invalid",
             ResponseDecision::QueryTooLong => "too long",
         };
         assert_eq!(decision, *expected, "borrowed classifier: {name}");
-        let recovered = managed_search_from_response(bytes);
+        let recovered = managed_search_from_response(bytes, MAX_SEARCH_QUERY_BYTES);
         assert_eq!(recovered.is_ok(), decision == "managed", "re-entry: {name}");
         if let Ok((pending, content)) = recovered {
             assert_eq!(pending.id, "toolu_1", "{name}");
@@ -1665,16 +1667,67 @@ fn managed_reentry_matches_borrowed_response_classification() {
         r#"{{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{{"type":"tool_use","id":"toolu_1","name":"WebSearch","input":{{"query":"{long_query}"}}}}]}}"#
     );
     assert!(matches!(
-        classify_response(oversized.as_bytes()),
+        classify_response(oversized.as_bytes(), MAX_SEARCH_QUERY_BYTES),
         ResponseDecision::QueryTooLong
     ));
-    assert!(managed_search_from_response(oversized.as_bytes()).is_err());
+    assert!(managed_search_from_response(oversized.as_bytes(), MAX_SEARCH_QUERY_BYTES).is_err());
+}
+
+#[test]
+fn classify_response_enforces_configured_lower_bound() {
+    // An admin-lowered bound, not the 8192 ceiling, gates classification, and
+    // the streaming failure carries the configured limit so the client-facing
+    // error names the operator's actual bound.
+    let lowered = 16;
+    let over_lowered = format!(
+        r#"{{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{{"type":"tool_use","id":"toolu_1","name":"WebSearch","input":{{"query":"{}"}}}}]}}"#,
+        "x".repeat(lowered + 1)
+    );
+    assert!(matches!(
+        classify_response(over_lowered.as_bytes(), lowered),
+        ResponseDecision::QueryTooLong
+    ));
+
+    let within_lowered = format!(
+        r#"{{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{{"type":"tool_use","id":"toolu_1","name":"WebSearch","input":{{"query":"{}"}}}}]}}"#,
+        "x".repeat(lowered)
+    );
+    assert!(matches!(
+        classify_response(within_lowered.as_bytes(), lowered),
+        ResponseDecision::Managed(_)
+    ));
+
+    let mut logical = streaming::LogicalStream::new(1 << 20, 1 << 20, lowered);
+    drive_streaming_chunk(&mut logical, &sse_message_start("msg_1"), false, Reentry::Available);
+    drive_streaming_chunk(
+        &mut logical,
+        &sse_web_search_block(0, "toolu_1", &"x".repeat(lowered + 1)),
+        false,
+        Reentry::Available,
+    );
+    drive_streaming_chunk(
+        &mut logical,
+        &sse_message_delta("tool_use", 1),
+        false,
+        Reentry::Available,
+    );
+    let error = logical.finish_round().unwrap_err();
+    assert_eq!(
+        error,
+        streaming::StreamError::QueryTooLong { max_bytes: lowered },
+        "the streaming failure carries the configured lower bound"
+    );
+    let terminal = String::from_utf8(streaming::error_event_bytes(&error)).unwrap();
+    assert!(
+        terminal.contains(&format!("must not exceed {lowered} bytes")),
+        "the client-facing error names the configured lower bound"
+    );
 }
 
 /// Feed a managed `WebSearch` round into a fresh logical stream, returning the
 /// terminal `drive_streaming_chunk` output and published action.
 fn drive_managed_round(reentry: Reentry) -> (String, Option<&'static str>) {
-    let mut logical = streaming::LogicalStream::new(1 << 20, 1 << 20);
+    let mut logical = streaming::LogicalStream::new(1 << 20, 1 << 20, MAX_SEARCH_QUERY_BYTES);
     let (start, start_action) = drive_streaming_chunk(&mut logical, &sse_message_start("msg_1"), false, reentry);
     assert!(
         String::from_utf8(start).unwrap().contains("event: message_start"),

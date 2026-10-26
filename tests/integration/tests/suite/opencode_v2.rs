@@ -67,9 +67,10 @@ use tempfile::TempDir;
 use super::{
     harness::OPENCODE_V2_PINNED_VERSION,
     opencode::{
-        CHILD_TIMEOUT, EXAMPLE_CONFIG, GUIDE_V2_HEADING, MODEL_ID, OpenCodeTrace, PROMPT, PROVIDER_ID, REPLY,
-        assert_not_timed_out, assert_requests_carry_injected_credential, fenced_blocks, fixture_path, gateway_config,
-        gateway_credential, gateway_password, guide_section, pin_value_in, repo_root, scripted_backend,
+        CHILD_TIMEOUT, EXAMPLE_CONFIG, GUIDE_PI_HEADING, GUIDE_V2_HEADING, MODEL_ID, OpenCodeTrace, PROMPT,
+        PROVIDER_ID, REPLY, assert_not_timed_out, assert_requests_carry_injected_credential, fenced_blocks,
+        fixture_path, gateway_config, gateway_credential, gateway_password, guide_section, pin_value_in, repo_root,
+        scripted_backend,
     },
 };
 
@@ -646,7 +647,7 @@ fn documented_v2_plugin_matches_fixture() {
     // The acceptance lane loads the fixture, so without this assertion the
     // suite would validate its own private copy of the plugin rather than the
     // one the guide tells users to create.
-    let section = guide_section(GUIDE_V2_HEADING, "\n## Cleanup\n");
+    let section = guide_section(GUIDE_V2_HEADING, GUIDE_PI_HEADING);
     let blocks = fenced_blocks(&section, "typescript");
     assert_eq!(
         blocks.len(),
@@ -669,7 +670,7 @@ fn documented_v2_config_matches_fixtures() {
     // Every lane builds its client config from these fixtures, so this is what
     // makes the configuration in the guide, not a private copy, the thing
     // under test.
-    let section = guide_section(GUIDE_V2_HEADING, "\n## Cleanup\n");
+    let section = guide_section(GUIDE_V2_HEADING, GUIDE_PI_HEADING);
     let blocks = fenced_blocks(&section, "json");
     assert_eq!(
         blocks.len(),

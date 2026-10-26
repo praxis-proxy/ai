@@ -1000,6 +1000,7 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+    use crate::web_search::config::MAX_SEARCH_QUERY_BYTES;
 
     /// Build a fixed, non-watched API-key handle for provider tests.
     fn test_api_key(key: &str) -> SecretHandle {
@@ -1121,6 +1122,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: None,
             user_credential: None,
         };
@@ -1157,6 +1159,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: None,
             user_credential: None,
         };
@@ -1185,6 +1188,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: None,
             user_credential: None,
         }
@@ -1271,6 +1275,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: None,
             user_credential: None,
         };
@@ -1290,6 +1295,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: None,
             user_credential: None,
         };
@@ -1313,6 +1319,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: Some("http://localhost:9999".into()),
             user_credential: None,
         };
@@ -1332,6 +1339,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: Some("http://localhost:9999".into()),
             user_credential: None,
         };
@@ -1351,6 +1359,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: Some("http://localhost:9999".into()),
             user_credential: None,
         };
@@ -1532,6 +1541,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: None,
             user_credential: None,
         };
@@ -1551,6 +1561,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: None,
             user_credential: None,
         };
@@ -1569,6 +1580,7 @@ mod tests {
             default_context_size: SearchContextSize::Medium,
             timeout_ms: 1000,
             max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
             base_url: None,
             user_credential: None,
         };

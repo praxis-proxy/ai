@@ -3,6 +3,8 @@
 
 //! `OpenAI` Responses API translation for Chat Completions-compatible providers.
 
+use std::collections::{HashMap, HashSet};
+
 use serde::Deserialize;
 use serde_json::{Map, Number, Value, json};
 use thiserror::Error;
@@ -654,7 +656,107 @@ fn build_chat_messages(
         append_input_messages(&mut messages, input, reasoning)?;
     }
 
+    keep_tool_answers_adjacent(&mut messages);
     Ok(messages)
+}
+
+/// Call IDs that an assistant `tool_calls` message expects tool answers for.
+///
+/// Returns `None` for messages that do not open a tool-call block. The IDs
+/// are copied into owned `String`s so planning can hold them while scanning
+/// the whole slot list; the cost is one short allocation per expected call
+/// ID, once per translated request.
+fn expected_tool_answers(message: &Value) -> Option<Vec<String>> {
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let calls = message.get("tool_calls")?.as_array()?;
+    let ids: Vec<String> = calls
+        .iter()
+        .filter_map(|call| call.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
+/// Keep each assistant `tool_calls` message adjacent to its tool answers.
+///
+/// Chat Completions backends reject a request where any other message sits
+/// between an assistant `tool_calls` message and the tool messages answering
+/// its call IDs: "An assistant message with `tool_calls` must be followed by
+/// tool messages responding to each `tool_call_id`." Responses input can
+/// legally produce that shape when an orphan output, a plain message, or a
+/// later `function_call` block sits between a call and its linked output, so
+/// the translated list is repaired here: each answer is pulled from anywhere
+/// after its block to directly follow it, and every other message keeps its
+/// relative order. An answer that appears nowhere after its block, or before
+/// it, cannot be repaired by reordering and passes through for the backend
+/// to reject.
+fn keep_tool_answers_adjacent(messages: &mut Vec<Value>) {
+    let mut slots: Vec<Option<Value>> = messages.drain(..).map(Some).collect();
+    let mut consumed: HashSet<usize> = HashSet::new();
+    let pulled_after = plan_answer_pulls(&slots, &mut consumed);
+    let mut order: Vec<usize> = Vec::with_capacity(slots.len());
+    for position in 0..slots.len() {
+        if !consumed.contains(&position) {
+            order.push(position);
+            if let Some(answers) = pulled_after.get(&position) {
+                order.extend(answers.iter().copied());
+            }
+        }
+    }
+    let mut repaired: Vec<Value> = Vec::with_capacity(order.len());
+    for position in order {
+        if let Some(message) = slots.get_mut(position).and_then(Option::take) {
+            repaired.push(message);
+        }
+    }
+    debug_assert_eq!(repaired.len(), slots.len(), "repair must keep every message");
+    *messages = repaired;
+}
+
+/// Positions of the tool answers each assistant block pulls after itself.
+///
+/// Each answer position is assigned to the first block that expects its call
+/// ID, so a block can collect answers that trail a later block. Answers that
+/// appear before their block, or that no block expects, are left in place.
+/// Planning scans the drained slot list once per expected call ID, so its cost
+/// is linear in history length per expected answer and it runs once per
+/// translated request; displacement itself is a single rebuild that moves
+/// each message exactly once.
+fn plan_answer_pulls(slots: &[Option<Value>], consumed: &mut HashSet<usize>) -> HashMap<usize, Vec<usize>> {
+    let mut pulled_after: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (block, slot) in slots.iter().enumerate() {
+        let Some(needed) = slot.as_ref().and_then(expected_tool_answers) else {
+            continue;
+        };
+        for id in &needed {
+            let answer = slots
+                .iter()
+                .enumerate()
+                .skip(block + 1)
+                .find(|&(candidate, candidate_slot)| {
+                    !consumed.contains(&candidate)
+                        && candidate_slot
+                            .as_ref()
+                            .is_some_and(|message| is_tool_answer_for(message, std::slice::from_ref(id)))
+                });
+            if let Some((position, _)) = answer {
+                consumed.insert(position);
+                pulled_after.entry(block).or_default().push(position);
+            }
+        }
+    }
+    pulled_after
+}
+
+/// Whether `message` is a Chat `tool` answer for one of `needed` call IDs.
+fn is_tool_answer_for(message: &Value, needed: &[String]) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("tool")
+        && message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .is_some_and(|answer_id| needed.iter().any(|needed_id| needed_id == answer_id))
 }
 
 /// Append converted input messages to a Chat Completions message list.
@@ -839,20 +941,43 @@ fn function_call_tool_call(obj: &Map<String, Value>) -> Result<Value, Translatio
     }))
 }
 
-/// Convert a `Responses` function call output item into a Chat tool message.
+/// Convert a `Responses` function call output item into a Chat message.
+///
+/// A linked output (string `call_id`) becomes a Chat tool message. An
+/// orphan output (`call_id` absent or null) has no tool call to correlate
+/// with, so its text lowers to a user message instead of failing the
+/// translated request; stored history can legitimately contain such items
+/// after the conversation contract made `call_id` optional. Any other
+/// `call_id` shape stays invalid input and fails closed.
 fn append_tool_output(messages: &mut Vec<Value>, obj: &Map<String, Value>) -> Result<(), TranslationError> {
-    let call_id = required_input_item_string(obj, "function_call_output", "call_id")?;
+    let linked_call_id = match obj.get("call_id") {
+        Some(Value::String(call_id)) => Some(call_id),
+        None | Some(Value::Null) => None,
+        Some(_) => {
+            return Err(TranslationError::InvalidInputItemStringField {
+                item_type: "function_call_output",
+                field: "call_id",
+            });
+        },
+    };
     let output = obj.get("output").ok_or(TranslationError::MissingInputItemField {
         item_type: "function_call_output",
         field: "output",
     })?;
     let content = convert_function_call_output(output)?;
 
-    messages.push(json!({
-        "role": "tool",
-        "tool_call_id": call_id,
-        "content": content
-    }));
+    // The request history is borrowed; the owned Chat request keeps this text.
+    match linked_call_id {
+        Some(call_id) => messages.push(json!({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": content
+        })),
+        None => messages.push(json!({
+            "role": "user",
+            "content": content
+        })),
+    }
     Ok(())
 }
 

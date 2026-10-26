@@ -98,7 +98,7 @@ response store** (`store/filter.rs`) — they do not reach the backend:
 | `DELETE /v1/responses/{id}` | Deleted from the store locally. | **Praxis-owned.** |
 | `POST /v1/responses/{id}/cancel` | Route registered but `mode=Passthrough`; the store filter does **not** handle it, so it is forwarded to the backend. Inert while `background` is unsupported. | Backend. |
 | `POST /v1/responses/input_tokens` | Body is **parsed and classified** like a create (it is a body-bearing operation), so a history selector is subject to the same rejection/rehydration handling; token counting itself is the backend's. Not forwarded unread. | Backend (count); Praxis (selector handling). |
-| `POST /v1/responses/compact` | An **OpenAI-spec** endpoint (`/responses/compact`), handled locally **only when the optional `openai_responses_compact` filter (feature `openai-compact`) is configured** (`handle_explicit_compact`); otherwise forwarded. Distinct from the reactive `context_management` compaction. | Praxis-owned when the compact filter is configured. |
+| `POST /v1/responses/compact` | An **OpenAI-spec** endpoint (`/responses/compact`), handled locally **only when the optional `openai_responses_compact` filter (feature `openai-compact`) is configured** (`handle_explicit_compact`); otherwise forwarded. Distinct from the reactive `context_management` compaction. Only `model` is required (`input`/`previous_response_id` are optional and nullable per the spec), so a schema-valid empty conversation is accepted and compacted as a no-op: no summarization callout, `output: []`, zero usage, and an empty history persisted under the returned id (#1139). | Praxis-owned when the compact filter is configured. |
 
 ## Rules that govern the state flags
 

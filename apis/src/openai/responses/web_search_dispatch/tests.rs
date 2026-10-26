@@ -4,7 +4,7 @@
 //! Tests for the `openai_web_search_dispatch` filter.
 
 use super::*;
-use crate::openai::responses::agentic_loop::budget::SimpleBudget;
+use crate::{openai::responses::agentic_loop::budget::SimpleBudget, web_search::config::MAX_SEARCH_QUERY_BYTES};
 
 // -----------------------------------------------------------------------------
 // Helper: build filter from YAML
@@ -119,6 +119,27 @@ fn from_config_validates_max_calls_per_round() {
 }
 
 #[test]
+fn from_config_validates_max_query_bytes() {
+    // 8192 is a hard safety ceiling: admins may lower the bound but not raise it.
+    for max_query_bytes in [0, MAX_SEARCH_QUERY_BYTES + 1] {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            "provider: brave\napi_key:\n  value: test-key\nmax_query_bytes: {max_query_bytes}"
+        ))
+        .unwrap();
+        assert!(
+            WebSearchDispatchFilter::from_config(&yaml).is_err(),
+            "max_query_bytes of {max_query_bytes} must be rejected"
+        );
+    }
+    let lowered: serde_yaml::Value =
+        serde_yaml::from_str("provider: brave\napi_key:\n  value: test-key\nmax_query_bytes: 1024").unwrap();
+    assert!(
+        WebSearchDispatchFilter::from_config(&lowered).is_ok(),
+        "an admin may lower max_query_bytes below the ceiling"
+    );
+}
+
+#[test]
 fn from_config_rejects_max_body_bytes() {
     // openai_web_search_dispatch is a read-only reader that produces no request body,
     // so it carries no per-filter raw-body cap: raw request size is governed
@@ -191,50 +212,197 @@ fn parse_search_request_prefers_current_field_and_rejects_invalid_current_field(
     let both = serde_json::json!({
         "action": {"query": "legacy", "queries": ["current one", "current two"]}
     });
-    let current = parse_search_request(&both, "ws_both", 0, 0).unwrap();
-    assert_eq!(current.queries, ["current one", "current two"]);
+    let PreparedCall::Dispatchable { queries, action, .. } =
+        parse_search_request(&both, "ws_both", 0, 0, MAX_SEARCH_QUERY_BYTES)
+    else {
+        panic!("a call with current queries is dispatchable");
+    };
+    assert_eq!(queries, ["current one", "current two"]);
     assert_eq!(
-        current.action,
+        action,
         serde_json::json!({"type": "search", "queries": ["current one", "current two"]})
     );
 
     let legacy = serde_json::json!({"action": {"query": "legacy"}});
-    let legacy = parse_search_request(&legacy, "ws_legacy", 0, 0).unwrap();
-    assert_eq!(legacy.queries, ["legacy"]);
-    assert_eq!(legacy.action, serde_json::json!({"type": "search", "query": "legacy"}));
+    let PreparedCall::Dispatchable { queries, action, .. } =
+        parse_search_request(&legacy, "ws_legacy", 0, 0, MAX_SEARCH_QUERY_BYTES)
+    else {
+        panic!("a call with only the deprecated query is dispatchable");
+    };
+    assert_eq!(queries, ["legacy"]);
+    assert_eq!(action, serde_json::json!({"type": "search", "query": "legacy"}));
 
     // The OpenAI schema puts no `minItems` on `queries` and still permits the
     // deprecated `query`, so an empty array carries no queries to prefer and
     // must not discard a usable legacy query.
     let empty_current = serde_json::json!({"action": {"query": "legacy", "queries": []}});
-    let empty_current = parse_search_request(&empty_current, "ws_empty", 0, 0).unwrap();
+    let PreparedCall::Dispatchable { queries, action, .. } =
+        parse_search_request(&empty_current, "ws_empty", 0, 0, MAX_SEARCH_QUERY_BYTES)
+    else {
+        panic!("an empty queries array falls back to the deprecated query");
+    };
+    assert_eq!(queries, ["legacy"]);
     assert_eq!(
-        empty_current.queries,
-        ["legacy"],
-        "an empty queries array falls back to the deprecated query"
-    );
-    assert_eq!(
-        empty_current.action,
+        action,
         serde_json::json!({"type": "search", "query": "legacy"}),
         "the fallback reports the legacy action shape it actually dispatched"
     );
 
     let empty_without_legacy = serde_json::json!({"action": {"queries": []}});
-    assert!(
-        parse_search_request(&empty_without_legacy, "ws_empty_only", 0, 0).is_none(),
-        "an empty queries array with no legacy query leaves nothing to dispatch"
+    let PreparedCall::Incomplete { reason, .. } =
+        parse_search_request(&empty_without_legacy, "ws_empty_only", 0, 0, MAX_SEARCH_QUERY_BYTES)
+    else {
+        panic!("an empty queries array with no legacy query is incomplete");
+    };
+    assert_eq!(
+        reason.output(MAX_SEARCH_QUERY_BYTES),
+        MISSING_QUERY_OUTPUT,
+        "a structurally absent query surfaces the missing-query turn"
     );
 
     let invalid_current = serde_json::json!({"action": {"query": "legacy", "queries": [42]}});
-    assert!(
-        parse_search_request(&invalid_current, "ws_invalid", 0, 0).is_none(),
-        "a non-string queries member must not fall back to query"
+    let PreparedCall::Incomplete { reason, .. } =
+        parse_search_request(&invalid_current, "ws_invalid", 0, 0, MAX_SEARCH_QUERY_BYTES)
+    else {
+        panic!("a malformed queries member is incomplete");
+    };
+    assert_eq!(
+        reason.output(MAX_SEARCH_QUERY_BYTES),
+        MISSING_QUERY_OUTPUT,
+        "a malformed queries member is a structural failure, not a validation failure"
     );
 
     let non_array_current = serde_json::json!({"action": {"query": "legacy", "queries": "rust"}});
+    let PreparedCall::Incomplete { reason, .. } =
+        parse_search_request(&non_array_current, "ws_non_array", 0, 0, MAX_SEARCH_QUERY_BYTES)
+    else {
+        panic!("a non-array queries field is incomplete");
+    };
+    assert_eq!(reason.output(MAX_SEARCH_QUERY_BYTES), MISSING_QUERY_OUTPUT);
+}
+
+#[test]
+fn parse_search_request_validates_query_before_dispatch() {
+    // A query that is blank after trimming never dispatches.
+    let blank = serde_json::json!({"action": {"query": "   \t\n"}});
+    let PreparedCall::Incomplete { reason, .. } =
+        parse_search_request(&blank, "ws_blank", 0, 0, MAX_SEARCH_QUERY_BYTES)
+    else {
+        panic!("a whitespace-only query is not dispatchable");
+    };
+    assert_eq!(
+        reason.output(MAX_SEARCH_QUERY_BYTES),
+        invalid_query_output(MAX_SEARCH_QUERY_BYTES),
+        "a blank query surfaces the invalid-query turn, not the missing-query one"
+    );
+
+    // One invalid member fails the whole call: a completed call that quietly
+    // searched less than it asked for would contradict the model's history.
+    let mixed = serde_json::json!({"action": {"queries": ["valid query", ""]}});
+    let PreparedCall::Incomplete { reason, .. } =
+        parse_search_request(&mixed, "ws_mixed", 0, 0, MAX_SEARCH_QUERY_BYTES)
+    else {
+        panic!("one invalid query must fail the whole call instead of partially dispatching");
+    };
+    assert_eq!(
+        reason.output(MAX_SEARCH_QUERY_BYTES),
+        invalid_query_output(MAX_SEARCH_QUERY_BYTES)
+    );
+
+    // A query over the UTF-8 byte ceiling fails locally instead of reaching
+    // hashing or provider request construction (issue #1145).
+    let oversized_legacy = serde_json::json!({"action": {"query": "x".repeat(MAX_SEARCH_QUERY_BYTES + 1)}});
+    let PreparedCall::Incomplete { reason, .. } =
+        parse_search_request(&oversized_legacy, "ws_oversized", 0, 0, MAX_SEARCH_QUERY_BYTES)
+    else {
+        panic!("an oversized legacy query is not dispatchable");
+    };
+    assert_eq!(
+        reason.output(MAX_SEARCH_QUERY_BYTES),
+        invalid_query_output(MAX_SEARCH_QUERY_BYTES)
+    );
+
+    let oversized_member = serde_json::json!({"action": {"queries": ["x".repeat(MAX_SEARCH_QUERY_BYTES + 1)]}});
+    let PreparedCall::Incomplete { reason, .. } =
+        parse_search_request(&oversized_member, "ws_oversized_member", 0, 0, MAX_SEARCH_QUERY_BYTES)
+    else {
+        panic!("an oversized queries member is not dispatchable");
+    };
+    assert_eq!(
+        reason.output(MAX_SEARCH_QUERY_BYTES),
+        invalid_query_output(MAX_SEARCH_QUERY_BYTES)
+    );
+
+    // The ceiling itself is inclusive: a boundary-sized query dispatches.
+    let boundary = serde_json::json!({"action": {"query": "x".repeat(MAX_SEARCH_QUERY_BYTES)}});
+    let PreparedCall::Dispatchable { queries, .. } =
+        parse_search_request(&boundary, "ws_boundary", 0, 0, MAX_SEARCH_QUERY_BYTES)
+    else {
+        panic!("a query at exactly the byte ceiling is dispatchable");
+    };
+    assert_eq!(
+        queries,
+        ["x".repeat(MAX_SEARCH_QUERY_BYTES).as_str()],
+        "a query at exactly the byte ceiling is dispatchable"
+    );
+
+    // The UTF-8 byte count, not the char count, is enforced: a multibyte
+    // string over the ceiling in bytes fails even with few characters.
+    let multibyte = "é".repeat(MAX_SEARCH_QUERY_BYTES / 2 + 1);
+    let multibyte_call = serde_json::json!({"action": {"query": multibyte}});
+    let PreparedCall::Incomplete { reason, .. } =
+        parse_search_request(&multibyte_call, "ws_multibyte", 0, 0, MAX_SEARCH_QUERY_BYTES)
+    else {
+        panic!("the byte ceiling must count UTF-8 bytes, not characters");
+    };
+    assert_eq!(
+        reason.output(MAX_SEARCH_QUERY_BYTES),
+        invalid_query_output(MAX_SEARCH_QUERY_BYTES),
+        "the byte ceiling must count UTF-8 bytes, not characters"
+    );
+
+    // Surrounding whitespace is trimmed from a valid query before dispatch.
+    let padded = serde_json::json!({"action": {"query": "  rust language  "}});
+    let PreparedCall::Dispatchable { queries, action, .. } =
+        parse_search_request(&padded, "ws_padded", 0, 0, MAX_SEARCH_QUERY_BYTES)
+    else {
+        panic!("a valid query is dispatchable");
+    };
+    assert_eq!(queries, ["rust language"], "a valid query is dispatched trimmed");
+    assert_eq!(action, serde_json::json!({"type": "search", "query": "rust language"}));
+}
+
+#[test]
+fn parse_search_request_enforces_configured_lower_bound() {
+    // An admin-lowered bound, not the 8192 ceiling, gates dispatch and names
+    // itself in the model-facing failure so the model can shorten the query.
+    let lowered = 16;
+    let over_lowered = serde_json::json!({"action": {"query": "x".repeat(lowered + 1)}});
+    let PreparedCall::Incomplete { reason, .. } = parse_search_request(&over_lowered, "ws_lowered", 0, 0, lowered)
+    else {
+        panic!("a query over the configured lower bound is not dispatchable");
+    };
+    let output = reason.output(lowered);
+    assert_eq!(
+        output,
+        invalid_query_output(lowered),
+        "the failure names the configured lower bound"
+    );
     assert!(
-        parse_search_request(&non_array_current, "ws_non_array", 0, 0).is_none(),
-        "a non-array queries field must not fall back to query"
+        output.contains(&format!("exceeded {lowered} bytes")),
+        "the model-facing output reports the actual configured limit"
+    );
+
+    let within_lowered = serde_json::json!({"action": {"query": "x".repeat(lowered)}});
+    let PreparedCall::Dispatchable { queries, .. } =
+        parse_search_request(&within_lowered, "ws_within_lowered", 0, 0, lowered)
+    else {
+        panic!("a query within the configured lower bound is dispatchable");
+    };
+    assert_eq!(
+        queries,
+        ["x".repeat(lowered).as_str()],
+        "a query within the configured lower bound is dispatchable"
     );
 }
 // -----------------------------------------------------------------------------
@@ -655,6 +823,133 @@ async fn on_request_body_missing_query_produces_failed_status() {
         state.persisted_messages.last(),
         Some(bridge_output),
         "persisted history must contain the truthful model continuation"
+    );
+}
+
+/// Blank and oversized queries fail locally without reaching the provider
+/// (issue #1145): no paid search is spent, the failed turn stays bounded, and
+/// the potentially body-sized query text is never echoed into the output.
+#[tokio::test]
+async fn on_request_body_invalid_query_fails_without_provider_request() {
+    // Bind but never accept: a provider dial would land in the listen backlog,
+    // so a successful non-blocking accept afterwards proves one was attempted.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "test"}));
+    state.select_test_output(
+        "web_search_call",
+        vec![
+            serde_json::json!({
+                "type": "web_search_call",
+                "id": "ws_blank_query",
+                "action": {"type": "search", "query": "   "}
+            }),
+            serde_json::json!({
+                "type": "web_search_call",
+                "id": "ws_oversized_query",
+                "action": {"type": "search", "query": "x".repeat(MAX_SEARCH_QUERY_BYTES + 1)}
+            }),
+        ],
+    );
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "an invalid query must never reject the Response"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.web_search_calls.is_empty(),
+        "calls should be cleared after execution"
+    );
+    assert_eq!(
+        state.web_search_calls_executed, 0,
+        "an invalid query must not be dispatched"
+    );
+
+    for output in &state.accumulated_output {
+        assert_eq!(
+            output["status"], "failed",
+            "invalid queries should produce failed status"
+        );
+        assert_eq!(
+            output["action"],
+            serde_json::json!({"type": "search", "query": ""}),
+            "the failed turn carries the bounded placeholder action, never the raw query"
+        );
+    }
+    let bridge_outputs: Vec<&Value> = state
+        .messages
+        .iter()
+        .filter(|message| message["type"] == "function_call_output")
+        .collect();
+    assert_eq!(
+        bridge_outputs.len(),
+        2,
+        "each invalid call bridges one bounded failure to the model"
+    );
+    for bridge_output in bridge_outputs {
+        assert_eq!(
+            bridge_output["output"],
+            invalid_query_output(MAX_SEARCH_QUERY_BYTES),
+            "each failed call bridges the bounded reason naming the configured limit"
+        );
+    }
+    assert_eq!(
+        state.persisted_messages.last(),
+        Some(state.messages.last().unwrap()),
+        "persisted history must contain the truthful model continuation"
+    );
+
+    listener.set_nonblocking(true).unwrap();
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "an invalid query must never reach the search provider"
+    );
+}
+
+/// A valid query with surrounding whitespace dispatches trimmed, so the
+/// provider request and the public action never carry padding.
+#[tokio::test]
+async fn on_request_body_dispatches_trimmed_query() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    spawn_brave_mock(listener);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "test"}));
+    state.select_test_output(
+        "web_search_call",
+        vec![serde_json::json!({
+            "type": "web_search_call",
+            "id": "ws_padded_query",
+            "action": {"type": "search", "query": "  rust language  "}
+        })],
+    );
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.web_search_calls_executed, 1, "the trimmed query was dispatched");
+    let output = &state.accumulated_output[0];
+    assert_eq!(output["status"], "completed");
+    assert_eq!(
+        output["action"]["query"], "rust language",
+        "the public action reports the trimmed query that was actually dispatched"
     );
 }
 
@@ -3044,5 +3339,68 @@ fn build_tool_result_messages_incomplete_with_results_keeps_them() {
     assert!(
         output.contains(PARTIAL_UNAVAILABLE_OUTPUT),
         "the partial notice is appended so the model knows the rows are incomplete"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// bound_streamed_search_action tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn bound_streamed_search_action_replaces_invalid_queries() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata(MAX_QUERY_METADATA, "16".to_owned());
+    let oversized = "x".repeat(17);
+    for action in [
+        serde_json::json!({"type": "search", "query": oversized}),
+        serde_json::json!({"type": "search", "query": "   "}),
+        serde_json::json!({"type": "search", "queries": ["ok", oversized]}),
+        serde_json::json!({"type": "search", "queries": [{"nested": oversized}]}),
+    ] {
+        let mut item = serde_json::json!({"type": "web_search_call", "id": "ws_1", "action": action});
+        bound_streamed_search_action(&ctx, &mut item);
+        assert_eq!(
+            item["action"],
+            invalid_search_action(),
+            "an undispatchable streamed query is replaced with the bounded placeholder"
+        );
+    }
+}
+
+#[test]
+fn bound_streamed_search_action_keeps_valid_and_queryless_items() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata(MAX_QUERY_METADATA, "16".to_owned());
+    for item in [
+        serde_json::json!({"type": "web_search_call", "id": "ws_1", "action": {"type": "search", "query": " rust "}}),
+        serde_json::json!({"type": "web_search_call", "id": "ws_1", "status": "in_progress"}),
+        serde_json::json!({"type": "web_search_call", "id": "ws_1", "action": {"type": "search"}}),
+        serde_json::json!({"type": "message", "action": {"query": "x".repeat(17)}}),
+    ] {
+        let mut bounded = item.clone();
+        bound_streamed_search_action(&ctx, &mut bounded);
+        assert_eq!(
+            bounded, item,
+            "a dispatchable, queryless, or non-search item passes unchanged"
+        );
+    }
+}
+
+#[test]
+fn bound_streamed_search_action_is_noop_without_dispatcher_bound() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let ctx = crate::test_utils::make_filter_context(&req);
+    let item = serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "action": {"type": "search", "query": "x".repeat(MAX_SEARCH_QUERY_BYTES + 1)}
+    });
+    let mut bounded = item.clone();
+    bound_streamed_search_action(&ctx, &mut bounded);
+    assert_eq!(
+        bounded, item,
+        "without the dispatcher in the chain the stream filter leaves the item as-is"
     );
 }

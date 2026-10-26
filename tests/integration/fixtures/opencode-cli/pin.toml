@@ -55,10 +55,11 @@ npm_package = "opencode-ai"
 # Required only when `install = "github-release"`.
 url = ""
 sha256 = ""
-# Major-series tripwire. The `config` plugin hook used by
-# `[opencode.auth.plugin]` is a 1.x contract; OpenCode 2.x requires a different
-# plugin implementation (see the migration guide linked from the client guide).
-# A bump across this boundary must rewrite the plugin, not just the version.
+# Major-series tripwire. The `provider.<id>.options` recipes this suite drives
+# (and the `{env:...}` config substitution) are 1.x contracts; OpenCode 2.x
+# replaces the provider schema entirely (see the migration guide linked from
+# the client guide). A bump across this boundary must rewrite the lanes' client
+# configuration, not just the version.
 major_series = 1
 
 [opencode.launch]
@@ -75,16 +76,11 @@ prompt_is_positional = true
 #   success: step_start -> text (assistant text at `part.text`) -> step_finish
 #   failure: error (name=APIError, with statusCode and metadata.url)
 format = "json"
-# Global flags (NOT `run` flags). `--print-logs` is mandatory for the plugin
-# lane: a failing plugin is otherwise completely silent (see
-# `[opencode.auth.plugin] fail_open` below).
+# Global flags (NOT `run` flags). `--print-logs` keeps client diagnostics on
+# stderr; without it a config or provider failure is completely silent.
 log_level = "ERROR"
 global_flags = ["--print-logs", "--log-level"]
 run_flags = ["--model", "--format"]
-# `--pure` runs without external plugins. Verified: with a plugin present,
-# `--pure` sends NO plugin-supplied credential, which is what makes the
-# inversion assertion in the headers lane meaningful.
-pure_flag = "--pure"
 # Exit codes are meaningful and safe to assert on:
 #   0 = success, 1 = unknown model, 1 = unknown provider, 1 = backend 401.
 # A 401 additionally emits an `error` event on stdout.
@@ -107,50 +103,36 @@ probes_models_endpoint = false
 [opencode.launch.stdin]
 must_be_null = true
 
-[opencode.auth.plugin]
-# The documented path: a `config` hook that attaches the gateway Basic
-# credential at runtime. Verified working on the pinned version.
-plugin_file = "praxis-auth.ts"
-config_file = "opencode.jsonc"
-hook = "config"
-# Loaded via the config `plugin` array as a path relative to the config dir.
-plugin_reference = "./praxis-auth.ts"
+[opencode.auth.options_headers]
+# The documented path: the gateway Basic credential rides
+# `provider.<id>.options.headers.Authorization`, read from the environment at
+# config-load time through `{env:PRAXIS_GATEWAY_AUTH}` substitution. Verified
+# working on the pinned version, end to end by the CPU lane.
+scope = "provider.<id>.options.headers"
+header_name = "Authorization"
+env_var = "PRAXIS_GATEWAY_AUTH"
 doc = "docs/developing/cli-vllm-through-praxis.md"
-# The fixture beside this manifest is asserted byte-equal to the sole
-# ```typescript block in the doc by `documented_plugin_matches_fixture`. That
-# assertion is what makes "the test validates the documentation" true; without
-# it the test would merely validate its own private copy.
-fixture = "praxis-auth.ts"
-# Environment the documented plugin reads.
-env_password = "GATEWAY_AUTH_PASSWORD"
-env_trusted_url = "PRAXIS_BASE_URL"
 #
-# !! THE PLUGIN IS NOT FAIL-CLOSED. !!
+# The published schema does NOT declare `headers` under provider options (it
+# names only apiKey, baseURL, enterpriseUrl, setCacheKey, timeout,
+# headerTimeout, chunkTimeout). The key works anyway because OpenCode passes
+# the whole `options` record through to the `@ai-sdk/openai-compatible`
+# factory, which accepts `headers`: source-verified at v1.18.35 and v1.19.3
+# (`resolveSDK` spreads `{ name, ...options }` into the factory with no key
+# filtering) and live-verified against the pinned version. An OpenCode release that started validating
+# provider options against the schema would drop the key; the per-model
+# `headers` map in `[opencode.auth.headers]` is the schema-declared fallback.
 #
-# When the hook throws — a `baseURL` that does not match `PRAXIS_BASE_URL`, or
-# an unset `GATEWAY_AUTH_PASSWORD` — OpenCode logs `plugin config hook failed`
-# and CONTINUES, sending the turn with no `Authorization` header at all. It
-# exits 0, emits no `error` event, and ends the stream with `step_finish`, so
-# the run looks successful. The log line appears ONLY with `--print-logs`.
-#
-# Consequences, both load-bearing for the tests:
-#   1. Exit status is NOT a valid auth oracle. The plugin lane must assert the
-#      `Authorization` header on EVERY captured request.
-#   2. The lane must also assert stderr is free of `plugin_failure_log`, so a
-#      silently broken plugin fails for the right reason.
-#
-# The destination check is therefore defence in depth, not an enforcing
-# control: it withholds the credential from an untrusted host but does not stop
-# the request reaching it.
-fail_open = true
-plugin_failure_log = "plugin config hook failed"
+# An UNSET variable substitutes to an EMPTY string — not an error — so the
+# request carries an empty `Authorization` header and the gateway rejects the
+# turn with a bare 401. The CPU inversion lane
+# (`pinned_opencode_missing_env_substitution_is_rejected`) asserts exactly
+# that, proving the credential comes from the environment and nowhere else.
 
 [opencode.auth.headers]
-# The plugin-free alternative. `provider.<id>.options` has NO `headers` key
-# (only apiKey, baseURL, enterpriseUrl, setCacheKey, timeout, headerTimeout,
-# chunkTimeout), but a PER-MODEL `headers` map is part of the published schema
-# and is honored. Verified: the Basic credential reaches the backend with
-# `--pure` and no plugin involved.
+# The schema-declared alternative: a PER-MODEL `headers` map is part of the
+# published schema and is honored. Verified: the Basic credential reaches the
+# backend with no provider-option involvement.
 scope = "provider.<id>.models.<model>.headers"
 header_name = "Authorization"
 schema_url = "https://opencode.ai/config.json"

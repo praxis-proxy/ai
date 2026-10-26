@@ -21,6 +21,7 @@ Each provider request is executed through the shared filtered-subrequest executo
 | `default_context_size` | string | no | Default search context size when the client omits it. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. Inside an iterative request router, the effective timeout is capped by the router's remaining deadline. |
 | `max_calls_per_round` | integer | no | Hard cap on web-search calls processed from one model response (1..=1024; default: 32). |
+| `max_query_bytes` | integer | no | Maximum UTF-8 bytes accepted for one model-generated search query, after trimming (1..=8192; default: 8192). A blank or oversized query fails the call locally instead of reaching the provider. 8192 is a hard ceiling: admins may lower the bound but cannot raise it. |
 | `base_url` | string | no | Override the provider's default API base URL. |
 | `outbound_chain` | string \| object | no | Outbound filter chain the provider callout executes through. See [`WebSearchFilterConfig::outbound_chain`]; the two configs stay in sync. Optional — when omitted it defaults to an empty inline passthrough chain via [`default_outbound_chain`]. |
 
@@ -46,4 +47,5 @@ outbound_chain: web_search_outbound
 default_context_size: medium
 timeout_ms: 10000
 max_calls_per_round: 32
+max_query_bytes: 8192
 ```

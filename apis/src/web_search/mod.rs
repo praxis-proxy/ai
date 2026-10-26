@@ -62,6 +62,36 @@ pub(crate) fn is_web_search_tool_type(tool_type: &str) -> bool {
     WEB_SEARCH_TOOL_TYPES.contains(&tool_type)
 }
 
+/// Outcome of validating one model-generated search query against the shared
+/// dispatch policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchQueryValidation<'a> {
+    /// Trimmed query, non-empty and within the byte bound, ready to dispatch.
+    Valid(&'a str),
+    /// Blank after trimming.
+    Blank,
+    /// Over the configured `max_query_bytes` UTF-8 bound.
+    Oversized,
+}
+
+/// Validate one model-generated search query under the shared dispatch policy.
+///
+/// Both web-search loops (OpenAI Responses dispatch and the Anthropic Messages
+/// loop) trim the query and bound it to the configured `max_query_bytes`
+/// UTF-8 bytes before hashing or provider request construction (issue #1145):
+/// a blank query would spend a paid provider call on a meaningless search,
+/// and an unbounded query can amplify the outbound URI or JSON body.
+pub(crate) fn validate_search_query<'a>(query: &'a str, max_query_bytes: usize) -> SearchQueryValidation<'a> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        SearchQueryValidation::Blank
+    } else if trimmed.len() > max_query_bytes {
+        SearchQueryValidation::Oversized
+    } else {
+        SearchQueryValidation::Valid(trimmed)
+    }
+}
+
 /// Format search results as readable text for a model prompt.
 pub(crate) fn format_search_results(results: &[SearchResult]) -> String {
     // Size from borrowed fields so growth cannot briefly keep an old large

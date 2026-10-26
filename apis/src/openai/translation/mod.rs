@@ -2060,15 +2060,160 @@ mod tests {
     }
 
     #[test]
-    fn function_call_output_without_call_id_returns_error() {
+    fn function_call_output_without_call_id_becomes_user_text() {
+        for item in [
+            json!({"type": "function_call_output", "output": "done"}),
+            json!({"type": "function_call_output", "call_id": null, "output": "done"}),
+            json!({"type": "function_call_output", "output": [{"type": "input_text", "text": "done"}]}),
+        ] {
+            let mapped = map(&json!({"model": "m", "input": [item]}));
+            assert_eq!(
+                mapped["messages"],
+                json!([{"role": "user", "content": "done"}]),
+                "an uncorrelated output retains its text without inventing a Chat tool-call relationship"
+            );
+        }
+    }
+
+    #[test]
+    fn function_call_output_with_invalid_call_id_still_returns_error() {
         let error = map_error(&json!({
             "model": "m",
-            "input": [{"type": "function_call_output", "output": "done"}]
+            "input": [{"type": "function_call_output", "call_id": 42, "output": "done"}]
         }));
-
         assert_eq!(
-            error,
-            "Responses function_call_output input item is missing required field `call_id`"
+            error, "Responses function_call_output input item field `call_id` must be a string",
+            "only absent or null call IDs may be lowered to uncorrelated text"
+        );
+    }
+
+    #[test]
+    fn orphan_output_between_call_and_linked_output_follows_tool_result() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "output": "orphan result"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "linked result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "linked result"},
+                {"role": "user", "content": "orphan result"},
+            ]),
+            "an orphan between a call and its linked output must not split the tool answer from its call"
+        );
+    }
+
+    #[test]
+    fn message_between_call_and_output_follows_tool_result() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"role": "user", "content": "interlude"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "linked result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "linked result"},
+                {"role": "user", "content": "interlude"},
+            ]),
+            "a message between a call and its output must not split the tool answer from its call"
+        );
+    }
+
+    #[test]
+    fn orphan_outputs_between_call_and_output_keep_their_relative_order() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "output": "orphan one"},
+                {"type": "function_call_output", "output": "orphan two"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "linked result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "linked result"},
+                {"role": "user", "content": "orphan one"},
+                {"role": "user", "content": "orphan two"},
+            ]),
+            "multiple orphans deferred past a tool answer keep their input order"
+        );
+    }
+
+    #[test]
+    fn linked_output_after_a_later_call_block_stays_with_its_call() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "output": "orphan result"},
+                {"type": "function_call", "call_id": "call_2", "name": "search", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "first result"},
+                {"type": "function_call_output", "call_id": "call_2", "output": "second result"},
+            ]
+        }));
+        assert_eq!(
+            mapped["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "first result"},
+                {"role": "user", "content": "orphan result"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_2", "content": "second result"},
+            ]),
+            "an answer that trails a later call block must still directly follow its own call"
         );
     }
 

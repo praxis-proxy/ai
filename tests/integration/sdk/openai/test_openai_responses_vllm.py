@@ -4898,22 +4898,69 @@ class TestResponsesCompactionVLLM:
             "rejected opaque compaction state must never reach the summarizer"
         )
 
-    def test_explicit_compact_valid_input_makes_one_callout(self, compact_client):
-        """Control for the #1403 rejection: a well-typed inline input compacts
-        with exactly one summarization callout and returns a compaction object."""
+    def test_explicit_compact_preserves_reasoning_summary_without_raw_content(
+        self, compact_client
+    ):
+        """The SDK compacts a reasoning item using only its safe summary."""
+        safe_summary = "safe reasoning summary for compaction"
+        raw_reasoning = "PRIVATE-RAW-REASONING-DO-NOT-SEND"
         before = len(CompactionHandler.requests)
         result = compact_client.responses.compact(
             model=VLLM_MODEL,
-            input=[
-                {"role": "user", "content": "Explain TCP vs UDP."},
-                {"role": "assistant", "content": "TCP is reliable; UDP is not."},
-            ],
+            extra_body={
+                "input": [
+                    {"role": "user", "content": "Explain TCP vs UDP."},
+                    {
+                        "type": "reasoning",
+                        "id": "rs_sdk_compact",
+                        "status": "completed",
+                        "summary": [{"type": "summary_text", "text": safe_summary}],
+                        "content": [{"type": "reasoning_text", "text": raw_reasoning}],
+                    },
+                    {"role": "assistant", "content": "TCP is reliable; UDP is not."},
+                ]
+            },
         )
 
         assert result.id, "a successful compact returns an identified compaction"
         assert result.object == "response.compaction"
         assert len(CompactionHandler.requests) == before + 1, (
             "a valid explicit compact must make exactly one summarization callout"
+        )
+        conversation = CompactionHandler.requests[-1]["messages"][1]["content"]
+        assert safe_summary in conversation, "the reasoning summary must reach the summarizer"
+        assert raw_reasoning not in conversation, (
+            "raw reasoning text must stay out of the summarizer request"
+        )
+
+    def test_explicit_compact_model_only_returns_noop_without_callout(self, compact_client):
+        """Issue #1139: ``model`` is the only required field, so a model-only
+        compact is schema-valid. It must not be rejected; with nothing to
+        summarize there is no callout, and the empty conversation is persisted
+        as a no-op compaction (empty ``output``, zero usage).
+        """
+        before = len(CompactionHandler.requests)
+        result = compact_client.responses.compact(model=VLLM_MODEL)
+
+        assert result.id, "a no-op compact still returns an identified compaction"
+        assert result.object == "response.compaction"
+        assert result.status == "completed", "a no-op compaction is completed"
+        assert result.output == [], "a no-op compaction emits no compaction item"
+        assert result.usage.input_tokens == 0, "an empty conversation has no input tokens"
+        assert result.usage.output_tokens == 0, "no summary was produced"
+        assert len(CompactionHandler.requests) == before, (
+            "a model-only compact must not reach the summarizer"
+        )
+
+        # `input: null` is an equally schema-valid way to carry no conversation.
+        result = compact_client.responses.compact(
+            model=VLLM_MODEL,
+            extra_body={"input": None},
+        )
+        assert result.object == "response.compaction"
+        assert result.output == [], "a null-input compact is also a no-op"
+        assert len(CompactionHandler.requests) == before, (
+            "a null-input compact must not reach the summarizer"
         )
 
     def test_below_threshold_skips_compaction(self, compact_client):
@@ -8018,9 +8065,12 @@ class TestAgenticLoopVLLM:
         web_search_calls = [
             item for item in response.output if item.type == "web_search_call"
         ]
-        assert len(web_search_calls) == 1, response.output
-        assert web_search_calls[0].status == "completed"
-        assert len(BraveSearchHandler.request_paths) == request_count + 1
+        assert web_search_calls, response.output
+        assert all(call.status == "completed" for call in web_search_calls), (
+            web_search_calls
+        )
+        # One hosted web-search call can expand into multiple provider queries.
+        assert len(BraveSearchHandler.request_paths) > request_count
         assert any(item.type == "message" for item in response.output)
         if VLLM_TEST_BACKEND == "simulator":
             _assert_simulator_auto_tool_round(
@@ -8190,6 +8240,61 @@ class TestAgenticLoopVLLM:
             BraveSearchHandler.reset()
             SimulatorBackendHandler.web_search_queries = []
             SimulatorBackendHandler.web_search_multi_query_call = False
+
+    @requires_simulator
+    def test_web_search_blank_query_fails_without_provider_request(
+        self,
+        translated_agentic_client,
+    ):
+        """#1145: a whitespace-only query fails locally, never reaching the provider.
+
+        The chat-translation layer only rejects structurally empty queries, so
+        a blank-after-trim query still reaches the dispatcher — which must
+        surface it as a bounded failed call without spending a paid search.
+        """
+        try:
+            request_count = len(BraveSearchHandler.request_paths)
+            SimulatorBackendHandler.web_search_queries = ["   "]
+            response = translated_agentic_client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input=(
+                    "You MUST use web search, then report the result title and "
+                    "URL. /no_think"
+                ),
+                tools=[
+                    {
+                        "type": "web_search",
+                        "search_context_size": "low",
+                    }
+                ],
+                tool_choice="auto",
+                store=False,
+                max_output_tokens=2048,
+            )
+
+            web_search_calls = [
+                item for item in response.output if item.type == "web_search_call"
+            ]
+            assert len(web_search_calls) == 1, response.output
+            assert web_search_calls[0].status == "failed", (
+                f"blank query should fail the call, got {web_search_calls[0].status}"
+            )
+            assert len(BraveSearchHandler.request_paths) == request_count, (
+                "a blank query must never reach the search provider"
+            )
+
+            messages = [
+                item.model_dump()
+                for item in response.output
+                if item.type == "message"
+            ]
+            assert messages, "the loop should re-enter inference and produce a final message"
+            assert "blank or exceeded" in json.dumps(messages), (
+                f"the model-facing bridge should explain the blank query, got {messages}"
+            )
+        finally:
+            BraveSearchHandler.reset()
+            SimulatorBackendHandler.web_search_queries = []
 
     @requires_real_inference
     def test_live_tavily_web_search_returns_real_sources(
@@ -8987,12 +9092,12 @@ class TestAgenticLoopVLLM:
         Chat-Completions-backed model the proxy executes the search locally, so
         the model backend's SSE stream never carries the web_search_call.*
         progress events. Without #276 the search surfaces only in the terminal
-        response.completed snapshot; this asserts the behavior #276 adds: the
+        response.completed snapshot; this asserts the behavior #276 adds: every
         locally executed web_search_call is synthesized as an incremental
         output_item.added -> web_search_call.in_progress -> searching ->
-        completed -> output_item.done sequence, exactly once (no re-emission
-        across IRR rounds), before the resumed model output, with an id and
-        output index that agree with the terminal snapshot.
+        completed -> output_item.done sequence exactly once per call (no
+        re-emission across IRR rounds), with ids and output indices that agree
+        with the terminal snapshot. The live model may make multiple searches.
         """
         stream = translated_agentic_client.responses.create(
             model=CHAT_TRANSLATION_MODEL,
@@ -9012,8 +9117,9 @@ class TestAgenticLoopVLLM:
         # against *resumed*-round text without depending on model prose.
         added = []  # (output_index, item_type, item_id, sequence_number)
         done = []   # (output_index, item_type, item_id, sequence_number)
-        # #276 tool-specific progress/outcome events: (type, item_id, seq).
+        # #276 tool-specific progress/outcome events: (type, item_id, output_index, seq).
         ws_progress = []
+        sequence_numbers = []
         ws_added_at = None
         # (position, output_index) per output_text.delta; the ordering check
         # isolates resumed text (output_index > ws_index) from any round-0
@@ -9022,6 +9128,7 @@ class TestAgenticLoopVLLM:
         final_response = None
 
         for position, event in enumerate(stream):
+            sequence_numbers.append(event.sequence_number)
             etype = event.type
             if etype == "response.output_item.added":
                 item = event.item.model_dump()
@@ -9043,7 +9150,7 @@ class TestAgenticLoopVLLM:
                 "response.web_search_call.completed",
             ):
                 ws_progress.append(
-                    (etype, event.item_id, event.sequence_number)
+                    (etype, event.item_id, event.output_index, event.sequence_number)
                 )
             elif etype == "response.output_text.delta":
                 text_deltas.append((position, event.output_index))
@@ -9053,80 +9160,74 @@ class TestAgenticLoopVLLM:
         assert final_response is not None, (
             "stream must terminate with a response.completed event"
         )
+        assert all(isinstance(number, int) for number in sequence_numbers), sequence_numbers
+        assert sequence_numbers == sorted(set(sequence_numbers)), sequence_numbers
 
-        # #276 core: the locally executed web_search_call must be streamed as
-        # exactly one incremental output_item.added. Without the synthesis it
-        # appears only in the terminal snapshot and never here -- so this is the
-        # assertion that fails when #276 is absent.
+        # #276 core: each locally executed web_search_call must be streamed as
+        # one incremental output_item.added. Without the synthesis they appear
+        # only in the terminal snapshot and never here.
         ws_added = [a for a in added if a[1] == "web_search_call"]
-        assert len(ws_added) == 1, (
-            "the locally executed web_search_call should surface as exactly one "
+        assert ws_added, (
+            "locally executed web_search_calls should surface as incremental "
             f"response.output_item.added; got incremental added items: {added}"
         )
-        ws_index, _, ws_id, ws_added_seq = ws_added[0]
-        assert ws_id, (
-            f"synthesized web_search_call must carry an id; got: {ws_added}"
+        ws_ids = [item_id for _, _, item_id, _ in ws_added]
+        assert all(ws_ids), f"every synthesized web_search_call must carry an id; got: {ws_added}"
+        assert len(ws_ids) == len(set(ws_ids)), (
+            "each locally executed search must be announced once with a unique id; "
+            f"got: {ws_ids}"
         )
 
-        # Exactly one matching output_item.done for the same id: proves the
-        # item is not re-emitted across IRR rounds and that the pair is closed.
-        ws_done = [d for d in done if d[1] == "web_search_call" and d[2] == ws_id]
-        assert len(ws_done) == 1, (
-            "the web_search_call should be closed by exactly one "
-            f"output_item.done for id {ws_id!r}; got incremental done: {done}"
-        )
-        assert ws_done[0][0] == ws_index, (
-            "output_item.done must reuse the added item's output_index; "
-            f"added index={ws_index}, done index={ws_done[0][0]}"
-        )
-        assert ws_added_seq < ws_done[0][3], (
-            "output_item.added must carry a lower sequence_number than its "
-            f"output_item.done; added={ws_added_seq}, done={ws_done[0][3]}"
+        # Each id must have exactly one matching output_item.done, proving the
+        # item is not re-emitted across IRR rounds and that every pair closes.
+        ws_done = [d for d in done if d[1] == "web_search_call"]
+        done_ids = [item_id for _, _, item_id, _ in ws_done]
+        assert len(done_ids) == len(set(done_ids)) and set(done_ids) == set(ws_ids), (
+            "each synthesized web_search_call must close exactly once; "
+            f"added ids={ws_ids}, done ids={done_ids}"
         )
 
-        # #276 tool-specific events: between the generic output-item pair the
-        # synthesized web_search_call must emit in_progress -> searching ->
-        # completed (the search succeeds; web search has no failed event). This
-        # is what turns an opaque output-item pair into search progress the
-        # client can render live.
-        ws_prog = [p for p in ws_progress if p[1] == ws_id]
-        prog_types = [p[0] for p in ws_prog]
-        assert prog_types.count("response.web_search_call.in_progress") == 1, (
-            "the synthesized web_search_call must emit exactly one in_progress "
-            f"event for id {ws_id!r}; got progress events: {ws_progress}"
+        # Each local call gets one complete progress lifecycle between its
+        # output-item events, regardless of how many times the model searches.
+        progress_ids = [item_id for _, item_id, _, _ in ws_progress]
+        assert len(progress_ids) == len(ws_ids) * 3 and set(progress_ids) == set(ws_ids), (
+            "each web_search_call must emit exactly three progress events; "
+            f"added ids={ws_ids}, progress events={ws_progress}"
         )
-        assert prog_types.count("response.web_search_call.searching") == 1, (
-            "the synthesized web_search_call must emit exactly one searching "
-            f"event for id {ws_id!r}; got progress events: {ws_progress}"
-        )
-        assert prog_types.count("response.web_search_call.completed") == 1, (
-            "a successful web_search_call must emit exactly one completed "
-            f"outcome event for id {ws_id!r}; got progress events: {ws_progress}"
-        )
-        in_progress_seq = next(
-            p[2] for p in ws_prog
-            if p[0] == "response.web_search_call.in_progress"
-        )
-        searching_seq = next(
-            p[2] for p in ws_prog
-            if p[0] == "response.web_search_call.searching"
-        )
-        completed_seq = next(
-            p[2] for p in ws_prog
-            if p[0] == "response.web_search_call.completed"
-        )
-        assert (
-            ws_added_seq < in_progress_seq
-            < searching_seq
-            < completed_seq
-            < ws_done[0][3]
-        ), (
-            "web_search_call events must be ordered added -> in_progress -> "
-            f"searching -> completed -> done by sequence_number; "
-            f"added={ws_added_seq}, in_progress={in_progress_seq}, "
-            f"searching={searching_seq}, completed={completed_seq}, "
-            f"done={ws_done[0][3]}"
-        )
+        for ws_index, _, ws_id, ws_added_seq in ws_added:
+            ws_done_item = next(item for item in ws_done if item[2] == ws_id)
+            assert ws_done_item[0] == ws_index, (
+                "output_item.done must reuse the added item's output_index; "
+                f"id={ws_id!r}, added index={ws_index}, done index={ws_done_item[0]}"
+            )
+            ws_prog = [p for p in ws_progress if p[1] == ws_id]
+            prog_types = [p[0] for p in ws_prog]
+            expected_progress = [
+                "response.web_search_call.in_progress",
+                "response.web_search_call.searching",
+                "response.web_search_call.completed",
+            ]
+            assert prog_types == expected_progress, (
+                f"web_search_call {ws_id!r} must emit its progress events once "
+                f"in order; got: {ws_prog}"
+            )
+            assert all(p[2] == ws_index for p in ws_prog), (
+                "each web_search_call progress event must reuse the added item's "
+                f"output_index; id={ws_id!r}, added index={ws_index}, progress={ws_prog}"
+            )
+            assert (
+                ws_added_seq
+                < ws_prog[0][3]
+                < ws_prog[1][3]
+                < ws_prog[2][3]
+                < ws_done_item[3]
+            ), (
+                "web_search_call events must be ordered added -> in_progress -> "
+                f"searching -> completed -> done; id={ws_id!r}, "
+                f"seqs={[ws_added_seq, *(p[3] for p in ws_prog), ws_done_item[3]]}"
+            )
+
+        ws_index = ws_added[0][0]
 
         # Ordering: synthesized tool activity must precede the *resumed* model
         # output. The model may narrate (stream output_text) in the round that
@@ -9155,16 +9256,19 @@ class TestAgenticLoopVLLM:
         # was streamed at -- the incremental events and final snapshot are one
         # coherent view, not two divergent ones.
         snapshot = [
-            (idx, item.type, item.id)
+            (idx, item.id, item.status)
             for idx, item in enumerate(final_response.output)
+            if item.type == "web_search_call"
         ]
-        assert any(
-            item_type == "web_search_call" and item_id == ws_id
-            and idx == ws_index
-            for idx, item_type, item_id in snapshot
-        ), (
-            "the terminal snapshot must agree with the streamed web_search_call "
-            f"(id={ws_id!r}, index={ws_index}); got snapshot: {snapshot}"
+        streamed_calls = [(idx, item_id) for idx, _, item_id, _ in ws_added]
+        snapshot_calls = [(idx, item_id) for idx, item_id, _ in snapshot]
+        assert snapshot_calls == streamed_calls, (
+            "the terminal snapshot must match every streamed web_search_call "
+            f"at the same output index; streamed={streamed_calls}, snapshot={snapshot_calls}"
+        )
+        assert all(status == "completed" for _, _, status in snapshot), (
+            "each terminal web_search_call must be completed; "
+            f"snapshot={snapshot}"
         )
 
     def test_client_function_exits_openai(self, agentic_client):

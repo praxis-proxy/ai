@@ -21,8 +21,8 @@
 //!   user-visible answer; and
 //! * a tool-call round trip, which is the scenario that earns GPU time.
 //!
-//! The `--pure`/model-headers lane stays on CPU: it is a config-parsing
-//! concern, and a real model adds cost without adding evidence.
+//! The per-model headers lane stays on CPU: it is a config-parsing concern,
+//! and a real model adds cost without adding evidence.
 //!
 //! # Gating
 //!
@@ -37,7 +37,7 @@
 //! PRAXIS_TEST_VLLM_MODEL=qwen3-8b \
 //! VLLM_API_KEY=<backend-token> \
 //!   cargo test -p praxis-tests-integration --features store-all --test suite \
-//!   opencode_vllm::opencode_vllm_plugin_auth_completes_text_turn -- --exact
+//!   opencode_vllm::opencode_vllm_options_headers_auth_completes_text_turn -- --exact
 //! ```
 //!
 //! Pins live in `tests/integration/fixtures/opencode-cli/pin.toml` and are
@@ -61,8 +61,7 @@ use super::{
         non_empty_env,
     },
     opencode::{
-        AuthLane, CHAT_PATH, EXAMPLE_CONFIG, GATEWAY_USER, LaunchSpec, OpenCodeTrace, PLUGIN_FAILURE_LOG,
-        gateway_password, launch,
+        AuthLane, CHAT_PATH, EXAMPLE_CONFIG, GATEWAY_USER, LaunchSpec, OpenCodeTrace, gateway_password, launch,
     },
 };
 
@@ -95,9 +94,22 @@ pub(super) const REASONING_LEAK_MARKERS: &[&str] = &["<think>", "</think>"];
 // Live gate
 // -----------------------------------------------------------------------------
 
+/// Names of the variables that gate one client's live lane.
+#[derive(Clone, Copy)]
+pub(super) struct LiveEnv<'a> {
+    /// Client name, for diagnostics.
+    pub(super) client: &'a str,
+    /// Path to the pinned client executable.
+    pub(super) bin: &'a str,
+    /// Optional Linux network namespace to launch the client in.
+    pub(super) netns: &'a str,
+    /// Demands a real live run rather than a silent skip.
+    pub(super) require_live: &'a str,
+}
+
 /// Resolved live environment for one acceptance run.
 pub(super) struct LiveConfig {
-    pub(super) opencode_bin: OsString,
+    pub(super) client_bin: OsString,
     vllm_authority: String,
     pub(super) model: String,
     listen_address: IpAddr,
@@ -120,20 +132,39 @@ impl LiveConfig {
     /// with this one — same backend, same namespace — and differs only in which
     /// pinned binary it launches.
     pub(super) fn from_env_for(bin_env: &str) -> Option<Self> {
-        let opencode_bin = std::env::var_os(bin_env).filter(|value| !value.is_empty());
+        Self::from_env_vars(&LiveEnv {
+            client: "OpenCode",
+            bin: bin_env,
+            netns: NETNS_ENV,
+            require_live: REQUIRE_LIVE_ENV,
+        })
+    }
+
+    /// Resolve the live environment from an explicit set of variable names.
+    ///
+    /// The pi lane in [`super::pi_vllm`] rides the same gateway config and the
+    /// same backend variables, but runs in its own job and namespace, so it
+    /// names its own executable, namespace, and require-live variables.
+    pub(super) fn from_env_vars(vars: &LiveEnv<'_>) -> Option<Self> {
+        let LiveEnv {
+            client,
+            bin: bin_env,
+            netns: netns_env,
+            require_live: require_live_env,
+        } = *vars;
+        let client_bin = std::env::var_os(bin_env).filter(|value| !value.is_empty());
         let base_url = non_empty_env(VLLM_BASE_URL_ENV);
         let model = non_empty_env(VLLM_MODEL_ENV);
         let token = non_empty_env(BACKEND_TOKEN_ENV);
 
-        let (Some(opencode_bin), Some(base_url), Some(model), Some(_token)) = (opencode_bin, base_url, model, token)
-        else {
+        let (Some(client_bin), Some(base_url), Some(model), Some(_token)) = (client_bin, base_url, model, token) else {
             assert!(
-                !env_is_truthy(REQUIRE_LIVE_ENV),
-                "{REQUIRE_LIVE_ENV} is set but a required variable is missing; set all of \
+                !env_is_truthy(require_live_env),
+                "{require_live_env} is set but a required variable is missing; set all of \
                  {bin_env}, {VLLM_BASE_URL_ENV}, {VLLM_MODEL_ENV}, and {BACKEND_TOKEN_ENV}"
             );
             eprintln!(
-                "skipping live OpenCode acceptance test; set {bin_env}, \
+                "skipping live {client} acceptance test; set {bin_env}, \
                  {VLLM_BASE_URL_ENV}, {VLLM_MODEL_ENV}, and {BACKEND_TOKEN_ENV} to run it"
             );
             return None;
@@ -148,13 +179,13 @@ impl LiveConfig {
             .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
 
         let config = Self {
-            opencode_bin,
+            client_bin,
             vllm_authority: authority_of(&base_url),
             model,
             listen_address,
-            netns: non_empty_env(NETNS_ENV),
+            netns: non_empty_env(netns_env),
         };
-        live_vllm::require_egress_isolation_if_demanded(config.netns.as_deref(), NETNS_ENV);
+        live_vllm::require_egress_isolation_if_demanded(config.netns.as_deref(), netns_env);
         Some(config)
     }
 }
@@ -194,33 +225,25 @@ async fn run_live(live: &LiveConfig, workspace: &Path, prompt: &str) -> Captured
     let home = TempDir::new().expect("temporary HOME should be creatable");
 
     launch(LaunchSpec {
-        bin: &live.opencode_bin,
+        bin: &live.client_bin,
         home: home.path(),
         workspace,
         base_url: &base_url,
         model: &live.model,
-        lane: AuthLane::Plugin,
+        lane: AuthLane::OptionsHeaders,
         prompt,
         timeout: CHILD_TIMEOUT,
     })
     .await
 }
 
-/// Shared post-run checks: the client finished, the plugin loaded, no errors.
-///
-/// The plugin check is not redundant with the exit status. A throwing `config`
-/// hook still exits 0 and still sends the turn, just unauthenticated, so
-/// without this a broken plugin would surface only as a confusing 401.
+/// Shared post-run checks: the client finished and reported no errors.
 fn assert_clean_run(output: &CapturedChildOutput, scenario: &str) -> OpenCodeTrace {
     live_vllm::assert_not_timed_out(output, "OpenCode", scenario, CHILD_TIMEOUT);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let trace = OpenCodeTrace::parse(&stdout);
 
-    assert!(
-        !stderr.contains(PLUGIN_FAILURE_LOG),
-        "{scenario}: the documented plugin must load cleanly; found {PLUGIN_FAILURE_LOG:?}\n{stderr}"
-    );
     // Diagnose from the trace before the exit status: a turn that failed for a
     // protocol reason is far more informative than a bare non-zero code.
     assert!(
@@ -241,7 +264,7 @@ fn assert_clean_run(output: &CapturedChildOutput, scenario: &str) -> OpenCodeTra
 // -----------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn opencode_vllm_plugin_auth_completes_text_turn() {
+async fn opencode_vllm_options_headers_auth_completes_text_turn() {
     let Some(live) = LiveConfig::from_env() else { return };
     let workspace = TempDir::new().expect("temporary workspace should be creatable");
 
@@ -376,7 +399,7 @@ fn live_config_patches_the_shipped_example() {
     // Exercises all three drift-guarded anchors against the real file, so an
     // example change breaks here rather than inside a nightly GPU run.
     let live = LiveConfig {
-        opencode_bin: OsString::from("/nonexistent/opencode"),
+        client_bin: OsString::from("/nonexistent/opencode"),
         vllm_authority: "10.201.0.3:8000".to_owned(),
         model: "qwen3-8b".to_owned(),
         listen_address: IpAddr::V4(Ipv4Addr::new(10, 201, 0, 1)),
