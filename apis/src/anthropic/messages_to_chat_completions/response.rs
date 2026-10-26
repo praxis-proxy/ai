@@ -254,11 +254,17 @@ fn map_finish_reason<'a>(obj: &'a Map<String, Value>, stop_sequences: &[String])
         .and_then(|c| c.get("stop_reason"))
         .and_then(Value::as_str)
         .filter(|matched| stop_sequences.iter().any(|sequence| sequence == matched));
+    let has_tool_calls = choice
+        .and_then(|c| c.get("message"))
+        .and_then(|message| message.get("tool_calls"))
+        .and_then(Value::as_array)
+        .is_some_and(|tool_calls| !tool_calls.is_empty());
 
     let mapped = match finish_reason {
         "tool_calls" => "tool_use",
         "length" => "max_tokens",
         "stop" if stop_sequence.is_some() => "stop_sequence",
+        "stop" if has_tool_calls => "tool_use",
         _ => "end_turn",
     };
 
@@ -513,6 +519,17 @@ mod tests {
             parsed["content"][0]["caller"]["type"], "direct",
             "tool_use caller should identify a direct invocation"
         );
+    }
+
+    #[test]
+    fn tool_calls_with_stop_finish_reason_report_tool_use() {
+        let body = br#"{"id":"chatcmpl-3","model":"qwen3-8b","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":15}}"#;
+        let tr = transform_response(body, "qwen3-8b", &[]).unwrap();
+        let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
+
+        assert_eq!(parsed["stop_reason"], "tool_use");
+        assert_eq!(parsed["content"][0]["type"], "tool_use");
+        assert_eq!(tr.original_finish_reason, "stop");
     }
 
     #[test]
