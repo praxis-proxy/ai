@@ -213,7 +213,9 @@ flags = [
 # so one container backs both the native and transformed acceptance paths with no
 # extra flag. Qwen3-8B on the A10G (24GB) is the capable model the full suite is
 # already green with; the 0.6B CPU model cannot drive Claude Code's tool use.
-image = "docker.io/vllm/vllm-openai:v0.32.0-cu129@sha256:bc0445dac61accbf1c3b17fbb524a71eee0b1b32f55ba45952095e3be8991c3f"
+# Use the CUDA 13 default image: the cu129 variant resolves a CUDA 13 torchcodec
+# wheel that fails to load because libnvrtc.so.13 is absent.
+image = "docker.io/vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34"
 # Exact served model name. Set via `--served-model-name`; every model-selection
 # surface in the test (--model and the ANTHROPIC_*_MODEL env vars) pins this. A
 # slash-free ALIAS is used deliberately: vLLM's Anthropic client surface cannot

@@ -90,9 +90,11 @@ docker run --rm --name vllm \
 
 With Podman, replace `--gpus all` with `--device nvidia.com/gpu=all` and leave
 the rest unchanged. Pin a released tag rather than `latest` for reproducible
-behavior; the on-demand GPU endpoint workflow uses `v0.32.0-cu129`. The first
-run downloads a multi-gigabyte image plus the model weights, and the Hugging
-Face cache mount keeps the weights for later runs.
+behavior; the on-demand GPU endpoint workflow uses the CUDA 13 default
+`v0.32.0` image. The `-cu129` variant currently resolves a CUDA 13 torchcodec
+wheel that cannot load without `libnvrtc.so.13`. The first run downloads a
+multi-gigabyte image plus the model weights, and the Hugging Face cache mount
+keeps the weights for later runs.
 
 Use `VLLM_URL=http://127.0.0.1:8000` for either local server.
 

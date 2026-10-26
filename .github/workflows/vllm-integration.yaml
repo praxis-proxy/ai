@@ -129,8 +129,9 @@ env:
   CARGO_TERM_COLOR: always
   VLLM_IMAGE: "quay.io/opendatahub/vllm-cpu:Qwen3-0.6B-granite-embedding-125m-english@sha256:0212dc82981178033cb71c7477ba8ad1998fb6c0b1ee40646119fb9724ac951b"
   VLLM_MODEL: "Qwen/Qwen3-0.6B"
-  # The acceptance jobs still use their pinned upstream image.
-  VLLM_GPU_IMAGE: "docker.io/vllm/vllm-openai:v0.32.0-cu129@sha256:bc0445dac61accbf1c3b17fbb524a71eee0b1b32f55ba45952095e3be8991c3f"
+  # Use the CUDA 13 default image. The v0.32.0-cu129 image resolves a CUDA 13
+  # torchcodec wheel, which fails to import because libnvrtc.so.13 is absent.
+  VLLM_GPU_IMAGE: "docker.io/vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34"
   # The full suite's model-baked image is NOT pinned here: it is described by
   # vllm/images.json and published by vllm-gpu-container.yaml. The job reads the
   # manifest, reuses the published build when it matches this checkout, and
