@@ -58,7 +58,9 @@ endif
 	test test-unit test-unit-apis test-unit-filters test-unit-proxy \
 	test-schema test-integration test-integration-experimental \
 	test-inference-fixtures test-inference-xtask bench-model-to-provider \
-	test-store-features test-responses-features \
+	test-store-features test-store-features-check test-store-features-clippy \
+	test-store-features-clippy-group test-store-features-test print-store-clippy-groups \
+	test-responses-features \
 	test-postgres-unit test-postgres-integration test-environment test-environment-suite \
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
 	test-token-rate-limit-sentinel-integration \
@@ -153,7 +155,12 @@ test-unit-proxy:
 	cargo test -p praxis-ai-proxy --features full,openai-all,store-postgres $(_NOCAPTURE)
 	cargo test -p praxis-ai-proxy --features full,openai-all,store-postgres,basic-auth-filter $(_NOCAPTURE)
 
-test-store-features:
+# Store backend feature-graph guard, split so CI can run check / clippy / test
+# as parallel jobs instead of serializing ~18 compiles in one runner. Running
+# `make test-store-features` locally still does all three in order.
+test-store-features: test-store-features-check test-store-features-clippy test-store-features-test
+
+test-store-features-check:
 	cargo check -p praxis-ai-proxy
 	cargo check -p praxis-ai-proxy --no-default-features --features $(STORE_BACKEND_FREE_FEATURES)
 	cargo check -p praxis-ai-proxy --no-default-features --features $(STORE_POSTGRES_FEATURES)
@@ -178,15 +185,30 @@ test-store-features:
 	for crate in sqlx-postgres native-tls; do assert_lacks "$$sqlite" "$$crate" SQLite-only; done; \
 	for crate in sqlx sqlx-postgres sqlx-sqlite libsqlite3-sys native-tls; do assert_has "$$combined" "$$crate" combined; done; \
 	for crate in sqlx sqlx-core sqlx-postgres native-tls sqlx-sqlite libsqlite3-sys; do assert_lacks "$$default" "$$crate" default; done
-	@# Lint each opt-in group on its own so a gate leak in a partial feature set
-	@# cannot hide behind the lean and full builds that other targets cover.
-	@for group in openai-responses openai-agentic-loop openai-file-resolve-filter store store-postgres store-postgres-cert-auth store-sqlite \
-		openai-conversations openai-compact openai-mcp-tools; do \
-		echo "clippy: standard + $$group"; \
-		cargo clippy -p praxis-ai-apis -p praxis-ai-filters -p praxis-ai-proxy --all-targets \
-			--no-default-features --features praxis-ai-proxy/standard,praxis-ai-proxy/$$group \
-			-- -D warnings || exit 1; \
+
+# Clippy each opt-in feature group on its own so a gate leak in a partial
+# feature set cannot hide behind the lean and full builds other targets cover.
+# This list is the single source of truth: the store-features-clippy CI matrix
+# in .github/workflows/tests.yaml is generated from `print-store-clippy-groups`.
+STORE_FEATURE_CLIPPY_GROUPS := openai-responses openai-agentic-loop openai-file-resolve-filter store store-postgres store-postgres-cert-auth store-sqlite openai-conversations openai-compact openai-mcp-tools
+
+# Emit the group list (space-separated) so CI can build its matrix from here.
+print-store-clippy-groups:
+	@echo $(STORE_FEATURE_CLIPPY_GROUPS)
+
+test-store-features-clippy:
+	@for group in $(STORE_FEATURE_CLIPPY_GROUPS); do \
+		$(MAKE) --no-print-directory test-store-features-clippy-group GROUP=$$group || exit 1; \
 	done
+
+test-store-features-clippy-group:
+	@test -n "$(GROUP)" || { echo "GROUP must be set, e.g. GROUP=store-sqlite" >&2; exit 2; }
+	@echo "clippy: standard + $(GROUP)"
+	cargo clippy -p praxis-ai-apis -p praxis-ai-filters -p praxis-ai-proxy --all-targets \
+		--no-default-features --features praxis-ai-proxy/standard,praxis-ai-proxy/$(GROUP) \
+		-- -D warnings
+
+test-store-features-test:
 	cargo test -p praxis-ai-apis --no-default-features --features openai-all,store-sqlite $(_NOCAPTURE)
 	cargo test -p praxis-ai-apis --no-default-features --features openai-all,store-all $(_NOCAPTURE)
 	@if cargo tree -p praxis-ai-proxy --features full --edges normal | grep -q libsqlite3-sys; then \
