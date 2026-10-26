@@ -87,6 +87,7 @@ impl HttpFilter for TrustedTenantMetadata {
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         ctx.set_metadata("x-tenant-username", "token-metrics-example-alice");
+        ctx.set_metadata("openai_chat_completions_request.model", "gpt-4o");
         Ok(FilterAction::Continue)
     }
 }
