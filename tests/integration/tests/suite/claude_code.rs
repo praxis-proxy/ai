@@ -19,7 +19,63 @@ use nix::{
 use praxis_core::config::Config;
 use praxis_test_utils::{StatefulCapturingBackend, free_port, start_proxy};
 
-use super::harness::{CLAUDE_CODE_PINNED_VERSION, TempWorkspace};
+use super::{
+    harness::{CLAUDE_CODE_PINNED_VERSION, TempWorkspace},
+    opencode::{pin_value_in, repo_root},
+};
+
+/// The Claude Code pin manifest, relative to this crate's `fixtures/` directory.
+const PIN_MANIFEST: &str = "claude-code-cli/pin.toml";
+
+#[test]
+fn pin_toml_version_matches_harness_const() {
+    // The CPU lane (npm) and the GPU lane (native download) both run this
+    // version; one manifest value keeps them from drifting apart.
+    assert_eq!(
+        pin_value_in(PIN_MANIFEST, "version"),
+        CLAUDE_CODE_PINNED_VERSION,
+        "the pin manifest and CLAUDE_CODE_PINNED_VERSION must agree; a bump must update both"
+    );
+}
+
+#[test]
+fn pinned_claude_code_version_matches_the_major_series_tripwire() {
+    let major = CLAUDE_CODE_PINNED_VERSION
+        .split('.')
+        .next()
+        .expect("version should be dotted");
+    assert_eq!(
+        major,
+        pin_value_in(PIN_MANIFEST, "major_series"),
+        "crossing a Claude Code major release must re-validate the manifest, not just bump the version"
+    );
+}
+
+#[test]
+fn pin_toml_url_downloads_the_pinned_version() {
+    assert_eq!(
+        pin_value_in(PIN_MANIFEST, "url"),
+        format!("https://downloads.claude.ai/claude-code-releases/{CLAUDE_CODE_PINNED_VERSION}/linux-x64/claude"),
+        "the manifest URL should fetch the pinned version's native build"
+    );
+    let digest = pin_value_in(PIN_MANIFEST, "sha256");
+    assert!(
+        digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()),
+        "the manifest sha256 should be a sha256 hex digest: {digest}"
+    );
+}
+
+#[test]
+fn claude_code_lane_is_wired_in_ci() {
+    let workflow = repo_root().join(".github/workflows/integration.yaml");
+    let yaml = std::fs::read_to_string(&workflow).expect("integration workflow should be readable");
+    let needle = format!("CLAUDE_CODE_PINNED_VERSION: \"{CLAUDE_CODE_PINNED_VERSION}\"");
+    assert!(
+        yaml.contains(&needle),
+        "{} must install the pinned Claude Code with {needle:?}",
+        workflow.display()
+    );
+}
 
 #[test]
 fn pinned_claude_code_version_check() {

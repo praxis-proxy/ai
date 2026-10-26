@@ -1,0 +1,39 @@
+# Codex CLI acceptance pin manifest
+#
+# Single source of truth for the pinned Codex acceptance tests
+# (`tests/integration/tests/suite/codex_http.rs` and `codex_websocket.rs`) and
+# their CI jobs (`codex-http` and `codex-websocket` in
+# `.github/workflows/integration.yaml`, and the Codex GPU job in
+# `.github/workflows/vllm-integration.yaml`). Codex speaks OpenAI Responses over
+# HTTP and WebSocket:
+#
+#   Codex -> Praxis /v1/responses -> backend
+#
+# Every value below was validated by hand against the pinned executable. Where
+# a value encodes observed client behavior rather than a choice, the comment
+# says so — those are the ones to re-validate when the version changes.
+
+[codex]
+# Version of the pinned release. Keep in sync with CODEX_PINNED_VERSION in
+# `tests/integration/tests/suite/harness.rs` and CODEX_VERSION in every Codex
+# CI job; the offline tests in `codex_pin.rs` enforce all three.
+#
+# There is no `major_series` tripwire: Codex is still 0.x, where any release
+# may break, so every bump re-validates the lanes. The WebSocket lane also
+# loads `fixtures/openai/responses/websocket-codex-<version>.json`, a
+# recording of this version's wire protocol, so a bump must recapture it
+# rather than rename it.
+version = "0.144.1"
+# Target triple of the pinned release archive.
+platform = "x86_64-unknown-linux-musl"
+# How CI obtains the executable.
+#
+# `github-release` downloads `archive` from the `<release_tag_prefix><version>`
+# tag of https://github.com/openai/codex and verifies it against
+# `tests/integration/fixtures/codex-cli/<version>-<platform>.sha256`.
+install = "github-release"
+release_tag_prefix = "rust-v"
+archive = "codex-x86_64-unknown-linux-musl.tar.gz"
+# Exact `codex --version` output. Observed: the product prefix is `codex-cli`,
+# not `codex`.
+version_output = "codex-cli 0.144.1"

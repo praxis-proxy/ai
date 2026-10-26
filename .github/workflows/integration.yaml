@@ -212,10 +212,13 @@ jobs:
 
       - name: Install pinned Claude Code CLI
         env:
-          CLAUDE_CODE_PINNED_VERSION: "2.1.267"
+          # Keep in sync with tests/integration/fixtures/claude-code-cli/pin.toml;
+          # the offline test `claude_code::claude_code_lane_is_wired_in_ci`
+          # enforces it.
+          CLAUDE_CODE_PINNED_VERSION: "2.1.278"
         run: |
           npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_PINNED_VERSION}"
-          claude --version
+          claude --version | grep -F "$CLAUDE_CODE_PINNED_VERSION"
 
       - name: Integration tests
         env:
@@ -560,6 +563,9 @@ jobs:
     permissions:
       contents: read
     env:
+      # Keep in sync with tests/integration/fixtures/codex-cli/pin.toml; the
+      # offline test `codex_pin::codex_lanes_are_wired_in_ci` enforces it.
+      CODEX_VERSION: "0.144.1"
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
     steps:
@@ -575,33 +581,33 @@ jobs:
       - name: Cache pinned Codex CLI
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl
-          key: codex-0.144.1-x86_64-unknown-linux-musl-84091ae20c65fcc7d4120db97d1bd57d7ff8df9c7609fb781c78c2ebbd4f5a28
+          path: ${{ runner.tool_cache }}/codex/${{ env.CODEX_VERSION }}/x86_64-unknown-linux-musl
+          key: codex-${{ env.CODEX_VERSION }}-x86_64-unknown-linux-musl-${{ hashFiles('tests/integration/fixtures/codex-cli/*.sha256') }}
 
       - name: Download pinned Codex CLI
         run: |
-          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/0.144.1/x86_64-unknown-linux-musl"
+          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/$CODEX_VERSION/x86_64-unknown-linux-musl"
           mkdir -p "$codex_cache_dir"
           if [ ! -f "$codex_cache_dir/$CODEX_ARCHIVE" ]; then
             curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
               --output "$codex_cache_dir/$CODEX_ARCHIVE" \
-              "https://github.com/openai/codex/releases/download/rust-v0.144.1/$CODEX_ARCHIVE"
+              "https://github.com/openai/codex/releases/download/rust-v$CODEX_VERSION/$CODEX_ARCHIVE"
           fi
 
       - name: Verify and extract pinned Codex CLI
         run: |
-          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/0.144.1/x86_64-unknown-linux-musl"
+          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/$CODEX_VERSION/x86_64-unknown-linux-musl"
           cd "$codex_cache_dir"
           sha256sum --check \
-            "$GITHUB_WORKSPACE/tests/integration/fixtures/codex-cli/0.144.1-x86_64-unknown-linux-musl.sha256"
+            "$GITHUB_WORKSPACE/tests/integration/fixtures/codex-cli/$CODEX_VERSION-x86_64-unknown-linux-musl.sha256"
           tar --extract --gzip --file "$CODEX_ARCHIVE"
           chmod +x "$CODEX_BIN"
           test -x "$CODEX_BIN"
-          test "$("./$CODEX_BIN" --version)" = "codex-cli 0.144.1"
+          test "$("./$CODEX_BIN" --version)" = "codex-cli $CODEX_VERSION"
 
       - name: Build pinned Codex HTTP acceptance test
         env:
-          PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
+          PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/${{ env.CODEX_VERSION }}/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
         run: |
           test -x "$PRAXIS_TEST_CODEX_BIN"
           cargo test -p praxis-tests-integration --features openai-all --test suite --no-run
@@ -615,7 +621,7 @@ jobs:
 
       - name: Run pinned Codex HTTP acceptance test without external network access
         env:
-          PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
+          PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/${{ env.CODEX_VERSION }}/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
         run: |
           runner_uid="$(id -u)"
           runner_gid="$(id -g)"
@@ -1106,6 +1112,9 @@ jobs:
     permissions:
       contents: read
     env:
+      # Keep in sync with tests/integration/fixtures/codex-cli/pin.toml; the
+      # offline test `codex_pin::codex_lanes_are_wired_in_ci` enforces it.
+      CODEX_VERSION: "0.144.1"
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
     steps:
@@ -1121,12 +1130,12 @@ jobs:
       - name: Cache pinned Codex CLI
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl
-          key: codex-0.144.1-x86_64-unknown-linux-musl-84091ae20c65fcc7d4120db97d1bd57d7ff8df9c7609fb781c78c2ebbd4f5a28
+          path: ${{ runner.tool_cache }}/codex/${{ env.CODEX_VERSION }}/x86_64-unknown-linux-musl
+          key: codex-${{ env.CODEX_VERSION }}-x86_64-unknown-linux-musl-${{ hashFiles('tests/integration/fixtures/codex-cli/*.sha256') }}
 
       - name: Download pinned Codex CLI
         run: |
-          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/0.144.1/x86_64-unknown-linux-musl"
+          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/$CODEX_VERSION/x86_64-unknown-linux-musl"
           mkdir -p "$codex_cache_dir"
           archive_path="$codex_cache_dir/$CODEX_ARCHIVE"
           if [ ! -f "$archive_path" ]; then
@@ -1136,9 +1145,9 @@ jobs:
             if ! curl --proto '=https' --tlsv1.2 --fail --location \
               --retry 10 --retry-all-errors --retry-delay 10 \
               --output "$tmp_archive" \
-              "https://github.com/openai/codex/releases/download/rust-v0.144.1/$CODEX_ARCHIVE"; then
+              "https://github.com/openai/codex/releases/download/rust-v$CODEX_VERSION/$CODEX_ARCHIVE"; then
               rm -f "$tmp_archive"
-              gh release download rust-v0.144.1 \
+              gh release download "rust-v$CODEX_VERSION" \
                 --repo openai/codex \
                 --pattern "$CODEX_ARCHIVE" \
                 --dir "$tmp_dir" \
@@ -1147,25 +1156,25 @@ jobs:
             (
               cd "$tmp_dir"
               sha256sum --check \
-                "$GITHUB_WORKSPACE/tests/integration/fixtures/codex-cli/0.144.1-x86_64-unknown-linux-musl.sha256"
+                "$GITHUB_WORKSPACE/tests/integration/fixtures/codex-cli/$CODEX_VERSION-x86_64-unknown-linux-musl.sha256"
             )
             mv "$tmp_archive" "$archive_path"
           fi
 
       - name: Verify and extract pinned Codex CLI
         run: |
-          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/0.144.1/x86_64-unknown-linux-musl"
+          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/$CODEX_VERSION/x86_64-unknown-linux-musl"
           cd "$codex_cache_dir"
           sha256sum --check \
-            "$GITHUB_WORKSPACE/tests/integration/fixtures/codex-cli/0.144.1-x86_64-unknown-linux-musl.sha256"
+            "$GITHUB_WORKSPACE/tests/integration/fixtures/codex-cli/$CODEX_VERSION-x86_64-unknown-linux-musl.sha256"
           tar --extract --gzip --file "$CODEX_ARCHIVE"
           chmod +x "$CODEX_BIN"
           test -x "$CODEX_BIN"
-          test "$("./$CODEX_BIN" --version)" = "codex-cli 0.144.1"
+          test "$("./$CODEX_BIN" --version)" = "codex-cli $CODEX_VERSION"
 
       - name: Run pinned Codex WebSocket acceptance test
         env:
-          PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
+          PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/${{ env.CODEX_VERSION }}/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
         run: |
           test -x "$PRAXIS_TEST_CODEX_BIN"
           cargo test -p praxis-tests-integration --features openai-all,store-sqlite --test suite \

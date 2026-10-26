@@ -844,6 +844,31 @@ fn pinned_opencode_version_is_a_one_x_release() {
 }
 
 #[test]
+fn checksum_fixture_names_the_pinned_platform_tarball() {
+    // The GPU lane verifies the downloaded platform tarball against this file,
+    // so a version bump that forgets it fails here rather than as a checksum
+    // mismatch on the nightly.
+    let platform = pin_value("platform");
+    let relative = format!("opencode-cli/{OPENCODE_PINNED_VERSION}-{platform}.sha256");
+    let line = std::fs::read_to_string(fixture_path(&relative))
+        .unwrap_or_else(|error| panic!("fixtures/{relative} should exist for the pinned version: {error}"));
+    let (digest, file) = line
+        .trim()
+        .split_once("  ")
+        .expect("the checksum fixture should be in `sha256sum` format");
+    assert_eq!(digest.len(), 64, "the checksum should be a sha256 hex digest: {digest}");
+    assert!(
+        digest.chars().all(|c| c.is_ascii_hexdigit()),
+        "the checksum should be hex: {digest}"
+    );
+    assert_eq!(
+        file,
+        format!("opencode-{platform}-{OPENCODE_PINNED_VERSION}.tgz"),
+        "the checksum should name the platform tarball the GPU lane downloads"
+    );
+}
+
+#[test]
 fn options_headers_lane_matches_the_documented_recipe() {
     // The acceptance lane builds its configuration from `client_config`, so
     // without this assertion the suite would validate its own private recipe

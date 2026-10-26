@@ -11,10 +11,10 @@
 //!   codex_websocket::pinned_codex_uses_responses_websocket_through_full_flow -- --exact
 //! ```
 //!
-//! The executable must report the version in [`CODEX_VERSION`]. To update the
-//! pin, update that constant, the fixture filename and metadata, the checksum
-//! manifest, and every version, archive, cache path/key, and version assertion
-//! in `.github/workflows/integration.yaml`. Recapture and sanitize the fixture
+//! The executable must report the version in [`CODEX_PINNED_VERSION`], which
+//! `tests/integration/fixtures/codex-cli/pin.toml` single-sources together
+//! with the checksum fixture and the CI `CODEX_VERSION` env (see
+//! `codex_pin`); also update the replay fixture metadata. Recapture and sanitize the fixture
 //! when the client's wire protocol changes, then run this test with the new
 //! verified binary before committing the coordinated update.
 
@@ -27,12 +27,12 @@ use praxis_test_utils::{
 };
 use serde::Deserialize;
 
+use super::harness::CODEX_PINNED_VERSION;
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Required output from the pinned executable.
-const CODEX_VERSION: &str = "codex-cli 0.144.1";
 /// Fixed prompt shared by the fixture and child process.
 const PROMPT: &str = "Reply with exactly PONG. Do not call tools.";
 /// Synthetic credential that must reach the test backend.
@@ -55,8 +55,8 @@ async fn pinned_codex_uses_responses_websocket_through_full_flow() {
         "the fixture schema version should match the harness"
     );
     assert_eq!(
-        fixture.metadata.codex_cli_version, "0.144.1",
-        "the fixture should identify the pinned Codex version"
+        fixture.metadata.codex_cli_version, CODEX_PINNED_VERSION,
+        "the fixture should identify the pinned Codex version; a bump must recapture it"
     );
     assert_eq!(
         fixture.client.kind, "text",
@@ -211,7 +211,7 @@ async fn assert_pinned_codex_version(codex_bin: &OsStr) {
     assert!(output.status.success(), "codex --version should succeed");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        CODEX_VERSION,
+        format!("codex-cli {CODEX_PINNED_VERSION}"),
         "acceptance fixture and executable pin must match"
     );
 }
@@ -275,7 +275,7 @@ env_key = "PRAXIS_TEST_API_KEY"
 /// Load and deserialize the committed deterministic fixture.
 fn load_fixture() -> CodexWsFixture {
     let path = format!(
-        "{}/fixtures/openai/responses/websocket-codex-0.144.1.json",
+        "{}/fixtures/openai/responses/websocket-codex-{CODEX_PINNED_VERSION}.json",
         env!("CARGO_MANIFEST_DIR")
     );
     let bytes = std::fs::read(path).expect("Codex WebSocket fixture should exist");

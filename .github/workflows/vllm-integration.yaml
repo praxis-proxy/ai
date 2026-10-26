@@ -617,9 +617,9 @@ jobs:
               raise SystemExit(
                   f"compaction window {compaction_context} must be in (0, {context})"
               )
-          # Pinned Claude Code 2.1.267 reserves 2,048 output + 13,000 compaction
-          # tokens, so its effective auto-compaction threshold is
-          # `compaction_context - 15048`. A single ballast read must fit well
+          # Claude Code reserves 2,048 output + 13,000 compaction tokens
+          # (measured on 2.1.267; re-validate on a bump), so its effective
+          # auto-compaction threshold is `compaction_context - 15048`. A single ballast read must fit well
           # under that headroom, or one post-compaction read immediately
           # re-crosses the threshold and the client's rapid-refill breaker aborts
           # the run. Total ballast must still exceed the threshold so compaction
@@ -1596,7 +1596,7 @@ jobs:
     env:
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
-      CODEX_VERSION: 0.144.1
+      CODEX_VERSION: "0.144.1"
       CODEX_VLLM_MODEL: qwen3-8b
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
