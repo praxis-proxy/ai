@@ -785,6 +785,8 @@ pub(super) const GUIDE: &str = "docs/developing/cli-vllm-through-praxis.md";
 pub(super) const GUIDE_V1_HEADING: &str = "\n### OpenCode 1.x\n";
 /// Heading that opens the guide's OpenCode 2.x setup, and closes the 1.x one.
 pub(super) const GUIDE_V2_HEADING: &str = "\n### OpenCode 2.x\n";
+/// Heading that opens the guide's pi setup, and closes the OpenCode 2.x one.
+pub(super) const GUIDE_PI_HEADING: &str = "\n## 6. Connect pi\n";
 
 /// The guide text from `start` up to (not including) `end`.
 ///

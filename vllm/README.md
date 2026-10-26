@@ -105,7 +105,7 @@ These are test-suite flags, not a template for interactive use. The
 reasoning-content tests need a model that thinks out loud, which makes agentic
 clients misbehave; for driving Codex, Claude Code, or OpenCode through Praxis,
 use the reasoning flags in
-[Run Codex, Claude Code, or OpenCode through Praxis and vLLM](../docs/developing/cli-vllm-through-praxis.md)
+[Run your Code Harness through Praxis and vLLM](../docs/developing/cli-vllm-through-praxis.md)
 instead.
 
 Additional flags for larger GPUs:

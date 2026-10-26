@@ -1,4 +1,4 @@
-# Run Codex, Claude Code, or OpenCode through Praxis and vLLM
+# Run your Code Harness through Praxis and vLLM
 
 This guide runs a real coding client through a local Praxis gateway while vLLM
 provides inference. The supported paths are:
@@ -9,10 +9,11 @@ Codex       -> Praxis /v1/responses        -> vLLM /v1/chat/completions (transla
 Claude Code -> Praxis /v1/messages         -> vLLM /v1/messages (native)
 Claude Code -> Praxis /v1/messages         -> vLLM /v1/chat/completions (translated)
 OpenCode    -> Praxis /v1/chat/completions -> vLLM /v1/chat/completions (native)
+pi          -> Praxis /v1/chat/completions -> vLLM /v1/chat/completions (native)
 ```
 
-One gateway can serve all three clients over their native paths at once; see
-[Serving all three clients from one gateway](#serving-all-three-clients-from-one-gateway).
+One gateway can serve all four clients over their native paths at once; see
+[Serving all four clients from one gateway](#serving-all-four-clients-from-one-gateway).
 
 Use the native paths when vLLM exposes the corresponding Responses or
 Anthropic-compatible API. For Codex, Praxis keeps `/v1/responses` end to end
@@ -147,7 +148,7 @@ cp examples/configs/openai/responses/client-tool-compat.yaml praxis-vllm.yaml
 # Codex, translated to Chat Completions
 cp examples/configs/openai/responses/codex-http-chat-translation.yaml praxis-vllm.yaml
 
-# Claude Code, native Anthropic API (preferred for vLLM), or OpenCode
+# Claude Code, native Anthropic API (preferred for vLLM), OpenCode, or pi
 cp examples/configs/anthropic/messages-native-vllm.yaml praxis-vllm.yaml
 
 # Claude Code, translated to Chat Completions
@@ -158,21 +159,22 @@ OpenCode was tested with the
 [native Claude configuration](../../examples/configs/anthropic/messages-native-vllm.yaml).
 It declares an explicit `/v1/chat/completions` route that forwards to vLLM
 without body translation, and Anthropic validation is scoped to `/v1/messages`.
-The same gateway can serve both Claude Code and OpenCode, provided vLLM
+pi uses the same configuration and the same `/v1/chat/completions` route. The
+same gateway can serve Claude Code, OpenCode, and pi together, provided vLLM
 supports their respective endpoints.
 
-### Serving all three clients from one gateway
+### Serving all four clients from one gateway
 
-One proxy process can serve all three CLIs over their native paths at once.
+One proxy process can serve all four CLIs over their native paths at once.
 There is no example config for this, because it is the two native examples
-above placed in one file: the Claude Code and OpenCode chain from
+above placed in one file: the Claude Code, OpenCode, and pi chain from
 `anthropic/messages-native-vllm.yaml` and the Codex chain from
 `openai/responses/client-tool-compat.yaml`, behind two listeners, pointed at
 the same vLLM server and sharing one `GATEWAY_AUTH_PASSWORD`.
 
 ```yaml
 listeners:
-  # Claude Code (/v1/messages) and OpenCode (/v1/chat/completions).
+  # Claude Code (/v1/messages), OpenCode and pi (/v1/chat/completions).
   - name: messages-chat-gateway
     address: "127.0.0.1:8080"
     filter_chains: [claude-and-opencode]
@@ -231,12 +233,12 @@ that cannot share a chain with a top-level `load_balancer`, so everything on
 that listener would have to route through it — and the IRR buffers a
 sub-request response unless a filter selects streaming, which the native
 `/v1/messages` and `/v1/chat/completions` paths do not. Routing them through it
-would hold each turn's SSE until the turn finished, so Claude Code and OpenCode
-would render nothing until completion. Because every CLI configures its own
+would hold each turn's SSE until the turn finished, so Claude Code, OpenCode,
+and pi would render nothing until completion. Because every CLI configures its own
 base URL, the second port costs one line of client config.
 
-Point Claude Code and OpenCode at `http://127.0.0.1:8080` and Codex at
-`http://127.0.0.1:8081/v1`, then follow sections 3 to 5 unchanged with two
+Point Claude Code, OpenCode, and pi at `http://127.0.0.1:8080` and Codex at
+`http://127.0.0.1:8081/v1`, then follow sections 3 to 6 unchanged with two
 exceptions: Codex now sits behind `basic_auth` and must present the shared
 Basic credential rather than a Bearer key — see
 [Codex behind the gateway's Basic auth](#codex-behind-the-gateways-basic-auth) —
@@ -451,7 +453,7 @@ back.
 The native Codex example has no `basic_auth` filter, so the client credential
 above *is* the backend credential. Put Codex behind a gateway that
 authenticates clients — as the Claude examples do, and as the
-[all-in-one gateway](#serving-all-three-clients-from-one-gateway) does — and it
+[all-in-one gateway](#serving-all-four-clients-from-one-gateway) does — and it
 must present the Basic credential instead. Codex builds its provider headers
 from `http_headers` and `env_http_headers` independently of `env_key`, and
 applies the `env_key` bearer by *appending* `Authorization` rather than
@@ -944,6 +946,101 @@ send anything when a project-level config has pointed `baseURL` at another
 host. The `headers` map has no such check and sends the token wherever
 `baseURL` points.
 
+## 6. Connect pi
+
+These steps are verified against pi 1.4.0. Install that version from the
+[upstream release](https://github.com/earendil-works/pi/releases/tag/v1.4.0),
+or with `npm install -g @earendil-works/pi-coding-agent@1.4.0` (Node 22.19 or
+later), and check it with `pi --version`.
+
+pi reaches custom endpoints through providers declared in
+`~/.pi/agent/models.json`. It can speak several wire APIs; use
+`openai-completions`, which sends native Chat Completions to the same
+`/v1/chat/completions` route OpenCode uses. The native Claude configuration
+from section 2 forwards those requests to vLLM without translation,
+authenticates the client with Basic auth, and injects `VLLM_API_KEY` toward
+vLLM. Nothing changes on the Praxis side.
+
+Create `~/.pi/agent/models.json`, or merge the `praxis` provider into the one
+you have:
+
+```json
+{
+  "$schema": "https://pi.dev/schemas/models.schema.json",
+  "providers": {
+    "praxis": {
+      "name": "Praxis",
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "local-pi-client-key",
+      "headers": { "Authorization": "Basic ${PRAXIS_GATEWAY_BASIC_TOKEN}" },
+      "models": [
+        { "id": "qwen3-8b", "name": "Qwen3 8B", "contextWindow": 32768, "maxTokens": 8192 }
+      ]
+    }
+  }
+}
+```
+
+Replace `qwen3-8b` with the exact served name in `VLLM_MODEL` and adjust
+`contextWindow` and `maxTokens` to match your vLLM server.
+
+The `Authorization` header carries the gateway credential. Export the Basic
+token it reads, which is the base64 encoding of `gateway:<password>`:
+
+```console
+export PRAXIS_GATEWAY_BASIC_TOKEN="$(printf 'gateway:%s' "$GATEWAY_AUTH_PASSWORD" | base64)"
+```
+
+Then launch pi from that shell. pi does not need `VLLM_API_KEY`:
+
+```console
+pi --model "praxis/$VLLM_MODEL"
+```
+
+Notes on this configuration, verified against pi 1.4.0:
+
+- **`apiKey` is a placeholder, but it must be set.** With no `apiKey`, pi
+  reports `No API key found for praxis.` and sends nothing. The configured
+  `Authorization` header replaces the `Bearer` key pi would otherwise send, so
+  the placeholder never leaves the client.
+- **A missing token fails closed.** `${PRAXIS_GATEWAY_BASIC_TOKEN}` resolves at
+  request time. If the variable is unset, pi sends no request and reports
+  `Failed to resolve provider "praxis" header "Authorization" from environment
+  variable: PRAXIS_GATEWAY_BASIC_TOKEN`. Header values also accept a leading
+  `!command`, if you would rather read the token from a secret manager.
+- **No `compat` or `reasoning` settings are needed for vLLM.** With
+  `reasoning` left at its default of `false`, pi sends no reasoning or
+  thinking fields, and Qwen3 thinking stays off through the server flags in
+  section 1. Do not set `thinkingTokenBudgetField` for this setup.
+- **The token goes wherever `baseUrl` points.** Unlike the OpenCode plugins,
+  there is no destination check, so keep `models.json` pointed at your
+  gateway.
+
+#### Headless invocation
+
+`pi --print` drives a single turn non-interactively, which is what CI and
+scripts use:
+
+```console
+pi --print --mode json --offline --no-session --model "praxis/$VLLM_MODEL" -- "Summarize README.md" < /dev/null
+```
+
+- **Redirect stdin from `/dev/null`.** With stdin left open, `pi --print`
+  waits for end of input and sends nothing. Anything piped in is prepended to
+  the prompt.
+- **In `--mode json`, a failed turn still exits `0`.** A gateway `401` or an
+  unresolved header shows up only as `stopReason: "error"` with an
+  `errorMessage` on the final assistant `message_end` event. `--mode text`
+  exits `1` for the same failures. Scripts that use JSON mode must check the
+  stop reason, not the exit status.
+- pi needs no egress beyond Praxis; it completes normally in a loopback-only
+  network namespace. `--offline` turns off its startup network operations
+  anyway.
+- pi registers four tools (`read`, `bash`, `edit`, `write`) and runs them
+  without a permission prompt, including in `--print` mode. Run it in a
+  workspace you are willing to let the model change.
+
 ## Cleanup
 
 When finished, stop local Praxis and cancel the on-demand endpoint workflow:
@@ -954,7 +1051,7 @@ kill "$PRAXIS_PID"
 
 ## Troubleshooting
 
-- `401` from Praxis on the Claude or OpenCode path: verify the Basic
+- `401` from Praxis on the Claude, OpenCode, or pi path: verify the Basic
   authorization header and that the client's `GATEWAY_AUTH_PASSWORD` matches
   the gateway's password.
 - `opencode run` hangs after logging `init` and nothing reaches Praxis: stdin
@@ -985,9 +1082,17 @@ kill "$PRAXIS_PID"
 - OpenCode 2.x processes keep running after `opencode run` exits: the run
   started the shared background server. Pass `--standalone`, or stop the
   server with `opencode service stop`.
+- `pi --print` hangs and nothing reaches Praxis: stdin is still open. Redirect
+  it from `/dev/null`.
+- pi reports `No API key found for praxis.`: the `praxis` provider in
+  `~/.pi/agent/models.json` has no `apiKey`. Set the placeholder shown in
+  section 6; the `Authorization` header still carries the real credential.
+- pi reports `Failed to resolve provider "praxis" header "Authorization"` and
+  nothing reaches Praxis: `PRAXIS_GATEWAY_BASIC_TOKEN` is not exported in the
+  shell that launched pi.
 - `401` from vLLM: `VLLM_API_KEY` does not match the key passed to vLLM.
 - `401` from vLLM on the Codex listener only, in the
-  [all-in-one gateway](#serving-all-three-clients-from-one-gateway): the
+  [all-in-one gateway](#serving-all-four-clients-from-one-gateway): the
   `basic_auth` prefixed onto the Codex chain strips the client credential the
   example forwards, and no `credential_injection` inside the IRR `inference`
   step replaced it. Add the injection shown in section 2, after the step's
@@ -1073,7 +1178,7 @@ kill "$PRAXIS_PID"
   filter in place and terminate TLS in front of it — the shared Basic password
   is otherwise readable on the wire. A second listener, such as the Codex one
   in the
-  [all-in-one gateway](#serving-all-three-clients-from-one-gateway), needs the
+  [all-in-one gateway](#serving-all-four-clients-from-one-gateway), needs the
   same treatment plus its own `-p 8081:8081` under the published-port container
   path.
 - Claude startup probes may call `/v1/messages/count_tokens`. Native vLLM

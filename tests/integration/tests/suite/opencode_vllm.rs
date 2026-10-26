@@ -94,9 +94,22 @@ pub(super) const REASONING_LEAK_MARKERS: &[&str] = &["<think>", "</think>"];
 // Live gate
 // -----------------------------------------------------------------------------
 
+/// Names of the variables that gate one client's live lane.
+#[derive(Clone, Copy)]
+pub(super) struct LiveEnv<'a> {
+    /// Client name, for diagnostics.
+    pub(super) client: &'a str,
+    /// Path to the pinned client executable.
+    pub(super) bin: &'a str,
+    /// Optional Linux network namespace to launch the client in.
+    pub(super) netns: &'a str,
+    /// Demands a real live run rather than a silent skip.
+    pub(super) require_live: &'a str,
+}
+
 /// Resolved live environment for one acceptance run.
 pub(super) struct LiveConfig {
-    pub(super) opencode_bin: OsString,
+    pub(super) client_bin: OsString,
     vllm_authority: String,
     pub(super) model: String,
     listen_address: IpAddr,
@@ -119,20 +132,39 @@ impl LiveConfig {
     /// with this one — same backend, same namespace — and differs only in which
     /// pinned binary it launches.
     pub(super) fn from_env_for(bin_env: &str) -> Option<Self> {
-        let opencode_bin = std::env::var_os(bin_env).filter(|value| !value.is_empty());
+        Self::from_env_vars(&LiveEnv {
+            client: "OpenCode",
+            bin: bin_env,
+            netns: NETNS_ENV,
+            require_live: REQUIRE_LIVE_ENV,
+        })
+    }
+
+    /// Resolve the live environment from an explicit set of variable names.
+    ///
+    /// The pi lane in [`super::pi_vllm`] rides the same gateway config and the
+    /// same backend variables, but runs in its own job and namespace, so it
+    /// names its own executable, namespace, and require-live variables.
+    pub(super) fn from_env_vars(vars: &LiveEnv<'_>) -> Option<Self> {
+        let LiveEnv {
+            client,
+            bin: bin_env,
+            netns: netns_env,
+            require_live: require_live_env,
+        } = *vars;
+        let client_bin = std::env::var_os(bin_env).filter(|value| !value.is_empty());
         let base_url = non_empty_env(VLLM_BASE_URL_ENV);
         let model = non_empty_env(VLLM_MODEL_ENV);
         let token = non_empty_env(BACKEND_TOKEN_ENV);
 
-        let (Some(opencode_bin), Some(base_url), Some(model), Some(_token)) = (opencode_bin, base_url, model, token)
-        else {
+        let (Some(client_bin), Some(base_url), Some(model), Some(_token)) = (client_bin, base_url, model, token) else {
             assert!(
-                !env_is_truthy(REQUIRE_LIVE_ENV),
-                "{REQUIRE_LIVE_ENV} is set but a required variable is missing; set all of \
+                !env_is_truthy(require_live_env),
+                "{require_live_env} is set but a required variable is missing; set all of \
                  {bin_env}, {VLLM_BASE_URL_ENV}, {VLLM_MODEL_ENV}, and {BACKEND_TOKEN_ENV}"
             );
             eprintln!(
-                "skipping live OpenCode acceptance test; set {bin_env}, \
+                "skipping live {client} acceptance test; set {bin_env}, \
                  {VLLM_BASE_URL_ENV}, {VLLM_MODEL_ENV}, and {BACKEND_TOKEN_ENV} to run it"
             );
             return None;
@@ -147,13 +179,13 @@ impl LiveConfig {
             .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
 
         let config = Self {
-            opencode_bin,
+            client_bin,
             vllm_authority: authority_of(&base_url),
             model,
             listen_address,
-            netns: non_empty_env(NETNS_ENV),
+            netns: non_empty_env(netns_env),
         };
-        live_vllm::require_egress_isolation_if_demanded(config.netns.as_deref(), NETNS_ENV);
+        live_vllm::require_egress_isolation_if_demanded(config.netns.as_deref(), netns_env);
         Some(config)
     }
 }
@@ -193,7 +225,7 @@ async fn run_live(live: &LiveConfig, workspace: &Path, prompt: &str) -> Captured
     let home = TempDir::new().expect("temporary HOME should be creatable");
 
     launch(LaunchSpec {
-        bin: &live.opencode_bin,
+        bin: &live.client_bin,
         home: home.path(),
         workspace,
         base_url: &base_url,
@@ -367,7 +399,7 @@ fn live_config_patches_the_shipped_example() {
     // Exercises all three drift-guarded anchors against the real file, so an
     // example change breaks here rather than inside a nightly GPU run.
     let live = LiveConfig {
-        opencode_bin: OsString::from("/nonexistent/opencode"),
+        client_bin: OsString::from("/nonexistent/opencode"),
         vllm_authority: "10.201.0.3:8000".to_owned(),
         model: "qwen3-8b".to_owned(),
         listen_address: IpAddr::V4(Ipv4Addr::new(10, 201, 0, 1)),
