@@ -566,9 +566,23 @@ fn convert_assistant_message(
     Ok(())
 }
 
+/// Reject assistant content parts that Gemini cannot represent.
+///
+/// Kept separate from the mutation loop so the `type` discriminator is only
+/// borrowed for the check and never copied per part.
+fn validate_assistant_part(part: &Value) -> Result<(), String> {
+    match part.get("type").and_then(Value::as_str) {
+        Some("text") => Ok(()),
+        Some("refusal") => Err("assistant refusal cannot be translated to Vertex Gemini".to_owned()),
+        other => Err(format!(
+            "unsupported assistant content part type `{}`",
+            other.unwrap_or("<missing>")
+        )),
+    }
+}
+
 /// Convert string or array-form assistant content into Gemini text parts.
 #[expect(clippy::needless_pass_by_value, reason = "requires moving Option fields")]
-#[expect(clippy::too_many_lines, reason = "match arms and error mapping")]
 fn collect_assistant_content(parts: &mut Vec<Value>, content: Option<&mut Value>) -> Result<(), String> {
     match content {
         Some(Value::String(text)) => {
@@ -580,19 +594,11 @@ fn collect_assistant_content(parts: &mut Vec<Value>, content: Option<&mut Value>
         },
         Some(Value::Array(content_parts)) => {
             for part in content_parts.iter_mut() {
-                let part_type = part
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<missing>")
-                    .to_owned();
-                let text = match part_type.as_str() {
-                    "text" => part
-                        .get_mut("text")
-                        .ok_or("assistant text part is missing `text`")?
-                        .take(),
-                    "refusal" => return Err("assistant refusal cannot be translated to Vertex Gemini".to_owned()),
-                    _ => return Err(format!("unsupported assistant content part type `{part_type}`")),
-                };
+                validate_assistant_part(part)?;
+                let text = part
+                    .get_mut("text")
+                    .ok_or("assistant text part is missing `text`")?
+                    .take();
                 if text.as_str().is_some_and(|s| !s.is_empty()) {
                     let mut map = Map::new();
                     map.insert("text".to_owned(), text);
