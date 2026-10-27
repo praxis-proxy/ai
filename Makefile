@@ -56,8 +56,8 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit test-unit-apis test-unit-filters test-unit-proxy \
-	test-schema test-integration test-integration-experimental \
-	test-inference-fixtures test-inference-xtask bench-model-to-provider \
+	test-schema test-integration test-integration-core test-integration-experimental \
+	test-inference-fixtures test-inference-fixtures-core test-inference-xtask bench-model-to-provider \
 	test-store-features test-store-features-check test-store-features-clippy \
 	test-store-features-clippy-group test-store-features-test print-store-clippy-groups \
 	test-responses-features \
@@ -256,7 +256,9 @@ test-schema:
 # the harness refuses to build it from inside a test (see praxis_ai_bin in
 # tests/utils), because a nested cargo build inherits the outer run's
 # instrumentation and target-dir locks and can run for minutes.
-test-integration:
+test-integration: test-integration-core test-integration-experimental
+
+test-integration-core:
 	cargo build -p praxis-ai-proxy --bin praxis-ai --features openai-all,store-all
 	PRAXIS_AI_BIN=$(abspath $(or $(CARGO_TARGET_DIR),target)/debug/praxis-ai) \
 	cargo test -p praxis-tests-integration --features openai-all,store-all $(_NOCAPTURE)
@@ -273,7 +275,9 @@ test-integration-experimental:
 		examples::vertex_anthropic \
 		$(if $(V),--nocapture)
 
-test-inference-fixtures:
+test-inference-fixtures: test-inference-fixtures-core test-inference-xtask
+
+test-inference-fixtures-core:
 	cargo test -p praxis-test-utils --features openai-all,store-all,vertex-anthropic-filter $(_NOCAPTURE)
 	cargo test -p praxis-tests-integration --features openai-all,store-all,vertex-anthropic-filter --test suite inference_fixtures $(_NOCAPTURE)
 
@@ -939,18 +943,26 @@ help:
 	@echo "Test:"
 	@echo "  test                 run all tests"
 	@echo "  test-unit            unit tests (providers, filters, server)"
-	@echo "  test-store-features   check the lean and store builds and lint each feature group alone"
+	@echo "  test-store-features       run store checks, Clippy, and API tests"
+	@echo "  test-store-features-check       check store feature graphs and backend boundaries"
+	@echo "  test-store-features-clippy      lint each store feature group"
+	@echo "  test-store-features-clippy-group lint one group (GROUP=name)"
+	@echo "  test-store-features-test        run store API tests and TLS graph checks"
 	@echo "  test-responses-features  independent experimental gates and Responses-only SDK smoke tests"
 	@echo "  test-schema          schema validation tests"
-	@echo "  test-integration     integration tests"
-	@echo "  test-inference-fixtures  inference fixture and replay tests"
+	@echo "  test-integration          full integration suite (core + experimental)"
+	@echo "  test-integration-core     store-all integration suite"
+	@echo "  test-integration-experimental experimental-filter integration suite"
+	@echo "  test-inference-fixtures   inference fixtures, replay, and xtask tests"
+	@echo "  test-inference-xtask     inference fixture xtask tests"
 	@echo "  bench-model-to-provider  optimized mapped and fallback request-body timings"
 	@echo "  test-postgres-unit       postgres store unit tests (needs DATABASE_URL)"
 	@echo "  test-postgres-integration postgres store integration tests (needs container engine)"
 	@echo "  test-token-rate-limit-valkey-unit        token_rate_limit Valkey unit tests (needs TOKEN_RATE_LIMIT_VALKEY_URL)"
 	@echo "  test-token-rate-limit-valkey-integration token_rate_limit Valkey integration test (needs TOKEN_RATE_LIMIT_VALKEY_URL)"
 	@echo "  test-token-rate-limit-sentinel-integration Sentinel fixture smoke (needs SENTINEL_IMAGE; failover with SENTINEL_FAILOVER_BEFORE_COMMAND=1)"
-	@echo "  test-environment     llm-d ext_proc environment tests"
+	@echo "  test-environment          llm-d ext_proc environment tests"
+	@echo "  test-environment-suite    llmd-ext-proc integration suite"
 	@echo "  openai-conformance   compare registered API areas with OpenAI's OpenAPI spec"
 	@echo "  check-openai-conformance-reference  verify the pinned complete OpenAI reference"
 	@echo "  test-responses-conformance  Run OpenResponses suite against the translation filter (needs bun, uv, vLLM)"

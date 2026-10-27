@@ -243,8 +243,10 @@ jobs:
           # vllm-responses and vllm-live-cpu build the identical
           # standard,openai-all,store-sqlite proxy, but had no cache-suffix, so
           # they collided on the default key and effectively built cold (~20m).
-          # Share one stable key so the build is warm (~14m). This target/ cache
-          # is the one accepted new family under the hard 10 GB cap.
+          # Share one stable key so later runs can reuse this build (~14m was the
+          # prior warm-build estimate). The first run after the profile/key
+          # change is cold; confirm reuse on a follow-up run. This target cache
+          # is subject to the repository's 10 GB Actions cache eviction limit.
           cache-suffix: vllm-cpu-cargo
 
       - name: Install uv

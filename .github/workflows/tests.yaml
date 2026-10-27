@@ -135,7 +135,7 @@ jobs:
 
   test-filters:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -203,7 +203,7 @@ jobs:
   # leaks across the graphs. Keeps the store-features-cargo cache.
   store-features:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -243,7 +243,11 @@ jobs:
         id: list
         run: |
           groups="$(make --no-print-directory print-store-clippy-groups)"
-          json="$(printf '%s' "$groups" | tr ' ' '\n' | grep -v '^$' | jq -R . | jq -s -c .)"
+          if [ -z "${groups//[[:space:]]/}" ]; then
+            echo "::error::STORE_FEATURE_CLIPPY_GROUPS is empty; no Clippy matrix can be created." >&2
+            exit 1
+          fi
+          json="$(printf '%s' "$groups" | tr ' ' '\n' | jq -R 'select(length > 0)' | jq -s -c .)"
           echo "groups=$json" >> "$GITHUB_OUTPUT"
 
   store-features-clippy:
