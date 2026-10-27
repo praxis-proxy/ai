@@ -180,6 +180,52 @@ fn gemini_large_request() -> Vec<u8> {
     .unwrap()
 }
 
+/// Build a Gemini request with a large system instruction text.
+fn gemini_large_system_request() -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "model": "gemini-1.5-pro",
+        "messages": [
+            {"role": "system", "content": "s".repeat(512 * 1024)},
+            {"role": "user", "content": "go"}
+        ]
+    }))
+    .unwrap()
+}
+
+/// Build a Gemini request with a large parsed tool-call argument object.
+fn gemini_large_arguments_request() -> Vec<u8> {
+    let arguments = json!({"payload": "a".repeat(512 * 1024)}).to_string();
+    serde_json::to_vec(&json!({
+        "model": "gemini-1.5-pro",
+        "messages": [
+            {"role": "user", "content": "call it"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_big", "type": "function",
+                 "function": {"name": "lookup", "arguments": arguments}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_big", "content": "{}"}
+        ]
+    }))
+    .unwrap()
+}
+
+/// Build a Gemini request carrying a large nested thought signature.
+fn gemini_large_signature_request() -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "model": "gemini-1.5-pro",
+        "messages": [
+            {"role": "user", "content": "call it"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_sig", "type": "function",
+                 "function": {"name": "lookup", "arguments": "{}"},
+                 "extra_content": {"google": {"thought_signature": {"nested": "g".repeat(512 * 1024)}}}}
+            ]},
+            {"role": "tool", "name": "lookup", "content": "{}"}
+        ]
+    }))
+    .unwrap()
+}
+
 /// Report allocator activity for one translation fixture.
 fn report_allocation(label: &str, translation: impl FnOnce()) {
     let allocations = allocation_counter::measure(translation);
@@ -245,9 +291,32 @@ fn gemini_large_fields(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark the ownership boundaries the issue names: system text, parsed
+/// tool-call arguments, and nested thought signatures.
+fn gemini_owned_boundaries(c: &mut Criterion) {
+    let fixtures = [
+        ("gemini_large_system", gemini_large_system_request()),
+        ("gemini_large_arguments", gemini_large_arguments_request()),
+        ("gemini_large_signature", gemini_large_signature_request()),
+    ];
+    let mut group = c.benchmark_group("gemini_owned_boundaries");
+    group.sample_size(30);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+    for (label, body) in &fixtures {
+        translate_gemini(body);
+        report_allocation(label, || translate_gemini(body));
+        group.bench_with_input(BenchmarkId::from_parameter(label), body, |b, body| {
+            b.iter(|| translate_gemini(body));
+        });
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bedrock_large_tools, gemini_lookup_scaling, gemini_large_fields
+    targets = bedrock_large_tools, gemini_lookup_scaling, gemini_large_fields,
+        gemini_owned_boundaries
 }
 criterion_main!(benches);
