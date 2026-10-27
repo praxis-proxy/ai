@@ -20,7 +20,7 @@ fn install_document_budget(ctx: &mut HttpFilterContext<'_>, body: &serde_json::V
     let policy =
         AgenticBudgetPolicy::from_config(&serde_yaml::from_str(&format!("max_retained_bytes: {limit}")).unwrap())
             .unwrap();
-    let mut state = ResponsesState::from_request_body(body.clone());
+    let mut state = ResponsesState::from_managed_request_body(body.clone());
     state.simple_budget = Some(SimpleBudget::new_with_store(limit, input_charge(&raw).unwrap(), false).unwrap());
     ctx.extensions.insert(policy);
     ctx.extensions.insert(state);
@@ -92,6 +92,36 @@ async fn budgeted_document_extract_reserves_rewritten_owners() {
     assert!(
         state.simple_budget.unwrap().remaining_bytes().unwrap() < initial,
         "rewritten document owners must consume request headroom"
+    );
+}
+
+#[tokio::test]
+async fn store_false_budgeted_document_extract_skips_absent_persistence_history() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    set_responses_metadata(&mut ctx);
+    let mut body_json = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_file", "filename": "notes.txt", "file_data": text_file_data("hello")}
+        ]}
+    ]));
+    body_json["store"] = serde_json::Value::Bool(false);
+    install_document_budget(&mut ctx, &body_json, 1_048_576);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "document extraction must not require a persistence-only history when store is false"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(!state.captures_persistence_history());
+    assert!(state.persisted_messages.is_empty());
+    assert_eq!(state.messages[0]["content"][0]["type"], "input_text");
+    assert_eq!(
+        state.input[0]["content"][0]["type"], "input_file",
+        "the original input snapshot remains available"
     );
 }
 
@@ -876,10 +906,9 @@ async fn sync_state_updates_responses_state() {
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
 
-    let state_input = state.request_body.get("input").and_then(|v| v.as_array()).unwrap();
-    assert_eq!(
-        state_input[0]["content"][0]["type"], "input_text",
-        "state.request_body should have extracted input_text"
+    assert!(
+        state.request_body.get("input").is_none(),
+        "extracted input is synced into histories, not duplicated in request_body (#1618)"
     );
 
     assert_eq!(

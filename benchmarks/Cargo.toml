@@ -11,12 +11,14 @@ publish = false
 
 [features]
 store-all = ["praxis-ai-apis/store-all"]
+responses-state = ["praxis-ai-apis/bench-responses-state"]
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }
+allocation-counter = { workspace = true }
 praxis-ai-apis = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true, features = ["postgres", "sqlite", "tls-native-tls"] }
@@ -28,6 +30,12 @@ name = "compression"
 path = "store/compression.rs"
 harness = false
 required-features = ["store-all"]
+
+[[bench]]
+name = "responses_state"
+path = "responses/state_initialization.rs"
+harness = false
+required-features = ["responses-state"]
 
 [[bench]]
 name = "gemini_translation"

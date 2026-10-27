@@ -23,11 +23,11 @@ use bytes::Bytes;
 #[cfg(any(test, feature = "openai-agentic-loop"))]
 use praxis_filter::{FilterAction, body::MAX_JSON_BODY_BYTES};
 
-use super::history::MessageHistory;
 #[cfg(feature = "openai-mcp-tools")]
 use super::mcp_classify::ApprovalFloor;
 #[cfg(any(test, feature = "openai-agentic-loop"))]
 use super::{bounded_json_size, error::responses_error_rejection, file_search_dispatch::citations::annotate_response};
+use super::{history::MessageHistory, request_input::InputForm};
 
 /// Internal persisted field identifying a Praxis-generated compaction item.
 ///
@@ -491,7 +491,22 @@ pub(crate) struct ResponsesState {
     /// Preserved as-is so downstream filters can inspect what the
     /// client actually sent, independent of conversation history
     /// resolved by `rehydrate`.
-    pub input: Vec<serde_json::Value>,
+    ///
+    /// Shares each item's `Arc` payload with [`Self::messages`] at construction,
+    /// so this immutable snapshot costs only a vector of handles rather than a
+    /// second deep copy of the input (#1618). Mutating `messages` detaches only
+    /// the edited item, leaving this view pointing at the original payload.
+    pub input: MessageHistory,
+
+    /// Original JSON shape of the request's `input` (missing/null/string/object/
+    /// array), kept so the current-request view reproduces the client's form
+    /// without retaining a second decoded copy in [`Self::request_body`] (#1618).
+    ///
+    /// Response synthesis echoes the client's `input` back onto the Responses
+    /// resource and MCP tool discovery re-serializes the current request, so the
+    /// original shape is tracked whenever the Responses API is built; input is
+    /// stripped from `request_body` regardless of features.
+    pub input_form: InputForm,
 
     /// Current agentic loop iteration (0-indexed). Incremented by
     /// `openai_agentic_loop` at the start of each new inference round.
@@ -646,6 +661,12 @@ pub(crate) struct ResponsesState {
     /// inference.
     pub persisted_messages: MessageHistory,
 
+    /// Whether this request needs an independently maintained history for a
+    /// future durable response record. `store:false` disables that consumer;
+    /// request-scoped `input` and `messages` remain available for translation,
+    /// tools, streaming, and conversation append-back.
+    pub(crate) persistence_history_enabled: bool,
+
     /// Server-owned pending MCP approvals emitted during this request.
     ///
     /// Populated by `mcp_dispatch` when it pauses on an
@@ -714,7 +735,13 @@ pub(crate) struct ResponsesState {
     /// metadata, so translated responses must also be able to read the ID here.
     pub response_id: Option<String>,
 
-    /// Parsed request body as received from the client.
+    /// Parsed request *parameters* as received from the client.
+    ///
+    /// The `input` member is moved out at construction into [`Self::input`] /
+    /// `input_form` so the payload is decoded only once (#1618); this
+    /// object holds everything else (model, tools, reasoning, store, etc.). Use
+    /// [`Self::set_request_params`] rather than assigning this field directly so a
+    /// later filter cannot reintroduce a duplicate `input` copy.
     pub request_body: serde_json::Value,
 
     /// What the request itself specified for `reasoning`.
@@ -1154,7 +1181,8 @@ impl Default for ResponsesState {
             local_stream_terminal_emitted: false,
             current_round_output_start: None,
             history_rehydrated: false,
-            input: Vec::new(),
+            input: MessageHistory::default(),
+            input_form: InputForm::default(),
             iteration: 0,
             deferred_mcp: Vec::new(),
             #[cfg(feature = "openai-mcp-tools")]
@@ -1182,6 +1210,7 @@ impl Default for ResponsesState {
             provider_compaction_ids: HashSet::new(),
             parallel_tool_calls: true,
             persisted_messages: MessageHistory::default(),
+            persistence_history_enabled: true,
             #[cfg(feature = "store")]
             pending_approvals: Vec::new(),
             store_persist_armed: false,
@@ -1337,33 +1366,76 @@ impl ResponsesState {
     }
 
     /// Create initial state from a parsed request body.
-    #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
+    #[cfg(test)]
     pub(crate) fn from_request_body(body: serde_json::Value) -> Self {
-        let messages = normalize_input(&body);
-        let input = messages.clone();
-        let messages = MessageHistory::from(messages);
-        let persisted_messages = messages.clone();
-        let provider_compaction_ids = Self::provider_compaction_ids_from_messages(&messages);
-        let tool_choice = body
-            .get("tool_choice")
-            .filter(|v| !v.is_null())
-            .cloned()
-            .unwrap_or_else(|| serde_json::Value::String("auto".to_owned()));
+        Self::from_request_body_with_persistence(body, true)
+    }
 
+    /// Create state using the request's persistence eligibility.
+    ///
+    /// `store` defaults to true under the Responses API contract. A conversation
+    /// can still append its request input and completed response when `store` is
+    /// false; that path does not consume this durable rehydration history.
+    pub(crate) fn from_managed_request_body(body: serde_json::Value) -> Self {
+        let capture_persistence = Self::request_captures_persistence_history(&body);
+        Self::from_request_body_with_persistence(body, capture_persistence)
+    }
+
+    /// Whether the Responses request contract requires a durable rehydration
+    /// history. Omitted or malformed `store` values conservatively retain it.
+    pub(crate) fn request_captures_persistence_history(body: &serde_json::Value) -> bool {
+        body.get("store").and_then(serde_json::Value::as_bool) != Some(false)
+    }
+
+    /// Create initial state with explicit persistence-history capture.
+    #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
+    fn from_request_body_with_persistence(mut body: serde_json::Value, capture_persistence: bool) -> Self {
+        // Move `input` out of the parsed parameters so it is decoded exactly once
+        // (#1618). Supported shapes (null/string/object/array) normalize into
+        // shared items and leave `request_body` with parameters only; an
+        // unsupported scalar can neither be normalized nor reconstructed, so it
+        // stays in the parameters for existing validators (e.g. Chat-completions
+        // translation) to reject. Cloning `MessageHistory` shares each item's
+        // `Arc` payload, so the immutable snapshot and persistence view never
+        // deep-copy the input; only `messages` detaches an item on later mutation.
+        let input_form = InputForm::classify(body.get("input"));
+        let messages = if input_is_normalizable(body.get("input")) {
+            let value = body
+                .as_object_mut()
+                .and_then(|object| object.remove("input"))
+                .unwrap_or(serde_json::Value::Null);
+            MessageHistory::from(normalize_input_owned(value))
+        } else {
+            MessageHistory::default()
+        };
+        let input = messages.clone();
+        // The persistence-only handle vector is absent for store:false. Keep the
+        // original input and backend history alive: tools, translation, streaming,
+        // and conversation append-back still consume those request-scoped views.
+        let persisted_messages = if capture_persistence {
+            messages.clone()
+        } else {
+            MessageHistory::default()
+        };
+        let provider_compaction_ids = Self::provider_compaction_ids_from_messages(&messages);
+        let tool_choice = request_tool_choice_or_auto(&body);
         let tools = extract_array_field(&body, "tools");
         Self {
             context_management: body.get("context_management").cloned(),
             conversation: body.get("conversation").cloned(),
             include: extract_string_array(&body, "include"),
             input,
+            input_form,
             max_tool_calls: extract_u32(&body, "max_tool_calls"),
             messages,
             provider_history_len: 0,
             provider_compaction_ids,
             parallel_tool_calls: extract_bool_or(&body, "parallel_tool_calls", true),
             persisted_messages,
+            persistence_history_enabled: capture_persistence,
             previous_response_id: extract_string(&body, "previous_response_id"),
             request_reasoning: request_reasoning_presence(&body),
+            // `input` was removed above; `request_body` now holds parameters only.
             request_body: body,
             tool_choice,
             tools,
@@ -1400,6 +1472,23 @@ impl ResponsesState {
         }
     }
 
+    /// Store request parameters, dropping any `input` member so the parameter
+    /// object never duplicates the shared current input (#1618).
+    ///
+    /// Filters that rewrite the body (file/document resolution, MCP tool
+    /// expansion) call this instead of assigning [`Self::request_body`] directly;
+    /// the current input remains owned by [`Self::input`] / `input_form`.
+    pub(crate) fn set_request_params(&mut self, mut params: serde_json::Value) {
+        // Strip only a normalizable `input`; an unsupported scalar is left in place
+        // (as in `from_request_body`) so existing validators still reject it (#1618).
+        if input_is_normalizable(params.get("input"))
+            && let Some(object) = params.as_object_mut()
+        {
+            object.remove("input");
+        }
+        self.request_body = params;
+    }
+
     /// Require the proxy to serialize provider-visible request state.
     pub(crate) fn mark_request_body_for_rebuild(&mut self) {
         self.request_body_rebuild = RequestBodyRebuild::Required;
@@ -1421,10 +1510,13 @@ impl ResponsesState {
     /// lockstep so storage assembly can drop the later wholesale append of the
     /// same item without guessing by value.
     #[cfg(feature = "openai-agentic-loop")]
-    pub(crate) fn persist_collected_output(&mut self, accumulated_index: usize, item: serde_json::Value) {
+    pub(crate) fn persist_collected_output(&mut self, accumulated_index: usize, item: &serde_json::Value) {
+        if !self.persistence_history_enabled {
+            return;
+        }
         self.collected_output_provenance
             .push((accumulated_index, self.persisted_messages.len()));
-        self.persisted_messages.push(item);
+        self.persisted_messages.push(item.clone());
     }
 
     /// Arc-sharing variant of [`Self::persist_collected_output`]: record the same
@@ -1437,6 +1529,9 @@ impl ResponsesState {
         accumulated_index: usize,
         item: std::sync::Arc<serde_json::Value>,
     ) {
+        if !self.persistence_history_enabled {
+            return;
+        }
         self.collected_output_provenance
             .push((accumulated_index, self.persisted_messages.len()));
         self.persisted_messages.push_shared(item);
@@ -1447,12 +1542,48 @@ impl ResponsesState {
     /// lengths captured when the round began collecting.
     #[cfg(feature = "openai-agentic-loop")]
     pub(crate) fn record_collected_round(&mut self, output_start: usize, persisted_start: usize) {
+        if !self.persistence_history_enabled {
+            return;
+        }
         self.collected_rounds.push(CollectedRound {
             output_start,
             output_end: self.accumulated_output.len(),
             persisted_start,
             persisted_end: self.persisted_messages.len(),
         });
+    }
+
+    /// Whether this exchange retains a durable history for a later store write.
+    pub(crate) fn captures_persistence_history(&self) -> bool {
+        self.persistence_history_enabled
+    }
+
+    /// Borrow the durable history only when the request can persist it.
+    pub(crate) fn persisted_messages_mut(&mut self) -> Option<&mut MessageHistory> {
+        self.persistence_history_enabled.then_some(&mut self.persisted_messages)
+    }
+
+    /// Append a persistence-only item when durable history capture is enabled.
+    #[cfg(any(feature = "openai-mcp-tools", test))]
+    pub(crate) fn push_persisted_message(&mut self, item: serde_json::Value) {
+        if self.persistence_history_enabled {
+            self.persisted_messages.push(item);
+        }
+    }
+
+    /// Append persistence-only items when durable history capture is enabled.
+    pub(crate) fn extend_persisted_messages(&mut self, items: impl IntoIterator<Item = serde_json::Value>) {
+        if self.persistence_history_enabled {
+            self.persisted_messages.extend(items);
+        }
+    }
+
+    /// Prepend stored history when this request will produce a durable record.
+    #[cfg(feature = "store")]
+    pub(crate) fn prepend_persisted_messages(&mut self, history: MessageHistory) {
+        if self.persistence_history_enabled {
+            self.persisted_messages.prepend_shared(history);
+        }
     }
 
     /// Borrow the public output owned by [`Self::response_object`].
@@ -1753,20 +1884,22 @@ pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> 
         .any(|admitted| admitted)
 }
 
-/// Normalize the `input` field into a message array.
+/// Whether an `input` value normalizes into message items, and is therefore moved
+/// out of `request_body` at construction.
 ///
-/// The Responses API `input` can be a string (single user message),
-/// a single item object, or an array of items. Normalizes all three
-/// forms to a `Vec<Value>`.
-fn normalize_input(body: &serde_json::Value) -> Vec<serde_json::Value> {
-    normalize_input_value(body.get("input"))
-}
-
-/// Normalize one Responses API `input` value into a message array.
-pub(crate) fn normalize_input_value(input: Option<&serde_json::Value>) -> Vec<serde_json::Value> {
-    input
-        .map(|input| normalize_input_owned(input.clone()))
-        .unwrap_or_default()
+/// Unsupported scalars (number/bool) return `false`: they cannot be normalized or
+/// reconstructed, so they stay in the parameter object for existing validators to
+/// reject, preserving prior behavior (#1618).
+fn input_is_normalizable(input: Option<&serde_json::Value>) -> bool {
+    matches!(
+        input,
+        Some(
+            serde_json::Value::Null
+                | serde_json::Value::String(_)
+                | serde_json::Value::Object(_)
+                | serde_json::Value::Array(_)
+        )
+    )
 }
 
 /// Normalize an owned `input` value without cloning array or object items.
@@ -1783,6 +1916,14 @@ pub(crate) fn normalize_input_owned(input: serde_json::Value) -> Vec<serde_json:
         },
         _ => Vec::new(),
     }
+}
+
+/// Resolve the request's `tool_choice`, defaulting to `"auto"` when absent or null.
+fn request_tool_choice_or_auto(body: &serde_json::Value) -> serde_json::Value {
+    body.get("tool_choice")
+        .filter(|v| !v.is_null())
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::String("auto".to_owned()))
 }
 
 /// Extract a JSON array field by name, defaulting to empty.
@@ -1922,6 +2063,180 @@ mod tests {
         assert_eq!(state.persisted_messages, state.input);
     }
 
+    /// Two-item body shared by the input-ownership tests below.
+    fn two_item_state() -> ResponsesState {
+        ResponsesState::from_request_body(json!({
+            "model": "gpt-4o",
+            "input": [
+                {"type": "message", "role": "user", "content": "first"},
+                {"type": "message", "role": "user", "content": "second"}
+            ]
+        }))
+    }
+
+    #[test]
+    fn from_request_body_shares_input_payloads_with_histories() {
+        // The immutable input snapshot shares each item's Arc payload with both
+        // the backend and persistence histories, so no item is deep-copied at
+        // construction (#1618).
+        let state = two_item_state();
+        assert!(
+            state.input.shares_item_with(0, &state.messages, 0),
+            "shares item 0 with messages"
+        );
+        assert!(
+            state.input.shares_item_with(1, &state.messages, 1),
+            "shares item 1 with messages"
+        );
+        assert!(
+            state.input.shares_item_with(0, &state.persisted_messages, 0),
+            "shares item 0 with persisted_messages"
+        );
+    }
+
+    #[test]
+    fn store_false_keeps_working_input_and_conversation_append_back_data() {
+        let input = json!([{"type": "message", "role": "user", "content": "hello"}]);
+        let mut state = ResponsesState::from_managed_request_body(json!({
+            "model": "gpt-4o",
+            "store": false,
+            "conversation": "conv_123",
+            "input": input,
+        }));
+
+        assert!(!state.captures_persistence_history());
+        assert!(state.persisted_messages.is_empty());
+        assert_eq!(
+            state.input, state.messages,
+            "the backend working history remains available"
+        );
+        assert_eq!(state.conversation, Some(json!("conv_123")));
+        assert_eq!(
+            super::super::request_input::input_echo_value(&state),
+            Some(input),
+            "conversation append-back still has the original client input"
+        );
+
+        state.push_persisted_message(json!({"type": "private"}));
+        assert!(
+            state.persisted_messages.is_empty(),
+            "disabled capture must stay disabled"
+        );
+    }
+
+    #[test]
+    fn messages_mutation_detaches_only_the_edited_input_item() {
+        let mut state = two_item_state();
+        state.messages[0]["content"] = json!("changed");
+        assert!(
+            !state.input.shares_item_with(0, &state.messages, 0),
+            "the edited message detaches from the input snapshot"
+        );
+        assert_eq!(
+            state.input[0]["content"], "first",
+            "the input snapshot keeps the original payload"
+        );
+        assert!(
+            state.input.shares_item_with(1, &state.messages, 1),
+            "an untouched item stays shared after an unrelated edit"
+        );
+    }
+
+    #[test]
+    fn from_request_body_input_snapshot_shares_large_text_without_deep_copy() {
+        // Prepare both representations outside the measured closures so only the
+        // input-snapshot clone is measured, never the parse (#1618 step 2).
+        let large = "x".repeat(200_000);
+        let body = json!({"model": "gpt-4o", "input": large});
+        let normalized = normalize_input_owned(body.get("input").cloned().unwrap_or(serde_json::Value::Null));
+        let history = MessageHistory::from(normalized.clone());
+
+        // Legacy ownership kept a second *deep* copy of the normalized input.
+        let legacy = allocation_counter::measure(|| {
+            std::hint::black_box(normalized.clone());
+        });
+        // The new snapshot clones only Arc handles.
+        let shared = allocation_counter::measure(|| {
+            std::hint::black_box(history.clone());
+        });
+
+        assert!(
+            legacy.bytes_total >= 200_000,
+            "legacy input snapshot deep-copies the 200 KiB text, allocated {} bytes",
+            legacy.bytes_total
+        );
+        assert!(
+            shared.bytes_total < legacy.bytes_total,
+            "shared input snapshot must not deep-copy the text: shared={} bytes, legacy={} bytes",
+            shared.bytes_total,
+            legacy.bytes_total
+        );
+    }
+
+    #[test]
+    fn from_request_body_input_snapshot_shares_many_small_messages_without_deep_copy() {
+        // Many small objects: the shape the issue calls out as amplifying most.
+        let items: Vec<_> = (0..2_000)
+            .map(|i| json!({"type": "message", "role": "user", "content": format!("m{i}")}))
+            .collect();
+        let body = json!({"model": "gpt-4o", "input": items});
+        let normalized = normalize_input_owned(body.get("input").cloned().unwrap_or(serde_json::Value::Null));
+        let history = MessageHistory::from(normalized.clone());
+
+        let legacy = allocation_counter::measure(|| {
+            std::hint::black_box(normalized.clone());
+        });
+        let shared = allocation_counter::measure(|| {
+            std::hint::black_box(history.clone());
+        });
+
+        assert!(
+            legacy.count_total >= 2_000,
+            "legacy input snapshot allocates per item, made {} allocations",
+            legacy.count_total
+        );
+        assert!(
+            shared.bytes_total < legacy.bytes_total,
+            "shared input snapshot must not deep-copy each item: shared={} bytes, legacy={} bytes",
+            shared.bytes_total,
+            legacy.bytes_total
+        );
+        assert!(
+            shared.count_total < legacy.count_total,
+            "shared input snapshot allocates far fewer times: shared={}, legacy={}",
+            shared.count_total,
+            legacy.count_total
+        );
+    }
+
+    #[test]
+    fn from_request_body_does_not_deep_copy_input_payload_through_init() {
+        // Measure the whole initialization, not just the snapshot clone: moving
+        // input out of the parsed body and sharing it across input, messages, and
+        // persisted_messages must never deep-copy the payload (#1618). Init cost is
+        // therefore independent of payload size, so a 200 KiB payload allocates no
+        // more than a tiny one. Bodies are built outside the measured closures so
+        // only the init work is attributed.
+        let make_body =
+            |payload: usize| json!({"model": "gpt-4o", "input": [{"role": "user", "content": "x".repeat(payload)}]});
+        let small_body = make_body(32);
+        let large_body = make_body(200_000);
+
+        let small = allocation_counter::measure(|| {
+            std::hint::black_box(ResponsesState::from_request_body(std::hint::black_box(small_body)));
+        });
+        let large = allocation_counter::measure(|| {
+            std::hint::black_box(ResponsesState::from_request_body(std::hint::black_box(large_body)));
+        });
+
+        assert!(
+            large.bytes_total < small.bytes_total + 50_000,
+            "init must not deep-copy the 200 KiB payload across the three histories: small={} bytes, large={} bytes",
+            small.bytes_total,
+            large.bytes_total
+        );
+    }
+
     #[test]
     fn from_request_body_empty_input() {
         let body = json!({"model": "gpt-4o"});
@@ -2004,10 +2319,37 @@ mod tests {
     }
 
     #[test]
-    fn request_body_is_preserved() {
+    fn request_body_retains_parameters_without_input() {
         let body = json!({"model": "gpt-4o", "input": "hello", "temperature": 0.7});
-        let state = ResponsesState::from_request_body(body.clone());
-        assert_eq!(state.request_body, body, "original request body should be preserved");
+        let state = ResponsesState::from_request_body(body);
+        assert_eq!(
+            state.request_body,
+            json!({"model": "gpt-4o", "temperature": 0.7}),
+            "request_body keeps parameters only; input is moved out of the parse (#1618)"
+        );
+        assert!(
+            state.request_body.get("input").is_none(),
+            "input must not be duplicated inside request_body"
+        );
+        assert_eq!(state.input[0]["content"], "hello", "the input is owned by state.input");
+    }
+
+    #[test]
+    fn set_request_params_strips_normalizable_input_but_keeps_scalar() {
+        let mut state = ResponsesState::default();
+        state.set_request_params(json!({"model": "m", "input": [{"role": "user", "content": "hi"}]}));
+        assert!(
+            state.request_body.get("input").is_none(),
+            "a normalizable input is stripped from the parameters"
+        );
+
+        let mut state = ResponsesState::default();
+        state.set_request_params(json!({"model": "m", "input": 42}));
+        assert_eq!(
+            state.request_body.get("input"),
+            Some(&json!(42)),
+            "an unsupported scalar stays in the parameters so validators still reject it (#1618)"
+        );
     }
 
     #[test]

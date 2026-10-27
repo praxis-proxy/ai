@@ -70,6 +70,92 @@ fn replay_shares_canonical_items_and_copies_only_legacy_normalization() {
     }
 }
 
+/// Compare the pre-#1618 ownership path with managed initialization, rehydration,
+/// and response-store input capture. Request parsing is prepared outside the
+/// measured closures, matching the managed filter's already-parsed input.
+fn compare_rehydrated_capture_allocations(body: Value) -> (u64, u64, u64, u64) {
+    let raw = serde_json::to_vec(&body).expect("serialize request fixture");
+    let stored = vec![json!({"type": "message", "role": "assistant", "content": "previous"})];
+    let legacy_body = body.clone();
+    let current_body = body;
+    let legacy_stored = stored.clone();
+    let current_stored = stored;
+    let legacy_raw = raw;
+
+    let legacy = allocation_counter::measure(|| {
+        super::super::rehydrate_benchmark::legacy(legacy_body, legacy_stored, &legacy_raw)
+            .expect("request fixture serialized as valid JSON");
+    });
+    let current = allocation_counter::measure(|| {
+        super::super::rehydrate_benchmark::current(current_body, current_stored);
+    });
+    (
+        legacy.bytes_total,
+        legacy.count_total,
+        current.bytes_total,
+        current.count_total,
+    )
+}
+
+#[test]
+fn store_false_rehydrates_working_history_without_persistence_capture() {
+    let state = build_state(
+        json!({
+            "model": "gpt-4o",
+            "previous_response_id": "resp_previous",
+            "store": false,
+            "input": "next",
+        }),
+        vec![json!({"type": "message", "role": "assistant", "content": "previous"})],
+        vec![],
+        None,
+    );
+
+    assert!(state.history_rehydrated);
+    assert_eq!(
+        state.messages.len(),
+        2,
+        "rehydrated context remains available to inference"
+    );
+    assert_eq!(state.messages[0]["content"], "previous");
+    assert_eq!(state.messages[1]["content"], "next");
+    assert!(
+        state.persisted_messages.is_empty(),
+        "store:false must not retain durable history"
+    );
+}
+
+#[test]
+fn managed_rehydrate_and_store_capture_reduce_large_text_allocations() {
+    let body = json!({
+        "model": "gpt-4o",
+        "previous_response_id": "resp_previous",
+        "input": "x".repeat(200_000),
+    });
+    let (legacy_bytes, legacy_count, current_bytes, current_count) = compare_rehydrated_capture_allocations(body);
+    assert!(
+        current_bytes < legacy_bytes,
+        "complete large-text path should allocate less: legacy={legacy_bytes} bytes/{legacy_count} allocations, current={current_bytes} bytes/{current_count} allocations"
+    );
+}
+
+#[test]
+fn managed_rehydrate_and_store_capture_reduce_many_small_item_allocations() {
+    let input = (0..2_000)
+        .map(|index| json!({"type": "message", "role": "user", "content": format!("message-{index}")}))
+        .collect::<Vec<_>>();
+    let body = json!({
+        "model": "gpt-4o",
+        "previous_response_id": "resp_previous",
+        "input": input,
+    });
+    let (legacy_bytes, legacy_count, current_bytes, current_count) = compare_rehydrated_capture_allocations(body);
+    assert!(
+        current_bytes < legacy_bytes && current_count < legacy_count,
+        "complete many-item path should allocate less: legacy={legacy_bytes} bytes/{legacy_count} allocations, current={current_bytes} bytes/{current_count} allocations"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // from_config
 // -----------------------------------------------------------------------------
@@ -234,6 +320,42 @@ async fn passthrough_when_previous_response_id_is_null() {
     );
 }
 
+#[tokio::test]
+async fn skips_rehydration_when_history_already_restored() {
+    // #1618 reuse path: under iterative re-entry the same already-rehydrated state
+    // is carried forward. Re-running must not merge the stored replay again, or it
+    // duplicates backend input and persisted history.
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "turn",
+        "previous_response_id": "resp_prev"
+    }));
+    state.history_rehydrated = true;
+    state.messages = vec![json!({"role": "user", "content": "already restored"})].into();
+    let messages_before = state.messages.len();
+    ctx.extensions.insert(state);
+
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"turn","previous_response_id":"resp_prev"}"#,
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "an already-rehydrated state must release without re-merging history"
+    );
+    assert_eq!(
+        ctx.extensions.get::<ResponsesState>().unwrap().messages.len(),
+        messages_before,
+        "history must not be duplicated on re-entry"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Validation + Metadata
 // -----------------------------------------------------------------------------
@@ -288,6 +410,55 @@ async fn validates_previous_response_and_sets_metadata() {
         state.messages[2]["content"], "What next?",
         "current input should be last"
     );
+    assert_eq!(state.response_id.as_deref(), Some("resp_current"));
+}
+
+#[tokio::test]
+async fn reuses_existing_state_instead_of_reparsing() {
+    // #1618: when a managed owner already decoded the request into ResponsesState,
+    // rehydration merges stored history into that state rather than re-parsing the
+    // body. A sentinel field the parse path never sets must survive, proving reuse.
+    let messages = json!([
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi there"}
+    ]);
+    let store = MockStore::with_completed_response("resp_prev", json!("Hello"), messages);
+    let registry = setup_registry(store);
+
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("responses.response_id", "resp_current");
+    let original = r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_prev"}"#;
+
+    // Simulate the managed owner having built state from the same body, with a
+    // sentinel the parse-based build_state would not reproduce.
+    let mut owner_state = ResponsesState::from_request_body(serde_json::from_str(original).unwrap());
+    owner_state.history_rehydrated = false;
+    owner_state.provider_history_len = 4242;
+    assert!(
+        owner_state.request_body.get("input").is_none(),
+        "precondition: #1618 strips input from request_body"
+    );
+    ctx.extensions.insert(owner_state);
+
+    let mut body = Some(Bytes::from(original));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release));
+
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("ResponsesState should be populated");
+    assert_eq!(
+        state.provider_history_len, 4242,
+        "the merged state must be the owner's state, not a freshly parsed one"
+    );
+    assert!(state.history_rehydrated, "reuse must mark the state rehydrated");
+    assert_eq!(state.messages.len(), 3, "2 stored messages prepend the current input");
+    assert_eq!(state.messages[2]["content"], "What next?", "current input stays last");
     assert_eq!(state.response_id.as_deref(), Some("resp_current"));
 }
 

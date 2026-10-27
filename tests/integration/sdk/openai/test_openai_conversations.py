@@ -371,6 +371,51 @@ def _write_passthrough_config(port: int, backend_port: int) -> str:
     return path
 
 
+def _write_managed_state_config(port: int, backend_port: int) -> str:
+    """Write a chain that initializes Responses state before routing.
+
+    With state initialized, `input` is moved out of `request_body` (#1618) and the
+    outbound request is rebuilt from the shared history, so this exercises that the
+    backend still receives the client's input through the real SDK.
+    """
+    config = {
+        "listeners": [
+            {
+                "name": "managed",
+                "address": f"127.0.0.1:{port}",
+                "filter_chains": ["managed-pipeline"],
+            }
+        ],
+        "filter_chains": [
+            {
+                "name": "managed-pipeline",
+                "filters": [
+                    {"filter": "ai_operation"},
+                    {"filter": "openai_responses_request", "on_invalid": "reject"},
+                    {
+                        "filter": "router",
+                        "routes": [{"path_prefix": "/", "cluster": "backend"}],
+                    },
+                    {
+                        "filter": "load_balancer",
+                        "clusters": [
+                            {
+                                "name": "backend",
+                                "endpoints": [f"127.0.0.1:{backend_port}"],
+                            }
+                        ],
+                    },
+                ],
+            }
+        ],
+        "insecure_options": {"allow_private_endpoints": True},
+    }
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        json.dump(config, f)
+    return path
+
+
 def _chunked_response_store_filters(db_path: str, port: int) -> tuple[dict, dict]:
     """Build matching filters for the listener-level regression test."""
     tables = {
@@ -762,6 +807,42 @@ def passthrough_client():
 
 
 @pytest.fixture
+def managed_state_client():
+    """Start a state-initializing proxy and a recording backend."""
+    _RecordingResponsesBackend.forwarded = []
+    backend = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _RecordingResponsesBackend
+    )
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+
+    port = _free_port()
+    config_path = _write_managed_state_config(port, backend.server_address[1])
+    proc = subprocess.Popen(
+        [_find_binary(), "-c", config_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_proxy(port, proc)
+        yield OpenAI(
+            api_key="not-needed",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            max_retries=0,
+            timeout=10.0,
+        )
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        backend.shutdown()
+        os.unlink(config_path)
+
+
+@pytest.fixture
 def chunked_response_store():
     """Start a composed response-store/Conversations proxy and chunked backend."""
     backend = http.server.ThreadingHTTPServer(
@@ -1031,6 +1112,31 @@ class TestOpenAIConversations:
         assert forwarded[0]["path"] == "/v1/responses", "the create path must be forwarded unchanged"
         assert forwarded[0]["body"]["model"] == "gpt-4.1", "the forwarded body must preserve the requested model"
         assert forwarded[0]["body"]["input"] == "Hello", "the forwarded body must preserve the request input"
+
+    def test_managed_create_forwards_input_rebuilt_from_state(self, managed_state_client):
+        """A managed create still forwards input after #1618 strips it internally.
+
+        With state initialized, `input` is moved out of `request_body` and the
+        outbound request is rebuilt from the shared history. The backend must still
+        receive the client's array input, proving the move did not drop it.
+        """
+        input_items = [
+            {"role": "user", "content": [{"type": "input_text", "text": "What is 2+2?"}]}
+        ]
+        response = managed_state_client.responses.create(
+            model="gpt-4.1",
+            input=input_items,
+        )
+
+        assert response.status == "completed", "the backend response must reach the client"
+
+        forwarded = _RecordingResponsesBackend.forwarded
+        assert len(forwarded) == 1, "exactly one request should reach the backend"
+        assert forwarded[0]["path"] == "/v1/responses"
+        assert forwarded[0]["body"]["input"] == input_items, (
+            "the outbound body must carry the input rebuilt from state, "
+            "not the input-stripped request_body"
+        )
 
     @pytest.mark.skipif(
         os.environ.get("PRAXIS_TEST_RESPONSES_ONLY") != "1",
@@ -3015,6 +3121,35 @@ def test_structured_mcp_failure_append_back(conversation_backend):
     assert (
         stored_error == failure_error
     ), "append-back must retain the structured error verbatim"
+
+
+def test_completed_response_stores_original_request_input(conversation_backend):
+    """#1618: the original request input round-trips into stored history.
+
+    Managed state init moves ``input`` out of ``request_body`` and the store/
+    append-back path reconstructs it from the shared snapshot. A completed
+    response must therefore persist the original user input as a conversation
+    item, exercising the shared input path end-to-end through the OpenAI client.
+    """
+    client, _, _output, _translated = conversation_backend
+    conversation = client.conversations.create()
+    response = client.responses.create(
+        model="test-model", conversation=conversation.id, input="remember this exact input"
+    )
+    assert response.status == "completed"
+
+    page = client.conversations.items.list(conversation.id, order="asc")
+    texts = []
+    for item in page.data:
+        if getattr(item, "role", None) != "user":
+            continue
+        for part in item.content or []:
+            text = part.text if hasattr(part, "text") else part.get("text") if isinstance(part, dict) else None
+            if text:
+                texts.append(text)
+    assert any("remember this exact input" in text for text in texts), (
+        "the original request input must be stored after #1618 moves it out of request_body"
+    )
 
 
 class _CapturingResponsesBackend(_ChunkedResponsesBackend):

@@ -123,6 +123,44 @@ fn budgeted_chat_response_overflow_rejects_before_json_parse() {
     assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
 }
 
+#[test]
+fn budgeted_finite_echo_reservation_counts_moved_out_input() {
+    // #1618 moved `input` out of `request_body`; the finite echo reservation must
+    // still count it, or a large input echo slips through unreserved. A tiny-param
+    // request with a large input and headroom that fits the params echo but not the
+    // input echo must reject.
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(RESPONSE_TRANSFORM_KEY, "success");
+    let big_input: Vec<_> = (0..400)
+        .map(|i| json!({"role": "user", "content": format!("message {i} with some filler text to add bytes")}))
+        .collect();
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": big_input, "store": false}));
+    assert!(
+        state.request_body.get("input").is_none(),
+        "precondition: #1618 strips input from request_body"
+    );
+    // Headroom (limit - input_charge - response_reserve = 1M - 605K - 375K = 20K)
+    // comfortably covers the params echo + small response, but not the
+    // (params + input) * 4 echo projection the ~28 KB input adds (~112 KB).
+    state.simple_budget = SimpleBudget::new_with_store(1_000_000, 605_000, false);
+    assert!(state.simple_budget.is_some(), "budget params must be admissible");
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(
+        br#"{"id":"c","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+    ));
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("the finite echo reservation must count the moved-out input and reject");
+    };
+    assert_eq!(rejection.status, 502);
+    assert!(body.is_none());
+}
+
 #[tokio::test]
 async fn budgeted_chat_stream_rejects_partial_frame_before_retaining_it() {
     for headers_committed in [false, true] {
@@ -1837,6 +1875,62 @@ async fn non_streaming_chat_response_becomes_response_resource() {
     assert_eq!(translated["output"][0]["content"][0]["text"], "Hello");
     assert_eq!(translated["usage"]["input_tokens"], 3);
     assert_eq!(translated["usage"]["output_tokens"], 2);
+}
+
+#[tokio::test]
+async fn non_streaming_response_echoes_array_input_moved_out_of_request_body() {
+    // #1618 moves `input` out of `request_body` at state init, so the synthesized
+    // Responses resource must echo it from the shared history instead. Regression
+    // guard for the inference-fixture replay that caught an empty `input` echo.
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.time_source = &fixed_time;
+    context.set_metadata("openai_responses_request.format", "openai_responses");
+    context.set_metadata("openai_responses_request.stream", "false");
+    context.set_metadata("responses.response_id", "resp_echo_input");
+    let input = json!([{"role": "user", "content": [{"type": "input_text", "text": "What is 2+2?"}]}]);
+    let request_value = json!({"model": "gpt-4.1-mini", "input": input, "stream": false});
+    let state = ResponsesState::from_request_body(request_value);
+    assert!(
+        state.request_body.get("input").is_none(),
+        "precondition: #1618 strips input from request_body"
+    );
+    context.extensions.insert(state);
+    let mut request_body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1-mini", "input": input, "stream": false})).unwrap(),
+    ));
+    assert!(matches!(
+        filter
+            .on_selected_upstream_request_body(&mut context, &mut request_body)
+            .await
+            .unwrap(),
+        SelectedUpstreamBodyOutcome::Continue
+    ));
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    assert!(matches!(
+        filter.on_response(&mut context).await.unwrap(),
+        FilterAction::Continue
+    ));
+    context.response_header = None;
+    let mut response_body = Some(Bytes::from_static(
+        br#"{"id":"chatcmpl_1","object":"chat.completion","model":"gpt-4.1-mini","choices":[{"index":0,"message":{"role":"assistant","content":"4"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}"#,
+    ));
+
+    let body_action = filter.on_response_body(&mut context, &mut response_body, true).unwrap();
+
+    assert!(matches!(body_action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(response_body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        translated["input"], input,
+        "the resource must echo the array input reconstructed from state, not an empty value"
+    );
 }
 
 #[tokio::test]

@@ -452,7 +452,7 @@ impl HttpFilter for FileResolveFilter {
 fn budgeted_plain_input_without_references(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
         state.simple_budget.is_some()
-            && super::text_only_input(state.request_body.get("input"))
+            && super::text_only_messages(state.input.iter())
             && state.messages.iter().all(|item| !history_needs_file_resolution(item))
             && state
                 .persisted_messages
@@ -723,22 +723,19 @@ async fn sync_state_with_budget(
         return Ok(());
     };
 
-    state.request_body = resolved_body;
-
     let input_len = state.input.len();
-    let ResponsesState {
-        request_body,
-        messages,
-        persisted_messages,
-        ..
-    } = state;
+    // Resolve the history tails from the locally owned resolved body before it is
+    // stored as request parameters; the resolved input is not retained in
+    // `request_body` (the params-only invariant, #1618).
+    if let Some(resolved_input) = resolved_body.get("input").and_then(serde_json::Value::as_array) {
+        sync_message_history(&mut state.messages, input_len, Some(resolved_input), resolver, budget).await?;
+        if let Some(persisted_messages) = state.persisted_messages_mut() {
+            sync_persisted_history(persisted_messages, input_len, Some(resolved_input), resolver, budget).await?;
+        }
+    }
 
-    let Some(resolved_input) = request_body.get("input").and_then(serde_json::Value::as_array) else {
-        return Ok(());
-    };
-
-    sync_message_history(messages, input_len, Some(resolved_input), resolver, budget).await?;
-    sync_persisted_history(persisted_messages, input_len, Some(resolved_input), resolver, budget).await
+    state.set_request_params(resolved_body);
+    Ok(())
 }
 
 /// Test helper that creates an isolated request resolution budget.
@@ -777,7 +774,10 @@ async fn resolve_state_history(
 
     let input_len = state.input.len();
     sync_message_history(&mut state.messages, input_len, None, resolver, budget).await?;
-    sync_persisted_history(&mut state.persisted_messages, input_len, None, resolver, budget).await
+    if let Some(persisted_messages) = state.persisted_messages_mut() {
+        sync_persisted_history(persisted_messages, input_len, None, resolver, budget).await?;
+    }
+    Ok(())
 }
 
 /// Shared dependencies for resolving one state history vector.

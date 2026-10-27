@@ -114,6 +114,8 @@ mod openai_prompts_routing;
 #[cfg(all(feature = "openai-file-resolve-filter", feature = "openai-mcp-tools"))]
 mod openai_responses_body_size_limits;
 #[cfg(feature = "openai-responses")]
+mod openai_responses_complexity_limit;
+#[cfg(feature = "openai-responses")]
 mod openai_responses_model_rewrite;
 #[cfg(feature = "openai-responses")]
 mod openai_responses_proxy;

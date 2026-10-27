@@ -430,6 +430,10 @@ impl ResponsesToChatCompletionsFilter {
                 "openai_responses_to_chat_completions: missing Responses state for streaming translation".into(),
             );
         };
+        // `input` was moved out of `request_body` at state init (#1618); rebuild the
+        // client's input once for this stream so lifecycle snapshots echo it without
+        // every heartbeat callback reconstructing it.
+        converter.ensure_echoed_input(state);
         let inputs = SnapshotInputs {
             request_body: &state.request_body,
             tools: &state.tools,
@@ -544,7 +548,10 @@ fn reserve_chat_stream_snapshots(ctx: &mut HttpFilterContext<'_>) -> Option<usiz
         )
         .ok()
         .flatten()?;
-        let source = request.checked_add(tools)?.checked_add(choice)?;
+        // `input` was moved out of `request_body` at init (#1618); the lifecycle
+        // snapshots echo it back, so include the retained input in the projection.
+        let input = bounded_json_size(&state.input, MAX_JSON_BODY_BYTES).ok().flatten()?;
+        let source = request.checked_add(tools)?.checked_add(choice)?.checked_add(input)?;
         let reserve = source
             .checked_mul(CHAT_STREAM_ECHO_MULTIPLIER)?
             .checked_add(CHAT_STREAM_ERROR_RESERVE)?;
@@ -661,9 +668,12 @@ fn reserve_finite_chat_response(ctx: &mut HttpFilterContext<'_>, body: &[u8]) ->
         if state.simple_budget.is_none() {
             return true;
         }
+        // `input` was moved out of `request_body` at init (#1618), so size the echo
+        // from the parameters plus the retained input snapshot the resource rebuilds.
         bounded_json_size(&state.request_body, MAX_JSON_BODY_BYTES)
             .ok()
             .flatten()
+            .and_then(|params| params.checked_add(bounded_json_size(&state.input, MAX_JSON_BODY_BYTES).ok().flatten()?))
             .and_then(|bytes| bytes.checked_mul(4))
     };
     let charge = echo_charge.and_then(|echo| output_charge(body)?.checked_add(echo));
@@ -1134,6 +1144,13 @@ fn translate_success_response(
     // outbound request is built from `state.tools`/`state.tool_choice`.
     response_context.tools = &state.tools;
     response_context.tool_choice = state.original_tool_choice.as_ref().or(Some(&state.tool_choice));
+    // `input` was moved out of `request_body` at state init (#1618), so echo the
+    // client's input onto the resource from the shared history instead. `None`
+    // leaves `from_responses_request`'s absent-input default in place.
+    let echoed_input = super::request_input::input_echo_value(state);
+    if let Some(echoed_input) = echoed_input.as_ref() {
+        response_context.input = Some(echoed_input);
+    }
     let provider_response: serde_json::Value = serde_json::from_slice(body)
         .map_err(|error| -> FilterError { format!("openai_responses_to_chat_completions: {error}").into() })?;
     let translated = chat_response_to_response_resource(&provider_response, &response_context)

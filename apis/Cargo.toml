@@ -28,6 +28,8 @@ openai-file-resolve-filter = ["openai-responses"]
 # Response and conversation storage. The SQL backends live in praxis-ai-store-backends
 # so a build without a backend carries no SQL client or crypto.
 store = ["openai-responses", "praxis-ai-store/compression", "dep:praxis-ai-store-lifecycle"]
+# Expose hidden Responses-state benchmark entry points to the workspace benchmark crate.
+bench-responses-state = ["store"]
 # Internal implementation marker shared by both PostgreSQL profiles. Do not
 # enable directly; select one of the public features below.
 _store-postgres = ["store", "dep:praxis-ai-store-backends"]

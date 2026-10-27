@@ -601,15 +601,14 @@ async fn sync_state_updates_responses_state() {
     });
 
     let client = make_client();
-    // Clone so the assertion below can compare against the pre-move value.
-    sync_state(&mut ctx, resolved_body.clone(), &client, OnMissing::Continue)
+    sync_state(&mut ctx, resolved_body, &client, OnMissing::Continue)
         .await
         .unwrap();
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(
-        state.request_body, resolved_body,
-        "request_body should be updated with resolved content"
+    assert!(
+        state.request_body.get("input").is_none(),
+        "resolved input is synced into messages, not duplicated in request_body (#1618)"
     );
 
     let tail = &state.messages[1];
@@ -689,7 +688,10 @@ timeout_ms: 2000"#
     assert_eq!(rewritten_part["file_data"], expected_data_uri);
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.request_body, rewritten);
+    assert!(
+        state.request_body.get("input").is_none(),
+        "resolved input is synced into histories, not duplicated in request_body (#1618)"
+    );
     for (name, part) in [
         ("messages", &state.messages[0]["content"][0]),
         ("persisted_messages", &state.persisted_messages[0]["content"][0]),
