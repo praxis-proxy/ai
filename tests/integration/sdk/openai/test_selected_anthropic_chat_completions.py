@@ -46,16 +46,16 @@ class _BackendState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.scripted: deque[tuple[int, str, bytes]] = deque()
-        self.requests: list[tuple[str, dict]] = []
+        self.requests: list[tuple[str, dict[str, str], dict]] = []
 
     def script(self, status: int, content_type: str, body: dict | str) -> None:
         encoded = json.dumps(body).encode() if isinstance(body, dict) else body.encode()
         with self.lock:
             self.scripted.append((status, content_type, encoded))
 
-    def take(self, path: str, body: bytes) -> tuple[int, str, bytes]:
+    def take(self, path: str, headers: dict[str, str], body: bytes) -> tuple[int, str, bytes]:
         with self.lock:
-            self.requests.append((path, json.loads(body)))
+            self.requests.append((path, headers, json.loads(body)))
             return self.scripted.popleft()
 
 
@@ -72,7 +72,8 @@ def reset_backend_state():
 class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         length = int(self.headers["content-length"])
-        status, content_type, body = STATE.take(self.path, self.rfile.read(length))
+        headers = {key.lower(): value for key, value in self.headers.items()}
+        status, content_type, body = STATE.take(self.path, headers, self.rfile.read(length))
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -196,9 +197,28 @@ def test_json_and_cached_usage(client: OpenAI) -> None:
     assert response.usage.prompt_tokens == 1060, "cache tokens must count toward prompt usage"
     assert response.usage.completion_tokens == 4, "Anthropic output tokens must become completion tokens"
     assert response.usage.total_tokens == 1064, "total tokens must include cache and output tokens"
-    path, upstream = STATE.requests[-1]
+    path, _headers, upstream = STATE.requests[-1]
     assert path == "/v1/messages", "selected Anthropic requests must use the Messages path"
     assert upstream["model"] == "claude-fixture-model", "selected target model must reach Anthropic"
+
+
+def test_anthropic_backend_wire_headers(client: OpenAI) -> None:
+    STATE.script(200, "application/json", _message(
+        [{"type": "text", "text": "hello"}],
+        {"input_tokens": 10, "output_tokens": 4},
+    ))
+    client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16)
+    path, headers, _upstream = STATE.requests[-1]
+    assert path == "/v1/messages", "selected Anthropic requests must use the Messages path"
+    assert headers.get("anthropic-version") == "2023-06-01", (
+        "the selected Anthropic route must pin the API version on the backend request"
+    )
+    assert headers.get("x-api-key") == "fixture-only-dummy-token", (
+        "the injected provider credential must travel in x-api-key"
+    )
+    assert "authorization" not in headers, (
+        "the caller's OpenAI authorization header must not leak to the Anthropic backend"
+    )
 
 
 def test_null_cache_usage(client: OpenAI) -> None:
@@ -258,7 +278,7 @@ def test_tool_call_and_result_round_trip(client: OpenAI) -> None:
         {"role": "tool", "tool_call_id": call.id, "content": "sunny"},
     ], tools=tools, max_tokens=16)
     assert second.choices[0].message.content == "sunny", "tool-result round trip must return translated text"
-    assert STATE.requests[-1][1]["messages"][-1]["content"][0]["type"] == "tool_result", "OpenAI tool results must become Anthropic tool_result blocks"
+    assert STATE.requests[-1][2]["messages"][-1]["content"][0]["type"] == "tool_result", "OpenAI tool results must become Anthropic tool_result blocks"
 
 
 @pytest.mark.parametrize("status", [429, 529])

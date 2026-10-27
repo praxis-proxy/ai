@@ -86,6 +86,25 @@ VLLM_MODEL=praxis-test-model VLLM_TEST_BACKEND=simulator uv run --with "openai>=
 
 You can also pass `--sdk-version=2.x` or `--sdk-version=3.x` to enforce version verification during pytest startup.
 
+### Anthropic SDK Integration Tests (Dual 1.x / 2.x Lanes)
+
+Praxis AI likewise maintains compatibility with both Anthropic Python SDK 1.x
+and 2.x releases. SDK v2 changes the client's wire defaults (`anthropic-version:
+2026-10-21` and `authorization: Bearer` instead of `2023-06-01` and `x-api-key`),
+so each lane is pinned and verified independently:
+
+```console
+cargo build -p praxis-ai-proxy
+uv run --with "anthropic<2" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -v --sdk-version=1.x
+uv run --with "anthropic>=2,<3" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -v --sdk-version=2.x
+```
+
+`make test-anthropic-sdk` runs both lanes; CI splits them into the parallel
+`test-anthropic-sdk-v1` and `test-anthropic-sdk-v2` targets. You can also pass
+`--sdk-version=1.x` or `--sdk-version=2.x` to enforce version verification
+during pytest startup. The suites scrub ambient `ANTHROPIC_*` environment
+variables so wire-header assertions stay deterministic.
+
 ### OpenAI Agents SDK Responses Compatibility
 
 The OpenAI Agents SDK function-calling loop is verified through the Responses
