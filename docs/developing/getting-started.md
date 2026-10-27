@@ -44,6 +44,17 @@ make test
 make test-integration
 ```
 
+`make test-integration` runs both the store-all suite and its experimental
+filter permutation. CI runs those permutations separately with
+`make test-integration-core` and `make test-integration-experimental`.
+Likewise, `make test-inference-fixtures` includes the xtask fixture tests;
+`make test-inference-fixtures-core` and `make test-inference-xtask` are the
+separate CI targets. `make test-environment-suite` runs the llmd-ext-proc
+integration suite alongside `make test-environment`'s environment tests.
+
+`make test-store-features` runs the feature graph checks, per-group Clippy,
+and API tests. CI uses its `-check`, `-clippy`, and `-test` targets separately.
+
 ### OpenAI SDK Integration Tests (Dual 2.x / 3.x Lanes)
 
 Praxis AI maintains compatibility with both OpenAI Python SDK 2.x and 3.x releases. Local and CI test runs validate both SDK major versions independently.

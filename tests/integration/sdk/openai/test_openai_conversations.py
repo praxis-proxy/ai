@@ -118,7 +118,7 @@ def _find_tenant_binary() -> str:
     )
 
 
-def _conversations_filter(table_prefix: str, db_path: str) -> dict:
+def _conversations_filter(table_prefix: str, db_path: str, ttl: str | None = None, sweep_interval: str | None = None) -> dict:
     """Build the conversations store for the backend configured by CI."""
     tables = {
         "conversations_table": f"{table_prefix}_conversations",
@@ -146,11 +146,16 @@ def _conversations_filter(table_prefix: str, db_path: str) -> dict:
             "database_url": f"sqlite://{db_path}?mode=rwc",
             "pool": {"max_connections": 1},
         }
-    return {
+    result = {
         "filter": "openai_conversations",
         **store,
         **tables,
     }
+    if ttl is not None:
+        result["ttl"] = ttl
+    if sweep_interval is not None:
+        result["sweep_interval"] = sweep_interval
+    return result
 
 
 def _write_config(
@@ -3103,6 +3108,101 @@ def test_capturing_backend_records_both_request_framings(chunked):
         backend.shutdown()
         backend.server_close()
         thread.join(timeout=5)
+
+
+@pytest.fixture
+def ttl_proxy_client():
+    """Start a proxy with short TTL for testing automatic purge (function-scoped to isolate)."""
+    with tempfile.TemporaryDirectory() as db_dir:
+        port = _free_port()
+        readiness_port = _free_port()
+        db_path = os.path.join(db_dir, "ttl_test.db")
+
+        # Build config with short TTL: 2s retention, 1s sweep interval
+        conversations_filter = _conversations_filter(
+            f"ttl_{port}", db_path, ttl="2s", sweep_interval="1s"
+        )
+        config = {
+            "listeners": [
+                {
+                    "name": "ttl-test",
+                    "address": f"127.0.0.1:{port}",
+                    "filter_chains": ["ttl-pipeline"],
+                }
+            ],
+            "filter_chains": [
+                {
+                    "name": "ttl-pipeline",
+                    "filters": [
+                        {
+                            "filter": "state_owner",
+                            "mode": "trusted_owner",
+                            "header": OWNER_HEADER,
+                        },
+                        {"filter": "ai_operation"},
+                        conversations_filter,
+                    ],
+                }
+            ],
+        }
+        fd, config_path = tempfile.mkstemp(suffix=".yaml")
+        with os.fdopen(fd, "w") as f:
+            json.dump(config, f)
+
+        binary = _find_binary()
+        proc = subprocess.Popen(
+            [binary, "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_proxy_env(readiness_port),
+        )
+        try:
+            _wait_for_proxy(port, proc)
+            _wait_for_store_ready(readiness_port, proc)
+            yield OpenAI(
+                api_key="not-needed",
+                base_url=f"http://127.0.0.1:{port}/v1",
+                default_headers={OWNER_HEADER: _owner_assertion("ttl_test")},
+                max_retries=0,
+                timeout=10.0,
+            )
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            if proc.stderr:
+                proc.stderr.close()
+            os.unlink(config_path)
+
+
+def test_ttl_purges_conversation_after_expiration(ttl_proxy_client):
+    """TTL reaper purges conversations older than configured retention period.
+
+    The reaper runs in the real binary (launched via subprocess), sweeping
+    records whose created_at exceeds the configured ttl. Activity does NOT
+    extend retention; ttl is measured from creation time only.
+    """
+    conversation = ttl_proxy_client.conversations.create(
+        metadata={"test": "ttl_purge"}
+    )
+    assert conversation.id.startswith("conv_"), "conversation must be created"
+
+    # Verify the conversation exists immediately after creation
+    retrieved = ttl_proxy_client.conversations.retrieve(conversation.id)
+    assert retrieved.id == conversation.id, "conversation must be retrievable immediately"
+
+    # Wait for ttl (2s) + sweep_interval (1s) + margin (3s) = 6s total
+    # This ensures at least one full sweep cycle completes after expiration
+    time.sleep(6)
+
+    # Conversation should now be purged
+    with pytest.raises(NotFoundError) as exc_info:
+        ttl_proxy_client.conversations.retrieve(conversation.id)
+    assert exc_info.value.status_code == 404, "expired conversation must be purged and return 404"
 
 
 if __name__ == "__main__":

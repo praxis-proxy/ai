@@ -13,9 +13,10 @@ use std::{collections::HashMap, sync::Arc};
 
 #[cfg(feature = "openai-conversations")]
 use praxis_ai_store::EffectiveConfigKey;
-use praxis_ai_store::{BackendError, StoreBackendFactory};
+use praxis_ai_store::{BackendError, ReaperConfig, ReaperPolicy, StoreBackendFactory};
 use praxis_ai_store_lifecycle::{ProvisionError, StoreRef};
 use praxis_core::config::FilterEntry;
+use praxis_filter::{FilterError, parse_filter_config};
 use serde_json::Value;
 
 #[cfg(feature = "openai-conversations")]
@@ -98,6 +99,86 @@ fn permissive_conversations_ref(config: &serde_yaml::Value) -> Option<StoreRef> 
     }
 }
 
+/// Discover reaper policy bindings reachable from the selected root chains.
+///
+/// Returns one `(store_name, policy)` for each store filter that declares a
+/// `ttl`, keyed by the registry name the backend is provisioned under
+/// ([`DEFAULT_STORE_NAME`] or [`CONVERSATIONS_STORE_NAME`]). Store filters
+/// without a `ttl` contribute nothing. Mirrors
+/// [`discover_store_refs_permissive`]: a malformed filter config is skipped
+/// rather than rejected, because such a config fails separately at pipeline
+/// construction. The raw filter YAML is parsed here, before the ttl fields are
+/// stripped from the forwarded [`StoreRef`] config.
+#[must_use]
+pub fn discover_reaper_bindings_permissive(
+    roots: &[String],
+    chains: &HashMap<&str, &[FilterEntry]>,
+) -> Vec<(Arc<str>, ReaperPolicy)> {
+    let responses = find_store_configs(roots, chains, RESPONSE_STORE_FILTER_NAME)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter_map(|config| reaper_policy_from_response_store(&config).ok().flatten())
+        .map(|policy| (Arc::<str>::from(DEFAULT_STORE_NAME), policy));
+    #[cfg(feature = "openai-conversations")]
+    {
+        let conversations = find_store_configs(roots, chains, CONVERSATIONS_STORE_FILTER_NAME)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter_map(|config| reaper_policy_from_conversations(&config).ok().flatten())
+            .map(|policy| (Arc::<str>::from(CONVERSATIONS_STORE_NAME), policy));
+        responses.chain(conversations).collect()
+    }
+    #[cfg(not(feature = "openai-conversations"))]
+    {
+        responses.collect()
+    }
+}
+
+/// Extract reaper policy from a response-store filter configuration.
+///
+/// Parses the filter config, extracts the TTL fields, and returns a policy
+/// with defaults applied when TTL is configured. Returns `None` when TTL is unset.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when the config does not parse as a valid
+/// `ResponseStoreConfig`.
+pub fn reaper_policy_from_response_store(
+    filter_config: &serde_yaml::Value,
+) -> Result<Option<ReaperPolicy>, FilterError> {
+    use crate::openai::responses::store::config::ResponseStoreConfig;
+    let cfg: ResponseStoreConfig = parse_filter_config(RESPONSE_STORE_FILTER_NAME, filter_config)?;
+    let reaper = ReaperConfig {
+        ttl: cfg.ttl,
+        sweep_interval: cfg.sweep_interval,
+        sweep_batch_size: cfg.sweep_batch_size,
+    };
+    Ok(reaper.policy())
+}
+
+/// Extract reaper policy from a conversations filter configuration.
+///
+/// Parses the filter config, extracts the TTL fields, and returns a policy
+/// with defaults applied when TTL is configured. Returns `None` when TTL is unset.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when the config does not parse as a valid
+/// `ConversationsConfig`.
+#[cfg(feature = "openai-conversations")]
+pub fn reaper_policy_from_conversations(
+    filter_config: &serde_yaml::Value,
+) -> Result<Option<ReaperPolicy>, FilterError> {
+    use crate::openai::conversations::config::ConversationsConfig;
+    let cfg: ConversationsConfig = parse_filter_config(CONVERSATIONS_STORE_FILTER_NAME, filter_config)?;
+    let reaper = ReaperConfig {
+        ttl: cfg.ttl,
+        sweep_interval: cfg.sweep_interval,
+        sweep_batch_size: cfg.sweep_batch_size,
+    };
+    Ok(reaper.policy())
+}
+
 /// Translate backend errors without adding connection material to diagnostics.
 fn backend_error(name: &str, source: BackendError) -> ProvisionError {
     ProvisionError::Backend {
@@ -106,8 +187,25 @@ fn backend_error(name: &str, source: BackendError) -> ProvisionError {
     }
 }
 
+/// Response-filter-only options the backend factory never sees, including the
+/// TTL fields consumed by the reaper. They are stripped before dispatch.
+const RESPONSE_FILTER_ONLY_FIELDS: [&str; 6] = [
+    "backend",
+    "max_event_count",
+    "max_event_bytes",
+    "ttl",
+    "sweep_interval",
+    "sweep_batch_size",
+];
+
 /// Remove response-filter options before passing configuration to a factory.
 fn response_store_ref(filter_config: &serde_yaml::Value) -> Result<StoreRef, ProvisionError> {
+    let mapping_error = || {
+        backend_error(
+            DEFAULT_STORE_NAME,
+            BackendError::Config("response store must be a mapping".to_owned()),
+        )
+    };
     let backend = filter_config
         .get("backend")
         .and_then(serde_yaml::Value::as_str)
@@ -117,19 +215,9 @@ fn response_store_ref(filter_config: &serde_yaml::Value) -> Result<StoreRef, Pro
                 BackendError::Config("response store requires a backend".to_owned()),
             )
         })?;
-    let mut config = serde_json::to_value(filter_config).map_err(|_error| {
-        backend_error(
-            DEFAULT_STORE_NAME,
-            BackendError::Config("response store must be a mapping".to_owned()),
-        )
-    })?;
-    let object = config.as_object_mut().ok_or_else(|| {
-        backend_error(
-            DEFAULT_STORE_NAME,
-            BackendError::Config("response store must be a mapping".to_owned()),
-        )
-    })?;
-    for field in ["backend", "max_event_count", "max_event_bytes"] {
+    let mut config = serde_json::to_value(filter_config).map_err(|_error| mapping_error())?;
+    let object = config.as_object_mut().ok_or_else(mapping_error)?;
+    for field in RESPONSE_FILTER_ONLY_FIELDS {
         object.remove(field);
     }
     normalize_sqlite_factory_config(backend, &mut config);
@@ -142,7 +230,7 @@ fn response_store_ref(filter_config: &serde_yaml::Value) -> Result<StoreRef, Pro
 
 /// Let the Conversations API own its table defaults and placeholder table.
 #[cfg(feature = "openai-conversations")]
-fn conversations_store_ref(filter_config: &serde_yaml::Value) -> Result<StoreRef, praxis_filter::FilterError> {
+fn conversations_store_ref(filter_config: &serde_yaml::Value) -> Result<StoreRef, FilterError> {
     let (backend, mut config) = conversations_store_ref_config(filter_config)?;
     normalize_sqlite_factory_config(&backend, &mut config);
     Ok(StoreRef {
@@ -212,6 +300,15 @@ fn connection_key(
 }
 
 /// Inventory table and generated index names for collision checks.
+///
+/// The index names must stay in exact lockstep with the names
+/// `store-backends` `schemas::generate_ddl` emits, including every per-table
+/// `created_at` index, so a configured table that shadows a generated index name
+/// is caught here rather than failing later at `CREATE INDEX`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear inventory: one entry per configured table and every generated table and index name"
+)]
 fn schema_objects(config: &Value) -> Vec<(&'static str, String)> {
     let mut objects = Vec::new();
     for field in ["responses_table", "conversations_table", "items_table"] {
@@ -225,11 +322,24 @@ fn schema_objects(config: &Value) -> Vec<(&'static str, String)> {
                     ),
                     ("responses schema-version table", format!("{table}_schema_version")),
                     ("responses event-log table", format!("{table}_events")),
+                    ("responses created_at index", format!("idx_{table}_created_at")),
+                    (
+                        "responses event-log created_at index",
+                        format!("idx_{table}_events_created_at"),
+                    ),
+                    (
+                        "responses pending-approvals created_at index",
+                        format!("idx_{table}_pending_approvals_created_at"),
+                    ),
                 ]),
-                "conversations_table" => objects.push(("conversations tenant index", format!("idx_{table}_tenant_id"))),
+                "conversations_table" => objects.extend([
+                    ("conversations tenant index", format!("idx_{table}_tenant_id")),
+                    ("conversations created_at index", format!("idx_{table}_created_at")),
+                ]),
                 _ => objects.extend([
                     ("items conversation index", format!("idx_{table}_conversation")),
                     ("items position index", format!("idx_{table}_position")),
+                    ("items created_at index", format!("idx_{table}_created_at")),
                 ]),
             }
         }
@@ -605,6 +715,26 @@ mod tests {
     }
 
     #[test]
+    fn cross_store_created_at_index_collides_with_other_store_table() {
+        // Store A's responses_table generates `idx_responses_a_created_at`. Store B,
+        // sharing the same database, configures a table literally named that index.
+        // Cross-store validation must reject this before provisioning fails at the
+        // database with "there is already an index named idx_responses_a_created_at",
+        // even with TTL disabled (the created_at indexes are always generated).
+        let mut first = reference("default", "a");
+        first.config["responses_table"] = json!("responses_a");
+        first.config["conversations_table"] = json!("conversations_a");
+        let mut second = reference("conversations", "a");
+        second.config["responses_table"] = json!("idx_responses_a_created_at");
+        second.config["conversations_table"] = json!("conversations_b");
+        let plans = vec![vec![first, second]];
+        assert!(
+            validate_cross_store_collisions(&plans, &factories()).is_err(),
+            "a table that shadows another store's generated created_at index must be rejected"
+        );
+    }
+
+    #[test]
     fn stateless_chains_require_no_backend() {
         let filters: Vec<FilterEntry> = serde_yaml::from_str("[{filter: request_id}]").expect("stateless chain");
         let chains = HashMap::from([("main", filters.as_slice())]);
@@ -654,11 +784,24 @@ mod tests {
     #[test]
     fn response_options_stay_out_of_backend_config() {
         let filter = serde_yaml::from_str(
-            "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nmax_event_count: 10\nmax_event_bytes: 1024",
+            "backend: sqlite\n\
+             database_url: 'sqlite::memory:'\n\
+             max_event_count: 10\n\
+             max_event_bytes: 1024\n\
+             ttl: 7d\n\
+             sweep_interval: 1h\n\
+             sweep_batch_size: 500\n",
         )
         .expect("filter config");
         let store_ref = response_store_ref(&filter).expect("store reference");
-        for field in ["backend", "max_event_count", "max_event_bytes"] {
+        for field in [
+            "backend",
+            "max_event_count",
+            "max_event_bytes",
+            "ttl",
+            "sweep_interval",
+            "sweep_batch_size",
+        ] {
             assert!(store_ref.config.get(field).is_none(), "filter-only option: {field}");
         }
         assert!(response_store_ref(&serde_yaml::from_str("database_url: secret").expect("config")).is_err());

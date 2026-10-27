@@ -144,8 +144,10 @@ supported persistence profiles:
 | SQLite-only | `standard,openai-all,store-sqlite` | SQLite |
 | Combined | `standard,openai-all,store-all` | PostgreSQL and SQLite |
 
-The released container image builds `full` without Responses or stores. Build
-with `--build-arg PRAXIS_AI_FEATURES=full,openai-all,store-sqlite` to opt in.
+The standard container image builds `full` without Responses or stores. The
+`-experimental` image tags build `full,openai-all,store-all`; build with
+`--build-arg PRAXIS_AI_FEATURES=full,openai-all,store-all` to do the same
+locally.
 SQLite configurations use a database path under the image's writable state
 directory, as described below.
 
@@ -365,6 +367,68 @@ payloads are bounded by output token limits (typically
 under 2 MiB). Non-persistable exchanges release chunks
 immediately via `FilterAction::Release` so
 pass-through traffic is not held.
+
+## TTL and Automatic Purging
+
+Store filters accept optional `ttl`, `sweep_interval`, and `sweep_batch_size` configuration
+fields that enable automatic purging of expired records. When `ttl` is set, a background
+reaper coordinator runs one reaper task per distinct TTL-enabled store backend (keyed on the
+factory's `EffectiveConfigKey`, so two filters on one physical database with different table
+sets each get their own reaper), sweeping records whose `created_at` is older than
+`now - ttl` in bounded batches.
+
+**IMPORTANT:** TTL is measured from record CREATION time, not last-accessed time. Activity
+does NOT extend retention. An actively-used conversation or response older than the configured
+`ttl` will be purged even if it was recently accessed. TTL is not a storage-capacity guarantee;
+tenant byte quotas and capacity accounting are tracked separately in #1626.
+
+Configuration:
+- `ttl: <duration>` - retention period (humantime format: `7d`, `24h`, `30m`, etc.). Omit to disable the reaper.
+- `sweep_interval: <duration>` - how often the reaper runs (default: `1h`)
+- `sweep_batch_size: <count>` - maximum records purged per sweep batch (default: `1000`)
+
+The reaper coordinator persists its policy (ttl, sweep_interval, sweep_batch_size) on each
+config commit. Policy changes take effect when the pipeline reloads. The reaper stops
+gracefully on shutdown and across config reloads. One coordinator instance manages all
+reapers for a given server process; each distinct TTL-enabled store backend gets its own
+reaper task that sweeps all record types (responses, conversations, conversation items,
+events, approvals) from that backend's tables.
+
+**The TTL reaper sweeps each table INDEPENDENTLY — it does NOT cascade.** Every table is
+swept by its OWN `created_at`, in its own bounded, per-batch-committed transaction, with no
+foreign-key cascade between tables. The reaper repeats batches per table until that table
+has no rows older than the cutoff or the batch size is reached. Because a child row's
+`created_at` (a conversation item, a response event, a pending approval) is caller-supplied
+and can be well after its parent's, a parent (e.g. a response) can be swept while a child
+that still falls inside the TTL window survives. That child is then orphaned (its
+`response_id`/parent id points at a deleted row) and persists until ITS OWN `created_at`
+passes the cutoff — a gap that can be much longer than one sweep interval. This is accepted
+under creation-time semantics: a dead parent id's orphaned children are inert. The request-path
+delete endpoints behave differently per endpoint, and neither matches the reaper: `delete_response`
+DOES cascade, removing the response row together with its dependent pending-approval and event rows
+in one operation; `delete_conversation` does NOT cascade — it deliberately preserves the
+conversation's item rows (see `ConversationItemStore::delete_conversation`) and deletes only the
+conversation row. The age-based TTL reaper is independent of both: it sweeps every table on its own
+`created_at` with no cross-table cascade at all.
+
+**Shared databases — every store is swept, and conflicting policies are rejected at
+startup.** Reapers are keyed on backend identity (the factory's `EffectiveConfigKey`), so
+every distinct cached backend gets its own reaper and is swept exactly once — two store
+filters on one database with different table sets (e.g. a different `items_table` or `pool`,
+so they resolve to distinct backends) each get a reaper, with no silently-dropped binding.
+Distinct backends can still overlap on a physical table, though: two stores with different
+`responses_table` but the same `conversations_table` resolve to different keys yet both sweep
+that shared table. To keep a shorter TTL from deleting rows a longer retention — or a store
+with no `ttl` at all — still needs, provisioning validates physical-table ownership: within
+one database, no two stores may assign different policies (including TTL-enabled vs.
+TTL-disabled) to the same physical table, and such a configuration is rejected before serving
+starts. The same policy on a shared table is allowed. To run independent retention policies
+on one database, give each store a fully disjoint table set or its own database.
+
+Future quota accounting (#1626) must credit storage released by TTL purges at the same
+atomic commit that removes the rows, ensuring exactly-once accounting even if a purge
+is interrupted. The TTL reaper is orthogonal to capacity limits; operators may configure
+both a time-based TTL and a future tenant-scoped capacity quota.
 
 ## Key Files
 

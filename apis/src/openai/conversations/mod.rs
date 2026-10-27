@@ -8,7 +8,7 @@
 //! trait. Requests never reach upstream.
 
 #[cfg(feature = "openai-conversations")]
-mod config;
+pub(crate) mod config;
 #[cfg(feature = "openai-conversations")]
 pub(crate) mod contracts;
 #[cfg(feature = "openai-conversations")]

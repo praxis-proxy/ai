@@ -228,6 +228,52 @@ pub enum EventLogStatus {
 }
 
 // -----------------------------------------------------------------------------
+// SweepStats
+// -----------------------------------------------------------------------------
+
+/// Statistics from a single `sweep_expired` call.
+///
+/// Each field counts the number of rows deleted from one table.
+/// Tables are swept independently; backends may process them in any
+/// order or in parallel within the batch limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepStats {
+    /// Responses deleted.
+    pub responses: u64,
+
+    /// Conversations deleted.
+    pub conversations: u64,
+
+    /// Conversation items deleted.
+    pub items: u64,
+
+    /// Pending approvals deleted.
+    pub pending_approvals: u64,
+
+    /// Response events deleted.
+    pub events: u64,
+}
+
+impl SweepStats {
+    /// Returns the maximum count across all tables.
+    ///
+    /// Callers loop until `max_table() < batch_size` to ensure
+    /// all tables are exhausted.
+    pub fn max_table(&self) -> u64 {
+        self.responses
+            .max(self.conversations)
+            .max(self.items)
+            .max(self.pending_approvals)
+            .max(self.events)
+    }
+
+    /// Returns the total number of rows deleted across all tables.
+    pub fn total(&self) -> u64 {
+        self.responses + self.conversations + self.items + self.pending_approvals + self.events
+    }
+}
+
+// -----------------------------------------------------------------------------
 // StoreError
 // -----------------------------------------------------------------------------
 

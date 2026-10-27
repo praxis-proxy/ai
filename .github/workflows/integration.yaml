@@ -51,6 +51,10 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  # Line-tables-only debuginfo: faster codegen and much smaller target/ caches
+  # (debuginfo dominates artifact size), which also eases the hard 10 GB cache
+  # cap so caches survive longer. Backtraces still resolve.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   V: ${{ inputs.debug && '1' || '' }}
 
 jobs:
@@ -149,7 +153,39 @@ jobs:
           cache-suffix: test-inference-cargo
 
       - name: Inference fixture tests
-        run: make test-inference-fixtures
+        run: make test-inference-fixtures-core
+
+  # ----------------------------------------------------------------------------
+  # xtask inference-fixture compile
+  #
+  # Split out of test-inference: the xtask crate graph shares no target
+  # artifacts with the test-utils/suite builds, so compiling it in the same job
+  # serialized two independent heavy builds. Cache-neutral (registry-only); the
+  # cold compile stays below the test-integration pole.
+  # ----------------------------------------------------------------------------
+
+  test-inference-xtask:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
+
+      - name: xtask inference fixture tests
+        run: make test-inference-xtask
 
   test-integration:
     needs: [changes]
@@ -157,9 +193,10 @@ jobs:
       always() &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
-    # store-all base compile plus the suite's two feature permutations
-    # (store-all and store-all + experimental filters); 45m leaves headroom for
-    # cache-cold runs while warmed caches finish well inside it.
+    # store-all base compile plus the full integration suite. The experimental
+    # permutation and the Bedrock SDK test now run as sibling jobs, off this
+    # job's critical path. 45m leaves headroom for cache-cold runs while warmed
+    # caches finish well inside it.
     timeout-minutes: 45
     permissions:
       contents: read
@@ -183,15 +220,80 @@ jobs:
       - name: Integration tests
         env:
           PRAXIS_TEST_CLAUDE_CODE_BIN: claude
-        run: make test-integration
+        run: make test-integration-core
+
+  # ----------------------------------------------------------------------------
+  # Experimental-filter permutation (store-all + example-config filters)
+  #
+  # Split out of test-integration so this second feature graph compiles in
+  # parallel instead of extending that job's critical path. Cache-neutral: a
+  # registry-only cache (cache-target: false) under a shared suffix, adding no
+  # new target/ cache family against the hard 10 GB cap. The cold compile is
+  # fine because this job sits below the test-integration pole.
+  # ----------------------------------------------------------------------------
+
+  test-integration-experimental:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
+
+      - name: Experimental-filter integration tests
+        run: make test-integration-experimental
+
+  # ----------------------------------------------------------------------------
+  # Bedrock Converse OpenAI SDK test (default-features proxy)
+  #
+  # Split out of test-integration: it needs only a default-features proxy build
+  # — a different feature graph than store-all — so riding along forced a full
+  # recompile on that job's critical path. Mirrors the azure-sdk / anthropic-sdk
+  # jobs. Cache-neutral (registry-only).
+  # ----------------------------------------------------------------------------
+
+  bedrock-sdk:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
 
       - name: Install uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: tests/integration/sdk/openai/test_bedrock_converse_chat_completions.py
 
-      - name: Build Praxis for SDK tests
+      - name: Build Praxis
         run: cargo build -p praxis-ai-proxy
 
-      - name: Bedrock Converse OpenAI SDK tests
+      - name: Run Bedrock Converse OpenAI SDK tests
         run: uv run tests/integration/sdk/openai/test_bedrock_converse_chat_completions.py -s
 
   # ----------------------------------------------------------------------------
@@ -226,31 +328,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Scope environment suite to ext-proc changes on pull_request
+      - name: Scope environment tests to relevant changes
         id: scope
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          if [ "$EVENT_NAME" != "pull_request" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          CHANGED=$(git diff --name-only "$PR_BASE_SHA" HEAD -- \
-            'integrations/' \
-            'tests/environment/' \
-            'tests/utils/' \
-            'tests/integration/tests/suite/examples/llmd_ext_proc.rs' \
-            'Cargo.toml' \
-            'Cargo.lock' \
-            'Makefile' \
-            '.github/workflows/integration.yaml')
-          if [ -n "$CHANGED" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "No ext-proc-relevant changes; skipping environment suite." >> "$GITHUB_STEP_SUMMARY"
-          fi
+        run: bash .github/scripts/scope-environment-tests.sh environment
 
       - name: Setup Rust
         if: steps.scope.outputs.run == 'true'
@@ -260,6 +343,49 @@ jobs:
       - name: Environment tests
         if: steps.scope.outputs.run == 'true'
         run: make test-environment
+
+  # ----------------------------------------------------------------------------
+  # llmd-ext-proc integration suite
+  #
+  # Split out of the environment job: the praxis-tests-integration ext-proc
+  # suite is the heaviest compile in that group, so running it in the same job
+  # serialized it behind the ext-proc and environment crates. It shares the
+  # pull_request scope helper and adds its own test source (push and merge_group
+  # always run it).
+  # Cache-neutral (registry-only).
+  # ----------------------------------------------------------------------------
+
+  environment-suite:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scope environment suite to relevant changes
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash .github/scripts/scope-environment-tests.sh suite
+
+      - name: Setup Rust
+        if: steps.scope.outputs.run == 'true'
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
+      - name: Environment ext-proc suite
+        if: steps.scope.outputs.run == 'true'
+        run: make test-environment-suite
 
   # ----------------------------------------------------------------------------
   # OpenAI Python SDK vs Azure translation (local fake backend)
@@ -297,16 +423,15 @@ jobs:
         run: uv run tests/integration/sdk/openai/test_azure_chat_completions.py -s
 
   # ----------------------------------------------------------------------------
-  # OpenAI Agents SDK function-tool loop over Responses (local scripted backend)
+  # Responses/agentic feature-boundary checks
   #
-  # One required job, not a per-storage/per-SDK-lane matrix: the Agents SDK owns
-  # its own compatible `openai` dependency (pinned via PEP 723 in the test), and
-  # storage backend is not what this test measures. It proves the SDK-managed
-  # model -> tool -> model loop crosses Praxis's /v1/responses deterministically
-  # with no credentials, network, or inference probability.
+  # Split out of agents-sdk: `make test-responses-features` is a multi-group
+  # feature-boundary compile (~18m) that dominated that job once the other poles
+  # fell. Keeps the agents-sdk-cargo cache (it is the heavy half); the Agents SDK
+  # build + test runs as the sibling below.
   # ----------------------------------------------------------------------------
 
-  agents-sdk:
+  responses-features:
     needs: [changes]
     if: |
       always() &&
@@ -329,10 +454,48 @@ jobs:
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
-          cache-dependency-glob: tests/integration/sdk/openai/test_openai_agents_sdk.py
+          cache-dependency-glob: tests/integration/sdk/openai/test_openai_conversations.py
 
       - name: Check Responses and agentic feature boundaries
         run: make test-responses-features
+
+  # ----------------------------------------------------------------------------
+  # OpenAI Agents SDK function-tool loop over Responses (local scripted backend)
+  #
+  # One required job, not a per-storage/per-SDK-lane matrix: the Agents SDK owns
+  # its own compatible `openai` dependency (pinned via PEP 723 in the test), and
+  # storage backend is not what this test measures. It proves the SDK-managed
+  # model -> tool -> model loop crosses Praxis's /v1/responses deterministically
+  # with no credentials, network, or inference probability. The feature-boundary
+  # checks moved to responses-features above; this job builds the experimental
+  # proxy and runs the SDK loop. Cache-neutral (registry-only).
+  # ----------------------------------------------------------------------------
+
+  agents-sdk:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: tests/integration/sdk/openai/test_openai_agents_sdk.py
 
       - name: Build Praxis with experimental Responses
         run: cargo build -p praxis-ai-proxy --features openai-all,store-sqlite

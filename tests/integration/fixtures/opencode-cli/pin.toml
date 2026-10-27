@@ -202,10 +202,11 @@ permission_env = "OPENCODE_PERMISSION"
 # Backend pins for the GPU nightly lane (`vllm-gpu-opencode-acceptance`). The
 # CPU lane ignores this block entirely; it runs against a scripted backend.
 #
-# Pinned by digest, and deliberately the SAME image the Claude acceptance job
-# uses, so both jobs share the warmed on-disk Hugging Face cache on the
-# ephemeral GPU runner rather than each pulling multi-gigabyte weights.
-image = "docker.io/vllm/vllm-openai:v0.32.0-cu129@sha256:bc0445dac61accbf1c3b17fbb524a71eee0b1b32f55ba45952095e3be8991c3f"
+# Pinned by digest, and deliberately the SAME CUDA 13 image the Claude
+# acceptance job uses, so both jobs share the warmed on-disk Hugging Face cache
+# on the ephemeral GPU runner. The cu129 variant resolves a CUDA 13 torchcodec
+# wheel that cannot load without libnvrtc.so.13.
+image = "docker.io/vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34"
 # Weights, and the exact alias they are served under. The alias is slash-free
 # and matches `[opencode.provider] model_id`: the client addresses the model as
 # `<provider_id>/<model_id>`, so a name containing "/" is unaddressable.
