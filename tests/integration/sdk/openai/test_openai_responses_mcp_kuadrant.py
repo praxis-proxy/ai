@@ -6,7 +6,7 @@
 #     "pytest>=8.0",
 # ]
 # ///
-"""Kuadrant MCP Gateway authorization acceptance — through the Responses agentic loop.
+"""Kuadrant MCP Gateway authorization acceptance — through the full-flow Responses loop.
 
 Proves, end-to-end, that a REAL Kuadrant MCP Gateway enforces per-user tool
 authorization (discovery filtering + per-call authorization) when driven through
@@ -39,8 +39,9 @@ KDIR = REPO / "tests" / "integration" / "kuadrant"
 STACK_ENV = KDIR / ".stack-env"
 MINT = KDIR / "scripts" / "mint_user_jwt.py"
 SCRIPTED_MODEL = KDIR / "scripts" / "scripted_model.py"
+PASSING_NEMO = KDIR / "scripts" / "passing_nemo.py"
 SWITCH = KDIR / "switch_authconfig.sh"
-EXAMPLE_CONFIG = REPO / "examples" / "configs" / "openai" / "responses" / "mcp-kuadrant-gateway.yaml"
+FULL_FLOW_CONFIG = REPO / "examples" / "configs" / "openai" / "responses" / "full-flow-agentic.yaml"
 
 # The MCP tool entry the client sends: connector-only (connector_id, NOT server_url)
 # so Praxis forwards the per-user context; auto-execute (no approval) for items 1-4.
@@ -254,6 +255,58 @@ def _approval_request_id(resp_json):
     return None
 
 
+def _has_final_answer(resp_json):
+    return any(
+        o.get("type") == "message"
+        and o.get("role") == "assistant"
+        and any(
+            c.get("type") == "output_text" and "sunny, 21C" in c.get("text", "")
+            for c in (o.get("content") or [])
+        )
+        for o in (resp_json.get("output") or [])
+    )
+
+
+def _nemo_count(port):
+    return httpx.get(f"http://127.0.0.1:{port}/stats", timeout=5).json()["requests"]
+
+
+def _full_flow_config(proxy_port, model_port, gateway_url, nemo_port, db_path):
+    """Retarget the checked-in full-flow example to this test's local fixtures."""
+    cfg = FULL_FLOW_CONFIG.read_text()
+
+    def replace_exact(old, new, expected=1):
+        nonlocal cfg
+        actual = cfg.count(old)
+        assert actual == expected, (
+            f"expected {expected} occurrences of {old!r}, got {actual}"
+        )
+        cfg = cfg.replace(old, new)
+
+    replace_exact('127.0.0.1:8080', f'127.0.0.1:{proxy_port}')
+    replace_exact('127.0.0.1:3001', f'127.0.0.1:{model_port}', expected=6)
+    replace_exact('http://127.0.0.1:8001/mcp', gateway_url)
+    replace_exact(
+        'sqlite://responses.db?mode=rwc',
+        f'sqlite://{db_path}?mode=rwc',
+        expected=2,
+    )
+    replace_exact(
+        'http://127.0.0.1:3003/v1/checks',
+        f'http://127.0.0.1:{nemo_port}/v1/checks',
+    )
+    return cfg
+
+
+def _stop_process(proc):
+    proc.send_signal(signal.SIGINT)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def _post(praxis_url, user, token, body):
     return httpx.post(praxis_url + "/v1/responses", headers=_headers(user, token), json=body, timeout=90)
 
@@ -313,94 +366,91 @@ def scripted_model():
 
 
 @pytest.fixture(scope="session")
-def praxis(stack, scripted_model):
-    """Real praxis-ai driving the gateway connector + the scripted model, from the
-    committed example config patched to the live ports (Topology A, store:false)."""
-    proxy_port = _free_port()
-    cfg = EXAMPLE_CONFIG.read_text()
-    cfg = cfg.replace("0.0.0.0:8080", f"127.0.0.1:{proxy_port}")
-    cfg = cfg.replace("127.0.0.1:3001", f"127.0.0.1:{scripted_model}")
-    cfg = cfg.replace("http://127.0.0.1:8000/mcp", stack["KUADRANT_GATEWAY_URL"])
-    fd, cfg_path = tempfile.mkstemp(suffix=".yaml", prefix="praxis-kuadrant-")
-    with os.fdopen(fd, "w") as f:
-        f.write(cfg)
+def passing_nemo():
+    """The full-flow config screens tool results through NeMo; keep that real
+    filter in the pipeline while using a deterministic passing endpoint."""
+    port = _free_port()
     proc = subprocess.Popen(
-        [_find_binary(), "-c", cfg_path],
+        [sys.executable, str(PASSING_NEMO)],
+        env={**os.environ, "PORT": str(port)},
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
-        _wait_tcp(proxy_port, 30)
-        yield f"http://127.0.0.1:{proxy_port}"
+        _wait_http(f"http://127.0.0.1:{port}/stats", 15)
+        yield port
     finally:
-        proc.send_signal(signal.SIGINT)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        os.unlink(cfg_path)
+        _stop_process(proc)
 
 
 @pytest.fixture(scope="session")
-def praxis_store(stack, scripted_model):
-    """Like `praxis` but with a file-backed SQLite Responses store armed before
-    dispatch, so approval create/resume survives two client turns (items 5/6b).
-    Requires praxis-ai built with store-sqlite."""
+def praxis(stack, scripted_model, passing_nemo):
+    """Real praxis-ai running the canonical full-flow config against the gateway,
+    scripted model, and passing NeMo fixture (Topology A, store:false)."""
     proxy_port = _free_port()
-    fd_db, db = tempfile.mkstemp(suffix=".db", prefix="kuadrant-store-")
-    os.close(fd_db)
-    os.unlink(db)  # let sqlite create it fresh (mode=rwc); avoids a stale-db 500
-    cfg = EXAMPLE_CONFIG.read_text()
-    cfg = cfg.replace("0.0.0.0:8080", f"127.0.0.1:{proxy_port}")
-    cfg = cfg.replace("127.0.0.1:3001", f"127.0.0.1:{scripted_model}")
-    cfg = cfg.replace("http://127.0.0.1:8000/mcp", stack["KUADRANT_GATEWAY_URL"])
-    store_block = (
-        "      - filter: openai_responses_store\n"
-        "        backend: sqlite\n"
-        f'        database_url: "sqlite://{db}?mode=rwc"\n'
-        "        responses_table: openai_responses\n"
-        "        conversations_table: openai_conversations\n"
-        "      - filter: openai_responses_rehydrate\n"
+    tmpdir = tempfile.TemporaryDirectory(prefix="praxis-kuadrant-")
+    cfg_path = Path(tmpdir.name) / "config.yaml"
+    db_path = Path(tmpdir.name) / "responses.db"
+    cfg_path.write_text(
+        _full_flow_config(
+            proxy_port, scripted_model, stack["KUADRANT_GATEWAY_URL"], passing_nemo, db_path
+        )
     )
-    cfg = cfg.replace(
-        "      - filter: openai_tool_parse\n",
-        "      - filter: openai_tool_parse\n" + store_block,
-        1,
-    )
-    fd, cfg_path = tempfile.mkstemp(suffix=".yaml", prefix="praxis-kuadrant-store-")
-    with os.fdopen(fd, "w") as f:
-        f.write(cfg)
     proc = subprocess.Popen(
-        [_find_binary(), "-c", cfg_path],
+        [_find_binary(), "-c", str(cfg_path)],
+        env={**os.environ, "WEB_SEARCH_API_KEY": "unused-kuadrant-test-key"},
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
         _wait_tcp(proxy_port, 30)
         yield f"http://127.0.0.1:{proxy_port}"
     finally:
-        proc.send_signal(signal.SIGINT)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        os.unlink(cfg_path)
-        if os.path.exists(db):
-            os.unlink(db)
+        _stop_process(proc)
+        tmpdir.cleanup()
+
+
+@pytest.fixture(scope="session")
+def praxis_store(stack, scripted_model, passing_nemo):
+    """Full-flow Praxis process with its configured SQLite stores, so approval
+    create/resume survives two client turns (items 5/6b)."""
+    proxy_port = _free_port()
+    tmpdir = tempfile.TemporaryDirectory(prefix="praxis-kuadrant-store-")
+    cfg_path = Path(tmpdir.name) / "config.yaml"
+    db_path = Path(tmpdir.name) / "responses.db"
+    cfg_path.write_text(
+        _full_flow_config(
+            proxy_port, scripted_model, stack["KUADRANT_GATEWAY_URL"], passing_nemo, db_path
+        )
+    )
+    proc = subprocess.Popen(
+        [_find_binary(), "-c", str(cfg_path)],
+        env={**os.environ, "WEB_SEARCH_API_KEY": "unused-kuadrant-test-key"},
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_tcp(proxy_port, 30)
+        yield f"http://127.0.0.1:{proxy_port}"
+    finally:
+        _stop_process(proc)
+        tmpdir.cleanup()
 
 
 # --- tests -------------------------------------------------------------------
 
-def test_item1_authorized_user_discovers_and_invokes_buffered(stack, praxis, scripted_model):
+def test_item1_authorized_user_discovers_and_invokes_buffered(
+    stack, praxis, scripted_model, passing_nemo
+):
     """userA (tool:get_forecast) discovers weather_get_forecast, the agentic loop
     dispatches it to the gateway, and the real backend executes exactly once."""
     token = _mint(stack, "userA", ROLES_AUTHORIZED)
     _reset_backend(stack)
+    httpx.post(f"http://127.0.0.1:{passing_nemo}/reset", timeout=5)
     r = _responses(praxis, "userA", token, [MCP_TOOL], stream=False)
     assert r.status_code == 200, r.text
     j = r.json()
     assert "weather_get_forecast" in _discovered_tools(j), j
     assert _mcp_call_ok(j), j
+    assert _has_final_answer(j), "the full agentic loop must return to the model after MCP dispatch"
+    assert _nemo_count(passing_nemo) >= 1, "full-flow ai_guardrails must screen the MCP result"
     assert _backend_count(stack, "get_forecast") == 1
 
 
@@ -453,11 +503,12 @@ def test_item3b_gateway_denies_discovered_but_forbidden_call(stack, praxis, scri
         _switch_authconfig("filtered")
 
 
-def test_item1_authorized_streaming(stack, praxis, scripted_model):
+def test_item1_authorized_streaming(stack, praxis, scripted_model, passing_nemo):
     """Streaming equivalent of item 1: userA discovers + invokes over SSE, the
     logical stream completes cleanly, and the backend executes once."""
     token = _mint(stack, "userA", ROLES_AUTHORIZED)
     _reset_backend(stack)
+    httpx.post(f"http://127.0.0.1:{passing_nemo}/reset", timeout=5)
     status, raw = _responses_stream(praxis, "userA", token, [MCP_TOOL])
     assert status == 200, raw
     assert raw.count("event: response.created") == 1, raw
@@ -469,6 +520,8 @@ def test_item1_authorized_streaming(stack, praxis, scripted_model):
         for o in out
     ), raw
     assert any(o.get("type") == "mcp_call" and not o.get("error") and o.get("output") for o in out), raw
+    assert _has_final_answer({"output": out}), "stream must complete the model-tool-model loop"
+    assert _nemo_count(passing_nemo) >= 1, "full-flow ai_guardrails must screen the MCP result"
     assert _backend_count(stack, "get_forecast") == 1
 
 

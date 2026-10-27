@@ -3,7 +3,11 @@
 Stands up a minimal, **no-full-Kubernetes** real Kuadrant MCP Gateway stack in
 containers and proves — through Praxis's OpenAI Responses agentic loop — that the
 gateway enforces per-user tool authorization (discovery filtering + per-call
-authorization). See the design and plan under `docs/superpowers/`.
+authorization). The Praxis process uses the canonical
+`examples/configs/openai/responses/full-flow-agentic.yaml`, retargeted to local
+fixtures. A deterministic passing NeMo endpoint keeps the full-flow tool-result
+guardrails active; the model and MCP backend are also deterministic fixtures.
+See the design and plan under `docs/superpowers/`.
 
 This is **acceptance** of already-delivered Praxis behavior: there are **no Praxis
 product-code changes**.
@@ -44,6 +48,11 @@ minutes cold. Budget ~10–15min on a cold CI runner (30min lane timeout). The g
 lane (`.github/workflows/kuadrant.yaml`) is path-filtered (only MCP courier / harness
 / example-config changes trigger it) and auto-registered as a required check by
 `ci-status.yaml` — no central list edit.
+
+The full-flow configuration also needs `WEB_SEARCH_API_KEY` at startup. The
+acceptance supplies a dummy value because the model never requests web search.
+Both Praxis processes use isolated temporary SQLite databases, and teardown
+removes them.
 
 `stack_up.sh` emits `.stack-env` (git-ignored) with `KUADRANT_GATEWAY_URL`,
 `KUADRANT_ISSUER_PRIV`, `KUADRANT_ISSUER_KID`, `KUADRANT_KUBECONFIG`,

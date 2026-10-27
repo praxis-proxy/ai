@@ -15,6 +15,7 @@ on:
       - "tests/integration/sdk/openai/test_openai_responses_mcp_kuadrant.py"
       - "tests/integration/tests/suite/examples/mcp_kuadrant_gateway.rs"
       - "examples/configs/openai/responses/mcp-kuadrant-gateway.yaml"
+      - "examples/configs/openai/responses/full-flow-agentic.yaml"
       - "apis/src/openai/responses/mcp_tool_resolve/**"
       - "apis/src/openai/responses/mcp_dispatch/**"
       - "apis/src/mcp_client/**"
@@ -81,6 +82,7 @@ jobs:
             'tests/integration/sdk/openai/test_openai_responses_mcp_kuadrant.py' \
             'tests/integration/tests/suite/examples/mcp_kuadrant_gateway.rs' \
             'examples/configs/openai/responses/mcp-kuadrant-gateway.yaml' \
+            'examples/configs/openai/responses/full-flow-agentic.yaml' \
             'apis/src/openai/responses/mcp_tool_resolve/' \
             'apis/src/openai/responses/mcp_dispatch/' \
             'apis/src/mcp_client/' \
