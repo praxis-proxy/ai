@@ -180,7 +180,8 @@ fn gemini_large_request() -> Vec<u8> {
     .unwrap()
 }
 
-/// Build a Gemini request with a large system instruction text.
+/// Isolate the systemInstruction wrapping boundary: one 512 KiB system text
+/// whose single copy decides whether the wrapper serialized it again.
 fn gemini_large_system_request() -> Vec<u8> {
     serde_json::to_vec(&json!({
         "model": "gemini-1.5-pro",
@@ -192,7 +193,8 @@ fn gemini_large_system_request() -> Vec<u8> {
     .unwrap()
 }
 
-/// Build a Gemini request with a large parsed tool-call argument object.
+/// Isolate the parsed-argument boundary: `arguments` arrives as a JSON string
+/// that must be parsed, then moved into `functionCall.args` rather than copied.
 fn gemini_large_arguments_request() -> Vec<u8> {
     let arguments = json!({"payload": "a".repeat(512 * 1024)}).to_string();
     serde_json::to_vec(&json!({
@@ -209,7 +211,8 @@ fn gemini_large_arguments_request() -> Vec<u8> {
     .unwrap()
 }
 
-/// Build a Gemini request carrying a large nested thought signature.
+/// Isolate the nested-signature boundary: a 512 KiB object under
+/// `extra_content.google.thought_signature` that must move onto the Part.
 fn gemini_large_signature_request() -> Vec<u8> {
     serde_json::to_vec(&json!({
         "model": "gemini-1.5-pro",
