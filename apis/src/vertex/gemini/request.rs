@@ -1812,6 +1812,36 @@ mod tests {
     }
 
     #[test]
+    fn parsed_tool_call_arguments_are_moved_not_reserialized() {
+        // `arguments` arrives as a JSON string, so one parse allocation is
+        // unavoidable and has no `Value` pointer to compare. What must not
+        // happen is a second payload-sized copy from wrapping the parsed tree
+        // in `json!` (serialize + re-parse).
+        use std::hint::black_box;
+
+        use allocation_counter::measure;
+
+        const PAYLOAD: usize = 256 * 1024;
+        let arguments = json!({ "payload": "a".repeat(PAYLOAD) }).to_string();
+        let mut call = json!({
+            "id": "call_args", "type": "function",
+            "function": {"name": "lookup", "arguments": arguments}
+        });
+
+        let info = measure(|| {
+            black_box(convert_tool_call(&mut call).unwrap());
+        });
+
+        // One parsed payload copy plus small wrapper maps. A reserialization
+        // would add roughly another payload-sized allocation.
+        let budget = (PAYLOAD + 8 * 1024) as u64;
+        assert!(
+            info.bytes_total <= budget,
+            "parsed arguments must move into functionCall.args without a second copy: {info:?}"
+        );
+    }
+
+    #[test]
     fn tool_call_index_reuses_owned_id_allocation() {
         let mut calls = vec![json!({
             "id": "i".repeat(256 * 1024), "type": "function",
