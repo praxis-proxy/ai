@@ -70,7 +70,7 @@ fn claude_code_lane_is_wired_in_ci() {
     let workflow = repo_root().join(".github/workflows/integration.yaml");
     let yaml = std::fs::read_to_string(&workflow).expect("integration workflow should be readable");
     let needle = format!("CLAUDE_CODE_PINNED_VERSION: \"{CLAUDE_CODE_PINNED_VERSION}\"");
-    let step = workflow_step(workflow_job(&yaml, "test-integration"), INSTALL_STEP);
+    let step = workflow_step(&workflow_job(&yaml, "test-integration"), INSTALL_STEP);
     assert!(
         step.contains(&needle),
         "the `test-integration` job's {INSTALL_STEP:?} step in {} must set {needle:?}",
@@ -83,27 +83,18 @@ const INSTALL_STEP: &str = "Install pinned Claude Code CLI";
 
 /// The text of the step named `name` in a workflow job, from its `- name:` line
 /// up to the job's next step.
-fn workflow_step<'a>(job: &'a str, name: &str) -> &'a str {
+fn workflow_step(job: &str, name: &str) -> String {
     let header = format!("- name: {name}");
-    let mut start = None;
-    let mut offset = 0;
-    for line in job.split_inclusive('\n') {
-        let content = line.trim_end();
-        let indent = content.len() - content.trim_start().len();
-        match start {
-            None if content.trim_start() == header => start = Some((offset, indent)),
-            Some((begin, step_indent))
-                if !content.is_empty()
-                    && (indent < step_indent || (indent == step_indent && content.trim_start().starts_with("- "))) =>
-            {
-                return &job[begin..offset];
-            },
-            _ => {},
-        }
-        offset += line.len();
-    }
-    let (begin, _) = start.unwrap_or_else(|| panic!("job should have a step named {name:?}"));
-    &job[begin..]
+    let mut lines = job.lines().skip_while(|line| line.trim() != header);
+    let first = lines
+        .next()
+        .unwrap_or_else(|| panic!("job should have a step named {name:?}"));
+    let step_indent = first.len() - first.trim_start().len();
+    let body = lines.take_while(|line| {
+        let indent = line.len() - line.trim_start().len();
+        line.trim().is_empty() || indent > step_indent
+    });
+    std::iter::once(first).chain(body).collect::<Vec<_>>().join("\n")
 }
 
 #[test]

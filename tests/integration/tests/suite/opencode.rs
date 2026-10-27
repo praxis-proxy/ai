@@ -178,21 +178,14 @@ pub(super) fn repo_root() -> PathBuf {
 /// A plain text scan is enough because the workflows keep the standard
 /// two-space job keys; it scopes a pin check to one job so another job's
 /// assignment cannot satisfy it.
-pub(super) fn workflow_job<'a>(yaml: &'a str, job: &str) -> &'a str {
+pub(super) fn workflow_job(yaml: &str, job: &str) -> String {
     let header = format!("  {job}:");
-    let mut start = None;
-    let mut offset = 0;
-    for line in yaml.split_inclusive('\n') {
-        let content = line.trim_end();
-        match start {
-            None if content == header => start = Some(offset),
-            Some(begin) if !content.is_empty() && !content.starts_with("    ") => return &yaml[begin..offset],
-            _ => {},
-        }
-        offset += line.len();
-    }
-    let begin = start.unwrap_or_else(|| panic!("workflow should define job `{job}`"));
-    &yaml[begin..]
+    let mut lines = yaml.lines().skip_while(|line| line.trim_end() != header);
+    let first = lines
+        .next()
+        .unwrap_or_else(|| panic!("workflow should define job `{job}`"));
+    let body = lines.take_while(|line| line.trim_end().is_empty() || line.starts_with("    "));
+    std::iter::once(first).chain(body).collect::<Vec<_>>().join("\n")
 }
 
 /// The gateway password these tests inject in place of `GATEWAY_AUTH_PASSWORD`.
