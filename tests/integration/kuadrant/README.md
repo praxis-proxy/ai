@@ -39,7 +39,7 @@ bash tests/integration/kuadrant/teardown.sh          # add --purge to drop .run/
 Measured runtime (local, warm image cache): stack-up ~30s; the 18-case
 buffered+streaming matrix ~2min (the item-6 live-revocation cases dominate — each
 applies a revoked AuthConfig, confirms the reconcile, then restores). The praxis-ai
-build (`make test-kuadrant-acceptance` rebuilds with `full,store-sqlite`) adds a few
+build (`make test-kuadrant-acceptance` rebuilds with `full,openai-all,store-sqlite`) adds a few
 minutes cold. Budget ~10–15min on a cold CI runner (30min lane timeout). The gated
 lane (`.github/workflows/kuadrant.yaml`) is path-filtered (only MCP courier / harness
 / example-config changes trigger it) and auto-registered as a required check by

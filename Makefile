@@ -358,7 +358,7 @@ test-token-rate-limit-valkey-integration:
 # container engine (CONTAINER_ENGINE, default: podman then docker), kubectl, uv,
 # openssl, curl.
 test-kuadrant-acceptance:
-	cargo build -p praxis-ai-proxy --features full,store-sqlite
+	cargo build -p praxis-ai-proxy --features full,openai-all,store-sqlite
 	bash tests/integration/kuadrant/stack_up.sh
 	uv run tests/integration/sdk/openai/test_openai_responses_mcp_kuadrant.py $(if $(V),-v,-q) ; \
 		status=$$? ; bash tests/integration/kuadrant/teardown.sh ; exit $$status
