@@ -129,8 +129,9 @@ async fn opencode_v2_vllm_tool_call_round_trip_writes_hash_verified_marker() {
     // 2.x renamed the 1.x `bash` tool to `shell`; naming the wrong tool would
     // leave the model to guess.
     let prompt = format!(
-        "Use the {tool} tool. Run exactly: cp {source} {target}. \
-         Then reply DONE. Do not print the file contents. /no_think",
+        "Use the {tool} tool exactly once to run: cp {source} {target} && echo COPY_OK. \
+         After the tool returns COPY_OK, reply exactly DONE and stop. \
+         Do not call any tool again or print the file contents. /no_think",
         tool = pin_value("shell_tool"),
         source = ToolWorkspace::SOURCE,
         target = ToolWorkspace::TARGET,
