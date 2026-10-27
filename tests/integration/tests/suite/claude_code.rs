@@ -132,8 +132,6 @@ async fn pinned_claude_code_completes_messages_coding_workflow() {
     let workspace = TempWorkspace::new().expect("failed to create temporary workspace");
     let expected_content = workspace.expected_content();
 
-    let title_sse = "data: {\"id\":\"chatcmpl-title\",\"object\":\"chat.completion.chunk\",\"created\":1677652287,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"{\\\"title\\\": \\\"Inspect and Update Task\\\"}\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-title\",\"object\":\"chat.completion.chunk\",\"created\":1677652287,\"model\":\"claude-3-5-sonnet-20241027\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":10,\"total_tokens\":20}}\n\ndata: [DONE]\n\n".to_owned();
-
     let bash_args_json = serde_json::json!({
         "command": format!("sh -c 'echo {expected_content} > result.txt && ./verify.sh'")
     });
@@ -158,7 +156,10 @@ async fn pinned_claude_code_completes_messages_coding_workflow() {
 
     let fallback_sse = "data: {\"id\":\"chatcmpl-fallback\",\"object\":\"chat.completion.chunk\",\"created\":1677652291,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Task completed.\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
 
-    let mut responses = vec![(200, title_sse), (200, turn1_sse), (200, turn2_sse)];
+    // The pinned client runs `claude -p` outside an SDK or IDE, so it sends no
+    // background auto-title request (removed in Claude Code 2.1.277). The first
+    // backend request is therefore the first turn of the coding task.
+    let mut responses = vec![(200, turn1_sse), (200, turn2_sse)];
     for _ in 0..20 {
         responses.push((200, fallback_sse.to_owned()));
     }
