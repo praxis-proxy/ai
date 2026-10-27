@@ -36,7 +36,10 @@ fn example_config_loads_and_pipeline_builds() {
         "/../../examples/configs/openai/responses/mcp-kuadrant-gateway.yaml"
     ))
     .expect("example config present");
-    assert!(raw.contains("id: trusted-mcp"), "connector id trusted-mcp must be declared");
+    assert!(
+        raw.contains("id: trusted-mcp"),
+        "connector id trusted-mcp must be declared"
+    );
     assert_eq!(
         raw.matches("user_credential: mcp_gateway").count(),
         2,
