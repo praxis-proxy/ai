@@ -14,6 +14,8 @@ use crate::GcpAdcFilter;
 use crate::HttpCalloutFilter;
 #[cfg(feature = "inflight-tracker-filter")]
 use crate::InFlightTrackerFilter;
+#[cfg(feature = "model-catalog-filter")]
+use crate::ModelCatalogFilter;
 #[cfg(feature = "aws-sigv4-filter")]
 use crate::Sigv4SignFilter;
 #[cfg(feature = "token-ceiling-filter")]
@@ -241,6 +243,11 @@ fn register_inference_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "llmisvc_model_provider_resolver" => LlmisvcModelProviderResolverFilter::from_config
+    );
+    #[cfg(feature = "model-catalog-filter")]
+    praxis_filter::register_filters!(
+        @register registry,
+        http "model_catalog" => ModelCatalogFilter::from_config
     );
 }
 
@@ -945,6 +952,7 @@ provider:
         assert_experimental_registration(&names, "token_rate_limit", cfg!(feature = "token-rate-limit-filter"));
         assert_experimental_registration(&names, "token_ceiling", cfg!(feature = "token-ceiling-filter"));
         assert_experimental_registration(&names, "inflight_tracker", cfg!(feature = "inflight-tracker-filter"));
+        assert_experimental_registration(&names, "model_catalog", cfg!(feature = "model-catalog-filter"));
     }
 
     /// Every opt-in filter paired with whether its cargo feature is enabled.

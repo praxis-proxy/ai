@@ -15,6 +15,8 @@ pub mod aws;
 pub mod azure;
 #[cfg(feature = "http-callout-filter")]
 pub mod callout;
+#[cfg(feature = "model-catalog-filter")]
+pub mod catalog;
 #[cfg(feature = "gcp-adc-filter")]
 pub mod gcp;
 pub mod guardrails;
@@ -42,6 +44,8 @@ pub use aws::Sigv4SignFilter;
 pub use azure::AzureAdFilter;
 #[cfg(feature = "http-callout-filter")]
 pub use callout::HttpCalloutFilter;
+#[cfg(feature = "model-catalog-filter")]
+pub use catalog::ModelCatalogFilter;
 #[cfg(feature = "gcp-adc-filter")]
 pub use gcp::GcpAdcFilter;
 pub use guardrails::AiGuardrailsFilter;

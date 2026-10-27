@@ -1,0 +1,75 @@
+# Principal-aware model catalog
+#
+# Serve an OpenAI-compatible GET /v1/models listing from the proxy, filtered by
+# the authenticated caller. basic_auth publishes the verified subject, and
+# model_catalog lists only the entries that subject may see. A hidden model
+# returns the same 404 as an unknown one. Catalog IDs match the public IDs that
+# model_to_provider routes, aliases included. Capabilities and cost tiers are
+# operator-declared metadata, not verified upstream. The catalog controls
+# discovery only; enforcing model access on inference requests is a separate
+# policy concern.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy --features basic-auth-filter,model-catalog-filter -- -c examples/configs/model-catalog.yaml
+#   curl -u viewer:example-password http://localhost:8080/v1/models
+#   curl -u ml-engineer:example-password http://localhost:8080/v1/models/claude-sonnet-4-5
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: basic_auth
+        strip_authorization: true
+        credentials:
+          - username: viewer
+            password: "example-password"
+          - username: ml-engineer
+            password: "example-password"
+
+      - filter: model_catalog
+        created: 1735689600
+        models:
+          - id: gpt-4o
+            provider: openai
+            capabilities: [chat_completions, responses]
+            cost_tier: standard
+            aliases: [gpt4o]
+          - id: claude-sonnet-4-5
+            owned_by: anthropic
+            provider: vertex
+            capabilities: [messages]
+            cost_tier: premium
+            visible_to:
+              subjects: [ml-engineer]
+
+      - filter: model_to_provider
+        models:
+          - model: gpt-4o
+            upstream: openai
+            target_model: gpt-4o
+            paths: [/v1/chat/completions, /v1/responses]
+          - model: gpt4o
+            upstream: openai
+            target_model: gpt-4o
+            paths: [/v1/chat/completions, /v1/responses]
+          - model: claude-sonnet-4-5
+            upstream: vertex
+            target_model: claude-sonnet-4-5@20250929
+            paths: [/v1/messages]
+
+      - filter: load_balancer
+        clusters:
+          - name: openai
+            endpoints:
+              - "127.0.0.1:3000"
+          - name: vertex
+            endpoints:
+              - "127.0.0.1:3001"
+
+insecure_options:
+  allow_private_endpoints: true
