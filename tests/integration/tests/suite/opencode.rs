@@ -172,6 +172,29 @@ pub(super) fn repo_root() -> PathBuf {
         .expect("repository root should resolve")
 }
 
+/// The text of job `job` in a GitHub Actions workflow, from its `  job:` key
+/// line up to the next line indented less than the job's body.
+///
+/// A plain text scan is enough because the workflows keep the standard
+/// two-space job keys; it scopes a pin check to one job so another job's
+/// assignment cannot satisfy it.
+pub(super) fn workflow_job<'a>(yaml: &'a str, job: &str) -> &'a str {
+    let header = format!("  {job}:");
+    let mut start = None;
+    let mut offset = 0;
+    for line in yaml.split_inclusive('\n') {
+        let content = line.trim_end();
+        match start {
+            None if content == header => start = Some(offset),
+            Some(begin) if !content.is_empty() && !content.starts_with("    ") => return &yaml[begin..offset],
+            _ => {},
+        }
+        offset += line.len();
+    }
+    let begin = start.unwrap_or_else(|| panic!("workflow should define job `{job}`"));
+    &yaml[begin..]
+}
+
 /// The gateway password these tests inject in place of `GATEWAY_AUTH_PASSWORD`.
 ///
 /// Drawn once per test process from the OS RNG rather than a source literal, so

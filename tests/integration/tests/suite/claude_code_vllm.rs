@@ -139,8 +139,10 @@ const CLAUDE_CODE_MAX_CONTEXT_TOKENS: &str = "32768";
 /// [`CLAUDE_CODE_MAX_OUTPUT_TOKENS`] bounds each turn's output.
 ///
 /// CRITICAL headroom constraint: Claude Code reserves 2,048 output tokens and
-/// 13,000 compaction tokens (measured on 2.1.267; re-validate on a bump), so
-/// its effective auto-compaction threshold is `window - 15048`. A single ballast Read must be comfortably
+/// 13,000 compaction tokens (measured on 2.1.267; this scenario still
+/// self-compacts mid-task with these values on 2.1.278; re-validate on a bump),
+/// so its effective auto-compaction threshold is `window - 15048`. A single
+/// ballast Read must be comfortably
 /// SMALLER than that headroom, otherwise one post-compaction read immediately
 /// re-crosses the threshold and the client's rapid-refill breaker aborts the
 /// run. At 30,000 the usable headroom is ~14,952 tokens, dwarfing a single

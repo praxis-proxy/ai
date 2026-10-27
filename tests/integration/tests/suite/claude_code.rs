@@ -21,7 +21,7 @@ use praxis_test_utils::{StatefulCapturingBackend, free_port, start_proxy};
 
 use super::{
     harness::{CLAUDE_CODE_PINNED_VERSION, TempWorkspace},
-    opencode::{pin_value_in, repo_root},
+    opencode::{pin_value_in, repo_root, workflow_job},
 };
 
 /// The Claude Code pin manifest, relative to this crate's `fixtures/` directory.
@@ -70,11 +70,40 @@ fn claude_code_lane_is_wired_in_ci() {
     let workflow = repo_root().join(".github/workflows/integration.yaml");
     let yaml = std::fs::read_to_string(&workflow).expect("integration workflow should be readable");
     let needle = format!("CLAUDE_CODE_PINNED_VERSION: \"{CLAUDE_CODE_PINNED_VERSION}\"");
+    let step = workflow_step(workflow_job(&yaml, "test-integration"), INSTALL_STEP);
     assert!(
-        yaml.contains(&needle),
-        "{} must install the pinned Claude Code with {needle:?}",
+        step.contains(&needle),
+        "the `test-integration` job's {INSTALL_STEP:?} step in {} must set {needle:?}",
         workflow.display()
     );
+}
+
+/// The CPU lane's workflow step that installs the pinned Claude Code from npm.
+const INSTALL_STEP: &str = "Install pinned Claude Code CLI";
+
+/// The text of the step named `name` in a workflow job, from its `- name:` line
+/// up to the job's next step.
+fn workflow_step<'a>(job: &'a str, name: &str) -> &'a str {
+    let header = format!("- name: {name}");
+    let mut start = None;
+    let mut offset = 0;
+    for line in job.split_inclusive('\n') {
+        let content = line.trim_end();
+        let indent = content.len() - content.trim_start().len();
+        match start {
+            None if content.trim_start() == header => start = Some((offset, indent)),
+            Some((begin, step_indent))
+                if !content.is_empty()
+                    && (indent < step_indent || (indent == step_indent && content.trim_start().starts_with("- "))) =>
+            {
+                return &job[begin..offset];
+            },
+            _ => {},
+        }
+        offset += line.len();
+    }
+    let (begin, _) = start.unwrap_or_else(|| panic!("job should have a step named {name:?}"));
+    &job[begin..]
 }
 
 #[test]

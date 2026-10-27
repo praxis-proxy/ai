@@ -192,7 +192,8 @@ permission_mode = "acceptEdits"
 allowed_tools = ["Read", "Edit", "Bash"]
 # Lowered client window that forces the client to auto-compact mid-task. Must be
 # > 0 and < vllm.context_length (the pins job asserts both). Claude Code
-# reserves 2,048 output + 13,000 compaction tokens (measured on 2.1.267;
+# reserves 2,048 output + 13,000 compaction tokens (measured on 2.1.267; the
+# GPU lane still self-compacts mid-task with these values on 2.1.278;
 # re-validate on a bump), so the usable
 # auto-compaction threshold is `max_context_tokens - 15048` (~14,952 here). A
 # single ballast read must stay well under that headroom or one post-compaction

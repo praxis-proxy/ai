@@ -10,7 +10,7 @@
 
 use super::{
     harness::CODEX_PINNED_VERSION,
-    opencode::{fixture_path, pin_value_in, repo_root},
+    opencode::{fixture_path, pin_value_in, repo_root, workflow_job},
 };
 
 /// The Codex pin manifest, relative to this crate's `fixtures/` directory.
@@ -81,19 +81,24 @@ fn codex_lanes_are_wired_in_ci() {
     // job-level CODEX_VERSION, so that env is the only workflow site. Any other
     // literal occurrence of the version is a site a bump would miss.
     let pinned = format!("CODEX_VERSION: \"{CODEX_PINNED_VERSION}\"");
-    for (workflow, jobs) in [("integration.yaml", 2), ("vllm-integration.yaml", 1)] {
+    for (workflow, jobs) in [
+        ("integration.yaml", &["codex-http", "codex-websocket"][..]),
+        ("vllm-integration.yaml", &["vllm-gpu-codex-acceptance"][..]),
+    ] {
         let path = repo_root().join(".github/workflows").join(workflow);
         let yaml = std::fs::read_to_string(&path).expect("workflow should be readable");
-        assert_eq!(
-            yaml.matches(&pinned).count(),
-            jobs,
-            "{} must set {pinned:?} in each of its {jobs} Codex job(s)",
-            path.display()
-        );
+        for job in jobs {
+            assert_eq!(
+                workflow_job(&yaml, job).matches(&pinned).count(),
+                1,
+                "the `{job}` job in {} must set {pinned:?} once",
+                path.display()
+            );
+        }
         assert_eq!(
             yaml.matches(CODEX_PINNED_VERSION).count(),
-            jobs,
-            "{} must not hardcode the Codex version outside CODEX_VERSION",
+            jobs.len(),
+            "{} must not hardcode the Codex version outside each Codex job's CODEX_VERSION",
             path.display()
         );
     }
