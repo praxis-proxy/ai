@@ -479,6 +479,11 @@ impl OpenCodeTrace {
         self.events.iter().filter_map(|event| event["type"].as_str()).collect()
     }
 
+    /// Raw events in the order emitted by the client.
+    pub(super) fn events(&self) -> &[Value] {
+        &self.events
+    }
+
     /// Concatenated assistant text across all `text` events.
     pub(super) fn assistant_text(&self) -> String {
         self.events
