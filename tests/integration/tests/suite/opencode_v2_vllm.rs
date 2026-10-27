@@ -130,7 +130,8 @@ async fn opencode_v2_vllm_tool_call_round_trip_writes_hash_verified_marker() {
     // leave the model to guess.
     let prompt = format!(
         "Use the {tool} tool exactly once to run: cp {source} {target} && echo COPY_OK. \
-         After the tool returns COPY_OK, reply exactly DONE and stop. \
+         Do not emit any text until the tool returns COPY_OK. \
+         Then reply exactly DONE and stop. \
          Do not call any tool again or print the file contents. /no_think",
         tool = pin_value("shell_tool"),
         source = ToolWorkspace::SOURCE,
@@ -144,13 +145,15 @@ async fn opencode_v2_vllm_tool_call_round_trip_writes_hash_verified_marker() {
     // marker rather than anything the client could have rewritten.
     workspace.assert_marker_copied();
 
-    // Oracle B: the client actually invoked a tool, rather than the file
-    // happening to exist. Lenient about event shape, strict about the fact.
+    // Oracle B: the client invoked exactly one tool and returned the requested
+    // final answer, rather than passing only because the file happened to exist.
     let types = trace.event_types();
-    assert!(
-        types.iter().any(|event| event.contains("tool")),
-        "the turn should contain at least one tool event, got {types:?}"
+    let tool_use_count = types.iter().filter(|event| **event == "tool_use").count();
+    assert_eq!(
+        tool_use_count, 1,
+        "the turn should contain exactly one tool_use event, got {types:?}"
     );
+    assert_eq!(trace.assistant_text().trim(), "DONE");
 }
 
 // -----------------------------------------------------------------------------
