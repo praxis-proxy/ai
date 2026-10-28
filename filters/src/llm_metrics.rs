@@ -120,24 +120,27 @@ fn ensure_described() {
 /// Distinct values are capped at [`MAX_MODEL_LABELS`] for the process
 /// lifetime; values arriving after the cap are labeled `"other"`.
 pub fn resolve_model(ctx: &HttpFilterContext<'_>) -> String {
-    let model = ctx
-        .get_metadata("openai_responses_request.model")
-        .or_else(|| ctx.get_metadata("openai_chat_completions_request.model"))
-        .or_else(|| ctx.get_metadata("anthropic_messages_request.model"))
-        .or_else(|| ctx.get_metadata("anthropic_messages_to_chat_completions.model"))
+    // Validate each candidate independently so an invalid value from one
+    // format filter cannot suppress a later valid model_to_header value.
+    let model = [
+        "openai_responses_request.model",
+        "openai_chat_completions_request.model",
+        "anthropic_messages_request.model",
+        "anthropic_messages_to_chat_completions.model",
         // The model_to_header filter publishes the client-requested model as
         // `model_to_header.model` metadata before token_count runs; fall back to
         // it so the label is populated even when no format filter ran. Only that
         // server-published, header-safety-validated value is used — a raw
         // client-supplied `X-Model` request header is never read, so clients
-        // cannot spoof the label. On chains without a model allowlist the value
-        // still originates from the request body, so admitted values are
-        // hard-capped at MAX_MODEL_LABELS for the recorder lifetime (the
-        // exporter has no idle eviction); values beyond the cap are labeled
-        // "other" instead of growing the registry.
-        .or_else(|| ctx.get_metadata(META_MODEL_TO_HEADER_MODEL))
-        .filter(|v| !v.is_empty() && is_promotable_value(v))
-        .unwrap_or("unknown");
+        // cannot spoof the label.
+        META_MODEL_TO_HEADER_MODEL,
+    ]
+    .into_iter()
+    .find_map(|key| {
+        ctx.get_metadata(key)
+            .filter(|value| !value.is_empty() && is_promotable_value(value))
+    })
+    .unwrap_or("unknown");
     if model == OTHER_MODEL_LABEL || model == "unknown" {
         return model.to_owned();
     }
@@ -314,6 +317,15 @@ mod tests {
     fn resolve_model_uses_model_to_header_metadata() {
         let req = crate::test_utils::make_request(Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
+        ctx.set_metadata("model_to_header.model", "gpt-header");
+        assert_eq!(resolve_model(&ctx), "gpt-header");
+    }
+
+    #[test]
+    fn resolve_model_falls_through_invalid_format_metadata() {
+        let req = crate::test_utils::make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        ctx.set_metadata("openai_chat_completions_request.model", "bad\nmodel");
         ctx.set_metadata("model_to_header.model", "gpt-header");
         assert_eq!(resolve_model(&ctx), "gpt-header");
     }
