@@ -360,8 +360,12 @@ class TestNativePassthrough:
         for expected in ["message_start", "content_block_start", "content_block_delta",
                          "message_delta", "message_stop"]:
             assert expected in kinds, f"native SSE lifecycle must include {expected}: {kinds}"
-        assert kinds.index("message_start") < kinds.index("content_block_delta")
-        assert kinds.index("content_block_delta") < kinds.index("message_stop")
+        assert kinds.index("message_start") < kinds.index("content_block_delta"), (
+            f"message_start must precede content_block_delta: {kinds}"
+        )
+        assert kinds.index("content_block_delta") < kinds.index("message_stop"), (
+            f"content_block_delta must precede message_stop: {kinds}"
+        )
 
     def test_tool_use_round_trip(self, native_client):
         NATIVE_STATE.script(200, "application/json", _anthropic_message(
