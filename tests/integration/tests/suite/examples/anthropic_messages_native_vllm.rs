@@ -32,9 +32,9 @@ use std::{
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    assert_error_is_anthropic_shaped, assert_error_is_openai_shaped, basic_auth_header, free_port, http_send,
-    json_post_with_header, parse_body, parse_status, start_capturing_backend, start_header_echo_backend, start_proxy,
-    start_uri_echo_backend,
+    StatefulCapturingBackend, assert_error_is_anthropic_shaped, assert_error_is_openai_shaped, basic_auth_header,
+    free_port, http_send, json_post_with_header, parse_body, parse_status, start_capturing_backend,
+    start_header_echo_backend, start_proxy, start_uri_echo_backend,
 };
 
 use super::load_example_config;
@@ -366,6 +366,43 @@ fn native_vllm_rejects_unauthenticated_gateway_request() {
         401,
         "an unauthenticated caller must be rejected by the gateway"
     );
+}
+
+/// Anthropic SDK v2 sends its API key as `Authorization: Bearer`, the other
+/// form of the credential the v1 SDK sends in `x-api-key`. This native chain
+/// terminates gateway auth with `basic_auth`, which only accepts `Basic`, so a
+/// v2 caller is rejected before routing and its Anthropic key never reaches the
+/// backend. The legacy form is covered by
+/// `native_vllm_strips_client_credentials_and_injects_backend_bearer`.
+#[test]
+fn native_vllm_rejects_sdk_v2_bearer_gateway_credential() {
+    let backend = StatefulCapturingBackend::new(vec![(200, "{}".to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let config = native_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"claude-opus-4-8","max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#;
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header("/v1/messages", body, "Authorization: Bearer client-anthropic-secret"),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        401,
+        "a bearer-only caller must not pass basic_auth: {raw}"
+    );
+    let forwarded_posts = backend
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "POST")
+        .count();
+    assert_eq!(
+        forwarded_posts, 0,
+        "the rejected caller's credential must never reach the backend"
+    );
+
+    drop(proxy);
 }
 
 // -----------------------------------------------------------------------------

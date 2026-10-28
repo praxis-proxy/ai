@@ -12,6 +12,16 @@
 //! The name refers to the Chat Completions wire shape, not the OpenAI
 //! Responses API: any Chat Completions-compatible backend is a valid
 //! target, not only OpenAI.
+//!
+//! # Client credentials stop here
+//!
+//! Translation ends the Anthropic wire contract, so an Anthropic credential
+//! has no meaning to the Chat Completions backend. The filter therefore removes
+//! both forms a client SDK may use (the legacy `x-api-key` header and the
+//! `Authorization: Bearer` header SDK v2 sends) alongside the Anthropic-only
+//! headers. Removal is queued before any server-owned credential is injected, so
+//! `credential_injection` and `credential_inject` still install the backend's own
+//! token on the same header.
 
 mod config;
 pub(crate) mod request;
@@ -283,6 +293,12 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         ctx.request_headers_to_remove
             .push(http::header::HeaderName::from_static("anthropic-version"));
+        // Both SDK credential forms. A v2 client sends its key as
+        // `Authorization: Bearer`, and a Chat Completions backend would read
+        // that as its own credential; leaving it in place leaks the caller's
+        // Anthropic key upstream. `credential_injection` runs later and still
+        // replaces it with the server-owned token.
+        ctx.request_headers_to_remove.push(http::header::AUTHORIZATION);
         ctx.request_headers_to_remove
             .push(http::header::HeaderName::from_static("x-api-key"));
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
@@ -1164,6 +1180,31 @@ mod tests {
             ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING),
             "response transformation requires an unencoded upstream representation"
         );
+    }
+
+    /// Both SDK credential forms must be queued for removal, because a Chat
+    /// Completions backend cannot tell an Anthropic key from its own. The
+    /// earliest form is the legacy `x-api-key` header; SDK v2 sends
+    /// `Authorization: Bearer`.
+    #[tokio::test]
+    async fn on_request_removes_both_client_credential_forms() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        for header in [
+            http::header::AUTHORIZATION,
+            http::header::HeaderName::from_static("x-api-key"),
+            http::header::HeaderName::from_static("anthropic-version"),
+        ] {
+            assert!(
+                ctx.request_headers_to_remove.contains(&header),
+                "translation must scrub the client {header} header so it cannot reach a Chat Completions backend"
+            );
+        }
     }
 
     #[test]

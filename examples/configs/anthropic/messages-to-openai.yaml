@@ -7,7 +7,11 @@
 # wire formats it bridges. It targets the Chat Completions wire shape,
 # so any Chat Completions-compatible backend can use it, not only OpenAI.
 #
-# Request: system hoisting, content block flattening, tool mapping.
+# Request: system hoisting, content block flattening, tool mapping, and
+# removal of both client credential headers (`x-api-key` and `Authorization`)
+# so a caller's Anthropic key cannot reach the Chat Completions backend. A
+# `credential_injection` later in the chain still installs the backend's own
+# token, because header removals are applied before injected values.
 # Response: content blocks, stop_reason, usage mapping back to
 # Anthropic format. Streaming responses are converted by
 # `anthropic_messages_to_chat_completions_stream`.
