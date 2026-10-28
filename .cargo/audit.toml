@@ -29,4 +29,6 @@ ignore = [
     # zstd-safe 7.3.0: uninitialized memory exposed when streaming
     # decompression of a legacy frame fails
     "RUSTSEC-2026-0403",
+    # zstd-safe 7.3.0: use-after-free with `CParameter::StableInBuffer`
+    "RUSTSEC-2026-0414",
 ]

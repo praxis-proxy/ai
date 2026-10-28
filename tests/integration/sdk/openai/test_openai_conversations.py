@@ -2606,8 +2606,14 @@ def test_configuration_update_controls_subsequent_inference(conversation_backend
             }
         ],
     )
-    for explicit, expected in [(None, "high"), ("medium", "medium"), (None, "high")]:
-        kwargs = {} if explicit is None else {"reasoning": {"effort": explicit}}
+    for reasoning, expected in [
+        (None, "high"),
+        ({"effort": "medium"}, "medium"),
+        ({"effort": None}, None),
+        ({}, "high"),
+        (None, "high"),
+    ]:
+        kwargs = {} if reasoning is None else {"reasoning": reasoning}
         response = client.responses.create(
             model="test-model",
             conversation=conversation.id,
@@ -2629,10 +2635,19 @@ def test_configuration_update_controls_subsequent_inference(conversation_backend
         assert (
             effort == expected
         ), f"forwarded reasoning effort must be {expected}, got {effort}"
+        if reasoning == {"effort": None} and not translated:
+            # The effort lookup alone cannot distinguish a forwarded explicit
+            # null from a dropped reasoning object, so pin the native body.
+            assert "reasoning" in body, (
+                "explicit null effort must keep the reasoning object"
+            )
+            assert body["reasoning"]["effort"] is None, (
+                "explicit null effort must be forwarded as null, not dropped"
+            )
         assert "configuration_update" not in json.dumps(
             body.get("messages" if translated else "input")
         ), "configuration_update must be consumed, not forwarded as history"
-    assert len(captured) == 3, "each of the three turns must reach the backend once"
+    assert len(captured) == 5, "each of the five turns must reach the backend once"
 
 
 @pytest.fixture(params=["/reasoning", "/reasoning/effort"], ids=["member", "effort"])

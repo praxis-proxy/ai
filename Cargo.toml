@@ -45,7 +45,7 @@ http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 humantime-serde = "1.1.1"
-jsonschema = { version = "0.58.1", default-features = false }
+jsonschema = { version = "0.60.1", default-features = false }
 nix = { version = "0.31.3", default-features = false, features = ["process", "resource", "signal", "user"] }
 percent-encoding = "2.3.2"
 notify = "8.2.0"
@@ -73,7 +73,7 @@ rustls-pki-types = "1.15.1"
 schemars = "1.2.2"
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
-serde_json_canonicalizer = "0.3.2"
+serde_json_canonicalizer = "0.4.1"
 serde_json = { version = "1.0.151", features = ["preserve_order", "raw_value"] }
 serde_json_path = "0.7.2"
 sha2 = "0.11.0"
@@ -107,7 +107,7 @@ prost = "0.14.4"
 prost-build = "0.14.4"
 prost-types = "0.14.4"
 prost-wkt-types = { version = "0.7.2", features = ["vendored-protox"] }
-protox = "0.9.1"
+protox = "0.10.0"
 sync_wrapper = "1.0.2"
 tonic = "0.14.6"
 tonic-prost = "0.14.6"

@@ -10424,6 +10424,7 @@ STRUCTURED_OUTPUT_SCHEMA_CASES = [
             "additionalProperties": False,
         },
         marks=pytest.mark.xfail(
+            condition=VLLM_MODEL == "Qwen/Qwen3-0.6B",
             strict=False,
             raises=json.JSONDecodeError,
             reason="CPU Qwen3-0.6B can exhaust the output limit for this schema",
