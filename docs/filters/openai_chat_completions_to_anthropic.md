@@ -19,7 +19,7 @@ The compatibility contract defaults an omitted token limit to 4096 and ignores `
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `api_translation_enabled` | bool | yes | Permission from trusted application configuration. Anthropic requests fail closed when this is false. |
+| `api_translation_enabled` | bool | no | Permission from trusted application configuration. Anthropic requests fail closed when this is false (the default). |
 | `max_body_bytes` | integer | no | Compatibility setting for the former shared request/response limit. A direction-specific limit takes precedence when set. |
 | `max_request_body_bytes` | integer | no | Maximum complete translated Chat Completions request body. |
 | `max_response_body_bytes` | integer | no | Maximum complete Anthropic JSON response body retained for conversion. |

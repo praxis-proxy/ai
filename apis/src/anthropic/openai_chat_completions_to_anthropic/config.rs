@@ -18,7 +18,8 @@ const DEFAULT_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct OpenaiChatCompletionsToAnthropicConfig {
     /// Permission from trusted application configuration. Anthropic requests
-    /// fail closed when this is false.
+    /// fail closed when this is false (the default).
+    #[serde(default)]
     pub(crate) api_translation_enabled: bool,
     /// Compatibility setting for the former shared request/response limit.
     /// A direction-specific limit takes precedence when set.
@@ -68,6 +69,7 @@ mod tests {
         let validation = OpenaiChatCompletionsToAnthropicConfig::default().validate();
         assert!(validation.is_ok(), "default limits must validate: {validation:?}");
         let config = validation.unwrap_or_default();
+        assert!(!config.api_translation_enabled, "translation must default to disabled");
         assert_eq!(config.request_limit(), 2 * 1024 * 1024);
         assert_eq!(config.response_limit(), 1024 * 1024);
     }

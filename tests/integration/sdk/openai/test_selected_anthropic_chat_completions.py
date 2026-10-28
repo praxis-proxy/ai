@@ -264,6 +264,23 @@ def test_data_and_remote_image_urls_are_translated_without_fetching(client: Open
     assert content[3]["source"] == {"type": "url", "url": "https://images.example.test/image.png"}
 
 
+def test_assistant_image_is_rejected_before_provider_contact(client: OpenAI) -> None:
+    with pytest.raises(APIStatusError) as caught:
+        client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "image_url", "image_url": {"url": "https://images.example.test/image.png"}},
+                ]},
+            ],
+            max_tokens=16,
+        )
+    assert caught.value.status_code == 400
+    assert "supported only in user messages" in str(caught.value)
+    assert not STATE.requests, "unsupported image roles must be rejected before provider contact"
+
+
 def test_malformed_image_is_rejected_before_provider_contact(client: OpenAI) -> None:
     with pytest.raises(APIStatusError) as caught:
         client.chat.completions.create(

@@ -22,6 +22,10 @@ shapes outside the explicit contract below.
 | Base64 `image_url` data URL | Anthropic base64 image source | JPEG, PNG, GIF, and WebP are accepted when the base64 payload is non-empty, decodable, and has a matching format signature. |
 | HTTPS `image_url` | Anthropic URL image source | The URL is passed through; the translator does not fetch it. |
 
+Image conversion is supported in user messages only. Assistant image blocks
+are rejected rather than silently dropped or moved to another role. System,
+developer, and tool-result content remains text-only in this translator.
+
 `image_url.detail` accepts `auto`, `low`, or `high` and is discarded because
 Anthropic Messages has no equivalent quality control. Unknown top-level or
 nested fields, malformed values, unsupported content block types, non-HTTPS

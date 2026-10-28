@@ -176,6 +176,43 @@ fn translates_base64_and_remote_image_sources_in_content_order() {
 }
 
 #[test]
+fn rejects_assistant_images_without_relabeling_or_dropping_them() {
+    for image in [
+        "https://images.example.test/photo.png",
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+    ] {
+        let input = json!({"model":"m","messages":[
+            {"role":"user","content":"Describe the image"},
+            {"role":"assistant","content":[
+                {"type":"text","text":"before"},
+                {"type":"image_url","image_url":{"url":image}},
+                {"type":"text","text":"after"}
+            ]}
+        ]});
+        assert!(
+            translate_request(input.to_string().as_bytes(), "provider-model")
+                .unwrap_err()
+                .contains("supported only in user messages"),
+            "assistant image must be rejected for source {image}"
+        );
+    }
+}
+
+#[test]
+fn rejects_invalid_preferred_token_alias_even_with_valid_legacy_alias() {
+    for invalid in [json!(0), json!(-1), json!(1.5), json!("many"), Value::Null] {
+        let input = json!({"model":"m","messages":[{"role":"user","content":"hi"}],
+            "max_tokens":8,"max_completion_tokens":invalid});
+        assert!(
+            translate_request(input.to_string().as_bytes(), "provider-model")
+                .unwrap_err()
+                .contains("positive integer"),
+            "invalid preferred alias must not fall back to max_tokens"
+        );
+    }
+}
+
+#[test]
 fn rejects_malformed_or_unsupported_images() {
     for (url, reason) in [
         ("data:image/png;base64,%%%", "invalid base64"),
@@ -183,6 +220,11 @@ fn rejects_malformed_or_unsupported_images() {
         ("data:image/svg+xml;base64,PHN2Zz4=", "media type"),
         ("data:image/png,abc", "base64 encoding marker"),
         ("http://images.example.test/a.png", "HTTPS URL"),
+        (
+            "https://user:password@images.example.test/a.png",
+            "embedded credentials",
+        ),
+        ("https://user@images.example.test/a.png", "embedded credentials"),
         ("not a url", "valid HTTPS"),
     ] {
         let input = format!(

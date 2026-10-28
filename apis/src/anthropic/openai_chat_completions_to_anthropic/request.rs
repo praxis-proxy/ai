@@ -241,7 +241,14 @@ fn translate_messages(value: &Value) -> Result<(Vec<Value>, Option<String>), Str
                     .get("content")
                     .filter(|value| !(value.is_null() || has_tool_calls && value.as_str().is_some_and(str::is_empty)))
                 {
-                    content.extend(translate_content(Some(value))?);
+                    let blocks = translate_content(Some(value))?;
+                    if blocks
+                        .iter()
+                        .any(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+                    {
+                        return Err("image_url content is supported only in user messages".to_owned());
+                    }
+                    content.extend(blocks);
                 }
                 if let Some(calls) = object.get("tool_calls") {
                     content.extend(translate_tool_calls(calls)?);
