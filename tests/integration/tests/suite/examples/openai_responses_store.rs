@@ -352,6 +352,12 @@ async fn response_store_delete_returns_200_after_post() {
     drop(proxy);
 }
 
+// TTL-based automatic purge cannot be tested via the in-process `start_proxy`
+// harness because it does not drive the `StoreProvisionService` background
+// service's tokio interval timer (first tick never fires). End-to-end TTL purge
+// is covered by the Python SDK suite (which launches the real binary via
+// subprocess) and by the store sweep contract tests + reaper lifecycle tests.
+
 #[test]
 fn response_store_delete_nonexistent_returns_404() {
     let backend_guard = Backend::fixed("unused")

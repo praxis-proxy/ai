@@ -56,7 +56,7 @@
 //! #   claude_code_vllm::pinned_claude_code_drives_transformed_vllm_through_full_flow
 //! ```
 //!
-//! Pin discipline: [`CLAUDE_CODE_VERSION`], [`PermissionScenario`], and
+//! Pin discipline: [`CLAUDE_CODE_PINNED_VERSION`], [`PermissionScenario`], and
 //! [`LAUNCH_FLAGS`] are part of the committed pin manifest
 //! (`tests/integration/fixtures/claude-code-cli/`). They MUST be re-validated
 //! against the pinned executable when its version changes. The served model,
@@ -77,9 +77,12 @@ use praxis_test_utils::{
 };
 use serde_json::Value;
 
-use super::live_vllm::{
-    self, BACKEND_TOKEN_ENV, LISTEN_ADDRESS_ENV, VLLM_BASE_URL_ENV, VLLM_MODEL_ENV, authority_of, env_is_truthy,
-    resolve_ip_binary,
+use super::{
+    harness::CLAUDE_CODE_PINNED_VERSION,
+    live_vllm::{
+        self, BACKEND_TOKEN_ENV, LISTEN_ADDRESS_ENV, VLLM_BASE_URL_ENV, VLLM_MODEL_ENV, authority_of, env_is_truthy,
+        resolve_ip_binary,
+    },
 };
 
 // -----------------------------------------------------------------------------
@@ -111,12 +114,6 @@ const TAVILY_API_KEY_ENV: &str = "TAVILY_API_KEY";
 /// silently skipping it.
 const REQUIRE_LIVE_WEB_SEARCH_ENV: &str = "PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH";
 
-/// Pinned Claude Code version substring expected from `claude --version`.
-///
-/// PIN: confirm the exact string against the pinned executable during the
-/// qualification run and update this constant and the manifest together.
-const CLAUDE_CODE_VERSION: &str = "2.1.278";
-
 /// Output-token ceiling passed to the pinned client for the 32K vLLM context.
 ///
 /// Claude Code otherwise requests 32K output tokens. vLLM clamps that to the
@@ -141,9 +138,11 @@ const CLAUDE_CODE_MAX_CONTEXT_TOKENS: &str = "32768";
 /// reject an oversized request. The coding task still fits because
 /// [`CLAUDE_CODE_MAX_OUTPUT_TOKENS`] bounds each turn's output.
 ///
-/// CRITICAL headroom constraint: pinned Claude Code 2.1.267 reserves 2,048
-/// output tokens and 13,000 compaction tokens, so its effective auto-compaction
-/// threshold is `window - 15048`. A single ballast Read must be comfortably
+/// CRITICAL headroom constraint: Claude Code reserves 2,048 output tokens and
+/// 13,000 compaction tokens (measured on 2.1.267; this scenario still
+/// self-compacts mid-task with these values on 2.1.278; re-validate on a bump),
+/// so its effective auto-compaction threshold is `window - 15048`. A single
+/// ballast Read must be comfortably
 /// SMALLER than that headroom, otherwise one post-compaction read immediately
 /// re-crosses the threshold and the client's rapid-refill breaker aborts the
 /// run. At 30,000 the usable headroom is ~14,952 tokens, dwarfing a single
@@ -1390,8 +1389,8 @@ async fn assert_pinned_version(claude_bin: &OsStr) {
     assert!(output.status.success(), "claude --version should succeed");
     let reported = String::from_utf8_lossy(&output.stdout);
     assert!(
-        reported.contains(CLAUDE_CODE_VERSION),
-        "pinned Claude Code version {CLAUDE_CODE_VERSION} not found in `claude --version` output: {}",
+        reported.contains(CLAUDE_CODE_PINNED_VERSION),
+        "pinned Claude Code version {CLAUDE_CODE_PINNED_VERSION} not found in `claude --version` output: {}",
         reported.trim()
     );
 }

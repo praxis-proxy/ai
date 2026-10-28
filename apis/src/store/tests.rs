@@ -2671,14 +2671,20 @@ async fn sqlite_rejects_table_with_missing_columns() {
         panic!("init should fail on schema mismatch");
     };
 
+    // A pre-existing table missing columns is still REFUSED at init, preserving
+    // the safety invariant. The rejection path changed with the TTL feature: the
+    // `created_at` index DDL (CREATE INDEX IF NOT EXISTS ... (created_at)) now runs
+    // before validate_schema and fails first, naming the absent column, so the
+    // error is a database error rather than the "schema validation failed" message.
     let msg = err.to_string();
     assert!(
-        msg.contains("schema validation failed"),
-        "error should mention schema validation: {msg}"
+        matches!(err, StoreError::Database(_)),
+        "a malformed pre-existing table must be rejected with a database error: {msg}"
     );
-    assert!(msg.contains("bad_responses"), "error should name the table: {msg}");
-    assert!(msg.contains("created_at"), "error should list missing column: {msg}");
-    assert!(msg.contains("model"), "error should list missing column: {msg}");
+    assert!(
+        msg.contains("created_at"),
+        "error should name the missing column: {msg}"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -3561,12 +3567,15 @@ async fn pg_rejects_table_with_missing_columns() {
         )
         .await;
 
+    // A pre-existing table missing columns is still REFUSED at init
+    // (expect_rejected panics otherwise). The rejection path changed with the TTL
+    // feature: the `created_at` index DDL runs before validate_schema and fails
+    // first, so the error names the absent column rather than carrying the
+    // "schema validation failed" message.
     assert!(
-        msg.contains("schema validation failed"),
-        "error should mention schema validation: {msg}"
+        msg.contains("created_at"),
+        "error should name the missing column: {msg}"
     );
-    assert!(msg.contains(&fx.responses), "error should name the table: {msg}");
-    assert!(msg.contains("created_at"), "error should list missing column: {msg}");
 }
 
 #[tokio::test]

@@ -14,11 +14,11 @@
 //! Required Linux CI wraps both pinned HTTP tests in a network namespace with
 //! only loopback enabled, so the client cannot reach an external provider.
 //!
-//! The executable must report the version in [`CODEX_VERSION`]. To update the
-//! pin, update that constant in both Codex acceptance modules, the fixture
-//! filename and checksum, and every version, archive, cache path/key, and
-//! version assertion in `.github/workflows/integration.yaml`. Run both pinned
-//! HTTP and WebSocket tests with the checksum-verified replacement binary.
+//! The executable must report the version in [`CODEX_PINNED_VERSION`], which
+//! `tests/integration/fixtures/codex-cli/pin.toml` single-sources together
+//! with the checksum fixture and the CI `CODEX_VERSION` env (see
+//! `codex_pin`). Run both pinned HTTP and WebSocket tests with the
+//! checksum-verified replacement binary before committing a bump.
 
 use std::{
     collections::HashMap,
@@ -47,7 +47,7 @@ use praxis_test_utils::{
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use super::harness::{CodexCompactionWorkspace, TempWorkspace};
+use super::harness::{CODEX_PINNED_VERSION, CodexCompactionWorkspace, TempWorkspace};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -57,8 +57,6 @@ use super::harness::{CodexCompactionWorkspace, TempWorkspace};
 const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum retained bytes from each child output pipe.
 const MAX_CHILD_OUTPUT_BYTES: usize = 4_194_304; // 4 MiB
-/// Required output from the pinned executable.
-const CODEX_VERSION: &str = "codex-cli 0.144.1";
 /// Synthetic credential that must reach the test backend.
 const TEST_API_KEY: &str = "praxis-http-test-key";
 /// Synthetic provider credential that replaces the client credential.
@@ -2018,7 +2016,7 @@ async fn assert_pinned_codex_version(codex_bin: &OsStr) {
     assert!(output.status.success(), "codex --version should succeed");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        CODEX_VERSION,
+        format!("codex-cli {CODEX_PINNED_VERSION}"),
         "acceptance fixture and executable pin must match"
     );
 }

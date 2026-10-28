@@ -32,14 +32,18 @@ use praxis_ai_apis::store::plan::{StoreRefLocation, coalesce_compatible_filter_r
 #[cfg(feature = "openai-conversations")]
 use praxis_ai_apis::store::{CONVERSATIONS_STORE_NAME, DEFAULT_STORE_NAME};
 use praxis_ai_apis::store::{ResponseStoreRegistry, plan, store_backend_factories};
-#[cfg(feature = "openai-conversations")]
-use praxis_ai_store::BackendError;
-use praxis_ai_store::{StoreBackendFactory, StoreRegistry};
+use praxis_ai_store::{
+    BackendError, BackendNamespaceKey, EffectiveConfigKey, PersistedStateBackend, ReaperPolicy, StoreBackendFactory,
+    StoreRegistry,
+};
 use praxis_ai_store_lifecycle::{BackendCache, BackendLease, ProvisionError, StoreRef};
 use praxis_core::config::{Config, FilterEntry};
 use praxis_filter::FilterPipeline;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
-use tracing::{error, info};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
+
+use crate::reaper::{ReaperHandle, run_reaper};
 
 /// Poll interval while an old pipeline generation drains in-flight requests.
 const PIPELINE_DRAIN_POLL: Duration = Duration::from_millis(10);
@@ -114,6 +118,9 @@ struct ListenerStorePlan {
     registry: StoreRegistry,
     /// Store references to provision (one default store, so at most one).
     refs: Vec<StoreRef>,
+    /// TTL reaper policy per store name, parsed from the filter config before its
+    /// ttl fields are stripped from `refs`. Empty when no store declares a `ttl`.
+    reaper_bindings: Vec<(Arc<str>, ReaperPolicy)>,
 }
 
 impl AsRef<[StoreRef]> for ListenerStorePlan {
@@ -277,10 +284,12 @@ fn build_listener_store_plans(config: &Config) -> Vec<ListenerStorePlan> {
     for listener in &config.listeners {
         let refs = plan::discover_store_refs_permissive(&listener.filter_chains, &chains);
         if !refs.is_empty() {
+            let reaper_bindings = plan::discover_reaper_bindings_permissive(&listener.filter_chains, &chains);
             plans.push(ListenerStorePlan {
                 listener: listener.name.clone(),
                 registry: StoreRegistry::new(),
                 refs,
+                reaper_bindings,
             });
         }
     }
@@ -338,10 +347,266 @@ fn validate_and_deduplicate_refs(
         validate_cross_store_collisions(plans, &factories)?;
     }
 
-    for plan in plans {
+    for plan in plans.iter_mut() {
         plan::deduplicate_refs(&format!("listener '{}'", plan.listener), &mut plan.refs, &factories)?;
     }
+    validate_reaper_policy_conflicts(plans, &factories)?;
     Ok(())
+}
+
+/// Suffix the responses schema appends to derive its server-owned
+/// pending-approvals table. Mirrors `schemas::pending_approvals_table` in the
+/// store-backends crate; kept in sync so the reaper-overlap check sweeps the exact
+/// physical table the store creates.
+const PENDING_APPROVALS_SUFFIX: &str = "_pending_approvals";
+
+/// Suffix the responses schema appends to derive its durable SSE event-log table.
+/// Mirrors `schemas::events_table` in the store-backends crate.
+const EVENTS_SUFFIX: &str = "_events";
+
+/// Reject a configuration whose store filters assign two different reaper policies
+/// to the same physical table.
+///
+/// Reapers are keyed on backend identity (the factory's [`EffectiveConfigKey`]) so
+/// every distinct cached backend is swept exactly once (see
+/// [`binding_effective_key`]). Distinct effective keys do not imply disjoint
+/// tables, though: two stores on one physical database with different
+/// `responses_table` but the same `conversations_table` resolve to different keys
+/// yet both sweep that shared conversations table, so a shorter TTL would delete
+/// rows the longer retention still needs. The real rule is therefore physical:
+/// within one database, no two bindings may give different policies to the same
+/// physical table.
+///
+/// Persistent backends expose a [`BackendNamespaceKey`], so they are checked by
+/// `(database, table)` overlap. In-memory backends report no namespace key and
+/// never share a physical table across distinct backends; they keep the
+/// effective-key check, so identical in-memory config with a different ttl (one
+/// shared backend) is still rejected. Both checks must hold. The same policy on a
+/// shared table is idempotent and allowed.
+///
+/// The loop walks **every** provisioned store (`plan.refs`), not just the
+/// TTL-enabled ones in `plan.reaper_bindings`. A store without a `ttl` is recorded
+/// with a `None` policy so a TTL-enabled store cannot quietly reap a physical table
+/// a TTL-disabled store shares: omitting `ttl` is documented to retain rows
+/// indefinitely, so an enabled-vs-disabled overlap is a conflict, rejected before
+/// provisioning. Reaper creation itself stays limited to TTL-enabled stores (see
+/// [`StoreProvisionService::desired_reapers`]).
+fn validate_reaper_policy_conflicts(
+    plans: &[ListenerStorePlan],
+    factories: &HashMap<&str, &dyn StoreBackendFactory>,
+) -> Result<(), ProvisionError> {
+    let mut by_table = ReaperTableOwners::new();
+    let mut by_effective_key: HashMap<EffectiveConfigKey, (Option<ReaperPolicy>, Arc<str>)> = HashMap::new();
+    for plan in plans {
+        for store_ref in &plan.refs {
+            let store_name = &store_ref.name;
+            let policy = plan
+                .reaper_bindings
+                .iter()
+                .find(|(name, _)| name == store_name)
+                .map(|(_, policy)| *policy);
+            let factory = binding_factory(store_ref, factories)?;
+            let namespace = factory
+                .namespace_key(&store_ref.config)
+                .map_err(|source| ProvisionError::Backend {
+                    name: Arc::clone(store_name),
+                    source,
+                })?;
+            if let Some(namespace) = namespace {
+                check_shared_table_policies(&mut by_table, &namespace, store_ref, store_name, policy)?;
+            } else {
+                check_in_memory_backend_policy(&mut by_effective_key, factory, store_ref, store_name, policy)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Maps each `(physical database, folded physical table)` to the reaper policy and
+/// the store that first claimed it, so a later binding assigning a different policy
+/// to a shared table can be rejected by name. `None` marks a TTL-disabled store, so
+/// an enabled-vs-disabled overlap is caught like any other policy mismatch.
+type ReaperTableOwners = HashMap<(BackendNamespaceKey, String), (Option<ReaperPolicy>, Arc<str>)>;
+
+/// Record a store's swept tables, rejecting a different policy on any physical table
+/// another store in the same database already claimed. A `None` policy (no `ttl`)
+/// conflicts with any TTL-enabled policy on the same table.
+fn check_shared_table_policies(
+    by_table: &mut ReaperTableOwners,
+    namespace: &BackendNamespaceKey,
+    store_ref: &StoreRef,
+    store_name: &Arc<str>,
+    policy: Option<ReaperPolicy>,
+) -> Result<(), ProvisionError> {
+    for table in swept_physical_tables(&store_ref.config) {
+        let key = (namespace.clone(), table.to_ascii_lowercase());
+        match by_table.get(&key) {
+            Some((existing_policy, existing_store)) if *existing_policy != policy => {
+                return Err(ProvisionError::Backend {
+                    name: Arc::clone(store_name),
+                    source: BackendError::Config(reaper_policy_conflict_message(
+                        *existing_policy,
+                        existing_store,
+                        policy,
+                        store_name,
+                        Some(&table),
+                    )),
+                });
+            },
+            Some(_) => {},
+            None => {
+                by_table.insert(key, (policy, Arc::clone(store_name)));
+            },
+        }
+    }
+    Ok(())
+}
+
+/// Record an in-memory store's backend identity, rejecting a different policy on the
+/// same shared in-memory backend (identical config, different or absent ttl).
+fn check_in_memory_backend_policy(
+    by_effective_key: &mut HashMap<EffectiveConfigKey, (Option<ReaperPolicy>, Arc<str>)>,
+    factory: &dyn StoreBackendFactory,
+    store_ref: &StoreRef,
+    store_name: &Arc<str>,
+    policy: Option<ReaperPolicy>,
+) -> Result<(), ProvisionError> {
+    let key = factory
+        .effective_key(&store_ref.config)
+        .map_err(|source| ProvisionError::Backend {
+            name: Arc::clone(store_name),
+            source,
+        })?;
+    match by_effective_key.get(&key) {
+        Some((existing_policy, existing_store)) if *existing_policy != policy => Err(ProvisionError::Backend {
+            name: Arc::clone(store_name),
+            source: BackendError::Config(reaper_policy_conflict_message(
+                *existing_policy,
+                existing_store,
+                policy,
+                store_name,
+                None,
+            )),
+        }),
+        Some(_) => Ok(()),
+        None => {
+            by_effective_key.insert(key, (policy, Arc::clone(store_name)));
+            Ok(())
+        },
+    }
+}
+
+/// Build the actionable error for two stores assigning different reaper policies to
+/// a shared target. `table` names the shared physical table for persistent backends;
+/// `None` describes a shared in-memory backend. A `Some`/`None` policy pair (one
+/// store sets a `ttl`, the other does not) is reported as the TTL-disabled store's
+/// rows being at risk; two differing `Some` policies are reported as a ttl mismatch.
+fn reaper_policy_conflict_message(
+    existing_policy: Option<ReaperPolicy>,
+    existing_store: &Arc<str>,
+    policy: Option<ReaperPolicy>,
+    store_name: &Arc<str>,
+    table: Option<&str>,
+) -> String {
+    let target = table.map_or_else(
+        || "the same in-memory store backend".to_owned(),
+        |table| format!("the shared physical table '{table}' in one database"),
+    );
+    if let (Some(_), Some(_)) = (existing_policy, policy) {
+        format!(
+            "conflicting reaper policies target {target} (stores '{existing_store}' and '{store_name}'); \
+             configure one ttl/sweep_interval/sweep_batch_size for every store that shares it"
+        )
+    } else {
+        let (enabled, disabled) = if existing_policy.is_some() {
+            (existing_store, store_name)
+        } else {
+            (store_name, existing_store)
+        };
+        format!(
+            "store '{enabled}' enables a ttl reaper on {target} shared with store '{disabled}', which sets \
+             no ttl and must retain its rows; give both stores the same ttl or stop sharing it"
+        )
+    }
+}
+
+/// Physical tables a reaper for this store sweeps, derived from its config.
+///
+/// Mirrors the store's own schema: the configured `responses_table`,
+/// `conversations_table`, and optional `items_table`, plus the two tables the
+/// responses schema derives from the responses name
+/// (`{responses}_pending_approvals` and `{responses}_events`). Names are returned
+/// as configured; the caller folds case so the overlap check matches both
+/// backends' identifier folding.
+fn swept_physical_tables(config: &serde_json::Value) -> Vec<String> {
+    let field = |name| config.get(name).and_then(serde_json::Value::as_str);
+    let mut tables = Vec::new();
+    if let Some(responses) = field("responses_table") {
+        tables.push(responses.to_owned());
+        tables.push(format!("{responses}{PENDING_APPROVALS_SUFFIX}"));
+        tables.push(format!("{responses}{EVENTS_SUFFIX}"));
+    }
+    if let Some(conversations) = field("conversations_table") {
+        tables.push(conversations.to_owned());
+    }
+    if let Some(items) = field("items_table") {
+        tables.push(items.to_owned());
+    }
+    tables
+}
+
+/// Resolve the store reference backing one reaper binding within its plan.
+fn binding_store_ref<'plan>(
+    plan: &'plan ListenerStorePlan,
+    store_name: &Arc<str>,
+) -> Result<&'plan StoreRef, ProvisionError> {
+    plan.refs
+        .iter()
+        .find(|store_ref| store_ref.name == *store_name)
+        .ok_or_else(|| ProvisionError::Backend {
+            name: Arc::clone(store_name),
+            source: BackendError::Config(format!("store reference {store_name} not found in plan")),
+        })
+}
+
+/// Resolve the injected factory for one store reference.
+fn binding_factory<'factory>(
+    store_ref: &StoreRef,
+    factories: &HashMap<&str, &'factory dyn StoreBackendFactory>,
+) -> Result<&'factory dyn StoreBackendFactory, ProvisionError> {
+    factories
+        .get(store_ref.backend_id.as_ref())
+        .copied()
+        .ok_or_else(|| ProvisionError::Backend {
+            name: Arc::clone(&store_ref.name),
+            source: BackendError::Config(format!("no factory injected for backend_id {}", store_ref.backend_id)),
+        })
+}
+
+/// Resolve the backend-identity key for one reaper binding.
+///
+/// Keys on the factory's [`EffectiveConfigKey`], which [`BackendCache`] also uses
+/// to deduplicate cached backends 1:1. Keying reapers on it therefore yields
+/// exactly one reaper per distinct cached backend -- every backend under the
+/// coordinator is swept with no drops, and two stores on one database with
+/// different table sets (distinct effective keys) each get their own reaper. The
+/// stripped `ttl`/`sweep_interval`/`sweep_batch_size` fields are not part of the
+/// key, so a ttl-only reload keeps the same key (pool reused, policy handed off in
+/// place) while a pool/compression reload changes it (old reaper retired, new one
+/// spawned on the rebuilt backend).
+fn binding_effective_key(
+    plan: &ListenerStorePlan,
+    store_name: &Arc<str>,
+    factories: &HashMap<&str, &dyn StoreBackendFactory>,
+) -> Result<EffectiveConfigKey, ProvisionError> {
+    let store_ref = binding_store_ref(plan, store_name)?;
+    let factory = binding_factory(store_ref, factories)?;
+    factory
+        .effective_key(&store_ref.config)
+        .map_err(|source| ProvisionError::Backend {
+            name: Arc::clone(&store_ref.name),
+            source,
+        })
 }
 
 /// Map each plan to the [`ResponseStoreRegistry`] installed into its pipeline,
@@ -589,6 +854,133 @@ impl StoreProvisionService {
         Ok(leases)
     }
 
+    /// Build the desired reaper set for a committed generation.
+    ///
+    /// One entry per distinct backend identity (the factory's
+    /// [`EffectiveConfigKey`]) that declares a `ttl`, carrying the committed policy
+    /// and the backend handle resolved from the generation's registry.
+    /// [`BackendCache`] deduplicates cached backends 1:1 by `effective_key`, so
+    /// keying here on the same value yields exactly one reaper per cached backend:
+    /// every distinct backend is swept, and two stores on one physical database
+    /// with different (non-coalescing) table sets each get their own reaper rather
+    /// than the second being silently dropped.
+    ///
+    /// A store with no registered backend in this generation is skipped.
+    /// Conflicting policies on one `effective_key` are rejected earlier by
+    /// [`validate_reaper_policy_conflicts`], so the first binding per key wins and
+    /// later equal bindings reuse it.
+    fn desired_reapers(
+        &self,
+        plans: &[ListenerStorePlan],
+    ) -> HashMap<EffectiveConfigKey, (ReaperPolicy, Arc<dyn PersistedStateBackend>)> {
+        let factories: HashMap<&str, &dyn StoreBackendFactory> = self
+            .factories
+            .iter()
+            .map(|factory| (factory.backend_id(), factory.as_ref()))
+            .collect();
+        let mut desired: HashMap<EffectiveConfigKey, (ReaperPolicy, Arc<dyn PersistedStateBackend>)> = HashMap::new();
+        for plan in plans {
+            for (store_name, policy) in &plan.reaper_bindings {
+                let Some(backend) = plan.registry.backend(store_name) else {
+                    debug!(
+                        listener = %plan.listener,
+                        store = %store_name,
+                        "ttl reaper: store declares a ttl but has no registered backend in this generation; skipping"
+                    );
+                    continue;
+                };
+                let key = match binding_effective_key(plan, store_name, &factories) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        warn!(%error, listener = %plan.listener, "ttl reaper: cannot compute effective key; skipping");
+                        continue;
+                    },
+                };
+                // Accepted narrow edge: two backends that share the same tables but
+                // differ only in pool/compression have distinct effective keys, so
+                // each gets its own reaper sweeping those tables — harmless
+                // (idempotent, bounded) and a bizarre config.
+                desired.entry(key).or_insert((*policy, backend));
+            }
+        }
+        desired
+    }
+
+    /// Reconcile running TTL reapers to a committed generation's policies.
+    ///
+    /// Stops (cancel + await) any reaper whose backend identity (`effective_key`)
+    /// left the generation or whose policy changed, then spawns a reaper for every
+    /// desired backend not already running. Stopping before spawning gives the
+    /// design's handoff: the outgoing reaper finishes its current batch and is
+    /// acknowledged stopped before the replacement sweeps, so two policies never
+    /// share one backend.
+    ///
+    /// A reload that changes only `pool`/`compression` produces a new
+    /// `effective_key`, so [`BackendCache`] builds a fresh backend `Arc` under a
+    /// new reaper key: the old key is absent from the desired set and its reaper is
+    /// retired, while a new reaper is spawned on the rebuilt backend. A ttl-only
+    /// reload keeps the same `effective_key`, so the same reaper key sees a changed
+    /// policy and hands off in place while the pool is reused. The retained
+    /// `Arc::ptr_eq` backend check stays correct because the same `effective_key`
+    /// resolves to the same cached backend `Arc`.
+    ///
+    /// Called only for an accepted generation (initial provisioning and
+    /// `Commit`), never for a prepared-but-aborted one, so a rejected reload
+    /// activates no policy and deletes nothing.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "staleness detection (policy or backend swap), handoff await, and respawn are one reconciliation step"
+    )]
+    async fn reconcile_reapers(
+        &self,
+        reapers: &mut HashMap<EffectiveConfigKey, ReaperHandle>,
+        plans: &[ListenerStorePlan],
+        shutdown: &ShutdownWatch,
+    ) {
+        let desired = self.desired_reapers(plans);
+
+        // Stop reapers whose backend identity left the committed generation or
+        // whose policy changed. Either hands off: the outgoing task is cancelled
+        // and awaited here before its replacement is spawned below.
+        let stale: Vec<EffectiveConfigKey> = reapers
+            .iter()
+            .filter(|&(key, handle)| match desired.get(key) {
+                Some((policy, backend)) => *policy != handle.policy || !Arc::ptr_eq(backend, &handle.backend),
+                None => true,
+            })
+            .map(|(key, _handle)| key.clone())
+            .collect();
+        for key in stale {
+            if let Some(handle) = reapers.remove(&key) {
+                handle.cancel.cancel();
+                let _joined = handle.join.await;
+            }
+        }
+
+        // Spawn a reaper for every desired backend not already running.
+        for (key, (policy, backend)) in desired {
+            if reapers.contains_key(&key) {
+                continue;
+            }
+            let cancel = CancellationToken::new();
+            let join = tokio::spawn(run_reaper(
+                Arc::clone(&backend),
+                policy,
+                cancel.clone(),
+                shutdown.clone(),
+            ));
+            reapers.insert(
+                key,
+                ReaperHandle {
+                    cancel,
+                    join,
+                    policy,
+                    backend,
+                },
+            );
+        }
+    }
+
     /// Own the initial startup gate and every subsequent reload generation.
     ///
     /// Pingora supplies `ready_notifier` in production. Holding it until all
@@ -599,7 +991,8 @@ impl StoreProvisionService {
     #[expect(
         clippy::too_many_lines,
         clippy::cognitive_complexity,
-        reason = "startup and reload commands share one serving-runtime lease owner"
+        clippy::large_stack_frames,
+        reason = "startup and reload commands share one serving-runtime lease owner; its one cold long-lived task holds the concurrent provisioning futures"
     )]
     async fn run(&self, mut shutdown: ShutdownWatch, ready_notifier: Option<ServiceReadyNotifier>) {
         let Some(mut commands) = self.commands.lock().await.take() else {
@@ -634,6 +1027,10 @@ impl StoreProvisionService {
             },
         };
         let mut active_plans = self.plans.clone();
+        let mut reapers: HashMap<EffectiveConfigKey, ReaperHandle> = HashMap::new();
+        // Box the reconcile future so the cold reload path does not inflate this
+        // long-lived task's stack frame.
+        Box::pin(self.reconcile_reapers(&mut reapers, &active_plans, &shutdown)).await;
         let mut pending: HashMap<u64, (Vec<BackendLease>, Vec<ListenerStorePlan>)> = HashMap::new();
         let mut next_generation = 1_u64;
 
@@ -676,6 +1073,11 @@ impl StoreProvisionService {
                             let result = if let Some((new_leases, new_plans)) = pending.remove(&generation) {
                                 let old_leases = std::mem::replace(&mut active_leases, new_leases);
                                 active_plans = new_plans;
+                                // The handoff cancels and awaits each stale reaper inline (finishing
+                                // its current bounded batch), so this commit can block the command
+                                // loop up to DB_WAIT_BOUND (30s) per stale reaper before the swap
+                                // completes. Acceptable: it runs only on a policy/backend change.
+                                Box::pin(self.reconcile_reapers(&mut reapers, &active_plans, &shutdown)).await;
                                 tokio::spawn(release_after_drain(old_pipelines, old_leases));
                                 let _sent = self.readiness.send(StoreReadiness::Ready);
                                 Ok(())
@@ -703,6 +1105,13 @@ impl StoreProvisionService {
         // Pingora's shutdown drain and disappear with the serving runtime.
         for (_, (leases, _plans)) in pending {
             release_leases(leases).await;
+        }
+        // Reapers subscribe to shutdown directly, but cancel and await them here
+        // too so a stuck sweep cannot outlive the service; each finishes its
+        // current bounded batch before stopping.
+        for (_key, handle) in reapers.drain() {
+            handle.cancel.cancel();
+            let _joined = handle.join.await;
         }
         drop(active_leases);
     }
@@ -740,15 +1149,17 @@ async fn release_after_drain(old_pipelines: Vec<Weak<FilterPipeline>>, leases: V
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, clippy::too_many_lines, reason = "tests")]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use praxis_ai_store::{
-        BackendError, EffectiveConfigKey, ProvisionedBackend, RetireBackend, StoreBackendFactory, memory::InMemoryStore,
+        BackendError, BackendNamespaceKey, ConversationItemRecord, ConversationItemStore, ConversationRecord,
+        EffectiveConfigKey, EventLogStatus, PendingApprovalRecord, ProvisionedBackend, ResponseEventRecord,
+        ResponseRecord, ResponseStore, RetireBackend, StateOwner, StoreBackendFactory, StoreError, SweepStats,
+        memory::InMemoryStore,
     };
-    #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
-    use praxis_ai_store::{ConversationRecord, StateOwner};
     use praxis_filter::FilterRegistry;
     use serde_json::json;
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -844,7 +1255,7 @@ mod tests {
     }
 
     struct HangingFactory {
-        entered: Arc<tokio::sync::Notify>,
+        entered: Arc<Notify>,
     }
 
     struct ReloadFactory {
@@ -1941,6 +2352,7 @@ filter_chains:
                     backend_id: Arc::from("fake"),
                     config: json!({}),
                 }],
+                reaper_bindings: Vec::new(),
             }],
             readiness,
             commands: AsyncMutex::new(Some(command_rx)),
@@ -1993,6 +2405,7 @@ filter_chains:
                         backend_id: Arc::from("unavailable"),
                         config: json!({}),
                     }],
+                    reaper_bindings: Vec::new(),
                 },
                 ListenerStorePlan {
                     listener: "healthy".to_owned(),
@@ -2002,6 +2415,7 @@ filter_chains:
                         backend_id: Arc::from("fake"),
                         config: json!({}),
                     }],
+                    reaper_bindings: Vec::new(),
                 },
             ],
             readiness,
@@ -2068,6 +2482,7 @@ filter_chains:
                             backend_id: Arc::from("unavailable"),
                             config: json!({}),
                         }],
+                        reaper_bindings: Vec::new(),
                     }],
                     readiness,
                     commands: AsyncMutex::new(Some(command_rx)),
@@ -2125,6 +2540,7 @@ filter_chains:
                     backend_id: Arc::from("recovering"),
                     config: json!({}),
                 }],
+                reaper_bindings: Vec::new(),
             }],
             readiness,
             commands: AsyncMutex::new(Some(command_rx)),
@@ -2151,7 +2567,7 @@ filter_chains:
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_cancels_reload_preparation_and_unblocks_watcher() {
-        let entered = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(Notify::new());
         let factory: Arc<dyn StoreBackendFactory> = Arc::new(HangingFactory {
             entered: Arc::clone(&entered),
         });
@@ -2387,5 +2803,1309 @@ filter_chains:
         .await
         .expect("weak observers must not block one another");
         assert_eq!(retires.load(Ordering::SeqCst), 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // TTL reaper coordinator lifecycle
+    // -------------------------------------------------------------------------
+
+    /// Shared record of every committed sweep, inspected by the reaper tests.
+    #[derive(Default)]
+    struct SweepSpy {
+        /// Cutoff second recorded by each `sweep_expired` call that returned Ok.
+        cutoffs: std::sync::Mutex<Vec<i64>>,
+        /// Count of committed `sweep_expired` calls.
+        committed: AtomicUsize,
+    }
+
+    impl SweepSpy {
+        /// Snapshot the recorded cutoffs.
+        fn cutoffs(&self) -> Vec<i64> {
+            match self.cutoffs.lock() {
+                Ok(guard) => guard.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            }
+        }
+
+        /// Number of sweeps that committed.
+        fn committed(&self) -> usize {
+            self.committed.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Lets a test hold one sweep batch open, then release it, to drive the
+    /// shutdown-during-active-batch case.
+    struct SweepGate {
+        /// Fired once the gated batch has entered `sweep_expired`.
+        entered: Notify,
+        /// Awaited inside the gated batch until the test lets it proceed.
+        proceed: Notify,
+        /// Gates only the first batch; later batches run through.
+        armed: AtomicBool,
+    }
+
+    /// A `PersistedStateBackend` that records sweeps and never touches real
+    /// storage. Non-sweep methods are never called by the reaper and return
+    /// benign values.
+    struct SpyBackend {
+        spy: Arc<SweepSpy>,
+        gate: Option<Arc<SweepGate>>,
+    }
+
+    #[async_trait]
+    impl ResponseStore for SpyBackend {
+        async fn sweep_expired(&self, cutoff_secs: i64, _batch_size: u32) -> Result<SweepStats, StoreError> {
+            if let Some(gate) = &self.gate
+                && gate.armed.swap(false, Ordering::SeqCst)
+            {
+                gate.entered.notify_one();
+                gate.proceed.notified().await;
+            }
+            match self.spy.cutoffs.lock() {
+                Ok(mut guard) => guard.push(cutoff_secs),
+                Err(poisoned) => poisoned.into_inner().push(cutoff_secs),
+            }
+            self.spy.committed.fetch_add(1, Ordering::SeqCst);
+            // Zero stats end the per-tick sweep loop after this single batch.
+            Ok(SweepStats::default())
+        }
+
+        async fn upsert_response(&self, _record: &ResponseRecord) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get_response(&self, _owner: &StateOwner, _id: &str) -> Result<Option<ResponseRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn delete_response(&self, _owner: &StateOwner, _id: &str) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn get_conversation(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+        ) -> Result<Option<ConversationRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn record_pending_approvals(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _records: &[PendingApprovalRecord],
+            _created_at: i64,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get_pending_approvals(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _approval_ids: &[&str],
+        ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn consume_approvals(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _approval_ids: &[&str],
+            _consumed_at: i64,
+        ) -> Result<Option<usize>, StoreError> {
+            Ok(None)
+        }
+
+        async fn append_events(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _events: &[ResponseEventRecord],
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn list_events_after(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+            _after: Option<u64>,
+            _limit: u32,
+        ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn event_log_status(
+            &self,
+            _owner: &StateOwner,
+            _response_id: &str,
+        ) -> Result<EventLogStatus, StoreError> {
+            Ok(EventLogStatus::Absent)
+        }
+    }
+
+    #[async_trait]
+    impl ConversationItemStore for SpyBackend {
+        async fn upsert_conversation(&self, _record: &ConversationRecord) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn update_conversation_messages(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _messages: &serde_json::Value,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn update_conversation_metadata(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _metadata: &serde_json::Value,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn compare_and_swap_conversation_messages(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _expected_messages: &serde_json::Value,
+            _messages: &serde_json::Value,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn get_conversation(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+        ) -> Result<Option<ConversationRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn delete_conversation(&self, _owner: &StateOwner, _conversation_id: &str) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn create_conversation_items(&self, _items: &[ConversationItemRecord]) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn list_conversation_items(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _after_item_id: Option<&str>,
+            _limit: u32,
+            _ascending: bool,
+        ) -> Result<Vec<ConversationItemRecord>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_existing_conversation_item_ids(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _item_ids: &[&str],
+        ) -> Result<Vec<String>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_conversation_item(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _item_id: &str,
+        ) -> Result<Option<ConversationItemRecord>, StoreError> {
+            Ok(None)
+        }
+
+        async fn delete_conversation_item(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _item_id: &str,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn conversation_item_position(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _item_id: &str,
+        ) -> Result<Option<i64>, StoreError> {
+            Ok(None)
+        }
+
+        async fn max_item_position(&self, _owner: &StateOwner, _conversation_id: &str) -> Result<i64, StoreError> {
+            Ok(0)
+        }
+
+        async fn conversation_history(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+        ) -> Result<Option<Vec<serde_json::Value>>, StoreError> {
+            Ok(None)
+        }
+
+        async fn create_items_and_sync_messages(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _items: &[ConversationItemRecord],
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn delete_item_and_sync_messages(
+            &self,
+            _owner: &StateOwner,
+            _conversation_id: &str,
+            _item_id: &str,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+    }
+
+    /// Offline factory that deduplicates pool and namespace by `database_url`,
+    /// counts builds, and provisions a [`SpyBackend`]. Identifies as `sqlite` so
+    /// `backend: sqlite` filter configs route to it.
+    struct ReaperFactory {
+        builds: Arc<AtomicUsize>,
+        spy: Arc<SweepSpy>,
+        gate: Option<Arc<SweepGate>>,
+    }
+
+    #[async_trait]
+    impl StoreBackendFactory for ReaperFactory {
+        fn backend_id(&self) -> &str {
+            "sqlite"
+        }
+
+        fn effective_key(&self, config: &serde_json::Value) -> Result<EffectiveConfigKey, BackendError> {
+            let url = config
+                .get("database_url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| BackendError::Config("missing database_url".to_owned()))?;
+            Ok(EffectiveConfigKey::new(url))
+        }
+
+        fn namespace_key(&self, config: &serde_json::Value) -> Result<Option<BackendNamespaceKey>, BackendError> {
+            Ok(config
+                .get("database_url")
+                .and_then(serde_json::Value::as_str)
+                .map(BackendNamespaceKey::new))
+        }
+
+        async fn build(&self, _config: &serde_json::Value) -> Result<ProvisionedBackend, BackendError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            Ok(ProvisionedBackend {
+                backend: Arc::new(SpyBackend {
+                    spy: Arc::clone(&self.spy),
+                    gate: self.gate.as_ref().map(Arc::clone),
+                }),
+                retire: Arc::new(CountingRetire(Arc::new(AtomicUsize::new(0)))),
+            })
+        }
+    }
+
+    /// A reaper factory that provisions a spy-backed store but reports NO
+    /// physical namespace key, mirroring a private in-memory SQLite store at
+    /// `sqlite::memory:`. The coordinator must still run a reaper for its live
+    /// backend instead of silently dropping the configured `ttl`.
+    struct NamespacelessReaperFactory {
+        builds: Arc<AtomicUsize>,
+        spy: Arc<SweepSpy>,
+    }
+
+    #[async_trait]
+    impl StoreBackendFactory for NamespacelessReaperFactory {
+        fn backend_id(&self) -> &str {
+            "sqlite"
+        }
+
+        fn effective_key(&self, config: &serde_json::Value) -> Result<EffectiveConfigKey, BackendError> {
+            let url = config
+                .get("database_url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| BackendError::Config("missing database_url".to_owned()))?;
+            Ok(EffectiveConfigKey::new(url))
+        }
+
+        fn namespace_key(&self, _config: &serde_json::Value) -> Result<Option<BackendNamespaceKey>, BackendError> {
+            // A private in-memory store has no physical namespace identity.
+            Ok(None)
+        }
+
+        async fn build(&self, _config: &serde_json::Value) -> Result<ProvisionedBackend, BackendError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            Ok(ProvisionedBackend {
+                backend: Arc::new(SpyBackend {
+                    spy: Arc::clone(&self.spy),
+                    gate: None,
+                }),
+                retire: Arc::new(CountingRetire(Arc::new(AtomicUsize::new(0)))),
+            })
+        }
+    }
+
+    /// A reaper factory that mints a FRESH spy-backed store on every build and
+    /// records each spy in order, so a test can tell which backend generation a
+    /// reaper is sweeping. Its `effective_key` folds in `pool` (so a pool-only
+    /// reload rebuilds the backend), while its `namespace_key` keys only on
+    /// `database_url` (so the reaper namespace is unchanged across that reload).
+    struct SwappingReaperFactory {
+        builds: Arc<AtomicUsize>,
+        spies: Arc<std::sync::Mutex<Vec<Arc<SweepSpy>>>>,
+    }
+
+    #[async_trait]
+    impl StoreBackendFactory for SwappingReaperFactory {
+        fn backend_id(&self) -> &str {
+            "sqlite"
+        }
+
+        fn effective_key(&self, config: &serde_json::Value) -> Result<EffectiveConfigKey, BackendError> {
+            let field = |name| config.get(name).map_or_else(String::new, serde_json::Value::to_string);
+            Ok(EffectiveConfigKey::new(format!(
+                "{}|{}",
+                field("database_url"),
+                field("pool")
+            )))
+        }
+
+        fn namespace_key(&self, config: &serde_json::Value) -> Result<Option<BackendNamespaceKey>, BackendError> {
+            Ok(config
+                .get("database_url")
+                .and_then(serde_json::Value::as_str)
+                .map(BackendNamespaceKey::new))
+        }
+
+        async fn build(&self, _config: &serde_json::Value) -> Result<ProvisionedBackend, BackendError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            let spy = Arc::new(SweepSpy::default());
+            match self.spies.lock() {
+                Ok(mut guard) => guard.push(Arc::clone(&spy)),
+                Err(poisoned) => poisoned.into_inner().push(Arc::clone(&spy)),
+            }
+            Ok(ProvisionedBackend {
+                backend: Arc::new(SpyBackend { spy, gate: None }),
+                retire: Arc::new(CountingRetire(Arc::new(AtomicUsize::new(0)))),
+            })
+        }
+    }
+
+    /// A reaper factory whose `effective_key` folds in the table set (so distinct
+    /// table sets are distinct backends) while its `namespace_key` keys only on the
+    /// database path (so distinct table sets share one physical namespace). This is
+    /// the DEFECT 1 shape: keying reapers on the namespace dropped the second
+    /// backend's tables; keying on the effective key covers every backend.
+    struct TableAwareReaperFactory {
+        builds: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl StoreBackendFactory for TableAwareReaperFactory {
+        fn backend_id(&self) -> &str {
+            "sqlite"
+        }
+
+        fn effective_key(&self, config: &serde_json::Value) -> Result<EffectiveConfigKey, BackendError> {
+            let field = |name| config.get(name).map_or_else(String::new, serde_json::Value::to_string);
+            Ok(EffectiveConfigKey::new(format!(
+                "{}|{}|{}",
+                field("database_url"),
+                field("responses_table"),
+                field("conversations_table"),
+            )))
+        }
+
+        fn namespace_key(&self, config: &serde_json::Value) -> Result<Option<BackendNamespaceKey>, BackendError> {
+            Ok(config
+                .get("database_url")
+                .and_then(serde_json::Value::as_str)
+                .map(BackendNamespaceKey::new))
+        }
+
+        async fn build(&self, _config: &serde_json::Value) -> Result<ProvisionedBackend, BackendError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            Ok(ProvisionedBackend {
+                backend: Arc::new(InMemoryStore::new()),
+                retire: Arc::new(CountingRetire(Arc::new(AtomicUsize::new(0)))),
+            })
+        }
+    }
+
+    /// A single-listener response-store config that opts into the TTL reaper.
+    fn reaper_store_config(database_url: &str, ttl: &str, sweep_interval: &str) -> Config {
+        Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses
+        conversations_table: conversations
+        ttl: {ttl}
+        sweep_interval: {sweep_interval}
+"#
+        ))
+        .expect("reaper store config")
+    }
+
+    /// A single-listener response-store config that opts into the TTL reaper and
+    /// sets an explicit pool size, so a reload can change only the pool to force a
+    /// backend rebuild while keeping the reaper policy and namespace.
+    fn reaper_store_config_with_pool(
+        database_url: &str,
+        ttl: &str,
+        sweep_interval: &str,
+        max_connections: u32,
+    ) -> Config {
+        Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses
+        conversations_table: conversations
+        ttl: {ttl}
+        sweep_interval: {sweep_interval}
+        pool:
+          max_connections: {max_connections}
+"#
+        ))
+        .expect("reaper store config with pool")
+    }
+
+    /// Current Unix time in whole seconds, for cutoff-window assertions.
+    fn unix_now_secs() -> i64 {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_secs(),
+        )
+        .expect("seconds fit i64")
+    }
+
+    /// Build a manually wired provisioner around the spying reaper factory.
+    fn reaper_service(
+        config: &Config,
+        factory: Arc<dyn StoreBackendFactory>,
+    ) -> (
+        Arc<StoreProvisionService>,
+        StoreReloadHandle,
+        watch::Receiver<StoreReadiness>,
+    ) {
+        let factories = vec![factory];
+        let mut plans = build_listener_store_plans(config);
+        validate_and_deduplicate_refs(&mut plans, &factories, None, None).expect("initial plans");
+        let (readiness, readiness_rx) = watch::channel(StoreReadiness::Pending);
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let service = Arc::new(StoreProvisionService {
+            cache: Arc::new(BackendCache::new(factories.clone())),
+            factories,
+            plans,
+            readiness,
+            commands: AsyncMutex::new(Some(command_rx)),
+        });
+        (service, StoreReloadHandle { commands }, readiness_rx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ttl_only_reload_reuses_pool_and_swaps_policy() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let spy = Arc::new(SweepSpy::default());
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(ReaperFactory {
+            builds: Arc::clone(&builds),
+            spy: Arc::clone(&spy),
+            gate: None,
+        });
+        // Long ttl, then a reload that changes only the ttl to a short one.
+        let initial = reaper_store_config("sqlite:///ttl_swap.db", "100000s", "50ms");
+        let (service, handle, mut readiness_rx) = reaper_service(&initial, factory);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let running = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.start(shutdown_rx).await }
+        });
+        readiness_rx
+            .wait_for(|state| *state == StoreReadiness::Ready)
+            .await
+            .expect("initial generation should become ready");
+        // The long initial policy must sweep before the reload.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while spy.cutoffs().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the initial policy should sweep");
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "initial generation opens one pool");
+
+        let next = reaper_store_config("sqlite:///ttl_swap.db", "10s", "50ms");
+        let prepared = tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.prepare(&next)
+        })
+        .await
+        .expect("prepare task")
+        .expect("ttl-only replacement should provision");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "a ttl-only reload must reuse the existing pool, not rebuild it"
+        );
+        tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.commit(prepared, Vec::new())
+        })
+        .await
+        .expect("commit task")
+        .expect("replacement generation should commit");
+
+        // Commit awaits the old reaper's handoff, so every cutoff recorded past
+        // this marker belongs to the new short policy alone.
+        let marker = spy.cutoffs().len();
+
+        // After the handoff only the new short policy may sweep.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while spy.cutoffs().len() <= marker + 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the swapped-in policy should sweep");
+        let now = unix_now_secs();
+        let cutoffs = spy.cutoffs();
+        let (before, after) = cutoffs.split_at(marker);
+        assert!(
+            before.iter().any(|&cutoff| cutoff <= now - 1000),
+            "the long initial policy must have swept with an old cutoff"
+        );
+        assert!(
+            after.iter().all(|&cutoff| cutoff > now - 1000),
+            "only the new short policy sweeps after commit; the old reaper must be gone"
+        );
+
+        shutdown_tx.send(true).expect("service should receive shutdown");
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("provisioner should stop promptly")
+            .expect("provisioner task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pool_reload_swaps_reaper_backend() {
+        // A reload that keeps the same ttl but changes only the pool rebuilds the
+        // backend (new effective_key → new Arc, old pool retired/closed) while the
+        // reaper namespace is unchanged. The coordinator must re-spawn the reaper
+        // on the new backend; otherwise it keeps sweeping the closed pool forever.
+        let builds = Arc::new(AtomicUsize::new(0));
+        let spies = Arc::new(std::sync::Mutex::new(Vec::<Arc<SweepSpy>>::new()));
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(SwappingReaperFactory {
+            builds: Arc::clone(&builds),
+            spies: Arc::clone(&spies),
+        });
+        let initial = reaper_store_config_with_pool("sqlite:///pool_swap.db", "100000s", "50ms", 4);
+        let (service, handle, mut readiness_rx) = reaper_service(&initial, factory);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let running = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.start(shutdown_rx).await }
+        });
+        readiness_rx
+            .wait_for(|state| *state == StoreReadiness::Ready)
+            .await
+            .expect("initial generation should become ready");
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "gen A opens one pool");
+
+        // Gen A's backend (the first spy) must sweep before the reload.
+        let gen_a = {
+            let guard = spies.lock().expect("spies");
+            Arc::clone(guard.first().expect("gen A spy recorded"))
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while gen_a.committed() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("gen A reaper should sweep");
+
+        // Reload with the SAME ttl but a different pool: the backend is rebuilt.
+        let next = reaper_store_config_with_pool("sqlite:///pool_swap.db", "100000s", "50ms", 8);
+        let prepared = tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.prepare(&next)
+        })
+        .await
+        .expect("prepare task")
+        .expect("pool-only reload should provision");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "a pool change must rebuild the backend under a new effective key"
+        );
+        tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.commit(prepared, Vec::new())
+        })
+        .await
+        .expect("commit task")
+        .expect("pool-only reload should commit");
+
+        // Commit awaited the old reaper's handoff, so gen A is already stopped.
+        let frozen_gen_a = gen_a.committed();
+
+        // The reaper must now sweep the freshly built backend (the second spy).
+        let gen_b = {
+            let guard = spies.lock().expect("spies");
+            Arc::clone(guard.get(1).expect("gen B spy recorded"))
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while gen_b.committed() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the reaper must sweep the new backend after a pool reload");
+
+        // Gen A's (closed) backend must no longer be swept.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            gen_a.committed(),
+            frozen_gen_a,
+            "the reaper must stop sweeping the retired backend after the swap"
+        );
+        assert!(gen_b.committed() > 0, "the reaper must sweep the freshly built backend");
+
+        shutdown_tx.send(true).expect("service should receive shutdown");
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("provisioner should stop promptly")
+            .expect("provisioner task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn namespaceless_store_still_gets_reaper() {
+        // A store whose factory reports no physical namespace key (a private
+        // in-memory SQLite store at `sqlite::memory:`) still has a live backend
+        // with rows to sweep. The coordinator must synthesize a per-backend key
+        // and run a reaper for it instead of silently disabling the configured
+        // ttl.
+        let builds = Arc::new(AtomicUsize::new(0));
+        let spy = Arc::new(SweepSpy::default());
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(NamespacelessReaperFactory {
+            builds: Arc::clone(&builds),
+            spy: Arc::clone(&spy),
+        });
+        let config = reaper_store_config("sqlite::memory:", "100000s", "50ms");
+        let (service, _handle, mut readiness_rx) = reaper_service(&config, factory);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let running = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.start(shutdown_rx).await }
+        });
+        readiness_rx
+            .wait_for(|state| *state == StoreReadiness::Ready)
+            .await
+            .expect("initial generation should become ready");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "the namespaceless store opens one backend"
+        );
+
+        // The reaper must run and sweep even though the backend reports no
+        // physical namespace key.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while spy.committed() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a namespaceless store with a ttl must still be swept");
+
+        shutdown_tx.send(true).expect("service should receive shutdown");
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("provisioner should stop promptly")
+            .expect("provisioner task");
+    }
+
+    #[tokio::test]
+    async fn independent_table_sets_same_db_each_get_a_reaper() {
+        // Two store filters target the SAME file-backed SQLite database with
+        // DIFFERENT, non-coalescing table sets, both with a ttl. They share one
+        // physical namespace — the DEFECT 1 shape that dropped the second backend
+        // when reapers keyed on the namespace — but resolve to DISTINCT effective
+        // keys. Keying reapers on backend identity must yield TWO reapers, one per
+        // cached backend, so neither store's tables are dropped from the sweep.
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("shared.db").display());
+        let builds = Arc::new(AtomicUsize::new(0));
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(TableAwareReaperFactory {
+            builds: Arc::clone(&builds),
+        });
+        let config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: a
+    address: "127.0.0.1:8080"
+    filter_chains: [chain-a]
+  - name: b
+    address: "127.0.0.1:8081"
+    filter_chains: [chain-b]
+filter_chains:
+  - name: chain-a
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses_a
+        conversations_table: conversations_a
+        ttl: 2s
+  - name: chain-b
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses_b
+        conversations_table: conversations_b
+        ttl: 2s
+"#
+        ))
+        .expect("two stores sharing one database with distinct table sets");
+
+        let factories = vec![Arc::clone(&factory)];
+        let mut plans = build_listener_store_plans(&config);
+        // Different table sets → different effective keys → not a policy conflict.
+        validate_and_deduplicate_refs(&mut plans, &factories, None, None)
+            .expect("distinct table sets are independent and must not conflict");
+        assert_eq!(
+            plans.iter().map(|plan| plan.reaper_bindings.len()).sum::<usize>(),
+            2,
+            "both stores declare a ttl, so both contribute a reaper binding"
+        );
+
+        let cache = Arc::new(BackendCache::new(factories.clone()));
+        let mut leases = Vec::new();
+        for plan in &plans {
+            leases.push(
+                cache
+                    .provision_into(&plan.refs, &plan.registry)
+                    .await
+                    .expect("each distinct table set provisions its own backend"),
+            );
+        }
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "distinct table sets open two backends"
+        );
+
+        let (readiness, _readiness_rx) = watch::channel(StoreReadiness::Pending);
+        let (_commands, command_rx) = mpsc::unbounded_channel();
+        let service = StoreProvisionService {
+            cache,
+            factories,
+            plans: plans.clone(),
+            readiness,
+            commands: AsyncMutex::new(Some(command_rx)),
+        };
+
+        let desired = service.desired_reapers(&plans);
+        assert_eq!(
+            desired.len(),
+            2,
+            "every distinct backend under the coordinator must get its own reaper; \
+             neither store's tables may be dropped from the sweep"
+        );
+
+        for lease in leases {
+            lease.release().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_reload_never_applies_candidate_policy() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let spy = Arc::new(SweepSpy::default());
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(ReaperFactory {
+            builds: Arc::clone(&builds),
+            spy: Arc::clone(&spy),
+            gate: None,
+        });
+        // No active TTL, so no reaper runs unless a committed policy activates one.
+        let initial = single_store_config("sqlite", "sqlite:///abort_policy.db");
+        let (service, handle, mut readiness_rx) = reaper_service(&initial, factory);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let running = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.start(shutdown_rx).await }
+        });
+        readiness_rx
+            .wait_for(|state| *state == StoreReadiness::Ready)
+            .await
+            .expect("initial generation should become ready");
+
+        // Prepare a short-ttl candidate, then abort it without committing.
+        let candidate = reaper_store_config("sqlite:///abort_policy.db", "10s", "50ms");
+        let prepared = tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.prepare(&candidate)
+        })
+        .await
+        .expect("prepare task")
+        .expect("candidate should provision");
+        tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.abort(prepared)
+        })
+        .await
+        .expect("abort task")
+        .expect("candidate generation should abort");
+
+        // Give any erroneously-spawned reaper time to sweep, then prove none did.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let now = unix_now_secs();
+        assert!(
+            spy.cutoffs().iter().all(|&cutoff| cutoff <= now - 1000),
+            "an aborted reload must never sweep with the candidate's short cutoff"
+        );
+
+        shutdown_tx.send(true).expect("service should receive shutdown");
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("provisioner should stop promptly")
+            .expect("provisioner task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_during_active_batch_stops_promptly() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let spy = Arc::new(SweepSpy::default());
+        let gate = Arc::new(SweepGate {
+            entered: Notify::new(),
+            proceed: Notify::new(),
+            armed: AtomicBool::new(true),
+        });
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(ReaperFactory {
+            builds: Arc::clone(&builds),
+            spy: Arc::clone(&spy),
+            gate: Some(Arc::clone(&gate)),
+        });
+        // One immediate sweep (long interval) that blocks inside the batch.
+        let config = reaper_store_config("sqlite:///shutdown_batch.db", "1d", "1h");
+        let (service, _handle, mut readiness_rx) = reaper_service(&config, factory);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let running = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.start(shutdown_rx).await }
+        });
+        readiness_rx
+            .wait_for(|state| *state == StoreReadiness::Ready)
+            .await
+            .expect("generation should become ready");
+
+        tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+            .await
+            .expect("the reaper should enter its first batch");
+
+        shutdown_tx.send(true).expect("service should receive shutdown");
+        // Release the in-flight batch so it commits and the reaper can stop.
+        gate.proceed.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("run() must return promptly after the in-flight batch finishes")
+            .expect("provisioner task");
+        assert_eq!(
+            spy.committed(),
+            1,
+            "the batch that was in flight at shutdown must still commit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unchanged_policy_reload_does_not_restart_reaper() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let spy = Arc::new(SweepSpy::default());
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(ReaperFactory {
+            builds: Arc::clone(&builds),
+            spy: Arc::clone(&spy),
+            gate: None,
+        });
+        // Long interval, so a running reaper sweeps exactly once (the immediate
+        // first tick). A restart would sweep again immediately.
+        let config = reaper_store_config("sqlite:///unchanged_policy.db", "1d", "1h");
+        let (service, handle, mut readiness_rx) = reaper_service(&config, factory);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let running = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.start(shutdown_rx).await }
+        });
+        readiness_rx
+            .wait_for(|state| *state == StoreReadiness::Ready)
+            .await
+            .expect("generation should become ready");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while spy.committed() < 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the reaper should sweep once on startup");
+
+        // Reload an identical config: same namespace, same policy.
+        let unchanged = reaper_store_config("sqlite:///unchanged_policy.db", "1d", "1h");
+        let prepared = tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.prepare(&unchanged)
+        })
+        .await
+        .expect("prepare task")
+        .expect("identical reload should provision");
+        tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.commit(prepared, Vec::new())
+        })
+        .await
+        .expect("commit task")
+        .expect("identical reload should commit");
+
+        // A restart would have swept again immediately; an unchanged reaper stays idle.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            spy.committed(),
+            1,
+            "an unchanged-policy reload must not cancel and respawn the reaper"
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "an unchanged reload reuses the pool");
+
+        shutdown_tx.send(true).expect("service should receive shutdown");
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("provisioner should stop promptly")
+            .expect("provisioner task");
+    }
+
+    #[test]
+    fn conflicting_policies_same_namespace_fail_validation() {
+        #[cfg(feature = "store-sqlite")]
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        #[cfg(feature = "store-sqlite")]
+        let (backend, database_url) = (
+            "sqlite",
+            format!("sqlite://{}?mode=rwc", directory.path().join("conflict.db").display()),
+        );
+        #[cfg(all(not(feature = "store-sqlite"), feature = "store-postgres"))]
+        let (backend, database_url) = ("postgres", "postgresql://user:password@8.8.8.8/store".to_owned());
+
+        let config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: a
+    address: "127.0.0.1:8080"
+    filter_chains: [chain-a]
+  - name: b
+    address: "127.0.0.1:8081"
+    filter_chains: [chain-b]
+filter_chains:
+  - name: chain-a
+    filters:
+      - filter: openai_responses_store
+        backend: {backend}
+        database_url: "{database_url}"
+        responses_table: responses
+        conversations_table: conversations
+        ttl: 1h
+  - name: chain-b
+    filters:
+      - filter: openai_responses_store
+        backend: {backend}
+        database_url: "{database_url}"
+        responses_table: responses
+        conversations_table: conversations
+        ttl: 2h
+"#
+        ))
+        .expect("conflicting ttl config");
+
+        let error = build_store_wiring(&config)
+            .err()
+            .expect("two policies on one physical store must fail startup");
+        assert!(
+            error.to_string().contains("conflicting reaper policies"),
+            "actionable conflict error: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "store-sqlite")]
+    fn conflicting_policies_shared_memory_backend_fail_validation() {
+        let config = Config::from_yaml(
+            r#"
+listeners:
+  - name: a
+    address: "127.0.0.1:8080"
+    filter_chains: [chain-a]
+  - name: b
+    address: "127.0.0.1:8081"
+    filter_chains: [chain-b]
+filter_chains:
+  - name: chain-a
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        responses_table: responses
+        conversations_table: conversations
+        ttl: 1h
+  - name: chain-b
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        responses_table: responses
+        conversations_table: conversations
+        ttl: 2h
+"#,
+        )
+        .expect("conflicting ttl in-memory config");
+
+        let error = build_store_wiring(&config)
+            .err()
+            .expect("two policies on one shared in-memory backend must fail startup");
+        assert!(
+            error.to_string().contains("conflicting reaper policies"),
+            "actionable conflict error for in-memory backend: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "store-sqlite")]
+    fn matching_policies_shared_memory_backend_succeed() {
+        let config = Config::from_yaml(
+            r#"
+listeners:
+  - name: a
+    address: "127.0.0.1:8080"
+    filter_chains: [chain-a]
+  - name: b
+    address: "127.0.0.1:8081"
+    filter_chains: [chain-b]
+filter_chains:
+  - name: chain-a
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        responses_table: responses
+        conversations_table: conversations
+        ttl: 1h
+        sweep_interval: 5m
+        sweep_batch_size: 100
+  - name: chain-b
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        responses_table: responses
+        conversations_table: conversations
+        ttl: 1h
+        sweep_interval: 5m
+        sweep_batch_size: 100
+"#,
+        )
+        .expect("matching ttl in-memory config");
+
+        let result = build_store_wiring(&config);
+        assert!(
+            result.is_ok(),
+            "two bindings with the same policy on one shared in-memory backend should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn conflicting_policies_on_shared_table_across_table_sets_fail_validation() {
+        // Two response stores on the SAME physical database with DIFFERENT
+        // responses_table but the SAME conversations_table, each with a different
+        // ttl. They resolve to DISTINCT effective keys (two reapers, full coverage),
+        // yet both sweep the shared conversations table, so the 1h policy would
+        // delete conversations before the 7d retention expires. The overlap must be
+        // rejected even though the effective keys differ.
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("shared.db").display());
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(TableAwareReaperFactory {
+            builds: Arc::new(AtomicUsize::new(0)),
+        });
+        let config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: a
+    address: "127.0.0.1:8080"
+    filter_chains: [chain-a]
+  - name: b
+    address: "127.0.0.1:8081"
+    filter_chains: [chain-b]
+filter_chains:
+  - name: chain-a
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses_a
+        conversations_table: conversations
+        ttl: 1h
+  - name: chain-b
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses_b
+        conversations_table: conversations
+        ttl: 7d
+"#
+        ))
+        .expect("two stores sharing one conversations table");
+
+        let mut plans = build_listener_store_plans(&config);
+        let error = validate_and_deduplicate_refs(&mut plans, &[factory], None, None)
+            .expect_err("a shared physical table with conflicting ttls must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("conflicting reaper policies"),
+            "actionable shared-table conflict error: {message}"
+        );
+        assert!(
+            message.contains("conversations"),
+            "the error must name the shared physical table: {message}"
+        );
+    }
+
+    #[test]
+    fn independent_policies_on_disjoint_table_sets_same_db_succeed() {
+        // Two response stores on the SAME physical database with fully DISJOINT
+        // table sets and different ttls. No physical table is shared, so the two
+        // retention policies are independent and must not be rejected.
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("shared.db").display());
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(TableAwareReaperFactory {
+            builds: Arc::new(AtomicUsize::new(0)),
+        });
+        let config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: a
+    address: "127.0.0.1:8080"
+    filter_chains: [chain-a]
+  - name: b
+    address: "127.0.0.1:8081"
+    filter_chains: [chain-b]
+filter_chains:
+  - name: chain-a
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses_a
+        conversations_table: conversations_a
+        ttl: 1h
+  - name: chain-b
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses_b
+        conversations_table: conversations_b
+        ttl: 7d
+"#
+        ))
+        .expect("two stores with disjoint table sets");
+
+        let mut plans = build_listener_store_plans(&config);
+        validate_and_deduplicate_refs(&mut plans, &[factory], None, None)
+            .expect("disjoint table sets on one database may set independent retention policies");
+    }
+
+    #[test]
+    fn ttl_enabled_store_sharing_table_with_ttl_disabled_store_fails_validation() {
+        // Two response stores on the SAME physical database with DIFFERENT
+        // responses_table but the SAME conversations_table. One sets a ttl; the other
+        // sets none. The enabled store's reaper would sweep the shared conversations
+        // table, deleting the disabled store's rows even though omitting ttl is
+        // documented to retain them indefinitely. The TTL-disabled store is absent
+        // from reaper_bindings, so the overlap must be caught by walking every ref.
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("shared.db").display());
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(TableAwareReaperFactory {
+            builds: Arc::new(AtomicUsize::new(0)),
+        });
+        let config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: a
+    address: "127.0.0.1:8080"
+    filter_chains: [chain-a]
+  - name: b
+    address: "127.0.0.1:8081"
+    filter_chains: [chain-b]
+filter_chains:
+  - name: chain-a
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses_a
+        conversations_table: conversations
+        ttl: 1h
+  - name: chain-b
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses_b
+        conversations_table: conversations
+"#
+        ))
+        .expect("one ttl store sharing a conversations table with a ttl-less store");
+
+        let mut plans = build_listener_store_plans(&config);
+        let error = validate_and_deduplicate_refs(&mut plans, &[factory], None, None)
+            .expect_err("a ttl reaper sharing a physical table with a ttl-less store must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("must retain its rows"),
+            "the error must explain the ttl-less store's rows are at risk: {message}"
+        );
+        assert!(
+            message.contains("conversations"),
+            "the error must name the shared physical table: {message}"
+        );
     }
 }

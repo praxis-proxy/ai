@@ -63,6 +63,10 @@ A test name filter that matches only compiled-out tests reports "0 passed" and
 exits successfully. Developer `cargo xtask` commands opt in through the alias;
 plain workspace builds do not.
 
+Keep local and release test aggregate targets complete when CI splits their
+recipes into parallel subtargets; the Makefile help lists the individual CI
+targets.
+
 ## Architecture
 
 **Crate dependency flow:**

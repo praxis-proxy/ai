@@ -29,11 +29,15 @@
 # `model_revision` is documentary and intentionally NOT a launch flag.
 
 [claude_code]
-# Version substring asserted from `claude --version`. Keep in sync with
-# CLAUDE_CODE_VERSION in claude_code_vllm.rs. 2.1.278 is the current published
-# latest (npm dist-tags.latest and the anthropics/claude-code CHANGELOG head);
-# it clears the intermediate 2.1.265-2.1.267 and 2.1.275 self-hosted
-# ANTHROPIC_BASE_URL regressions that returned blanket HTTP 400s.
+# Version substring asserted from `claude --version`. Both lanes run it: the
+# GPU lane downloads `url` below, and the CPU lane installs the same version
+# from npm. Keep in sync with CLAUDE_CODE_PINNED_VERSION in
+# `tests/integration/tests/suite/harness.rs` and CLAUDE_CODE_PINNED_VERSION in
+# `.github/workflows/integration.yaml`; the offline tests in `claude_code.rs`
+# enforce both. 2.1.278 is the current published latest (npm dist-tags.latest
+# and the anthropics/claude-code CHANGELOG head); it clears the intermediate
+# 2.1.265-2.1.267 and 2.1.275 self-hosted ANTHROPIC_BASE_URL regressions that
+# returned blanket HTTP 400s.
 version = "2.1.278"
 # Platform triple the pinned archive targets (e.g. "x86_64-unknown-linux-gnu").
 platform = "x86_64-unknown-linux-gnu"
@@ -45,6 +49,9 @@ platform = "x86_64-unknown-linux-gnu"
 url = "https://downloads.claude.ai/claude-code-releases/2.1.278/linux-x64/claude"
 # SHA-256 of the downloaded executable; CI verifies this before running.
 sha256 = "5c4735937844e84f8a93306e841a5b0e12252909b07870f789b190468da147ab"
+# Major release line the pinned launch contract was validated against. Crossing
+# it must re-validate the manifest, not just bump the version.
+major_series = 2
 
 # Pinned launch setup (excluding `-p`, the prompt, `--model`, and
 # `--mcp-config`, which the test supplies from the workspace). Keep in sync with
@@ -184,8 +191,10 @@ exposed_tools = ["Read", "Edit", "Bash"]
 permission_mode = "acceptEdits"
 allowed_tools = ["Read", "Edit", "Bash"]
 # Lowered client window that forces the client to auto-compact mid-task. Must be
-# > 0 and < vllm.context_length (the pins job asserts both). Pinned Claude Code
-# 2.1.267 reserves 2,048 output + 13,000 compaction tokens, so the usable
+# > 0 and < vllm.context_length (the pins job asserts both). Claude Code
+# reserves 2,048 output + 13,000 compaction tokens (measured on 2.1.267; the
+# GPU lane still self-compacts mid-task with these values on 2.1.278;
+# re-validate on a bump), so the usable
 # auto-compaction threshold is `max_context_tokens - 15048` (~14,952 here). A
 # single ballast read must stay well under that headroom or one post-compaction
 # read re-crosses the threshold and the client's rapid-refill breaker aborts.

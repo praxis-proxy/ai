@@ -9,7 +9,7 @@
 //!
 //! [`ResponseStore`]: crate::store::ResponseStore
 
-mod config;
+pub(crate) mod config;
 mod filter;
 
 pub use self::filter::ResponseStoreFilter;

@@ -27,6 +27,10 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  # Line-tables-only debuginfo: faster codegen and much smaller target/ caches
+  # (debuginfo dominates artifact size), which also eases the hard 10 GB cache
+  # cap so caches survive longer. Backtraces still resolve.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   V: ${{ inputs.debug && '1' || '' }}
 
 jobs:
@@ -131,7 +135,7 @@ jobs:
 
   test-filters:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -146,6 +150,33 @@ jobs:
 
       - name: Unit tests (filters)
         run: make test-unit-filters
+
+  # ----------------------------------------------------------------------------
+  # Model-to-provider latency microbenchmark (release profile)
+  #
+  # Split out of test-filters: `--release` is a separate compile profile whose
+  # artifacts are not shared with the dev/test build, so running it inline
+  # recompiled praxis-ai-filters from scratch and added ~8.6m to that job's
+  # critical path. Runs in parallel now, off the pole. Cache-neutral:
+  # registry-only cache (cache-target: false) under the shared split suffix, so
+  # it adds no new target/ cache family against the hard 10 GB cap.
+  # ----------------------------------------------------------------------------
+
+  bench-model-to-provider:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
 
       - name: Model-to-provider latency benchmark (release)
         run: make bench-model-to-provider
@@ -168,10 +199,11 @@ jobs:
       - name: Unit tests (proxy)
         run: make test-unit-proxy
 
+  # Feature-graph checks: compile each store permutation and assert no backend
+  # leaks across the graphs. Keeps the store-features-cargo cache.
   store-features:
     runs-on: ubuntu-24.04
-    # Also lints each opt-in feature group on its own (one clippy pass each).
-    timeout-minutes: 60
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -184,6 +216,83 @@ jobs:
         with:
           cache-suffix: store-features-cargo
 
-      - name: Store backend feature matrix
-        run: make test-store-features
+      - name: Store backend feature-graph checks
+        run: make test-store-features-check
+
+  # ----------------------------------------------------------------------------
+  # Per-group gate-leak clippy, fanned out as a matrix so the ~10 clippy passes
+  # run in parallel instead of serializing (~25m -> the slowest single pass). The
+  # matrix is generated from the Makefile's STORE_FEATURE_CLIPPY_GROUPS (via
+  # print-store-clippy-groups) so the list has a single source of truth and
+  # cannot silently drift. Cache-neutral (registry-only) under the hard 10 GB cap.
+  # ----------------------------------------------------------------------------
+
+  store-clippy-groups:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      groups: ${{ steps.list.outputs.groups }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build clippy group matrix from the Makefile
+        id: list
+        run: |
+          groups="$(make --no-print-directory print-store-clippy-groups)"
+          if [ -z "${groups//[[:space:]]/}" ]; then
+            echo "::error::STORE_FEATURE_CLIPPY_GROUPS is empty; no Clippy matrix can be created." >&2
+            exit 1
+          fi
+          json="$(printf '%s' "$groups" | tr ' ' '\n' | jq -R 'select(length > 0)' | jq -s -c .)"
+          echo "groups=$json" >> "$GITHUB_OUTPUT"
+
+  store-features-clippy:
+    needs: store-clippy-groups
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.store-clippy-groups.outputs.groups) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
+
+      - name: Clippy standard + ${{ matrix.group }}
+        env:
+          GROUP: ${{ matrix.group }}
+        run: make test-store-features-clippy-group GROUP="$GROUP"
+
+  # Store API tests plus the final TLS-backend graph assertions.
+  store-features-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
+
+      - name: Store API tests
+        run: make test-store-features-test
 

@@ -127,6 +127,10 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  # Line-tables-only debuginfo: faster codegen and much smaller target/ caches
+  # (debuginfo dominates artifact size), which also eases the hard 10 GB cache
+  # cap so caches survive longer. Backtraces still resolve.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   VLLM_IMAGE: "quay.io/opendatahub/vllm-cpu:Qwen3-0.6B-granite-embedding-125m-english@sha256:0212dc82981178033cb71c7477ba8ad1998fb6c0b1ee40646119fb9724ac951b"
   VLLM_MODEL: "Qwen/Qwen3-0.6B"
   # Use the CUDA 13 default image. The v0.32.0-cu129 image resolves a CUDA 13
@@ -244,9 +248,18 @@ jobs:
 
       - name: Setup Rust
         uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          # vllm-responses and vllm-live-cpu build the identical
+          # standard,openai-all,store-sqlite proxy, but had no cache-suffix, so
+          # they collided on the default key and effectively built cold (~20m).
+          # Share one stable key so later runs can reuse this build (~14m was the
+          # prior warm-build estimate). The first run after the profile/key
+          # change is cold; confirm reuse on a follow-up run. This target cache
+          # is subject to the repository's 10 GB Actions cache eviction limit.
+          cache-suffix: vllm-cpu-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every
@@ -442,9 +455,13 @@ jobs:
 
       - name: Setup Rust
         uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          # Shares the store-sqlite rust-cache with vllm-responses (identical
+          # standard,openai-all,store-sqlite proxy). See that job for rationale.
+          cache-suffix: vllm-cpu-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -600,9 +617,9 @@ jobs:
               raise SystemExit(
                   f"compaction window {compaction_context} must be in (0, {context})"
               )
-          # Pinned Claude Code 2.1.267 reserves 2,048 output + 13,000 compaction
-          # tokens, so its effective auto-compaction threshold is
-          # `compaction_context - 15048`. A single ballast read must fit well
+          # Claude Code reserves 2,048 output + 13,000 compaction tokens
+          # (measured on 2.1.267; re-validate on a bump), so its effective
+          # auto-compaction threshold is `compaction_context - 15048`. A single ballast read must fit well
           # under that headroom, or one post-compaction read immediately
           # re-crosses the threshold and the client's rapid-refill breaker aborts
           # the run. Total ballast must still exceed the threshold so compaction
@@ -950,7 +967,7 @@ jobs:
 
       - name: Install uv for Anthropic SDK acceptance
         id: anthropic_sdk_uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.12"
           enable-cache: true
@@ -1579,7 +1596,7 @@ jobs:
     env:
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
-      CODEX_VERSION: 0.144.1
+      CODEX_VERSION: "0.144.1"
       CODEX_VLLM_MODEL: qwen3-8b
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2950,7 +2967,7 @@ jobs:
 
       - name: Log in to GHCR (docker)
         if: env.CONTAINER_RUNTIME == 'docker'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -3018,7 +3035,7 @@ jobs:
           done
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           # The GPU AMI ships Python 3.9; ogx[starter] needs >=3.12, so pin the
           # interpreter setup-uv provisions. Cache is repo-scoped (GH cache
@@ -3395,7 +3412,7 @@ jobs:
         uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every

@@ -6,8 +6,13 @@
 //! `"completed"`, and populating [`ResponsesState`] with the
 //! full conversation history (stored turns + current input).
 //!
-//! The request body is **not** modified; downstream filters
-//! read from `ResponsesState.messages` instead.
+//! The request body is only modified when a stored
+//! `configuration_update` carries a reasoning default the
+//! request omitted: that default is merged into the live body
+//! so later filters observe (and may edit or remove) the
+//! effective setting. Everything else stays untouched;
+//! downstream filters read from [`ResponsesState`].messages
+//! instead.
 //!
 //! ## Response-side `previous_response_id` restore
 //!
@@ -51,10 +56,11 @@ use super::{
     extract_conversation_id,
     history::MessageHistory,
     is_canonical_openresponses_replay_type,
-    state::{LOCAL_COMPACTION_MARKER, ResponsesState, request_reasoning_presence, strip_local_compaction_marker},
+    state::{LOCAL_COMPACTION_MARKER, ResponsesState, strip_local_compaction_marker},
 };
 use crate::{
     is_event_stream_content_type,
+    json_body::replace_json_body,
     state_owner::{StateOwner, require_state_owner},
     store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry, StoreError},
 };
@@ -88,8 +94,13 @@ const PREV_USAGE_TOTAL_KEY: &str = "responses.previous_usage_total_tokens";
 /// populating `ResponsesState` with the full conversation
 /// history (stored turns + current input).
 ///
-/// The request body is **not** modified; downstream filters
-/// read from `ResponsesState.messages` instead.
+/// The request body is only modified when a stored
+/// `configuration_update` carries a reasoning default the
+/// request omitted: that default is merged into the live body
+/// so later filters observe (and may edit or remove) the
+/// effective setting. Everything else stays untouched;
+/// downstream filters read from `ResponsesState.messages`
+/// instead.
 ///
 /// # YAML
 ///
@@ -129,14 +140,14 @@ impl RehydrateFilter {
     async fn rehydrate(
         &self,
         ctx: &mut HttpFilterContext<'_>,
-        body: &Option<Bytes>,
+        body: &mut Option<Bytes>,
     ) -> Result<FilterAction, FilterError> {
         let Some(bytes) = body.as_ref() else {
             return Ok(FilterAction::Release);
         };
         match parse_body_and_extract_id(bytes) {
-            Ok((body, Some(id))) => self.rehydrate_from_response(ctx, body, id).await,
-            Ok((body, None)) => self.rehydrate_from_conversation(ctx, body).await,
+            Ok((body_value, Some(id))) => self.rehydrate_from_response(ctx, body, body_value, id).await,
+            Ok((body_value, None)) => self.rehydrate_from_conversation(ctx, body, body_value).await,
             Err(action) => Ok(action),
         }
     }
@@ -145,6 +156,7 @@ impl RehydrateFilter {
     async fn rehydrate_from_response(
         &self,
         ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
         parsed_body: Value,
         prev_id: String,
     ) -> Result<FilterAction, FilterError> {
@@ -166,7 +178,7 @@ impl RehydrateFilter {
         bind_previous_tools_to_owner(&mut previous_tools, &owner);
         let previous_usage = record.response_object.get("usage").filter(|u| !u.is_null()).cloned();
         let stored = stored_messages_for_response(record);
-        let state = build_state(parsed_body, stored, previous_tools, previous_usage);
+        let state = merge_configuration_and_build_state(body, parsed_body, stored, previous_tools, previous_usage);
         install_rehydrated_state(ctx, state);
         debug!(previous_response_id = %prev_id, "previous response validated, state populated");
         ctx.set_metadata("responses.previous_response_id", prev_id);
@@ -178,6 +190,7 @@ impl RehydrateFilter {
     async fn rehydrate_from_conversation(
         &self,
         ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
         parsed_body: Value,
     ) -> Result<FilterAction, FilterError> {
         let conv_id = match resolve_conversation_id(&parsed_body) {
@@ -196,7 +209,7 @@ impl RehydrateFilter {
             return Ok(action);
         }
         let stored = stored_messages_for_conversation(record);
-        let state = build_state(parsed_body, stored, vec![], None);
+        let state = merge_configuration_and_build_state(body, parsed_body, stored, vec![], None);
         install_rehydrated_state(ctx, state);
         debug!(conversation_id = %conv_id, "conversation rehydrated, state populated");
         Ok(FilterAction::Release)
@@ -210,11 +223,13 @@ impl HttpFilter for RehydrateFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        // ReadWrite so a stored `configuration_update` reasoning default
+        // can be published into the live request body.
+        BodyAccess::ReadWrite
     }
 
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadWrite
     }
 
     /// `StreamBuffer` so the protocol layer assembles the complete
@@ -1296,18 +1311,15 @@ async fn fetch_conversation(
 
 /// Build [`ResponsesState`] by prepending stored messages before the current input.
 fn build_state(
-    mut parsed_body: Value,
+    parsed_body: Value,
     stored: Vec<Value>,
     previous_tools: Vec<Value>,
     previous_usage: Option<Value>,
 ) -> ResponsesState {
-    let request_reasoning = request_reasoning_presence(&parsed_body);
-    apply_stored_configuration(&mut parsed_body, &stored);
     let stored = MessageHistory::from(stored);
     let replay = replay_messages_from_stored(&stored);
     let mut state = ResponsesState::from_request_body(parsed_body);
     state.history_rehydrated = true;
-    state.request_reasoning = request_reasoning;
     state.messages.prepend_shared(replay);
     state
         .provider_compaction_ids
@@ -1318,26 +1330,58 @@ fn build_state(
     state
 }
 
+/// Merge the stored conversation's configuration defaults into the live
+/// request body, then build the rehydrated state from the merged body.
+///
+/// The merge is published to the live body so later filters observe the
+/// effective reasoning setting and may edit or remove it; the selected-
+/// upstream rebuild then preserves whatever the live body carries instead
+/// of re-applying the stored default over later edits.
+fn merge_configuration_and_build_state(
+    body: &mut Option<Bytes>,
+    mut parsed_body: Value,
+    stored: Vec<Value>,
+    previous_tools: Vec<Value>,
+    previous_usage: Option<Value>,
+) -> ResponsesState {
+    if apply_stored_configuration(&mut parsed_body, &stored)
+        && let Err(error) = replace_json_body(body, &parsed_body, "openai_responses_rehydrate", "reasoning")
+    {
+        warn!(error = %error, "rehydrate: failed to publish merged configuration to request body");
+    }
+    build_state(parsed_body, stored, previous_tools, previous_usage)
+}
+
 /// Configuration items are persisted, not replayed as model input. The latest
 /// update replaces earlier defaults; explicit per-request effort takes priority.
-fn apply_stored_configuration(body: &mut Value, stored: &[Value]) {
+///
+/// Returns whether a stored effort default was merged into the body.
+fn apply_stored_configuration(body: &mut Value, stored: &[Value]) -> bool {
     let effort = stored
         .iter()
         .rev()
         .find(|item| item.get("type").and_then(Value::as_str) == Some("configuration_update"))
         .and_then(|item| item.get("reasoning"))
-        .and_then(|reasoning| reasoning.get("effort"));
+        .and_then(|reasoning| reasoning.get("effort"))
+        .cloned();
     let Some(effort) = effort else {
-        return;
+        return false;
     };
     let Some(body) = body.as_object_mut() else {
-        return;
+        return false;
     };
     let reasoning = body
         .entry("reasoning")
         .or_insert_with(|| Value::Object(serde_json::Map::default()));
-    if let Some(reasoning) = reasoning.as_object_mut() {
-        reasoning.entry("effort").or_insert_with(|| effort.clone());
+    let Some(reasoning) = reasoning.as_object_mut() else {
+        return false;
+    };
+    match reasoning.entry("effort") {
+        serde_json::map::Entry::Vacant(slot) => {
+            slot.insert(effort);
+            true
+        },
+        serde_json::map::Entry::Occupied(_) => false,
     }
 }
 

@@ -9,4 +9,26 @@ ignore = [
     "RUSTSEC-2024-0388",
     # rustls-pemfile 2.2.0: unmaintained (via pingora-rustls)
     "RUSTSEC-2025-0134",
+
+    # zstd 0.13.3 and zstd-safe 7.3.0, reached only through
+    # quixotic-plecostomus-header-serde -> ...-cache -> ...-proxy ->
+    # praxis-proxy-protocol. Both are patched upstream, but only in
+    # releases we cannot reach from here: zstd needs >= 0.14.3 and
+    # zstd-safe needs >= 8.2.0, each a semver-incompatible jump from the
+    # version the vendored Pingora fork pins. The copies this workspace
+    # owns directly are already on the patched releases.
+    #
+    # Remove these three once the fork moves to zstd 0.14.3 or later.
+    #
+    # zstd 0.13.3: data from an abandoned stream leaks into the next
+    # stream on a reused context
+    "RUSTSEC-2026-0391",
+    # zstd-safe 7.3.0: `Seekable::decompress` sets a `Vec` length beyond
+    # its capacity for offsets past the end
+    "RUSTSEC-2026-0398",
+    # zstd-safe 7.3.0: uninitialized memory exposed when streaming
+    # decompression of a legacy frame fails
+    "RUSTSEC-2026-0403",
+    # zstd-safe 7.3.0: use-after-free with `CParameter::StableInBuffer`
+    "RUSTSEC-2026-0414",
 ]

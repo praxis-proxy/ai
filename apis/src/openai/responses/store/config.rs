@@ -3,10 +3,13 @@
 
 //! Configuration types for the response store filter.
 
-use std::num::{NonZeroU32, NonZeroU64};
+use std::{
+    num::{NonZeroU32, NonZeroU64},
+    time::Duration,
+};
 
 use percent_encoding::percent_decode_str;
-use praxis_ai_store::{PoolConfig, SslMode, StoreCompressionConfig, validate_table_identifier};
+use praxis_ai_store::{PoolConfig, ReaperConfig, SslMode, StoreCompressionConfig, validate_table_identifier};
 #[cfg(feature = "_store-postgres")]
 use praxis_ai_store_backends::{PgTlsConfig, postgres_url, validate_postgres_table_identifiers};
 use praxis_filter::{FilterError, has_dot_dot_traversal};
@@ -174,6 +177,19 @@ pub(crate) struct ResponseStoreConfig {
     /// Same over-budget behavior as `max_event_count`.
     #[serde(default = "default_max_event_bytes")]
     pub max_event_bytes: NonZeroU64,
+
+    /// Time-to-live for stored records. Records older than this are eligible
+    /// for deletion. When unset, the reaper is disabled.
+    #[serde(default, with = "humantime_serde")]
+    pub ttl: Option<Duration>,
+
+    /// How often to run the reaper sweep. Defaults to 1 hour when `ttl` is set.
+    #[serde(default, with = "humantime_serde")]
+    pub sweep_interval: Option<Duration>,
+
+    /// Maximum number of records to delete in a single sweep batch.
+    #[serde(default)]
+    pub sweep_batch_size: Option<NonZeroU32>,
 }
 
 #[cfg(feature = "_store-postgres")]
@@ -195,6 +211,7 @@ impl ResponseStoreConfig {
 // -----------------------------------------------------------------------------
 
 /// Validate the parsed configuration.
+#[expect(clippy::too_many_lines, reason = "config validation enumerates all fields")]
 pub(crate) fn validate_config(cfg: &ResponseStoreConfig) -> Result<(), FilterError> {
     validate_backend_available(cfg.backend)?;
     let database_url = cfg.database_url.expose_secret();
@@ -214,6 +231,12 @@ pub(crate) fn validate_config(cfg: &ResponseStoreConfig) -> Result<(), FilterErr
     if let Some(compression) = &cfg.compression {
         compression.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
     }
+    let reaper = ReaperConfig {
+        ttl: cfg.ttl,
+        sweep_interval: cfg.sweep_interval,
+        sweep_batch_size: cfg.sweep_batch_size,
+    };
+    reaper.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
     match cfg.backend {
         StorageBackend::Sqlite => {
             validate_sqlite_database_url(database_url)?;
@@ -338,6 +361,56 @@ fn sqlite_file_path(database_url: &str) -> Option<&str> {
         .strip_prefix("sqlite://")
         .or_else(|| database_url.strip_prefix("sqlite:"))
         .map(|rest| rest.split_once('?').map_or(rest, |(path, _query)| path))
+}
+
+#[cfg(test)]
+#[cfg(feature = "store-sqlite")]
+#[expect(clippy::expect_used, reason = "tests")]
+mod reaper_config_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(feature = "store-sqlite")]
+    fn validate_rejects_sweep_interval_without_ttl() {
+        let yaml = serde_yaml::from_str(
+            "backend: sqlite\n\
+             database_url: 'sqlite::memory:'\n\
+             responses_table: responses\n\
+             conversations_table: conversations\n\
+             sweep_interval: 1h\n",
+        )
+        .expect("valid YAML");
+        let cfg: ResponseStoreConfig = serde_yaml::from_value(yaml).expect("parses");
+        let err = validate_config(&cfg).expect_err("sweep_interval without ttl must fail");
+        assert!(err.to_string().contains("sweep_interval requires"), "{err}");
+    }
+
+    #[test]
+    #[cfg(feature = "store-sqlite")]
+    fn accepts_ttl_with_defaults() {
+        use std::time::Duration;
+
+        use crate::store::plan::reaper_policy_from_response_store;
+
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            "backend: sqlite\n\
+             database_url: 'sqlite::memory:'\n\
+             responses_table: responses\n\
+             conversations_table: conversations\n\
+             ttl: 1d\n",
+        )
+        .expect("valid YAML");
+        let cfg: ResponseStoreConfig = serde_yaml::from_value(yaml.clone()).expect("parses");
+        validate_config(&cfg).expect("ttl without sweep_interval is valid");
+
+        // Verify extraction helper returns expected policy.
+        let policy = reaper_policy_from_response_store(&yaml)
+            .expect("extraction succeeds")
+            .expect("ttl set => policy present");
+        assert_eq!(policy.ttl, Duration::from_secs(24 * 3600));
+        assert_eq!(policy.sweep_interval, Duration::from_secs(3600)); // default 1h
+        assert_eq!(policy.batch_size.get(), 1000); // default
+    }
 }
 
 #[cfg(test)]

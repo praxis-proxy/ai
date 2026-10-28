@@ -7,6 +7,34 @@ ignore = [
     "RUSTSEC-2024-0388",
     # rustls-pemfile 2.2.0: unmaintained (via pingora-rustls)
     "RUSTSEC-2025-0134",
+
+    # zstd 0.13.3 and zstd-safe 7.3.0, reached only through
+    # quixotic-plecostomus-header-serde -> ...-cache -> ...-proxy ->
+    # praxis-proxy-protocol. Fixed upstream in zstd 0.14.3 and
+    # zstd-safe 8.2.0, each a semver-incompatible jump from what the
+    # vendored Pingora fork pins, so no resolution of this lockfile can
+    # take them. The copies this workspace owns are already patched.
+    #
+    # This list is longer than the one in .cargo/audit.toml because
+    # cargo-deny errors on the informational "unsound" advisories that
+    # cargo-audit only reports as warnings. Every entry below is the
+    # same root cause.
+    #
+    # Remove all of these once the fork moves to zstd 0.14.3 or later.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0395",
+    "RUSTSEC-2026-0396",
+    "RUSTSEC-2026-0397",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0399",
+    "RUSTSEC-2026-0400",
+    "RUSTSEC-2026-0401",
+    "RUSTSEC-2026-0402",
+    "RUSTSEC-2026-0403",
+    "RUSTSEC-2026-0404",
+    "RUSTSEC-2026-0405",
+    "RUSTSEC-2026-0406",
+    "RUSTSEC-2026-0414",
 ]
 
 [licenses]

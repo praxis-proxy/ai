@@ -19,7 +19,83 @@ use nix::{
 use praxis_core::config::Config;
 use praxis_test_utils::{StatefulCapturingBackend, free_port, start_proxy};
 
-use super::harness::{CLAUDE_CODE_PINNED_VERSION, TempWorkspace};
+use super::{
+    harness::{CLAUDE_CODE_PINNED_VERSION, TempWorkspace},
+    opencode::{pin_value_in, repo_root, workflow_job},
+};
+
+/// The Claude Code pin manifest, relative to this crate's `fixtures/` directory.
+const PIN_MANIFEST: &str = "claude-code-cli/pin.toml";
+
+#[test]
+fn pin_toml_version_matches_harness_const() {
+    // The CPU lane (npm) and the GPU lane (native download) both run this
+    // version; one manifest value keeps them from drifting apart.
+    assert_eq!(
+        pin_value_in(PIN_MANIFEST, "version"),
+        CLAUDE_CODE_PINNED_VERSION,
+        "the pin manifest and CLAUDE_CODE_PINNED_VERSION must agree; a bump must update both"
+    );
+}
+
+#[test]
+fn pinned_claude_code_version_matches_the_major_series_tripwire() {
+    let major = CLAUDE_CODE_PINNED_VERSION
+        .split('.')
+        .next()
+        .expect("version should be dotted");
+    assert_eq!(
+        major,
+        pin_value_in(PIN_MANIFEST, "major_series"),
+        "crossing a Claude Code major release must re-validate the manifest, not just bump the version"
+    );
+}
+
+#[test]
+fn pin_toml_url_downloads_the_pinned_version() {
+    assert_eq!(
+        pin_value_in(PIN_MANIFEST, "url"),
+        format!("https://downloads.claude.ai/claude-code-releases/{CLAUDE_CODE_PINNED_VERSION}/linux-x64/claude"),
+        "the manifest URL should fetch the pinned version's native build"
+    );
+    let digest = pin_value_in(PIN_MANIFEST, "sha256");
+    assert!(
+        digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()),
+        "the manifest sha256 should be a sha256 hex digest: {digest}"
+    );
+}
+
+#[test]
+fn claude_code_lane_is_wired_in_ci() {
+    let workflow = repo_root().join(".github/workflows/integration.yaml");
+    let yaml = std::fs::read_to_string(&workflow).expect("integration workflow should be readable");
+    let needle = format!("CLAUDE_CODE_PINNED_VERSION: \"{CLAUDE_CODE_PINNED_VERSION}\"");
+    let step = workflow_step(&workflow_job(&yaml, "test-integration"), INSTALL_STEP);
+    assert!(
+        step.contains(&needle),
+        "the `test-integration` job's {INSTALL_STEP:?} step in {} must set {needle:?}",
+        workflow.display()
+    );
+}
+
+/// The CPU lane's workflow step that installs the pinned Claude Code from npm.
+const INSTALL_STEP: &str = "Install pinned Claude Code CLI";
+
+/// The text of the step named `name` in a workflow job, from its `- name:` line
+/// up to the job's next step.
+fn workflow_step(job: &str, name: &str) -> String {
+    let header = format!("- name: {name}");
+    let mut lines = job.lines().skip_while(|line| line.trim() != header);
+    let first = lines
+        .next()
+        .unwrap_or_else(|| panic!("job should have a step named {name:?}"));
+    let step_indent = first.len() - first.trim_start().len();
+    let body = lines.take_while(|line| {
+        let indent = line.len() - line.trim_start().len();
+        line.trim().is_empty() || indent > step_indent
+    });
+    std::iter::once(first).chain(body).collect::<Vec<_>>().join("\n")
+}
 
 #[test]
 fn pinned_claude_code_version_check() {
@@ -56,8 +132,6 @@ async fn pinned_claude_code_completes_messages_coding_workflow() {
     let workspace = TempWorkspace::new().expect("failed to create temporary workspace");
     let expected_content = workspace.expected_content();
 
-    let title_sse = "data: {\"id\":\"chatcmpl-title\",\"object\":\"chat.completion.chunk\",\"created\":1677652287,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"{\\\"title\\\": \\\"Inspect and Update Task\\\"}\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-title\",\"object\":\"chat.completion.chunk\",\"created\":1677652287,\"model\":\"claude-3-5-sonnet-20241027\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":10,\"total_tokens\":20}}\n\ndata: [DONE]\n\n".to_owned();
-
     let bash_args_json = serde_json::json!({
         "command": format!("sh -c 'echo {expected_content} > result.txt && ./verify.sh'")
     });
@@ -82,7 +156,10 @@ async fn pinned_claude_code_completes_messages_coding_workflow() {
 
     let fallback_sse = "data: {\"id\":\"chatcmpl-fallback\",\"object\":\"chat.completion.chunk\",\"created\":1677652291,\"model\":\"claude-3-5-sonnet-20241022\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Task completed.\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
 
-    let mut responses = vec![(200, title_sse), (200, turn1_sse), (200, turn2_sse)];
+    // The pinned client runs `claude -p` outside an SDK or IDE, so it sends no
+    // background auto-title request (removed in Claude Code 2.1.277). The first
+    // backend request is therefore the first turn of the coding task.
+    let mut responses = vec![(200, turn1_sse), (200, turn2_sse)];
     for _ in 0..20 {
         responses.push((200, fallback_sse.to_owned()));
     }

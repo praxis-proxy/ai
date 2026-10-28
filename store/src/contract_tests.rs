@@ -91,6 +91,7 @@ async fn persist_parent_response(backend: &dyn PersistedStateBackend, owner: &St
 #[expect(
     clippy::large_stack_frames,
     clippy::cognitive_complexity,
+    clippy::too_many_lines,
     reason = "sequentially runs the complete backend contract"
 )]
 pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
@@ -122,6 +123,11 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     event_log_requires_owner_matched_response(backend).await;
     event_log_status_gates_on_terminal(backend).await;
     event_log_removed_with_response(backend).await;
+    sweep_removes_expired_rows_per_table(backend).await;
+    sweep_respects_batch_bound(backend).await;
+    sweep_filters_by_time_across_tenants(backend).await;
+    sweep_leaves_newer_child_until_its_own_cutoff(backend).await;
+    sweep_allows_reinsert_of_swept_ids(backend).await;
 }
 
 /// A budgeted response read returns the measured charge and rejects a record
@@ -1914,6 +1920,429 @@ async fn event_log_removed_with_response(backend: &dyn PersistedStateBackend) {
             .expect("status after delete"),
         EventLogStatus::Absent,
         "event-log status survived its response"
+    );
+}
+
+/// Sweep removes expired rows from each table independently based on `created_at`.
+#[expect(
+    clippy::too_many_lines,
+    clippy::missing_panics_doc,
+    reason = "linear contract assertions"
+)]
+pub async fn sweep_removes_expired_rows_per_table(backend: &dyn PersistedStateBackend) {
+    let o = owner("sweep-all");
+
+    // Persist a response with created_at=10
+    backend
+        .upsert_response(&ResponseRecord {
+            id: "resp_old".to_owned(),
+            owner: o.clone(),
+            created_at: 10,
+            model: "m".to_owned(),
+            response_object: serde_json::json!({}),
+            input: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert old response");
+
+    // Persist a conversation with created_at=10
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: "conv_old".to_owned(),
+            owner: o.clone(),
+            created_at: 10,
+            metadata: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert old conversation");
+
+    // Persist an item with created_at=10
+    backend
+        .create_items_and_sync_messages(&o, "conv_old", &[item(&o, "conv_old", "item_old")])
+        .await
+        .expect("create old item");
+
+    // Record a pending approval with created_at=10 (scoped to resp_old)
+    persist_parent_response(backend, &o, "resp_old_approvals").await;
+    backend
+        .record_pending_approvals(&o, "resp_old_approvals", &[approval("appr_old")], 10)
+        .await
+        .expect("record old approval");
+
+    // Persist an event with created_at=10
+    persist_parent_response(backend, &o, "resp_old_events").await;
+    backend
+        .append_events(&o, "resp_old_events", &[event(&o, "resp_old_events", 0, false)])
+        .await
+        .expect("append old event");
+
+    // Persist a second batch at created_at=1000 (should survive)
+    backend
+        .upsert_response(&ResponseRecord {
+            id: "resp_new".to_owned(),
+            owner: o.clone(),
+            created_at: 1000,
+            model: "m".to_owned(),
+            response_object: serde_json::json!({}),
+            input: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert new response");
+
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: "conv_new".to_owned(),
+            owner: o.clone(),
+            created_at: 1000,
+            metadata: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert new conversation");
+
+    // Sweep with cutoff=100 should remove created_at=10 rows
+    let stats = backend.sweep_expired(100, 1000).await.expect("sweep");
+    assert!(stats.responses >= 1, "should delete at least 1 response");
+    assert!(stats.conversations >= 1, "should delete at least 1 conversation");
+    assert!(stats.items >= 1, "should delete at least 1 item");
+    assert!(
+        stats.pending_approvals >= 1,
+        "should delete at least 1 pending approval"
+    );
+    assert!(stats.events >= 1, "should delete at least 1 event");
+
+    // Verify old rows are gone
+    assert!(
+        backend
+            .get_response(&o, "resp_old")
+            .await
+            .expect("get old response")
+            .is_none(),
+        "old response survived sweep"
+    );
+    assert!(
+        ConversationItemStore::get_conversation(backend, &o, "conv_old")
+            .await
+            .expect("get old conversation")
+            .is_none(),
+        "old conversation survived sweep"
+    );
+
+    // Verify new rows survived
+    assert!(
+        backend
+            .get_response(&o, "resp_new")
+            .await
+            .expect("get new response")
+            .is_some(),
+        "new response deleted by sweep"
+    );
+    assert!(
+        ConversationItemStore::get_conversation(backend, &o, "conv_new")
+            .await
+            .expect("get new conversation")
+            .is_some(),
+        "new conversation deleted by sweep"
+    );
+}
+
+/// Sweep respects the batch size limit per table.
+#[expect(clippy::missing_panics_doc, reason = "linear contract assertions")]
+pub async fn sweep_respects_batch_bound(backend: &dyn PersistedStateBackend) {
+    let o = owner("sweep-batch");
+
+    // Insert 5 expired responses
+    for i in 1..=5 {
+        backend
+            .upsert_response(&ResponseRecord {
+                id: format!("resp_{i}"),
+                owner: o.clone(),
+                created_at: 10,
+                model: "m".to_owned(),
+                response_object: serde_json::json!({}),
+                input: serde_json::json!({}),
+                messages: serde_json::json!([]),
+            })
+            .await
+            .expect("upsert expired response");
+    }
+
+    // First sweep with batch_size=2 should delete at most 2
+    let stats = backend.sweep_expired(100, 2).await.expect("first sweep");
+    assert!(stats.responses <= 2, "first sweep exceeded batch size");
+
+    // Loop until max_table() < 2 to remove all 5
+    let mut total_responses = stats.responses;
+    let mut iterations = 0;
+    let mut last_stats = stats;
+    while last_stats.max_table() >= 2 && iterations < 10 {
+        last_stats = backend.sweep_expired(100, 2).await.expect("loop sweep");
+        total_responses += last_stats.responses;
+        iterations += 1;
+    }
+
+    assert_eq!(total_responses, 5, "looping sweep did not remove all 5 responses");
+}
+
+/// Sweep filters by time across tenants: with two owners' rows present, only the
+/// row older than the cutoff is removed regardless of owner.
+#[expect(
+    clippy::too_many_lines,
+    clippy::missing_panics_doc,
+    reason = "linear contract assertions"
+)]
+pub async fn sweep_filters_by_time_across_tenants(backend: &dyn PersistedStateBackend) {
+    let a = owner("tenant-a");
+    let b = owner("tenant-b");
+
+    // Tenant A row at created_at=10
+    backend
+        .upsert_response(&ResponseRecord {
+            id: "resp_a".to_owned(),
+            owner: a.clone(),
+            created_at: 10,
+            model: "m".to_owned(),
+            response_object: serde_json::json!({}),
+            input: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert tenant A");
+
+    // Tenant B row at created_at=1000
+    backend
+        .upsert_response(&ResponseRecord {
+            id: "resp_b".to_owned(),
+            owner: b.clone(),
+            created_at: 1000,
+            model: "m".to_owned(),
+            response_object: serde_json::json!({}),
+            input: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert tenant B");
+
+    // Sweep with cutoff=100 removes A's old row but keeps B's newer row
+    backend.sweep_expired(100, 1000).await.expect("sweep");
+
+    assert!(
+        backend
+            .get_response(&a, "resp_a")
+            .await
+            .expect("get tenant A")
+            .is_none(),
+        "tenant A row survived sweep"
+    );
+    assert!(
+        backend
+            .get_response(&b, "resp_b")
+            .await
+            .expect("get tenant B")
+            .is_some(),
+        "tenant B row deleted by sweep"
+    );
+}
+
+/// Sweep leaves newer child rows until their own cutoff is reached.
+#[expect(
+    clippy::too_many_lines,
+    clippy::missing_panics_doc,
+    reason = "linear contract assertions"
+)]
+pub async fn sweep_leaves_newer_child_until_its_own_cutoff(backend: &dyn PersistedStateBackend) {
+    let o = owner("sweep-child");
+
+    // Parent response at created_at=10
+    backend
+        .upsert_response(&ResponseRecord {
+            id: "resp_parent".to_owned(),
+            owner: o.clone(),
+            created_at: 10,
+            model: "m".to_owned(),
+            response_object: serde_json::json!({}),
+            input: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert parent");
+
+    // Child approval at created_at=1000
+    backend
+        .record_pending_approvals(&o, "resp_parent", &[approval("appr_child")], 1000)
+        .await
+        .expect("record child approval");
+
+    // Child event at created_at=1000
+    backend
+        .append_events(
+            &o,
+            "resp_parent",
+            &[ResponseEventRecord {
+                response_id: "resp_parent".to_owned(),
+                owner: o.clone(),
+                sequence_number: 0,
+                event_type: "test".to_owned(),
+                payload: vec![],
+                terminal: false,
+                created_at: 1000,
+            }],
+        )
+        .await
+        .expect("append child event");
+
+    // First sweep with cutoff=100 deletes the parent but NOT the child
+    let stats1 = backend.sweep_expired(100, 1000).await.expect("first sweep");
+    assert!(stats1.responses >= 1, "parent response not deleted");
+
+    // Verify parent is gone
+    assert!(
+        backend
+            .get_response(&o, "resp_parent")
+            .await
+            .expect("get parent")
+            .is_none(),
+        "parent survived first sweep"
+    );
+
+    // Verify child approval and event still exist (orphaned)
+    let approvals = backend
+        .get_pending_approvals(&o, "resp_parent", &["appr_child"])
+        .await
+        .expect("get approvals");
+    assert_eq!(approvals.len(), 1, "child approval deleted with parent");
+
+    let events = backend
+        .list_events_after(&o, "resp_parent", None, 10)
+        .await
+        .expect("list events");
+    assert_eq!(events.len(), 1, "child event deleted with parent");
+
+    // Second sweep with cutoff=2000 deletes the children
+    let stats2 = backend.sweep_expired(2000, 1000).await.expect("second sweep");
+    assert!(
+        stats2.pending_approvals >= 1,
+        "child approval not deleted on second sweep"
+    );
+    assert!(stats2.events >= 1, "child event not deleted on second sweep");
+
+    // Verify children are now gone
+    let approvals_after = backend
+        .get_pending_approvals(&o, "resp_parent", &["appr_child"])
+        .await
+        .expect("get approvals after");
+    assert!(approvals_after.is_empty(), "child approval survived second sweep");
+
+    let events_after = backend
+        .list_events_after(&o, "resp_parent", None, 10)
+        .await
+        .expect("list events after");
+    assert!(events_after.is_empty(), "child event survived second sweep");
+}
+
+/// After sweeping a conversation and an item, a new conversation/item with the
+/// same ID can be created (no spurious "already exists" from stale uniqueness
+/// trackers).
+#[expect(clippy::too_many_lines, reason = "linear contract assertions")]
+async fn sweep_allows_reinsert_of_swept_ids(backend: &dyn PersistedStateBackend) {
+    let o = owner("sweep-reinsert");
+
+    // Create a conversation with created_at=10
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: "conv_reinsert".to_owned(),
+            owner: o.clone(),
+            created_at: 10,
+            metadata: serde_json::json!({"original": true}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("create original conversation");
+
+    // Create an item in that conversation with created_at=10
+    backend
+        .create_conversation_items(&[ConversationItemRecord {
+            item_id: "item_reinsert".to_owned(),
+            owner: o.clone(),
+            conversation_id: "conv_reinsert".to_owned(),
+            item_data: serde_json::json!({"original": true}),
+            created_at: 10,
+            position: 1,
+        }])
+        .await
+        .expect("create original item");
+
+    // Sweep with cutoff=100 to remove both
+    let stats = backend.sweep_expired(100, 1000).await.expect("sweep");
+    assert!(stats.conversations >= 1, "conversation not swept");
+    assert!(stats.items >= 1, "item not swept");
+
+    // Verify conversation was removed
+    assert!(
+        ConversationItemStore::get_conversation(backend, &o, "conv_reinsert")
+            .await
+            .expect("get conversation after sweep")
+            .is_none(),
+        "conversation survived sweep"
+    );
+
+    // Verify item was removed
+    let items_after_sweep = backend
+        .list_conversation_items(&o, "conv_reinsert", None, 10, true)
+        .await
+        .expect("list items after sweep");
+    assert!(items_after_sweep.is_empty(), "item survived sweep");
+
+    // Now create a NEW conversation with the SAME ID
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: "conv_reinsert".to_owned(),
+            owner: o.clone(),
+            created_at: 1000,
+            metadata: serde_json::json!({"reinserted": true}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("reinsert conversation with same ID should succeed");
+
+    // Verify the new conversation was created
+    let reinserted_conv = ConversationItemStore::get_conversation(backend, &o, "conv_reinsert")
+        .await
+        .expect("get reinserted conversation")
+        .expect("reinserted conversation not found");
+    assert_eq!(
+        reinserted_conv.metadata.get("reinserted"),
+        Some(&serde_json::json!(true)),
+        "wrong conversation data after reinsertion"
+    );
+
+    // Now create a NEW item with the SAME ID
+    backend
+        .create_conversation_items(&[ConversationItemRecord {
+            item_id: "item_reinsert".to_owned(),
+            owner: o.clone(),
+            conversation_id: "conv_reinsert".to_owned(),
+            item_data: serde_json::json!({"reinserted": true}),
+            created_at: 1000,
+            position: 2,
+        }])
+        .await
+        .expect("reinsert item with same ID should succeed");
+
+    // Verify the new item was created
+    let reinserted_items = backend
+        .list_conversation_items(&o, "conv_reinsert", None, 10, true)
+        .await
+        .expect("list reinserted items");
+    assert_eq!(reinserted_items.len(), 1, "reinserted item not found");
+    let first_item = reinserted_items.first().expect("reinserted item missing");
+    assert_eq!(
+        first_item.item_data.get("reinserted"),
+        Some(&serde_json::json!(true)),
+        "wrong item data after reinsertion"
     );
 }
 

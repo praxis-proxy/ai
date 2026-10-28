@@ -172,6 +172,22 @@ pub(super) fn repo_root() -> PathBuf {
         .expect("repository root should resolve")
 }
 
+/// The text of job `job` in a GitHub Actions workflow, from its `  job:` key
+/// line up to the next line indented less than the job's body.
+///
+/// A plain text scan is enough because the workflows keep the standard
+/// two-space job keys; it scopes a pin check to one job so another job's
+/// assignment cannot satisfy it.
+pub(super) fn workflow_job(yaml: &str, job: &str) -> String {
+    let header = format!("  {job}:");
+    let mut lines = yaml.lines().skip_while(|line| line.trim_end() != header);
+    let first = lines
+        .next()
+        .unwrap_or_else(|| panic!("workflow should define job `{job}`"));
+    let body = lines.take_while(|line| line.trim_end().is_empty() || line.starts_with("    "));
+    std::iter::once(first).chain(body).collect::<Vec<_>>().join("\n")
+}
+
 /// The gateway password these tests inject in place of `GATEWAY_AUTH_PASSWORD`.
 ///
 /// Drawn once per test process from the OS RNG rather than a source literal, so
@@ -477,6 +493,11 @@ impl OpenCodeTrace {
     /// Every `type` discriminant, in order.
     pub(super) fn event_types(&self) -> Vec<&str> {
         self.events.iter().filter_map(|event| event["type"].as_str()).collect()
+    }
+
+    /// Raw events in the order emitted by the client.
+    pub(super) fn events(&self) -> &[Value] {
+        &self.events
     }
 
     /// Concatenated assistant text across all `text` events.
@@ -840,6 +861,31 @@ fn pinned_opencode_version_is_a_one_x_release() {
         pin_value("major_series"),
         "1",
         "the pin manifest's major_series tripwire must agree with the pinned version"
+    );
+}
+
+#[test]
+fn checksum_fixture_names_the_pinned_platform_tarball() {
+    // The GPU lane verifies the downloaded platform tarball against this file,
+    // so a version bump that forgets it fails here rather than as a checksum
+    // mismatch on the nightly.
+    let platform = pin_value("platform");
+    let relative = format!("opencode-cli/{OPENCODE_PINNED_VERSION}-{platform}.sha256");
+    let line = std::fs::read_to_string(fixture_path(&relative))
+        .unwrap_or_else(|error| panic!("fixtures/{relative} should exist for the pinned version: {error}"));
+    let (digest, file) = line
+        .trim()
+        .split_once("  ")
+        .expect("the checksum fixture should be in `sha256sum` format");
+    assert_eq!(digest.len(), 64, "the checksum should be a sha256 hex digest: {digest}");
+    assert!(
+        digest.chars().all(|c| c.is_ascii_hexdigit()),
+        "the checksum should be hex: {digest}"
+    );
+    assert_eq!(
+        file,
+        format!("opencode-{platform}-{OPENCODE_PINNED_VERSION}.tgz"),
+        "the checksum should name the platform tarball the GPU lane downloads"
     );
 }
 

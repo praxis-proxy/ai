@@ -7,7 +7,7 @@ use bytes::{Bytes, BytesMut};
 use praxis_filter::{FilterAction, FilterEntry, FilterPipeline, SelectedUpstreamBodyOutcome};
 use serde_json::json;
 
-use super::{super::state::RequestReasoningPresence, *};
+use super::*;
 use crate::{
     openai::sse::{SseFrame, SseFrameParser},
     store::{
@@ -97,8 +97,11 @@ fn unknown_field_rejected() {
 #[test]
 fn declares_dual_phase_body_access() {
     let filter = default_filter();
-    assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
-    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadOnly);
+    // `ReadWrite` in both phases: a merged stored configuration default is
+    // published to the live body so later filters observe the effective
+    // reasoning setting.
+    assert_eq!(filter.request_body_access(), BodyAccess::ReadWrite);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadWrite);
 }
 
 // -----------------------------------------------------------------------------
@@ -2053,6 +2056,56 @@ async fn configuration_update_applies_to_native_and_translated_conversation_requ
     }
 }
 
+#[tokio::test]
+async fn configuration_update_publishes_merged_default_to_live_request_body() {
+    for request_reasoning in [
+        None,
+        Some(json!({})),
+        Some(json!({"effort": null})),
+        Some(json!({"effort": "low"})),
+    ] {
+        let stored = json!([
+            {"type": "configuration_update", "id": "cnfu_1", "reasoning": {"effort": "medium"}},
+            {"type": "message", "id": "msg_1", "role": "user", "content": "hello"},
+            {"type": "configuration_update", "id": "cnfu_2", "reasoning": {"effort": "high"}},
+        ]);
+        let registry = setup_registry(MockStore::with_conversation("conv_config", stored));
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        ctx.extensions.insert(registry);
+        ctx.set_metadata("openai_responses_request.format", "openai_responses");
+        let mut request = json!({"model": "gpt-4.1", "input": "continue", "conversation": "conv_config"});
+        if let Some(reasoning) = &request_reasoning {
+            request["reasoning"] = reasoning.clone();
+        }
+        let mut body = Some(Bytes::from(serde_json::to_vec(&request).unwrap()));
+        let action = default_filter()
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .unwrap();
+        assert!(
+            matches!(action, FilterAction::Release),
+            "rehydration must release: request_reasoning={request_reasoning:?}"
+        );
+        let live: Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+        // An effort the request carried (including an explicit null) wins; a
+        // vacant or absent effort inherits the latest stored default.
+        let expected_effort = match &request_reasoning {
+            Some(reasoning) => reasoning.get("effort").cloned().unwrap_or_else(|| json!("high")),
+            None => json!("high"),
+        };
+        assert_eq!(
+            live["reasoning"]["effort"], expected_effort,
+            "the merged default must be published to the live body later filters see: request_reasoning={request_reasoning:?}"
+        );
+        assert_eq!(live["model"], "gpt-4.1", "unrelated members must be preserved in place");
+        assert_eq!(
+            live["conversation"], "conv_config",
+            "the selector stays for the selected rebuild to remove"
+        );
+    }
+}
+
 #[test]
 fn configuration_update_replacement_does_not_resurrect_earlier_effort() {
     for replacement in [
@@ -2065,7 +2118,9 @@ fn configuration_update_replacement_does_not_resurrect_earlier_effort() {
             json!({"type": "configuration_update", "reasoning": {"effort": "high"}}),
             replacement,
         ];
-        let state = build_state(json!({"model": "m", "input": "hello"}), stored, vec![], None);
+        let mut body = json!({"model": "m", "input": "hello"});
+        apply_stored_configuration(&mut body, &stored);
+        let state = build_state(body, stored, vec![], None);
         assert!(
             state.request_body["reasoning"]["effort"].is_null(),
             "replacement {shape} must not resurrect the stored effort"
@@ -2081,58 +2136,15 @@ fn configuration_update_replacement_does_not_resurrect_earlier_effort() {
 
 #[test]
 fn configuration_update_preserves_other_request_reasoning_fields() {
-    let state = build_state(
-        json!({"input": "hello", "reasoning": {"summary": "auto"}}),
-        vec![json!({"type": "configuration_update", "reasoning": {"effort": "high"}})],
-        vec![],
-        None,
-    );
+    let stored = vec![json!({"type": "configuration_update", "reasoning": {"effort": "high"}})];
+    let mut body = json!({"input": "hello", "reasoning": {"summary": "auto"}});
+    assert!(apply_stored_configuration(&mut body, &stored));
+    let state = build_state(body, stored, vec![], None);
     assert_eq!(
         state.request_body["reasoning"],
         json!({"summary": "auto", "effort": "high"}),
         "request-supplied reasoning fields must survive beside the inherited effort"
     );
-}
-
-#[test]
-fn build_state_records_request_reasoning_presence() {
-    let config = vec![json!({"type": "configuration_update", "reasoning": {"effort": "high"}})];
-    for (request, expected) in [
-        (
-            json!({"model": "m", "input": "hello"}),
-            RequestReasoningPresence::Absent,
-        ),
-        (
-            json!({"model": "m", "input": "hello", "reasoning": null}),
-            RequestReasoningPresence::OmittedEffort,
-        ),
-        (
-            json!({"model": "m", "input": "hello", "reasoning": {}}),
-            RequestReasoningPresence::OmittedEffort,
-        ),
-        (
-            json!({"model": "m", "input": "hello", "reasoning": {"summary": "auto"}}),
-            RequestReasoningPresence::OmittedEffort,
-        ),
-        (
-            json!({"model": "m", "input": "hello", "reasoning": {"effort": "low"}}),
-            RequestReasoningPresence::ExplicitEffort,
-        ),
-        (
-            json!({"model": "m", "input": "hello", "reasoning": {"effort": null}}),
-            RequestReasoningPresence::ExplicitEffort,
-        ),
-    ] {
-        let state = build_state(request, config.clone(), vec![], None);
-        assert_eq!(
-            state.request_reasoning, expected,
-            "presence must be captured before the stored default merges into the body"
-        );
-    }
-    // The captured presence is provenance only; the merge itself is unchanged.
-    let state = build_state(json!({"model": "m", "input": "hello"}), config, vec![], None);
-    assert_eq!(state.request_reasoning, RequestReasoningPresence::Absent);
-    assert_eq!(state.request_body["reasoning"]["effort"], json!("high"));
 }
 
 #[tokio::test]

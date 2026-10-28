@@ -100,6 +100,35 @@ filter_chains:
         #   schema version must be migrated before the proxy will start — see
         #   docs/store/schema-migration.md.
         #
+        # TTL and automatic purge (optional, off by default):
+        #   Time-to-live retention policy that purges records older than the
+        #   specified age. A background coordinator runs one reaper per distinct
+        #   store backend (so two filters on one database with different table sets
+        #   each get a reaper), sweeping expired records in bounded batches at the
+        #   configured interval.
+        #
+        #   IMPORTANT: TTL is measured from record CREATION time; activity does
+        #   NOT extend retention. An actively-used conversation or response older
+        #   than `ttl` is purged even if recently accessed. TTL is not a storage-
+        #   capacity guarantee; tenant byte quotas are tracked separately in #1626.
+        #
+        #   Each table is swept INDEPENDENTLY by its own created_at; the reaper
+        #   does NOT cascade. A child row (conversation item, event, approval)
+        #   created later than its parent can outlive a swept parent and persists
+        #   until its own created_at passes the cutoff — possibly much longer than
+        #   one sweep interval. (DELETE /v1/responses/{id} cascades to its approval
+        #   and event rows; DELETE /v1/conversations/{id} does NOT cascade — item
+        #   rows are preserved by design. The reaper is independent of both.)
+        #
+        #   ttl: 7d                      # retention period (humantime: 7d, 24h, 30m, etc.)
+        #                                # omit or comment out to disable TTL purging
+        #   sweep_interval: 1h           # how often to run the reaper (default: 1h)
+        #   sweep_batch_size: 1000       # records purged per sweep batch (default: 1000)
+        #
+        #   The coordinator persists its policy (ttl, sweep_interval, sweep_batch_size)
+        #   on each config commit. Policy changes take effect when the pipeline
+        #   reloads. The reaper stops gracefully on shutdown and across config reloads.
+        #
         # PostgreSQL backend:
         #   backend: postgres
         #   database_url: "postgres://user:pass@db.example.com:5432/praxis"
