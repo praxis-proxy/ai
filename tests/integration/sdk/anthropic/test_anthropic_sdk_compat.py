@@ -22,63 +22,35 @@ backend wire headers are asserted in
 
 Everything runs against local stub backends: no Anthropic credentials and
 no external provider calls. Select the lane explicitly with
-``--sdk-version=1.x`` or ``--sdk-version=2.x`` (see the conftest), e.g.:
+``--anthropic-sdk-version=1.x`` or ``--anthropic-sdk-version=2.x`` (see the
+conftest), e.g.:
 
     cargo build -p praxis-ai-proxy
-    uv run --with "anthropic==1.17.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s -v --sdk-version=1.x
-    uv run --with "anthropic==2.3.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s -v --sdk-version=2.x
+    uv run --with "anthropic==1.17.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s -v --anthropic-sdk-version=1.x
+    uv run --with "anthropic==2.3.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s -v --anthropic-sdk-version=2.x
 """
 
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
 import threading
-import time
 from collections import deque
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
 import pytest
 from anthropic import Anthropic, BadRequestError
 
+from conftest import find_binary as _find_binary
+from conftest import free_port as _free_port
+from conftest import wait_for_proxy as _wait_for_proxy
+
 NATIVE_CONFIG_PATH = "examples/configs/anthropic/messages-protocol.yaml"
 TRANSLATED_CONFIG_PATH = "examples/configs/anthropic/messages-to-openai.yaml"
 MODEL = "stub-model"
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def _find_binary() -> str:
-    configured = os.environ.get("PRAXIS_AI_BIN")
-    if configured:
-        if os.path.isfile(configured):
-            return configured
-        raise FileNotFoundError(f"PRAXIS_AI_BIN={configured!r} not found")
-    for candidate in ["target/debug/praxis-ai", "target/release/praxis-ai"]:
-        if os.path.isfile(candidate):
-            return candidate
-    raise FileNotFoundError(
-        "praxis-ai binary not found — run `cargo build -p praxis-ai-proxy` first"
-    )
-
-
-def _wait_for_proxy(port: int, timeout: float = 10.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                return
-        except OSError:
-            time.sleep(0.1)
-    raise TimeoutError(f"proxy did not start within {timeout}s on port {port}")
 
 
 class _RecordingState:
@@ -246,7 +218,7 @@ def _start_proxy(config_path: str, port: int) -> subprocess.Popen:
     try:
         _wait_for_proxy(port)
     except BaseException:
-        proc.send_signal(signal.SIGINT)
+        _stop_proxy(proc)
         raise
     return proc
 
@@ -261,6 +233,7 @@ def _start_backend(state: _RecordingState, handler_class) -> tuple[ThreadingHTTP
 
 def _stop_backend(server: ThreadingHTTPServer, thread: threading.Thread) -> None:
     server.shutdown()
+    server.server_close()
     thread.join(timeout=5)
 
 
@@ -276,47 +249,48 @@ def _stop_proxy(proc: subprocess.Popen) -> None:
 @pytest.fixture(scope="module")
 def native_client():
     """Anthropic SDK client against native Messages passthrough (example config)."""
-    server, thread = _start_backend(NATIVE_STATE, _NativeHandler)
-    proxy_port = _free_port()
-    config_path = _retarget_example(NATIVE_CONFIG_PATH, [
-        ("127.0.0.1:8080", f"127.0.0.1:{proxy_port}"),
-        ("127.0.0.1:3001", f"127.0.0.1:{server.server_address[1]}"),
-    ])
-    proc = _start_proxy(config_path, proxy_port)
-    try:
+    # ExitStack registers cleanup as each resource is created, so a failure
+    # partway through startup (backend, config, proxy) still releases the
+    # resources that were already created.
+    with ExitStack() as stack:
+        server, thread = _start_backend(NATIVE_STATE, _NativeHandler)
+        stack.callback(_stop_backend, server, thread)
+        proxy_port = _free_port()
+        config_path = _retarget_example(NATIVE_CONFIG_PATH, [
+            ("127.0.0.1:8080", f"127.0.0.1:{proxy_port}"),
+            ("127.0.0.1:3001", f"127.0.0.1:{server.server_address[1]}"),
+        ])
+        stack.callback(os.unlink, config_path)
+        proc = _start_proxy(config_path, proxy_port)
+        stack.callback(_stop_proxy, proc)
         yield Anthropic(
             base_url=f"http://127.0.0.1:{proxy_port}",
             api_key="test-key",
             max_retries=0,
             timeout=10.0,
         )
-    finally:
-        _stop_proxy(proc)
-        _stop_backend(server, thread)
-        os.unlink(config_path)
 
 
 @pytest.fixture(scope="module")
 def translated_client():
     """Anthropic SDK client against Messages -> Chat Completions translation."""
-    server, thread = _start_backend(TRANSLATED_STATE, _TranslatedHandler)
-    proxy_port = _free_port()
-    config_path = _retarget_example(TRANSLATED_CONFIG_PATH, [
-        ("127.0.0.1:8080", f"127.0.0.1:{proxy_port}"),
-        ("127.0.0.1:8000", f"127.0.0.1:{server.server_address[1]}"),
-    ])
-    proc = _start_proxy(config_path, proxy_port)
-    try:
+    with ExitStack() as stack:
+        server, thread = _start_backend(TRANSLATED_STATE, _TranslatedHandler)
+        stack.callback(_stop_backend, server, thread)
+        proxy_port = _free_port()
+        config_path = _retarget_example(TRANSLATED_CONFIG_PATH, [
+            ("127.0.0.1:8080", f"127.0.0.1:{proxy_port}"),
+            ("127.0.0.1:8000", f"127.0.0.1:{server.server_address[1]}"),
+        ])
+        stack.callback(os.unlink, config_path)
+        proc = _start_proxy(config_path, proxy_port)
+        stack.callback(_stop_proxy, proc)
         yield Anthropic(
             base_url=f"http://127.0.0.1:{proxy_port}",
             api_key="test-key",
             max_retries=0,
             timeout=10.0,
         )
-    finally:
-        _stop_proxy(proc)
-        _stop_backend(server, thread)
-        os.unlink(config_path)
 
 
 def _native_expected_headers(lane: str) -> dict[str, str]:
@@ -458,6 +432,11 @@ class TestTranslatedToChatCompletions:
         assert "x-api-key" not in headers, (
             f"the Anthropic credential header must not leak to a Chat Completions "
             f"backend (SDK {lane})"
+        )
+        assert "authorization" not in headers, (
+            f"the caller's credential must not leak to a Chat Completions backend "
+            f"in any SDK lane — SDK v2 sends it as 'authorization: Bearer' "
+            f"(SDK {lane})"
         )
         assert headers.get("content-type") == "application/json"
 

@@ -32,7 +32,7 @@ wait_for_proxy = _shared.wait_for_proxy
 
 def pytest_addoption(parser):
     parser.addoption(
-        "--sdk-version",
+        "--anthropic-sdk-version",
         action="store",
         default=os.getenv("ANTHROPIC_SDK_VERSION", "auto"),
         choices=["auto", "1.x", "2.x"],
@@ -62,7 +62,7 @@ def pytest_configure(config):
     config._anthropic_sdk_version = installed_version
     config._anthropic_sdk_lane = detected_lane
 
-    requested_lane = config.getoption("--sdk-version")
+    requested_lane = config.getoption("--anthropic-sdk-version")
     if requested_lane != "auto" and requested_lane != detected_lane:
         raise pytest.UsageError(
             f"Requested SDK version lane '{requested_lane}', but installed anthropic "
@@ -96,12 +96,16 @@ def anthropic_sdk_info(request):
 #
 # The scrub is session-scoped and runs before any module-scoped client
 # fixture constructs its SDK client, because the SDK reads these variables
-# once at construction time.
+# once at construction time. MonkeyPatch restores the original values when
+# the session ends, so later code in the same pytest process (other
+# directories' suites, plugins) sees the caller's environment again.
 _ANTHROPIC_ENV_PREFIXES = ("ANTHROPIC_",)
 
 
 @pytest.fixture(autouse=True, scope="session")
 def _sanitize_anthropic_env():
-    for name in list(os.environ):
-        if name.startswith(_ANTHROPIC_ENV_PREFIXES):
-            os.environ.pop(name, None)
+    with pytest.MonkeyPatch.context() as mp:
+        for name in list(os.environ):
+            if name.startswith(_ANTHROPIC_ENV_PREFIXES):
+                mp.delenv(name)
+        yield

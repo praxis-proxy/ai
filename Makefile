@@ -289,20 +289,21 @@ test-inference-xtask:
 	cargo test -p xtask --features openai-all,store-all inference_fixtures $(_NOCAPTURE)
 
 # Anthropic SDK v1/v2 compatibility lanes for Messages routes (issue #1825).
-# The aggregate runs both pinned lanes serially for local use; CI splits the
-# lanes into the two parallel subtargets below, so each lane builds the binary
-# itself instead of depending on sibling lane ordering.
+# The aggregate runs both pinned lanes serially for local use; CI runs the
+# lanes as sequential steps in the `anthropic-sdk` job of integration.yaml
+# after a single binary build. These per-lane targets build the binary
+# themselves, so a local lane run never depends on a sibling lane's build.
 test-anthropic-sdk: test-anthropic-sdk-v1 test-anthropic-sdk-v2
 
 test-anthropic-sdk-v1:
 	cargo build -p praxis-ai-proxy
 	uv run --with "anthropic==1.17.0" --with "pytest>=8.0" \
-		tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s --sdk-version=1.x
+		tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s --anthropic-sdk-version=1.x
 
 test-anthropic-sdk-v2:
 	cargo build -p praxis-ai-proxy
 	uv run --with "anthropic==2.3.0" --with "pytest>=8.0" \
-		tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s --sdk-version=2.x
+		tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s --anthropic-sdk-version=2.x
 
 # Every ignored test in praxis-ai-apis is a PostgreSQL store contract, so
 # --ignored alone selects them all: no name filter can drop one silently.

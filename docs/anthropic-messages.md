@@ -283,6 +283,10 @@ lane's wire headers, JSON and streaming message round-trips, tool use, and
 the route-owned `2026-10-21` acceptance constraints (sampling parameter
 mapping, empty versus active citations, `document` and `thinking` block
 rejection). It needs no Anthropic credentials and makes no external calls.
+On the translated route, the `anthropic_messages_to_chat_completions`
+filter strips the caller's Anthropic wire credentials — `x-api-key` (SDK v1)
+and `authorization: Bearer` (SDK v2) — along with `anthropic-version`, so
+neither reaches a Chat Completions backend in either lane.
 
 The OpenAI -> Anthropic Messages direction is driven by the OpenAI SDK as the
 client, so it does not vary on the Anthropic SDK axis; its backend wire
@@ -294,11 +298,11 @@ Run both lanes locally with `make test-anthropic-sdk`, or one lane at a time:
 
 ```console
 cargo build -p praxis-ai-proxy
-uv run --with "anthropic==1.17.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s -v --sdk-version=1.x
-uv run --with "anthropic==2.3.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s -v --sdk-version=2.x
+uv run --with "anthropic==1.17.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s -v --anthropic-sdk-version=1.x
+uv run --with "anthropic==2.3.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s -v --anthropic-sdk-version=2.x
 ```
 
-CI runs the lanes as parallel steps in the `anthropic-sdk` job of
+CI runs both lanes as sequential steps in the `anthropic-sdk` job of
 [`integration.yaml`](../.github/workflows/integration.yaml).
 
 ## Passthrough to Anthropic API

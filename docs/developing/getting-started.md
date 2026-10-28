@@ -95,15 +95,18 @@ so each lane is pinned and verified independently:
 
 ```console
 cargo build -p praxis-ai-proxy
-uv run --with "anthropic<2" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -v --sdk-version=1.x
-uv run --with "anthropic>=2,<3" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -v --sdk-version=2.x
+uv run --with "anthropic==1.17.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -v --anthropic-sdk-version=1.x
+uv run --with "anthropic==2.3.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -v --anthropic-sdk-version=2.x
 ```
 
-`make test-anthropic-sdk` runs both lanes; CI splits them into the parallel
-`test-anthropic-sdk-v1` and `test-anthropic-sdk-v2` targets. You can also pass
-`--sdk-version=1.x` or `--sdk-version=2.x` to enforce version verification
-during pytest startup. The suites scrub ambient `ANTHROPIC_*` environment
-variables so wire-header assertions stay deterministic.
+The pinned versions match the `make test-anthropic-sdk-v1` and
+`test-anthropic-sdk-v2` lane targets and CI. `make test-anthropic-sdk` runs
+both lanes locally; CI runs them as sequential steps in the `anthropic-sdk`
+job of `integration.yaml` after a single binary build. You can also pass
+`--anthropic-sdk-version=1.x` or `--anthropic-sdk-version=2.x` to enforce
+version verification during pytest startup. The suites scrub ambient
+`ANTHROPIC_*` environment variables so wire-header assertions stay
+deterministic.
 
 ### OpenAI Agents SDK Responses Compatibility
 
