@@ -70,8 +70,16 @@ mod tests {
         assert!(validation.is_ok(), "default limits must validate: {validation:?}");
         let config = validation.unwrap_or_default();
         assert!(!config.api_translation_enabled, "translation must default to disabled");
-        assert_eq!(config.request_limit(), 2 * 1024 * 1024);
-        assert_eq!(config.response_limit(), 1024 * 1024);
+        assert_eq!(
+            config.request_limit(),
+            2 * 1024 * 1024,
+            "default request allowance must be 2 MiB"
+        );
+        assert_eq!(
+            config.response_limit(),
+            1024 * 1024,
+            "default response allowance must remain 1 MiB"
+        );
     }
 
     /// Deserialize a known-valid test configuration without panicking on parse errors.
@@ -87,15 +95,27 @@ mod tests {
         let validation = legacy.validate();
         assert!(validation.is_ok(), "legacy limit must validate: {validation:?}");
         let legacy = validation.unwrap_or_default();
-        assert_eq!(legacy.request_limit(), 4096);
-        assert_eq!(legacy.response_limit(), 4096);
+        assert_eq!(legacy.request_limit(), 4096, "legacy shared limit must govern requests");
+        assert_eq!(
+            legacy.response_limit(),
+            4096,
+            "legacy shared limit must govern responses"
+        );
 
         let split = parse_config("max_body_bytes: 4096\nmax_request_body_bytes: 8192\nmax_response_body_bytes: 2048\n");
         let validation = split.validate();
         assert!(validation.is_ok(), "split limits must validate: {validation:?}");
         let split = validation.unwrap_or_default();
-        assert_eq!(split.request_limit(), 8192);
-        assert_eq!(split.response_limit(), 2048);
+        assert_eq!(
+            split.request_limit(),
+            8192,
+            "request-specific limit must override the shared limit"
+        );
+        assert_eq!(
+            split.response_limit(),
+            2048,
+            "response-specific limit must override the shared limit"
+        );
     }
 
     #[test]
@@ -104,6 +124,9 @@ mod tests {
         let validation = config.validate();
         assert!(validation.is_err(), "zero request limit must fail validation");
         let error = validation.err().map(|value| value.to_string()).unwrap_or_default();
-        assert!(error.contains("max_request_body_bytes"));
+        assert!(
+            error.contains("max_request_body_bytes"),
+            "validation must identify the invalid request limit: {error}"
+        );
     }
 }

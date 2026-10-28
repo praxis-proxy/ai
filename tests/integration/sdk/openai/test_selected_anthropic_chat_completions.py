@@ -250,7 +250,7 @@ def test_data_and_remote_image_urls_are_translated_without_fetching(client: Open
         model=MODEL,
         messages=[{"role": "user", "content": [
             {"type": "text", "text": "before"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "detail": "high"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "detail": "high"}},
             {"type": "text", "text": "after"},
             {"type": "image_url", "image_url": {"url": "https://images.example.test/image.png"}},
         ]}],
@@ -260,7 +260,7 @@ def test_data_and_remote_image_urls_are_translated_without_fetching(client: Open
     assert path == "/v1/messages"
     content = upstream["messages"][0]["content"]
     assert [block["type"] for block in content] == ["text", "image", "text", "image"]
-    assert content[1]["source"] == {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}
+    assert content[1]["source"] == {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}
     assert content[3]["source"] == {"type": "url", "url": "https://images.example.test/image.png"}
 
 

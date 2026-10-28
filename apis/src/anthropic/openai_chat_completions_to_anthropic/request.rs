@@ -3,7 +3,9 @@
 
 //! Validated Chat Completions request conversion for Anthropic Messages.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use std::io::Read as _;
+
+use base64::{engine::general_purpose::STANDARD, read::DecoderReader};
 use serde_json::{Map, Value, json};
 use url::Url;
 
@@ -352,13 +354,19 @@ fn translate_base64_data_url(value: &str) -> Result<Value, String> {
     if metadata_parts.next() != Some("base64") || metadata_parts.next().is_some() {
         return Err("image data URL must use the base64 encoding marker".to_owned());
     }
-    let decoded = STANDARD
-        .decode(encoded)
+    let mut decoder = DecoderReader::new(encoded.as_bytes(), &STANDARD);
+    // The longest signature is 12 bytes; validate the rest without retaining the image.
+    let mut signature = Vec::with_capacity(12);
+    decoder
+        .by_ref()
+        .take(12)
+        .read_to_end(&mut signature)
         .map_err(|_error| "image data URL contains invalid base64")?;
-    if decoded.is_empty() {
+    std::io::copy(&mut decoder, &mut std::io::sink()).map_err(|_error| "image data URL contains invalid base64")?;
+    if signature.is_empty() {
         return Err("image data URL payload must not be empty".to_owned());
     }
-    if !matches_image_signature(media_type, &decoded) {
+    if !matches_image_signature(media_type, &signature) {
         return Err("image data URL payload does not match its declared image media type".to_owned());
     }
     Ok(json!({"type":"image","source":{"type":"base64","media_type":media_type,"data":encoded}}))

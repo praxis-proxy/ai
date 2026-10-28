@@ -46,6 +46,12 @@ Request and response buffering limits are independent:
 | `max_request_body_bytes` | 2 MiB | 16 MiB | Complete Chat Completions request needed for validation and translation. |
 | `max_response_body_bytes` | 1 MiB | 16 MiB | Non-streaming Anthropic JSON response retained for conversion. |
 
+These are filter limits, not overrides of the listener's body ceilings. Praxis
+listeners default to 10 MiB for both `body_limits.max_request_bytes` and
+`body_limits.max_response_bytes`. To use a filter limit above 10 MiB, also raise
+the corresponding listener ceiling to accommodate it. A lower listener ceiling
+still takes precedence.
+
 For existing configurations, `max_body_bytes` remains supported as a shared
 limit. A direction-specific setting takes precedence over the shared setting
 for that direction. If neither direction-specific nor shared value is set,

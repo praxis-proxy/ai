@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use http::{HeaderValue, StatusCode};
 use praxis_filter::{FilterAction, Response, SelectedUpstreamBodyOutcome};
@@ -156,7 +157,7 @@ fn rejects_malformed_ignored_options() {
 
 #[test]
 fn translates_base64_and_remote_image_sources_in_content_order() {
-    let input = br#"{"model":"client-model","messages":[{"role":"user","content":[{"type":"text","text":"first"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC","detail":"high"}},{"type":"text","text":"last"},{"type":"image_url","image_url":{"url":"https://images.example.test/photo.png"}}]}]}"#;
+    let input = br#"{"model":"client-model","messages":[{"role":"user","content":[{"type":"text","text":"first"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC","detail":"high"}},{"type":"text","text":"last"},{"type":"image_url","image_url":{"url":"https://images.example.test/photo.png"}}]}]}"#;
     let (bytes, profile) = translate_request(input, "provider-model").unwrap();
     let output: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(output["model"], "provider-model");
@@ -166,7 +167,7 @@ fn translates_base64_and_remote_image_sources_in_content_order() {
     assert_eq!(content[0], json!({"type":"text","text":"first"}));
     assert_eq!(
         content[1],
-        json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}})
+        json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}})
     );
     assert_eq!(content[2], json!({"type":"text","text":"last"}));
     assert_eq!(
@@ -179,7 +180,7 @@ fn translates_base64_and_remote_image_sources_in_content_order() {
 fn rejects_assistant_images_without_relabeling_or_dropping_them() {
     for image in [
         "https://images.example.test/photo.png",
-        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
     ] {
         let input = json!({"model":"m","messages":[
             {"role":"user","content":"Describe the image"},
@@ -208,6 +209,37 @@ fn rejects_invalid_preferred_token_alias_even_with_valid_legacy_alias() {
                 .unwrap_err()
                 .contains("positive integer"),
             "invalid preferred alias must not fall back to max_tokens"
+        );
+    }
+}
+
+#[test]
+fn validates_base64_beyond_the_image_signature_and_preserves_encoded_data() {
+    let mut decoded = b"\x89PNG\r\n\x1a\n".to_vec();
+    decoded.resize(32 * 1024, 0);
+    let encoded = STANDARD.encode(&decoded);
+    let request = |payload: &str| {
+        json!({"model":"m","messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{payload}")}}
+        ]}]})
+        .to_string()
+    };
+    let (translated, _) = translate_request(request(&encoded).as_bytes(), "provider-model").unwrap();
+    let translated: Value = serde_json::from_slice(&translated).unwrap();
+    assert_eq!(
+        translated["messages"][0]["content"][0]["source"]["data"], encoded,
+        "incremental validation must forward the original encoding unchanged"
+    );
+    for invalid in [
+        format!("{encoded}%"),
+        format!("{encoded}AAAA"),
+        encoded.trim_end_matches('=').to_owned(),
+    ] {
+        assert!(
+            translate_request(request(&invalid).as_bytes(), "provider-model")
+                .unwrap_err()
+                .contains("invalid base64"),
+            "invalid trailing data or padding after a valid signature must be rejected"
         );
     }
 }
