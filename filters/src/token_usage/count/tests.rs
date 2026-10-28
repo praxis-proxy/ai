@@ -2381,6 +2381,156 @@ fn non_output_sse_events_do_not_start_timing() {
     );
 }
 
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "test setup and metric assertions stay together")]
+async fn sse_terminal_usage_event_records_tpot_and_itl() {
+    let filter = make_filter(ProviderKind::OpenAi);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.cluster = Some("test-cluster".to_owned().into());
+    ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "test-model");
+
+    let mut resp = make_response_with_content_type("text/event-stream");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let events = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"B\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}}\n\n",
+    );
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        let mut body = Some(Bytes::copy_from_slice(events.as_bytes()));
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+    });
+
+    assert_eq!(ctx.get_metadata("token.output"), Some("3"));
+    let snap = snapshotter.snapshot().into_vec();
+    let samples = |name: &str| -> usize {
+        snap.iter()
+            .filter_map(|(key, _, _, value)| {
+                if key.key().name() == name
+                    && let DebugValue::Histogram(values) = value
+                {
+                    Some(values.len())
+                } else {
+                    None
+                }
+            })
+            .sum()
+    };
+    assert_eq!(samples(crate::llm_metrics::METRIC_TPOT_SECONDS), 1);
+    assert_eq!(samples(crate::llm_metrics::METRIC_ITL_SECONDS), 1);
+}
+
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "test setup and metric assertions stay together")]
+async fn sse_terminal_usage_event_with_single_output_token_skips_tpot() {
+    let filter = make_filter(ProviderKind::OpenAi);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.cluster = Some("test-cluster".to_owned().into());
+    ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "test-model");
+
+    let mut resp = make_response_with_content_type("text/event-stream");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let events = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}\n\n",
+    );
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        let mut body = Some(Bytes::copy_from_slice(events.as_bytes()));
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+    });
+
+    assert_eq!(ctx.get_metadata("token.output"), Some("1"));
+    let snap = snapshotter.snapshot().into_vec();
+    let tpot_samples: usize = snap
+        .iter()
+        .filter_map(|(key, _, _, value)| {
+            if key.key().name() == crate::llm_metrics::METRIC_TPOT_SECONDS
+                && let DebugValue::Histogram(values) = value
+            {
+                Some(values.len())
+            } else {
+                None
+            }
+        })
+        .sum();
+    assert_eq!(tpot_samples, 0, "output_tokens <= 1 must not produce TPOT");
+}
+
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "test setup and metric assertions stay together")]
+async fn sse_without_usage_does_not_emit_empty_completion() {
+    let filter = make_filter(ProviderKind::OpenAi);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.cluster = Some("test-cluster".to_owned().into());
+    ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "test-model");
+
+    let mut resp = make_response_with_content_type("text/event-stream");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let events = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"B\"}}]}\n\n",
+    );
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        let mut body = Some(Bytes::copy_from_slice(events.as_bytes()));
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+    });
+
+    assert!(ctx.get_metadata("token.output").is_none());
+    let snap = snapshotter.snapshot().into_vec();
+    assert!(
+        snap.iter()
+            .all(|(key, ..)| key.key().name() != crate::llm_metrics::METRIC_EMPTY_COMPLETIONS_TOTAL),
+        "no-usage streams cannot infer an empty completion"
+    );
+    let itl_samples: usize = snap
+        .iter()
+        .filter_map(|(key, _, _, value)| {
+            if key.key().name() == crate::llm_metrics::METRIC_ITL_SECONDS
+                && let DebugValue::Histogram(values) = value
+            {
+                Some(values.len())
+            } else {
+                None
+            }
+        })
+        .sum();
+    assert_eq!(itl_samples, 1);
+    let tpot_samples: usize = snap
+        .iter()
+        .filter_map(|(key, _, _, value)| {
+            if key.key().name() == crate::llm_metrics::METRIC_TPOT_SECONDS
+                && let DebugValue::Histogram(values) = value
+            {
+                Some(values.len())
+            } else {
+                None
+            }
+        })
+        .sum();
+    assert_eq!(tpot_samples, 0);
+}
+
 #[test]
 fn extract_finish_reason_is_provider_aware() {
     assert_eq!(

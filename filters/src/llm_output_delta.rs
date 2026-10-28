@@ -118,6 +118,7 @@ mod tests {
                 true,
             ),
             (br#"{"choices":[{"text":"Hi"}]}"#.as_slice(), true),
+            (br#"{"choices":[{"text":""}]}"#.as_slice(), true),
             (br#"{"type":"response.created"}"#.as_slice(), false),
             (
                 br#"{"type":"response.output_text.delta","delta":"Hi"}"#.as_slice(),
