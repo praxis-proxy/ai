@@ -7,7 +7,7 @@ Measures time-to-first-token for streaming AI responses.
 
 ## Configuration Notes
 
-Activates only for successful `text/event-stream` responses. On the first non-empty body chunk, records `ctx.request_start.elapsed()` as a Prometheus histogram and deactivates for the remainder of the response.
+Activates only for successful `text/event-stream` responses. It scans SSE data payloads until the first generated output delta, then records `ctx.request_start.elapsed()` once and deactivates. Role, metadata, usage, and finish events do not trigger TTFT; SSE comments are ignored by the scanner. The OpenAI Chat/Responses output-delta rules match `vllm bench serve`.
 
 The histogram's `model` label is read from metadata set by an upstream request fact filter: `openai_responses_request` (Responses create bodies), `openai_chat_completions_request` (native `POST /v1/chat/completions` bodies), `anthropic_messages_request`, `anthropic_messages_to_chat_completions` (Anthropic, including Anthropic-to-Chat translation), or the `model_to_header`-published `model_to_header.model` value. If none runs before this filter, all TTFT samples are labeled `unknown`.
 

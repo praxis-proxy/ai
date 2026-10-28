@@ -7,7 +7,7 @@ Serves a configured model list as a terminal response to `GET {path}`.
 
 ## Configuration Notes
 
-Discovery only: it advertises what the gateway exposes. Authorization stays with `model_access`; this filter does not enforce access.
+Discovery only: it advertises what the gateway exposes. Authorization is owned by the deployment's metering policy preflight; this filter does not enforce access.
 
 ## Configuration
 

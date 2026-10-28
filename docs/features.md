@@ -53,6 +53,7 @@ See the generated [Anthropic filter inventory](filters/reference.md#anthropic).
 - Evaluate request content through an external guardrail provider.
 - Extract token usage across supported provider response formats.
 - Expose normalized token counts through downstream response headers.
+- Emit vLLM-aligned TTFT, TPOT, and ITL histograms plus token, finish-reason, and empty-completion metrics; see [LLM gateway metrics](llm-metrics.md).
 
 ## Cargo features
 

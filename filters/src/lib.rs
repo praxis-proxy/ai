@@ -24,6 +24,7 @@ pub mod guardrails;
 mod identity_guard;
 pub mod inference;
 mod llm_metrics;
+mod llm_output_delta;
 pub mod metering;
 pub mod model_access;
 pub mod model_catalog;

@@ -36,6 +36,10 @@ provider API integrations on top of [Praxis](https://github.com/praxis-proxy/pra
 - [Project management](developing/project-management.md)
 - [Proposal process](https://github.com/praxis-proxy/enhancements)
 
+## Observability
+
+- [LLM gateway metrics](llm-metrics.md)
+
 ## Operations and releases
 
 - [EnMaaS image publishing](enmaas-image-publishing.md)

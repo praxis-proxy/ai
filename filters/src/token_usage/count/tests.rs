@@ -3,6 +3,8 @@
 
 //! Boundary tests for the `token_count` filter.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use http::header::HeaderValue;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -2116,6 +2118,30 @@ fn publish_token_usage_bumps_empty_completions_on_zero_output() {
 }
 
 #[test]
+fn publish_token_usage_excludes_non_generation_terminations_from_empty_completions() {
+    for reason in ["tool_calls", "refusal", "content_filter"] {
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "gpt-x");
+        ctx.set_metadata(META_FINISH_RECORDED, reason);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            publish_token_usage(&mut ctx, TokenUsage::new(12, 0, Some(12)));
+        });
+        let snap = snapshotter.snapshot().into_vec();
+
+        assert!(
+            !snap
+                .iter()
+                .any(|(key, ..)| key.key().name() == crate::llm_metrics::METRIC_EMPTY_COMPLETIONS_TOTAL),
+            "empty_completions must not count {reason} terminations"
+        );
+    }
+}
+
+#[test]
 #[expect(clippy::too_many_lines, reason = "test asserts many metrics")]
 fn bedrock_headers_record_llm_metrics() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
@@ -2228,7 +2254,7 @@ async fn metrics_sse_openai_records_finish_reason() {
 }
 
 #[test]
-fn record_tpot_records_inter_delta_samples() {
+fn output_deltas_record_itl_and_one_vllm_tpot_sample() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.cluster = Some("test-cluster".to_owned().into());
@@ -2237,12 +2263,78 @@ fn record_tpot_records_inter_delta_samples() {
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     metrics::with_local_recorder(&recorder, || {
-        record_tpot_delta(&mut ctx);
-        record_tpot_delta(&mut ctx);
+        record_output_delta(&mut ctx);
+        record_output_delta(&mut ctx);
+        record_output_delta(&mut ctx);
+        record_streaming_tpot(&mut ctx, 4);
     });
     let snap = snapshotter.snapshot().into_vec();
 
-    let samples: usize = snap
+    let samples = |name: &str| -> usize {
+        snap.iter()
+            .filter_map(|(key, _, _, value)| {
+                if key.key().name() == name
+                    && let DebugValue::Histogram(values) = value
+                {
+                    Some(values.len())
+                } else {
+                    None
+                }
+            })
+            .sum()
+    };
+    assert_eq!(samples(crate::llm_metrics::METRIC_ITL_SECONDS), 2);
+    assert_eq!(samples(crate::llm_metrics::METRIC_TPOT_SECONDS), 1);
+}
+
+#[test]
+#[expect(clippy::too_many_lines, reason = "formula and skip assertions stay together")]
+fn tpot_uses_vllm_formula_and_skips_single_token_responses() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let start = Instant::now();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        ctx.extensions.insert(StreamTimingState {
+            first_output: start,
+            last_output: start + Duration::from_secs(2),
+            itl: crate::llm_metrics::itl_histogram("test-model", "test-cluster"),
+            tpot: crate::llm_metrics::tpot_histogram("test-model", "test-cluster"),
+        });
+        record_streaming_tpot(&mut ctx, 5);
+    });
+    let snap = snapshotter.snapshot().into_vec();
+
+    let values: Vec<f64> = snap
+        .iter()
+        .filter_map(|(key, _, _, value)| {
+            if key.key().name() == crate::llm_metrics::METRIC_TPOT_SECONDS
+                && let DebugValue::Histogram(values) = value
+            {
+                Some(values.iter().map(|value| value.into_inner()).collect::<Vec<f64>>())
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect();
+    assert_eq!(values, vec![0.5], "(2s) / (5-1 output tokens) == 0.5s");
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        ctx.extensions.insert(StreamTimingState {
+            first_output: start,
+            last_output: start + Duration::from_secs(2),
+            itl: crate::llm_metrics::itl_histogram("test-model", "test-cluster"),
+            tpot: crate::llm_metrics::tpot_histogram("test-model", "test-cluster"),
+        });
+        record_streaming_tpot(&mut ctx, 1);
+    });
+    let samples: usize = snapshotter
+        .snapshot()
+        .into_vec()
         .iter()
         .filter_map(|(key, _, _, value)| {
             if key.key().name() == crate::llm_metrics::METRIC_TPOT_SECONDS
@@ -2254,7 +2346,39 @@ fn record_tpot_records_inter_delta_samples() {
             }
         })
         .sum();
-    assert_eq!(samples, 1, "the second delta should record one TPOT sample");
+    assert_eq!(samples, 0, "single-token responses must not produce TPOT");
+}
+
+#[test]
+fn non_output_sse_events_do_not_start_timing() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.cluster = Some("test-cluster".to_owned().into());
+    ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "test-model");
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        process_sse_payload(
+            &mut ctx,
+            br#"{"choices":[{"delta":{"role":"assistant"}}]}"#,
+            ProviderKind::OpenAi,
+        );
+        process_sse_payload(
+            &mut ctx,
+            br#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            ProviderKind::OpenAi,
+        );
+    });
+
+    assert!(ctx.extensions.get::<StreamTimingState>().is_none());
+    assert!(
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .iter()
+            .all(|(key, ..)| key.key().name() != crate::llm_metrics::METRIC_ITL_SECONDS)
+    );
 }
 
 #[test]
@@ -2291,4 +2415,52 @@ fn normalize_finish_reason_bounds_labels() {
     assert_eq!(normalize_finish_reason("SAFETY"), "content_filter");
     assert_eq!(normalize_finish_reason("stop_sequence"), "stop_sequence");
     assert_eq!(normalize_finish_reason("brand_new_reason"), "other");
+}
+
+#[test]
+#[ignore = "release-mode overhead benchmark; run with --release --ignored --nocapture"]
+#[expect(clippy::too_many_lines, reason = "benchmark setup and assertions stay together")]
+#[expect(clippy::print_stdout, reason = "release-mode benchmark output")]
+fn metrics_overhead_is_within_budget() {
+    const ITERATIONS: usize = 100_000;
+    const BUDGET_NANOS: u128 = 50_000;
+
+    let payload = br#"{"choices":[{"delta":{"content":"token"}}]}"#;
+    let mut detector_samples = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let start = Instant::now();
+        std::hint::black_box(crate::llm_output_delta::payload_has_output_delta(payload));
+        detector_samples.push(start.elapsed().as_nanos());
+    }
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut itl_samples = Vec::with_capacity(ITERATIONS);
+    metrics::with_local_recorder(&metrics::NoopRecorder, || {
+        ctx.extensions.insert(StreamTimingState {
+            first_output: Instant::now(),
+            last_output: Instant::now(),
+            itl: crate::llm_metrics::itl_histogram("test-model", "test-cluster"),
+            tpot: crate::llm_metrics::tpot_histogram("test-model", "test-cluster"),
+        });
+        for _ in 0..ITERATIONS {
+            let start = Instant::now();
+            record_output_delta(&mut ctx);
+            itl_samples.push(start.elapsed().as_nanos());
+        }
+    });
+
+    detector_samples.sort_unstable();
+    itl_samples.sort_unstable();
+    let p99 = |samples: &[u128]| samples[ITERATIONS * 99 / 100];
+    println!(
+        "detector p99={}ns itl-record p99={}ns",
+        p99(&detector_samples),
+        p99(&itl_samples)
+    );
+    assert!(
+        p99(&detector_samples) < BUDGET_NANOS,
+        "output-delta detector exceeded 50us p99"
+    );
+    assert!(p99(&itl_samples) < BUDGET_NANOS, "ITL recording exceeded 50us p99");
 }

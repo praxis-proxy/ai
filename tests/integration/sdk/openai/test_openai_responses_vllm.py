@@ -10161,8 +10161,9 @@ def test_native_chat_completions_ttft_labeled_by_request_model(ttft_proxy):
     chunks = list(stream)
     assert chunks, "native chat completion should stream at least one chunk"
 
-    # The histogram is recorded as the first SSE chunk is relayed on the response
-    # path; retry briefly so the scrape never races the recorder's render.
+    # The histogram is recorded when the first generated output delta is relayed
+    # on the response path; retry briefly so the scrape never races the
+    # recorder's render.
     deadline = time.monotonic() + 10
     metrics_text = ""
     while time.monotonic() < deadline:

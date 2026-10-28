@@ -11,8 +11,8 @@
 //! Anthropic envelope.
 //!
 //! This filter handles discovery only. Authorization — deciding who may
-//! call a model — stays with `model_access`; the catalog does not
-//! re-declare access rules.
+//! call a model — is owned by the deployment's metering policy preflight;
+//! the catalog does not re-declare access rules.
 //!
 //! ```yaml
 //! filter: model_catalog
@@ -97,8 +97,9 @@ impl CatalogModel {
 /// Serves a configured model list as a terminal response to
 /// `GET {path}`.
 ///
-/// Discovery only: it advertises what the gateway exposes. Authorization
-/// stays with `model_access`; this filter does not enforce access.
+/// Discovery only: it advertises what the gateway exposes. Authorization is
+/// owned by the deployment's metering policy preflight; this filter does not
+/// enforce access.
 ///
 /// # YAML configuration
 ///

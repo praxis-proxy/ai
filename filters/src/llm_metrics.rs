@@ -6,12 +6,15 @@
 //! These complement the proxy-owned `praxis_http_*` metrics (which live in
 //! the external `praxis-proxy` crates) with model/provider-labeled signals
 //! that the proxy cannot produce on its own: token accounting from backend
-//! usage metadata, per-token decode timing, finish reasons, and empty
-//! completions.
+//! usage metadata, per-request TPOT, per-interval ITL, finish reasons, and
+//! empty completions.
 //!
 //! Every metric carries a `model` label for drill-down and a `cluster` label
 //! for provider-level rollup, so both per-model and per-provider views are
 //! one `sum by (...)` away.
+//!
+//! See `docs/llm-metrics.md` for the metric catalog, vLLM parity notes, query
+//! examples, and the overhead budget.
 //!
 //! The `model` label is bounded: at most [`MAX_MODEL_LABELS`] distinct values
 //! are admitted per process lifetime, and later unseen values are labeled
@@ -28,8 +31,12 @@
 //! - `praxis_ai_cache_read_tokens_total`: prompt-cache hit volume (cost/latency).
 //! - `praxis_ai_finish_reasons_total{reason}`: *why* generations end — `length` share = max-token/capacity friction,
 //!   `content_filter` = policy.
-//! - `praxis_ai_empty_completions_total`: zero-output responses = silent generation failures.
-//! - `praxis_ai_tpot_seconds` (histogram): inter-token decode time (tokens/s ≈ 1/TPOT) — pure generation throughput.
+//! - `praxis_ai_empty_completions_total`: successful zero-output responses, excluding tool-call, refusal, and
+//!   content-filter terminations.
+//! - `praxis_ai_tpot_seconds` (histogram): vLLM-style per-request time per output token, `(last output delta - first
+//!   output delta) / (output_tokens - 1)`.
+//! - `praxis_ai_itl_seconds` (histogram): time between consecutive output deltas, matching vLLM's chunk-level ITL
+//!   distribution.
 
 use std::{
     collections::HashSet,
@@ -37,7 +44,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use metrics::{Unit, counter, describe_histogram, histogram};
+use metrics::{Histogram, Unit, counter, describe_histogram, histogram};
 use praxis_ai_apis::promotion::is_promotable_value;
 use praxis_filter::HttpFilterContext;
 
@@ -53,12 +60,15 @@ pub const METRIC_OUTPUT_TOKENS: &str = "praxis_ai_output_tokens";
 pub const METRIC_REASONING_TOKENS_TOTAL: &str = "praxis_ai_reasoning_tokens_total";
 /// Input tokens served from the provider's prompt cache, cumulative.
 pub const METRIC_CACHE_READ_TOKENS_TOTAL: &str = "praxis_ai_cache_read_tokens_total";
-/// Responses that produced zero output tokens.
+/// Successful responses reporting zero output tokens, excluding tool-call,
+/// refusal, and content-filter completions.
 pub const METRIC_EMPTY_COMPLETIONS_TOTAL: &str = "praxis_ai_empty_completions_total";
 /// Why a generation ended (`stop`, `length`, `content_filter`, `tool_calls`, ...).
 pub const METRIC_FINISH_REASONS_TOTAL: &str = "praxis_ai_finish_reasons_total";
-/// Time between consecutive streamed deltas (decode speed).
+/// vLLM-style per-request time per output token, excluding the first token.
 pub const METRIC_TPOT_SECONDS: &str = "praxis_ai_tpot_seconds";
+/// Time between consecutive output deltas in a streamed response.
+pub const METRIC_ITL_SECONDS: &str = "praxis_ai_itl_seconds";
 
 /// Metadata key where the `model_to_header` filter publishes the model it
 /// promoted from the request body. Server-published (not a raw client header),
@@ -91,7 +101,16 @@ fn ensure_described() {
     DESCRIBED.call_once(|| {
         describe_histogram!(METRIC_PROMPT_TOKENS, Unit::Count, "prompt tokens per request");
         describe_histogram!(METRIC_OUTPUT_TOKENS, Unit::Count, "output tokens per request");
-        describe_histogram!(METRIC_TPOT_SECONDS, Unit::Seconds, "time per output token");
+        describe_histogram!(
+            METRIC_TPOT_SECONDS,
+            Unit::Seconds,
+            "per-request time per output token: (last-first)/(output_tokens-1)"
+        );
+        describe_histogram!(
+            METRIC_ITL_SECONDS,
+            Unit::Seconds,
+            "time between consecutive output deltas"
+        );
     });
 }
 
@@ -200,12 +219,14 @@ pub fn cluster(ctx: &HttpFilterContext<'_>) -> String {
     clippy::cast_precision_loss,
     reason = "token counts are recorded as f64 histogram values"
 )]
+#[expect(clippy::too_many_arguments, reason = "explicit metric inputs")]
 pub fn record_token_usage(
     ctx: &HttpFilterContext<'_>,
     input: u64,
     output: u64,
     cache_read: Option<u64>,
     reasoning: Option<u64>,
+    count_empty: bool,
 ) {
     ensure_described();
     let model = resolve_model(ctx);
@@ -225,17 +246,29 @@ pub fn record_token_usage(
         counter!(METRIC_REASONING_TOKENS_TOTAL, "model" => model.clone(), "cluster" => cluster.clone())
             .increment(reasoning);
     }
-    if output == 0 {
+    if count_empty && output == 0 {
         counter!(METRIC_EMPTY_COMPLETIONS_TOTAL, "model" => model.clone(), "cluster" => cluster.clone()).increment(1);
     }
 }
 
-/// Emit an inter-delta (decode) timing sample.
-pub fn record_tpot(ctx: &HttpFilterContext<'_>, delta_seconds: f64) {
+/// Build a per-stream TPOT histogram handle with fixed labels.
+pub(crate) fn tpot_histogram(model: &str, cluster: &str) -> Histogram {
     ensure_described();
-    let model = resolve_model(ctx);
-    let cluster = cluster(ctx);
-    histogram!(METRIC_TPOT_SECONDS, "model" => model, "cluster" => cluster).record(delta_seconds);
+    histogram!(
+        METRIC_TPOT_SECONDS,
+        "model" => model.to_owned(),
+        "cluster" => cluster.to_owned()
+    )
+}
+
+/// Build a per-stream ITL histogram handle with fixed labels.
+pub(crate) fn itl_histogram(model: &str, cluster: &str) -> Histogram {
+    ensure_described();
+    histogram!(
+        METRIC_ITL_SECONDS,
+        "model" => model.to_owned(),
+        "cluster" => cluster.to_owned()
+    )
 }
 
 /// Emit one finish-reason observation.
@@ -307,7 +340,7 @@ mod tests {
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        metrics::with_local_recorder(&recorder, || record_token_usage(&ctx, 12, 34, Some(5), Some(2)));
+        metrics::with_local_recorder(&recorder, || record_token_usage(&ctx, 12, 34, Some(5), Some(2), true));
         let snap = snapshotter.snapshot().into_vec();
 
         let total = |name: &str| -> u64 {
@@ -361,7 +394,7 @@ mod tests {
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        metrics::with_local_recorder(&recorder, || record_token_usage(&ctx, 12, 0, None, None));
+        metrics::with_local_recorder(&recorder, || record_token_usage(&ctx, 12, 0, None, None, true));
         let snap = snapshotter.snapshot().into_vec();
 
         let total = |name: &str| -> u64 {

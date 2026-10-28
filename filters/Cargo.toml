@@ -18,7 +18,7 @@ default = ["standard"]
 standard = ["aws-sigv4-filter", "policy-engine"]
 # EnMaaS API-key authentication. Kept out of the lean standard graph because
 # its direct HTTP client is intentionally excluded from minimal builds.
-api-key-auth-filter = ["dep:reqwest"]
+api-key-auth-filter = ["dep:reqwest", "dep:sha2"]
 # The `policy` filter from Praxis core. Kept explicit so no-default FIPS builds
 # can omit the policy engine and its pure-Rust cryptography.
 policy-engine = ["praxis-filter/policy-engine"]
@@ -106,7 +106,7 @@ serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
 serde_json_path = { workspace = true, optional = true }
 serde_yaml = { workspace = true }
-sha2 = { workspace = true }
+sha2 = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tiktoken-rs = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }

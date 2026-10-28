@@ -25,10 +25,11 @@
 )]
 mod tests;
 
-use std::fmt::Write as _;
+use std::{fmt::Write as _, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use metrics::Histogram;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
     builtins::http::payload_processing::config_validation::validate_max_body_bytes, parse_filter_config,
@@ -120,12 +121,20 @@ const META_SSE_SKIP: &str = "token_count.sse_skip";
 /// to mark overflow when the terminal usage event itself was dropped.
 const META_SSE_DROPPED_TAIL: &str = "token_count.sse_dropped_tail";
 
-/// Metadata key for the last SSE delta timestamp (unix nanos), used to
-/// measure inter-delta decode time (TPOT).
-const META_TPOT_LAST: &str = "token_count.tpot_last_nanos";
-
 /// Metadata key guarding single-fire finish-reason recording.
 const META_FINISH_RECORDED: &str = "token_count.finish_reason_recorded";
+
+/// Per-stream timing state for vLLM-style TPOT and ITL.
+struct StreamTimingState {
+    /// Timestamp of the first output delta.
+    first_output: Instant,
+    /// Timestamp of the most recent output delta.
+    last_output: Instant,
+    /// Cached histogram handle for inter-delta timing.
+    itl: Histogram,
+    /// Cached histogram handle for per-request TPOT.
+    tpot: Histogram,
+}
 
 /// Bedrock `InvokeModel` response header carrying the input token count.
 const HEADER_BEDROCK_INPUT: &str = "x-amzn-bedrock-input-token-count";
@@ -296,7 +305,8 @@ impl ProviderKind {
 ///
 /// Emits model/cluster-labeled `praxis_ai_*` metrics: prompt, output,
 /// reasoning, and cache-read token counts; empty completions; and, for
-/// streaming responses, TPOT samples and one normalized finish reason per
+/// streaming responses, one vLLM-style TPOT sample per request, one ITL
+/// sample per output-delta interval, and one normalized finish reason per
 /// response. The `model` label comes from `model_to_header` metadata (not a
 /// raw client header), and finish reasons are mapped to a bounded set
 /// (`stop`, `length`, `tool_calls`, `content_filter`, `stop_sequence`,
@@ -390,9 +400,9 @@ impl HttpFilter for TokenCountFilter {
     /// other providers, detects the content-type to select the body
     /// extraction strategy used by `on_response_body`.
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        // A retry can reuse the request context; never let TPOT or finish-reason
-        // state from the previous response leak into this one.
-        ctx.filter_metadata.remove(META_TPOT_LAST);
+        // A retry can reuse the request context; never let timing or
+        // finish-reason state from the previous response leak into this one.
+        ctx.extensions.remove::<StreamTimingState>();
         ctx.filter_metadata.remove(META_FINISH_RECORDED);
 
         let is_success = ctx.response_header.as_ref().is_some_and(|r| r.status.is_success());
@@ -522,7 +532,7 @@ fn extract_bedrock_headers(ctx: &mut HttpFilterContext<'_>) {
     };
 
     set_token_usage(ctx, input, output, None);
-    crate::llm_metrics::record_token_usage(ctx, input, output, None, None);
+    crate::llm_metrics::record_token_usage(ctx, input, output, None, None, true);
     debug!(
         input,
         output, "extracted Bedrock InvokeModel token counts from response headers"
@@ -615,12 +625,17 @@ fn publish_token_usage(ctx: &mut HttpFilterContext<'_>, usage: TokenUsage) {
     );
     set_cache_token_usage(ctx, usage.cache_read_tokens(), usage.cache_write_tokens());
     set_reasoning_token_usage(ctx, usage.reasoning_tokens());
+    let count_empty = !matches!(
+        ctx.get_metadata(META_FINISH_RECORDED),
+        Some("tool_calls" | "refusal" | "content_filter")
+    );
     crate::llm_metrics::record_token_usage(
         ctx,
         usage.input_tokens(),
         usage.output_tokens(),
         usage.cache_read_tokens(),
         usage.reasoning_tokens(),
+        count_empty,
     );
 }
 
@@ -678,7 +693,9 @@ fn process_sse_payload(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider
         return;
     }
 
-    record_tpot_delta(ctx);
+    if crate::llm_output_delta::payload_has_output_delta(payload) {
+        record_output_delta(ctx);
+    }
     record_finish_reason_once(ctx, payload, provider);
 
     if try_complete_usage(ctx, payload, provider) {
@@ -688,27 +705,25 @@ fn process_sse_payload(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider
     try_partial_usage(ctx, payload, provider);
 }
 
-/// Record the elapsed time since the previous SSE delta as a TPOT sample.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "nanosecond duration is recorded as seconds f64"
-)]
-fn record_tpot_delta(ctx: &mut HttpFilterContext<'_>) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-
-    if let Some(last) = ctx
-        .filter_metadata
-        .get(META_TPOT_LAST)
-        .and_then(|v| v.parse::<u128>().ok())
-    {
-        let delta_seconds = now.saturating_sub(last) as f64 / 1_000_000_000.0;
-        crate::llm_metrics::record_tpot(ctx, delta_seconds);
+/// Record one output delta for ITL and cache the TPOT/ITL histogram handles.
+fn record_output_delta(ctx: &mut HttpFilterContext<'_>) {
+    let now = Instant::now();
+    if let Some(state) = ctx.extensions.get_mut::<StreamTimingState>() {
+        state
+            .itl
+            .record(now.saturating_duration_since(state.last_output).as_secs_f64());
+        state.last_output = now;
+        return;
     }
 
-    ctx.filter_metadata.insert(META_TPOT_LAST.to_owned(), now.to_string());
+    let model = crate::llm_metrics::resolve_model(ctx);
+    let cluster = crate::llm_metrics::cluster(ctx);
+    ctx.extensions.insert(StreamTimingState {
+        first_output: now,
+        last_output: now,
+        itl: crate::llm_metrics::itl_histogram(&model, &cluster),
+        tpot: crate::llm_metrics::tpot_histogram(&model, &cluster),
+    });
 }
 
 /// Record the first finish reason observed on this response.
@@ -918,6 +933,8 @@ fn finalize_streaming_counts(ctx: &mut HttpFilterContext<'_>, dropped_tail: bool
 
     if has_accumulated {
         publish_accumulated_streaming_usage(ctx);
+    } else {
+        ctx.extensions.remove::<StreamTimingState>();
     }
 }
 
@@ -937,6 +954,7 @@ fn publish_accumulated_streaming_usage(ctx: &mut HttpFilterContext<'_>) {
         .with_reasoning(read_accumulated(ctx, META_REASONING));
 
     publish_token_usage(ctx, usage);
+    record_streaming_tpot(ctx, output);
     debug!(
         input,
         output,
@@ -946,6 +964,26 @@ fn publish_accumulated_streaming_usage(ctx: &mut HttpFilterContext<'_>) {
         reasoning = ?usage.reasoning_tokens(),
         "finalized streaming token counts"
     );
+}
+
+/// Record vLLM-style per-request TPOT once the stream is complete.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the output token denominator is converted to f64 for the histogram"
+)]
+fn record_streaming_tpot(ctx: &mut HttpFilterContext<'_>, output_tokens: u64) {
+    let Some(state) = ctx.extensions.remove::<StreamTimingState>() else {
+        return;
+    };
+    if output_tokens <= 1 {
+        return;
+    }
+
+    let elapsed = state
+        .last_output
+        .saturating_duration_since(state.first_output)
+        .as_secs_f64();
+    state.tpot.record(elapsed / (output_tokens - 1) as f64);
 }
 
 // -----------------------------------------------------------------------------

@@ -3,14 +3,17 @@
 
 //! Time-to-first-token (TTFT) measurement filter.
 //!
-//! Records the elapsed time from request receipt to the first non-empty
-//! SSE response body chunk as a Prometheus histogram labeled by `model` and
-//! `cluster`. The filter is transparent: response bodies and status codes
+//! Records the server-side elapsed time from request receipt to the first
+//! generated output delta as a Prometheus histogram labeled by `model` and
+//! `cluster`. The event definition matches vLLM's TTFT (the first output
+//! token chunk); vLLM measures it client-side, so values are not directly
+//! comparable. The filter is transparent: response bodies and status codes
 //! pass through unchanged.
 //!
 //! # Metric
 //!
 //! `praxis_ai_ttft_seconds` — histogram with `model` and `cluster` labels.
+//! See `docs/llm-metrics.md` for vLLM parity and query examples.
 //!
 //! # YAML
 //!
@@ -38,19 +41,33 @@ use praxis_filter::{
 };
 use tracing::debug;
 
+use crate::{
+    agentic::a2a::sse,
+    llm_metrics::{cluster, resolve_model},
+    llm_output_delta::payload_has_output_delta,
+};
+
 /// Prometheus histogram name for time-to-first-token measurements.
 const METRIC_TTFT_SECONDS: &str = "praxis_ai_ttft_seconds";
 
-/// Metadata key indicating this request is an active TTFT candidate.
-/// Present after `on_response` detects SSE; removed once TTFT is recorded.
-const META_ACTIVE: &str = "time_to_first_token.active";
+/// Maximum bytes buffered while scanning the prefix of an SSE stream.
+const MAX_SSE_SCRATCH_BYTES: usize = 1024 * 1024;
+
+/// Per-request SSE scanner state used until the first output delta.
+#[derive(Default)]
+struct TtftState {
+    /// Incremental SSE scanner state for the prefix of the stream.
+    scan: sse::SseScanState,
+}
 
 /// Measures time-to-first-token for streaming AI responses.
 ///
-/// Activates only for successful `text/event-stream` responses. On the
-/// first non-empty body chunk, records `ctx.request_start.elapsed()` as
-/// a Prometheus histogram and deactivates for the remainder of the
-/// response.
+/// Activates only for successful `text/event-stream` responses. It scans SSE
+/// data payloads until the first generated output delta, then records
+/// `ctx.request_start.elapsed()` once and deactivates. Role, metadata,
+/// usage, and finish events do not trigger TTFT; SSE comments are ignored by
+/// the scanner. The OpenAI Chat/Responses output-delta rules match
+/// `vllm bench serve`.
 ///
 /// The histogram's `model` label is read from metadata set by an upstream
 /// request fact filter: `openai_responses_request` (Responses create bodies),
@@ -103,6 +120,8 @@ impl HttpFilter for TimeToFirstTokenFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        ctx.extensions.remove::<TtftState>();
+
         let is_success = ctx.response_header.as_ref().is_some_and(|r| r.status.is_success());
         if !is_success {
             return Ok(FilterAction::Continue);
@@ -116,7 +135,7 @@ impl HttpFilter for TimeToFirstTokenFilter {
             .is_some_and(is_event_stream_content_type);
 
         if is_sse {
-            ctx.filter_metadata.insert(META_ACTIVE.to_owned(), String::new());
+            ctx.extensions.insert(TtftState::default());
         }
 
         Ok(FilterAction::Continue)
@@ -126,24 +145,34 @@ impl HttpFilter for TimeToFirstTokenFilter {
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        _end_of_stream: bool,
+        end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if !ctx.filter_metadata.contains_key(META_ACTIVE) {
+        let Some(state) = ctx.extensions.get_mut::<TtftState>() else {
             return Ok(FilterAction::Continue);
+        };
+
+        let mut found = false;
+        if let Some(chunk) = body.as_ref() {
+            let result = sse::scan_sse_chunk(&mut state.scan, chunk, MAX_SSE_SCRATCH_BYTES);
+            found = result.payloads.iter().any(|payload| payload_has_output_delta(payload));
         }
 
-        if body.as_ref().is_none_or(Bytes::is_empty) {
-            return Ok(FilterAction::Continue);
+        if end_of_stream && !found {
+            let mut pending = Vec::new();
+            sse::flush_sse_state(&mut state.scan, &mut pending);
+            found = pending.iter().any(|payload| payload_has_output_delta(payload));
         }
 
-        let ttft = ctx.request_start.elapsed().as_secs_f64();
-        let model = crate::llm_metrics::resolve_model(ctx);
-        let cluster = crate::llm_metrics::cluster(ctx);
-
-        histogram!(METRIC_TTFT_SECONDS, "model" => model, "cluster" => cluster).record(ttft);
-        ctx.filter_metadata.remove(META_ACTIVE);
-
-        debug!(ttft, "recorded time-to-first-token");
+        if found {
+            let ttft = ctx.request_start.elapsed().as_secs_f64();
+            let model = resolve_model(ctx);
+            let cluster = cluster(ctx);
+            histogram!(METRIC_TTFT_SECONDS, "model" => model, "cluster" => cluster).record(ttft);
+            ctx.extensions.remove::<TtftState>();
+            debug!(ttft, "recorded time-to-first-token");
+        } else if end_of_stream {
+            ctx.extensions.remove::<TtftState>();
+        }
 
         Ok(FilterAction::Continue)
     }
