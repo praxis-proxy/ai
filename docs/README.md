@@ -38,6 +38,7 @@ provider API integrations on top of [Praxis](https://github.com/praxis-proxy/pra
 
 ## Operations and releases
 
+- [EnMaaS image publishing](enmaas-image-publishing.md)
 - [Capacity planning: file descriptors](capacity-planning.md)
 - [Release process](release.md)
 - [FIPS 140-3](fips.md)

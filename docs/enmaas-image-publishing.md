@@ -6,7 +6,8 @@ in [the release process](release.md); this document covers only the fork-side
 Quay image.
 
 The image is built by `.github/workflows/publish-quay.yaml` on every push to
-`main` and pushed to:
+`main`, with a manual dispatch path for rebuilding a specific `main` commit,
+and pushed to:
 
 ```text
 quay.io/modden/praxis-ai
@@ -29,6 +30,40 @@ This matches the production deployment build. The `gcp-adc-filter` feature is
 required for the production GCP ADC credential filter; production routing
 breaks without it. The build uses GitHub Actions cache to avoid rebuilding the
 Rust dependency graph on every push.
+
+## Triggers and manual rebuilds
+
+- A push to `main` builds the image and updates both `:main` and
+  `:sha-<commit>` tags.
+- `workflow_dispatch` accepts an optional `commit` input. A manual rebuild
+  tags only `:sha-<commit>`; it never moves `:main`.
+- The workflow is intended for branches in the canonical repository, where
+  the Quay builder secrets are available. Do not expose those credentials to
+  arbitrary fork code.
+
+## SBOM artifacts
+
+Every successful build generates two SPDX JSON documents for the source
+commit:
+
+- `image.spdx.json`: the packages visible in the exact pushed image digest.
+- `source.spdx.json`: the source tree and Rust dependency graph from
+  `Cargo.lock`; this is where Rust crates are enumerated even when the
+  runtime binary does not carry embedded cargo metadata.
+
+Both files are uploaded together as the Actions artifact
+`praxis-ai-sbom-<commit>` with 90-day retention. The job summary records the
+image digest, source commit, and artifact name.
+
+Download the artifact from the workflow run, for example:
+
+```bash
+gh run download <run-id> -n praxis-ai-sbom-<commit>
+```
+
+The SBOM is inventory evidence, not a signature. Signed provenance and
+attestations are still deferred; deploy by digest and retain the SBOM
+artifact with the deployment record.
 
 ## Ownership
 
@@ -72,12 +107,13 @@ leaves, and otherwise on a regular schedule (at least every 90 days).
 ## Release and consumption policy
 
 - Every push to `main` produces a development image:
-  - `:main` is a mutable convenience tag.
+  - `:main` is a mutable convenience tag, updated only by a `main` push.
   - `:sha-<full 40-character commit SHA>` identifies the build for that commit.
+- Manual dispatches produce only the `:sha-` tag for the selected commit.
 - Tags are convenience pointers. The image digest is the immutable reference.
-- The workflow records `quay.io/modden/praxis-ai@sha256:...` plus the source
-  commit in the Actions run summary. That digest is the authoritative
-  deployment reference.
+- The workflow records `quay.io/modden/praxis-ai@sha256:...`, the source
+  commit, and the SBOM artifact name in the Actions run summary. That digest
+  is the authoritative deployment reference.
 - Deploy by digest. Never deploy `:main`.
 - Promotion is explicit: build on `main`, validate the digest in staging, then
   update the digest pin in the EnMaaS deployment configuration for staging and
