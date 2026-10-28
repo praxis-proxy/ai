@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Strict Chat Completions request conversion for the legacy IPP direction.
+//! Validated Chat Completions request conversion for Anthropic Messages.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value, json};
+use url::Url;
 
 /// Request details retained for response JSON and SSE conversion.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,6 +66,7 @@ pub(crate) fn translate_request(bytes: &[u8], target_model: &str) -> Result<(Vec
         .as_object_mut()
         .ok_or("Chat Completions request must be a JSON object")?;
     reject_unknown_fields(object)?;
+    validate_ignored_legacy_fields(object)?;
 
     let client_model = take_string(object, "model")?;
     if client_model.trim().is_empty() {
@@ -145,33 +148,56 @@ fn reject_unknown_fields(object: &Map<String, Value>) -> Result<(), String> {
         "tools",
         "tool_choice",
         "parallel_tool_calls",
+        "user",
+        "n",
+        "seed",
     ];
     if let Some(field) = object.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
         return Err(format!(
             "unsupported Chat Completions field {field:?} cannot be preserved by Anthropic Messages"
         ));
     }
-    if object.contains_key("parallel_tool_calls") {
-        return Err("parallel_tool_calls cannot be guaranteed by Anthropic Messages".to_owned());
-    }
     Ok(())
 }
 
-/// Select the equivalent token limit and reject conflicting aliases.
+/// Select the token limit using the compatibility precedence and default.
 fn resolve_max_tokens(object: &mut Map<String, Value>) -> Result<u64, String> {
     let old = object.remove("max_tokens");
     let new = object.remove("max_completion_tokens");
-    let selected = match (old, new) {
-        (Some(left), Some(right)) if left != right => {
-            return Err("max_tokens and max_completion_tokens disagree".to_owned());
-        },
-        (Some(value), _) | (_, Some(value)) => value,
-        (None, None) => return Err("Chat Completions request requires max_tokens or max_completion_tokens".to_owned()),
-    };
-    selected
-        .as_u64()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| "Chat Completions max token count must be a positive integer".to_owned())
+    let selected = new.or(old);
+    match selected {
+        Some(value) => value
+            .as_u64()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "Chat Completions max token count must be a positive integer".to_owned()),
+        None => Ok(4096),
+    }
+}
+
+/// Validate the small set of legacy-accepted fields whose semantics are not
+/// represented by Anthropic Messages, then drop them from the upstream body.
+fn validate_ignored_legacy_fields(object: &mut Map<String, Value>) -> Result<(), String> {
+    if let Some(user) = object.remove("user")
+        && !user.is_string()
+    {
+        return Err("Chat Completions user must be a string".to_owned());
+    }
+    if let Some(n) = object.remove("n")
+        && n.as_u64().is_none_or(|value| value == 0)
+    {
+        return Err("Chat Completions n must be a positive integer".to_owned());
+    }
+    if let Some(seed) = object.remove("seed")
+        && seed.as_i64().is_none()
+    {
+        return Err("Chat Completions seed must be an integer".to_owned());
+    }
+    if let Some(parallel) = object.remove("parallel_tool_calls")
+        && !parallel.is_boolean()
+    {
+        return Err("Chat Completions parallel_tool_calls must be a boolean".to_owned());
+    }
+    Ok(())
 }
 
 #[expect(
@@ -245,7 +271,7 @@ fn translate_messages(value: &Value) -> Result<(Vec<Value>, Option<String>), Str
     Ok((output, (!system.is_empty()).then(|| system.join("\n"))))
 }
 
-/// Translate a string or text-block content value; reject other modalities.
+/// Translate a string or supported text/image content blocks.
 fn translate_content(value: Option<&Value>) -> Result<Vec<Value>, String> {
     let value = value.ok_or("Chat Completions message requires content")?;
     if let Some(text) = value.as_str() {
@@ -260,20 +286,86 @@ fn translate_content(value: Option<&Value>) -> Result<Vec<Value>, String> {
             let object = block
                 .as_object()
                 .ok_or("Chat Completions content block must be an object")?;
-            reject_nested_fields(object, &["type", "text"], "content block")?;
             match object.get("type").and_then(Value::as_str) {
                 Some("text") => {
+                    reject_nested_fields(object, &["type", "text"], "text content block")?;
                     let text = object
                         .get("text")
                         .and_then(Value::as_str)
                         .ok_or("text content block requires a string text")?;
                     Ok(json!({"type":"text","text":text}))
                 },
+                Some("image_url") => translate_image_url(object),
                 Some(kind) => Err(format!("unsupported Chat Completions content block {kind:?}")),
                 None => Err("Chat Completions content block requires type".to_owned()),
             }
         })
         .collect()
+}
+
+/// Convert an OpenAI `image_url` content block to an Anthropic image source.
+/// Remote URLs are passed through as URL references; Praxis never fetches them.
+fn translate_image_url(object: &Map<String, Value>) -> Result<Value, String> {
+    reject_nested_fields(object, &["type", "image_url"], "image_url content block")?;
+    let image = object
+        .get("image_url")
+        .and_then(Value::as_object)
+        .ok_or("image_url content block requires an image_url object")?;
+    reject_nested_fields(image, &["url", "detail"], "image_url")?;
+    if let Some(detail) = image.get("detail")
+        && !matches!(detail.as_str(), Some("auto" | "low" | "high"))
+    {
+        return Err("image_url detail must be auto, low, or high".to_owned());
+    }
+    let source = image
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+        .ok_or("image_url requires a non-empty string url")?;
+    if let Some(data_url) = source.strip_prefix("data:") {
+        return translate_base64_data_url(data_url);
+    }
+    let url = Url::parse(source).map_err(|_error| "image_url must be a valid HTTPS or base64 data URL")?;
+    if url.scheme() != "https" || url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+        return Err("remote image_url must be an HTTPS URL without embedded credentials".to_owned());
+    }
+    Ok(json!({"type":"image","source":{"type":"url","url":source}}))
+}
+
+/// Convert a validated base64 data URL to an Anthropic image block.
+fn translate_base64_data_url(value: &str) -> Result<Value, String> {
+    let (metadata, encoded) = value
+        .split_once(',')
+        .ok_or("image data URL must contain a base64 payload")?;
+    let mut metadata_parts = metadata.split(';');
+    let media_type = metadata_parts.next().unwrap_or_default();
+    if !matches!(media_type, "image/jpeg" | "image/png" | "image/gif" | "image/webp") {
+        return Err("image data URL media type must be JPEG, PNG, GIF, or WebP".to_owned());
+    }
+    if metadata_parts.next() != Some("base64") || metadata_parts.next().is_some() {
+        return Err("image data URL must use the base64 encoding marker".to_owned());
+    }
+    let decoded = STANDARD
+        .decode(encoded)
+        .map_err(|_error| "image data URL contains invalid base64")?;
+    if decoded.is_empty() {
+        return Err("image data URL payload must not be empty".to_owned());
+    }
+    if !matches_image_signature(media_type, &decoded) {
+        return Err("image data URL payload does not match its declared image media type".to_owned());
+    }
+    Ok(json!({"type":"image","source":{"type":"base64","media_type":media_type,"data":encoded}}))
+}
+
+/// Check that the decoded image begins with the signature for its declared type.
+fn matches_image_signature(media_type: &str, bytes: &[u8]) -> bool {
+    match media_type {
+        "image/jpeg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(&b"WEBP"[..]),
+        _ => false,
+    }
 }
 
 /// Flatten validated text blocks for Anthropic system and tool-result content.

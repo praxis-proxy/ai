@@ -13,11 +13,13 @@ For Anthropic candidates, non-streaming JSON response chunks are retained in bou
 
 Anthropic translation runs only when the filter's `api_translation_enabled` setting is true, as derived from the tenant's API translation permission.
 
-Only Chat Completions fields represented by Anthropic Messages are accepted. Unsupported fields and modalities fail with a 400 response.
+The compatibility contract defaults an omitted token limit to 4096 and ignores `user`, `n`, `seed`, and `parallel_tool_calls` after validating their types. Ignoring `n` does not produce multiple completions; ignoring `seed` does not make generation deterministic; and ignoring `parallel_tool_calls` does not constrain the provider's tool scheduling. Other unsupported fields fail with HTTP 400.
 
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `api_translation_enabled` | bool | yes | Permission projected from the authoritative `MaaS` tenant setting. Anthropic candidates fail closed when this is false. |
-| `max_body_bytes` | integer | yes | Maximum complete JSON body retained for one request or response. |
+| `api_translation_enabled` | bool | yes | Permission from trusted application configuration. Anthropic requests fail closed when this is false. |
+| `max_body_bytes` | integer | no | Compatibility setting for the former shared request/response limit. A direction-specific limit takes precedence when set. |
+| `max_request_body_bytes` | integer | no | Maximum complete translated Chat Completions request body. |
+| `max_response_body_bytes` | integer | no | Maximum complete Anthropic JSON response body retained for conversion. |
