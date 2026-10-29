@@ -100,6 +100,10 @@ const COMPACTION_XFAIL_CHILD_TIMEOUT: Duration = Duration::from_secs(180);
 /// See docs/developing/gpu-nightly-suite.md.
 const COMPACTION_XFAIL_MODEL: &str = "qwen3-8b";
 
+/// Pinned Codex model-catalog entry that enables its grammar-based apply_patch tool.
+/// The live test rewrites this client-facing slug to the configured vLLM model.
+const CODEX_APPLY_PATCH_MODEL: &str = "gpt-5.2";
+
 /// Codex output item types that would indicate an attempted tool call.
 const TOOL_ITEM_TYPES: &[&str] = &["command_execution", "file_change", "mcp_tool_call", "web_search"];
 
@@ -282,6 +286,7 @@ async fn pinned_codex_completes_native_vllm_apply_patch_workflow_over_http() {
             .as_deref()
             .unwrap_or_else(|| panic!("{LIVE_DATABASE_URL_ENV} must be set for the native vLLM acceptance test")),
     );
+    let patched = patch_live_apply_patch_model_alias(&patched, &live.model);
     let config = praxis_core::config::Config::from_yaml(&patched).expect("live native Codex config should parse");
 
     run_live_codex_apply_patch_workflow(&live, proxy_port, config).await;
@@ -318,6 +323,7 @@ async fn pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http()
             .as_deref()
             .unwrap_or_else(|| panic!("{LIVE_DATABASE_URL_ENV} must be set for the translated vLLM acceptance test")),
     );
+    let patched = patch_live_apply_patch_model_alias(&patched, &live.model);
     let config = praxis_core::config::Config::from_yaml(&patched).expect("live Codex config should parse");
 
     run_live_codex_apply_patch_workflow(&live, proxy_port, config).await;
@@ -377,7 +383,8 @@ async fn run_live_codex_apply_patch_workflow(
     }
 
     let prompt = format!(
-        "First, use the apply_patch tool to create result.txt with exactly this one line: {}.\n\
+        "You MUST use the apply_patch tool exactly once with this exact patch to add result.txt:\n\
+         *** Begin Patch\n*** Add File: result.txt\n+{}\n*** End Patch\n\n\
          Do not use exec_command or another tool to write or edit files.\n\
          After apply_patch succeeds, use exec_command only to run exactly `./verify.sh`.\n\
          Do not answer before verification succeeds. Then summarize what changed. /no_think",
@@ -389,7 +396,7 @@ async fn run_live_codex_apply_patch_workflow(
         &live.codex_bin,
         CodexRunOptions {
             proxy_base_url: &proxy_base_url,
-            model: &live.model,
+            model: CODEX_APPLY_PATCH_MODEL,
             working_dir: workspace.path(),
             prompt: &prompt,
             sandbox: "danger-full-access",
@@ -554,12 +561,14 @@ fn live_codex_config_replaces_the_provider_credential() {
     let backend_token = "ephemeral-backend-token-for-this-test";
     let database_url = "postgres://praxis:praxis@127.0.0.1:5432/praxis";
     let patched = patch_live_codex_config(&yaml, 18_080, "127.0.0.1:8000", backend_token, database_url);
+    let patched = patch_live_apply_patch_model_alias(&patched, "qwen3-8b");
 
     assert!(patched.contains(backend_token));
     assert!(!patched.contains(TEST_PROVIDER_API_KEY));
     assert!(patched.contains(database_url));
     assert!(patched.contains("backend: postgres"));
     assert!(patched.contains("allow_private_database_url: true"));
+    assert!(patched.contains("\"gpt-5.2\": \"qwen3-8b\""));
     assert!(!patched.contains("sqlite://responses.db?mode=rwc"));
     praxis_core::config::Config::from_yaml(&patched).expect("patched live Codex config should parse");
 }
@@ -573,12 +582,14 @@ fn live_native_codex_config_injects_the_provider_credential() {
     let backend_token = "ephemeral-native-backend-token-for-this-test";
     let database_url = "postgres://praxis:praxis@127.0.0.1:5432/praxis";
     let patched = patch_live_native_codex_config(&yaml, 18_080, "127.0.0.1:8000", backend_token, database_url);
+    let patched = patch_live_apply_patch_model_alias(&patched, "qwen3-8b");
 
     assert!(patched.contains(backend_token));
     assert!(patched.contains("strip_client_credential: true"));
     assert!(patched.contains(database_url));
     assert!(patched.contains("backend: postgres"));
     assert!(patched.contains("allow_private_database_url: true"));
+    assert!(patched.contains("\"gpt-5.2\": \"qwen3-8b\""));
     assert!(!patched.contains("sqlite://responses.db?mode=rwc"));
     praxis_core::config::Config::from_yaml(&patched).expect("patched live native Codex config should parse");
 }
@@ -907,6 +918,25 @@ fn patch_live_codex_config(
             "                  - name: chat-provider\n                    endpoints:",
             "                  - name: chat-provider\n                    read_timeout_ms: 300000\n                    endpoints:",
         )
+}
+
+/// Give Codex the pinned catalog metadata that enables its grammar-based
+/// `apply_patch` tool, while routing its inference to the actual vLLM model.
+fn patch_live_apply_patch_model_alias(yaml: &str, backend_model: &str) -> String {
+    const MARKER: &str = "              - filter: openai_agentic_loop\n";
+    let marker_count = yaml.matches(MARKER).count();
+    assert_eq!(
+        marker_count, 1,
+        "client-tool example should have one agentic-loop filter"
+    );
+
+    let backend_model = serde_json::to_string(backend_model).expect("backend model should serialize as a YAML string");
+    let indent = "              ";
+    let insertion = format!(
+        "{indent}- filter: openai_responses_model_rewrite\n{indent}  model_aliases:\n\
+         {indent}    \"{CODEX_APPLY_PATCH_MODEL}\": {backend_model}\n{MARKER}"
+    );
+    yaml.replacen(MARKER, &insertion, 1)
 }
 
 /// Patch the native Responses example for a keyed, slower live vLLM backend.
