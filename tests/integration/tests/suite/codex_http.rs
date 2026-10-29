@@ -100,9 +100,10 @@ const COMPACTION_XFAIL_CHILD_TIMEOUT: Duration = Duration::from_secs(180);
 /// See docs/developing/gpu-nightly-suite.md.
 const COMPACTION_XFAIL_MODEL: &str = "qwen3-8b";
 
-/// Pinned Codex model-catalog entry that enables its grammar-based apply_patch tool.
+/// Pinned Codex model-catalog entry that enables `apply_patch` without requesting
+/// reasoning summaries, which the Responses-to-Chat path cannot translate.
 /// The live test rewrites this client-facing slug to the configured vLLM model.
-const CODEX_APPLY_PATCH_MODEL: &str = "gpt-5.2";
+const CODEX_APPLY_PATCH_MODEL: &str = "gpt-5.4";
 
 /// Codex output item types that would indicate an attempted tool call.
 const TOOL_ITEM_TYPES: &[&str] = &["command_execution", "file_change", "mcp_tool_call", "web_search"];
@@ -568,7 +569,7 @@ fn live_codex_config_replaces_the_provider_credential() {
     assert!(patched.contains(database_url));
     assert!(patched.contains("backend: postgres"));
     assert!(patched.contains("allow_private_database_url: true"));
-    assert!(patched.contains("\"gpt-5.2\": \"qwen3-8b\""));
+    assert!(patched.contains("\"gpt-5.4\": \"qwen3-8b\""));
     assert!(!patched.contains("sqlite://responses.db?mode=rwc"));
     praxis_core::config::Config::from_yaml(&patched).expect("patched live Codex config should parse");
 }
@@ -589,7 +590,7 @@ fn live_native_codex_config_injects_the_provider_credential() {
     assert!(patched.contains(database_url));
     assert!(patched.contains("backend: postgres"));
     assert!(patched.contains("allow_private_database_url: true"));
-    assert!(patched.contains("\"gpt-5.2\": \"qwen3-8b\""));
+    assert!(patched.contains("\"gpt-5.4\": \"qwen3-8b\""));
     assert!(!patched.contains("sqlite://responses.db?mode=rwc"));
     praxis_core::config::Config::from_yaml(&patched).expect("patched live native Codex config should parse");
 }
