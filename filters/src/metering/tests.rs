@@ -9,6 +9,15 @@ fn build_filter(yaml: &serde_yaml::Value) -> Result<ExternalMeteringFilter, Filt
     ExternalMeteringFilter::build(yaml, crate::isolated_subrequest_client(1))
 }
 
+/// Extract a configuration error without requiring the success type to
+/// implement `Debug`.
+fn config_error(yaml: &serde_yaml::Value) -> FilterError {
+    match ExternalMeteringFilter::from_config(yaml) {
+        Err(error) => error,
+        Ok(_) => panic!("invalid external_metering config unexpectedly succeeded"),
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Config Parsing
 // -----------------------------------------------------------------------------
@@ -343,6 +352,361 @@ unknown_field: true
     .unwrap();
     let result = ExternalMeteringFilter::from_config(&yaml);
     assert!(result.is_err());
+}
+
+#[cfg(not(feature = "metering-kafka"))]
+#[test]
+fn kafka_config_requires_metering_kafka_feature() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+kafka:
+  brokers: ["kafka:9093"]
+  topic: metering.events
+  tls:
+    enabled: false
+  sasl:
+    mechanism: SCRAM-SHA-512
+    username: metering
+    password:
+      file: /nonexistent/kafka-password
+"#,
+    )
+    .unwrap();
+    let Err(err) = ExternalMeteringFilter::from_config(&yaml) else {
+        panic!("kafka config without metering-kafka feature must fail construction");
+    };
+    assert!(
+        err.to_string().contains("metering-kafka"),
+        "error should name the feature: {err}"
+    );
+}
+
+#[cfg(feature = "metering-kafka")]
+mod kafka_config {
+    use std::io::Write;
+
+    use super::*;
+    use crate::metering::config::{join_kafka_brokers, kafka_security_protocol, validate_kafka_brokers};
+
+    fn kafka_yaml(password_file: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(&format!(
+            r#"
+metering_url: "http://metering:8080"
+kafka:
+  brokers: ["kafka:9093"]
+  topic: metering.events
+  tls:
+    enabled: false
+  sasl:
+    mechanism: SCRAM-SHA-512
+    username: metering
+    password:
+      file: {password_file}
+"#
+        ))
+        .unwrap()
+    }
+
+    fn write_temp_file(dir: &tempfile::TempDir, name: &str, contents: &[u8]) -> String {
+        let path = dir.path().join(name);
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn security_protocol_follows_tls_flag() {
+        assert_eq!(kafka_security_protocol(true), "SASL_SSL");
+        assert_eq!(kafka_security_protocol(false), "SASL_PLAINTEXT");
+    }
+
+    #[test]
+    fn brokers_validate_and_join() {
+        assert!(validate_kafka_brokers(&[]).is_err());
+        assert!(validate_kafka_brokers(&[String::new()]).is_err());
+        assert!(validate_kafka_brokers(&[String::from("kafka:9093")]).is_ok());
+        assert!(validate_kafka_brokers(&[String::from("broker.example")]).is_ok());
+        assert!(validate_kafka_brokers(&[String::from("[::1]:9093")]).is_ok());
+        assert!(validate_kafka_brokers(&[String::from("[::1]")]).is_ok());
+        assert!(validate_kafka_brokers(&[String::from("kafka:65535")]).is_ok());
+        assert_eq!(
+            join_kafka_brokers(&[String::from("a:1"), String::from("b:2")]),
+            "a:1,b:2"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_broker_addresses() {
+        for broker in [
+            "https://127.0.0.1:9093",
+            "127.0.0.1:notaport",
+            "127.0.0.1:65536",
+            "127.0.0.1:0",
+            "127.0.0.1:9093,127.0.0.1:9094",
+            " broker:9093",
+        ] {
+            let error = validate_kafka_brokers(&[broker.to_owned()])
+                .expect_err(&format!("malformed broker address {broker:?} must fail at startup"));
+            assert!(error.to_string().contains("kafka.brokers"), "{error}");
+        }
+    }
+
+    #[test]
+    fn accepts_valid_kafka_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let yaml = kafka_yaml(&password);
+        ExternalMeteringFilter::from_config(&yaml).expect("valid kafka config must construct");
+    }
+
+    #[test]
+    fn accepts_topic_at_the_kafka_name_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let mut yaml = kafka_yaml(&password);
+        yaml["kafka"]["topic"] = serde_yaml::Value::String("x".repeat(249));
+
+        ExternalMeteringFilter::from_config(&yaml).expect("249-byte Kafka topic names are valid");
+    }
+
+    #[test]
+    fn teardown_does_not_block_a_current_thread_runtime() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let mut yaml = kafka_yaml(&password);
+        yaml["kafka"]["brokers"] =
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("127.0.0.1:1".to_owned())]);
+        yaml["timeout_seconds"] = serde_yaml::Value::Number(30.into());
+        let filter = build_filter(&yaml).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            let UsageEventSink::Kafka(sink) = &filter.event_sink else {
+                panic!("Kafka config must construct a Kafka usage sink");
+            };
+            sink.deliver(b"pending record".to_vec(), "teardown-test".to_owned());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let started = Instant::now();
+            drop(filter);
+            assert!(
+                started.elapsed() < Duration::from_millis(250),
+                "dropping a producer with a pending record must not block its runtime worker"
+            );
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                tokio::time::sleep(Duration::from_millis(10)),
+            )
+            .await
+            .expect("the current-thread runtime must keep polling during producer teardown");
+        });
+    }
+
+    #[test]
+    fn failed_kafka_delivery_increments_the_report_failure_counter() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let mut yaml = kafka_yaml(&password);
+        yaml["kafka"]["brokers"] =
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("127.0.0.1:1".to_owned())]);
+        yaml["timeout_seconds"] = serde_yaml::Value::Number(1.into());
+        let filter = build_filter(&yaml).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let failure_recorded = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async move {
+                let UsageEventSink::Kafka(sink) = &filter.event_sink else {
+                    panic!("Kafka config must construct a Kafka usage sink");
+                };
+                sink.deliver(b"unreachable broker".to_vec(), "failure-test".to_owned());
+
+                let recorded = tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let failures = snapshotter.snapshot().into_vec().into_iter().any(|(key, _, _, value)| {
+                            key.key().name() == METRIC_REPORT_FAILURES
+                                && matches!(value, metrics_util::debugging::DebugValue::Counter(count) if count > 0)
+                        });
+                        if failures {
+                            break true;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the unreachable broker should produce a counted delivery failure");
+
+                drop(filter);
+                recorded
+            })
+        });
+
+        assert!(
+            failure_recorded,
+            "Kafka delivery failures must increment the shared report counter"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            r#"
+metering_url: "http://metering:8080"
+kafka:
+  brokers: ["kafka:9093"]
+  topic: "   "
+  tls:
+    enabled: false
+  sasl:
+    mechanism: SCRAM-SHA-512
+    username: metering
+    password:
+      file: {password}
+"#
+        ))
+        .unwrap();
+        let err = config_error(&yaml);
+        assert!(err.to_string().contains("kafka.topic"), "{err}");
+    }
+
+    #[test]
+    fn rejects_invalid_or_oversized_topic_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let oversized_topic = "x".repeat(513);
+        let topic_over_limit = "x".repeat(250);
+        for topic in [
+            ".",
+            "..",
+            "bad topic",
+            topic_over_limit.as_str(),
+            oversized_topic.as_str(),
+        ] {
+            let mut yaml = kafka_yaml(&password);
+            yaml["kafka"]["topic"] = serde_yaml::Value::String(topic.to_owned());
+            let error = config_error(&yaml);
+            assert!(error.to_string().contains("kafka.topic"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_scram_mechanism() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            r#"
+metering_url: "http://metering:8080"
+kafka:
+  brokers: ["kafka:9093"]
+  topic: metering.events
+  tls:
+    enabled: false
+  sasl:
+    mechanism: PLAIN
+    username: metering
+    password:
+      file: {password}
+"#
+        ))
+        .unwrap();
+        let err = config_error(&yaml);
+        assert!(err.to_string().contains("SCRAM-SHA-512"), "{err}");
+    }
+
+    #[test]
+    fn rejects_inline_password() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+metering_url: "http://metering:8080"
+kafka:
+  brokers: ["kafka:9093"]
+  topic: metering.events
+  tls:
+    enabled: false
+  sasl:
+    mechanism: SCRAM-SHA-512
+    username: metering
+    password:
+      value: inline-secret
+"#,
+        )
+        .unwrap();
+        let err = config_error(&yaml);
+        assert!(err.to_string().contains("file:"), "{err}");
+    }
+
+    #[test]
+    fn rejects_missing_password_file() {
+        let yaml = kafka_yaml("/nonexistent/kafka-password");
+        let err = config_error(&yaml);
+        assert!(err.to_string().contains("kafka.sasl.password"), "{err}");
+    }
+
+    #[test]
+    fn rejects_tls_without_ca_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            r#"
+metering_url: "http://metering:8080"
+kafka:
+  brokers: ["kafka:9093"]
+  topic: metering.events
+  tls:
+    enabled: true
+  sasl:
+    mechanism: SCRAM-SHA-512
+    username: metering
+    password:
+      file: {password}
+"#
+        ))
+        .unwrap();
+        let err = config_error(&yaml);
+        assert!(err.to_string().contains("kafka.tls.ca_file"), "{err}");
+    }
+
+    #[test]
+    fn accepts_tls_with_ca_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = write_temp_file(&dir, "password", b"secret");
+        let ca_key = rcgen::KeyPair::generate().expect("generate test CA key");
+        let ca_params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("CA params");
+        let ca_cert = ca_params.self_signed(&ca_key).expect("self-sign test CA");
+        let ca = write_temp_file(&dir, "ca.pem", ca_cert.pem().as_bytes());
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            r#"
+metering_url: "http://metering:8080"
+kafka:
+  brokers: ["kafka:9093"]
+  topic: metering.events
+  tls:
+    enabled: true
+    ca_file: {ca}
+  sasl:
+    mechanism: SCRAM-SHA-512
+    username: metering
+    password:
+      file: {password}
+"#
+        ))
+        .unwrap();
+        ExternalMeteringFilter::from_config(&yaml).expect("tls + ca_file must construct");
+    }
 }
 
 // -----------------------------------------------------------------------------

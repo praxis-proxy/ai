@@ -520,7 +520,7 @@ fn run_tls_container(engine: &str, port: u16, certs: &CertMaterial, auth: TcpAut
 }
 
 /// Detect the container engine to use.
-fn detect_container_engine() -> String {
+pub(super) fn detect_container_engine() -> String {
     if let Ok(engine) = std::env::var("CONTAINER_ENGINE") {
         return engine;
     }

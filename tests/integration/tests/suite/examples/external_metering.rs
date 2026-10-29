@@ -5,8 +5,10 @@
 
 use std::collections::HashMap;
 
+#[cfg(feature = "metering-kafka")]
+use praxis_test_utils::start_kafka;
 use praxis_test_utils::{
-    Backend, RoutedBackend, StatefulCapturingBackend, StatefulCapturingGuard, free_port, http_send,
+    Backend, RoutedBackend, StatefulBackend, StatefulCapturingBackend, StatefulCapturingGuard, free_port, http_send,
     json_post_with_header, parse_body, parse_status, start_header_echo_backend,
 };
 
@@ -24,6 +26,129 @@ fn external_metering_config_parses() {
     );
 
     assert_eq!(config.listeners.len(), 1, "should have 1 listener");
+}
+
+#[test]
+fn external_metering_kafka_config_parses() {
+    let metering_port = free_port();
+    let config = super::load_example_config(
+        "external-metering-kafka.yaml",
+        29810,
+        HashMap::from([("127.0.0.1:3000", 29811_u16), ("127.0.0.1:9090", metering_port)]),
+    );
+
+    assert_eq!(config.listeners.len(), 1, "should have 1 listener");
+}
+
+#[cfg(feature = "metering-kafka")]
+#[test]
+fn external_metering_kafka_delivers_usage_and_error_events_after_teardown() {
+    use std::{io::Write, time::Duration};
+
+    let backend_guard = StatefulBackend::new(vec![
+        (200, r#"{"id":"usage-response"}"#.to_owned()),
+        (500, r#"{"error":"upstream failure"}"#.to_owned()),
+    ])
+    .start_with_shutdown();
+    let backend_port = backend_guard.port();
+    let proxy_port = free_port();
+    let kafka = start_kafka();
+
+    // Both balance checks stay on HTTP. Usage and error reports are verified
+    // from Kafka after the proxy shuts down, exercising producer teardown.
+    let balance_response = r#"{"hasAccess": true, "balance": 9000.0}"#.to_owned();
+    let metering = StatefulCapturingBackend::new(vec![(200, balance_response.clone()), (200, balance_response)])
+        .start_with_shutdown();
+    let metering_port = metering.port();
+
+    let password_dir = tempfile::tempdir().expect("temp dir for kafka password");
+    let password_path = password_dir.path().join("kafka-sasl-password");
+    std::fs::File::create(&password_path)
+        .and_then(|mut file| file.write_all(b"test-password"))
+        .expect("write kafka password to file");
+
+    let path = praxis_test_utils::example_config_path("external-metering-kafka.yaml");
+    let yaml = std::fs::read_to_string(&path).expect("read kafka example config");
+    // fail_open:false so a failed balance check cannot yield 200.
+    let patched = praxis_test_utils::patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3000", backend_port), ("127.0.0.1:9090", metering_port)]),
+    )
+    .replace(
+        "/run/secrets/kafka-sasl-password",
+        password_path.to_str().expect("password path is utf-8"),
+    )
+    .replace("127.0.0.1:9093", &kafka.bootstrap_servers())
+    .replace("fail_open: true", "fail_open: false");
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("parse kafka example");
+
+    let proxy = praxis_test_utils::start_proxy(&config);
+    let usage_response = http_send(
+        proxy.addr(),
+        "POST /v1/chat/completions HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         x-tenant-username: alice\r\n\
+         x-tenant-group: engineering\r\n\
+         Connection: close\r\n\r\n",
+    );
+    assert_eq!(
+        parse_status(&usage_response),
+        200,
+        "a successful HTTP balance check should allow the usage request"
+    );
+
+    let error_response = http_send(
+        proxy.addr(),
+        "POST /v1/chat/completions HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         x-tenant-username: alice\r\n\
+         x-tenant-group: engineering\r\n\
+         Connection: close\r\n\r\n",
+    );
+    assert_eq!(
+        parse_status(&error_response),
+        500,
+        "the second backend response should be an error"
+    );
+
+    let balance_requests = metering.requests();
+    assert_eq!(
+        balance_requests.len(),
+        2,
+        "each request should perform an HTTP balance check"
+    );
+    assert!(
+        balance_requests.iter().all(|request| {
+            request.method == "GET"
+                && request
+                    .uri
+                    .starts_with("/api/v1/customers/alice/entitlements/inference-tokens/value")
+        }),
+        "balance checks must use the customer entitlement path over HTTP"
+    );
+
+    // Shutdown drains the proxy workers and drops the final producer while
+    // the two delivery tasks may still be awaiting their broker acknowledgments.
+    drop(proxy);
+    let messages = kafka.consume_messages("metering.usage.events", 2, Duration::from_secs(15));
+    let events: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|message| serde_json::from_slice(message).expect("Kafka record should contain JSON"))
+        .collect();
+
+    let usage = events
+        .iter()
+        .find(|event| event["type"] == "inference.tokens.used")
+        .expect("Kafka should contain the usage CloudEvent");
+    assert_eq!(usage["subject"], "alice");
+
+    let error = events
+        .iter()
+        .find(|event| event["type"] == "inference.request.error")
+        .expect("Kafka should contain the error CloudEvent");
+    assert_eq!(error["subject"], "alice");
+    assert_eq!(error["data"]["status_code"], 500);
 }
 
 // -----------------------------------------------------------------------------

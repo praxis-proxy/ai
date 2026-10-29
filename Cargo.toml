@@ -57,6 +57,9 @@ quote = "1.0.47"
 rand = "0.10.3"
 rcgen = "0.14.10"
 redis = { version = "1.7.0", default-features = false, features = ["sentinel", "tokio-rustls-comp"] }
+# Optional Kafka client for external_metering.
+# `ssl` is required for TLS and SCRAM-SHA-512.
+rdkafka = { version = "0.39.0", default-features = false, features = ["cmake-build", "tokio", "ssl"] }
 regex = "1.13.1"
 # reqwest is a dev/test-only dependency. Production callouts use
 # SubRequestClient, which inherits TLS from the process-wide Pingora

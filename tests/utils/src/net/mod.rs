@@ -8,6 +8,8 @@ pub mod backend;
 #[cfg(feature = "llmd-ext-proc")]
 pub mod ext_proc_mock;
 pub mod http_client;
+#[cfg(feature = "metering-kafka")]
+pub mod kafka;
 pub mod port;
 pub mod postgres;
 pub mod simulator;
@@ -29,6 +31,8 @@ pub use http_client::{
     basic_auth_header, http_get, http_get_retry, http_get_v6, http_post, http_send, json_post, json_post_with_header,
     parse_body, parse_header, parse_header_all, parse_status,
 };
+#[cfg(feature = "metering-kafka")]
+pub use kafka::{KafkaGuard, start_kafka};
 pub use port::{PortGuard, bind_unique_port, free_port, free_port_guard, free_port_v6, ipv6_available};
 pub use postgres::{
     PostgresCertAuthGuard, PostgresGuard, start_postgres, start_postgres_cert_auth, start_postgres_scram_auth_tls,

@@ -1,0 +1,60 @@
+# External Metering with Kafka event transport (#1638)
+#
+# Balance checks still use HTTP against metering_url. Usage/error CloudEvents
+# are produced to Kafka when the proxy is built with `--features metering-kafka`.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy --features metering-kafka -- \
+#     -c examples/configs/external-metering-kafka.yaml
+#
+# Loopback / local testing only: tls.enabled is false (plaintext SASL).
+# Usage events can carry tenant fields (organization_id, cost_center, etc.).
+# For a remote broker, set tls.enabled: true and tls.ca_file to a PEM CA
+# bundle, and point password.file at a file-backed SASL secret (not inline).
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      - filter: external_metering
+        metering_url: "http://127.0.0.1:9090"
+        allow_private_endpoint: true
+        timeout_seconds: 5
+        feature_key: "inference-tokens"
+        source: "ai-gateway"
+        provider: "openai"
+        fail_open: true
+        identity_header_prefix: "x-tenant-"
+        kafka:
+          brokers:
+            - "127.0.0.1:9093"
+          topic: metering.usage.events
+          tls:
+            enabled: false
+          sasl:
+            mechanism: SCRAM-SHA-512
+            username: metering-producer
+            password:
+              file: /run/secrets/kafka-sasl-password
+
+      - filter: token_count
+        provider: openai
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true

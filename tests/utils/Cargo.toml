@@ -39,6 +39,7 @@ llmd-ext-proc = [
     "dep:tonic",
 ]
 vertex-anthropic-filter = ["praxis-ai-proxy/vertex-anthropic-filter"]
+metering-kafka = ["praxis-ai-proxy/metering-kafka", "dep:rdkafka"]
 praxis-main = ["praxis-ai-proxy/praxis-main"]
 
 [lints]
@@ -63,6 +64,7 @@ openssl = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 rand = { workspace = true }
+rdkafka = { workspace = true, optional = true }
 rcgen = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }

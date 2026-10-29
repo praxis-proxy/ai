@@ -11,13 +11,19 @@ Tenant identity is resolved from the highest-trust source available: verified `{
 
 When no `{prefix}model` identity header names the model and `model_to_provider` mapped the request, balance checks and usage events use the client-facing model ID it recorded rather than the provider target. That filter buffers the request body, so its body pass completes before this filter's request hook runs the balance check.
 
+Usage and error `CloudEvents` default to an HTTP POST on `{metering_url}/api/v1/events`. With the `metering-kafka` feature, an optional `kafka:` config block switches event delivery to a durable Kafka producer instead. Balance checks always remain HTTP against `metering_url`. Event delivery is fire-and-forget on either transport so broker or HTTP sink unavailability never adds request latency (at-most-once until #1637).
+
+Kafka reads `kafka.sasl.password` only when the filter is constructed. After the password file changes, reload the filter so the producer is recreated.
+
+Optional Kafka transport for usage and error `CloudEvents`.
+
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `metering_url` | string | yes | Base URL of the external metering service (required). |
 | `allow_private_endpoint` | bool | no | Allow the metering endpoint to resolve to non-public addresses (loopback, private, link-local). Defaults to `false`, so callouts are rejected before connecting unless the operator opts in. Cloud metadata, unspecified, and multicast addresses remain blocked. |
-| `timeout_seconds` | integer | no | HTTP timeout in seconds for all metering calls. |
+| `timeout_seconds` | integer | no | Timeout in seconds for metering HTTP calls and Kafka event delivery. |
 | `feature_key` | string | no | Entitlement feature key used in balance check URL path. |
 | `source` | string | no | `CloudEvents` `source` field value. |
 | `provider` | string | no | Static provider name attributed to emitted `CloudEvents`. |
@@ -27,6 +33,16 @@ When no `{prefix}model` identity header names the model and `model_to_provider` 
 | `default_username` | string | no | Fallback username when no identity header is present. If set, requests without `{prefix}username` are still metered under this name. If unset, metering is skipped entirely. |
 | `default_model` | string | no | Fallback model name when no identity model header is present. |
 | `internal_auth_token` | CredentialSource | no | Optional internal bearer token for authenticating metering callouts (the balance check and the usage report). One of `value \| env_var \| file`, read through the shared [`CredentialSource`] core: bounded reads, restart-free file rotation (ideal for a Kubernetes projected Secret), and fail-closed publication. When omitted, callouts are sent unauthenticated (unchanged behavior). |
+| `kafka` | object | no | Optional Kafka transport for usage and error `CloudEvents`. When absent, events are sent via POST `{metering_url}/api/v1/events`. When present, events are produced to Kafka instead. Balance checks always use `metering_url` via HTTP. |
+| `kafka.brokers` | string[] | yes | Bootstrap broker list (host:port entries). |
+| `kafka.topic` | string | yes | Topic that receives `CloudEvent` JSON payloads. |
+| `kafka.tls` | object | yes | TLS configuration. |
+| `kafka.tls.enabled` | bool | yes | Whether to use TLS for the brokers. |
+| `kafka.tls.ca_file` | string | no | PEM CA bundle used for broker certificate verification. Required when `tls.enabled` is `true` and ignored when TLS is off. |
+| `kafka.sasl` | object | yes | Required SASL authentication. TLS selects `SASL_SSL` or `SASL_PLAINTEXT` for the connection. |
+| `kafka.sasl.mechanism` | `SCRAM-SHA-512` | yes | SASL mechanism. Must be `SCRAM-SHA-512`. |
+| `kafka.sasl.username` | string | yes | SASL username. |
+| `kafka.sasl.password` | CredentialSource | yes | SASL password. Must be file-backed [`CredentialSource`] (`file:` only). |
 
 ## Example
 

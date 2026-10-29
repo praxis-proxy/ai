@@ -76,6 +76,9 @@ token-ceiling-filter = ["experimental", "dep:tiktoken-rs"]
 # backing store is still an open question, so the filter itself stays gated
 # until both land. Activates the `experimental` marker.
 inflight-tracker-filter = ["experimental"]
+# Experimental: Kafka transport for external_metering usage and error CloudEvents.
+# Balance checks stay on HTTP. Pulls in librdkafka from rdkafka.
+metering-kafka = ["experimental", "dep:rdkafka"]
 # Marker feature activated transitively by any experimental feature, mirroring
 # praxis core's server crate. Lets consumers gate on "anything experimental".
 experimental = ["praxis-ai-apis/experimental"]
@@ -105,6 +108,7 @@ praxis-core = { workspace = true }
 praxis-filter = { workspace = true, features = ["chain-binding"] }
 praxis-tls = { workspace = true }
 redis = { workspace = true, optional = true }
+rdkafka = { workspace = true, optional = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

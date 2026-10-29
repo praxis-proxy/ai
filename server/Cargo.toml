@@ -73,6 +73,9 @@ token-rate-limit-filter = ["praxis-ai-filters/token-rate-limit-filter", "experim
 token-ceiling-filter = ["praxis-ai-filters/token-ceiling-filter", "experimental"]
 # Experimental: the inflight_tracker filter (see praxis-ai-filters).
 inflight-tracker-filter = ["praxis-ai-filters/inflight-tracker-filter", "experimental"]
+# Experimental: Kafka transport for external_metering usage and error CloudEvents
+# (see praxis-ai-filters). Balance checks remain HTTP.
+metering-kafka = ["praxis-ai-filters/metering-kafka", "experimental"]
 # Marker feature activated transitively by any experimental feature.
 experimental = ["praxis-ai-filters/experimental"]
 opentelemetry = ["praxis-ai-filters/opentelemetry"]

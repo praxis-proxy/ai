@@ -15,6 +15,10 @@
 //! [`filter_metadata`]: HttpFilterContext::filter_metadata
 
 mod config;
+mod sink;
+
+#[cfg(feature = "metering-kafka")]
+mod kafka;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -49,7 +53,10 @@ use serde::Deserialize;
 use tracing::{debug, trace, warn};
 use zeroize::Zeroizing;
 
-use self::config::{ExternalMeteringConfig, validate_config};
+use self::{
+    config::{ExternalMeteringConfig, validate_config},
+    sink::{HttpUsageEventSink, UsageEventSink},
+};
 // Import the token metadata keys from `token_count`, their sole writer, so this
 // reader can never drift to a stale literal and silently meter zero tokens.
 use crate::token_usage::{
@@ -139,6 +146,17 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// That filter buffers the request body, so its body pass completes before
 /// this filter's request hook runs the balance check.
 ///
+/// Usage and error `CloudEvents` default to an HTTP POST on
+/// `{metering_url}/api/v1/events`. With the `metering-kafka` feature, an
+/// optional `kafka:` config block switches event delivery to a durable Kafka
+/// producer instead. Balance checks always remain HTTP against `metering_url`.
+/// Event delivery is fire-and-forget on either transport so broker or HTTP
+/// sink unavailability never adds request latency (at-most-once until #1637).
+///
+/// Kafka reads `kafka.sasl.password` only when the filter is constructed.
+/// After the password file changes, reload the filter so the producer is
+/// recreated.
+///
 /// # YAML
 ///
 /// ```yaml
@@ -206,8 +224,11 @@ pub struct ExternalMeteringFilter {
     /// Shared HTTP client for balance checks and usage reports.
     subrequest_client: SubRequestClient,
 
-    /// HTTP timeout applied to each metering call.
+    /// HTTP timeout applied to each metering call or Kafka producer.
     timeout: Duration,
+
+    /// Delivers usage and error `CloudEvents`.
+    event_sink: UsageEventSink,
 }
 
 impl ExternalMeteringFilter {
@@ -248,9 +269,12 @@ impl ExternalMeteringFilter {
         validate_config(&cfg)?;
 
         let (auth_token, auth_watch) = build_auth_token(cfg.internal_auth_token.as_ref())?;
+        let address_policy = AddressPolicy::from_allow_private(cfg.allow_private_endpoint);
+        let timeout = Duration::from_secs(cfg.timeout_seconds);
+        let event_sink = build_event_sink(&cfg, subrequest_client.clone(), address_policy, timeout)?;
 
         Ok(Self {
-            address_policy: AddressPolicy::from_allow_private(cfg.allow_private_endpoint),
+            address_policy,
             auth_token,
             _auth_watch: auth_watch,
             default_model: cfg.default_model,
@@ -263,7 +287,8 @@ impl ExternalMeteringFilter {
             provider: cfg.provider,
             source: cfg.source,
             subrequest_client,
-            timeout: Duration::from_secs(cfg.timeout_seconds),
+            timeout,
+            event_sink,
         })
     }
 
@@ -381,7 +406,7 @@ impl ExternalMeteringFilter {
         let request_id = ctx.id_generator.generate(ctx.time_source);
         let event_ctx = EventContext {
             duration_ms: u64::try_from(state.request_start.elapsed().as_millis()).unwrap_or(u64::MAX),
-            event_id: &request_id,
+            event_id: request_id.as_str(),
             provider: self.resolve_provider(ctx),
             source: &self.source,
             state: &state,
@@ -393,21 +418,61 @@ impl ExternalMeteringFilter {
             build_usage_event(&event_ctx, &TokenCounts::read(ctx))
         };
 
-        // Resolve the callout credential on the filter (not in the spawned
-        // task) so a rotation gap fails the report closed rather than sending
-        // it unauthenticated.
-        let Some(headers) = report_callout_headers(self.auth_header()) else {
-            return;
+        let body = match serde_json::to_vec(&event) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!("failed to serialize metering event: {error}");
+                return;
+            },
         };
 
-        spawn_usage_report(
-            self.subrequest_client.clone(),
-            &self.metering_url,
-            self.timeout,
-            self.address_policy,
-            headers,
-            &event,
+        self.deliver_report(
+            body,
+            #[cfg(feature = "metering-kafka")]
+            &request_id,
         );
+    }
+
+    /// Hand the serialized event to the configured broker.
+    fn deliver_report(&self, body: Vec<u8>, #[cfg(feature = "metering-kafka")] request_id: &str) {
+        match &self.event_sink {
+            UsageEventSink::Http(sink) => {
+                let Some(headers) = report_callout_headers(self.auth_header()) else {
+                    return;
+                };
+                sink.deliver(body, headers);
+            },
+            #[cfg(feature = "metering-kafka")]
+            UsageEventSink::Kafka(sink) => sink.deliver(body, request_id.to_owned()),
+        }
+    }
+}
+
+/// Select the HTTP or Kafka transport from config.
+fn build_event_sink(
+    cfg: &ExternalMeteringConfig,
+    client: SubRequestClient,
+    address_policy: AddressPolicy,
+    timeout: Duration,
+) -> Result<UsageEventSink, FilterError> {
+    match cfg.kafka.as_ref() {
+        None => Ok(UsageEventSink::Http(HttpUsageEventSink::new(
+            client,
+            &cfg.metering_url,
+            timeout,
+            address_policy,
+        ))),
+        Some(kafka) => {
+            #[cfg(feature = "metering-kafka")]
+            {
+                Ok(UsageEventSink::Kafka(kafka::KafkaUsageEventSink::new(kafka, timeout)?))
+            }
+            #[cfg(not(feature = "metering-kafka"))]
+            {
+                let _ = kafka;
+                Err("external_metering: kafka transport requires rebuilding with `--features metering-kafka`".into())
+            }
+        },
     }
 }
 
@@ -863,91 +928,6 @@ fn reject_unavailable() -> FilterAction {
 }
 
 // -----------------------------------------------------------------------------
-// Usage Reporting (fire-and-forget)
-// -----------------------------------------------------------------------------
-
-/// Deliver an event without blocking the response.
-///
-/// Metering is an observer: a slow or failing metering service must never add
-/// latency to, or fail, a request the upstream already answered. `headers`
-/// carries the resolved internal-auth header (empty when unauthenticated),
-/// assembled on the filter before spawning so a credential gap already failed
-/// the report closed by this point.
-#[expect(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "sequential fire-and-forget callout setup with explicit transport inputs and the resolved auth headers; bundling them would only hide the callout's dependencies"
-)]
-fn spawn_usage_report(
-    client: SubRequestClient,
-    metering_url: &str,
-    timeout: Duration,
-    address_policy: AddressPolicy,
-    mut headers: http::HeaderMap,
-    event: &serde_json::Value,
-) {
-    let url = format!("{}/api/v1/events", metering_url.trim_end_matches('/'));
-
-    let body = match serde_json::to_vec(event) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("failed to serialize metering event: {e}");
-            return;
-        },
-    };
-
-    headers.insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("application/json"),
-    );
-
-    tokio::spawn(async move {
-        let request = SubRequest {
-            method: http::Method::POST,
-            uri: http::Uri::default(),
-            headers,
-            body: Bytes::from(body),
-        };
-
-        // The metering service URL is operator-configured, so it resolves
-        // through the shared DNS cache.
-        report_delivery(
-            client
-                .execute_url(
-                    &url,
-                    request,
-                    subrequest::address_policy_hook(address_policy),
-                    subrequest::UrlResolutionPolicy::OperatorCached,
-                    timeout,
-                    MAX_CALLOUT_RESPONSE_BYTES,
-                    None,
-                )
-                .await
-                .map_err(subrequest::map_url_error),
-        );
-    });
-}
-
-/// Log the outcome of a usage report delivery and count failures.
-///
-/// Emits [`METRIC_REPORT_FAILURES`] so dropped billing events are visible
-/// on a dashboard rather than only in debug logs.
-fn report_delivery(result: Result<SubResponse, SubRequestError>) {
-    match result {
-        Ok(resp) if is_success(resp.status) => {
-            trace!(status = resp.status, "metering usage report sent");
-        },
-        Ok(resp) => {
-            counter!(METRIC_REPORT_FAILURES).increment(1);
-            warn!(status = resp.status, "metering usage report rejected");
-        },
-        Err(error) => {
-            counter!(METRIC_REPORT_FAILURES).increment(1);
-            warn!(%error, "metering usage report failed");
-        },
-    }
-}
-
 /// Whether an HTTP status code is in the 2xx range.
 fn is_success(status: u16) -> bool {
     (200..300).contains(&status)
