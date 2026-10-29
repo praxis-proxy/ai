@@ -410,13 +410,17 @@ async fn run_live_codex_apply_patch_workflow(
     );
 
     observer.assert_http_only();
-    observer.assert_apply_patch_output_traversed_praxis();
+    // Check the client-visible tool lifecycle and workspace result before the wire
+    // observer assertion. If the model completes without returning a client-tool
+    // result, this reports Codex's JSONL trace instead of masking it with the more
+    // generic missing-wire-output error.
     assert_live_apply_patch_codex_jsonl(&output.stdout);
     assert_eq!(
         workspace.read_result().expect("result.txt should be readable"),
         format!("{}\n", workspace.expected_content()),
         "the apply_patch call should create the exact expected file content",
     );
+    observer.assert_apply_patch_output_traversed_praxis();
     workspace.assert_successful_completion();
 }
 
