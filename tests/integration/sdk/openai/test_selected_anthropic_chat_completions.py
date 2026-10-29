@@ -235,7 +235,7 @@ def test_legacy_omitted_tokens_and_ignored_openai_options(client: OpenAI) -> Non
     )
     assert response.choices[0].message.content == "compatibility"
     assert len(response.choices) == 1, "ignored n does not request multiple completions from Anthropic"
-    _, upstream = STATE.requests[-1]
+    _, _headers, upstream = STATE.requests[-1]
     assert upstream["max_tokens"] == 4096, "omitted token limits must use the compatibility default"
     assert upstream["model"] == "claude-fixture-model"
     for field in ("user", "n", "seed", "parallel_tool_calls"):
@@ -256,7 +256,7 @@ def test_data_and_remote_image_urls_are_translated_without_fetching(client: Open
         ]}],
         max_tokens=16,
     )
-    path, upstream = STATE.requests[-1]
+    path, _headers, upstream = STATE.requests[-1]
     assert path == "/v1/messages"
     content = upstream["messages"][0]["content"]
     assert [block["type"] for block in content] == ["text", "image", "text", "image"]
