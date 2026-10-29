@@ -41,6 +41,10 @@ listeners:
 filter_chains:
   - name: nemo-guardrails
     filters:
+      # Publishes the trusted operation identity used to select the request
+      # message extractor. It must run before ai_guardrails.
+      - filter: ai_operation
+
       - filter: ai_guardrails
         # Optional. Omit for an empty pass-through chain; configure one when
         # NeMo callouts need credentials, tracing, or destination policy.

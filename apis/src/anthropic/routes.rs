@@ -287,6 +287,17 @@ pub(crate) fn match_route<'a>(method: &str, path: &'a str) -> Option<MatchedAnth
     })
 }
 
+/// Whether a matched operation head is the Messages create call.
+///
+/// Consumers that act on inference-bearing Anthropic traffic use this registry
+/// predicate instead of duplicating the protocol and operation ID strings.
+pub(crate) fn is_create_message(protocol: ApplicationProtocol, operation_id: &str) -> bool {
+    protocol == APPLICATION_PROTOCOL
+        && OPERATION_SPECS.iter().any(|spec| {
+            spec.operation == AnthropicMessagesOperation::CreateMessage && spec.operation_id() == operation_id
+        })
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, reason = "tests")]
