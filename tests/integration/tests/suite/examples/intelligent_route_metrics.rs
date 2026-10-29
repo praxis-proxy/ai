@@ -8,7 +8,7 @@
 //! filter makes is counted by outcome, and every fresh selection by cluster,
 //! so operators can see routing behaviour without reading debug logs.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, env, process::Command};
 
 use praxis_test_utils::{
     free_port, http_get_retry, http_send, load_example_config, parse_status, start_backend_with_shutdown, start_proxy,
@@ -71,15 +71,36 @@ fn scrape(metrics_address: &str) -> String {
     body
 }
 
-/// One routed request and one unknown-model request are counted by outcome,
-/// the routed one is attributed to its cluster, and the snapshot size is
-/// published.
-///
-/// The Prometheus recorder is process-global and other suites in this binary
-/// start their own proxies, so the test asserts on the delta between two
-/// scrapes rather than on absolute counts.
+/// Other proxies in this test binary can clear the process-global snapshot
+/// gauge when they are dropped, so the listener assertions need a fresh process.
 #[test]
 fn decisions_are_counted_on_the_metrics_listener() {
+    let output = Command::new(env::current_exe().expect("locate integration test binary"))
+        .args([
+            "--exact",
+            "examples::intelligent_route_metrics::isolated_metrics_listener_contract",
+            "--ignored",
+            "--nocapture",
+        ])
+        .output()
+        .expect("run metrics listener contract in an isolated process");
+    assert!(
+        output.status.success(),
+        "isolated metrics listener contract must pass:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "the isolated process must execute exactly the metrics listener contract"
+    );
+}
+
+/// Real requests must publish decision counters, cluster attribution, and the
+/// serving snapshot gauge without interference from unrelated proxy instances.
+#[test]
+#[ignore = "invoked by decisions_are_counted_on_the_metrics_listener in a fresh process"]
+fn isolated_metrics_listener_contract() {
     let granite = start_backend_with_shutdown("granite-backend");
     let llama = start_backend_with_shutdown("llama-backend");
     let (proxy_port, admin_port) = (free_port(), free_port());
