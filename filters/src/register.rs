@@ -52,6 +52,8 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
     #[cfg(feature = "gcp-adc-filter")]
     register_gcp_filters(registry, subrequest_client);
     register_general_ai_filters(registry);
+    #[cfg(feature = "model-catalog-filter")]
+    register_model_catalog(registry, subrequest_client);
     register_ai_guardrails(registry, subrequest_client);
     register_external_metering(registry, subrequest_client);
     register_anthropic_filters(registry, subrequest_client);
@@ -244,11 +246,29 @@ fn register_inference_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "llmisvc_model_provider_resolver" => LlmisvcModelProviderResolverFilter::from_config
     );
-    #[cfg(feature = "model-catalog-filter")]
-    praxis_filter::register_filters!(
-        @register registry,
-        http "model_catalog" => ModelCatalogFilter::from_config
-    );
+}
+
+/// Register the model catalog filter, capturing the shared sub-request client
+/// for upstream model discovery when one is available.
+#[cfg(feature = "model-catalog-filter")]
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_model_catalog(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    if let Some(client) = subrequest_client {
+        let client = client.clone();
+        registry
+            .register(
+                "model_catalog",
+                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
+                    ModelCatalogFilter::from_config_with_client(config, client.clone())
+                })),
+            )
+            .unwrap_or_else(|_| panic!("duplicate filter name: 'model_catalog'"));
+    } else {
+        praxis_filter::register_filters!(
+            @register registry,
+            http "model_catalog" => ModelCatalogFilter::from_config
+        );
+    }
 }
 
 /// Register token counting/usage/rate-limiting filters.
