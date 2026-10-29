@@ -564,6 +564,7 @@ fn live_codex_config_replaces_the_provider_credential() {
     let patched = patch_live_codex_config(&yaml, 18_080, "127.0.0.1:8000", backend_token, database_url);
     let patched = patch_live_apply_patch_model_alias(&patched, "qwen3-8b");
 
+    assert_apply_patch_model_alias_precedes_state_initialization(&patched);
     assert!(patched.contains(backend_token));
     assert!(!patched.contains(TEST_PROVIDER_API_KEY));
     assert!(patched.contains(database_url));
@@ -585,6 +586,7 @@ fn live_native_codex_config_injects_the_provider_credential() {
     let patched = patch_live_native_codex_config(&yaml, 18_080, "127.0.0.1:8000", backend_token, database_url);
     let patched = patch_live_apply_patch_model_alias(&patched, "qwen3-8b");
 
+    assert_apply_patch_model_alias_precedes_state_initialization(&patched);
     assert!(patched.contains(backend_token));
     assert!(patched.contains("strip_client_credential: true"));
     assert!(patched.contains(database_url));
@@ -924,20 +926,48 @@ fn patch_live_codex_config(
 /// Give Codex the pinned catalog metadata that enables its grammar-based
 /// `apply_patch` tool, while routing its inference to the actual vLLM model.
 fn patch_live_apply_patch_model_alias(yaml: &str, backend_model: &str) -> String {
-    const MARKER: &str = "              - filter: openai_agentic_loop\n";
+    const MARKER: &str = concat!(
+        "      - filter: openai_responses_request\n",
+        "        on_invalid: reject\n",
+        "        headers:\n",
+        "          format: ~\n",
+        "          model: ~\n",
+        "          stream: ~\n",
+        "          mode: ~\n",
+    );
     let marker_count = yaml.matches(MARKER).count();
     assert_eq!(
         marker_count, 1,
-        "client-tool example should have one agentic-loop filter"
+        "client-tool example should have one request-state initialization filter"
     );
 
     let backend_model = serde_json::to_string(backend_model).expect("backend model should serialize as a YAML string");
-    let indent = "              ";
     let insertion = format!(
-        "{indent}- filter: openai_responses_model_rewrite\n{indent}  model_aliases:\n\
-         {indent}    \"{CODEX_APPLY_PATCH_MODEL}\": {backend_model}\n{MARKER}"
+        "      - filter: openai_responses_model_rewrite\n        model_aliases:\n          \"{CODEX_APPLY_PATCH_MODEL}\": {backend_model}\n{MARKER}"
     );
     yaml.replacen(MARKER, &insertion, 1)
+}
+
+/// The translated request must build its managed state from the rewritten model.
+fn assert_apply_patch_model_alias_precedes_state_initialization(yaml: &str) {
+    const REWRITE: &str = "      - filter: openai_responses_model_rewrite\n";
+    const STATE_INITIALIZATION: &str = concat!(
+        "      - filter: openai_responses_request\n",
+        "        on_invalid: reject\n",
+        "        headers:\n",
+        "          format: ~\n",
+        "          model: ~\n",
+        "          stream: ~\n",
+        "          mode: ~\n",
+    );
+    let rewrite_position = yaml.find(REWRITE).expect("model alias filter should be present");
+    let state_position = yaml
+        .find(STATE_INITIALIZATION)
+        .expect("Responses state initializer should be present");
+    assert!(
+        rewrite_position < state_position,
+        "model alias rewrite must precede Responses state initialization"
+    );
 }
 
 /// Patch the native Responses example for a keyed, slower live vLLM backend.

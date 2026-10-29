@@ -49,6 +49,35 @@ fn load_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxis_core::c
     praxis_core::config::Config::from_yaml(&yaml).expect("parse composed config")
 }
 
+/// Load the composed example with the model alias before the request parser
+/// initializes the Responses state used by Chat translation.
+fn load_config_with_model_alias_before_state(
+    proxy_port: u16,
+    model_port: u16,
+    db_url: &str,
+) -> praxis_core::config::Config {
+    const MARKER: &str = concat!(
+        "      - filter: openai_responses_request\n",
+        "        on_invalid: reject\n",
+        "        headers:\n",
+        "          format: ~\n",
+        "          model: ~\n",
+        "          stream: ~\n",
+        "          mode: ~\n",
+    );
+    let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("read composed example");
+    let insertion = format!(
+        "      - filter: openai_responses_model_rewrite\n        model_aliases:\n          \"gpt-5.4\": \"qwen3-8b\"\n{MARKER}"
+    );
+    assert_eq!(yaml.matches(MARKER).count(), 1, "request-state marker should be unique");
+    let patched_yaml = yaml.replacen(MARKER, &insertion, 1);
+    assert_ne!(patched_yaml, yaml, "the pre-state alias filter should be inserted");
+    let yaml = patched_yaml;
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse composed config with pre-state model alias")
+}
+
 /// Like [`load_config`] but with `openai_stream_events` removed from the inference
 /// step, so the streaming-restoration owner is never armed. Exercises the
 /// missing-owner fail-closed path (#1159) under the composed pipeline.
@@ -222,6 +251,48 @@ fn custom_tool_round_trip_over_chat_backend() {
     assert!(
         !body.contains("chat.completion"),
         "no raw Chat framing may leak to the Responses client: {body}"
+    );
+}
+
+#[test]
+fn model_alias_reaches_chat_backend_after_client_tool_lowering() {
+    let model = StatefulCapturingBackend::new(vec![(
+        200,
+        chat_tool_call_response(
+            "chatcmpl_model_alias",
+            "call_abc",
+            "apply_patch",
+            r#"{"input":"*** Begin Patch"}"#,
+        ),
+    )])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("compat_chat_model_alias");
+    let config = load_config_with_model_alias_before_state(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-5.4",
+        "input": "Apply the patch.",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply a unified diff to the workspace."
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "custom round trip should return 200: {raw}");
+    let model_reqs = model.requests();
+    assert_eq!(model_reqs.len(), 1, "one translated inference request");
+    let backend_body: serde_json::Value =
+        serde_json::from_str(&model_reqs[0].body).expect("backend request body should be JSON");
+    assert_eq!(
+        backend_body["model"], "qwen3-8b",
+        "the translated Chat request must use the aliased backend model: {backend_body}"
     );
 }
 
