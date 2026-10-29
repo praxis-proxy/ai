@@ -532,10 +532,16 @@ jobs:
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
-          cache-dependency-glob: tests/integration/sdk/anthropic/test_anthropic_messages_to_chat_completions.py
+          cache-dependency-glob: tests/integration/sdk/anthropic/*.py
 
       - name: Build Praxis
         run: cargo build -p praxis-ai-proxy
+
+      - name: Run Anthropic SDK v1 compatibility lane
+        run: uv run --with "anthropic==1.17.0" --with "pytest>=8.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s --anthropic-sdk-version=1.x
+
+      - name: Run Anthropic SDK v2 compatibility lane
+        run: uv run --with "anthropic==2.3.0" --with "pytest>=8.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s --anthropic-sdk-version=2.x
 
       - name: Run Anthropic Python SDK tests
         run: uv run tests/integration/sdk/anthropic/test_anthropic_messages_to_chat_completions.py -s

@@ -9,7 +9,7 @@
 
 use std::{borrow::Cow, collections::HashMap};
 
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 // -----------------------------------------------------------------------------
 // Public Entry Point
@@ -47,9 +47,9 @@ pub(crate) struct TransformResult {
 /// Returns a human-readable error string when the body is not valid
 /// JSON or is missing required fields.
 pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> {
-    let value: Value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
+    let mut value: Value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
 
-    let Some(obj) = value.as_object() else {
+    let Some(obj) = value.as_object_mut() else {
         return Err("request body is not a JSON object".to_owned());
     };
     validate_request_fields(obj)?;
@@ -266,27 +266,34 @@ fn expected_candidate_count(obj: &Map<String, Value>) -> u64 {
 /// - `user` → `role: "user"`
 /// - `assistant` → `role: "model"`
 /// - `tool` / `function` → `role: "user"` with `functionResponse` part
-fn convert_messages(obj: &Map<String, Value>) -> Result<(Vec<Value>, Option<Value>), String> {
-    let messages = obj
-        .get("messages")
-        .and_then(Value::as_array)
-        .ok_or("`messages` must be an array")?;
+fn convert_messages(obj: &mut Map<String, Value>) -> Result<(Vec<Value>, Option<Value>), String> {
+    let Some(Value::Array(mut messages)) = obj.remove("messages") else {
+        return Err("`messages` must be an array".to_owned());
+    };
 
     let mut contents = Vec::new();
     let mut system_parts = Vec::new();
-    // Request-local, borrowed from `messages`: populated while traversing
-    // assistant tool calls so each tool result resolves its function name
-    // with one lookup instead of rescanning history per result.
+    // Request-local: populated while traversing assistant tool calls so each
+    // tool result resolves its function name with one lookup instead of
+    // rescanning history per result.
     let mut tool_call_names = ToolCallNameIndex::new();
 
-    for (i, msg) in messages.iter().enumerate() {
-        convert_one_message(&mut contents, &mut system_parts, &mut tool_call_names, messages, i, msg)?;
+    for i in 0..messages.len() {
+        let (prior, current_and_rest) = messages.split_at_mut(i);
+        let Some(msg) = current_and_rest.first_mut() else {
+            continue;
+        };
+        convert_one_message(&mut contents, &mut system_parts, &mut tool_call_names, prior, msg)?;
     }
 
     let system_instruction = if system_parts.is_empty() {
         None
     } else {
-        Some(json!({ "parts": system_parts }))
+        // Move the collected parts into their wrapper. `json!` would serialize
+        // the value and re-parse it, copying every system string.
+        let mut instruction = Map::new();
+        instruction.insert("parts".to_owned(), Value::Array(system_parts));
+        Some(Value::Object(instruction))
     };
 
     Ok((contents, system_instruction))
@@ -298,17 +305,12 @@ fn convert_messages(obj: &Map<String, Value>) -> Result<(Vec<Value>, Option<Valu
 /// is only ever updated by the `assistant` arm and read by the
 /// `tool`/`function` arm, so results can only resolve against preceding
 /// declarations.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "accumulator pattern requires passing all traversal state"
-)]
-fn convert_one_message<'a>(
+fn convert_one_message(
     contents: &mut Vec<Value>,
     system_parts: &mut Vec<Value>,
-    tool_call_names: &mut ToolCallNameIndex<'a>,
-    messages: &'a [Value],
-    i: usize,
-    msg: &'a Value,
+    tool_call_names: &mut ToolCallNameIndex,
+    prior: &[Value],
+    msg: &mut Value,
 ) -> Result<(), String> {
     let role = msg
         .get("role")
@@ -320,7 +322,8 @@ fn convert_one_message<'a>(
         "user" => convert_user_message(contents, msg)?,
         "assistant" => convert_assistant_message(contents, tool_call_names, msg)?,
         "tool" | "function" => {
-            convert_tool_result(contents, tool_call_names, msg, is_tool_result_continuation(messages, i))?;
+            let is_continuation = is_tool_result_continuation(prior);
+            convert_tool_result(contents, tool_call_names, msg, is_continuation)?;
         },
         _ => return Err(format!("unsupported message role `{role}`")),
     }
@@ -355,24 +358,30 @@ fn validate_message_fields(msg: &Value, role: &str) -> Result<(), String> {
 // -----------------------------------------------------------------------------
 
 /// Collect system/developer message content into `systemInstruction` parts.
-fn collect_system_parts(parts: &mut Vec<Value>, msg: &Value) -> Result<(), String> {
-    match msg.get("content") {
+fn collect_system_parts(parts: &mut Vec<Value>, msg: &mut Value) -> Result<(), String> {
+    match msg.get_mut("content") {
         Some(Value::String(text)) => {
             if !text.is_empty() {
-                parts.push(json!({ "text": text }));
+                let mut part = Map::new();
+                part.insert("text".to_owned(), Value::String(std::mem::take(text)));
+                parts.push(Value::Object(part));
             }
         },
         Some(Value::Array(content_parts)) => {
-            for part in content_parts {
+            for part in content_parts.iter_mut() {
                 if part.get("type").and_then(Value::as_str) != Some("text") {
                     return Err("unsupported system content part".to_owned());
                 }
-                let text = part
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or("system text part is missing `text`")?;
-                if !text.is_empty() {
-                    parts.push(json!({ "text": text }));
+                let text = part.get_mut("text").ok_or("system text part is missing `text`")?;
+                // A non-string `text` is malformed, not empty: reject it rather
+                // than silently dropping the part from the instruction.
+                if !text.is_string() {
+                    return Err("system text part is missing `text`".to_owned());
+                }
+                if text.as_str().is_some_and(|s| !s.is_empty()) {
+                    let mut map = Map::new();
+                    map.insert("text".to_owned(), text.take());
+                    parts.push(Value::Object(map));
                 }
             }
         },
@@ -386,37 +395,76 @@ fn collect_system_parts(parts: &mut Vec<Value>, msg: &Value) -> Result<(), Strin
 // -----------------------------------------------------------------------------
 
 /// Convert a `user` role message to a Gemini content entry.
-fn convert_user_message(contents: &mut Vec<Value>, msg: &Value) -> Result<(), String> {
-    let parts = match msg.get("content") {
-        Some(Value::String(text)) => vec![json!({ "text": text })],
+fn convert_user_message(contents: &mut Vec<Value>, msg: &mut Value) -> Result<(), String> {
+    let parts = match msg.get_mut("content") {
+        Some(Value::String(text)) => {
+            let mut part = Map::new();
+            part.insert("text".to_owned(), Value::String(std::mem::take(text)));
+            vec![Value::Object(part)]
+        },
         Some(Value::Array(content_parts)) => convert_multipart_content(content_parts)?,
         _ => return Err("user message `content` must be a string or array".to_owned()),
     };
 
     if !parts.is_empty() {
-        contents.push(json!({ "role": "user", "parts": parts }));
+        let mut map = Map::new();
+        map.insert("role".to_owned(), Value::String("user".to_owned()));
+        map.insert("parts".to_owned(), Value::Array(parts));
+        contents.push(Value::Object(map));
     }
     Ok(())
+}
+
+/// Allocation-free discriminator for OpenAI content-part `type` values.
+///
+/// Reading the discriminator as a borrowed `&str` would keep `part`
+/// immutably borrowed across the `match`, blocking the `get_mut` calls each
+/// arm needs. Copying the small string just to select an arm allocates per
+/// content part, so classify into this `Copy` enum instead and re-read the
+/// raw string only on the error path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UserPartKind {
+    /// A `text` part.
+    Text,
+    /// An `image_url` part.
+    ImageUrl,
+}
+
+impl UserPartKind {
+    /// Classify a content part, or return its raw `type` for the error message.
+    fn classify(part: &Value) -> Result<Self, String> {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => Ok(Self::Text),
+            Some("image_url") => Ok(Self::ImageUrl),
+            other => Err(format!(
+                "unsupported user content part type `{}`",
+                other.unwrap_or("<missing>")
+            )),
+        }
+    }
 }
 
 /// Convert OpenAI multipart content array to Gemini parts.
 ///
 /// Handles `text`, `image_url` (both URLs and base64 data URIs).
-fn convert_multipart_content(content_parts: &[Value]) -> Result<Vec<Value>, String> {
+fn convert_multipart_content(content_parts: &mut [Value]) -> Result<Vec<Value>, String> {
     let mut parts = Vec::new();
 
-    for part in content_parts {
-        let part_type = part.get("type").and_then(Value::as_str).unwrap_or("<missing>");
-
-        match part_type {
-            "text" => {
+    for part in content_parts.iter_mut() {
+        match UserPartKind::classify(part)? {
+            UserPartKind::Text => {
                 let text = part
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or("text content part is missing `text`")?;
-                parts.push(json!({ "text": text }));
+                    .get_mut("text")
+                    .ok_or("text content part is missing `text`")?
+                    .take();
+                if !text.is_string() {
+                    return Err("text content part is missing `text`".to_owned());
+                }
+                let mut map = Map::new();
+                map.insert("text".to_owned(), text);
+                parts.push(Value::Object(map));
             },
-            "image_url" => {
+            UserPartKind::ImageUrl => {
                 if part
                     .get("image_url")
                     .and_then(|image| image.get("detail"))
@@ -424,9 +472,8 @@ fn convert_multipart_content(content_parts: &[Value]) -> Result<Vec<Value>, Stri
                 {
                     return Err("image_url detail cannot be translated to Vertex Gemini".to_owned());
                 }
-                parts.push(convert_image_url(part).ok_or("image_url part requires a supported URL")?);
+                parts.push(convert_image_url(part.take()).ok_or("image_url part requires a supported URL")?);
             },
-            _ => return Err(format!("unsupported user content part type `{part_type}`")),
         }
     }
 
@@ -438,27 +485,38 @@ fn convert_multipart_content(content_parts: &[Value]) -> Result<Vec<Value>, Stri
 ///
 /// - `data:{mime};base64,{data}` → `inlineData` with `mimeType` + `data`
 /// - `https://...` → `fileData` with `mimeType` guessed + `fileUri`
-fn convert_image_url(part: &Value) -> Option<Value> {
-    let url = part
-        .get("image_url")
-        .and_then(|v| v.get("url"))
-        .and_then(Value::as_str)?;
+fn convert_image_url(part: Value) -> Option<Value> {
+    let Value::Object(mut part) = part else {
+        return None;
+    };
+    let Some(Value::Object(mut image_url)) = part.remove("image_url") else {
+        return None;
+    };
+    let Some(Value::String(mut url)) = image_url.remove("url") else {
+        return None;
+    };
 
     if let Some(rest) = url.strip_prefix("data:") {
-        let (mime, data) = rest.split_once(";base64,")?;
-        Some(json!({
-            "inlineData": {
-                "mimeType": mime,
-                "data": data,
-            }
-        }))
+        let delimiter = ";base64,";
+        let (mime, data) = rest.split_once(delimiter)?;
+        let mime = mime.to_owned();
+        let data_start = url.len() - data.len();
+        url.drain(..data_start);
+
+        let mut inline_data = Map::new();
+        inline_data.insert("mimeType".to_owned(), Value::String(mime));
+        inline_data.insert("data".to_owned(), Value::String(url));
+        let mut part = Map::new();
+        part.insert("inlineData".to_owned(), Value::Object(inline_data));
+        Some(Value::Object(part))
     } else {
-        Some(json!({
-            "fileData": {
-                "mimeType": guess_mime_type(url),
-                "fileUri": url,
-            }
-        }))
+        let mime = guess_mime_type(&url).to_owned();
+        let mut file_data = Map::new();
+        file_data.insert("mimeType".to_owned(), Value::String(mime));
+        file_data.insert("fileUri".to_owned(), Value::String(url));
+        let mut part = Map::new();
+        part.insert("fileData".to_owned(), Value::Object(file_data));
+        Some(Value::Object(part))
     }
 }
 
@@ -488,17 +546,19 @@ fn guess_mime_type(url: &str) -> &'static str {
 /// Valid tool-call declarations are also recorded into `tool_call_names` so
 /// later tool results can resolve their function names without rescanning
 /// history.
-fn convert_assistant_message<'a>(
+fn convert_assistant_message(
     contents: &mut Vec<Value>,
-    tool_call_names: &mut ToolCallNameIndex<'a>,
-    msg: &'a Value,
+    tool_call_names: &mut ToolCallNameIndex,
+    msg: &mut Value,
 ) -> Result<(), String> {
     let mut parts = Vec::new();
 
-    collect_assistant_content(&mut parts, msg.get("content"))?;
+    collect_assistant_content(&mut parts, msg.get_mut("content"))?;
 
-    if let Some(tool_calls) = msg.get("tool_calls").filter(|calls| !calls.is_null()) {
-        let tool_calls = tool_calls.as_array().ok_or("assistant `tool_calls` must be an array")?;
+    if let Some(tool_calls) = msg.get_mut("tool_calls").filter(|calls| !calls.is_null()) {
+        let tool_calls = tool_calls
+            .as_array_mut()
+            .ok_or("assistant `tool_calls` must be an array")?;
         tool_call_names.record(tool_calls);
         for tc in tool_calls {
             parts.push(convert_tool_call(tc)?);
@@ -506,33 +566,53 @@ fn convert_assistant_message<'a>(
     }
 
     if !parts.is_empty() {
-        contents.push(json!({ "role": "model", "parts": parts }));
+        let mut map = Map::new();
+        map.insert("role".to_owned(), Value::String("model".to_owned()));
+        map.insert("parts".to_owned(), Value::Array(parts));
+        contents.push(Value::Object(map));
     }
 
     Ok(())
 }
 
+/// Reject assistant content parts that Gemini cannot represent.
+///
+/// Kept separate from the mutation loop so the `type` discriminator is only
+/// borrowed for the check and never copied per part.
+fn validate_assistant_part(part: &Value) -> Result<(), String> {
+    match part.get("type").and_then(Value::as_str) {
+        Some("text") => Ok(()),
+        Some("refusal") => Err("assistant refusal cannot be translated to Vertex Gemini".to_owned()),
+        other => Err(format!(
+            "unsupported assistant content part type `{}`",
+            other.unwrap_or("<missing>")
+        )),
+    }
+}
+
 /// Convert string or array-form assistant content into Gemini text parts.
-fn collect_assistant_content(parts: &mut Vec<Value>, content: Option<&Value>) -> Result<(), String> {
+#[expect(clippy::needless_pass_by_value, reason = "requires moving Option fields")]
+fn collect_assistant_content(parts: &mut Vec<Value>, content: Option<&mut Value>) -> Result<(), String> {
     match content {
         Some(Value::String(text)) => {
             if !text.is_empty() {
-                parts.push(json!({ "text": text }));
+                let mut map = Map::new();
+                map.insert("text".to_owned(), Value::String(std::mem::take(text)));
+                parts.push(Value::Object(map));
             }
         },
         Some(Value::Array(content_parts)) => {
-            for part in content_parts {
-                let part_type = part.get("type").and_then(Value::as_str).unwrap_or("<missing>");
-                let text = match part_type {
-                    "text" => part
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .ok_or("assistant text part is missing `text`")?,
-                    "refusal" => return Err("assistant refusal cannot be translated to Vertex Gemini".to_owned()),
-                    _ => return Err(format!("unsupported assistant content part type `{part_type}`")),
-                };
-                if !text.is_empty() {
-                    parts.push(json!({ "text": text }));
+            for part in content_parts.iter_mut() {
+                validate_assistant_part(part)?;
+                let text = part.get_mut("text").ok_or("assistant text part is missing `text`")?;
+                // Reject malformed text instead of silently dropping the part.
+                if !text.is_string() {
+                    return Err("assistant text part is missing `text`".to_owned());
+                }
+                if text.as_str().is_some_and(|s| !s.is_empty()) {
+                    let mut map = Map::new();
+                    map.insert("text".to_owned(), text.take());
+                    parts.push(Value::Object(map));
                 }
             }
         },
@@ -551,24 +631,26 @@ fn collect_assistant_content(parts: &mut Vec<Value>, content: Option<&Value>) ->
     clippy::too_many_lines,
     reason = "tool-call validation and construction share one boundary"
 )]
-fn convert_tool_call(tc: &Value) -> Result<Value, String> {
+fn convert_tool_call(tc: &mut Value) -> Result<Value, String> {
     if tc.get("type").and_then(Value::as_str) != Some("function") {
         return Err("only function tool calls can be translated to Vertex Gemini".to_owned());
     }
-    let name = tc
-        .get("function")
-        .and_then(|f| f.get("name"))
-        .and_then(Value::as_str)
-        .ok_or("tool call is missing required field function.name")?;
 
-    let args_str = tc
-        .get("function")
-        .and_then(|f| f.get("arguments"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| "tool call is missing required field function.arguments".to_owned())?;
+    // Take the function object out so its owned fields can be moved into the
+    // generated `functionCall` instead of being serialized by `json!`.
+    let Some(Value::Object(mut function)) = tc.get_mut("function").map(Value::take) else {
+        return Err("tool call is missing required field function.name".to_owned());
+    };
+    let Some(Value::String(name)) = function.remove("name") else {
+        return Err("tool call is missing required field function.name".to_owned());
+    };
+
+    let Some(Value::String(args_str)) = function.remove("arguments") else {
+        return Err("tool call is missing required field function.arguments".to_owned());
+    };
 
     let args: Value =
-        serde_json::from_str(args_str).map_err(|e| format!("tool call arguments are not valid JSON: {e}"))?;
+        serde_json::from_str(&args_str).map_err(|e| format!("tool call arguments are not valid JSON: {e}"))?;
 
     if !args.is_object() {
         return Err(format!(
@@ -577,21 +659,22 @@ fn convert_tool_call(tc: &Value) -> Result<Value, String> {
         ));
     }
 
-    let mut part = json!({
-        "functionCall": {
-            "name": name,
-            "args": args,
-        }
-    });
+    let mut function_call = Map::new();
+    function_call.insert("name".to_owned(), Value::String(name));
+    function_call.insert("args".to_owned(), args);
 
-    if let Some(sig) = tc.pointer("/extra_content/google/thought_signature")
-        && !sig.is_null()
-        && let Some(obj) = part.as_object_mut()
+    let mut part = Map::new();
+    part.insert("functionCall".to_owned(), Value::Object(function_call));
+
+    // Move any nested signature out of the disposable tool call.
+    if let Some(sig) = tc
+        .pointer_mut("/extra_content/google/thought_signature")
+        .filter(|sig| !sig.is_null())
     {
-        obj.insert("thoughtSignature".to_owned(), sig.clone());
+        part.insert("thoughtSignature".to_owned(), sig.take());
     }
 
-    Ok(part)
+    Ok(Value::Object(part))
 }
 
 /// Return the JSON type name of a value for error messages.
@@ -611,13 +694,12 @@ fn json_kind(v: &Value) -> &'static str {
 // -----------------------------------------------------------------------------
 
 /// Returns `true` when `messages[index - 1]` is also a `tool`/`function` result.
-fn is_tool_result_continuation(messages: &[Value], index: usize) -> bool {
-    index > 0
-        && messages
-            .get(index - 1)
-            .and_then(|m| m.get("role"))
-            .and_then(Value::as_str)
-            .is_some_and(|r| r == "tool" || r == "function")
+fn is_tool_result_continuation(prior: &[Value]) -> bool {
+    prior
+        .last()
+        .and_then(|m| m.get("role"))
+        .and_then(Value::as_str)
+        .is_some_and(|r| r == "tool" || r == "function")
 }
 
 /// Convert a `tool` or `function` role message to a Gemini
@@ -631,29 +713,32 @@ fn is_tool_result_continuation(messages: &[Value], index: usize) -> bool {
 ///
 /// When `append_to_last` is `true`, the part is appended to the last `contents`
 /// entry rather than opening a new `user` turn (required for parallel tool calls).
-fn convert_tool_result<'a>(
+fn convert_tool_result(
     contents: &mut Vec<Value>,
-    tool_call_names: &ToolCallNameIndex<'a>,
-    msg: &'a Value,
+    tool_call_names: &ToolCallNameIndex,
+    msg: &mut Value,
     append_to_last: bool,
 ) -> Result<(), String> {
+    // Resolve the name first: it reads sibling fields of `content`, which is
+    // moved out below.
     let name = resolve_tool_function_name(tool_call_names, msg)?;
+    let content = tool_result_content(msg)?;
 
-    let content = tool_result_content(msg.get("content"))?;
-
-    // Gemini response must be a Struct (JSON object); wrap plain text and
-    // valid-but-non-object JSON (arrays, numbers) in {"result": ...}.
-    let response: Value = match serde_json::from_str::<Value>(&content) {
-        Ok(Value::Object(map)) => Value::Object(map),
-        _ => json!({ "result": content.as_ref() }),
+    let response: Value = if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&content) {
+        Value::Object(map)
+    } else {
+        let mut wrapper = Map::new();
+        wrapper.insert("result".to_owned(), Value::String(content.into_owned()));
+        Value::Object(wrapper)
     };
 
-    let part = json!({
-        "functionResponse": {
-            "name": name,
-            "response": response,
-        }
-    });
+    let mut function_response = Map::new();
+    function_response.insert("name".to_owned(), Value::String(name));
+    function_response.insert("response".to_owned(), response);
+
+    let mut part_map = Map::new();
+    part_map.insert("functionResponse".to_owned(), Value::Object(function_response));
+    let part = Value::Object(part_map);
 
     if append_to_last
         && let Some(last) = contents.last_mut()
@@ -663,20 +748,26 @@ fn convert_tool_result<'a>(
         return Ok(());
     }
 
-    contents.push(json!({
-        "role": "user",
-        "parts": [part]
-    }));
+    let mut turn = Map::new();
+    turn.insert("role".to_owned(), Value::String("user".to_owned()));
+    turn.insert("parts".to_owned(), Value::Array(vec![part]));
+    contents.push(Value::Object(turn));
+
     Ok(())
 }
 
-/// Flatten OpenAI tool-result text parts while borrowing the common string form.
-fn tool_result_content(content: Option<&Value>) -> Result<Cow<'_, str>, String> {
-    match content {
-        Some(Value::String(text)) => Ok(Cow::Borrowed(text)),
+/// Flatten an OpenAI tool-result into the text Gemini can carry.
+///
+/// The common single-string form is *moved* out of the disposable message
+/// with [`std::mem::take`], so a large tool result is never copied. The
+/// array form still has to join its parts, which is one unavoidable
+/// allocation; a borrow of that joined text cannot outlive the local.
+fn tool_result_content(msg: &mut Value) -> Result<Cow<'static, str>, String> {
+    match msg.get_mut("content") {
+        Some(Value::String(text)) => Ok(Cow::Owned(std::mem::take(text))),
         Some(Value::Array(parts)) => {
             let mut text_parts = Vec::with_capacity(parts.len());
-            for part in parts {
+            for part in parts.iter() {
                 if part.get("type").and_then(Value::as_str) != Some("text") {
                     return Err("unsupported tool result content part".to_owned());
                 }
@@ -699,11 +790,11 @@ fn tool_result_content(content: Option<&Value>) -> Result<Cow<'_, str>, String> 
 /// `tool_call_names`, which holds the nearest preceding declaration for
 /// the `tool_call_id`, so a reused id from a later round cannot steal an
 /// earlier result.
-fn resolve_tool_function_name<'a>(tool_call_names: &ToolCallNameIndex<'a>, msg: &'a Value) -> Result<&'a str, String> {
-    if let Some(name) = msg.get("name").and_then(Value::as_str)
+fn resolve_tool_function_name(tool_call_names: &ToolCallNameIndex, msg: &mut Value) -> Result<String, String> {
+    if let Some(Value::String(name)) = msg.get_mut("name")
         && !name.is_empty()
     {
-        return Ok(name);
+        return Ok(std::mem::take(name));
     }
 
     let Some(tool_call_id) = msg.get("tool_call_id").and_then(Value::as_str) else {
@@ -712,6 +803,7 @@ fn resolve_tool_function_name<'a>(tool_call_names: &ToolCallNameIndex<'a>, msg: 
 
     tool_call_names
         .resolve(tool_call_id)
+        .map(str::to_owned)
         .ok_or_else(|| format!("tool message `tool_call_id` `{tool_call_id}` has no matching function call"))
 }
 
@@ -724,16 +816,18 @@ fn resolve_tool_function_name<'a>(tool_call_names: &ToolCallNameIndex<'a>, msg: 
 /// per-result reverse scan produced, without rescanning history for every
 /// tool result.
 ///
-/// Keys and values borrow from the parsed `messages` array, so populating
-/// the index never clones or serializes history. The index only ever holds
-/// declarations from messages traversed so far: a tool result cannot be
-/// satisfied by an assistant call that appears later in the request.
-struct ToolCallNameIndex<'a> {
+/// Keys and values are owned copies of the short tool-call id and function
+/// name. They are copied rather than borrowed so the traversal can consume
+/// the parsed message fields (large payloads are moved, never cloned); two
+/// short strings per tool call is the bounded cost of that. The index only
+/// ever holds declarations from messages traversed so far: a tool result
+/// cannot be satisfied by an assistant call that appears later in the request.
+struct ToolCallNameIndex {
     /// Tool-call ID → nearest preceding non-empty `function.name`.
-    names: HashMap<&'a str, &'a str>,
+    names: HashMap<String, String>,
 }
 
-impl<'a> ToolCallNameIndex<'a> {
+impl ToolCallNameIndex {
     /// Create an empty index for one request translation.
     fn new() -> Self {
         Self { names: HashMap::new() }
@@ -747,24 +841,31 @@ impl<'a> ToolCallNameIndex<'a> {
     /// overwrites an earlier valid declaration for the same id. Recording
     /// runs on the raw array before per-call conversion; a conversion error
     /// aborts the whole translation, so partial recording is unobservable.
-    fn record(&mut self, tool_calls: &'a [Value]) {
+    fn record(&mut self, tool_calls: &mut [Value]) {
         for tc in tool_calls {
-            let (Some(id), Some(name)) = (
-                tc.get("id").and_then(Value::as_str),
-                tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str),
-            ) else {
+            // The function name still has to be copied: `function` stays in the
+            // tool call for `convert_tool_call`, so it cannot be moved here.
+            let Some(name) = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+            else {
                 continue;
             };
-            if !name.is_empty() {
-                self.names.insert(id, name);
-            }
+            // `convert_tool_call` never reads the id, so move it into the index.
+            let Some(Value::String(id)) = tc.as_object_mut().and_then(|map| map.remove("id")) else {
+                continue;
+            };
+            self.names.insert(id, name);
         }
     }
 
     /// Resolve the function name declared by the nearest preceding tool
     /// call with this ID, if any.
-    fn resolve(&self, tool_call_id: &str) -> Option<&'a str> {
-        self.names.get(tool_call_id).copied()
+    fn resolve(&self, tool_call_id: &str) -> Option<&str> {
+        self.names.get(tool_call_id).map(String::as_str)
     }
 }
 
@@ -783,12 +884,11 @@ impl<'a> ToolCallNameIndex<'a> {
 /// - `frequency_penalty` → `frequencyPenalty`
 /// - `seed` → `seed`
 /// - `response_format` → `responseMimeType` + `responseSchema`
-fn build_generation_config(obj: &Map<String, Value>) -> Map<String, Value> {
+fn build_generation_config(obj: &mut Map<String, Value>) -> Map<String, Value> {
     let mut config = Map::new();
 
-    // max_completion_tokens takes precedence over max_tokens.
-    if let Some(v) = obj.get("max_completion_tokens").or_else(|| obj.get("max_tokens")) {
-        config.insert("maxOutputTokens".to_owned(), v.clone());
+    if let Some(v) = obj.remove("max_completion_tokens").or_else(|| obj.remove("max_tokens")) {
+        config.insert("maxOutputTokens".to_owned(), v);
     }
 
     copy_generation_params(&mut config, obj);
@@ -799,7 +899,7 @@ fn build_generation_config(obj: &Map<String, Value>) -> Map<String, Value> {
 }
 
 /// Copy simple 1:1 generation parameters from OpenAI to Gemini names.
-fn copy_generation_params(config: &mut Map<String, Value>, obj: &Map<String, Value>) {
+fn copy_generation_params(config: &mut Map<String, Value>, obj: &mut Map<String, Value>) {
     const MAPPINGS: &[(&str, &str)] = &[
         ("temperature", "temperature"),
         ("top_p", "topP"),
@@ -810,23 +910,23 @@ fn copy_generation_params(config: &mut Map<String, Value>, obj: &Map<String, Val
         ("top_logprobs", "logprobs"),
     ];
     for &(openai, gemini) in MAPPINGS {
-        if let Some(v) = obj.get(openai) {
-            config.insert(gemini.to_owned(), v.clone());
+        if let Some(v) = obj.remove(openai) {
+            config.insert(gemini.to_owned(), v);
         }
     }
-    if obj.get("logprobs") == Some(&Value::Bool(true)) {
+    if obj.remove("logprobs") == Some(Value::Bool(true)) {
         config.insert("responseLogprobs".to_owned(), Value::Bool(true));
     }
 }
 
 /// Map `stop` (string or array) to Gemini `stopSequences`.
-fn copy_stop_sequences(config: &mut Map<String, Value>, obj: &Map<String, Value>) {
-    match obj.get("stop") {
+fn copy_stop_sequences(config: &mut Map<String, Value>, obj: &mut Map<String, Value>) {
+    match obj.remove("stop") {
         Some(Value::Array(stops)) => {
-            config.insert("stopSequences".to_owned(), Value::Array(stops.clone()));
+            config.insert("stopSequences".to_owned(), Value::Array(stops));
         },
         Some(Value::String(s)) => {
-            config.insert("stopSequences".to_owned(), json!([s]));
+            config.insert("stopSequences".to_owned(), Value::Array(vec![Value::String(s)]));
         },
         _ => {},
     }
@@ -839,27 +939,29 @@ fn copy_stop_sequences(config: &mut Map<String, Value>, obj: &Map<String, Value>
 /// - `{"type": "json_schema", "json_schema": {"schema": ...}}` → `responseMimeType: "application/json"` +
 ///   `responseSchema`
 /// - `{"type": "text"}` → no-op (Gemini default)
-fn convert_response_format(config: &mut Map<String, Value>, obj: &Map<String, Value>) {
-    let Some(Value::Object(rf)) = obj.get("response_format") else {
+fn convert_response_format(config: &mut Map<String, Value>, obj: &mut Map<String, Value>) {
+    let Some(Value::Object(mut rf)) = obj.remove("response_format") else {
         return;
     };
 
-    let format_type = rf.get("type").and_then(Value::as_str).unwrap_or("");
-
-    match format_type {
-        "json_object" => {
+    // `rf.remove("type")` moves the discriminator out, so selecting the arm
+    // never allocates a copy of a request string.
+    match rf.remove("type").as_ref().and_then(Value::as_str) {
+        Some("json_object") => {
             config.insert(
                 "responseMimeType".to_owned(),
                 Value::String("application/json".to_owned()),
             );
         },
-        "json_schema" => {
+        Some("json_schema") => {
             config.insert(
                 "responseMimeType".to_owned(),
                 Value::String("application/json".to_owned()),
             );
-            if let Some(schema) = rf.get("json_schema").and_then(|js| js.get("schema")) {
-                config.insert("responseSchema".to_owned(), schema.clone());
+            if let Some(Value::Object(mut js)) = rf.remove("json_schema")
+                && let Some(schema) = js.remove("schema")
+            {
+                config.insert("responseSchema".to_owned(), schema);
             }
         },
         _ => {},
@@ -880,11 +982,14 @@ fn convert_response_format(config: &mut Map<String, Value>, obj: &Map<String, Va
     clippy::too_many_lines,
     reason = "validates and maps each tool declaration in one pass"
 )]
-fn convert_tools(obj: &Map<String, Value>) -> Result<Option<Value>, String> {
-    let Some(tools) = obj.get("tools").filter(|tools| !tools.is_null()) else {
+fn convert_tools(obj: &mut Map<String, Value>) -> Result<Option<Value>, String> {
+    let Some(mut tools_val) = obj.remove("tools") else {
         return Ok(None);
     };
-    let tools = tools.as_array().ok_or("`tools` must be an array")?;
+    if tools_val.is_null() {
+        return Ok(None);
+    }
+    let tools = tools_val.as_array_mut().ok_or("`tools` must be an array")?;
 
     let mut declarations = Vec::new();
 
@@ -893,23 +998,22 @@ fn convert_tools(obj: &Map<String, Value>) -> Result<Option<Value>, String> {
             return Err("unsupported tool type for Vertex Gemini translation".to_owned());
         }
 
-        let function = tool
-            .get("function")
-            .and_then(Value::as_object)
-            .ok_or("function tool requires a `function` object")?;
+        let Some(Value::Object(mut function)) = tool.get_mut("function").map(Value::take) else {
+            return Err("function tool requires a `function` object".to_owned());
+        };
 
         let mut decl = Map::new();
 
-        if let Some(name) = function.get("name") {
-            decl.insert("name".to_owned(), name.clone());
+        if let Some(name) = function.remove("name") {
+            decl.insert("name".to_owned(), name);
         }
 
-        if let Some(desc) = function.get("description") {
-            decl.insert("description".to_owned(), desc.clone());
+        if let Some(desc) = function.remove("description") {
+            decl.insert("description".to_owned(), desc);
         }
 
-        if let Some(params) = function.get("parameters") {
-            decl.insert("parameters".to_owned(), params.clone());
+        if let Some(params) = function.remove("parameters") {
+            decl.insert("parameters".to_owned(), params);
         }
 
         if function.iter().any(|(key, value)| {
@@ -930,7 +1034,9 @@ fn convert_tools(obj: &Map<String, Value>) -> Result<Option<Value>, String> {
         return Ok(None);
     }
 
-    Ok(Some(json!([{ "functionDeclarations": declarations }])))
+    let mut decl_map = Map::new();
+    decl_map.insert("functionDeclarations".to_owned(), Value::Array(declarations));
+    Ok(Some(Value::Array(vec![Value::Object(decl_map)])))
 }
 
 // -----------------------------------------------------------------------------
@@ -943,35 +1049,50 @@ fn convert_tools(obj: &Map<String, Value>) -> Result<Option<Value>, String> {
 /// - `"required"` → `ANY` (must call a function)
 /// - `"none"` → `NONE` (no function calls)
 /// - `{"type": "function", "function": {"name": "..."}}` → `ANY` with `allowedFunctionNames`
-fn convert_tool_choice(obj: &Map<String, Value>) -> Result<Option<Value>, String> {
-    let Some(tool_choice) = obj.get("tool_choice").filter(|choice| !choice.is_null()) else {
+fn convert_tool_choice(obj: &mut Map<String, Value>) -> Result<Option<Value>, String> {
+    let Some(mut tool_choice) = obj.remove("tool_choice") else {
         return Ok(None);
     };
+    if tool_choice.is_null() {
+        return Ok(None);
+    }
 
-    let converted = match tool_choice {
+    let converted = match &mut tool_choice {
         Value::String(s) => match s.as_str() {
-            "none" => Some(json!({ "functionCallingConfig": { "mode": "NONE" } })),
-            "required" => Some(json!({ "functionCallingConfig": { "mode": "ANY" } })),
+            "none" => Some(function_calling_tool_config("NONE", None)),
+            "required" => Some(function_calling_tool_config("ANY", None)),
             // "auto" is the Gemini default — no need to send toolConfig.
             "auto" => None,
             _ => return Err(format!("unsupported tool_choice `{s}`")),
         },
         Value::Object(tc) if tc.get("type").and_then(Value::as_str) == Some("function") => {
-            let name = tc
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-                .ok_or("function tool_choice requires a string `function.name`")?;
-            Some(json!({
-                "functionCallingConfig": {
-                    "mode": "ANY",
-                    "allowedFunctionNames": [name],
-                }
-            }))
+            let name = match tc.get_mut("function") {
+                Some(Value::Object(function)) => match function.remove("name") {
+                    Some(Value::String(name)) => name,
+                    _ => return Err("function tool_choice requires a string `function.name`".to_owned()),
+                },
+                _ => return Err("function tool_choice requires a string `function.name`".to_owned()),
+            };
+            Some(function_calling_tool_config("ANY", Some(name)))
         },
         _ => return Err("unsupported tool_choice for Vertex Gemini translation".to_owned()),
     };
     Ok(converted)
+}
+
+/// Build the small function-calling configuration without cloning owned names.
+fn function_calling_tool_config(mode: &str, name: Option<String>) -> Value {
+    let mut config = Map::new();
+    config.insert("mode".to_owned(), Value::String(mode.to_owned()));
+    if let Some(name) = name {
+        config.insert(
+            "allowedFunctionNames".to_owned(),
+            Value::Array(vec![Value::String(name)]),
+        );
+    }
+    let mut root = Map::new();
+    root.insert("functionCallingConfig".to_owned(), Value::Object(config));
+    Value::Object(root)
 }
 
 // -----------------------------------------------------------------------------
@@ -981,6 +1102,8 @@ fn convert_tool_choice(obj: &Map<String, Value>) -> Result<Option<Value>, String
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     // -------------------------------------------------------------------------
@@ -1055,6 +1178,57 @@ mod tests {
     // -------------------------------------------------------------------------
     // Role mapping
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn non_string_text_parts_are_rejected_for_system_developer_and_assistant() {
+        for role in ["system", "developer", "assistant"] {
+            for invalid in [json!(null), json!(false), json!(7), json!([]), json!({})] {
+                let request = json!({
+                    "model": "gemini-1.5-pro",
+                    "messages": [
+                        {"role": role, "content": [{"type": "text", "text": invalid}]},
+                        {"role": "user", "content": "continue"}
+                    ]
+                });
+                let error = transform_request(&serde_json::to_vec(&request).unwrap()).unwrap_err();
+                let expected = if role == "assistant" {
+                    "assistant text part is missing `text`"
+                } else {
+                    "system text part is missing `text`"
+                };
+                assert_eq!(error, expected, "role={role}, invalid={invalid}");
+            }
+        }
+    }
+
+    #[test]
+    fn empty_system_and_assistant_text_parts_are_omitted() {
+        let request = json!({
+            "model": "gemini-1.5-pro",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": ""}]},
+                {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+                {"role": "user", "content": "continue"}
+            ]
+        });
+        let result = transform_request(&serde_json::to_vec(&request).unwrap()).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+        assert!(parsed.get("systemInstruction").is_none());
+        assert_eq!(
+            parsed["contents"],
+            json!([{"role": "user", "parts": [{"text": "continue"}]}])
+        );
+    }
+
+    #[test]
+    fn system_instruction_reuses_owned_text_allocation() {
+        let mut request = json!({"messages": [{"role": "system", "content": "s".repeat(256 * 1024)}]});
+        let before = request["messages"][0]["content"].as_str().unwrap().as_ptr();
+        let (_, instruction) = convert_messages(request.as_object_mut().unwrap()).unwrap();
+        let instruction = instruction.unwrap();
+        let after = instruction["parts"][0]["text"].as_str().unwrap().as_ptr();
+        assert_eq!(before, after, "system text should be moved into its final wrapper");
+    }
 
     #[test]
     fn system_message_becomes_system_instruction() {
@@ -1613,6 +1787,85 @@ mod tests {
     // -------------------------------------------------------------------------
     // Assistant tool calls
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn thought_signature_reuses_owned_nested_string_allocation() {
+        let mut call = json!({
+            "id": "call_1", "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+            "extra_content": {"google": {"thought_signature": {"nested": "s".repeat(256 * 1024)}}}
+        });
+        let before = call
+            .pointer("/extra_content/google/thought_signature/nested")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .as_ptr();
+        let part = convert_tool_call(&mut call).unwrap();
+        let after = part
+            .pointer("/thoughtSignature/nested")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .as_ptr();
+        assert_eq!(before, after, "nested signature should move into its final wrapper");
+    }
+
+    #[test]
+    fn parsed_tool_call_arguments_are_moved_not_reserialized() {
+        // `arguments` arrives as a JSON string, so one parse allocation is
+        // unavoidable and has no `Value` pointer to compare. What must not
+        // happen is a second payload-sized copy from wrapping the parsed tree
+        // in `json!` (serialize + re-parse).
+        use std::hint::black_box;
+
+        use allocation_counter::measure;
+
+        const PAYLOAD: usize = 256 * 1024;
+        let arguments = json!({ "payload": "a".repeat(PAYLOAD) }).to_string();
+        let mut call = json!({
+            "id": "call_args", "type": "function",
+            "function": {"name": "lookup", "arguments": arguments}
+        });
+
+        let info = measure(|| {
+            black_box(convert_tool_call(&mut call).unwrap());
+        });
+
+        // One parsed payload copy plus small wrapper maps. A reserialization
+        // would add roughly another payload-sized allocation.
+        let budget = (PAYLOAD + 8 * 1024) as u64;
+        assert!(
+            info.bytes_total <= budget,
+            "parsed arguments must move into functionCall.args without a second copy: {info:?}"
+        );
+    }
+
+    #[test]
+    fn tool_call_index_reuses_owned_id_allocation() {
+        let mut calls = vec![json!({
+            "id": "i".repeat(256 * 1024), "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"}
+        })];
+        let before = calls[0]["id"].as_str().unwrap().as_ptr();
+        let mut index = ToolCallNameIndex::new();
+        index.record(&mut calls);
+        let after = index.names.keys().next().unwrap().as_ptr();
+        assert_eq!(before, after, "tool call ID should move into the index");
+    }
+
+    #[test]
+    fn explicit_tool_result_name_reuses_owned_allocation() {
+        let mut message = json!({"role": "tool", "name": "n".repeat(256 * 1024), "content": "{}"});
+        let before = message["name"].as_str().unwrap().as_ptr();
+        let mut contents = Vec::new();
+        convert_tool_result(&mut contents, &ToolCallNameIndex::new(), &mut message, false).unwrap();
+        let after = contents[0]["parts"][0]["functionResponse"]["name"]
+            .as_str()
+            .unwrap()
+            .as_ptr();
+        assert_eq!(before, after, "explicit name should move into the response");
+    }
 
     #[test]
     fn assistant_tool_calls_become_function_call_parts() {

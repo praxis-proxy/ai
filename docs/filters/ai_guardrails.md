@@ -21,7 +21,13 @@ A provider `modified` verdict on the request rewrites each targeted user message
 
 When `phase.response` is enabled, Chat Completions requests with `"stream": true` are rejected with HTTP 422 until incremental SSE response evaluation is supported (see #1108).
 
+The response phase screens only 2xx responses to requests that carried a body. Responses to bodyless requests (for example `GET /v1/models`) and non-2xx responses are forwarded unevaluated, with their original status and body, so upstream errors and management endpoints sharing the listener still reach the client.
+
 For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail configurations. When `provider.guardrails` is omitted, the request omits `config_ids` so the service can use its default configuration. Omit `provider.model` to leave the selected configuration's models unchanged; a non-empty value replaces or adds its main model.
+
+In production, set `provider.endpoint` to `https://`. Set `provider.tls.ca_file` to the PEM bundle that signed the `NeMo` server certificate. That bundle is this peer's trust store, and hostname verification stays enabled. Without it, the call uses the trust store loaded for the Praxis process.
+
+`provider.token_file` is optional. When set, Praxis reads that Kubernetes service account token at startup and sends it on the call to this `NeMo` address. The token is not on the request the outbound chain sees. Praxis adds `Authorization` after that chain runs, so a filter there cannot remove or replace it. An `http` endpoint is refused unless its host is loopback. A file that is missing, empty, or not a valid header value refuses to start. If the file later becomes unreadable, the `NeMo` call is refused and handled as a provider error: with the default `failure_mode: closed` the chat is rejected, and with `failure_mode: open` it is forwarded unscreened.
 
 ## Configuration
 
@@ -42,9 +48,11 @@ filter: ai_guardrails
 outbound_chain: nemo-outbound # optional
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/checks"
+  endpoint: "https://nemo.default.svc:8443/v1/checks"
   guardrails:
     config_ids: ["your-config"]
+  tls:
+    ca_file: /var/run/secrets/nemo/ca.crt
   timeout_ms: 5000
 phase:
   request: true

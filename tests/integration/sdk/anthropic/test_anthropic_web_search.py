@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "anthropic>=0.40",
+#     "anthropic==1.17.0",
 #     "pytest>=8.0",
 # ]
 # ///

@@ -47,7 +47,6 @@ use praxis_filter::{
 };
 use serde::Deserialize;
 use tracing::{debug, trace, warn};
-use zeroize::Zeroizing;
 
 use self::config::{ExternalMeteringConfig, validate_config};
 // Import the token metadata keys from `token_count`, their sole writer, so this
@@ -975,15 +974,7 @@ fn build_auth_token(
         owner: "external_metering",
         reference: None,
     };
-    let transform = |token: &str| -> Result<Zeroizing<String>, FilterError> {
-        let header = format!("Bearer {token}");
-        http::HeaderValue::from_str(&header).map_err(|e| {
-            FilterError::from(format!(
-                "external_metering: invalid internal_auth_token header value: {e}"
-            ))
-        })?;
-        Ok(Zeroizing::new(header))
-    };
+    let transform = credential_source::bearer_header("external_metering", "internal_auth_token");
     let (handle, watch) = credential_source::build_one(ctx, source, transform)?;
     Ok((Some(handle), watch))
 }

@@ -27,7 +27,7 @@ use crate::{
     traits::{ConversationItemStore, ResponseStore},
     types::{
         BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-        ResponseEventRecord, ResponseRecord, StoreError,
+        ResponseCasOutcome, ResponseEventRecord, ResponseRecord, StoreError,
     },
 };
 
@@ -272,6 +272,27 @@ impl ResponseStore for InMemoryStore {
     async fn get_response(&self, owner: &StateOwner, id: &str) -> Result<Option<ResponseRecord>, StoreError> {
         let inner = self.lock()?;
         Ok(inner.responses.get(id).filter(|record| &record.owner == owner).cloned())
+    }
+
+    async fn compare_and_swap_response_object(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        expected_response_object: &serde_json::Value,
+        response_object: &serde_json::Value,
+    ) -> Result<ResponseCasOutcome, StoreError> {
+        let mut inner = self.lock()?;
+        // The SQL backends decode the stored payload and compare the same way,
+        // so every backend arbitrates on the decoded value regardless of which
+        // codec wrote the row.
+        match inner.responses.get_mut(id).filter(|record| &record.owner == owner) {
+            Some(record) if &record.response_object == expected_response_object => {
+                record.response_object = response_object.clone();
+                Ok(ResponseCasOutcome::Applied)
+            },
+            Some(_) => Ok(ResponseCasOutcome::Mismatch),
+            None => Ok(ResponseCasOutcome::NotFound),
+        }
     }
 
     async fn get_response_bounded(

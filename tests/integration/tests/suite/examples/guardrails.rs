@@ -145,7 +145,14 @@ fn nemo_guardrails_callout_runs_outbound_chain() {
             .any(|line| line.to_ascii_lowercase().starts_with("x-request-id: ")),
         "outbound chain should run request_id for the callout"
     );
-    assert!(!requests[0].headers.to_ascii_lowercase().contains("authorization:"));
+    assert!(
+        !requests[0]
+            .headers
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("authorization:")),
+        "the anonymous NeMo callout must not send an Authorization header: {}",
+        requests[0].headers
+    );
     assert!(!requests[0].headers.to_ascii_lowercase().contains("x-client-secret:"));
     assert_eq!(requests[0].method, "POST");
     assert_eq!(requests[0].uri, "/v1/checks");

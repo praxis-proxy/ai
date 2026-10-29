@@ -4239,6 +4239,19 @@ impl ResponseStore for MockStore {
         Ok(self.records.get(id).filter(|r| &r.owner == tenant_id).cloned())
     }
 
+    async fn compare_and_swap_response_object(
+        &self,
+        _owner: &StateOwner,
+        _id: &str,
+        _expected_response_object: &Value,
+        _response_object: &Value,
+    ) -> Result<crate::store::ResponseCasOutcome, StoreError> {
+        // This mock exercises a path that never swaps a response object; the
+        // stub reports "no such record" so an accidental call is visible in a
+        // test rather than silently reported as applied.
+        Ok(crate::store::ResponseCasOutcome::NotFound)
+    }
+
     async fn get_response_bounded(
         &self,
         tenant_id: &StateOwner,

@@ -7,7 +7,7 @@ use praxis_filter::{HttpFilter, HttpFilterContext};
 use super::filter::record_local_tool_verdict;
 use super::{
     config::{AiGuardrailsConfig, PhaseConfig, ProviderType},
-    filter::AiGuardrailsFilter,
+    filter::{AiGuardrailsFilter, ResponseScreening},
     providers::GuardResult,
 };
 
@@ -204,6 +204,18 @@ fn buffer_response(ctx: &mut HttpFilterContext<'_>) {
     ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
 }
 
+/// Run as pipeline filter 0 and record that the request carried a body, as
+/// `on_request_body` does inside a pipeline.
+fn mark_request_body(ctx: &mut HttpFilterContext<'_>) {
+    ctx.current_filter_id = Some(0);
+    ctx.insert_filter_state(ResponseScreening::Screen);
+}
+
+/// The response-phase decision recorded for filter 0.
+fn screening(ctx: &HttpFilterContext<'_>) -> Option<ResponseScreening> {
+    ctx.get_filter_state::<ResponseScreening>().copied()
+}
+
 /// The body is one JSON value and is not space-padded out to a longer length.
 fn assert_natural_json(body: &bytes::Bytes) {
     let json: serde_json::Value = serde_json::from_slice(body).expect("unpadded body must be valid JSON");
@@ -266,6 +278,42 @@ provider:
         error.to_string(),
         "ai_guardrails (nemo): 'guardrails.config_ids' must not be empty; omit 'guardrails' to use the service default"
     );
+}
+
+#[test]
+fn nemo_token_file_must_exist_at_startup() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+provider:
+  type: nemo
+  endpoint: "http://127.0.0.1:8000/v1/checks"
+  token_file: /nonexistent/nemo-token
+"#,
+    )
+    .unwrap();
+
+    let err = AiGuardrailsFilter::from_config(&yaml)
+        .err()
+        .expect("a missing token file must be rejected at startup");
+    assert!(err.to_string().contains("cannot read"), "{err}");
+}
+
+#[test]
+fn nemo_token_file_rejects_non_loopback_http() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+provider:
+  type: nemo
+  endpoint: "http://nemo:8000/v1/checks"
+  token_file: /var/run/secrets/tokens/nemo/token
+"#,
+    )
+    .unwrap();
+
+    let err = AiGuardrailsFilter::from_config(&yaml)
+        .err()
+        .expect("a token file on a non-loopback http endpoint must be rejected");
+    assert!(err.to_string().contains("loopback"), "{err}");
 }
 
 #[test]
@@ -1314,6 +1362,7 @@ async fn on_response_sse_is_rejected() {
     let filter = nemo_filter_response("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
+    mark_request_body(&mut ctx);
 
     let mut resp = crate::test_utils::make_response();
     resp.headers
@@ -1340,6 +1389,7 @@ async fn on_response_json_upgrades_to_stream_buffer() {
     let filter = nemo_filter_response("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
+    mark_request_body(&mut ctx);
 
     let mut resp = crate::test_utils::make_response();
     resp.headers
@@ -1352,6 +1402,115 @@ async fn on_response_json_upgrades_to_stream_buffer() {
         matches!(ctx.response_body_mode, praxis_filter::BodyMode::StreamBuffer { .. }),
         "JSON responses should be upgraded to StreamBuffer for guardrail evaluation"
     );
+    assert_eq!(screening(&ctx), Some(ResponseScreening::Screen));
+}
+
+// =============================================================================
+// Response phase: only model output is screened
+// =============================================================================
+
+#[tokio::test]
+async fn on_request_body_marks_response_for_screening() {
+    let filter = nemo_filter_response("http://nemo:8000/v1/checks");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut body = Some(bytes::Bytes::from_static(
+        br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    assert_eq!(
+        screening(&ctx),
+        Some(ResponseScreening::Screen),
+        "a request with a body must have its response screened"
+    );
+}
+
+/// Run `on_response` then a buffered `on_response_body` for `resp`, returning
+/// the forwarded body. Buffering stands in for another filter that buffers the
+/// response, so the skip must hold in `on_response_body` too.
+async fn forwarded_response<'a>(
+    filter: &dyn HttpFilter,
+    ctx: &mut HttpFilterContext<'a>,
+    resp: &'a mut praxis_filter::Response,
+    original: &'static [u8],
+) -> bytes::Bytes {
+    ctx.response_header = Some(resp);
+    let action = filter.on_response(ctx).await.unwrap();
+    ctx.response_header = None;
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    assert_eq!(
+        ctx.response_body_mode,
+        praxis_filter::BodyMode::Stream,
+        "a skipped response must not be buffered by this filter"
+    );
+    assert_eq!(screening(ctx), Some(ResponseScreening::Skip));
+
+    buffer_response(ctx);
+    let mut body = Some(bytes::Bytes::from_static(original));
+    let action = filter.on_response_body(ctx, &mut body, true).unwrap();
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    body.expect("body is forwarded")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_skips_bodyless_request() {
+    let filter = nemo_filter_response("http://127.0.0.1:9/v1/checks");
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/models");
+    let mut resp = crate::test_utils::make_response();
+    resp.headers
+        .insert("content-type", http::HeaderValue::from_static("application/json"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    let original = br#"{"object":"list","data":[{"id":"qwen"}]}"#;
+
+    let forwarded = forwarded_response(filter.as_ref(), &mut ctx, &mut resp, original).await;
+    assert_eq!(
+        forwarded.as_ref(),
+        original,
+        "a model list must reach the client unchanged"
+    );
+    assert!(
+        !ctx.filter_results.contains_key("ai_guardrails"),
+        "no verdict is recorded for a skipped response"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_skips_error_status() {
+    let filter = nemo_filter_request_and_response("http://127.0.0.1:9/v1/checks");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut resp = crate::test_utils::make_response();
+    resp.status = http::StatusCode::UNAUTHORIZED;
+    resp.headers
+        .insert("content-type", http::HeaderValue::from_static("text/plain"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    mark_request_body(&mut ctx);
+    let original = b"Unauthorized";
+
+    let forwarded = forwarded_response(filter.as_ref(), &mut ctx, &mut resp, original).await;
+    assert_eq!(
+        forwarded.as_ref(),
+        original,
+        "an upstream error must reach the client unchanged"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_error_status_event_stream_is_not_rejected() {
+    let filter = nemo_filter_response("http://127.0.0.1:9/v1/checks");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut resp = crate::test_utils::make_response();
+    resp.status = http::StatusCode::SERVICE_UNAVAILABLE;
+    resp.headers
+        .insert("content-type", http::HeaderValue::from_static("text/event-stream"));
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    mark_request_body(&mut ctx);
+
+    let forwarded = forwarded_response(filter.as_ref(), &mut ctx, &mut resp, b"data: overloaded\n\n").await;
+    assert_eq!(forwarded.as_ref(), b"data: overloaded\n\n");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1832,6 +1991,7 @@ async fn on_response_removes_stale_content_length() {
     let filter = nemo_filter_response("http://127.0.0.1:9/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
+    mark_request_body(&mut ctx);
     let mut response = crate::test_utils::make_response();
     response
         .headers

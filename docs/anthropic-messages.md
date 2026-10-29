@@ -261,6 +261,50 @@ Anthropic Messages conformance gate: other content blocks, request fields,
 server tools, caching, and model-dependent behaviors require separate contract
 and live-backend coverage before a broader support claim.
 
+The GPU acceptance SDK is pinned to `anthropic==1.9.0` deliberately: that
+client release and its `2023-06-01` API-version header are the qualified
+baseline, and upgrading it is a separate, explicitly validated change rather
+than something a floating dependency may drift into.
+
+### Anthropic SDK v1/v2 compatibility lanes (issue #1825)
+
+Anthropic Python SDK v2 changes the defaults the client puts on the wire:
+
+| | SDK v1 (through 1.17.0) | SDK v2 |
+|---|---|---|
+| `anthropic-version` | `2023-06-01` | `2026-10-21` |
+| credential header | `x-api-key: <key>` | `authorization: Bearer <key>` |
+
+[`tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py`](../tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py)
+exercises both pinned lanes against local recording backends across the two
+routes where the Anthropic SDK is the client — native `/v1/messages`
+passthrough and the Messages -> Chat Completions translation — asserting each
+lane's wire headers, JSON and streaming message round-trips, tool use, and
+the route-owned `2026-10-21` acceptance constraints (sampling parameter
+mapping, empty versus active citations, `document` and `thinking` block
+rejection). It needs no Anthropic credentials and makes no external calls.
+On the translated route, the `anthropic_messages_to_chat_completions`
+filter strips the caller's Anthropic wire credentials — `x-api-key` (SDK v1)
+and `authorization: Bearer` (SDK v2) — along with `anthropic-version`, so
+neither reaches a Chat Completions backend in either lane.
+
+The OpenAI -> Anthropic Messages direction is driven by the OpenAI SDK as the
+client, so it does not vary on the Anthropic SDK axis; its backend wire
+headers (pinned `anthropic-version: 2023-06-01`, injected `x-api-key`,
+stripped caller `authorization`) are asserted in
+[`tests/integration/sdk/openai/test_selected_anthropic_chat_completions.py`](../tests/integration/sdk/openai/test_selected_anthropic_chat_completions.py).
+
+Run both lanes locally with `make test-anthropic-sdk`, or one lane at a time:
+
+```console
+cargo build -p praxis-ai-proxy
+uv run --with "anthropic==1.17.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s -v --anthropic-sdk-version=1.x
+uv run --with "anthropic==2.3.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s -v --anthropic-sdk-version=2.x
+```
+
+CI runs both lanes as sequential steps in the `anthropic-sdk` job of
+[`integration.yaml`](../.github/workflows/integration.yaml).
+
 ## Passthrough to Anthropic API
 
 Route to `api.anthropic.com` with credential

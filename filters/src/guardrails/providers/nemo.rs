@@ -10,13 +10,15 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method};
 use praxis_ai_apis::{
     callout_target::{AddressPolicy, validate_configured_http_target, validate_resolved_addrs},
+    credential_source::{self, CredentialSource, DiagnosticContext, SecretHandle, WatchHandle},
     subrequest::{SubRequest, SubRequestClient, SubResponse},
 };
-use praxis_core::connectivity::{UrlResolutionPolicy, UrlTargetError, prepare_url_target_with_policy};
+use praxis_core::connectivity::{PreparedTarget, UrlResolutionPolicy, UrlTargetError, prepare_url_target_with_policy};
 use praxis_filter::{
-    CalloutOutcome, CalloutResponse, FilterError, FilteredSubrequestExecutor, RequestExtensions, StagedUpstream,
-    StagedUpstreamFallback,
+    CalloutOutcome, CalloutResponse, DeferredCredential, FilterError, FilteredSubrequestExecutor, PendingCredentials,
+    RequestExtensions, StagedUpstream, StagedUpstreamFallback,
 };
+use praxis_tls::{CaConfig, CachedClusterTls, ClusterTls};
 use serde::{Deserialize, Serialize};
 
 use super::{GuardCalloutRuntime, GuardPhase, GuardResult};
@@ -39,7 +41,11 @@ const OUTPUT_RAIL_TYPES: &[&str] = &["output"];
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NemoConfig {
-    /// `NeMo` endpoint URL.
+    /// Address of the `NeMo` service. Use `https://` in production.
+    ///
+    /// Without `tls.ca_file`, the call checks the server certificate against
+    /// the trust store loaded for the Praxis process. Set `tls.ca_file` to
+    /// verify this provider's server with a private bundle instead.
     endpoint: String,
 
     /// Model name sent in each request. Defaults to `""` when omitted.
@@ -57,6 +63,33 @@ struct NemoConfig {
     /// Maximum number of per-message `/v1/checks` callouts per proxy request.
     #[serde(default = "default_max_message_checks")]
     max_message_checks: u32,
+
+    /// Provider-specific trust bundle for the `NeMo` server certificate.
+    #[serde(default)]
+    tls: Option<NemoTls>,
+
+    /// Path to a Kubernetes service account token.
+    ///
+    /// When set, each call to this `NeMo` address sends `Authorization: Bearer`
+    /// with the current token. The file is read at startup and refreshed when
+    /// Kubernetes rotates it. The token is added after the outbound chain
+    /// runs, so a filter on that chain cannot remove it. An `http` endpoint is
+    /// refused unless its host is loopback. A file that is missing, empty, or
+    /// not a valid header value refuses to start. If a later reload fails, the
+    /// `NeMo` call is refused and handled as a provider error.
+    #[serde(default)]
+    token_file: Option<String>,
+}
+
+/// PEM trust bundle for one `NeMo` peer.
+///
+/// The bundle replaces the process roots for this provider's upstream only.
+/// Hostname verification stays enabled.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NemoTls {
+    /// Path to the PEM file of CAs that signed the `NeMo` server certificate.
+    ca_file: String,
 }
 
 /// Returns the default timeout value for serde deserialization.
@@ -131,6 +164,25 @@ pub(in crate::guardrails) struct NemoProvider {
 
     /// Maximum per-message `/v1/checks` callouts per proxy request.
     max_message_checks: u32,
+
+    /// Parsed CA for this provider's HTTPS peer.
+    ///
+    /// `None` keeps the process trust store. The SNI applied at call time is
+    /// the endpoint host.
+    ca: Option<CachedClusterTls>,
+
+    /// Service account token staged onto each call when `token_file` is set.
+    service_account: Option<NemoServiceAccount>,
+}
+
+/// Pod service account token and the `NeMo` host:port allowed to receive it.
+struct NemoServiceAccount {
+    /// Pre-assembled `Bearer` header value. An empty snapshot refuses the call.
+    header: SecretHandle,
+    /// Keeps the token file watcher alive while this provider exists.
+    _watch: Option<WatchHandle>,
+    /// Exact `host:port` the executor resolves for `provider.endpoint`.
+    authority: String,
 }
 
 impl NemoProvider {
@@ -164,6 +216,7 @@ impl NemoProvider {
         if cfg.max_message_checks == 0 {
             return Err("ai_guardrails (nemo): 'max_message_checks' must be greater than zero".into());
         }
+        let (ca, service_account) = load_peer_material(&cfg)?;
 
         Ok(Self {
             client,
@@ -172,6 +225,8 @@ impl NemoProvider {
             guardrails: cfg.guardrails,
             timeout: Duration::from_millis(cfg.timeout_ms),
             max_message_checks: cfg.max_message_checks,
+            ca,
+            service_account,
         })
     }
 
@@ -253,6 +308,9 @@ impl NemoProvider {
         request: SubRequest,
         runtime: &GuardCalloutRuntime<'_>,
     ) -> Result<SubResponse, FilterError> {
+        let mut extensions = RequestExtensions::default();
+        stage_service_account_token(self.service_account.as_ref(), &mut extensions)?;
+
         let address_policy = AddressPolicy::from_allow_private(runtime.outbound.allow_private_upstreams());
         // The guardrails provider endpoint is operator-configured, so it
         // resolves through the shared DNS cache.
@@ -269,8 +327,7 @@ impl NemoProvider {
         .await
         .map_err(map_url_target_error)?;
 
-        let mut extensions = RequestExtensions::default();
-        extensions.insert(StagedUpstream::from_prepared_target(&target)?);
+        extensions.insert(stage_nemo_upstream(&target, self.ca.as_ref())?);
         if target.addresses().len() > 1 {
             extensions.insert(StagedUpstreamFallback::from_prepared_target(&target));
         }
@@ -304,6 +361,143 @@ impl NemoProvider {
 // -----------------------------------------------------------------------------
 // Private Utilities
 // -----------------------------------------------------------------------------
+
+/// Load the provider CA and service account token named in the config.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when the CA file or token file cannot be read,
+/// when a CA is set on a plaintext endpoint, or when a token file is set on
+/// an `http` endpoint whose host is not loopback.
+fn load_peer_material(cfg: &NemoConfig) -> Result<(Option<CachedClusterTls>, Option<NemoServiceAccount>), FilterError> {
+    let ca = match cfg.tls.as_ref() {
+        Some(tls) => {
+            require_https_for_ca(&cfg.endpoint)?;
+            Some(load_provider_ca(&tls.ca_file)?)
+        },
+        None => None,
+    };
+    let service_account = match cfg.token_file.as_deref() {
+        Some(path) => Some(open_service_account(path, &cfg.endpoint)?),
+        None => None,
+    };
+    Ok((ca, service_account))
+}
+
+/// Read and watch `token_file`, publishing it as a `Bearer` header value.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when the endpoint cannot carry a token, or when the
+/// file is missing, empty, oversized, or does not form a valid header value.
+fn open_service_account(token_file: &str, endpoint: &str) -> Result<NemoServiceAccount, FilterError> {
+    require_token_transport(endpoint)?;
+    let authority = praxis_ai_apis::credential_authority("ai_guardrails (nemo)", endpoint)?;
+    let ctx = DiagnosticContext {
+        owner: "ai_guardrails (nemo)",
+        reference: None,
+    };
+    let source = CredentialSource::File(token_file.to_owned());
+    let transform = credential_source::bearer_header("ai_guardrails (nemo)", "token_file");
+    let (header, watch) = credential_source::build_one(ctx, &source, transform)?;
+    Ok(NemoServiceAccount {
+        header,
+        _watch: watch,
+        authority,
+    })
+}
+
+/// Reject `tls.ca_file` on a plaintext endpoint.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when the endpoint is not `https`.
+fn require_https_for_ca(endpoint: &str) -> Result<(), FilterError> {
+    let url = url::Url::parse(endpoint)
+        .map_err(|error| -> FilterError { format!("ai_guardrails (nemo): {error}").into() })?;
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    Err("ai_guardrails (nemo): 'tls.ca_file' requires an https endpoint".into())
+}
+
+/// Reject a service account token on plaintext except for a loopback host.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when `endpoint` is `http` and its host is not
+/// loopback. `https` is always accepted.
+fn require_token_transport(endpoint: &str) -> Result<(), FilterError> {
+    let url = url::Url::parse(endpoint)
+        .map_err(|error| -> FilterError { format!("ai_guardrails (nemo): {error}").into() })?;
+    if url.scheme() == "https" || url.host().as_ref().is_some_and(host_is_loopback) {
+        return Ok(());
+    }
+    Err("ai_guardrails (nemo): 'token_file' requires https unless the endpoint host is loopback".into())
+}
+
+/// Whether `host` is `localhost`, `127.0.0.0/8`, or `::1`.
+fn host_is_loopback(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Ipv4(address) => address.is_loopback(),
+        url::Host::Ipv6(address) => {
+            address.is_loopback() || address.to_ipv4_mapped().is_some_and(|mapped| mapped.is_loopback())
+        },
+        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// Load `tls.ca_file` as this peer's only trust anchors.
+///
+/// Verification stays enabled. The caller sets SNI from the endpoint host.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when the path is empty, traverses a parent
+/// directory, or the PEM cannot be read.
+fn load_provider_ca(ca_file: &str) -> Result<CachedClusterTls, FilterError> {
+    if ca_file.is_empty() {
+        return Err("ai_guardrails (nemo): 'tls.ca_file' must not be empty".into());
+    }
+    let tls = ClusterTls {
+        ca: Some(CaConfig {
+            ca_path: ca_file.to_owned(),
+            crl_paths: Vec::new(),
+        }),
+        client_cert: None,
+        sni: None,
+        verify: true,
+    };
+    tls.validate()
+        .map_err(|error| -> FilterError { format!("ai_guardrails (nemo): invalid tls.ca_file: {error}").into() })?;
+    CachedClusterTls::try_from_config(&tls)
+        .map_err(|error| -> FilterError { format!("ai_guardrails (nemo): failed to load tls.ca_file: {error}").into() })
+}
+
+/// Stage the resolved `NeMo` peer, attaching the provider CA when configured.
+///
+/// The CA replaces the process roots for this upstream. The SNI and hostname
+/// check stay those of the prepared target.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when the target has no TLS material to verify.
+fn stage_nemo_upstream(target: &PreparedTarget, ca: Option<&CachedClusterTls>) -> Result<StagedUpstream, FilterError> {
+    let mut staged = StagedUpstream::from_prepared_target(target)?;
+    let Some(ca) = ca else {
+        return Ok(staged);
+    };
+    let sni = staged
+        .0
+        .tls
+        .as_ref()
+        .and_then(|existing| existing.sni().map(str::to_owned))
+        .ok_or_else(|| -> FilterError { "ai_guardrails (nemo): 'tls.ca_file' requires an https endpoint".into() })?;
+    let mut tls = ca.clone();
+    tls.set_sni(sni);
+    staged.0.tls = Some(tls);
+    Ok(staged)
+}
 
 /// Reject an explicitly empty configuration selection.
 fn validate_guardrails_config(config: &NemoConfig) -> Result<(), FilterError> {
@@ -451,6 +645,36 @@ fn build_request<'a>(
     })
 }
 
+/// Stage the service account token for injection after the outbound chain.
+///
+/// The executor writes `Authorization` only once the dial is pinned to
+/// `authority`. The header is not on the request that chain sees, so a filter
+/// there cannot remove or replace it. A configured token that cannot be read
+/// refuses the call before anything is sent.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when a token file is configured and the latest
+/// reload produced no usable token.
+fn stage_service_account_token(
+    account: Option<&NemoServiceAccount>,
+    extensions: &mut RequestExtensions,
+) -> Result<(), FilterError> {
+    let Some(account) = account else {
+        return Ok(());
+    };
+    let snapshot = account.header.current();
+    let Some(value) = snapshot.payload.as_deref() else {
+        tracing::debug!("ai_guardrails (nemo): service account token unavailable");
+        return Err("ai_guardrails (nemo): service account token unavailable".into());
+    };
+    let credential = DeferredCredential::new(&account.authority, http::header::AUTHORIZATION, value.as_str())?;
+    let mut pending = PendingCredentials::new();
+    pending.push(credential);
+    extensions.insert(pending);
+    Ok(())
+}
+
 /// Map URL target preparation failures to filter errors.
 fn map_url_target_error(error: UrlTargetError) -> FilterError {
     match error {
@@ -536,7 +760,82 @@ fn map_nemo_response(nemo: NemoResponse) -> Result<NemoVerdict, FilterError> {
     reason = "tests"
 )]
 mod tests {
+    use zeroize::Zeroizing;
+
     use super::{super::MessageRedaction, *};
+
+    fn fixed_account(payload: Option<&str>) -> NemoServiceAccount {
+        NemoServiceAccount {
+            header: SecretHandle::new(credential_source::SecretSnapshot {
+                payload: payload.map(|value| Zeroizing::new(value.to_owned())),
+            }),
+            _watch: None,
+            authority: "127.0.0.1:3001".to_owned(),
+        }
+    }
+
+    fn write_token(contents: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, contents).unwrap();
+        (dir, path.to_str().unwrap().to_owned())
+    }
+
+    #[test]
+    fn available_token_is_staged_as_a_deferred_credential() {
+        let account = fixed_account(Some("Bearer sa-jwt"));
+        let mut extensions = RequestExtensions::default();
+        stage_service_account_token(Some(&account), &mut extensions).unwrap();
+        let pending = extensions.get::<PendingCredentials>().unwrap();
+        assert!(!pending.is_empty(), "credential staged");
+    }
+
+    #[test]
+    fn token_file_is_published_as_a_bearer_header_value() {
+        let (_dir, path) = write_token("sa-jwt\n");
+        let account = open_service_account(&path, "http://127.0.0.1:3001/v1/checks").unwrap();
+        assert_eq!(
+            account.header.current().payload.as_deref().map(String::as_str),
+            Some("Bearer sa-jwt")
+        );
+        assert_eq!(account.authority, "127.0.0.1:3001");
+    }
+
+    #[test]
+    fn token_that_cannot_be_a_header_value_is_rejected_at_startup() {
+        let (_dir, path) = write_token("sa\u{7f}jwt\n");
+        let err = open_service_account(&path, "http://127.0.0.1:3001/v1/checks")
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("not a valid header value"), "{err}");
+    }
+
+    #[test]
+    fn token_file_http_requires_a_loopback_host() {
+        assert!(require_token_transport("https://nemo.default.svc:8443/v1/checks").is_ok());
+        assert!(require_token_transport("http://127.0.0.1:3001/v1/checks").is_ok());
+        assert!(require_token_transport("http://localhost:3001/v1/checks").is_ok());
+        assert!(require_token_transport("http://[::1]:3001/v1/checks").is_ok());
+        assert!(require_token_transport("http://[::ffff:127.0.0.1]:3001/v1/checks").is_ok());
+        let err = require_token_transport("http://nemo:8000/v1/checks").unwrap_err();
+        assert!(err.to_string().contains("loopback"), "{err}");
+    }
+
+    #[test]
+    fn omitted_token_adds_no_authorization() {
+        let mut extensions = RequestExtensions::default();
+        stage_service_account_token(None, &mut extensions).unwrap();
+        assert!(extensions.get::<PendingCredentials>().is_none());
+    }
+
+    #[test]
+    fn unavailable_token_refuses_the_call() {
+        let account = fixed_account(None);
+        let mut extensions = RequestExtensions::default();
+        let err = stage_service_account_token(Some(&account), &mut extensions).unwrap_err();
+        assert!(err.to_string().contains("unavailable"), "{err}");
+        assert!(extensions.get::<PendingCredentials>().is_none());
+    }
 
     #[test]
     fn request_serializes_configured_guardrails() {
@@ -777,5 +1076,65 @@ guardrails:
             err_msg.contains("unknown status 'garbage'"),
             "unknown status should produce a descriptive error: {err_msg}"
         );
+    }
+
+    #[test]
+    fn ca_file_is_optional() {
+        let config: NemoConfig = serde_yaml::from_str("endpoint: http://localhost:8000").unwrap();
+        assert!(config.tls.is_none());
+    }
+
+    #[test]
+    fn ca_file_rejects_unknown_tls_fields() {
+        let error = serde_yaml::from_str::<NemoConfig>(
+            "endpoint: https://nemo.example/v1/checks\ntls:\n  ca_file: /tmp/ca.crt\n  extra: true\n",
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("extra") || message.contains("unknown"),
+            "unknown tls field should be rejected: {message}"
+        );
+    }
+
+    #[test]
+    fn ca_file_requires_https() {
+        let error = require_https_for_ca("http://nemo.example/v1/checks").unwrap_err();
+        assert!(format!("{error}").contains("https"));
+        require_https_for_ca("https://nemo.example/v1/checks").unwrap();
+    }
+
+    #[test]
+    fn ca_file_loads_pem_and_keeps_verification() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ca.crt");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.distinguished_name.push(rcgen::DnType::CommonName, "test-ca");
+        let certificate = params.self_signed(&key).unwrap();
+        std::fs::write(&path, certificate.pem()).unwrap();
+        let cached = load_provider_ca(path.to_str().unwrap()).unwrap();
+        assert!(cached.verify(), "hostname verification stays enabled");
+        assert!(cached.ca().is_some(), "the provider bundle is this peer's trust store");
+        assert!(cached.sni().is_none(), "SNI is applied from the endpoint at call time");
+    }
+
+    #[test]
+    fn ca_file_rejects_missing_file() {
+        let error = load_provider_ca("/tmp/does-not-exist-nemo-ca.pem").unwrap_err();
+        assert!(format!("{error}").contains("tls.ca_file"));
+    }
+
+    #[test]
+    fn ca_file_rejects_parent_directory() {
+        let error = load_provider_ca("/tmp/../etc/passwd").unwrap_err();
+        assert!(format!("{error}").contains("tls.ca_file"));
+    }
+
+    #[test]
+    fn ca_file_rejects_empty_path() {
+        let error = load_provider_ca("").unwrap_err();
+        assert!(format!("{error}").contains("must not be empty"));
     }
 }

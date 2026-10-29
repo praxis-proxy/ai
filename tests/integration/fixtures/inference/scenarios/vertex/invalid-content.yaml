@@ -34,6 +34,31 @@ turns:
       upstream_body_kind: empty
       client_sse_events: []
       upstream_sse_events: []
+  - name: non-string-assistant-text-part
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: assistant
+              content:
+                - type: text
+                  text: null
+            - role: user
+              content: continue
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ""
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []
   - name: text-metadata-response
     request:
       method: POST

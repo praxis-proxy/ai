@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, BackendGuard, StatefulCapturingBackend, free_port, http_post, start_backend_with_shutdown,
+    Backend, BackendGuard, StatefulCapturingBackend, free_port, http_get, http_post, start_backend_with_shutdown,
     start_capturing_backend, start_proxy,
 };
 
@@ -53,6 +53,7 @@ fn chat_backend(content: &str) -> BackendGuard {
         .start_with_shutdown()
 }
 
+/// Load `nemo-guardrails-response.yaml` with its listener and NeMo ports patched.
 fn load_response_config(proxy_port: u16, backend_port: u16, nemo_port: u16) -> praxis_core::config::Config {
     load_example_config(
         "nemo-guardrails-response.yaml",
@@ -257,6 +258,58 @@ fn response_guardrails_non_chat_body_replaces_body() {
     assert!(
         body.contains(r#""error""#),
         "body should be replaced with an error payload; got: {body}"
+    );
+}
+
+/// A bodyless request cannot carry a prompt, so its response is not model
+/// output: a model list on the same listener reaches the client unchanged and
+/// `NeMo` is never called.
+#[test]
+fn response_guardrails_bodyless_request_forwards_upstream_body() {
+    let models = r#"{"object":"list","data":[{"id":"test-model","object":"model"}]}"#;
+    let backend = Backend::status(200, models)
+        .header("Content-Type", "application/json")
+        .start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"blocked","content":"x"}"#.to_owned())])
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = load_response_config(proxy_port, backend.port(), nemo.port());
+    let proxy = start_proxy(&config);
+
+    let (status, body) = http_get(proxy.addr(), "/v1/models", None);
+
+    assert_eq!(status, 200);
+    assert_eq!(body, models, "a model list must reach the client unchanged");
+    assert!(
+        nemo.requests().iter().all(|r| r.method != "POST"),
+        "NeMo must not be called for a bodyless request"
+    );
+}
+
+/// An upstream error is a diagnostic, not a completion: its status and body
+/// reach the client unchanged and `NeMo` is never called.
+#[test]
+fn response_guardrails_upstream_error_is_forwarded() {
+    let backend = Backend::status(401, "Unauthorized")
+        .header("Content-Type", "text/plain")
+        .start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"blocked","content":"x"}"#.to_owned())])
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = load_response_config(proxy_port, backend.port(), nemo.port());
+    let proxy = start_proxy(&config);
+
+    let (status, body) = http_post(
+        proxy.addr(),
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"Hello"}]}"#,
+    );
+
+    assert_eq!(status, 401, "the upstream status must reach the client");
+    assert_eq!(body, "Unauthorized", "the upstream error body must reach the client");
+    assert!(
+        nemo.requests().iter().all(|r| r.method != "POST"),
+        "NeMo must not be called for an upstream error"
     );
 }
 

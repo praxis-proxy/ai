@@ -45,5 +45,5 @@ pub use size::json_values_fit;
 pub use traits::{ConversationItemStore, PersistedStateBackend, ResponseStore};
 pub use types::{
     BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-    ResponseEventRecord, ResponseRecord, StoreError, SweepStats,
+    ResponseCasOutcome, ResponseEventRecord, ResponseRecord, StoreError, SweepStats,
 };

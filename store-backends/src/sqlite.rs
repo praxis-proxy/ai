@@ -15,7 +15,8 @@ use tracing::info;
 
 use super::{
     BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
-    PendingApprovalRecord, PoolConfig, ResponseEventRecord, ResponseRecord, ResponseStore, StoreError, SweepStats,
+    PendingApprovalRecord, PoolConfig, ResponseCasOutcome, ResponseEventRecord, ResponseRecord, ResponseStore,
+    StoreError, SweepStats,
     compression::{StoreCompressionConfig, decode, decode_bounded, decode_budgeted, decode_bytes, run_blocking},
     json_payload_charge, json_values_charge, json_values_fit,
     pool::apply_pool_config,
@@ -136,6 +137,22 @@ impl SqliteResponseStore {
     /// reload does not leak pools.
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+
+    /// Encode one response object into its stored form with the active codec.
+    async fn encode_object(&self, value: &serde_json::Value) -> Result<Vec<u8>, StoreError> {
+        let json = serde_json::to_vec(value).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let mut encoded = self.compression.encode_byte_values(&[&json]).await?.into_iter();
+        let Some(payload) = encoded.next() else {
+            return Err(StoreError::Serialization("compression returned no payload".to_owned()));
+        };
+        // With `algorithm: none` the codec hands back a borrow of `json`, so the
+        // buffer we already own is the stored form: move it rather than copying
+        // the whole object on every transition. zstd allocates its own frame.
+        Ok(match payload {
+            std::borrow::Cow::Borrowed(_) => json,
+            std::borrow::Cow::Owned(frame) => frame,
+        })
     }
 
     /// Insert or update a conversation row shared by both store traits.
@@ -551,6 +568,72 @@ impl ResponseStore for SqliteResponseStore {
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
         require_owner_preserving_write(result.rows_affected(), "response")
+    }
+
+    async fn compare_and_swap_response_object(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        expected_response_object: &serde_json::Value,
+        response_object: &serde_json::Value,
+    ) -> Result<ResponseCasOutcome, StoreError> {
+        // Encode before opening the transaction: compressing a large object is
+        // the slowest step here, and `BEGIN IMMEDIATE` would otherwise hold the
+        // write lock across it. The cost is a wasted encode when the comparison
+        // then fails, which is the rarer path.
+        let next = self.encode_object(response_object).await?;
+
+        // `BEGIN IMMEDIATE` takes the write lock up front so the read, the
+        // comparison and the update are one atomic step and cannot interleave
+        // with a competing claimant.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        let select = format!(
+            "SELECT response_object FROM {} \
+             WHERE id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            self.tables.responses
+        );
+        let row = sqlx::query(AssertSqlSafe(select.as_str()))
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        // Owner-scoped, so another principal's record is indistinguishable
+        // from a missing one. Dropping the transaction rolls it back.
+        let Some(row) = row else {
+            return Ok(ResponseCasOutcome::NotFound);
+        };
+        let stored_bytes: Vec<u8> = row
+            .try_get("response_object")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let stored = run_blocking(move || decode(&stored_bytes)).await?;
+        if &stored != expected_response_object {
+            return Ok(ResponseCasOutcome::Mismatch);
+        }
+
+        let update = format!(
+            "UPDATE {} SET response_object = ? \
+             WHERE id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            self.tables.responses
+        );
+        sqlx::query(AssertSqlSafe(update.as_str()))
+            .bind(&next)
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(ResponseCasOutcome::Applied)
     }
 
     async fn get_response(&self, owner: &StateOwner, id: &str) -> Result<Option<ResponseRecord>, StoreError> {
@@ -2820,7 +2903,6 @@ mod tests {
         assert!(store.delete_item_and_sync_messages(&owner, "c", "old").await.unwrap());
         assert_eq!(store.conversation_history(&owner, "c").await.unwrap(), Some(vec![]));
     }
-
 
     #[tokio::test]
     #[expect(

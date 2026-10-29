@@ -195,6 +195,32 @@ pub struct ResponseEventRecord {
 }
 
 // -----------------------------------------------------------------------------
+// ResponseCasOutcome
+// -----------------------------------------------------------------------------
+
+/// Result of a conditional response-object write.
+///
+/// Returned by [`compare_and_swap_response_object`]. The three variants let a
+/// caller tell a lost race apart from an absent record without a second read,
+/// which is what lets a cancellation handler answer "already finished" with a
+/// conflict and "no such response" with a not-found.
+///
+/// [`compare_and_swap_response_object`]: crate::ResponseStore::compare_and_swap_response_object
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponseCasOutcome {
+    /// The stored object matched the expected value and was replaced.
+    Applied,
+
+    /// The record exists in this owner scope but no longer holds the expected
+    /// object, so a concurrent writer won the race and nothing was written.
+    Mismatch,
+
+    /// No record with this id exists in this owner scope. Indistinguishable
+    /// from a record owned by a different principal, by design.
+    NotFound,
+}
+
+// -----------------------------------------------------------------------------
 // EventLogStatus
 // -----------------------------------------------------------------------------
 

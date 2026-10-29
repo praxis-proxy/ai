@@ -2,6 +2,8 @@
 #
 # Evaluates incoming requests against a NeMo Guardrails service.
 # For response-phase guardrails, see nemo-guardrails-response.yaml.
+# NeMo is called with no credentials. When kube-rbac-proxy protects NeMo,
+# use nemo-guardrails-service-account.yaml.
 #
 #   Request phase:
 #     passed   - request forwarded to the upstream unchanged
@@ -42,13 +44,9 @@ filter_chains:
   - name: nemo-guardrails
     filters:
       - filter: ai_guardrails
-        # Optional. Omit for an empty pass-through chain; configure one when
-        # NeMo callouts need credentials, tracing, or destination policy.
         outbound_chain: nemo-outbound
         provider:
           type: nemo
-          # NeMo callouts are anonymous; no downstream authentication
-          # headers are forwarded to this endpoint.
           # Requires NeMo Guardrails 0.24.0 or newer.
           endpoint: "http://127.0.0.1:3001/v1/checks"
           guardrails:
@@ -70,8 +68,7 @@ filter_chains:
             endpoints:
               - "127.0.0.1:3000"
 
-  # Every NeMo callout traverses this independently built chain. Add
-  # destination-bound authentication, authorization, and audit filters here.
+  # Observability for NeMo callouts. This chain carries no credentials.
   - name: nemo-outbound
     filters:
       - filter: request_id

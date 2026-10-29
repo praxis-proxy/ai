@@ -291,16 +291,18 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // Strip the caller's Anthropic wire credentials so they never reach a
+        // Chat Completions backend. SDK v1 sends the key as `x-api-key`; SDK
+        // v2 sends it as `authorization: Bearer`. Symmetric with
+        // `openai_chat_completions_to_anthropic`, which strips the caller's
+        // `authorization` on the reverse route. Operators who want a backend
+        // credential compose `credential_injection` after this filter.
         ctx.request_headers_to_remove
             .push(http::header::HeaderName::from_static("anthropic-version"));
-        // Both SDK credential forms. A v2 client sends its key as
-        // `Authorization: Bearer`, and a Chat Completions backend would read
-        // that as its own credential; leaving it in place leaks the caller's
-        // Anthropic key upstream. `credential_injection` runs later and still
-        // replaces it with the server-owned token.
-        ctx.request_headers_to_remove.push(http::header::AUTHORIZATION);
         ctx.request_headers_to_remove
             .push(http::header::HeaderName::from_static("x-api-key"));
+        ctx.request_headers_to_remove
+            .push(http::header::HeaderName::from_static("authorization"));
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
 
         Ok(FilterAction::Continue)
@@ -1182,12 +1184,8 @@ mod tests {
         );
     }
 
-    /// Both SDK credential forms must be queued for removal, because a Chat
-    /// Completions backend cannot tell an Anthropic key from its own. The
-    /// earliest form is the legacy `x-api-key` header; SDK v2 sends
-    /// `Authorization: Bearer`.
     #[tokio::test]
-    async fn on_request_removes_both_client_credential_forms() {
+    async fn on_request_strips_caller_anthropic_credentials() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
         let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/v1/messages");
@@ -1195,14 +1193,14 @@ mod tests {
 
         drop(filter.on_request(&mut ctx).await.unwrap());
 
-        for header in [
-            http::header::AUTHORIZATION,
-            http::header::HeaderName::from_static("x-api-key"),
-            http::header::HeaderName::from_static("anthropic-version"),
-        ] {
+        // The caller's Anthropic wire credentials must not reach a Chat
+        // Completions backend, whichever header the SDK lane puts them on:
+        // `x-api-key` (SDK v1) or `authorization: Bearer` (SDK v2).
+        for header in ["anthropic-version", "x-api-key", "authorization"] {
             assert!(
-                ctx.request_headers_to_remove.contains(&header),
-                "translation must scrub the client {header} header so it cannot reach a Chat Completions backend"
+                ctx.request_headers_to_remove
+                    .contains(&http::header::HeaderName::from_static(header)),
+                "caller credential header {header} must be stripped"
             );
         }
     }

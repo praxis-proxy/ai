@@ -6,6 +6,9 @@
 # guardrails cannot evaluate SSE responses.
 # This config is used by integration tests to verify response-phase behavior in isolation.
 #
+# NeMo is called with no credentials. When kube-rbac-proxy protects NeMo,
+# use nemo-guardrails-service-account.yaml.
+#
 #   Response phase:
 #     passed   - response forwarded to the client unchanged
 #     blocked  - response body replaced with a JSON error payload
@@ -24,8 +27,6 @@ filter_chains:
   - name: nemo-guardrails-response
     filters:
       - filter: ai_guardrails
-        # Optional. Omit for an empty pass-through chain; configure one when
-        # NeMo callouts need credentials, tracing, or destination policy.
         outbound_chain: nemo-outbound
         provider:
           type: nemo
@@ -50,6 +51,7 @@ filter_chains:
             endpoints:
               - "127.0.0.1:3000"
 
+  # Observability for NeMo callouts. This chain carries no credentials.
   - name: nemo-outbound
     filters:
       - filter: request_id

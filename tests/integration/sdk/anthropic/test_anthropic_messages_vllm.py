@@ -12,6 +12,11 @@ The native and translated production examples are both exercised against the
 same keyed vLLM server. Qwen3-8B runs the text matrix; the image case requires
 a separately served vision model and is selected with ``-k image``.
 
+The SDK is pinned to ``anthropic==1.9.0`` deliberately: this GPU acceptance
+baseline was qualified against that client release and its ``2023-06-01``
+API-version header, and upgrading it is a separate, explicitly validated
+change — not something a floating dependency may drift into.
+
 Required: PRAXIS_TEST_VLLM_BASE_URL (local HTTP URL), PRAXIS_TEST_VLLM_MODEL,
 VLLM_API_KEY, and a built praxis-ai binary (or PRAXIS_AI_BIN). Set
 PRAXIS_TEST_REQUIRE_LIVE=1 in CI so missing infrastructure fails instead of

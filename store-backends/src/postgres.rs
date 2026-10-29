@@ -16,7 +16,8 @@ use tracing::info;
 
 use super::{
     BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
-    PendingApprovalRecord, PoolConfig, ResponseEventRecord, ResponseRecord, ResponseStore, SslMode, StoreError,
+    PendingApprovalRecord, PoolConfig, ResponseCasOutcome, ResponseEventRecord, ResponseRecord, ResponseStore, SslMode,
+    StoreError,
     compression::{StoreCompressionConfig, decode, decode_bounded, decode_budgeted, decode_bytes, run_blocking},
     json_payload_charge, json_values_charge, json_values_fit,
     pool::apply_pool_config,
@@ -157,6 +158,22 @@ impl PostgresResponseStore {
     /// credentials before it becomes a [`StoreError::Database`].
     fn db_err(&self, e: impl std::fmt::Display) -> StoreError {
         StoreError::Database(super::redact_connection_error(&self.redact_url, &e.to_string()))
+    }
+
+    /// Encode one response object into its stored form with the active codec.
+    async fn encode_object(&self, value: &serde_json::Value) -> Result<Vec<u8>, StoreError> {
+        let json = serde_json::to_vec(value).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let mut encoded = self.compression.encode_byte_values(&[&json]).await?.into_iter();
+        let Some(payload) = encoded.next() else {
+            return Err(StoreError::Serialization("compression returned no payload".to_owned()));
+        };
+        // With `algorithm: none` the codec hands back a borrow of `json`, so the
+        // buffer we already own is the stored form: move it rather than copying
+        // the whole object on every transition. zstd allocates its own frame.
+        Ok(match payload {
+            std::borrow::Cow::Borrowed(_) => json,
+            std::borrow::Cow::Owned(frame) => frame,
+        })
     }
 
     /// Append items at the next positions and invalidate the retired message cache.
@@ -727,6 +744,68 @@ impl ResponseStore for PostgresResponseStore {
             .await
             .map_err(|e| self.db_err(&e))?;
         require_owner_preserving_write(result.rows_affected(), "response")
+    }
+
+    async fn compare_and_swap_response_object(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        expected_response_object: &serde_json::Value,
+        response_object: &serde_json::Value,
+    ) -> Result<ResponseCasOutcome, StoreError> {
+        // Encode before opening the transaction: compressing a large object is
+        // the slowest step here, and `FOR UPDATE` would otherwise hold the row
+        // lock across it. The cost is a wasted encode when the comparison then
+        // fails, which is the rarer path.
+        let next = self.encode_object(response_object).await?;
+
+        // `FOR UPDATE` holds the row for the life of the transaction so the
+        // read, the comparison and the update are one atomic step and cannot
+        // interleave with a competing claimant. The begin future is boxed to
+        // keep this method inside the workspace stack-size budget.
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+
+        let select = format!(
+            "SELECT response_object FROM {} \
+             WHERE id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
+             FOR UPDATE",
+            self.tables.responses
+        );
+        let row = sqlx::query(AssertSqlSafe(select.as_str()))
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        // Owner-scoped, so another principal's record is indistinguishable
+        // from a missing one. Dropping the transaction rolls it back.
+        let Some(row) = row else {
+            return Ok(ResponseCasOutcome::NotFound);
+        };
+        let stored_bytes: Vec<u8> = row.try_get("response_object").map_err(|e| self.db_err(&e))?;
+        let stored = run_blocking(move || decode(&stored_bytes)).await?;
+        if &stored != expected_response_object {
+            return Ok(ResponseCasOutcome::Mismatch);
+        }
+
+        let update = format!(
+            "UPDATE {} SET response_object = $1 \
+             WHERE id = $2 AND tenant_id = $3 AND owner_issuer = $4 AND owner_subject = $5",
+            self.tables.responses
+        );
+        sqlx::query(AssertSqlSafe(update.as_str()))
+            .bind(&next)
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
+        Ok(ResponseCasOutcome::Applied)
     }
 
     async fn get_response(&self, owner: &StateOwner, id: &str) -> Result<Option<ResponseRecord>, StoreError> {

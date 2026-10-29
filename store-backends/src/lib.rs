@@ -90,8 +90,8 @@ pub(crate) use praxis_ai_store::compression;
 #[cfg(any(feature = "sqlite", feature = "_postgres"))]
 use praxis_ai_store::{
     BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
-    PendingApprovalRecord, ResponseEventRecord, ResponseRecord, ResponseStore, StoreError, SweepStats,
-    json_payload_charge, json_values_charge, json_values_fit, retained_charge,
+    PendingApprovalRecord, ResponseCasOutcome, ResponseEventRecord, ResponseRecord, ResponseStore, StoreError,
+    SweepStats, json_payload_charge, json_values_charge, json_values_fit, retained_charge,
 };
 #[cfg(any(feature = "sqlite", feature = "_postgres"))]
 pub use provisioning::store_backend_factories;

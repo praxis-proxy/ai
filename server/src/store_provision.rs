@@ -1153,9 +1153,9 @@ mod tests {
 
     use praxis_ai_store::{
         BackendError, BackendNamespaceKey, ConversationItemRecord, ConversationItemStore, ConversationRecord,
-        EffectiveConfigKey, EventLogStatus, PendingApprovalRecord, ProvisionedBackend, ResponseEventRecord,
-        ResponseRecord, ResponseStore, RetireBackend, StateOwner, StoreBackendFactory, StoreError, SweepStats,
-        memory::InMemoryStore,
+        EffectiveConfigKey, EventLogStatus, PendingApprovalRecord, ProvisionedBackend, ResponseCasOutcome,
+        ResponseEventRecord, ResponseRecord, ResponseStore, RetireBackend, StateOwner, StoreBackendFactory, StoreError,
+        SweepStats, memory::InMemoryStore,
     };
     use praxis_filter::FilterRegistry;
     use serde_json::json;
@@ -2880,6 +2880,16 @@ filter_chains:
 
         async fn delete_response(&self, _owner: &StateOwner, _id: &str) -> Result<bool, StoreError> {
             Ok(false)
+        }
+
+        async fn compare_and_swap_response_object(
+            &self,
+            _owner: &StateOwner,
+            _id: &str,
+            _expected_response_object: &serde_json::Value,
+            _response_object: &serde_json::Value,
+        ) -> Result<ResponseCasOutcome, StoreError> {
+            Ok(ResponseCasOutcome::NotFound)
         }
 
         async fn get_conversation(

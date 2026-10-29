@@ -107,15 +107,29 @@ impl CalloutIdentity {
 }
 
 /// Compute the exact `host:port` authority used by Praxis Core's deferred-credential
-/// matcher from an operator-configured HTTP(S) URL.
+/// matcher from a configured URL.
 ///
 /// Callers invoke this during configuration and retain the result, preventing a malformed
-/// authority from degrading at request time into a silently unauthenticated callout.
-#[cfg(any(test, feature = "openai-responses"))]
-pub(crate) fn credential_authority(filter_name: &str, raw_url: &str) -> Result<String, FilterError> {
-    let url = url::Url::parse(raw_url).map_err(|error| -> FilterError {
+/// URL from degrading at request time into a silently unauthenticated callout. The scheme
+/// is not part of the result. It only selects the default port when the URL omits one.
+///
+/// # Errors
+///
+/// Returns an error when `raw_url` is not a URL, has no host, uses a scheme with no known
+/// default port and no explicit port, or does not form an HTTP authority.
+pub fn credential_authority(filter_name: &str, raw_url: &str) -> Result<String, FilterError> {
+    authority_from_url(filter_name, &parse_credential_url(filter_name, raw_url)?)
+}
+
+/// Parse `raw_url` once for credential binding.
+fn parse_credential_url(filter_name: &str, raw_url: &str) -> Result<url::Url, FilterError> {
+    url::Url::parse(raw_url).map_err(|error| -> FilterError {
         format!("{filter_name}: target URL is not a valid URL for credential binding: {error}").into()
-    })?;
+    })
+}
+
+/// Host and port of an already-parsed credential URL.
+fn authority_from_url(filter_name: &str, url: &url::Url) -> Result<String, FilterError> {
     let host = url.host_str().ok_or_else(|| -> FilterError {
         format!("{filter_name}: target URL has no host for credential binding").into()
     })?;
