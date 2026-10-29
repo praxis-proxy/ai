@@ -40,7 +40,10 @@ fn converts_legacy_request_direction_and_binds_target_model() {
     assert_eq!(translated["messages"][2]["content"][0]["tool_use_id"], "call-1");
     assert_eq!(translated["tools"][0]["input_schema"]["type"], "object");
     assert_eq!(translated["tool_choice"], json!({"type":"tool","name":"weather"}));
-    assert_eq!(profile.client_model, "client-model");
+    assert_eq!(
+        profile.client_model, "client-model",
+        "the profile must preserve the client-visible model"
+    );
     assert!(profile.stream);
     assert!(profile.include_usage);
 }
@@ -71,19 +74,35 @@ fn defaults_missing_max_tokens_and_preserves_alias_precedence() {
     let base = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]"#;
     let defaulted = format!("{base}}}");
     let (bytes, _) = translate_request(defaulted.as_bytes(), "provider-model").unwrap();
-    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["max_tokens"], 4096);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["max_tokens"],
+        4096,
+        "omitting both token aliases must use the compatibility default"
+    );
 
     for (field, expected) in [("max_tokens", 12), ("max_completion_tokens", 13)] {
         let input = format!("{base},\"{field}\":{expected}}}");
         let (bytes, _) = translate_request(input.as_bytes(), "provider-model").unwrap();
-        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["max_tokens"], expected);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["max_tokens"],
+            expected,
+            "an explicit {field} must override the compatibility default"
+        );
     }
     let equal = format!("{base},\"max_tokens\":14,\"max_completion_tokens\":14}}");
     let (bytes, _) = translate_request(equal.as_bytes(), "provider-model").unwrap();
-    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["max_tokens"], 14);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["max_tokens"],
+        14,
+        "equal token aliases must preserve their explicit value"
+    );
     let conflict = format!("{base},\"max_tokens\":15,\"max_completion_tokens\":16}}");
     let (bytes, _) = translate_request(conflict.as_bytes(), "provider-model").unwrap();
-    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["max_tokens"], 16);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["max_tokens"],
+        16,
+        "max_completion_tokens must take precedence over max_tokens"
+    );
 }
 
 #[test]
@@ -132,7 +151,10 @@ fn accepts_and_drops_only_the_legacy_ignored_options() {
     let (bytes, _) = translate_request(combined, "provider-model").unwrap();
     let output: Value = serde_json::from_slice(&bytes).unwrap();
     for field in ["user", "n", "seed", "parallel_tool_calls"] {
-        assert!(output.get(field).is_none());
+        assert!(
+            output.get(field).is_none(),
+            "the combined request must omit {field} upstream"
+        );
     }
 }
 
@@ -160,19 +182,39 @@ fn translates_base64_and_remote_image_sources_in_content_order() {
     let input = br#"{"model":"client-model","messages":[{"role":"user","content":[{"type":"text","text":"first"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC","detail":"high"}},{"type":"text","text":"last"},{"type":"image_url","image_url":{"url":"https://images.example.test/photo.png"}}]}]}"#;
     let (bytes, profile) = translate_request(input, "provider-model").unwrap();
     let output: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(output["model"], "provider-model");
-    assert_eq!(profile.client_model, "client-model");
+    assert_eq!(
+        output["model"], "provider-model",
+        "image requests must use the selected provider model"
+    );
+    assert_eq!(
+        profile.client_model, "client-model",
+        "the profile must preserve the client-visible model"
+    );
     let content = output["messages"][0]["content"].as_array().unwrap();
-    assert_eq!(content.len(), 4);
-    assert_eq!(content[0], json!({"type":"text","text":"first"}));
+    assert_eq!(
+        content.len(),
+        4,
+        "image conversion must retain every input content block"
+    );
+    assert_eq!(
+        content[0],
+        json!({"type":"text","text":"first"}),
+        "leading text must remain before the first image"
+    );
     assert_eq!(
         content[1],
-        json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}})
+        json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}}),
+        "the inline image must preserve its encoding and declared media type"
     );
-    assert_eq!(content[2], json!({"type":"text","text":"last"}));
+    assert_eq!(
+        content[2],
+        json!({"type":"text","text":"last"}),
+        "intervening text must remain between the images"
+    );
     assert_eq!(
         content[3],
-        json!({"type":"image","source":{"type":"url","url":"https://images.example.test/photo.png"}})
+        json!({"type":"image","source":{"type":"url","url":"https://images.example.test/photo.png"}}),
+        "the remote image must remain an unchanged URL reference"
     );
 }
 

@@ -312,8 +312,7 @@ fn translate_content(value: Option<&Value>) -> Result<Vec<Value>, String> {
         .collect()
 }
 
-/// Convert an OpenAI `image_url` content block to an Anthropic image source.
-/// Remote URLs are passed through as URL references; Praxis never fetches them.
+/// Keep remote images as references so fetching remains the provider's responsibility.
 fn translate_image_url(object: &Map<String, Value>) -> Result<Value, String> {
     reject_nested_fields(object, &["type", "image_url"], "image_url content block")?;
     let image = object
@@ -341,7 +340,7 @@ fn translate_image_url(object: &Map<String, Value>) -> Result<Value, String> {
     Ok(json!({"type":"image","source":{"type":"url","url":source}}))
 }
 
-/// Convert a validated base64 data URL to an Anthropic image block.
+/// Validate the encoding without allocating a second full copy of the decoded image.
 fn translate_base64_data_url(value: &str) -> Result<Value, String> {
     let (metadata, encoded) = value
         .split_once(',')
@@ -372,7 +371,7 @@ fn translate_base64_data_url(value: &str) -> Result<Value, String> {
     Ok(json!({"type":"image","source":{"type":"base64","media_type":media_type,"data":encoded}}))
 }
 
-/// Check that the decoded image begins with the signature for its declared type.
+/// Catch mislabeled payloads without requiring a full image decoder in the proxy.
 fn matches_image_signature(media_type: &str, bytes: &[u8]) -> bool {
     match media_type {
         "image/jpeg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),

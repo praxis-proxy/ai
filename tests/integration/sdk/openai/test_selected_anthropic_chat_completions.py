@@ -233,11 +233,11 @@ def test_legacy_omitted_tokens_and_ignored_openai_options(client: OpenAI) -> Non
         seed=17,
         parallel_tool_calls=True,
     )
-    assert response.choices[0].message.content == "compatibility"
+    assert response.choices[0].message.content == "compatibility", "accepted compatibility options must preserve the translated response"
     assert len(response.choices) == 1, "ignored n does not request multiple completions from Anthropic"
     _, _headers, upstream = STATE.requests[-1]
     assert upstream["max_tokens"] == 4096, "omitted token limits must use the compatibility default"
-    assert upstream["model"] == "claude-fixture-model"
+    assert upstream["model"] == "claude-fixture-model", "the selected provider model must replace the client model"
     for field in ("user", "n", "seed", "parallel_tool_calls"):
         assert field not in upstream, f"legacy compatibility field {field} must not leak into Anthropic JSON"
 
@@ -257,11 +257,11 @@ def test_data_and_remote_image_urls_are_translated_without_fetching(client: Open
         max_tokens=16,
     )
     path, _headers, upstream = STATE.requests[-1]
-    assert path == "/v1/messages"
+    assert path == "/v1/messages", "image requests must use the Anthropic Messages endpoint"
     content = upstream["messages"][0]["content"]
-    assert [block["type"] for block in content] == ["text", "image", "text", "image"]
-    assert content[1]["source"] == {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}
-    assert content[3]["source"] == {"type": "url", "url": "https://images.example.test/image.png"}
+    assert [block["type"] for block in content] == ["text", "image", "text", "image"], "conversion must preserve text and image ordering"
+    assert content[1]["source"] == {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}, "inline images must retain their original base64 data and media type"
+    assert content[3]["source"] == {"type": "url", "url": "https://images.example.test/image.png"}, "remote images must remain URL references"
 
 
 def test_assistant_image_is_rejected_before_provider_contact(client: OpenAI) -> None:
@@ -276,8 +276,8 @@ def test_assistant_image_is_rejected_before_provider_contact(client: OpenAI) -> 
             ],
             max_tokens=16,
         )
-    assert caught.value.status_code == 400
-    assert "supported only in user messages" in str(caught.value)
+    assert caught.value.status_code == 400, "unsupported or malformed images must return a client error"
+    assert "supported only in user messages" in str(caught.value), "assistant image rejection must explain the supported role"
     assert not STATE.requests, "unsupported image roles must be rejected before provider contact"
 
 
@@ -290,7 +290,7 @@ def test_malformed_image_is_rejected_before_provider_contact(client: OpenAI) -> 
             ]}],
             max_tokens=16,
         )
-    assert caught.value.status_code == 400
+    assert caught.value.status_code == 400, "unsupported or malformed images must return a client error"
     assert not STATE.requests, "malformed image data must be rejected before contacting the provider"
 
 
