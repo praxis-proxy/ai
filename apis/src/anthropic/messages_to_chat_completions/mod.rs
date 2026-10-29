@@ -12,16 +12,6 @@
 //! The name refers to the Chat Completions wire shape, not the OpenAI
 //! Responses API: any Chat Completions-compatible backend is a valid
 //! target, not only OpenAI.
-//!
-//! # Client credentials stop here
-//!
-//! Translation ends the Anthropic wire contract, so an Anthropic credential
-//! has no meaning to the Chat Completions backend. The filter therefore removes
-//! both forms a client SDK may use (the legacy `x-api-key` header and the
-//! `Authorization: Bearer` header SDK v2 sends) alongside the Anthropic-only
-//! headers. Removal is queued before any server-owned credential is injected, so
-//! `credential_injection` and `credential_inject` still install the backend's own
-//! token on the same header.
 
 mod config;
 pub(crate) mod request;
