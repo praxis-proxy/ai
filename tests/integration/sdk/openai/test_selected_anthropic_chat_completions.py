@@ -23,6 +23,7 @@ from openai import APIStatusError, OpenAI
 
 ROOT = Path(__file__).resolve().parents[4]
 OVERLAY = ROOT / "tests/integration/fixtures/inference/routing/openai-to-anthropic.json"
+FAILOVER_EXAMPLE = ROOT / "examples/configs/inference/fallback-with-provider-translation.yaml"
 MODEL = "fixture-openai-model"
 
 
@@ -122,6 +123,17 @@ def _config(proxy_port: int, backend_port: int, api_translation_enabled: bool = 
     }
 
 
+def _failover_config(proxy_port: int, primary_port: int, fallback_port: int) -> str:
+    """Render the checked-in cross-provider failover example for local SDK backends."""
+    return (
+        FAILOVER_EXAMPLE.read_text()
+        .replace("127.0.0.1:8080", f"127.0.0.1:{proxy_port}")
+        .replace("127.0.0.1:3001", f"127.0.0.1:{primary_port}")
+        .replace("127.0.0.1:3002", f"127.0.0.1:{fallback_port}")
+        .replace("tests/integration/fixtures/inference/routing/openai-to-anthropic.json", str(OVERLAY))
+    )
+
+
 @pytest.fixture(scope="module")
 def client():
     proxy_port, backend_port = _port(), _port()
@@ -184,6 +196,50 @@ def translation_disabled_client():
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+
+
+@pytest.fixture
+def failover_client():
+    """OpenAI SDK client backed by the checked-in cross-provider failover example."""
+    proxy_port, primary_port, fallback_port = _port(), _port(), _port()
+    primary = ThreadingHTTPServer(("127.0.0.1", primary_port), _Handler)
+    fallback = ThreadingHTTPServer(("127.0.0.1", fallback_port), _Handler)
+    primary_thread = threading.Thread(target=primary.serve_forever, daemon=True)
+    fallback_thread = threading.Thread(target=fallback.serve_forever, daemon=True)
+    primary_thread.start()
+    fallback_thread.start()
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "praxis.yaml"
+            log = Path(directory) / "praxis.log"
+            config.write_text(_failover_config(proxy_port, primary_port, fallback_port))
+            with log.open("w") as log_file:
+                proc = subprocess.Popen([_binary(), "-c", str(config)], stdout=subprocess.DEVNULL, stderr=log_file)
+                try:
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        try:
+                            with socket.create_connection(("127.0.0.1", proxy_port), timeout=0.2):
+                                break
+                        except OSError:
+                            time.sleep(0.1)
+                    else:
+                        raise TimeoutError(f"Praxis did not start:\n{log.read_text()}")
+                    with OpenAI(api_key="caller-only", base_url=f"http://127.0.0.1:{proxy_port}/v1",
+                                max_retries=0, timeout=10) as sdk:
+                        yield sdk
+                finally:
+                    proc.send_signal(signal.SIGINT)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+    finally:
+        primary.shutdown()
+        fallback.shutdown()
+        primary_thread.join(timeout=5)
+        fallback_thread.join(timeout=5)
 
 
 def test_json_and_cached_usage(client: OpenAI) -> None:
@@ -328,6 +384,43 @@ def test_streaming_and_terminal_usage(client: OpenAI) -> None:
     assert any(chunk.choices and chunk.choices[0].delta.content == "hello" for chunk in chunks), "Anthropic SSE text must reach OpenAI chunks"
     assert chunks[-1].usage.prompt_tokens == 1060, "SSE cache tokens must count toward prompt usage"
     assert chunks[-1].usage.total_tokens == 1064, "SSE total usage must include cache and output tokens"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_failover_example_supports_explicit_stream_modes(failover_client: OpenAI, stream: bool) -> None:
+    """The SDK must receive translated fallback responses in both IRR transport modes."""
+    STATE.script(503, "application/json", {"error": "primary unavailable"})
+    if stream:
+        events = (
+            'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_failover_stream",'
+            '"usage":{"input_tokens":3,"output_tokens":0}}}\n\n'
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+            '"content_block":{"type":"text","text":""}}\n\n'
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+            '"delta":{"type":"text_delta","text":"failover"}}\n\n'
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+            '"usage":{"output_tokens":2}}\n\n'
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+        )
+        STATE.script(200, "text/event-stream", events)
+        chunks = list(failover_client.chat.completions.create(
+            model=MODEL, messages=[{"role": "user", "content": "hi"}], stream=True, max_tokens=16,
+        ))
+        assert any(
+            chunk.choices and chunk.choices[0].delta.content == "failover" for chunk in chunks
+        ), "translated fallback SSE must reach the OpenAI client"
+    else:
+        STATE.script(200, "application/json", _message(
+            [{"type": "text", "text": "failover"}], {"input_tokens": 3, "output_tokens": 2},
+        ))
+        response = failover_client.chat.completions.create(
+            model=MODEL, messages=[{"role": "user", "content": "hi"}], stream=False, max_tokens=16,
+        )
+        assert response.choices[0].message.content == "failover", "translated fallback JSON must reach the OpenAI client"
+
+    assert [path for path, _ in STATE.requests] == ["/v1/chat/completions", "/v1/messages"]
+    assert STATE.requests[0][1]["stream"] is stream, "primary must receive the SDK stream selection"
 
 
 def test_tool_call_and_result_round_trip(client: OpenAI) -> None:

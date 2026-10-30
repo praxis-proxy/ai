@@ -60,6 +60,7 @@ mod guardrails_service_account;
 mod identity_header_guard;
 #[cfg(feature = "openai-responses")]
 mod inference_fallback;
+mod inference_fallback_provider;
 #[cfg(feature = "inflight-tracker-filter")]
 mod inflight_tracking;
 mod intelligent_route_hardening;

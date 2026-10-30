@@ -386,6 +386,10 @@ fn register_openai_filters(registry: &mut FilterRegistry) {
     );
     praxis_filter::register_filters!(
         @register registry,
+        http "openai_chat_completions_streaming_selector" => praxis_ai_apis::openai::OpenaiChatCompletionsStreamingSelectorFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
         http "ai_operation" => praxis_ai_apis::operation_classifier::AiOperationFilter::from_config
     );
 }
@@ -748,6 +752,7 @@ mod tests {
             "openai_responses_model_rewrite",
             "openai_tool_parse",
             "openai_chat_completions_request",
+            "openai_chat_completions_streaming_selector",
             "ai_operation",
             "a2a",
             "intelligent_route",
