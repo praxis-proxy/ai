@@ -24,7 +24,7 @@ filters/src/              Cross-provider behavior
   guardrails/             AI content guardrails
   inference/              Model routing
   prompt_enrich/          Prompt injection
-  token_usage/            Token counting and headers
+  token_usage/            Token counting, headers, and per-tenant metrics
 ```
 
 Praxis AI also inherits all base proxy filters from Praxis core through
