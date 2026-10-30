@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use praxis_core::config::Config;
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext};
 use praxis_test_utils::{
-    Backend, free_port, http_send, load_example_config, parse_body, parse_status, registry_with, start_proxy,
-    start_proxy_with_registry, wait_for_http,
+    Backend, RoutedBackend, free_port, http_send, load_example_config, parse_body, parse_status, registry_with,
+    start_proxy, start_proxy_with_registry, wait_for_http,
 };
 
 const OPENAI_JSON: &str = r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}"#;
@@ -87,7 +87,6 @@ impl HttpFilter for TrustedTenantMetadata {
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         ctx.set_metadata("x-tenant-username", "token-metrics-example-alice");
-        ctx.set_metadata("openai_chat_completions_request.model", "gpt-4o");
         Ok(FilterAction::Continue)
     }
 }
@@ -97,6 +96,10 @@ fn example_config_emits_metrics_for_authenticated_tenant() {
     let backend = Backend::fixed(OPENAI_JSON)
         .header("content-type", "application/json")
         .start_with_shutdown();
+    let metering_port = RoutedBackend::new()
+        .route("/api/v1/customers", 200, r#"{"hasAccess": true, "balance": 9000.0}"#)
+        .route("/api/v1/events", 204, "")
+        .start();
     let proxy_port = free_port();
     let admin_port = free_port();
     let yaml = format!(
@@ -117,6 +120,14 @@ filter_chains:
         tenant_metadata_key: "x-tenant-username"
         allowed_tenants: [token-metrics-example-alice]
         allowed_models: [gpt-4o]
+      - filter: external_metering
+        metering_url: "http://127.0.0.1:{metering_port}"
+        allow_private_endpoint: true
+        feature_key: "inference-tokens"
+        source: "ai-gateway"
+        provider: "openai"
+        fail_open: false
+        identity_header_prefix: "x-tenant-"
       - filter: token_count
         provider: openai
       - filter: load_balancer

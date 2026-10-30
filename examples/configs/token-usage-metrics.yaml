@@ -48,6 +48,8 @@ filter_chains:
         prefix: "x-tenant-"
         metadata_namespace: "identity"
 
+      - filter: model_to_header
+
       - filter: token_usage_metrics
         tenant_metadata_key: "x-tenant-username"
         allowed_tenants:
@@ -67,7 +69,7 @@ filter_chains:
               - "127.0.0.1:3000"
 
 admin:
-  address: "127.0.0.1:9901"
+  metrics_address: "127.0.0.1:9901"
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends

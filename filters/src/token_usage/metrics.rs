@@ -238,7 +238,6 @@ fn shared_string(label: &Arc<str>) -> SharedString {
 }
 
 struct MetricsRequestState {
-    model: SharedString,
     tenant: SharedString,
 }
 
@@ -267,8 +266,7 @@ impl HttpFilter for TokenUsageMetricsFilter {
         }
 
         let tenant = self.tenant_label(tenant);
-        let model = self.model_label(resolve_model(ctx));
-        ctx.insert_filter_state(MetricsRequestState { model, tenant });
+        ctx.insert_filter_state(MetricsRequestState { tenant });
         Ok(FilterAction::Continue)
     }
 
@@ -288,22 +286,29 @@ impl HttpFilter for TokenUsageMetricsFilter {
         let Some(state) = ctx.remove_filter_state::<MetricsRequestState>() else {
             return Ok(FilterAction::Continue);
         };
-        emit_token_counters(ctx, &state);
+        let model = self.model_label(resolve_model(ctx));
+        emit_token_counters(ctx, &state, &model);
         Ok(FilterAction::Continue)
     }
 }
 
 fn resolve_model<'a>(ctx: &'a HttpFilterContext<'_>) -> Option<&'a str> {
-    ctx.get_metadata("openai_responses_request.model")
-        .or_else(|| ctx.get_metadata("openai_chat_completions_request.model"))
-        .or_else(|| ctx.get_metadata("anthropic_messages_request.model"))
-        .or_else(|| ctx.get_metadata("anthropic_messages_to_chat_completions.model"))
-        .or_else(|| ctx.get_metadata("model_to_header.model"))
-        .or_else(|| ctx.get_metadata(META_METERING_MODEL))
-        .filter(|value| !value.is_empty() && is_promotable_value(value))
+    [
+        "openai_responses_request.model",
+        "openai_chat_completions_request.model",
+        "anthropic_messages_request.model",
+        "anthropic_messages_to_chat_completions.model",
+        "model_to_header.model",
+        META_METERING_MODEL,
+    ]
+    .into_iter()
+    .find_map(|key| {
+        ctx.get_metadata(key)
+            .filter(|value| !value.is_empty() && is_promotable_value(value))
+    })
 }
 
-fn emit_token_counters(ctx: &HttpFilterContext<'_>, state: &MetricsRequestState) {
+fn emit_token_counters(ctx: &HttpFilterContext<'_>, state: &MetricsRequestState, model: &SharedString) {
     if ctx.get_metadata(META_TOKEN_STATUS) == Some(TOKEN_STATUS_OVERFLOW) {
         debug!("token capture overflow, skipping token usage metrics");
         return;
@@ -315,17 +320,17 @@ fn emit_token_counters(ctx: &HttpFilterContext<'_>, state: &MetricsRequestState)
     ) else {
         return;
     };
-    increment_tokens(state, "input", input);
-    increment_tokens(state, "output", output);
-    increment_tokens(state, "total", total);
-    debug!(tenant = %state.tenant, model = %state.model, input, output, total, "recorded per-tenant token usage metrics");
+    increment_tokens(state, model, "input", input);
+    increment_tokens(state, model, "output", output);
+    increment_tokens(state, model, "total", total);
+    debug!(tenant = %state.tenant, %model, input, output, total, "recorded per-tenant token usage metrics");
 }
 
-fn increment_tokens(state: &MetricsRequestState, usage_type: &'static str, value: u64) {
+fn increment_tokens(state: &MetricsRequestState, model: &SharedString, usage_type: &'static str, value: u64) {
     counter!(
         METRIC_TOKENS_TOTAL,
         "tenant" => state.tenant.clone(),
-        "model" => state.model.clone(),
+        "model" => model.clone(),
         "kind" => usage_type,
     )
     .increment(value);
@@ -460,13 +465,23 @@ mod tests {
         let req = make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
         ctx.set_metadata(DEFAULT_TENANT_METADATA_KEY, "alice");
-        ctx.set_metadata("openai_chat_completions_request.model", "gpt-4o");
         request(&filter, &mut ctx).await;
+        ctx.set_metadata(META_METERING_MODEL, "gpt-4o");
         set_counts(&mut ctx, 10, 20, 30);
         let snapshot = emit(&filter, &mut ctx);
         assert_eq!(value(&snapshot, "alice", "gpt-4o", "input"), Some(10));
         assert_eq!(value(&snapshot, "alice", "gpt-4o", "output"), Some(20));
         assert_eq!(value(&snapshot, "alice", "gpt-4o", "total"), Some(30));
+    }
+
+    #[test]
+    fn resolve_model_skips_invalid_candidates() {
+        let req = make_request(http::Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        ctx.set_metadata("openai_responses_request.model", "");
+        ctx.set_metadata("anthropic_messages_request.model", "bad\nmodel");
+        ctx.set_metadata("model_to_header.model", "gpt-4o");
+        assert_eq!(resolve_model(&ctx), Some("gpt-4o"));
     }
 
     #[tokio::test]
