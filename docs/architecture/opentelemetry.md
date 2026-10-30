@@ -101,7 +101,11 @@ miss, or backend error before the rule reservation uses the same span with
   Soft decisions align with `praxis_trl_requests_total{result=…}`.
 - `token_rate_limit.actual_cost`: provider-reported weighted usage, recorded
   when the response body ends. Absent when the decision was not `admitted`
-  or no usage metadata was produced.
+or no usage metadata was produced.
+
+The Prometheus metric `praxis_trl_quota_source_missing_total{rule}` counts
+shared-quota responses for which PPE produced no decision; `rule` is the
+configured rule name.
 
 The token-rate-limit Prometheus metrics include
 `praxis_trl_fail_open_admissions_total{rule,backend,outcome}` for explicit

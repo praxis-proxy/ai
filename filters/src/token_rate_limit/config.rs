@@ -57,6 +57,9 @@ use serde::Deserialize;
 ///
 /// - `praxis_trl_unauthenticated_total{rule}`
 ///
+/// - `praxis_trl_quota_source_missing_total{rule}`: shared-quota responses for
+///   which PPE produced no decision; `rule` is the configured rule name.
+///
 /// - `praxis_trl_tokens_reserved_total{rule}`
 ///
 /// - `praxis_trl_tokens_reconciled_total{rule}`
@@ -235,6 +238,18 @@ pub(super) struct TokenRateLimitConfig {
     /// reserves the estimation/`reserved_tokens` cost unweighted.
     #[serde(default)]
     pub default_weights: super::weights::TokenTypeWeightsConfig,
+
+    /// Reconcile reservations from a PPE token-quota plugin result instead of
+    /// recomputing static token weights inside this filter. Defaults to `false`
+    /// for full compatibility with existing configurations.
+    /// Requires the `token-quota-filter` feature when set to `true`.
+    ///
+    /// Mutually exclusive with both `default_weights` and per-rule `weights`:
+    /// the PPE result must be the single source of quota units.
+    /// Server startup also requires one unconditional response chain ordered
+    /// `token_rate_limit`, `policy`, then `token_count`.
+    #[serde(default)]
+    pub use_token_quota: bool,
 
     /// Optional three-level hierarchy enforcing independent org, team,
     /// and user budgets on each request. Exactly three levels in

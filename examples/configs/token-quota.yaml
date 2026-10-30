@@ -1,0 +1,42 @@
+# Token quota policy
+#
+# PPE evaluates a weighted quota over the final normalized token usage snapshot.
+# `token_count` supplies trusted usage; the policy document selects the quota
+# plugin and formula; downstream filters consume PPE output.
+#
+# Run from the repository root with:
+#   cargo run -p praxis-ai-proxy --features token-quota-filter -- \
+#     -c examples/configs/token-quota.yaml
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      - filter: model_to_header
+
+      # Response hooks run in reverse: token_count -> policy/PPE.
+      - filter: policy
+        config_path: examples/configs/token-quota.ppe.yaml
+        body_access: read_only
+
+      - filter: token_count
+        provider: openai
+
+      - filter: access_log
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints: ["127.0.0.1:3000"]
+
+insecure_options:
+  allow_private_endpoints: true

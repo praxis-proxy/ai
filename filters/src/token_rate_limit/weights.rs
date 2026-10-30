@@ -20,18 +20,11 @@
 //! at the input weight so quota cannot drop below the provider total.
 //! See [`weighted_cost`].
 
-use praxis_filter::{FilterError, HttpFilterContext};
+use praxis_filter::FilterError;
 use serde::Deserialize;
 
-use crate::token_usage::{
-    META_TOKEN_CACHE_READ, META_TOKEN_CACHE_WRITE, META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_REASONING,
-    META_TOKEN_STATUS, META_TOKEN_TOTAL, TOKEN_STATUS_OVERFLOW,
-};
-
-/// Cap for the float→integer conversion. Matches the `f64` safe-integer
-/// bound the ledgers already enforce on `capacity`, so a weighted cost can
-/// never be a value the backends cannot represent exactly.
-const COST_U64_CAP: u64 = 9_007_199_254_740_992; // 2^53
+pub(super) use crate::token_usage::normalized::{UsageCounts, parse_u64_meta};
+use crate::token_usage::normalized::{UsageInput, weighted_cost as normalized_weighted_cost};
 
 /// Operator-facing per-type weights. Omitted keys stay `None` so a rule
 /// overlay can replace only the types it cares about.
@@ -66,6 +59,17 @@ pub(super) struct TokenTypeWeightsConfig {
     /// Weight for reasoning / thinking tokens (`token.reasoning`).
     #[serde(default)]
     pub reasoning: Option<f64>,
+}
+
+impl TokenTypeWeightsConfig {
+    /// Whether this layer contributes no weight overrides.
+    pub(super) fn is_empty(&self) -> bool {
+        self.input.is_none()
+            && self.output.is_none()
+            && self.cached_input.is_none()
+            && self.cache_write.is_none()
+            && self.reasoning.is_none()
+    }
 }
 
 /// Resolved weights applied on the reconcile hot path. Every field is
@@ -132,51 +136,6 @@ fn checked_weight(value: f64, loc: &str, field: &str) -> Result<f64, FilterError
     }
 }
 
-/// Typed usage recovered from `token_count` metadata. Every count is
-/// optional so absence stays distinct from a reported zero.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct UsageCounts {
-    /// `token.input`, cache included.
-    pub input: Option<u64>,
-    /// `token.output` (visible candidates on Google).
-    pub output: Option<u64>,
-    /// `token.total`.
-    pub total: Option<u64>,
-    /// `token.cache_read`, a subset of `input`.
-    pub cache_read: Option<u64>,
-    /// `token.cache_write`, a subset of `input`.
-    pub cache_write: Option<u64>,
-    /// `token.reasoning`.
-    pub reasoning: Option<u64>,
-    /// `token.status == overflow`: capture was abandoned; do not trust
-    /// any partial counts for quota.
-    pub overflow: bool,
-}
-
-impl UsageCounts {
-    /// Read the `token.*` keys `token_count` publishes onto `ctx`.
-    ///
-    /// Unparseable values are treated as absent, matching the pre-M4
-    /// `token.total` parse.
-    pub(super) fn from_context(ctx: &HttpFilterContext<'_>) -> Self {
-        Self {
-            input: parse_u64_meta(ctx, META_TOKEN_INPUT),
-            output: parse_u64_meta(ctx, META_TOKEN_OUTPUT),
-            total: parse_u64_meta(ctx, META_TOKEN_TOTAL),
-            cache_read: parse_u64_meta(ctx, META_TOKEN_CACHE_READ),
-            cache_write: parse_u64_meta(ctx, META_TOKEN_CACHE_WRITE),
-            reasoning: parse_u64_meta(ctx, META_TOKEN_REASONING),
-            overflow: ctx.get_metadata(META_TOKEN_STATUS) == Some(TOKEN_STATUS_OVERFLOW),
-        }
-    }
-}
-
-/// Parse a metadata value as `u64`. Missing or unparseable strings are
-/// `None`, matching the pre-M4 `token.total` path.
-pub(super) fn parse_u64_meta(ctx: &HttpFilterContext<'_>, key: &str) -> Option<u64> {
-    ctx.get_metadata(key).and_then(|value| value.parse::<u64>().ok())
-}
-
 /// Compute the integer cost to settle against the reservation.
 ///
 /// Returns:
@@ -188,112 +147,18 @@ pub(super) fn parse_u64_meta(ctx: &HttpFilterContext<'_>, key: &str) -> Option<u
 ///   charged at the input weight, then `ceil(Σ type × weight)`.
 #[must_use]
 pub(super) fn weighted_cost(usage: UsageCounts, weights: TokenWeights) -> Option<u64> {
-    if usage.overflow {
-        return None;
-    }
-    match (usage.input, usage.output) {
-        (Some(input), Some(output)) => Some(partitioned_cost(input, output, usage, weights)),
-        _ => usage.total,
-    }
-}
-
-/// Partition nested types, then apply weights. Malformed breakdowns that
-/// exceed their parent are clamped so the residual never underflows.
-///
-/// When `token.total` exceeds the typed parents (Bedrock Converse:
-/// `inputTokens` is uncached-only and cache lives only in `totalTokens`),
-/// the uncovered remainder is charged at [`TokenWeights::input`] so the
-/// cost cannot fall below what `token.total` covered.
-fn partitioned_cost(input: u64, output: u64, usage: UsageCounts, weights: TokenWeights) -> u64 {
-    let cache_read = usage.cache_read.unwrap_or(0).min(input);
-    let after_read = input - cache_read;
-    let cache_write = usage.cache_write.unwrap_or(0).min(after_read);
-    let uncached = after_read - cache_write;
-
-    let reasoning = usage.reasoning.unwrap_or(0);
-    let nested = reasoning_is_nested(input, output, usage.total, reasoning);
-    let (visible_output, reasoning_tokens) = if nested {
-        let nested_reasoning = reasoning.min(output);
-        (output - nested_reasoning, nested_reasoning)
-    } else {
-        (output, reasoning)
-    };
-
-    let mut accounted = input.saturating_add(output);
-    if !nested {
-        accounted = accounted.saturating_add(reasoning);
-    }
-    let uncovered = usage.total.map_or(0, |total| total.saturating_sub(accounted));
-
-    let cost = to_cost_f64(uncached) * weights.input
-        + to_cost_f64(cache_read) * weights.cached_input
-        + to_cost_f64(cache_write) * weights.cache_write
-        + to_cost_f64(visible_output) * weights.output
-        + to_cost_f64(reasoning_tokens) * weights.reasoning
-        + to_cost_f64(uncovered) * weights.input;
-    ceil_cost(cost)
-}
-
-/// Decide whether reasoning is already inside `output`.
-///
-/// `token_count` publishes `token.total = input + output` for OpenAI /
-/// Anthropic (reasoning ⊆ output) and `token.total = input + output +
-/// reasoning` for Google (thoughts billed separately). When `total` is
-/// absent, nested is the conservative default: it never charges reasoning
-/// twice on the common providers.
-fn reasoning_is_nested(input: u64, output: u64, total: Option<u64>, reasoning: u64) -> bool {
-    if reasoning == 0 {
-        return true;
-    }
-    let Some(total) = total else {
-        return true;
-    };
-    let nested_sum = input.saturating_add(output);
-    let additive_sum = nested_sum.saturating_add(reasoning);
-    // Closer to `input + output` → nested (OpenAI/Anthropic). Closer to
-    // `input + output + reasoning` → additive (Google). Equal distance
-    // prefers nested so we never double-count the common case.
-    total.abs_diff(nested_sum) <= total.abs_diff(additive_sum)
-}
-
-/// `f64` form of [`COST_U64_CAP`]. `2^53` is an exact `f64` value.
-const COST_F64_CAP: f64 = 9_007_199_254_740_992.0;
-
-/// Convert a token count to `f64` for weighting. Clamped to [`COST_U64_CAP`]
-/// so the mantissa stays exact (the ledgers already reject capacities
-/// above this bound).
-fn to_cost_f64(tokens: u64) -> f64 {
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "clamped to 2^53, which is exactly representable in f64"
-    )]
-    {
-        tokens.min(COST_U64_CAP) as f64
-    }
-}
-
-/// Ceiling conversion so a quota never under-charges a fractional cost
-/// (9 cached tokens × 0.1 = 0.9 → 1).
-///
-/// Positive overflow (`+inf`, including a finite weight times a count that
-/// exceeds the `f64` range) saturates to [`COST_U64_CAP`] so the request
-/// cannot settle at zero and refund its reservation. `NaN` and non-positive
-/// results stay 0.
-fn ceil_cost(cost: f64) -> u64 {
-    if cost.is_nan() || cost <= 0.0 {
-        return 0;
-    }
-    if cost.is_infinite() {
-        return COST_U64_CAP;
-    }
-    let capped = cost.min(COST_F64_CAP).ceil();
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "capped is finite, non-negative, and <= 2^53, so ceil is an exact u64"
-    )]
-    {
-        capped as u64
+    match usage.normalize() {
+        UsageInput::Missing | UsageInput::Overflow => None,
+        UsageInput::Available(usage) => Some(normalized_weighted_cost(
+            &usage,
+            [
+                weights.input,
+                weights.cached_input,
+                weights.cache_write,
+                weights.output,
+                weights.reasoning,
+            ],
+        )),
     }
 }
 
@@ -424,22 +289,6 @@ mod tests {
     }
 
     #[test]
-    fn total_identity_classifies_nested_vs_additive_reasoning() {
-        assert!(
-            reasoning_is_nested(120, 800, Some(920), 640),
-            "OpenAI: total == input+output"
-        );
-        assert!(
-            !reasoning_is_nested(50, 80, Some(330), 200),
-            "Google: total == input+output+reasoning"
-        );
-        assert!(
-            reasoning_is_nested(50, 80, None, 200),
-            "missing total defaults to nested"
-        );
-    }
-
-    #[test]
     fn missing_total_defaults_to_nested_reasoning() {
         let mut counts = UsageCounts {
             input: Some(10),
@@ -512,19 +361,6 @@ mod tests {
     }
 
     #[test]
-    fn ceil_cost_saturates_positive_infinity_to_the_u64_cap() {
-        assert_eq!(ceil_cost(f64::INFINITY), COST_U64_CAP);
-    }
-
-    #[test]
-    fn ceil_cost_maps_nan_and_non_positive_to_zero() {
-        assert_eq!(ceil_cost(f64::NAN), 0);
-        assert_eq!(ceil_cost(f64::NEG_INFINITY), 0);
-        assert_eq!(ceil_cost(0.0), 0);
-        assert_eq!(ceil_cost(-1.0), 0);
-    }
-
-    #[test]
     fn large_finite_weight_overflows_to_the_cost_cap_not_zero() {
         // f64::MAX is finite, so checked_weight accepts it. 2 × MAX overflows
         // to +inf; settling that at 0 would refund the reservation.
@@ -532,7 +368,7 @@ mod tests {
             input: f64::MAX,
             ..TokenWeights::UNITY
         };
-        assert_eq!(weighted_cost(usage(2, 0, 2), w), Some(COST_U64_CAP));
+        assert_eq!(weighted_cost(usage(2, 0, 2), w), Some(9_007_199_254_740_992));
     }
 
     #[test]

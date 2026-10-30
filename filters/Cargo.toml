@@ -67,6 +67,9 @@ vertex-anthropic-filter = ["experimental", "praxis-ai-apis/vertex-anthropic"]
 # optional so the rest of the crate (and its consumers) don't compile the
 # Valkey client and its transitive deps unless this feature is on.
 token-rate-limit-filter = ["experimental", "dep:redis", "dep:thiserror"]
+# Experimental: lets PPE select and evaluate weighted quota plugins over the
+# final normalized per-request token usage snapshot.
+token-quota-filter = ["experimental", "policy-engine", "dep:ppe"]
 # Experimental pre-forward input/output token ceiling guard.  Kept separate
 # from token-rate-limit-filter because static request admission must fail
 # closed independently of quota-backend health.
@@ -103,6 +106,7 @@ praxis-core = { workspace = true }
 # chain-binding: ChainBindingContext for register.rs outbound-chain wiring.
 # Off-by-default experimental feature in praxis 0.7.0 (no extra dependencies).
 praxis-filter = { workspace = true, features = ["chain-binding"] }
+ppe = { workspace = true, optional = true }
 praxis-tls = { workspace = true }
 redis = { workspace = true, optional = true }
 rand = { workspace = true }

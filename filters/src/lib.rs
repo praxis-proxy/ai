@@ -31,6 +31,8 @@ pub mod routing;
 #[cfg(feature = "store")]
 mod store_readiness;
 mod time_to_first_token;
+#[cfg(feature = "token-quota-filter")]
+mod token_quota;
 #[cfg(feature = "token-rate-limit-filter")]
 mod token_rate_limit;
 mod token_usage;

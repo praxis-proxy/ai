@@ -7,11 +7,38 @@ use std::future::Future;
 
 use praxis_filter::{FilterAction, HttpFilter};
 
+#[cfg(feature = "token-quota-filter")]
+use super::shared_quota_cost;
+#[cfg(feature = "token-quota-filter")]
+use super::weights::{UsageCounts, weighted_cost};
 use super::{META_FAIL_OPEN, META_RESERVATION_ID, TokenRateLimitFilter};
+#[cfg(feature = "token-quota-filter")]
+use crate::token_quota::{TokenQuotaDecision, TokenQuotaResultStatus};
 use crate::token_usage::{
     META_TOKEN_CACHE_READ, META_TOKEN_CACHE_WRITE, META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_REASONING,
     META_TOKEN_STATUS, META_TOKEN_TOTAL, TOKEN_STATUS_OVERFLOW,
 };
+#[cfg(feature = "token-quota-filter")]
+pub(crate) fn legacy_weighted_cost_parity_fixture() -> Option<u64> {
+    let usage = UsageCounts {
+        input: Some(100),
+        output: Some(50),
+        total: Some(150),
+        cache_read: Some(10),
+        cache_write: Some(5),
+        reasoning: Some(10),
+        ..UsageCounts::default()
+    };
+    let weights = super::TokenWeights {
+        input: 1.0,
+        output: 1.0,
+        cached_input: 0.1,
+        cache_write: 2.4,
+        reasoning: 1.0,
+    };
+
+    weighted_cost(usage, weights)
+}
 
 /// Wrap one rule body (already-valid YAML lines, unindented) into a
 /// full one-rule `rules:` config, named `"default"`. Most scenarios
@@ -1219,6 +1246,7 @@ fn debug_format_lists_configured_rule_names() {
         epoch: std::time::Instant::now(),
         valkey_clock: false,
         hierarchy: None,
+        reconciliation_source: super::ReconciliationSource::LegacyWeights,
         on_failure: super::config::BackendOnFailure::Closed,
     };
     let debug = format!("{filter:?}");
@@ -2858,6 +2886,41 @@ async fn model_scaled_outer_multiplier_composes_with_per_model_multiplier() {
 // -----------------------------------------------------------------------------
 // M4 token-type weights
 // -----------------------------------------------------------------------------
+
+#[test]
+fn shared_quota_source_rejects_legacy_weight_configuration() {
+    for (top_level, rule) in [
+        (
+            "use_token_quota: true\ndefault_weights:\n  cached_input: 0.1",
+            "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 50",
+        ),
+        (
+            "use_token_quota: true",
+            "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 50\nweights:\n  reasoning: 0.9",
+        ),
+    ] {
+        let error = TokenRateLimitFilter::from_config(&single_rule_yaml_with(top_level, rule))
+            .err()
+            .expect("two quota sources must be rejected");
+        assert!(error.to_string().contains("cannot be combined"), "{error}");
+    }
+}
+
+#[cfg(feature = "token-quota-filter")]
+#[test]
+fn shared_quota_decision_is_the_authoritative_reconciliation_value() {
+    let decision = TokenQuotaDecision {
+        status: TokenQuotaResultStatus::Evaluated,
+        value: Some(29),
+    };
+    assert_eq!(shared_quota_cost(decision), Some(29));
+
+    let missing = TokenQuotaDecision {
+        status: TokenQuotaResultStatus::MissingUsage,
+        value: Some(110),
+    };
+    assert_eq!(shared_quota_cost(missing), None);
+}
 
 fn set_typed_usage(ctx: &mut praxis_filter::HttpFilterContext<'_>, input: u64, output: u64, total: u64) {
     ctx.set_metadata(META_TOKEN_INPUT, input.to_string());

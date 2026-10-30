@@ -21,6 +21,8 @@ Accounting log field `outcome` on hard denials is one of: `budget_exhausted` (wi
 
 - `praxis_trl_unauthenticated_total{rule}`
 
+- `praxis_trl_quota_source_missing_total{rule}`: shared-quota responses for which PPE produced no decision; `rule` is the configured rule name.
+
 - `praxis_trl_tokens_reserved_total{rule}`
 
 - `praxis_trl_tokens_reconciled_total{rule}`
@@ -128,6 +130,7 @@ Admissions, denials, reconciliations, and backend failures also emit structured 
 | `default_weights.cached_input` | number | no | Weight for prompt-cache hits (`token.cache_read`). A value below `1.0` cheapens cached input; the proposal's example is `0.1`. |
 | `default_weights.cache_write` | number | no | Weight for prompt-cache writes (`token.cache_write`). Anthropic cache creation is typically priced *above* uncached input; omit to keep `1.0`. |
 | `default_weights.reasoning` | number | no | Weight for reasoning / thinking tokens (`token.reasoning`). |
+| `use_token_quota` | bool | no | Reconcile reservations from a PPE token-quota plugin result instead of recomputing static token weights inside this filter. Defaults to `false` for full compatibility with existing configurations. Requires the `token-quota-filter` feature when set to `true`. Mutually exclusive with both `default_weights` and per-rule `weights`: the PPE result must be the single source of quota units. Server startup also requires one unconditional response chain ordered `token_rate_limit`, `policy`, then `token_count`. |
 | `hierarchy` | object[] | no | Optional three-level hierarchy enforcing independent org, team, and user budgets on each request. Exactly three levels in `[org, team, user]` order are required when present; each level reuses the existing algorithm/capacity fields from [`RuleAlgorithm`]. Org and team set `identity_header`. The user level sets `identity: authenticated_subject`. Exactly one of those fields is present. A configured hierarchy applies to every request that reaches the filter. The rule list must include a catch-all (a rule with no `match`), and every rule must have `reserved_tokens` or `estimation.fallback_estimate`, so a request cannot skip the three budgets by missing a matcher or a body field. A fixed estimate (`reserved_tokens` or `strategy: fixed`) must fit in every level's capacity. An org, team, or user denial is always 429. A rule's `enforcement: soft` does not apply to those three levels. Soft still applies to the matched rule after the three levels accept. |
 | `hierarchy[].level` | `org` \| `team` \| `user` | yes | Which hierarchy level this entry configures. |
 | `hierarchy[].algorithm` | `sliding_window` \| `token_bucket` | yes | Algorithm choice and parameters for this level's budget. |
@@ -163,6 +166,8 @@ default_weights:                   # optional: omitted types default to 1.0
   cached_input: 0.1                # prompt-cache hits (token.cache_read)
   cache_write: 1.25                # prompt-cache writes (token.cache_write)
   reasoning: 0.9                   # thinking tokens (token.reasoning)
+# use_token_quota: true            # alternatively consume PPE quota output;
+                                   # mutually exclusive with all weights
 rules:
   - name: team-alpha                 # human-readable, unique per filter instance
     match:                           # optional: omit for a catch-all rule

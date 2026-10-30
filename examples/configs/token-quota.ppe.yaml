@@ -1,0 +1,22 @@
+plugins:
+  - name: weighted-quota-v1
+    kind: ai/token-quota
+    hooks: [cmf.llm_output]
+    capabilities: [metadata_only_response]
+    mode: sequential
+    on_error: fail
+    config:
+      formula_id: weighted-quota-v1
+      unit: quota_units
+      weights:
+        input: 0.3333333333333333
+        cached_input: 0.03333333333333333
+        cache_write: 0.4166666666666667
+        output: 1.0
+        reasoning: 1.0
+
+routes:
+  - llm: "*"
+    authorization:
+      post_invocation:
+        - "run(weighted-quota-v1)"
