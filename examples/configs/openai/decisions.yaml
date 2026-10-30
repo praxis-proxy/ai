@@ -1,0 +1,65 @@
+# OpenAI Decisions API Pass-Through
+#
+# Routes OpenAI Decisions API traffic (`POST /v1/decisions`) to a dedicated
+# backend. The `ai_operation` filter classifies the request head — method and
+# path alone, without reading the body — and promotes the
+# `openai_decisions` application protocol to an internal routing header
+# (x-praxis-ai-*) that the branch router matches for cluster selection.
+# Internal headers are stripped before upstream by header hygiene.
+#
+# The Decisions contract is proxied, not owned: the request body and the
+# response pass through unchanged, and the backend owns validation and the
+# answer semantics.
+#
+# Example request:
+#
+#   curl -X POST http://localhost:8080/v1/decisions \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-6-luna","input":"Order arrived damaged.",
+#          "questions":[{"type":"predicate","name":"damaged",
+#          "instructions":"Does the text report damage?"}]}'
+#
+# All other traffic, including unrecognized paths, falls through to the
+# default cluster.
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [ai-routing]
+
+filter_chains:
+  - name: ai-routing
+    filters:
+      - filter: ai_operation
+        branch_chains:
+          - name: decisions
+            on_result:
+              filter: ai_operation
+              key: application_protocol
+              result: openai_decisions
+            chains:
+              - name: decisions-chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: "decisions-backend"
+            rejoin: shared_load_balancer
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "default-backend"
+
+      - name: shared_load_balancer
+        filter: load_balancer
+        clusters:
+          - name: "decisions-backend"
+            endpoints:
+              - "127.0.0.1:3001"
+          - name: "default-backend"
+            endpoints:
+              - "127.0.0.1:3002"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

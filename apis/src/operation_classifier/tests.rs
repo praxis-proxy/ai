@@ -194,6 +194,53 @@ async fn classifies_chat_completions_operations_from_the_request_head() {
 }
 
 #[tokio::test]
+async fn classifies_decisions_operations_from_the_request_head() {
+    for (method, path, operation_id) in [
+        ("POST", "/v1/decisions", "createDecision"),
+        ("POST", "/v1/decisions/", "createDecision"),
+        ("POST", "/v1/decisions?foo=1", "createDecision"),
+    ] {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
+        drop(filter.on_request_head(&mut ctx).await.unwrap());
+
+        let matched = ctx.extensions.get::<AiOperationMatch>().copied();
+        assert!(matched.is_some(), "{method} {path} must classify");
+        let matched = matched.unwrap();
+        assert_eq!(
+            matched.application_protocol,
+            ApplicationProtocol::new("openai_decisions"),
+            "{method} {path}"
+        );
+        assert_eq!(matched.operation_id, operation_id, "{method} {path}");
+        assert_eq!(matched.transport, Transport::Http, "{method} {path}");
+        assert_eq!(
+            matched.request_body,
+            RequestBody::Json { required: true },
+            "{method} {path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn decisions_heads_with_unsupported_methods_do_not_classify() {
+    for (method, path) in [
+        ("GET", "/v1/decisions"),
+        ("DELETE", "/v1/decisions"),
+        ("POST", "/v1/decisions/abc"),
+    ] {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
+        drop(filter.on_request_head(&mut ctx).await.unwrap());
+
+        let matched = ctx.extensions.get::<AiOperationMatch>().copied();
+        assert!(matched.is_none(), "{method} {path} must not classify");
+    }
+}
+
+#[tokio::test]
 async fn websocket_handshake_on_chat_completions_does_not_match() {
     let filter = default_filter();
     let mut request = req("GET", "/v1/chat/completions");

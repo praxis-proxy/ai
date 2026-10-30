@@ -126,6 +126,7 @@ for how these are authored and regenerated.
 | ------ | ------------- |
 | [conversations-postgres-mtls.yaml](configs/openai/conversations/conversations-postgres-mtls.yaml) | Local /v1/conversations endpoints backed by PostgreSQL over a TLS-verified connection that authenticates with a client certificate instead of a password |
 | [conversations.yaml](configs/openai/conversations/conversations.yaml) | Local /v1/conversations endpoints for conversation lifecycle, backed by the ConversationItemStore |
+| [decisions.yaml](configs/openai/decisions.yaml) | Routes OpenAI Decisions API traffic (`POST /v1/decisions`) to a dedicated backend |
 | [embeddings-routing.yaml](configs/openai/embeddings/embeddings-routing.yaml) | Routes OpenAI Embeddings API requests to a dedicated Embeddings API backend |
 | [operation-classifier.yaml](configs/openai/operation-classifier.yaml) | Identifies supported AI operations from the request head — method, normalized path, and protocol headers — and publishes the result so a pipeline can branch on a proxy-owned fact instead of a path prefix |
 | [prompts-routing.yaml](configs/openai/prompts/prompts-routing.yaml) | Routes OpenAI Prompts API requests to a dedicated Prompts API backend |
