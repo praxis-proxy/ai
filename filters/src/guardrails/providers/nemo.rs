@@ -7,6 +7,7 @@
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures::{StreamExt as _, stream::FuturesUnordered};
 use http::{HeaderMap, HeaderValue, Method};
 use praxis_ai_apis::{
     callout_target::{AddressPolicy, validate_configured_http_target, validate_resolved_addrs},
@@ -31,6 +32,12 @@ const DEFAULT_MAX_MESSAGE_CHECKS: u32 = 32;
 
 /// Maximum response body size accepted from `NeMo` (1 MiB).
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
+
+/// Maximum number of prefix checks allowed to be in flight at once.
+///
+/// This keeps operator-configured `max_message_checks` values from creating
+/// an unbounded number of retained cumulative request bodies and callouts.
+const MAX_IN_FLIGHT_CHECKS: usize = 32;
 
 /// Input-only rail selection for request-phase checks.
 const INPUT_RAIL_TYPES: &[&str] = &["input"];
@@ -256,7 +263,7 @@ impl NemoProvider {
         self.evaluate_prefixes(messages, indices, phase, runtime).await
     }
 
-    /// Evaluate each target prefix, accumulating `modified` replacements.
+    /// Evaluate each target prefix concurrently, accumulating `modified` replacements.
     async fn evaluate_prefixes(
         &self,
         messages: Vec<serde_json::Value>,
@@ -264,18 +271,46 @@ impl NemoProvider {
         phase: GuardPhase,
         runtime: &GuardCalloutRuntime<'_>,
     ) -> Result<GuardResult, FilterError> {
-        let mut pending_redact = None;
-        for end in indices {
-            ensure_deadline_remaining(runtime.deadline)?;
-            let prefix = messages
-                .get(..=end)
-                .ok_or_else(|| -> FilterError { "ai_guardrails (nemo): invalid message index".into() })?;
-            match apply_slice_result(pending_redact, self.check_messages(prefix, phase, runtime).await?, end) {
-                Ok(pending) => pending_redact = pending,
-                Err(block) => return Ok(block),
+        ensure_deadline_remaining(runtime.deadline)?;
+
+        let mut pending_indices = indices.into_iter();
+        let mut checks = FuturesUnordered::new();
+        for _ in 0..MAX_IN_FLIGHT_CHECKS {
+            let Some(end) = pending_indices.next() else {
+                break;
+            };
+            checks.push(self.check_prefix(&messages, end, phase, runtime));
+        }
+
+        let mut results = Vec::with_capacity(checks.len());
+        while let Some(result) = checks.next().await {
+            let (end, result) = result?;
+            if let NemoVerdict::Block { reason } = result {
+                return Ok(GuardResult::Block { reason });
+            }
+            results.push((end, result));
+            if let Some(end) = pending_indices.next() {
+                checks.push(self.check_prefix(&messages, end, phase, runtime));
             }
         }
-        Ok(pending_redact.unwrap_or(GuardResult::Pass))
+
+        Ok(combine_slice_results(results))
+    }
+
+    /// Start one prefix check while retaining its target message index.
+    async fn check_prefix(
+        &self,
+        messages: &[serde_json::Value],
+        end: usize,
+        phase: GuardPhase,
+        runtime: &GuardCalloutRuntime<'_>,
+    ) -> Result<(usize, NemoVerdict), FilterError> {
+        let prefix = messages
+            .get(..=end)
+            .ok_or_else(|| -> FilterError { "ai_guardrails (nemo): invalid message index".into() })?;
+        self.check_messages(prefix, phase, runtime)
+            .await
+            .map(|result| (end, result))
     }
 
     /// POST one message slice to `/v1/checks` through the outbound chain.
@@ -554,7 +589,25 @@ fn apply_slice_result(
     }
 }
 
-/// Append one `modified` verdict onto any pending redaction.
+/// Combine completed non-terminal slice results in message order.
+///
+/// Concurrent completion order is nondeterministic, so results carry their
+/// target-message index and are sorted before applying the existing aggregate
+/// semantics. This preserves the sequential behavior where the latest
+/// modified result wins.
+fn combine_slice_results(mut results: Vec<(usize, NemoVerdict)>) -> GuardResult {
+    results.sort_unstable_by_key(|(end, _)| *end);
+    let mut pending_redact = None;
+    for (message_index, result) in results {
+        match apply_slice_result(pending_redact, result, message_index) {
+            Ok(pending) => pending_redact = pending,
+            Err(block) => return block,
+        }
+    }
+    pending_redact.unwrap_or(GuardResult::Pass)
+}
+
+/// Indices of messages whose role matches the active guard phase.
 ///
 /// A later `modified` slice replaces the reason and keeps every earlier replacement.
 fn merge_redact(pending: Option<GuardResult>, extra: GuardResult) -> GuardResult {
@@ -992,6 +1045,36 @@ guardrails:
                 ],
                 reason: "pii".into(),
             })
+        );
+    }
+
+    #[test]
+    fn combine_slice_results_uses_message_order_not_completion_order() {
+        let first = NemoVerdict::Modified {
+            content: "first".into(),
+            reason: "pii".into(),
+        };
+        let latest = NemoVerdict::Modified {
+            content: "latest".into(),
+            reason: "latest-pii".into(),
+        };
+
+        let result = combine_slice_results(vec![(3, latest), (1, first)]);
+        assert_eq!(
+            result,
+            GuardResult::Redact {
+                replacements: vec![
+                    MessageRedaction {
+                        index: 1,
+                        modified_text: "first".into(),
+                    },
+                    MessageRedaction {
+                        index: 3,
+                        modified_text: "latest".into(),
+                    },
+                ],
+                reason: "latest-pii".into(),
+            }
         );
     }
 

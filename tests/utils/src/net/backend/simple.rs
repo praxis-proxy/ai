@@ -484,6 +484,56 @@ impl StatefulCapturingBackend {
     }
 }
 
+/// Start a backend whose response is selected from the captured request body.
+///
+/// The returned guard captures every request, while the handler makes response
+/// selection independent of concurrent request arrival order.
+///
+/// # Panics
+///
+/// Panics if the backend cannot bind or if the handler panics while serving a
+/// request.
+pub fn start_body_aware_backend(
+    handler: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
+) -> StatefulCapturingGuard {
+    use std::sync::{Arc, Mutex};
+
+    let handler = Arc::new(handler);
+    let captured: Arc<Mutex<Vec<CapturedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = Arc::clone(&captured);
+    let handler_clone = Arc::clone(&handler);
+
+    let guard = spawn_tcp_server_with_shutdown(move |mut stream| {
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let raw = read_full_request(&mut stream);
+        let (method, uri, headers, body) = parse_raw_request(&raw);
+
+        captured_clone
+            .lock()
+            .expect("captured requests mutex not poisoned")
+            .push(CapturedRequest {
+                method: method.clone(),
+                uri: uri.clone(),
+                headers,
+                body: body.clone(),
+            });
+
+        if is_probe_request(&method, &uri) {
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nOK");
+            return;
+        }
+
+        let (status, response_body) = handler_clone(&body);
+        let response = format_http_response(status, &response_body);
+        let _ = stream.write_all(&response);
+    });
+
+    StatefulCapturingGuard {
+        guard,
+        requests: captured,
+    }
+}
+
 /// Check if request is a probe.
 fn is_probe_request(method: &str, uri: &str) -> bool {
     (method == "GET" && (uri == "/" || uri == "/api/hello")) || method == "HEAD"
