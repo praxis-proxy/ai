@@ -29,7 +29,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use metrics::{SharedString, counter};
-use praxis_ai_apis::promotion::is_promotable_value;
+use praxis_ai_apis::{MODEL_PROVIDER_CLIENT_MODEL_METADATA, promotion::is_promotable_value};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
@@ -294,6 +294,7 @@ impl HttpFilter for TokenUsageMetricsFilter {
 
 fn resolve_model<'a>(ctx: &'a HttpFilterContext<'_>) -> Option<&'a str> {
     [
+        MODEL_PROVIDER_CLIENT_MODEL_METADATA,
         "openai_responses_request.model",
         "openai_chat_completions_request.model",
         "anthropic_messages_request.model",
@@ -481,6 +482,15 @@ mod tests {
         ctx.set_metadata("openai_responses_request.model", "");
         ctx.set_metadata("anthropic_messages_request.model", "bad\nmodel");
         ctx.set_metadata("model_to_header.model", "gpt-4o");
+        assert_eq!(resolve_model(&ctx), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn resolve_model_prefers_preserved_client_model() {
+        let req = make_request(http::Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "gpt-4o");
+        ctx.set_metadata("openai_chat_completions_request.model", "provider-model");
         assert_eq!(resolve_model(&ctx), Some("gpt-4o"));
     }
 

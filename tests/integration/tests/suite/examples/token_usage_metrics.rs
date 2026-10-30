@@ -9,11 +9,10 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use praxis_core::config::Config;
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext};
 use praxis_test_utils::{
-    Backend, RoutedBackend, free_port, http_send, load_example_config, parse_body, parse_status, registry_with,
-    start_proxy, start_proxy_with_registry, wait_for_http,
+    Backend, free_port, http_send, load_example_config, parse_body, parse_status, registry_with, start_proxy,
+    start_proxy_with_registry, wait_for_http,
 };
 
 const OPENAI_JSON: &str = r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}"#;
@@ -96,55 +95,20 @@ fn example_config_emits_metrics_for_authenticated_tenant() {
     let backend = Backend::fixed(OPENAI_JSON)
         .header("content-type", "application/json")
         .start_with_shutdown();
-    let metering_port = RoutedBackend::new()
-        .route("/api/v1/customers", 200, r#"{"hasAccess": true, "balance": 9000.0}"#)
-        .route("/api/v1/events", 204, "")
-        .start();
     let proxy_port = free_port();
     let admin_port = free_port();
-    let yaml = format!(
-        r#"
-listeners:
-  - name: default
-    address: "127.0.0.1:{proxy_port}"
-    filter_chains: [main]
-filter_chains:
-  - name: main
-    filters:
-      - filter: trusted_tenant_metadata
-      - filter: router
-        routes:
-          - path_prefix: "/"
-            cluster: backend
-      - filter: token_usage_metrics
-        tenant_metadata_key: "x-tenant-username"
-        allowed_tenants: [token-metrics-example-alice]
-        allowed_models: [gpt-4o]
-      - filter: external_metering
-        metering_url: "http://127.0.0.1:{metering_port}"
-        allow_private_endpoint: true
-        feature_key: "inference-tokens"
-        source: "ai-gateway"
-        provider: "openai"
-        fail_open: false
-        identity_header_prefix: "x-tenant-"
-      - filter: token_count
-        provider: openai
-      - filter: load_balancer
-        clusters:
-          - name: backend
-            endpoints: ["127.0.0.1:{backend_port}"]
-admin:
-  metrics_address: "127.0.0.1:{admin_port}"
-insecure_options:
-  allow_private_endpoints: true
-"#,
-        backend_port = backend.port(),
+    let mut config = load_example_config(
+        "token-usage-metrics.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3000", backend.port())]),
     );
-    let config = Config::from_yaml(&yaml).expect("authenticated metrics config should parse");
+    let trusted_tenant_filter =
+        serde_yaml::from_str("filter: trusted_tenant_metadata").expect("trusted tenant test filter should parse");
+    config.filter_chains[0].filters.insert(0, trusted_tenant_filter);
+    let admin_addr = format!("127.0.0.1:{admin_port}");
+    config.admin.metrics_address = Some(admin_addr.clone());
     let registry = registry_with("trusted_tenant_metadata", || Box::new(TrustedTenantMetadata));
     let proxy = start_proxy_with_registry(&config, &registry);
-    let admin_addr = format!("127.0.0.1:{admin_port}");
     wait_for_http(&admin_addr);
 
     let raw = http_send(
