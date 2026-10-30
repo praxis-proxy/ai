@@ -438,6 +438,58 @@ class TestRequestFieldHandling:
         assert "thinking" in str(excinfo.value)
         assert RecordingBackend.bodies == []
 
+    def test_cache_control_rejection_names_the_marker(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                system=[
+                    {
+                        "type": "text",
+                        "text": "You are helpful",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+            )
+
+        assert excinfo.value.status_code == 400
+        assert "`system` block carries `cache_control`" in str(excinfo.value), (
+            "error message must name the cache_control marker"
+        )
+        assert "prompt_caching" in str(excinfo.value), (
+            "error message must name the allow_lossy_features opt-in that degrades it"
+        )
+        assert RecordingBackend.bodies == []
+
+    def test_cache_control_rejection_does_not_recommend_degradation_for_unrecognized_marker(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                system=[
+                    {
+                        "type": "text",
+                        "text": "You are helpful",
+                        "cache_control": {"type": "ephemeral", "ttl": "7m"},
+                    }
+                ],
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+            )
+
+        assert excinfo.value.status_code == 400
+        assert "unsupported `cache_control` marker" in str(excinfo.value), (
+            "error message must report the marker as unsupported"
+        )
+        assert "allow_lossy_features" not in str(excinfo.value), (
+            "unrecognized marker cannot be degraded, so the opt-in must not be recommended"
+        )
+        assert RecordingBackend.bodies == []
+
     def test_default_valued_rejected_field_is_dropped(self, anthropic_client):
         RecordingBackend.bodies.clear()
 
