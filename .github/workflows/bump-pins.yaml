@@ -1,0 +1,192 @@
+name: Bump Pins
+
+# ------------------------------------------------------------------------------
+# Weekly pinned-client and vLLM bump
+#
+# Runs `cargo xtask bump-pins`, which moves the pinned coding clients (Claude
+# Code, OpenCode 1.x/2.x, pi, Codex) and the vLLM GPU image to their latest
+# upstream releases, rewrites every site from the manifests, swaps the checksum
+# fixtures, and validates the result with `check-pins` (see
+# xtask/src/pins/bump.rs).
+#
+# The result is a DRAFT pull request from the `bot/bump-pins` branch whose body
+# is the re-validation checklist. It never auto-merges: behavioral pins (tool
+# lists, exit codes, xfails, replay recordings, "verified against" claims) are
+# re-validated by a person, and the GPU acceptance lanes (`vllm-full-suite`
+# label) are the ready-for-review gate.
+#
+# The PR is opened with the praxis-bot-app token rather than github.token, so
+# CI runs on it. The commit is created through the GitHub API, which signs it
+# as the app (a local `git commit` here would be unsigned and fail the
+# signed-commits check), and the branch is moved with a lease on the head the
+# workflow inspected, so a concurrent push is never overwritten.
+# ------------------------------------------------------------------------------
+
+on:
+  schedule:
+    # Mondays, clear of the nightly, CodeQL, publish, and GPU schedules.
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      pins:
+        description: "Space-separated pins to bump (claude opencode opencode-v2 pi codex vllm); empty for all"
+        required: false
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  BRANCH: bot/bump-pins
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: bump-pins-cargo
+
+      - name: Bump pins
+        env:
+          # Lifts the anonymous GitHub API rate limit for release discovery.
+          GITHUB_TOKEN: ${{ github.token }}
+          PINS: ${{ inputs.pins }}
+        run: |
+          args=()
+          for pin in $PINS; do
+            args+=(--pin "$pin")
+          done
+          cargo xtask bump-pins "${args[@]}" --report "$RUNNER_TEMP/bump-report.md"
+
+      - name: Detect changes
+        id: diff
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No pin moved; nothing to propose."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate token
+        if: steps.diff.outputs.changed == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.PRAXIS_BOT_APP_ID }}
+          private-key: ${{ secrets.PRAXIS_BOT_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Open or update the draft pull request
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          set -o pipefail
+          bot="${APP_SLUG}[bot]"
+          zero=0000000000000000000000000000000000000000
+          pr=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+
+          if [ -n "$pr" ]; then
+            # One snapshot: the head inspected here is the lease for the ref
+            # update below.
+            view=$(gh pr view "$pr" --json commits,headRefOid,isDraft,labels)
+            head=$(jq -r .headRefOid <<<"$view")
+
+            # A person re-validating on the bot branch pushes their own commits;
+            # replacing the branch would discard them. Leave that PR alone.
+            others=$(jq --arg bot "$bot" \
+              '[.commits[].authors[].login | select(. != $bot)] | length' <<<"$view")
+            if [ "$others" -gt 0 ]; then
+              echo "::notice::#$pr has commits from people; not overwriting it."
+              exit 0
+            fi
+
+            # New content needs a fresh review and a fresh GPU acceptance run:
+            # the vLLM lanes start on the `labeled` event, so a label left in
+            # place would never re-run them. Both happen before the push so its
+            # synchronize event does not start the label-gated lanes either.
+            if [ "$(jq .isDraft <<<"$view")" = false ]; then
+              gh pr ready "$pr" --undo
+            fi
+            if jq -e '.labels | any(.name == "vllm-full-suite")' <<<"$view" >/dev/null; then
+              gh pr edit "$pr" --remove-label vllm-full-suite
+            fi
+          else
+            # No open PR: create the branch, or replace one left by a closed PR.
+            head=$(gh api "repos/$GH_REPO/git/ref/heads/$BRANCH" --jq .object.sha 2>/dev/null || echo "$zero")
+          fi
+
+          # Build the commit on the checked-out base through the API so GitHub
+          # signs it as the app.
+          base=$(git rev-parse HEAD)
+          git add -A
+          entries='[]'
+          while IFS= read -r -d '' status && IFS= read -r -d '' path; do
+            if [ "$status" = D ]; then
+              entry=$(jq -n --arg path "$path" '{path: $path, mode: "100644", type: "blob", sha: null}')
+            else
+              mode=$(git ls-files --stage -- "$path" | cut -d' ' -f1)
+              blob=$(base64 -w0 "$path" | jq -Rs '{content: ., encoding: "base64"}' |
+                gh api "repos/$GH_REPO/git/blobs" --input - --jq .sha)
+              entry=$(jq -n --arg path "$path" --arg mode "$mode" --arg sha "$blob" \
+                '{path: $path, mode: $mode, type: "blob", sha: $sha}')
+            fi
+            entries=$(jq -c --argjson entry "$entry" '. + [$entry]' <<<"$entries")
+          done < <(git diff --cached --name-status --no-renames -z HEAD)
+
+          tree=$(jq -n --arg base "$(git rev-parse 'HEAD^{tree}')" --argjson tree "$entries" \
+            '{base_tree: $base, tree: $tree}' |
+            gh api "repos/$GH_REPO/git/trees" --input - --jq .sha)
+
+          bot_id=$(gh api "/users/${bot}" --jq .id)
+          message="chore(pins): bump pinned clients and vLLM image
+
+          Generated by cargo xtask bump-pins; see the pull request for the re-validation checklist.
+
+          Signed-off-by: ${bot} <${bot_id}+${bot}@users.noreply.github.com>"
+          # No author or committer: GitHub only signs API commits it attributes
+          # to the app itself.
+          commit=$(jq -n --arg message "$message" \
+            --arg tree "$tree" --arg parent "$base" \
+            '{message: $message, tree: $tree, parents: [$parent]}' |
+            gh api "repos/$GH_REPO/git/commits" --input - --jq .sha)
+
+          # Move the branch only if it still points where it did when inspected.
+          repo_id=$(gh api "repos/$GH_REPO" --jq .node_id)
+          # shellcheck disable=SC2016 # $repo etc. are GraphQL variables, not shell
+          if ! gh api graphql \
+            -f query='mutation($repo: ID!, $ref: GitRefname!, $before: GitObjectID!, $after: GitObjectID!) {
+              updateRefs(input: {repositoryId: $repo, refUpdates: [{name: $ref, beforeOid: $before, afterOid: $after, force: true}]}) {
+                clientMutationId
+              }
+            }' \
+            -f repo="$repo_id" -f ref="refs/heads/$BRANCH" -f before="$head" -f after="$commit" >/dev/null; then
+            echo "::error::$BRANCH moved since it was inspected; not overwriting it. Re-run the workflow."
+            exit 1
+          fi
+
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" --body-file "$RUNNER_TEMP/bump-report.md"
+          else
+            gh pr create --draft --base main --head "$BRANCH" \
+              --title "chore(pins): bump pinned clients and vLLM image" \
+              --body-file "$RUNNER_TEMP/bump-report.md"
+          fi

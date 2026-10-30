@@ -89,6 +89,11 @@ enum Command {
     #[cfg(feature = "pins")]
     CheckPins(pins::CheckArgs),
 
+    /// Bump the pinned coding clients and vLLM image to their latest
+    /// upstream releases, leaving behavioral re-validation to a checklist.
+    #[cfg(feature = "dev")]
+    BumpPins(pins::BumpArgs),
+
     /// Check the runtime Anthropic Messages operation registry
     /// against the pinned Anthropic specification.
     #[cfg(feature = "dev")]
@@ -259,6 +264,7 @@ fn run_dev(command: Command) {
 #[cfg(feature = "dev")]
 fn run_dev_continued(command: Command) {
     match command {
+        Command::BumpPins(args) => pins::run_bump(&args),
         Command::SyncExampleReadme(args) => sync_example_readme::run(&args),
         Command::GenerateFilterDocs(args) => filter_docs::generate(args),
         Command::LintFilterDocs(args) => filter_docs::lint(args),

@@ -131,6 +131,13 @@ impl Site {
         self.template.replace("{v}", value)
     }
 
+    /// Rewrite the anchor for `old` to the anchor for `new`, failing on drift.
+    #[cfg(feature = "dev")]
+    pub(crate) fn rewrite(&self, contents: &str, old: &str, new: &str) -> Result<String, String> {
+        self.expect(contents, old)?;
+        Ok(contents.replace(&self.render(old), &self.render(new)))
+    }
+
     /// Fail unless `contents` carries the anchor for `value` exactly
     /// [`count`](Self::count) times.
     pub(crate) fn expect(&self, contents: &str, value: &str) -> Result<(), String> {
@@ -146,6 +153,10 @@ impl Site {
         }
     }
 }
+
+/// The Claude Code manifest's inline checksum, rewritten with its version.
+#[cfg(feature = "dev")]
+pub(crate) const CLAUDE_SHA256_SITE: Site = site(manifest::CLAUDE, "sha256 = \"{v}\"", 1);
 
 /// Shorthand for a [`Site`] table entry.
 const fn site(path: &'static str, template: &'static str, count: usize) -> Site {

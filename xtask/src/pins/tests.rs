@@ -152,6 +152,30 @@ fn drifted_checksum_fixture_is_reported() {
     assert_reported(&errors, &["codex-cli", "names `other-"]);
 }
 
+#[test]
+fn stale_checksum_fixture_is_reported() {
+    let manifests = Manifests::load(&Repo::new(workspace_root())).expect("manifests should parse");
+    let fixture = sites::fixtures(&manifests)
+        .into_iter()
+        .find(|fixture| fixture.pin == Pin::Pi)
+        .expect("pi should have a checksum fixture");
+    let mut repo = Repo::new(workspace_root());
+    repo.stage(&format!("{}/0.0.1-linux-x64.sha256", fixture.dir), String::new());
+    assert_reported(&errors(&repo), &["0.0.1-linux-x64.sha256 is stale"]);
+}
+
+#[test]
+fn removed_checksum_fixture_is_reported() {
+    let manifests = Manifests::load(&Repo::new(workspace_root())).expect("manifests should parse");
+    let fixture = sites::fixtures(&manifests)
+        .into_iter()
+        .find(|fixture| fixture.pin == Pin::OpencodeV2)
+        .expect("OpenCode 2.x should have a checksum fixture");
+    let mut repo = Repo::new(workspace_root());
+    repo.stage_removal(&fixture.path());
+    assert_reported(&errors(&repo), &["OpenCode 2.x needs a checksum fixture"]);
+}
+
 // -----------------------------------------------------------------------------
 // Manifest Invariants
 // -----------------------------------------------------------------------------
@@ -230,4 +254,163 @@ fn major_reads_the_leading_component() {
     assert_eq!(major("1.19.3"), Some(1));
     assert_eq!(major("0.144.1"), Some(0));
     assert_eq!(major("v2"), None);
+}
+
+// -----------------------------------------------------------------------------
+// bump-pins
+// -----------------------------------------------------------------------------
+
+#[cfg(feature = "dev")]
+mod bump {
+    use serde_json::json;
+
+    use super::super::{
+        bump::{checklist, display_version, names_version},
+        sites::{Pin, Site},
+        upstream::{
+            is_stable, newest_in_series, newest_release, parse_claude_checksum, parse_hub_digest, parse_release,
+            tags_latest_in_series,
+        },
+    };
+
+    /// A site used only by these tests.
+    const SITE: Site = Site {
+        path: "test.yaml",
+        template: "VERSION: \"{v}\"",
+        count: 1,
+    };
+
+    #[test]
+    fn site_rewrite_replaces_the_anchor() {
+        let rewritten = SITE
+            .rewrite("a\nVERSION: \"1.0.0\"\nb", "1.0.0", "1.1.0")
+            .expect("anchor should rewrite");
+        assert_eq!(rewritten, "a\nVERSION: \"1.1.0\"\nb");
+    }
+
+    #[test]
+    fn site_rewrite_fails_on_a_missing_anchor() {
+        let error = SITE
+            .rewrite("VERSION: \"0.9.0\"", "1.0.0", "1.1.0")
+            .expect_err("a drifted anchor should fail");
+        assert!(error.contains("found 0"), "{error}");
+    }
+
+    #[test]
+    fn site_rewrite_fails_on_a_duplicated_anchor() {
+        let error = SITE
+            .rewrite("VERSION: \"1.0.0\"\nVERSION: \"1.0.0\"", "1.0.0", "1.1.0")
+            .expect_err("an ambiguous anchor should fail");
+        assert!(error.contains("found 2"), "{error}");
+    }
+
+    #[test]
+    fn npm_latest_is_used_only_within_the_series() {
+        let tags = json!({"latest": "1.19.4", "beta": "0.0.0-beta-1"});
+        assert_eq!(tags_latest_in_series(&tags, 1).as_deref(), Some("1.19.4"));
+        assert_eq!(tags_latest_in_series(&tags, 2), None);
+        assert_eq!(tags_latest_in_series(&json!({"latest": "2.0.0-rc.1"}), 2), None);
+    }
+
+    #[test]
+    fn newest_in_series_compares_numerically_and_skips_prereleases() {
+        let packument = json!({"versions": {
+            "1.9.0": {}, "1.10.0": {}, "1.11.0-rc.1": {}, "2.0.0": {}, "0.0.0-dev-1": {}
+        }});
+        assert_eq!(newest_in_series(&packument, 1).as_deref(), Some("1.10.0"));
+        assert_eq!(newest_in_series(&packument, 3), None);
+    }
+
+    #[test]
+    fn github_release_strips_the_tag_prefix_and_reads_asset_digests() {
+        let digest = "a".repeat(64);
+        let release = json!({
+            "tag_name": "rust-v0.164.0",
+            "prerelease": false,
+            "draft": false,
+            "assets": [
+                {"name": "codex.tar.gz", "digest": format!("sha256:{digest}")},
+                {"name": "no-digest.tar.gz", "digest": null},
+            ],
+        });
+        let parsed = parse_release(&release, "rust-v").expect("release should parse");
+        assert_eq!(parsed.version, "0.164.0");
+        assert_eq!(parsed.asset_sha256("codex.tar.gz"), Ok(digest.as_str()));
+        assert!(parsed.asset_sha256("no-digest.tar.gz").is_err());
+        assert!(parse_release(&release, "v").is_err(), "a mismatched prefix should fail");
+    }
+
+    #[test]
+    fn github_prereleases_are_rejected() {
+        let release = json!({"tag_name": "v1.5.0", "prerelease": true, "assets": []});
+        assert!(parse_release(&release, "v").is_err());
+    }
+
+    #[test]
+    fn newest_github_release_honors_prefix_series_and_version_order() {
+        let releases = json!([
+            {"tag_name": "v2.0.0", "prerelease": false, "assets": []},
+            {"tag_name": "v1.10.0-rc.1", "prerelease": true, "assets": []},
+            {"tag_name": "v1.9.0", "prerelease": false, "assets": []},
+            {"tag_name": "v1.10.0", "prerelease": false, "assets": []},
+            {"tag_name": "sdk-v9.0.0", "prerelease": false, "assets": []},
+        ]);
+        let newest = |prefix, series| {
+            newest_release(&releases, prefix, series)
+                .expect("listing should parse")
+                .map(|release| release.tag)
+        };
+        assert_eq!(newest("v", None).as_deref(), Some("v2.0.0"));
+        assert_eq!(newest("v", Some(1)).as_deref(), Some("v1.10.0"));
+        assert_eq!(newest("sdk-v", None).as_deref(), Some("sdk-v9.0.0"));
+        assert_eq!(newest("v", Some(3)), None);
+        assert!(newest_release(&json!({}), "v", None).is_err());
+    }
+
+    #[test]
+    fn claude_manifest_checksum_is_read_per_platform() {
+        let checksum = "b".repeat(64);
+        let manifest = json!({"platforms": {"linux-x64": {"checksum": checksum}}});
+        assert_eq!(parse_claude_checksum(&manifest, "linux-x64"), Ok(checksum));
+        assert!(parse_claude_checksum(&manifest, "darwin-arm64").is_err());
+    }
+
+    #[test]
+    fn docker_hub_digest_must_be_sha256() {
+        let digest = format!("sha256:{}", "c".repeat(64));
+        assert_eq!(parse_hub_digest(&json!({"digest": digest})), Ok(digest));
+        assert!(parse_hub_digest(&json!({"digest": "sha256:short"})).is_err());
+    }
+
+    #[test]
+    fn stable_versions_are_three_numeric_components() {
+        assert!(is_stable("0.164.0"));
+        assert!(!is_stable("0.165.0-alpha.1"));
+        assert!(!is_stable("1.2"));
+    }
+
+    #[test]
+    fn version_mentions_match_whole_versions_only() {
+        assert!(names_version("verified against pi 1.4.0.", "1.4.0"));
+        assert!(names_version("`opencode v2.1.2`", "2.1.2"));
+        assert!(!names_version("pi 11.4.0", "1.4.0"));
+        assert!(!names_version("pi 1.4.0.1", "1.4.0"));
+        assert!(!names_version("pi 1.4.01", "1.4.0"));
+    }
+
+    #[test]
+    fn vllm_display_version_is_the_bare_tag() {
+        let image = format!("docker.io/vllm/vllm-openai:v0.32.0@sha256:{}", "d".repeat(64));
+        assert_eq!(display_version(Pin::Vllm, &image), "0.32.0");
+        assert_eq!(display_version(Pin::Pi, "1.4.0"), "1.4.0");
+    }
+
+    #[test]
+    fn codex_checklist_requires_a_new_recording() {
+        let items = checklist(Pin::Codex, "0.164.0");
+        assert!(
+            items.iter().any(|item| item.contains("websocket-codex-0.164.0.json")),
+            "{items:#?}"
+        );
+    }
 }

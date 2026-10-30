@@ -191,6 +191,12 @@ pub(crate) struct OpenCode {
     #[serde(default)]
     pub(crate) npm_package: String,
 
+    /// npm package holding the platform binary, when it is not
+    /// `opencode-<platform>` (2.x scopes it).
+    #[cfg(feature = "dev")]
+    #[serde(default)]
+    pub(crate) platform_package: Option<String>,
+
     /// Release URL, for `install = "github-release"`.
     #[serde(default)]
     pub(crate) url: String,
