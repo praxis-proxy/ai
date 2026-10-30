@@ -75,6 +75,8 @@ mod lakera_guard;
 mod llmd_ext_proc;
 mod llmisvc_model_provider_resolver;
 mod mcp_broker;
+#[cfg(all(feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
+mod mcp_kuadrant_gateway;
 mod model_to_header;
 mod model_to_header_trust_existing;
 mod model_to_provider;

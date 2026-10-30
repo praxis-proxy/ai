@@ -1,0 +1,155 @@
+# OpenAI Responses agentic loop driving a Kuadrant MCP Gateway as a connector.
+#
+# This is the reference config for the issue #1673 acceptance: per-user MCP tool
+# authorization enforced by a real Kuadrant MCP Gateway (discovery filtering +
+# per-call authorization), proven end-to-end through the Responses agentic loop.
+# See docs + tests/integration/kuadrant/ and the gated Kuadrant CI lane.
+#
+# Topology A — the per-user OAuth Bearer is the enforcement carrier:
+#   client ingress `x-user-mcp-key` (a per-user OAuth JWT)
+#     -> callout_credentials `mcp_gateway` slot
+#     -> injected as `Authorization: Bearer` on MCP callouts to the connector.
+#   The gateway's Authorino validates the Bearer, mints the discovery wristband,
+#   and authorizes every tools/call. Praxis is the courier; it does NOT make the
+#   authorization decision and makes no code change for this.
+#
+# The connector `server_url` below is the Kuadrant gateway's MCP endpoint
+# (Envoy front door). In CI the acceptance driver patches it to the live stack's
+# URL; here it is a loopback placeholder.
+#
+# NOTE: a trusted authentication boundary in front of Praxis must delete any
+# client-supplied `x-user-mcp-key` and set the verified per-user value. Praxis
+# forwards the slot value opaquely.
+
+listeners:
+  - name: ai-gateway
+    address: "0.0.0.0:8080"
+    filter_chains: [ingress-and-binding, managed-responses, managed-execution]
+
+filter_chains:
+  - name: ingress-and-binding
+    filters:
+      - filter: trace_context
+      - filter: state_owner
+        mode: trusted_headers
+        tenant: {header: x-auth-tenant}
+        issuer: {static: urn:example:gateway}
+        subject: {header: x-auth-user}
+      - filter: callout_credentials
+        credentials:
+          - slot: mcp_gateway
+            source_header: x-user-mcp-key
+        # The opaque x-mcp-authorized wristband courier. In Topology A the gateway's
+        # Authorino mints its own wristband, so this forwarded value is not the
+        # enforcement carrier — it is forwarded opaquely and asserted for courier
+        # correctness (reaches both discovery and dispatch; missing -> fail closed).
+        assertions:
+          - slot: mcp_gateway
+            source_header: x-mcp-authorized
+      - filter: project_state_owner_headers
+        tenant_header: x-tenant-id
+        subject_header: x-user-id
+      - filter: ai_operation
+      - filter: openai_responses_request
+        initialize_state: false
+        on_invalid: continue
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+          mode: x-praxis-responses-mode
+      - filter: router
+        routes:
+          - path: "/v1/responses"
+            headers:
+              x-praxis-ai-format: "openai_responses"
+            cluster: "inference-backend"
+          - path_prefix: "/v1/responses"
+            headers:
+              x-praxis-ai-format: "openai_responses"
+            cluster: "inference-backend"
+
+  - name: managed-responses
+    filters:
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers: {format: ~, model: ~, stream: ~, mode: ~}
+      - filter: openai_tool_parse
+      - filter: openai_mcp_tool_resolve
+        user_credential: mcp_gateway
+        authorization_assertion: mcp_gateway
+        forward_headers:
+          - x-tenant-id
+          - x-user-id
+        connectors:
+          - id: trusted-mcp
+            server_url: http://127.0.0.1:8000/mcp
+
+  - name: managed-execution
+    filters:
+      - filter: static_response
+        status: 404
+        body: '{"error":{"message":"unsupported","type":"invalid_request_error"}}'
+        headers:
+          - {name: Content-Type, value: application/json}
+        conditions:
+          - when: {path_prefix: "/v1/responses"}
+          - unless: {path: "/v1/responses"}
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 8
+        timeout_ms: 120000
+        step_timeout_ms: 60000
+        max_response_bytes: 67108864
+        max_stream_response_bytes: 67108864
+        max_state_bytes: 136314880
+        steps:
+          - name: inference
+            filters:
+              - filter: project_state_owner_headers
+                tenant_header: x-tenant-id
+                subject_header: x-user-id
+              - filter: openai_stream_events
+                max_buffer_bytes: 67108864
+                max_events: 200000
+                timeout_secs: 600
+              - filter: openai_mcp_dispatch
+                user_credential: mcp_gateway
+                authorization_assertion: mcp_gateway
+                forward_headers:
+                  - x-tenant-id
+                  - x-user-id
+                max_calls_per_round: 32
+                max_parallel_calls: 8
+                max_result_bytes: 1048576
+                max_total_result_bytes: 8388608
+              - filter: openai_agentic_loop
+                max_infer_iters: 7
+              - filter: headers
+                request_set:
+                  - {name: Content-Type, value: application/json}
+              - filter: load_balancer
+                cluster_source: bound_upstream
+                clusters:
+                  - name: "inference-backend"
+                    http:
+                      application_protocol: openai_responses
+                      application_provider: vllm
+                    endpoints:
+                      - "127.0.0.1:3001"
+              - filter: openai_responses_proxy
+                conditions:
+                  - when:
+                      selected_upstream:
+                        application_protocol: openai_responses
+            on_result:
+              - filter: openai_agentic_loop
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true
+  allow_private_upstreams: true

@@ -1,0 +1,60 @@
+# Part 3 A3 variant (OPEN discovery + per-call enforcement): authenticated identity (JWT/JWKS) + REAL per-call authz on the
+# router-set x-mcp-toolname/x-mcp-servername headers + wristband capabilities computed
+# from the identity's resource_access roles (adapted from mcp-gateway
+# config/e2e/auth/{mcp,mcps}-auth-policy.yaml).
+#
+# Hosts cover BOTH decision points because the router rewrites :authority to the
+# upstream hostname (weather.local) BEFORE ext_authz on a tools/call and on the
+# hairpin initialize, while initialize/tools/list stay on mcp.local:8080.
+apiVersion: authorino.kuadrant.io/v1beta3
+kind: AuthConfig
+metadata:
+  name: mcp-edge
+  namespace: default
+spec:
+  hosts:
+    - "mcp.local:8080"
+    - "mcp.local"
+    - "weather.local"
+    - "weather.local:8080"
+  authentication:
+    "users":
+      jwt:
+        # issuerUrl (OIDC discovery) rather than jwksUrl: the festival-wristband
+        # evaluator reads the resolved identity's stored OIDC config, which only
+        # exists in issuerUrl mode (else "rule does not store openid configuration").
+        issuerUrl: "http://jwks:8089"
+        audiences:
+          - "mcp-gateway"
+  authorization:
+    # Compute allowed capabilities from the identity's resource_access roles.
+    "tool-access-check":
+      when:
+        - predicate: "request.headers.exists(h, h == 'x-mcp-toolname')"
+      patternMatching:
+        patterns:
+          - predicate: |
+              ('tool:' + request.headers['x-mcp-toolname']) in (has(auth.identity.resource_access) && auth.identity.resource_access.exists(p, p == request.headers['x-mcp-servername']) ? auth.identity.resource_access[request.headers['x-mcp-servername']].roles : [])
+  response:
+    success:
+      headers:
+        "x-mcp-authorized":
+          wristband:
+            issuer: "http://authorino:8083/default/mcp-edge/x-mcp-authorized"
+            tokenDuration: 300
+            customClaims:
+              "allowed-capabilities":
+                # OPEN DISCOVERY (Part 3 A3): static wristband lists ALL tools so the tool
+                # is DISCOVERED regardless of roles; per-call tool-access-check still enforces.
+                value: '{"tools":{"weather":["get_forecast","get_alerts"]}}' 
+            signingKeyRefs:
+              - name: wristband-signing-key
+                algorithm: ES256
+    unauthenticated:
+      code: 401
+      message:
+        value: "Authentication required (invalid or missing token)."
+    unauthorized:
+      code: 403
+      message:
+        value: "MCP Tool Access denied: Insufficient permissions for this tool."
