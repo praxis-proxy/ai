@@ -69,18 +69,25 @@ const OUTPUT_CONFIG_KEYS: [&str; 3] = ["effort", "format", "task_budget"];
 /// A flag is set only when a recognized marker was actually removed, so the
 /// operator signals report real degradation rather than mere opt-in.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one flat flag per allowlisted LossyFeature, mirroring the config enum"
+)]
 pub(crate) struct DegradedFeatures {
     /// A recognized `thinking` request or thinking-only `context_management`
     /// edit was removed.
     pub extended_thinking: bool,
     /// A valid `cache_control` marker was removed.
     pub prompt_caching: bool,
+    /// A mid-conversation `system` message was moved into the leading system
+    /// message.
+    pub mid_conversation_system: bool,
 }
 
 impl DegradedFeatures {
     /// Whether any feature was degraded.
     pub(crate) fn any(self) -> bool {
-        self.extended_thinking || self.prompt_caching
+        self.extended_thinking || self.prompt_caching || self.mid_conversation_system
     }
 }
 
@@ -143,6 +150,9 @@ pub(crate) fn transform_request_degrading(
     }
     if allow.prompt_caching {
         degraded.prompt_caching = degrade_prompt_caching(&mut body)?;
+    }
+    if allow.mid_conversation_system {
+        degraded.mid_conversation_system = degrade_mid_conversation_system(&mut body)?;
     }
 
     normalize_nullable_tool_cache_control(&mut body);
@@ -481,6 +491,209 @@ fn cache_control_marker_is_recognized(marker: &Value) -> bool {
         && obj
             .get("ttl")
             .is_none_or(|ttl| matches!(ttl.as_str(), Some("5m" | "1h")))
+}
+
+/// One merged system-prompt source: per-block `(text, cache_control marker)`
+/// parts, moved rather than cloned from the consumed message content.
+type SystemParts = Vec<(String, Option<Value>)>;
+
+/// Error for a top-level `system` shape the strict validator would reject;
+/// surfaced verbatim by the degrade path so it never masks strict behavior.
+const SYSTEM_SHAPE_ERROR: &str = "`system` must be a string or array of text blocks";
+
+/// Move mid-conversation `system` messages into the top-level `system` field.
+///
+/// Chat Completions permits `system` messages anywhere in the array and real
+/// OpenAI serves them, but backends with strict chat templates — `vLLM`-hosted
+/// models behind a `LiteLLM` gateway — reject a `system` message that follows
+/// a non-system one ("System message must be at the beginning"). When the
+/// operator allowlists this feature, every text-only `system` message that
+/// appears after the first non-system turn is removed from its position and
+/// its text appended, in encounter order, to the top-level `system`, which
+/// [`hoist_system`] then emits as the single leading system message. A
+/// `system` message in the leading position needs no move and is left alone,
+/// and a message whose content is not text-only is left for the strict
+/// validator to reject.
+///
+/// `cache_control` markers surviving on moved blocks are carried onto the
+/// merged top-level blocks, so an operator who allowlisted this feature but
+/// not `prompt_caching` still fails closed in validation instead of silently
+/// losing cache breakpoints. (When `prompt_caching` is allowlisted it runs
+/// first and strips those markers, so nothing is carried.)
+fn degrade_mid_conversation_system(body: &mut Map<String, Value>) -> Result<bool, String> {
+    // Only take the field when it is an array; any other shape is put back
+    // untouched for the strict validator, which rejects non-array `messages`.
+    let messages = match body.remove("messages") {
+        Some(Value::Array(messages)) => messages,
+        Some(other) => {
+            body.insert("messages".to_owned(), other);
+            return Ok(false);
+        },
+        None => return Ok(false),
+    };
+
+    // Partition in one pass: system messages after the first non-system turn
+    // are consumed into text groups; everything else is kept in order. The
+    // content is moved, not cloned — message values are already owned here.
+    // Each moved message stays its own group so the merge below can join
+    // blocks within a message with `\n` (hoist_system's intra-system join)
+    // and separate messages with a blank line.
+    let mut retained = Vec::with_capacity(messages.len());
+    let mut moved: Vec<SystemParts> = Vec::new();
+    let mut seen_non_system = false;
+    for message in messages {
+        match take_movable_system_content(message, seen_non_system) {
+            Ok(group) => moved.push(group),
+            Err(message) => {
+                seen_non_system |= message.get("role").and_then(Value::as_str) != Some("system");
+                retained.push(message);
+            },
+        }
+    }
+
+    if moved.is_empty() {
+        body.insert("messages".to_owned(), Value::Array(retained));
+        return Ok(false);
+    }
+    merge_mid_conversation_system(body, moved)?;
+    body.insert("messages".to_owned(), Value::Array(retained));
+    Ok(true)
+}
+
+/// Consume a message into its text-only system content parts when it is a
+/// movable system message, or hand the untouched message back.
+///
+/// Movable means: a `system`-role message that follows a non-system turn and
+/// whose content is a string or an array of text blocks. Anything else —
+/// including a non-text content a strict backend would also reject — is
+/// returned unchanged so the strict validator produces its own error.
+fn take_movable_system_content(message: Value, seen_non_system: bool) -> Result<SystemParts, Value> {
+    let is_movable_system = message.get("role").and_then(Value::as_str) == Some("system")
+        && seen_non_system
+        && message.get("content").is_some_and(content_is_text_only);
+    if !is_movable_system {
+        return Err(message);
+    }
+    // A message whose `role` was readable is an object, and `is_movable_system`
+    // confirmed its `content` is present, so both branches below are total.
+    let Value::Object(mut message) = message else {
+        return Err(Value::Object(Map::new()));
+    };
+    match message.remove("content") {
+        Some(content) => Ok(system_parts_from_content(content)),
+        None => Err(Value::Object(message)),
+    }
+}
+
+/// Merge moved system-message groups into the top-level `system` field.
+///
+/// Preserves the field's representation: a string stays a string (message
+/// groups joined with a blank line), a block array gains blocks, an absent
+/// field becomes a string. `cache_control` markers force the block
+/// representation so validation can still see them. A `system` value the
+/// strict validator would reject fails here with the same message; the
+/// request is answered 400 either way, so no state needs restoring.
+fn merge_mid_conversation_system(body: &mut Map<String, Value>, moved: Vec<SystemParts>) -> Result<(), String> {
+    let existing = body.remove("system").filter(|value| !value.is_null());
+    let (mut groups, existing_is_blocks) = existing_system_groups(existing)?;
+    // One group per source: the existing top-level system, then each moved
+    // message in encounter order.
+    groups.extend(moved);
+
+    let carries_marker = groups
+        .iter()
+        .flat_map(|group| group.iter())
+        .any(|(_, marker)| marker.is_some());
+    let system = if carries_marker || existing_is_blocks {
+        Value::Array(groups.into_iter().flat_map(system_blocks_from_group).collect())
+    } else {
+        Value::String(
+            groups
+                .into_iter()
+                .map(|group| group.into_iter().map(|(text, _)| text).collect::<Vec<_>>().join("\n"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
+    };
+    body.insert("system".to_owned(), system);
+    Ok(())
+}
+
+/// Parse the existing top-level `system` into one merged group, reporting
+/// whether it was a block array (so the merge keeps that representation).
+///
+/// A value the strict validator would reject fails with the same message; the
+/// request is answered 400 either way, so no state needs restoring.
+fn existing_system_groups(existing: Option<Value>) -> Result<(Vec<SystemParts>, bool), String> {
+    match existing {
+        None => Ok((Vec::new(), false)),
+        Some(Value::String(text)) => Ok((vec![vec![(text, None)]], false)),
+        Some(Value::Array(blocks)) => {
+            let mut group = Vec::with_capacity(blocks.len());
+            for block in blocks {
+                let Value::Object(mut block) = block else {
+                    return Err(SYSTEM_SHAPE_ERROR.to_owned());
+                };
+                if block.get("type").and_then(Value::as_str) != Some("text") {
+                    return Err(SYSTEM_SHAPE_ERROR.to_owned());
+                }
+                let Some(text) = take_string(&mut block, "text") else {
+                    return Err(SYSTEM_SHAPE_ERROR.to_owned());
+                };
+                let marker = block.remove("cache_control").filter(|value| !value.is_null());
+                group.push((text, marker));
+            }
+            Ok((vec![group], true))
+        },
+        Some(_) => Err(SYSTEM_SHAPE_ERROR.to_owned()),
+    }
+}
+
+/// Build Chat Completions text blocks from one merged system group, carrying
+/// any surviving `cache_control` marker onto its block.
+fn system_blocks_from_group(group: SystemParts) -> Vec<Value> {
+    group
+        .into_iter()
+        .map(|(text, marker)| {
+            let mut block = Map::new();
+            block.insert("type".to_owned(), Value::String("text".to_owned()));
+            block.insert("text".to_owned(), Value::String(text));
+            if let Some(marker) = marker {
+                block.insert("cache_control".to_owned(), marker);
+            }
+            Value::Object(block)
+        })
+        .collect()
+}
+
+/// Whether a message content is a string or an array of text blocks.
+fn content_is_text_only(content: &Value) -> bool {
+    match content {
+        Value::String(_) => true,
+        Value::Array(blocks) => blocks.iter().all(|block| {
+            block.get("type").and_then(Value::as_str) == Some("text") && block.get("text").is_some_and(Value::is_string)
+        }),
+        _ => false,
+    }
+}
+
+/// Consume a text-only content value into `(text, cache_control marker)` parts.
+fn system_parts_from_content(content: Value) -> SystemParts {
+    match content {
+        Value::String(text) => vec![(text, None)],
+        Value::Array(blocks) => blocks
+            .into_iter()
+            .filter_map(|block| {
+                let Value::Object(mut block) = block else {
+                    return None;
+                };
+                let text = take_string(&mut block, "text")?;
+                let marker = block.remove("cache_control").filter(|value| !value.is_null());
+                Some((text, marker))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Reject request data the translator would discard or change meaning.
@@ -2751,6 +2964,219 @@ mod tests {
     }
 
     #[test]
+    fn mid_conversation_system_merged_into_leading_system() {
+        // Claude Code sends a text-only system message inside the messages
+        // array, after the first user turn. Backends with strict chat
+        // templates (vLLM-hosted models) reject a system message that follows
+        // a non-system one, so the allowlisted degradation folds each
+        // mid-conversation system message into the single leading system
+        // message, in encounter order.
+        let body = json!({
+            "model": "m",
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "# Environment\nworking directory: /tmp"},
+                {"role": "user", "content": "Reply with exactly: OK"}
+            ]
+        });
+        let (translated, degraded) = degrade(body, MIDSYS).unwrap();
+        assert!(degraded.mid_conversation_system, "a system message moved");
+        assert!(!degraded.prompt_caching);
+        assert!(!degraded.extended_thinking);
+        let messages = translated["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            3,
+            "the system message must not survive in place: {messages:?}"
+        );
+        assert_eq!(
+            messages[0],
+            json!({"role": "system", "content": "You are helpful.\n\n# Environment\nworking directory: /tmp"}),
+            "mid-conversation system text merges into the leading system message"
+        );
+        assert_eq!(messages[1], json!({"role": "user", "content": "Hi"}));
+        assert_eq!(
+            messages[2],
+            json!({"role": "user", "content": "Reply with exactly: OK"})
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_without_top_level_system() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "Be terse."},
+                {"role": "user", "content": "Reply with exactly: OK"}
+            ]
+        });
+        let (translated, degraded) = degrade(body, MIDSYS).unwrap();
+        assert!(degraded.mid_conversation_system);
+        let messages = translated["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            3,
+            "no system message may remain in history: {messages:?}"
+        );
+        assert_eq!(
+            messages[0],
+            json!({"role": "system", "content": "Be terse."}),
+            "the moved text becomes the leading system message"
+        );
+        assert_eq!(messages[1], json!({"role": "user", "content": "Hi"}));
+        assert_eq!(
+            messages[2],
+            json!({"role": "user", "content": "Reply with exactly: OK"})
+        );
+    }
+
+    #[test]
+    fn multiple_mid_conversation_systems_join_in_encounter_order() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "one"},
+                {"role": "system", "content": "first"},
+                {"role": "assistant", "content": "two"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "second-a"},
+                    {"type": "text", "text": "second-b"}
+                ]},
+                {"role": "user", "content": "three"}
+            ]
+        });
+        let (translated, degraded) = degrade(body, MIDSYS).unwrap();
+        assert!(degraded.mid_conversation_system);
+        let messages = translated["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4, "both system messages moved: {messages:?}");
+        assert_eq!(
+            messages[0]["content"], "first\n\nsecond-a\nsecond-b",
+            "messages join with a blank line; blocks within a message with a newline"
+        );
+        assert_eq!(messages[1], json!({"role": "user", "content": "one"}));
+        assert_eq!(messages[2], json!({"role": "assistant", "content": "two"}));
+        assert_eq!(messages[3], json!({"role": "user", "content": "three"}));
+    }
+
+    #[test]
+    fn mid_conversation_system_leading_system_message_untouched() {
+        // A system message in the leading position needs no move: strict
+        // backends accept system messages before the first non-system turn,
+        // so the degradation leaves it in place.
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "leading"},
+                {"role": "user", "content": "Hi"}
+            ]
+        });
+        let (translated, degraded) = degrade(body, MIDSYS).unwrap();
+        assert!(!degraded.mid_conversation_system, "nothing needed moving");
+        assert_eq!(
+            translated["messages"],
+            json!([
+                {"role": "system", "content": "leading"},
+                {"role": "user", "content": "Hi"}
+            ])
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_preserves_marker_when_prompt_caching_not_allowed() {
+        // Moving the text must not silently strip a cache_control marker the
+        // operator did not allowlist: the marker is carried onto the merged
+        // top-level block, so strict validation still fails closed.
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "Be terse.", "cache_control": {"type": "ephemeral"}}
+                ]}
+            ]
+        });
+        let error = degrade(body, MIDSYS).unwrap_err();
+        assert!(
+            error.contains("`system`"),
+            "the carried marker must fail closed with the system shape error: {error}"
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_with_prompt_caching_allowed_strips_and_reports_both() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "Be terse.", "cache_control": {"type": "ephemeral"}}
+                ]}
+            ]
+        });
+        let allow = LossyFeatureAllowlist {
+            prompt_caching: true,
+            extended_thinking: false,
+            mid_conversation_system: true,
+        };
+        let (translated, degraded) = degrade(body, allow).unwrap();
+        assert!(degraded.mid_conversation_system);
+        assert!(degraded.prompt_caching);
+        let serialized = translated.to_string();
+        assert!(
+            !serialized.contains("cache_control"),
+            "the allowed marker is stripped: {serialized}"
+        );
+        assert_eq!(
+            translated["messages"][0],
+            json!({"role": "system", "content": "Be terse."})
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_appends_to_block_array_system() {
+        // An existing top-level block-array system keeps its representation:
+        // moved text is appended as blocks, which hoist_system joins.
+        let body = json!({
+            "model": "m",
+            "system": [{"type": "text", "text": "Part 1"}],
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "Part 2"}
+            ]
+        });
+        let (translated, degraded) = degrade(body, MIDSYS).unwrap();
+        assert!(degraded.mid_conversation_system);
+        assert_eq!(
+            translated["messages"][0],
+            json!({"role": "system", "content": "Part 1\nPart 2"})
+        );
+        assert_eq!(translated["messages"][1], json!({"role": "user", "content": "Hi"}));
+    }
+
+    #[test]
+    fn mid_conversation_system_leaves_non_text_system_for_strict_validation() {
+        // A system message with non-text content is not moved; the strict
+        // validator produces the proper rejection instead.
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "ok"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+                ]}
+            ]
+        });
+        let error = degrade(body, MIDSYS).unwrap_err();
+        assert!(
+            error.contains("image"),
+            "left in place, the strict validator rejects the block: {error}"
+        );
+    }
+
+    #[test]
     fn prompt_caching_degradation_rejects_malformed_marker() {
         for marker in [
             json!("ephemeral"),
@@ -3055,7 +3481,8 @@ mod tests {
             degraded,
             DegradedFeatures {
                 prompt_caching: true,
-                extended_thinking: true
+                extended_thinking: true,
+                mid_conversation_system: false
             }
         );
     }
@@ -3075,14 +3502,22 @@ mod tests {
     const CACHE: LossyFeatureAllowlist = LossyFeatureAllowlist {
         prompt_caching: true,
         extended_thinking: false,
+        mid_conversation_system: false,
     };
     const THINK: LossyFeatureAllowlist = LossyFeatureAllowlist {
         prompt_caching: false,
         extended_thinking: true,
+        mid_conversation_system: false,
     };
     const BOTH: LossyFeatureAllowlist = LossyFeatureAllowlist {
         prompt_caching: true,
         extended_thinking: true,
+        mid_conversation_system: false,
+    };
+    const MIDSYS: LossyFeatureAllowlist = LossyFeatureAllowlist {
+        prompt_caching: false,
+        extended_thinking: false,
+        mid_conversation_system: true,
     };
 
     fn degrade(body: Value, allow: LossyFeatureAllowlist) -> Result<(Value, DegradedFeatures), String> {

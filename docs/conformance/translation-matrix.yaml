@@ -219,8 +219,16 @@ surfaces:
         evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:838-860; apis/src/anthropic/messages_to_chat_completions/request.rs:476-481; apis/src/anthropic/messages_to_chat_completions/request.rs:682-690
       multi-turn:
         status: translated
-        note: In-array system messages are accepted deliberately (Claude Code emits them).
-        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:516-521
+        note: >-
+          In-array system messages are accepted deliberately (Claude Code
+          emits them) and preserved in position by default. With
+          allow_lossy_features: [mid_conversation_system] each system message
+          after the first non-system turn is folded into the single leading
+          system message in encounter order and signalled, for backends whose
+          chat templates reject a mid-conversation system message (vLLM "System
+          message must be at the beginning"); a leading system message is
+          never moved.
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:751-753; apis/src/anthropic/messages_to_chat_completions/request.rs:523-561
       multimodal-image:
         status: translated
         note: >-
