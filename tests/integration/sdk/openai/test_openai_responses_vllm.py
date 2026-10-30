@@ -288,6 +288,7 @@ def _write_full_flow_config(
     tool_admission: str | None = None,
     require_connector: bool | None = None,
     mcp_minimum_approval: str | None = None,
+    max_retained_bytes: int | None = None,
 ) -> str:
     """Patch the shared full-flow example for live or recording backends."""
     resolved_backend = backend_endpoint or _vllm_endpoint()
@@ -438,6 +439,12 @@ def _write_full_flow_config(
         config = config.replace(
             anchor,
             anchor + f"                minimum_approval: {mcp_minimum_approval}\n",
+        )
+    if max_retained_bytes is not None:
+        anchor = "                max_infer_iters: 7\n"
+        assert config.count(anchor) == 1, config
+        config = config.replace(
+            anchor, anchor + f"                max_retained_bytes: {max_retained_bytes}\n"
         )
     if compression:
         config = _enable_response_store_compression(config)
@@ -663,6 +670,8 @@ class MCPHandler(BaseHTTPRequestHandler):
 
     authorization_headers: ClassVar[list[str | None]] = []
     assertion_headers: ClassVar[list[str | None]] = []
+    # Attached as ``structuredContent`` to text tool results when set.
+    structured_content: ClassVar[dict | None] = None
 
     _request_count = 0
     _request_count_lock = threading.Lock()
@@ -775,9 +784,10 @@ class MCPHandler(BaseHTTPRequestHandler):
                     if tool_name == "get_time"
                     else f"72F and sunny in {city}"
                 )
-                self._json_rpc(
-                    rid, {"content": [{"type": "text", "text": result}]}
-                )
+                tool_result = {"content": [{"type": "text", "text": result}]}
+                if self.structured_content is not None:
+                    tool_result["structuredContent"] = self.structured_content
+                self._json_rpc(rid, tool_result)
         elif method == "ping":
             self._json_rpc(rid, {})
         else:
@@ -819,6 +829,11 @@ class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
     the advertised ``inputSchema`` before any outbound ``tools/call``.
     """
 
+    # ``city`` must be a string per the advertised schema; a number violates it,
+    # so the gateway rejects it before dispatch.
+    call_arguments: ClassVar[dict] = {"city": 42}
+    final_text: ClassVar[str] = "I passed the wrong type; let me correct it."
+
     @staticmethod
     def _encoded_get_weather(request_body: dict) -> str:
         """Find the function tool the resolver advertised for ``get_weather``."""
@@ -851,12 +866,7 @@ class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
                     "type": "message",
                     "status": "completed",
                     "role": "assistant",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": "I passed the wrong type; let me correct it.",
-                        }
-                    ],
+                    "content": [{"type": "output_text", "text": self.final_text}],
                 }
             ]
         else:
@@ -866,9 +876,7 @@ class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
                     "type": "function_call",
                     "call_id": "call_mcp_invalid_1",
                     "name": self._encoded_get_weather(request_body),
-                    # ``city`` must be a string per the advertised schema; a number
-                    # violates it, so the gateway rejects it before dispatch.
-                    "arguments": json.dumps({"city": 42}),
+                    "arguments": json.dumps(self.call_arguments),
                     "status": "completed",
                 }
             ]
@@ -892,6 +900,36 @@ class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         pass
+
+
+class StructuredMCPHandler(MCPHandler):
+    """MCP mock whose text tool results carry a Kubernetes-shaped
+    ``structuredContent`` of ~5 KiB and ~550 JSON nodes (issue #1847)."""
+
+    structured_content: ClassVar[dict | None] = {
+        "kind": "Deployment",
+        "containers": [
+            {
+                "name": f"container-{i}",
+                "image": "quay.io/example/app:v1",
+                "ready": True,
+                "restarts": 0,
+            }
+            for i in range(60)
+        ],
+    }
+
+
+class McpStructuredResultBackendHandler(McpInvalidArgsBackendHandler):
+    """Scripts one valid ``get_weather`` call, then a final message."""
+
+    call_arguments: ClassVar[dict] = {"city": "Paris"}
+    final_text: ClassVar[str] = "done"
+    request_count = 0
+
+    def do_POST(self):
+        type(self).request_count += 1
+        super().do_POST()
 
 
 class BraveSearchHandler(BaseHTTPRequestHandler):
@@ -7209,6 +7247,96 @@ def test_mcp_schema_invalid_arguments_rejected_without_outbound_call(
         "the loop should resume to a model message after the rejection; got "
         f"{[item.type for item in response.output]}"
     )
+
+
+@pytest.fixture(scope="session")
+def structured_mcp_client(tmp_path_factory, request, nemo_guardrails_server):
+    """Full-flow agentic proxy with a 10 MiB retained budget, a scripted model,
+    and an MCP server returning ``structuredContent``."""
+    servers = []
+    for handler in (StructuredMCPHandler, McpStructuredResultBackendHandler):
+        server = HTTPServer(("127.0.0.1", _free_port()), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        servers.append(server)
+    mcp_port, backend_port = (s.server_address[1] for s in servers)
+
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("structured-mcp-responses")
+    config_path = _write_full_flow_config(
+        port,
+        str(db_dir / "responses.db"),
+        backend_endpoint=f"127.0.0.1:{backend_port}",
+        mcp_endpoint=f"http://127.0.0.1:{mcp_port}/mcp",
+        nemo_port=nemo_guardrails_server,
+        max_retained_bytes=10_485_760,
+    )
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    proc = subprocess.Popen(
+        [_find_binary(), "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield _make_openai_client(
+            port,
+            default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
+        )
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        for server in servers:
+            server.shutdown()
+        if not started or request.session.testsfailed > 0:
+            print(
+                f"\n=== Structured MCP Praxis logs ===\n{_read_log_tail(log_path, 200)}",
+                file=sys.stderr,
+            )
+        os.unlink(config_path)
+
+
+@qualification_profile("supporting")
+def test_retained_budget_admits_structured_mcp_result(structured_mcp_client):
+    """A structured MCP result fits a 10 MiB retained budget (issue #1847).
+
+    The per-call parse allowance is ~1.5 MB: enough for the MCP result charge
+    (~0.4 MB) but not the provider-output charge (~4.9 MB) once applied to MCP
+    replies.
+    """
+    calls_before = StructuredMCPHandler.tool_call_count()
+    model_requests_before = McpStructuredResultBackendHandler.request_count
+
+    response = structured_mcp_client.responses.create(
+        model=VLLM_MODEL,
+        input="What is the weather in Paris?",
+        tools=[
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "connector_id": "trusted-mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": "never",
+            }
+        ],
+        store=False,
+    )
+
+    assert response.status == "completed", response
+    mcp_calls = [item for item in response.output if item.type == "mcp_call"]
+    assert len(mcp_calls) == 1, [item.type for item in response.output]
+    assert mcp_calls[0].error is None, mcp_calls[0].error
+    assert "72F and sunny in Paris" in (mcp_calls[0].output or ""), mcp_calls[0]
+    assert StructuredMCPHandler.tool_call_count() == calls_before + 1
+    assert McpStructuredResultBackendHandler.request_count == model_requests_before + 2
+    assert response.output_text == "done"
 
 
 class TestAgenticLoopVLLM:

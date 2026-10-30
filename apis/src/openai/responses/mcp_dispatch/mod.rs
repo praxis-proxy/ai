@@ -182,7 +182,7 @@ fn reserve_mcp_execution(
     }
     let reserved = slot.checked_mul(count)?;
     let parse_charge_limit = slot / 2;
-    let wire_limit = parse_charge_limit / 64;
+    let wire_limit = parse_charge_limit / 16;
     if parse_charge_limit < MIN_MCP_INITIALIZE_PARSE_CHARGE
         || wire_limit < 512
         || !budget.reserve_additional_input(reserved)

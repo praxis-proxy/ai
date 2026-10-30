@@ -18,6 +18,13 @@ const JSON_NODE_RESERVE: usize = 256;
 /// Parsed provider values may own a four-slot Vec or map for only a few wire
 /// bytes. Leave room for those allocations and their response-state copies.
 const OUTPUT_NODE_RESERVE: usize = 8_192;
+/// Raw body, SSE framing, rmcp parsing, and result conversion of one MCP
+/// reply. Measured peak is about 8x wire bytes plus 250 bytes per node.
+#[cfg(any(test, feature = "openai-mcp-tools"))]
+const MCP_RESULT_WIRE_MULTIPLIER: usize = 16;
+/// Per-node reserve for an MCP reply, about 2x the measured parse cost.
+#[cfg(any(test, feature = "openai-mcp-tools"))]
+const MCP_RESULT_NODE_RESERVE: usize = 512;
 /// Retained projections of each wire chunk across the logical stream.
 const STREAM_WIRE_MULTIPLIER: usize = 32;
 /// Additional retained replay and response projections when Store is active.
@@ -417,6 +424,15 @@ pub(crate) fn output_charge(bytes: &[u8]) -> Option<usize> {
         .checked_add(json_node_count(bytes)?.checked_mul(OUTPUT_NODE_RESERVE)?)
 }
 
+/// Charge an MCP server reply before rmcp parses it.
+#[cfg(any(test, feature = "openai-mcp-tools"))]
+pub(crate) fn mcp_result_charge(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .len()
+        .checked_mul(MCP_RESULT_WIRE_MULTIPLIER)?
+        .checked_add(json_node_count(bytes)?.checked_mul(MCP_RESULT_NODE_RESERVE)?)
+}
+
 /// Count syntactic JSON nodes without allocating or trusting the payload.
 #[expect(
     clippy::too_many_lines,
@@ -463,6 +479,14 @@ fn json_node_count(bytes: &[u8]) -> Option<usize> {
 #[expect(clippy::unwrap_used, reason = "unit tests construct validated budgets")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_result_charge_tracks_measured_parse_cost() {
+        let payload = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}],"structuredContent":{"replicas":[1,2,3],"ready":true}}}"#;
+        let nodes = json_node_count(payload).unwrap();
+        assert_eq!(mcp_result_charge(payload), Some(payload.len() * 16 + nodes * 512));
+        assert!(mcp_result_charge(payload).unwrap() * 4 < output_charge(payload).unwrap());
+    }
 
     #[test]
     fn cumulative_output_and_lower_limit() {

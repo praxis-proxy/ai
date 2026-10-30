@@ -3485,6 +3485,98 @@ fn retained_budget_reuses_released_round_body_headroom() {
 }
 
 #[test]
+fn retained_budget_admits_structured_mcp_result() {
+    // A ~5 KiB `structuredContent` result with ~550 JSON nodes, shaped like a
+    // Kubernetes object. Under a 10 MiB limit the per-call parse allowance is
+    // ~1.5 MB: enough for the MCP result charge (~0.4 MB) but not for the
+    // provider-output charge (~4.9 MB) applied to MCP replies previously.
+    let containers: Vec<serde_json::Value> = (0..60)
+        .map(|i| {
+            serde_json::json!({
+                "name": format!("container-{i}"),
+                "image": "quay.io/example/app:v1",
+                "ready": true,
+                "restarts": 0
+            })
+        })
+        .collect();
+    let tool_round = serde_json::json!({
+        "id": "resp_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "k8s__resources_get",
+            "arguments": r#"{"name":"shop"}"#,
+            "status": "completed"
+        }]
+    })
+    .to_string();
+    let final_response = serde_json::json!({
+        "id": "resp_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "done"}]
+        }]
+    })
+    .to_string();
+    let model = StatefulCapturingBackend::new(vec![(200, tool_round), (200, final_response)]).start_with_shutdown();
+
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("resources_get").with_input_schema(object_schema("name"))],
+        sse_tool_results: true,
+        structured_content: Some(serde_json::json!({"kind": "Deployment", "containers": containers})),
+        ..McpMockConfig::default()
+    });
+
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config_with_budget(proxy_port, model.port(), 10_485_760);
+    let proxy = start_proxy(&config);
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Inspect the shop deployment",
+        "store": false,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "k8s",
+            "server_url": mcp_url,
+            "allowed_tools": ["resources_get"],
+            "require_approval": "never"
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "structured MCP result must fit the budget: {raw}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be valid JSON");
+    let mcp_call = response["output"]
+        .as_array()
+        .and_then(|output| output.iter().find(|item| item["type"] == "mcp_call"))
+        .expect("response must include the mcp_call");
+    assert!(
+        mcp_call["error"].is_null()
+            && mcp_call["output"]
+                .as_str()
+                .is_some_and(|out| out.contains("mock result for resources_get")),
+        "structured MCP result must succeed: {mcp_call:#?}"
+    );
+    assert_eq!(model.requests().len(), 2, "both inference rounds ran");
+}
+
+#[test]
 fn two_tool_rounds_accumulate_output_and_usage() {
     // Round 1: the model asks to call the weather tool.
     let first_response = serde_json::json!({
