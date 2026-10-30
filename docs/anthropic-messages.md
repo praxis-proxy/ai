@@ -101,15 +101,18 @@ and the response, so vLLM only ever sees OpenAI Chat Completions.
 
 Chat Completions cannot represent the Anthropic-only features an unmodified
 Claude Code client always sends — prompt caching (`cache_control` markers) and
-extended thinking (`thinking`). The example enables **operator-approved
-degradation** on the translation filter so those requests succeed instead of
-failing closed with a 400:
+extended thinking (`thinking`) — and backends with strict chat templates
+(vLLM-hosted models) additionally reject the mid-conversation `system`
+message Claude Code sends after its first user turn. The example enables
+**operator-approved degradation** on the translation filter so those requests
+succeed instead of failing closed with a 400:
 
 ```yaml
 - filter: anthropic_messages_to_chat_completions
   allow_lossy_features:
     - prompt_caching
     - extended_thinking
+    - mid_conversation_system
 ```
 
 Each listed feature's wire markers are validated and then stripped, and the
@@ -118,7 +121,11 @@ degradation is reported to the operator — one `WARN` log per request, a
 feature, and an `x-degraded-features` response header. `prompt_caching`
 preserves all prompt and tool content but does not honor explicit cache
 breakpoints, so cost and latency may differ; `extended_thinking` means the
-translated response carries no thinking blocks. Remove an entry to make that
+translated response carries no thinking blocks; `mid_conversation_system`
+folds each `system` message that appears after the first non-system turn into
+the single leading system message (real OpenAI accepts mid-array `system`
+messages, but vLLM chat templates answer "System message must be at the
+beginning"). Remove an entry to make that
 feature fail closed again. Malformed markers, other `context_management` edits,
 and every feature not listed are still rejected with a 400. Leaving the
 allowlist empty (the default of [`messages-to-openai.yaml`](../examples/configs/anthropic/messages-to-openai.yaml))
@@ -457,6 +464,13 @@ The `anthropic_messages_to_chat_completions` filter:
   unless `prompt_caching` is in `allow_lossy_features`,
   which strips `cache_control` markers (preserving the
   prompt and tool content) and reports the degradation
+- Preserves a text-only `system` message inside the
+  `messages` array in its original position, unless
+  `mid_conversation_system` is in `allow_lossy_features`,
+  which folds every `system` message that follows the
+  first non-system turn into the single leading system
+  message (in encounter order) and reports the
+  degradation; a leading `system` message is never moved
 - Transforms the response back to Anthropic format
 - Normalizes pre-stream upstream 4xx/5xx responses into
   Anthropic error envelopes for both streaming and
