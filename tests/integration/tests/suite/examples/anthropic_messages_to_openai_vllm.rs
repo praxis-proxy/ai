@@ -471,6 +471,42 @@ fn transform_vllm_rejects_unauthenticated_gateway_request() {
     drop(proxy);
 }
 
+/// Anthropic SDK v2 sends its API key as `Authorization: Bearer`, the other
+/// form of the credential the v1 SDK sends in `x-api-key`. `basic_auth` only
+/// accepts `Basic`, so a v2 caller is rejected before any translation or
+/// routing and its Anthropic key never reaches the backend. The legacy form is
+/// covered by `transform_vllm_strips_client_credentials_and_injects_backend_bearer`.
+#[test]
+fn transform_vllm_rejects_sdk_v2_bearer_gateway_credential() {
+    let backend = start_chat_backend();
+    let proxy_port = free_port();
+    let config = transform_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"claude-opus-4-8","max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#;
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header("/v1/messages", body, "Authorization: Bearer client-anthropic-secret"),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        401,
+        "a bearer-only caller must not pass basic_auth: {raw}"
+    );
+    let forwarded_posts = backend
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "POST")
+        .count();
+    assert_eq!(
+        forwarded_posts, 0,
+        "the rejected caller's credential must never reach the backend"
+    );
+
+    drop(proxy);
+}
+
 #[test]
 fn streaming_non2xx_response_yields_single_anthropic_error() {
     // A streaming request whose upstream returns a non-2xx JSON error must be

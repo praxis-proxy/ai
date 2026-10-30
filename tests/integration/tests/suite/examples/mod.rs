@@ -14,6 +14,7 @@ mod anthropic_full_flow_agentic_chat;
 #[cfg(feature = "openai-responses")]
 mod anthropic_messages;
 mod anthropic_messages_native_vllm;
+mod anthropic_messages_to_openai;
 mod anthropic_messages_to_openai_vllm;
 mod anthropic_web_search_scoped_credentials;
 mod anthropic_web_search_tavily_scoped_credentials;
