@@ -73,6 +73,8 @@ token-rate-limit-filter = ["praxis-ai-filters/token-rate-limit-filter", "experim
 token-ceiling-filter = ["praxis-ai-filters/token-ceiling-filter", "experimental"]
 # Experimental: the inflight_tracker filter (see praxis-ai-filters).
 inflight-tracker-filter = ["praxis-ai-filters/inflight-tracker-filter", "experimental"]
+# Experimental: the model_catalog filter (see praxis-ai-filters).
+model-catalog-filter = ["praxis-ai-filters/model-catalog-filter", "experimental"]
 # Marker feature activated transitively by any experimental feature.
 experimental = ["praxis-ai-filters/experimental"]
 opentelemetry = ["praxis-ai-filters/opentelemetry"]

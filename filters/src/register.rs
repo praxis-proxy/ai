@@ -14,6 +14,8 @@ use crate::GcpAdcFilter;
 use crate::HttpCalloutFilter;
 #[cfg(feature = "inflight-tracker-filter")]
 use crate::InFlightTrackerFilter;
+#[cfg(feature = "model-catalog-filter")]
+use crate::ModelCatalogFilter;
 #[cfg(feature = "aws-sigv4-filter")]
 use crate::Sigv4SignFilter;
 #[cfg(feature = "token-ceiling-filter")]
@@ -50,6 +52,8 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
     #[cfg(feature = "gcp-adc-filter")]
     register_gcp_filters(registry, subrequest_client);
     register_general_ai_filters(registry);
+    #[cfg(feature = "model-catalog-filter")]
+    register_model_catalog(registry, subrequest_client);
     register_ai_guardrails(registry, subrequest_client);
     register_external_metering(registry, subrequest_client);
     register_anthropic_filters(registry, subrequest_client);
@@ -242,6 +246,29 @@ fn register_inference_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "llmisvc_model_provider_resolver" => LlmisvcModelProviderResolverFilter::from_config
     );
+}
+
+/// Register the model catalog filter, capturing the shared sub-request client
+/// for upstream model discovery when one is available.
+#[cfg(feature = "model-catalog-filter")]
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_model_catalog(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    if let Some(client) = subrequest_client {
+        let client = client.clone();
+        registry
+            .register(
+                "model_catalog",
+                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
+                    ModelCatalogFilter::from_config_with_client(config, client.clone())
+                })),
+            )
+            .unwrap_or_else(|_| panic!("duplicate filter name: 'model_catalog'"));
+    } else {
+        praxis_filter::register_filters!(
+            @register registry,
+            http "model_catalog" => ModelCatalogFilter::from_config
+        );
+    }
 }
 
 /// Register token counting/usage/rate-limiting filters.
@@ -940,6 +967,7 @@ provider:
         assert_experimental_registration(&names, "token_rate_limit", cfg!(feature = "token-rate-limit-filter"));
         assert_experimental_registration(&names, "token_ceiling", cfg!(feature = "token-ceiling-filter"));
         assert_experimental_registration(&names, "inflight_tracker", cfg!(feature = "inflight-tracker-filter"));
+        assert_experimental_registration(&names, "model_catalog", cfg!(feature = "model-catalog-filter"));
     }
 
     /// Every opt-in filter paired with whether its cargo feature is enabled.

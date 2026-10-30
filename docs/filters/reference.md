@@ -101,6 +101,12 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`http_callout`](http_callout.md) | Calls an external HTTP service during request processing and feeds its response into branch-chain evaluation. |
 
+### Catalog
+
+| Filter | Description |
+|--------|-------------|
+| [`model_catalog`](model_catalog.md) | Serves an OpenAI-compatible `GET /v1/models` catalog filtered per principal. |
+
 ### GCP
 
 | Filter | Description |

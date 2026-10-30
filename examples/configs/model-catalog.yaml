@@ -1,0 +1,92 @@
+# Principal-aware model catalog
+#
+# Serve an OpenAI-compatible GET /v1/models listing from the proxy, built from
+# what the upstreams actually serve and filtered by the authenticated caller.
+# model_catalog fetches each upstream's GET /v1/models on first use and
+# refreshes it every refresh_interval_secs in the background; an upstream that
+# fails keeps its last known list. Models are never hand-listed: the models
+# entries below only overlay client-facing IDs, aliases, metadata, and
+# visibility onto discovered models, and an entry no upstream reports is not
+# listed. Upstream models without an entry (gpt-4o-mini here) are listed as-is;
+# set unconfigured_models: hide to list only entries.
+#
+# basic_auth publishes the verified subject, and model_catalog lists only the
+# models that subject may see. A hidden model returns the same 404 as an
+# unknown one. Catalog IDs match the public IDs that model_to_provider routes,
+# aliases included; llama-70b maps to the upstream's own ID via upstream_id.
+# Capabilities and cost tiers are operator-declared metadata, not verified
+# upstream. The catalog controls discovery only; enforcing model access on
+# inference requests is a separate policy concern.
+#
+# Hosted providers need credentials for their model list, for example
+# bearer_token_env_var: OPENAI_API_KEY on the upstream entry.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy --features basic-auth-filter,model-catalog-filter -- -c examples/configs/model-catalog.yaml
+#   curl -u viewer:example-password http://localhost:8080/v1/models
+#   curl -u ml-engineer:example-password http://localhost:8080/v1/models/llama-70b
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: basic_auth
+        strip_authorization: true
+        credentials:
+          - username: viewer
+            password: "example-password"
+          - username: ml-engineer
+            password: "example-password"
+
+      - filter: model_catalog
+        created: 1735689600
+        refresh_interval_secs: 60
+        upstreams:
+          - name: openai
+            url: http://127.0.0.1:3000/v1/models
+            provider: openai
+            allow_private: true
+          - name: vllm
+            url: http://127.0.0.1:3001/v1/models
+            provider: vllm
+            allow_private: true
+        models:
+          - id: gpt-4o
+            capabilities: [chat_completions, responses]
+            cost_tier: standard
+            aliases: [gpt4o]
+          - id: llama-70b
+            upstream_id: meta-llama/Llama-3.1-70B-Instruct
+            capabilities: [chat_completions]
+            cost_tier: premium
+            visible_to:
+              subjects: [ml-engineer]
+
+      - filter: model_to_provider
+        fallback_upstream: openai
+        models:
+          - model: gpt4o
+            upstream: openai
+            target_model: gpt-4o
+            paths: [/v1/chat/completions, /v1/responses]
+          - model: llama-70b
+            upstream: vllm
+            target_model: meta-llama/Llama-3.1-70B-Instruct
+            paths: [/v1/chat/completions]
+
+      - filter: load_balancer
+        clusters:
+          - name: openai
+            endpoints:
+              - "127.0.0.1:3000"
+          - name: vllm
+            endpoints:
+              - "127.0.0.1:3001"
+
+insecure_options:
+  allow_private_endpoints: true

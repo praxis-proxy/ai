@@ -59,6 +59,7 @@ for how these are authored and regenerated.
 | [llmisvc-model-provider-resolver.yaml](configs/llmisvc-model-provider-resolver.yaml) | Rewrites publisher-ID body `model` values to the short model name for LLMISvc / KServe routing; the routing header (default `X-Model`) is left unchanged so routing can still use the publisher ID |
 | [mcp-classifier-routing.yaml](configs/mcp-classifier-routing.yaml) | Routes MCP requests by body-derived method and tool name |
 | [mcp-stateless-broker.yaml](configs/mcp-stateless-broker.yaml) | Configurable stateless MCP broker using the final MCP 2026-07-28 stateless profile |
+| [model-catalog.yaml](configs/model-catalog.yaml) | Serve an OpenAI-compatible GET /v1/models listing from the proxy, built from what the upstreams actually serve and filtered by the authenticated caller. model_catalog fetches each upstream's GET /v1/models on first use and refreshes it every refresh_interval_secs in the background; an upstream that fails keeps its last known list |
 | [model-to-header-routing.yaml](configs/model-to-header-routing.yaml) | Routes LLM API requests to different backends based on the "model" field in the JSON request body |
 | [model-to-header-trust-existing.yaml](configs/model-to-header-trust-existing.yaml) | Routes on a model header that a trusted hop in front of Praxis has already set, skipping the filter entirely when the header is present |
 | [model-to-provider.yaml](configs/model-to-provider.yaml) | Map a stable public model ID to an existing upstream cluster and target model |
