@@ -35,6 +35,7 @@ import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import urlparse
 
@@ -58,6 +59,13 @@ from openai.types.responses import ResponseCustomToolCall
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-0.6B")
 VLLM_TEST_BACKEND = os.environ.get("VLLM_TEST_BACKEND", "live")
+
+# The pinned Codex apply_patch grammar, read from the same vendored file the compat
+# filter recognizes so the SDK declares the exact grammar the backend constrains.
+APPLY_PATCH_GRAMMAR = (
+    Path(__file__).resolve().parents[4]
+    / "apis/src/openai/responses/openai_client_tool_compat/apply_patch.lark"
+).read_text()
 OGX_BASE_URL = os.environ.get("OGX_BASE_URL", "http://127.0.0.1:8321")
 PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -6475,6 +6483,69 @@ class TestClientToolCompatVLLM:
         )
         # Request phase echo: the client sees its original ``custom`` tool back.
         assert any(t.type == "custom" for t in response.tools), response.tools
+
+    def test_apply_patch_grammar_tool_round_trip_constrains_and_restores(
+        self, client_tool_compat_client
+    ):
+        """#1834: a ``custom`` tool declaring the pinned Codex apply_patch Lark
+        grammar is lowered to a private ``function`` whose ``input`` carries a
+        JSON-Schema pattern; constrained decoding on vLLM emits a grammar-valid
+        patch, and the returned call is restored to a ``custom_tool_call`` whose
+        ``input`` is that patch. This is the live end-to-end proof that the pattern
+        actually constrains generation on the pinned runtime — distinct from the
+        ``exec_command`` coding workflow."""
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the apply_patch tool to add a file named hello.txt "
+                "containing the single line: hello world. Do not answer directly. "
+                "/no_think"
+            ),
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                    "format": {
+                        "type": "grammar",
+                        "syntax": "lark",
+                        "definition": APPLY_PATCH_GRAMMAR,
+                    },
+                }
+            ],
+            # Force the call so the small CI model is deterministic; the compat
+            # filter lowers this custom selector to a function selector for vLLM.
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status == "completed", response
+        custom_calls = [
+            item for item in response.output if item.type == "custom_tool_call"
+        ]
+        assert len(custom_calls) >= 1, (
+            "compat filter must restore the function_call to a custom_tool_call; "
+            f"got output types: {[i.type for i in response.output]}"
+        )
+        call = custom_calls[0]
+        assert call.name == "apply_patch"
+        assert isinstance(call.input, str)
+        # The grammar constrained generation to an actual patch envelope.
+        assert call.input.startswith("*** Begin Patch"), (
+            f"the pattern must constrain generation to a patch: {call.input!r}"
+        )
+        assert "*** End Patch" in call.input, (
+            f"the restored input must be a complete patch: {call.input!r}"
+        )
+        # No un-restored private function_call may leak to the client.
+        assert all(item.type != "function_call" for item in response.output), (
+            f"lowered function must not leak: {[i.type for i in response.output]}"
+        )
+        # The client sees its original grammar declaration echoed back.
+        echoed = [t for t in response.tools if t.type == "custom"]
+        assert echoed, f"the original custom grammar tool must be echoed: {response.tools}"
 
     def test_shell_tool_round_trip_lowers_and_restores(
         self, client_tool_compat_client

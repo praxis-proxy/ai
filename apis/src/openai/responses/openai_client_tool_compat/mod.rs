@@ -4,7 +4,7 @@
 //! Compatibility adapter that lets a rich Codex-style Responses client talk to a
 //! function-only Responses backend (#1131).
 //!
-//! Some Responses backends (for example vLLM at `POST /v1/responses`) accept only
+//! Some Responses backends (for example `vLLM` at `POST /v1/responses`) accept only
 //! `type: "function"` tool declarations and only emit `function_call` output
 //! items. A Codex client, however, declares richer *client-owned* tools —
 //! freeform `custom` tools, `namespace` groupings, a local `shell`, and a
@@ -133,6 +133,7 @@
 //! the filter is a transparent passthrough, so native traffic is unchanged.
 
 mod config;
+pub(crate) mod custom_input;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -156,7 +157,10 @@ use praxis_filter::{
 use serde_json::{Map, Value, json};
 use tracing::debug;
 
-use self::config::{ClientToolCompatConfig, build_config};
+use self::{
+    config::{ClientToolCompatConfig, build_config},
+    custom_input::{CustomInputFormat, CustomInputPatternEncoding},
+};
 use super::{
     agentic_loop::{AgenticBudgetPolicy, budget::output_charge},
     body_limits::reject_rewritten_body_too_large,
@@ -286,6 +290,10 @@ pub struct ClientToolCompatFilter {
 
     /// Maximum number of client-owned tool declarations lowered per request.
     max_client_tools: usize,
+
+    /// How the backend interprets a JSON-Schema `pattern`, deciding the encoding of
+    /// the constraint emitted on a lowered grammar tool's `input`.
+    custom_input_pattern_encoding: CustomInputPatternEncoding,
 }
 
 impl ClientToolCompatFilter {
@@ -300,6 +308,7 @@ impl ClientToolCompatFilter {
         Ok(Box::new(Self {
             max_rewritten_body_bytes: validated.max_rewritten_body_bytes,
             max_client_tools: validated.max_client_tools,
+            custom_input_pattern_encoding: validated.custom_input_pattern_encoding,
         }))
     }
 
@@ -387,7 +396,7 @@ impl ClientToolCompatFilter {
             Some(canonical) => canonical,
             None => take_request_tools(state).unwrap_or_default(),
         };
-        let mut lowering = Lowering::new(self.max_client_tools);
+        let mut lowering = Lowering::new(self.max_client_tools, self.custom_input_pattern_encoding);
         let (mut lowered_tools, lowered_any) = match lowering.lower_tools(&original_tools) {
             Ok(result) => result,
             Err(action) => {
@@ -1229,8 +1238,10 @@ fn member_conflict_identity(member: &Value) -> Value {
 ///   distinguishes two listings.
 /// - a `null`/absent `allowed_callers` is accepted and lowers to omission (only a non-`null` restriction fails closed,
 ///   per [`reject_if_restricted_callers`]), so it is dropped while a non-`null` restriction is kept verbatim.
-/// - an *accepted* custom `format` (absent or `{"type":"text"}`) is only validated, never read afterwards
-///   ([`custom_extra_fields`] excludes it), so it lowers identically and is dropped; a reject-worthy `format` is kept.
+/// - a *text* custom `format` (absent or `{"type":"text"}`) is only validated, never read afterwards
+///   ([`custom_extra_fields`] excludes it), so it lowers identically and is dropped. A *grammar* `format` is kept
+///   verbatim: two listings that differ only by grammar (base vs Environment-ID `apply_patch`) lower to materially
+///   different `input` constraints, so their identities must stay distinct. A reject-worthy `format` is likewise kept.
 ///   Every other custom field (including `output_schema`) is folded into the lowered function's prose, so it stays.
 /// - the `description` is canonicalized per kind by [`normalize_identity_description`] to mirror how that kind's
 ///   lowering folds its prose (`custom` trims and drops-when-empty, `namespace` trims, `shell` ignores it,
@@ -1240,15 +1251,17 @@ fn normalize_conflict_identity_fields(map: &mut Map<String, Value>) {
     if map.get("allowed_callers").is_none_or(Value::is_null) {
         map.remove("allowed_callers");
     }
-    if map.get("type").and_then(Value::as_str) == Some("custom") && custom_format_is_accepted(map) {
+    if map.get("type").and_then(Value::as_str) == Some("custom") && custom_format_is_text(map) {
         map.remove("format");
     }
     normalize_identity_description(map);
 }
 
-/// Whether a custom tool object's `format` is one lowering accepts (absent, or an
-/// object whose `type` is `"text"`), mirroring [`reject_unsupported_custom_declaration`].
-fn custom_format_is_accepted(map: &Map<String, Value>) -> bool {
+/// Whether a custom tool object's `format` is unconstrained text (absent, or an
+/// object whose `type` is `"text"`). A grammar `format` is not text, so it is
+/// retained in the conflict identity ([`normalize_conflict_identity_fields`]) to
+/// keep materially different grammars distinct.
+fn custom_format_is_text(map: &Map<String, Value>) -> bool {
     match map.get("format") {
         None => true,
         Some(format) => format.get("type").and_then(Value::as_str) == Some("text"),
@@ -1482,11 +1495,14 @@ struct Lowering {
     /// `tool_choice` forcing a still-deferred tool fails closed with a deferred-
     /// specific rejection instead of dangling a selector the backend cannot honor.
     withheld: HashSet<String>,
+    /// How the backend interprets a JSON-Schema `pattern`, applied when a lowered
+    /// grammar `custom` tool emits an `input` constraint.
+    custom_input_pattern_encoding: CustomInputPatternEncoding,
 }
 
 impl Lowering {
     /// Create an empty accumulator bounded by `max_client_tools`.
-    fn new(max_client_tools: usize) -> Self {
+    fn new(max_client_tools: usize, custom_input_pattern_encoding: CustomInputPatternEncoding) -> Self {
         Self {
             max_client_tools,
             occupied: HashMap::new(),
@@ -1495,6 +1511,7 @@ impl Lowering {
             withheld_any: false,
             withheld_count: 0,
             withheld: HashSet::new(),
+            custom_input_pattern_encoding,
         }
     }
 
@@ -1741,6 +1758,24 @@ impl Lowering {
         }
     }
 
+    /// Push the private `function` a `custom`/`NamespaceCustom` tool lowers to and
+    /// register its restoration recipe under the outbound `wire_name`.
+    fn finish_custom_lowering(
+        &mut self,
+        wire_name: String,
+        recipe: LoweredClientTool,
+        description: &str,
+        lowered: &mut Vec<Value>,
+    ) -> Result<(), FilterAction> {
+        lowered.push(custom_lowered_function(
+            &wire_name,
+            description,
+            recipe.format,
+            self.custom_input_pattern_encoding,
+        ));
+        self.register(wire_name, recipe)
+    }
+
     /// Lower a `custom` tool to a `function` with a single string `input`.
     ///
     /// `source` distinguishes a declared custom from one a `tool_search` discovered:
@@ -1755,19 +1790,20 @@ impl Lowering {
         let Some(name) = tool.get("name").and_then(Value::as_str).filter(|name| !name.is_empty()) else {
             return Err(reject_bad_request("custom tool requires a non-empty name"));
         };
-        reject_unsupported_custom_declaration(tool, &format!("custom tool '{name}'"))?;
+        let descriptor = format!("custom tool '{name}'");
+        let format = custom_input::resolve_custom_input_format(tool, &descriptor)?;
+        reject_if_restricted_callers(tool, &descriptor)?;
         let name = name.to_owned();
         self.claim_lowered(&name)?;
         self.reclaim_withheld(source, &name);
-        lowered.push(custom_lowered_function(&name, &custom_model_visible_description(tool)));
-        self.register(
-            name.clone(),
-            LoweredClientTool {
-                original_name: name,
-                namespace: None,
-                restore: ClientToolRestore::Custom,
-            },
-        )
+        let description = custom_model_visible_description(tool);
+        let recipe = LoweredClientTool {
+            original_name: name.clone(),
+            namespace: None,
+            restore: ClientToolRestore::Custom,
+            format,
+        };
+        self.finish_custom_lowering(name, recipe, &description, lowered)
     }
 
     /// Lower a local `shell` tool to the `shell` `function`, folding any declared
@@ -1783,6 +1819,7 @@ impl Lowering {
                 original_name: SHELL_FUNCTION_NAME.to_owned(),
                 namespace: None,
                 restore: ClientToolRestore::Shell,
+                format: CustomInputFormat::Text,
             },
         )
     }
@@ -1819,6 +1856,7 @@ impl Lowering {
                 original_name: TOOL_SEARCH_NAME.to_owned(),
                 namespace: None,
                 restore: ClientToolRestore::ToolSearch,
+                format: CustomInputFormat::Text,
             },
         )
     }
@@ -1908,6 +1946,7 @@ impl Lowering {
                 original_name: member_name.to_owned(),
                 namespace: Some(namespace.name.to_owned()),
                 restore: ClientToolRestore::Namespace,
+                format: CustomInputFormat::Text,
             },
         )
     }
@@ -1930,10 +1969,9 @@ impl Lowering {
         else {
             return Err(reject_bad_request("namespace member requires a non-empty name"));
         };
-        reject_unsupported_custom_declaration(
-            member,
-            &format!("namespace '{}' member '{member_name}'", namespace.name),
-        )?;
+        let descriptor = format!("namespace '{}' member '{member_name}'", namespace.name);
+        let format = custom_input::resolve_custom_input_format(member, &descriptor)?;
+        reject_if_restricted_callers(member, &descriptor)?;
         let flat = namespace_member_name(namespace.name, member_name);
         self.claim_lowered(&flat)?;
         self.reclaim_withheld(source, &flat);
@@ -1942,15 +1980,13 @@ impl Lowering {
             namespace.description,
             &custom_model_visible_description(member),
         );
-        lowered.push(custom_lowered_function(&flat, &description));
-        self.register(
-            flat,
-            LoweredClientTool {
-                original_name: member_name.to_owned(),
-                namespace: Some(namespace.name.to_owned()),
-                restore: ClientToolRestore::NamespaceCustom,
-            },
-        )
+        let recipe = LoweredClientTool {
+            original_name: member_name.to_owned(),
+            namespace: Some(namespace.name.to_owned()),
+            restore: ClientToolRestore::NamespaceCustom,
+            format,
+        };
+        self.finish_custom_lowering(flat, recipe, &description, lowered)
     }
 }
 
@@ -2075,19 +2111,34 @@ fn default_tool_search_parameters() -> Value {
 }
 
 /// Build the private `function` a `custom` tool lowers to.
-fn custom_lowered_function(name: &str, description: &str) -> Value {
+///
+/// When `format` is a recognized grammar and `encoding` emits a pattern, the
+/// lowered `input` property carries a JSON-Schema `pattern` so the backend
+/// constrains generation to the grammar. A `text` format (or the `none` encoding)
+/// lowers to the unconstrained `input` string. The decoded input is always
+/// re-validated on restoration regardless of what the backend enforces.
+fn custom_lowered_function(
+    name: &str,
+    description: &str,
+    format: CustomInputFormat,
+    encoding: CustomInputPatternEncoding,
+) -> Value {
+    let mut input = json!({
+        "type": "string",
+        "description": "Raw custom tool input. Follow the tool description and declared format exactly."
+    });
+    if let Some(pattern) = custom_input::backend_input_pattern(format, encoding)
+        && let Some(object) = input.as_object_mut()
+    {
+        object.insert("pattern".to_owned(), json!(pattern));
+    }
     json!({
         "type": "function",
         "name": name,
         "description": description,
         "parameters": {
             "type": "object",
-            "properties": {
-                "input": {
-                    "type": "string",
-                    "description": "Raw custom tool input. Follow the tool description and declared format exactly."
-                }
-            },
+            "properties": { "input": input },
             "required": ["input"],
             "additionalProperties": false
         },
@@ -2690,15 +2741,11 @@ pub(crate) fn restore_output_item(
         return Ok(());
     };
     match lowered.restore {
-        ClientToolRestore::Custom => {
-            *item = restore_custom_call(item).map_err(|()| "custom_tool_call")?;
+        ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom => {
+            *item = restore_custom_like(item, lowered).map_err(|()| "custom_tool_call")?;
         },
         ClientToolRestore::Namespace => {
             restore_namespace_call(item, &lowered.original_name, lowered.namespace.as_deref());
-        },
-        ClientToolRestore::NamespaceCustom => {
-            *item = restore_namespace_custom_call(item, &lowered.original_name, lowered.namespace.as_deref())
-                .map_err(|()| "custom_tool_call")?;
         },
         ClientToolRestore::Shell => {
             *item = restore_shell_call(item).map_err(|()| "shell_call")?;
@@ -2708,6 +2755,35 @@ pub(crate) fn restore_output_item(
         },
     }
     Ok(())
+}
+
+/// Unwrap a lowered custom call's `{"input":...}` envelope and validate the decoded
+/// value against `format`'s grammar. `Err(())` on a malformed envelope or a decoded
+/// patch that violates the grammar — the authoritative, backend-independent guarantee
+/// that malformed backend output never becomes a completed call (`Text` always
+/// validates). Shared by the buffered and streaming restoration paths.
+pub(crate) fn decoded_input(arguments: &str, format: CustomInputFormat) -> Result<String, ()> {
+    let input = input_from_arguments_strict(arguments)?;
+    if custom_input::validate_decoded_input(format, &input) {
+        Ok(input)
+    } else {
+        Err(())
+    }
+}
+
+/// Restore a lowered `function_call` to a (possibly namespaced) `custom_tool_call`,
+/// selecting the restore by the recipe's kind. Shared by the buffered response pass
+/// and the streaming finalizer so both validate the decoded input identically.
+pub(crate) fn restore_custom_like(item: &Value, lowered: &LoweredClientTool) -> Result<Value, ()> {
+    match lowered.restore {
+        ClientToolRestore::NamespaceCustom => restore_namespace_custom_call(
+            item,
+            &lowered.original_name,
+            lowered.namespace.as_deref(),
+            lowered.format,
+        ),
+        _ => restore_custom_call(item, lowered.format),
+    }
 }
 
 /// Restore a lowered `function_call` to a `custom_tool_call`, failing closed when
@@ -2725,7 +2801,7 @@ pub(crate) fn restore_output_item(
 /// schema, so carrying the backend `function_call`'s status would emit a
 /// noncanonical field. "Preserve status" applies only to target item types that
 /// define it.
-pub(crate) fn restore_custom_call(item: &Value) -> Result<Value, ()> {
+pub(crate) fn restore_custom_call(item: &Value, format: CustomInputFormat) -> Result<Value, ()> {
     let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
     let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
     let call_id = item
@@ -2733,7 +2809,7 @@ pub(crate) fn restore_custom_call(item: &Value) -> Result<Value, ()> {
         .and_then(Value::as_str)
         .filter(|call_id| !call_id.trim().is_empty())
         .ok_or(())?;
-    let input = input_from_arguments_strict(arguments)?;
+    let input = decoded_input(arguments, format)?;
     let mut out = json!({
         "type": "custom_tool_call",
         "id": custom_public_item_id(id),
@@ -2765,8 +2841,9 @@ pub(crate) fn restore_namespace_custom_call(
     item: &Value,
     member_name: &str,
     namespace: Option<&str>,
+    format: CustomInputFormat,
 ) -> Result<Value, ()> {
-    let mut out = restore_custom_call(item)?;
+    let mut out = restore_custom_call(item, format)?;
     if let Some(object) = out.as_object_mut() {
         object.insert("name".to_owned(), json!(member_name));
         if let Some(namespace) = namespace {
@@ -3152,28 +3229,6 @@ fn reject_unsupported_namespace_member(namespace: &str, member_type: Option<&str
         "namespace '{namespace}' contains an unsupported '{member_type}' member; only function and custom members can \
          be lowered for a function-only Responses backend"
     ))
-}
-
-/// Fail closed when a `custom` declaration (a top-level `custom` tool or a
-/// `custom` namespace member) uses features that cannot be preserved once lowered
-/// to a private `function`: a non-`text` constrained `format` or a restricted
-/// `allowed_callers`. `descriptor` names the offending tool for the rejection
-/// message (e.g. `custom tool 'x'` or `namespace 'n' member 'm'`).
-///
-/// `defer_loading` is intentionally not rejected here: a deferred `custom`
-/// declaration is withheld from the outbound set on the declaration path (see
-/// `lower_tools`/`lower_namespace`) and consumed — loaded and made callable — on
-/// the discovery path, exactly like a deferred `function`.
-fn reject_unsupported_custom_declaration(tool: &Value, descriptor: &str) -> Result<(), FilterAction> {
-    if let Some(format) = tool.get("format")
-        && format.get("type").and_then(Value::as_str) != Some("text")
-    {
-        return Err(reject_bad_request(&format!(
-            "{descriptor} uses an unsupported custom format; constrained decoding cannot be preserved for a \
-             function-only backend"
-        )));
-    }
-    reject_if_restricted_callers(tool, descriptor)
 }
 
 /// Fail closed when a rewritten tool declares a non-null `allowed_callers`

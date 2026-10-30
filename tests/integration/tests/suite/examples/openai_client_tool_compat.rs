@@ -2006,3 +2006,140 @@ fn stored_custom_tool_history_survives_continuation() {
         "the stored custom call/output pair must replay and lower in order: {second_wire}"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Round trip: Codex apply_patch grammar lowered with a pattern, restored, validated
+// -----------------------------------------------------------------------------
+
+/// The pinned Codex apply_patch grammar, read from the same vendored file the filter
+/// recognizes so the declaration is accepted and lowered with a pattern.
+const APPLY_PATCH_GRAMMAR: &str =
+    include_str!("../../../../../apis/src/openai/responses/openai_client_tool_compat/apply_patch.lark");
+
+/// A `custom` tool declaring the pinned apply_patch grammar is lowered to a private
+/// `function` whose `input` carries a JSON-Schema `pattern`, and the backend's
+/// `function_call` (a grammar-valid patch) is restored to a `custom_tool_call` whose
+/// `input` is the exact patch, with the original grammar declaration echoed back.
+#[test]
+fn apply_patch_grammar_round_trip_lowers_with_pattern_and_restores() {
+    let patch = "*** Begin Patch\n*** Add File: hello.txt\n+hello world\n*** End Patch\n";
+    let args = serde_json::json!({ "input": patch }).to_string();
+    let backend_response = serde_json::json!({
+        "id": "resp_ap",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_ap",
+            "call_id": "call_ap",
+            "name": "apply_patch",
+            "arguments": args,
+            "status": "completed"
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, backend_response.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("client_tool_compat_apply_patch_grammar");
+    let config = load_client_tool_compat_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Apply the patch.",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply a unified diff to the workspace.",
+            "format": {"type": "grammar", "syntax": "lark", "definition": APPLY_PATCH_GRAMMAR}
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    assert_eq!(parse_status(&raw), 200, "grammar round trip should return 200: {raw}");
+
+    // Request phase: the backend saw a pattern-constrained private function.
+    let model_reqs = inference_requests(&model);
+    assert_eq!(
+        model_reqs.len(),
+        1,
+        "exactly one inference round for a single tool call"
+    );
+    let backend_body: serde_json::Value = serde_json::from_str(&model_reqs[0].body).expect("backend body JSON");
+    let tool = &backend_body["tools"][0];
+    assert_eq!(tool["type"], "function", "custom grammar tool lowered to function");
+    assert_eq!(tool["name"], "apply_patch");
+    assert!(
+        tool["parameters"]["properties"]["input"]["pattern"].is_string(),
+        "the lowered input is constrained by a grammar pattern: {backend_body}"
+    );
+    assert!(
+        backend_body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["type"] != "custom"),
+        "no rich custom tool may reach the backend: {backend_body}"
+    );
+
+    // Response phase: restored custom_tool_call with the exact patch; echoed grammar tool.
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("client response JSON");
+    let item = &response["output"][0];
+    assert_eq!(
+        item["type"], "custom_tool_call",
+        "function_call restored to custom: {response}"
+    );
+    assert_eq!(item["name"], "apply_patch");
+    assert_eq!(item["input"], patch, "the exact patch bytes are restored: {response}");
+    assert_eq!(
+        response["tools"][0]["format"]["type"], "grammar",
+        "the client sees its original grammar declaration: {response}"
+    );
+}
+
+/// A backend `function_call` whose decoded `input` violates the grammar never
+/// becomes a completed `custom_tool_call`: buffered restoration fails closed with
+/// HTTP 502, host-side (independent of whatever the backend enforced).
+#[test]
+fn apply_patch_grammar_malformed_backend_output_returns_502() {
+    let args = serde_json::json!({ "input": "this is not a patch" }).to_string();
+    let backend_response = serde_json::json!({
+        "id": "resp_bad",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_bad",
+            "call_id": "call_bad",
+            "name": "apply_patch",
+            "arguments": args,
+            "status": "completed"
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, backend_response.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("client_tool_compat_apply_patch_malformed");
+    let config = load_client_tool_compat_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Apply the patch.",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply a unified diff to the workspace.",
+            "format": {"type": "grammar", "syntax": "lark", "definition": APPLY_PATCH_GRAMMAR}
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        502,
+        "a backend patch that violates the grammar fails closed with 502: {raw}"
+    );
+}

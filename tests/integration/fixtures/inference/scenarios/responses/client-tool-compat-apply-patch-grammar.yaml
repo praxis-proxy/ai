@@ -1,0 +1,72 @@
+version: 1
+id: responses/client-tool-compat-apply-patch-grammar
+description: apply_patch grammar custom client tool lowered to a pattern-constrained private function on a function-only Responses backend, then restored to a custom_tool_call.
+protocol: openai_responses
+example_config: openai/responses/client-tool-compat.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+- responses.client_tool_compat.apply_patch_grammar
+turns:
+- name: apply-patch-grammar-lower-restore
+  request:
+    method: POST
+    path: /v1/responses
+    headers:
+      content-type:
+      - application/json
+    body:
+      kind: json
+      value:
+        model: ${MODEL}
+        input: Apply the patch.
+        store: false
+        stream: false
+        tools:
+        - type: custom
+          name: apply_patch
+          description: Apply a unified diff to the workspace.
+          format:
+            type: grammar
+            syntax: lark
+            definition: 'start: begin_patch hunk+ end_patch
+
+              begin_patch: "*** Begin Patch" LF
+
+              end_patch: "*** End Patch" LF?
+
+
+              hunk: add_hunk | delete_hunk | update_hunk
+
+              add_hunk: "*** Add File: " filename LF add_line+
+
+              delete_hunk: "*** Delete File: " filename LF
+
+              update_hunk: "*** Update File: " filename LF change_move? change?
+
+
+              filename: /(.+)/
+
+              add_line: "+" /(.*)/ LF -> line
+
+
+              change_move: "*** Move to: " filename LF
+
+              change: (change_context | change_line)+ eof_line?
+
+              change_context: ("@@" | "@@ " /(.+)/) LF
+
+              change_line: ("+" | "-" | " ") /(.*)/ LF
+
+              eof_line: "*** End of File" LF
+
+
+              %import common.LF
+
+              '
+  expect:
+    client_status: 200
+    client_body_kind: json
+    upstream_path: /v1/responses
+    upstream_body_kind: json
+    client_sse_events: []
+    upstream_sse_events: []
