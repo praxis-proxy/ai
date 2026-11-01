@@ -773,6 +773,7 @@ fn try_complete_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider:
 }
 
 /// Extract the provider-specific terminal reason from a JSON payload.
+#[expect(clippy::too_many_lines, reason = "provider-specific reason paths are clearer inline")]
 fn extract_finish_reason(payload: &[u8], provider: ProviderKind) -> Option<String> {
     let needle: &[u8] = match provider {
         ProviderKind::OpenAi | ProviderKind::Azure => b"\"finish_reason\"",
@@ -781,61 +782,37 @@ fn extract_finish_reason(payload: &[u8], provider: ProviderKind) -> Option<Strin
         ProviderKind::Bedrock => b"\"stopReason\"",
         ProviderKind::BedrockInvokeModel | ProviderKind::Auto => return None,
     };
-    extract_json_string_after(payload, needle)
-}
+    if !payload.windows(needle.len()).any(|window| window == needle) {
+        return None;
+    }
 
-/// Extract a quoted JSON string value immediately following `needle`.
-#[expect(
-    clippy::indexing_slicing,
-    reason = "bounded slicing over a byte buffer after explicit length checks"
-)]
-fn extract_json_string_after(payload: &[u8], needle: &[u8]) -> Option<String> {
-    let start = find_subslice(payload, needle)?;
-    let mut rest = &payload[start + needle.len()..];
-    rest = skip_json_separator(rest)?;
-    if rest.first() != Some(&b'"') {
-        return None;
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let reason = match provider {
+        ProviderKind::OpenAi | ProviderKind::Azure => value
+            .get("choices")?
+            .as_array()?
+            .first()?
+            .get("finish_reason")?
+            .as_str()?,
+        ProviderKind::Anthropic => value.get("delta")?.get("stop_reason")?.as_str()?,
+        ProviderKind::Google => value
+            .get("candidates")?
+            .as_array()?
+            .first()?
+            .get("finishReason")?
+            .as_str()?,
+        ProviderKind::Bedrock => value
+            .get("messageStop")
+            .and_then(|message| message.get("stopReason"))
+            .or_else(|| value.get("stopReason"))
+            .and_then(serde_json::Value::as_str)?,
+        ProviderKind::BedrockInvokeModel | ProviderKind::Auto => return None,
+    };
+    if reason.is_empty() {
+        None
+    } else {
+        Some(reason.to_owned())
     }
-    rest = &rest[1..];
-    let end = rest.iter().position(|&b| b == b'"')?;
-    let value = std::str::from_utf8(&rest[..end]).ok()?;
-    if value.is_empty() {
-        return None;
-    }
-    Some(value.to_owned())
-}
-
-/// Skip ASCII whitespace and a single `:` before a JSON value.
-#[expect(
-    clippy::indexing_slicing,
-    reason = "bounded slicing over a byte buffer after explicit length checks"
-)]
-fn skip_json_separator(mut rest: &[u8]) -> Option<&[u8]> {
-    while let Some(&first) = rest.first() {
-        if !first.is_ascii_whitespace() {
-            break;
-        }
-        rest = &rest[1..];
-    }
-    if rest.first() != Some(&b':') {
-        return None;
-    }
-    rest = &rest[1..];
-    while let Some(&first) = rest.first() {
-        if !first.is_ascii_whitespace() {
-            break;
-        }
-        rest = &rest[1..];
-    }
-    Some(rest)
-}
-
-/// Locate `needle` in `haystack`, returning the byte index of the match.
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|window| window == needle)
 }
 
 /// Map provider-native terminal reasons onto the bounded metric label set.

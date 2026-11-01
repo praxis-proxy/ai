@@ -2585,6 +2585,16 @@ fn extract_finish_reason_is_provider_aware() {
 }
 
 #[test]
+fn finish_reason_ignores_key_inside_content() {
+    let payload = br#"{"choices":[{"delta":{"content":"literal \"finish_reason\": \"stop\""}}]}"#;
+    assert_eq!(
+        extract_finish_reason(payload, ProviderKind::OpenAi),
+        None,
+        "generated content must not be mistaken for a finish-reason field"
+    );
+}
+
+#[test]
 fn normalize_finish_reason_bounds_labels() {
     assert_eq!(normalize_finish_reason("stop"), "stop");
     assert_eq!(normalize_finish_reason("end_turn"), "stop");

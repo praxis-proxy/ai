@@ -8,98 +8,104 @@
 //! reasoning, tool calls, and function calls; Responses counts only
 //! output-text and reasoning-text deltas.
 
-/// Largest event inspected for output-delta structure.
-///
-/// Output deltas are small. Large terminal events (for example a Responses
-/// `response.completed` payload) can embed the whole response and are never
-/// output deltas; skipping them keeps the hot path bounded.
-const MAX_OUTPUT_DELTA_PAYLOAD_BYTES: usize = 64 * 1024;
-
 /// Returns whether an SSE data payload carries a generated output delta.
-#[expect(clippy::too_many_lines, reason = "provider rules are clearer inline")]
 pub(crate) fn payload_has_output_delta(payload: &[u8]) -> bool {
-    if payload.is_empty() || payload.len() > MAX_OUTPUT_DELTA_PAYLOAD_BYTES {
+    if payload.is_empty() {
         return false;
     }
 
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
-        return false;
-    };
-
-    if let Some(event_type) = value.get("type").and_then(serde_json::Value::as_str) {
-        if event_type.starts_with("response.") {
-            return matches!(
-                event_type,
-                "response.output_text.delta" | "response.reasoning_text.delta"
-            );
-        }
-        if event_type == "content_block_delta" {
-            return ["text", "thinking", "partial_json"].iter().any(|key| {
-                value
-                    .get("delta")
-                    .and_then(|delta| delta.get(*key))
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|text| !text.is_empty())
-            });
-        }
-        if event_type == "contentBlockDelta" {
-            return ["text", "input"].iter().any(|key| {
-                value
-                    .get("delta")
-                    .and_then(|delta| delta.get(*key))
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|text| !text.is_empty())
-            });
-        }
+    if json_string_starts_with(payload, b"\"type\"", b"response.") {
+        return json_string_equals(payload, b"\"type\"", b"response.output_text.delta")
+            || json_string_equals(payload, b"\"type\"", b"response.reasoning_text.delta");
+    }
+    if json_string_equals(payload, b"\"type\"", b"content_block_delta") {
+        return json_string_nonempty(payload, b"\"text\"")
+            || json_string_nonempty(payload, b"\"thinking\"")
+            || json_string_nonempty(payload, b"\"partial_json\"");
+    }
+    if json_string_equals(payload, b"\"type\"", b"contentBlockDelta") {
+        return json_string_nonempty(payload, b"\"text\"") || json_string_nonempty(payload, b"\"input\"");
     }
 
-    if let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) {
-        let Some(choice) = choices.first() else {
-            return false;
-        };
-        if choice.get("text").is_some() {
+    if find_subslice(payload, b"\"choices\"").is_some() {
+        if find_subslice(payload, b"\"text\"").is_some() {
             return true;
         }
-        if let Some(delta) = choice.get("delta") {
-            if delta
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|content| !content.is_empty() || delta.get("role").is_none())
-            {
-                return true;
-            }
-            if ["reasoning", "reasoning_content"].iter().any(|key| {
-                delta
-                    .get(*key)
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|text| !text.is_empty())
-            }) {
-                return true;
-            }
-            if delta.get("tool_calls").is_some() || delta.get("function_call").is_some() {
-                return true;
-            }
+        if json_string_nonempty(payload, b"\"content\"")
+            || (json_string_empty(payload, b"\"content\"") && find_subslice(payload, b"\"role\"").is_none())
+        {
+            return true;
         }
-        return false;
+        return json_string_nonempty(payload, b"\"reasoning\"")
+            || json_string_nonempty(payload, b"\"reasoning_content\"")
+            || find_subslice(payload, b"\"tool_calls\"").is_some()
+            || find_subslice(payload, b"\"function_call\"").is_some();
     }
 
-    if let Some(candidates) = value.get("candidates").and_then(serde_json::Value::as_array) {
-        return candidates.iter().any(|candidate| {
-            candidate
-                .get("content")
-                .and_then(|content| content.get("parts"))
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|parts| {
-                    parts.iter().any(|part| {
-                        part.get("text")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|text| !text.is_empty())
-                    })
-                })
-        });
-    }
+    find_subslice(payload, b"\"candidates\"").is_some() && json_string_nonempty(payload, b"\"text\"")
+}
 
-    false
+/// Return whether the JSON string after `needle` starts with `prefix`.
+fn json_string_starts_with(payload: &[u8], needle: &[u8], prefix: &[u8]) -> bool {
+    json_string_after(payload, needle).is_some_and(|value| value.starts_with(prefix))
+}
+
+/// Return whether the JSON string after `needle` is non-empty.
+fn json_string_nonempty(payload: &[u8], needle: &[u8]) -> bool {
+    json_string_after(payload, needle).is_some_and(|value| !value.is_empty())
+}
+
+/// Return whether the JSON string after `needle` is empty.
+fn json_string_empty(payload: &[u8], needle: &[u8]) -> bool {
+    json_string_after(payload, needle).is_some_and(<[u8]>::is_empty)
+}
+
+/// Return whether the JSON string after `needle` equals `expected`.
+fn json_string_equals(payload: &[u8], needle: &[u8], expected: &[u8]) -> bool {
+    json_string_after(payload, needle).is_some_and(|value| value == expected)
+}
+
+/// Extract a quoted JSON string value immediately following `needle`.
+fn json_string_after<'a>(payload: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
+    let start = find_subslice(payload, needle)?;
+    let mut rest = payload.get(start + needle.len()..)?;
+    rest = skip_json_separator(rest)?;
+    if rest.first() != Some(&b'"') {
+        return None;
+    }
+    rest = rest.get(1..)?;
+    let end = rest.iter().position(|&byte| byte == b'"')?;
+    rest.get(..end)
+}
+
+/// Skip ASCII whitespace and a single `:` before a JSON value.
+fn skip_json_separator(mut rest: &[u8]) -> Option<&[u8]> {
+    while let Some((&first, tail)) = rest.split_first() {
+        if !first.is_ascii_whitespace() {
+            break;
+        }
+        rest = tail;
+    }
+    let (&separator, tail) = rest.split_first()?;
+    if separator != b':' {
+        return None;
+    }
+    rest = tail;
+    while let Some((&first, tail)) = rest.split_first() {
+        if !first.is_ascii_whitespace() {
+            break;
+        }
+        rest = tail;
+    }
+    Some(rest)
+}
+
+/// Locate `needle` in `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|window| window == needle)
 }
 
 #[cfg(test)]
@@ -160,5 +166,23 @@ mod tests {
         for (payload, want) in cases {
             assert_eq!(payload_has_output_delta(payload), *want, "{payload:?}");
         }
+    }
+
+    #[test]
+    fn large_output_delta_is_not_dropped() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(br#"{"choices":[{"delta":{"content":""#);
+        payload.extend(std::iter::repeat_n(b'x', 70_000));
+        payload.extend_from_slice(br#""}}]}"#);
+        assert!(payload_has_output_delta(&payload));
+    }
+
+    #[test]
+    fn large_terminal_event_is_not_an_output_delta() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(br#"{"type":"response.completed","response":{"output":""#);
+        payload.extend(std::iter::repeat_n(b'x', 70_000));
+        payload.extend_from_slice(br#""}}"#);
+        assert!(!payload_has_output_delta(&payload));
     }
 }

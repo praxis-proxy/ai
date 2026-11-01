@@ -166,7 +166,8 @@ documented rate rather than silently slowing every stream.
 - ITL is chunk-level, not exactly per generated token.
 - Provider-specific output-delta rules differ where vLLM has no equivalent
   benchmark backend.
-- Events larger than 64 KiB are treated as non-deltas to keep the hot path
-  bounded; normal content deltas are far smaller.
 - The `model` label is intentionally bounded; `unknown` means no model
   metadata and `other` means the admission cap was reached.
+- An output delta in a final SSE event without a trailing blank line is
+  recovered at end-of-stream; TTFT then reflects the flush time rather than
+  the first-token arrival time.
