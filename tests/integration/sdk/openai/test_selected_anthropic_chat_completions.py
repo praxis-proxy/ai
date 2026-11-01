@@ -108,7 +108,7 @@ def _config(proxy_port: int, backend_port: int, api_translation_enabled: bool = 
                 {"filter": "openai_chat_completions_to_anthropic_stream", "max_partial_event_bytes": 1048576,
                  "max_tool_blocks": 256},
                 {"filter": "openai_chat_completions_to_anthropic", "api_translation_enabled": api_translation_enabled,
-                 "max_body_bytes": 1048576},
+                 "max_request_body_bytes": 2097152, "max_response_body_bytes": 1048576},
                 {"filter": "credential_inject", "credentials": [{
                     "name": "anthropic-fixture-secret", "namespace": "grid-fixture", "key": "api-key",
                     "strategy": "apikey", "header": "x-api-key", "value": "fixture-only-dummy-token"}]},
@@ -219,6 +219,79 @@ def test_anthropic_backend_wire_headers(client: OpenAI) -> None:
     assert "authorization" not in headers, (
         "the caller's OpenAI authorization header must not leak to the Anthropic backend"
     )
+
+
+def test_legacy_omitted_tokens_and_ignored_openai_options(client: OpenAI) -> None:
+    STATE.script(200, "application/json", _message(
+        [{"type": "text", "text": "compatibility"}], {"input_tokens": 1, "output_tokens": 1},
+    ))
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": "hello"}],
+        user="customer-42",
+        n=2,
+        seed=17,
+        parallel_tool_calls=True,
+    )
+    assert response.choices[0].message.content == "compatibility", "accepted compatibility options must preserve the translated response"
+    assert len(response.choices) == 1, "ignored n does not request multiple completions from Anthropic"
+    _, _headers, upstream = STATE.requests[-1]
+    assert upstream["max_tokens"] == 4096, "omitted token limits must use the compatibility default"
+    assert upstream["model"] == "claude-fixture-model", "the selected provider model must replace the client model"
+    for field in ("user", "n", "seed", "parallel_tool_calls"):
+        assert field not in upstream, f"legacy compatibility field {field} must not leak into Anthropic JSON"
+
+
+def test_data_and_remote_image_urls_are_translated_without_fetching(client: OpenAI) -> None:
+    STATE.script(200, "application/json", _message(
+        [{"type": "text", "text": "image received"}], {"input_tokens": 2, "output_tokens": 2},
+    ))
+    client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": "before"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "detail": "high"}},
+            {"type": "text", "text": "after"},
+            {"type": "image_url", "image_url": {"url": "https://images.example.test/image.png"}},
+        ]}],
+        max_tokens=16,
+    )
+    path, _headers, upstream = STATE.requests[-1]
+    assert path == "/v1/messages", "image requests must use the Anthropic Messages endpoint"
+    content = upstream["messages"][0]["content"]
+    assert [block["type"] for block in content] == ["text", "image", "text", "image"], "conversion must preserve text and image ordering"
+    assert content[1]["source"] == {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}, "inline images must retain their original base64 data and media type"
+    assert content[3]["source"] == {"type": "url", "url": "https://images.example.test/image.png"}, "remote images must remain URL references"
+
+
+def test_assistant_image_is_rejected_before_provider_contact(client: OpenAI) -> None:
+    with pytest.raises(APIStatusError) as caught:
+        client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "image_url", "image_url": {"url": "https://images.example.test/image.png"}},
+                ]},
+            ],
+            max_tokens=16,
+        )
+    assert caught.value.status_code == 400, "unsupported or malformed images must return a client error"
+    assert "supported only in user messages" in str(caught.value), "assistant image rejection must explain the supported role"
+    assert not STATE.requests, "unsupported image roles must be rejected before provider contact"
+
+
+def test_malformed_image_is_rejected_before_provider_contact(client: OpenAI) -> None:
+    with pytest.raises(APIStatusError) as caught:
+        client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,%%%"}},
+            ]}],
+            max_tokens=16,
+        )
+    assert caught.value.status_code == 400, "unsupported or malformed images must return a client error"
+    assert not STATE.requests, "malformed image data must be rejected before contacting the provider"
 
 
 def test_null_cache_usage(client: OpenAI) -> None:
