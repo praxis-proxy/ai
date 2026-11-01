@@ -419,8 +419,8 @@ def test_failover_example_supports_explicit_stream_modes(failover_client: OpenAI
         )
         assert response.choices[0].message.content == "failover", "translated fallback JSON must reach the OpenAI client"
 
-    assert [path for path, _ in STATE.requests] == ["/v1/chat/completions", "/v1/messages"]
-    assert STATE.requests[0][1]["stream"] is stream, "primary must receive the SDK stream selection"
+    assert [path for path, _, _ in STATE.requests] == ["/v1/chat/completions", "/v1/messages"]
+    assert STATE.requests[0][2]["stream"] is stream, "primary must receive the SDK stream selection"
 
 
 def test_tool_call_and_result_round_trip(client: OpenAI) -> None:

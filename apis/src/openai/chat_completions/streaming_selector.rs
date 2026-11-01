@@ -114,11 +114,7 @@ impl HttpFilter for OpenaiChatCompletionsStreamingSelectorFilter {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "tests use unwrap and expect for concise assertions"
-)]
+#[expect(clippy::unwrap_used, reason = "tests use unwrap for concise assertions")]
 mod tests {
     use bytes::Bytes;
     use http::Method;
@@ -136,6 +132,7 @@ mod tests {
         assert!(matches!(filter.response_body_mode(), BodyMode::Stream));
     }
 
+    #[expect(clippy::too_many_lines, reason = "covers streaming and buffered transport selection")]
     #[tokio::test]
     async fn selects_streaming_only_for_a_true_stream_field() {
         let request = crate::test_utils::make_request(Method::POST, "/v1/chat/completions");
@@ -152,7 +149,7 @@ mod tests {
             SubRequestResponseMode::Streaming
         );
 
-        for body in [br#"{"stream":false}"#.as_slice(), br#"{}"#.as_slice(), b"not-json"] {
+        for body in [br#"{"stream":false}"#.as_slice(), b"{}".as_slice(), b"not-json"] {
             let mut buffered_ctx = crate::test_utils::make_filter_context(&request);
             let mut buffered_body = Some(Bytes::copy_from_slice(body));
             let action = filter()
