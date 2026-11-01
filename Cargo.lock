@@ -1445,6 +1445,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "enmaas-policy-filter"
+version = "0.6.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http",
+ "praxis-ai-apis",
+ "praxis-proxy-core",
+ "praxis-proxy-filter",
+ "praxis-proxy-tls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "yaml_serde",
+]
+
+[[package]]
 name = "enum-ordinalize"
 version = "4.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3637,6 +3655,7 @@ dependencies = [
  "bytes",
  "cargo_metadata",
  "clap",
+ "enmaas-policy-filter",
  "futures",
  "http",
  "nix",

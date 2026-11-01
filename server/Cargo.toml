@@ -85,6 +85,7 @@ notify = { workspace = true }
 percent-encoding = { workspace = true }
 pingora-core = { workspace = true }
 praxis-ai-filters = { workspace = true }
+enmaas_policy_filter = { path = "../enmaas-policy-filter", package = "enmaas-policy-filter" }
 praxis-ai-apis = { workspace = true }
 praxis-ai-store = { workspace = true }
 praxis-ai-store-lifecycle = { workspace = true }
