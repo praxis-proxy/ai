@@ -9,7 +9,11 @@
 
 use praxis_filter::FilterRegistry;
 
-use crate::{config::EnmaasPolicyConfig, filter::EnmaasPolicyFilter, policy::PolicyDecision};
+use crate::{
+    config::EnmaasPolicyConfig,
+    filter::EnmaasPolicyFilter,
+    policy::{DenyReason, PolicyDecision},
+};
 
 #[test]
 fn exports_enmaas_policy() {
@@ -31,27 +35,26 @@ fn parses_policy_decision() {
     let decision: PolicyDecision = serde_json::from_str(
         r#"{
             "version": 1,
-            "hasAccess": true,
-            "modelAllowed": false,
+            "allowed": false,
+            "denyReason": "model_not_allowed",
             "qosClass": "ratelimit",
             "qosSubject": "subject-1",
-            "qosRetryAfter": 12,
-            "qosKeyAlias": "main-0",
+            "retryAfterSeconds": 12,
+            "qosKeyAlias": "main",
             "cacheTtlSeconds": 3
         }"#,
     )
     .expect("decision parses");
-    assert!(decision.has_access);
-    assert!(!decision.model_allowed);
+    assert!(!decision.allowed);
+    assert_eq!(decision.deny_reason, Some(DenyReason::ModelNotAllowed));
     assert_eq!(decision.normalized_class("main"), "ratelimit");
-    assert_eq!(decision.qos_retry_after, Some(12));
+    assert_eq!(decision.retry_after_seconds, Some(12));
 }
 
 #[test]
 fn rejects_unknown_decision_fields() {
-    let decision = serde_json::from_str::<PolicyDecision>(
-        r#"{"version":1,"hasAccess":true,"modelAllowed":true,"qosClass":"main","extra":1}"#,
-    );
+    let decision =
+        serde_json::from_str::<PolicyDecision>(r#"{"version":1,"allowed":true,"qosClass":"main","extra":1}"#);
     assert!(decision.is_err());
 }
 
@@ -65,6 +68,9 @@ fn defaults_are_stable() {
     assert!(matches!(config.qos_enforcement, crate::config::QosEnforcement::Soft));
     assert_eq!(config.username_metadata, "x-tenant-username");
     assert_eq!(config.model_metadata, "model_to_provider.client_model");
+    assert_eq!(config.timeout_seconds, 1);
+    assert_eq!(config.response_class_header, "x-enmaas-qos-class");
+    assert!(!config.credential_enabled);
 }
 
 use std::{
@@ -186,15 +192,21 @@ fn mock_policy(body: &'static str) -> (String, Arc<Mutex<String>>, thread::JoinH
 }
 
 fn build_filter(policy_url: &str) -> Box<dyn HttpFilter> {
-    let yaml = serde_yaml::from_str(&format!("policy_url: {policy_url}\nallow_private_endpoint: true\n"))
-        .expect("filter yaml");
+    build_filter_with(policy_url, "")
+}
+
+fn build_filter_with(policy_url: &str, extra: &str) -> Box<dyn HttpFilter> {
+    let yaml = serde_yaml::from_str(&format!(
+        "policy_url: {policy_url}\nallow_private_endpoint: true\n{extra}"
+    ))
+    .expect("filter yaml");
     EnmaasPolicyFilter::from_config(&yaml).expect("filter builds")
 }
 
 #[tokio::test]
 async fn callout_uses_body_model_and_publishes_class() {
     let (policy_url, captured, handle) = mock_policy(
-        r#"{"version":1,"hasAccess":true,"modelAllowed":true,"qosClass":"main","qosSubject":"subject-1","cacheTtlSeconds":5}"#,
+        r#"{"version":1,"allowed":true,"qosClass":"main","qosSubject":"subject-1","qosKeyAlias":"main","cacheTtlSeconds":5}"#,
     );
     let filter = build_filter(&policy_url);
     let request = make_request(Method::POST, "/v1/chat/completions");
@@ -231,7 +243,7 @@ async fn callout_uses_body_model_and_publishes_class() {
 #[tokio::test]
 async fn model_denial_rejects_with_403() {
     let (policy_url, _captured, handle) =
-        mock_policy(r#"{"version":1,"hasAccess":true,"modelAllowed":false,"qosClass":"main"}"#);
+        mock_policy(r#"{"version":1,"allowed":false,"denyReason":"model_not_allowed","qosClass":"main"}"#);
     let filter = build_filter(&policy_url);
     let request = make_request(Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&request);
@@ -253,5 +265,131 @@ async fn model_denial_rejects_with_403() {
         },
         other => panic!("expected 403 rejection, got {other:?}"),
     }
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn quota_denial_uses_retry_after() {
+    let (policy_url, _captured, handle) = mock_policy(
+        r#"{"version":1,"allowed":false,"denyReason":"quota_exhausted","qosClass":"main","qosSubject":"subject-1","retryAfterSeconds":42,"cacheTtlSeconds":0}"#,
+    );
+    let filter = build_filter(&policy_url);
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    match action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 429);
+            assert_eq!(
+                rejection
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                    .map(|(_, value)| value.as_str()),
+                Some("42")
+            );
+        },
+        other => panic!("expected quota rejection, got {other:?}"),
+    }
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn hard_ratelimit_rejects_with_policy_retry() {
+    let (policy_url, _captured, handle) = mock_policy(
+        r#"{"version":1,"allowed":true,"qosClass":"ratelimit","qosSubject":"subject-1","retryAfterSeconds":17,"cacheTtlSeconds":0}"#,
+    );
+    let filter = build_filter_with(&policy_url, "qos_enforcement: hard\n");
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    match action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 429);
+            assert_eq!(
+                rejection
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                    .map(|(_, value)| value.as_str()),
+                Some("17")
+            );
+        },
+        other => panic!("expected ratelimit rejection, got {other:?}"),
+    }
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn soft_ratelimit_passes_and_publishes_class() {
+    let (policy_url, _captured, handle) = mock_policy(
+        r#"{"version":1,"allowed":true,"qosClass":"ratelimit","qosSubject":"subject-1","retryAfterSeconds":17,"cacheTtlSeconds":0}"#,
+    );
+    let filter = build_filter(&policy_url);
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.get_metadata("qos.class"), Some("ratelimit"));
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn local_bucket_rejects_after_burst() {
+    let (policy_url, _captured, handle) =
+        mock_policy(r#"{"version":1,"allowed":true,"qosClass":"main","qosSubject":"subject-1","cacheTtlSeconds":5}"#);
+    let filter = build_filter_with(
+        &policy_url,
+        "qos_enforcement: hard\nmain_burst: 1\nmain_refill_per_second: 0.001\n",
+    );
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut first = make_filter_context(&request);
+    first.set_metadata("x-tenant-username", "alice");
+    first.set_metadata("model_to_provider.client_model", "model-a");
+    let first_action = filter.on_request(&mut first).await.expect("first policy request");
+    assert!(matches!(first_action, FilterAction::Continue));
+
+    let mut second = make_filter_context(&request);
+    second.set_metadata("x-tenant-username", "alice");
+    second.set_metadata("model_to_provider.client_model", "model-a");
+    let second_action = filter.on_request(&mut second).await.expect("second policy request");
+    match second_action {
+        FilterAction::Reject(rejection) => assert_eq!(rejection.status, 429),
+        other => panic!("expected local bucket rejection, got {other:?}"),
+    }
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn class_key_alias_is_injected() {
+    let key_file = tempfile::NamedTempFile::new().expect("temp key file");
+    std::fs::write(key_file.path(), r#"{"main":[{"id":"main-0","key":"secret-main"}]}"#).expect("write key file");
+    let (policy_url, _captured, handle) = mock_policy(
+        r#"{"version":1,"allowed":true,"qosClass":"main","qosSubject":"subject-1","qosKeyAlias":"main","cacheTtlSeconds":0}"#,
+    );
+    let extra = format!("credential_enabled: true\nkey_file: {}\n", key_file.path().display());
+    let filter = build_filter_with(&policy_url, &extra);
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.cluster = Some(Arc::from("cb-glm"));
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.extra_request_headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("authorization") && value == "Bearer secret-main")
+    );
     handle.join().expect("mock policy thread");
 }

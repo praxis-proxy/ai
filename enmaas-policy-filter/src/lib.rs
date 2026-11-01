@@ -6,8 +6,11 @@
 
 //! EnMaaS request authorization and QoS policy filter.
 
+mod buckets;
 mod config;
+mod events;
 mod filter;
+mod keys;
 mod policy;
 
 #[cfg(test)]
