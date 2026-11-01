@@ -37,6 +37,35 @@ jobs:
       PRAXIS_AI_FEATURES: full,gcp-adc-filter
       SOURCE_SHA: ${{ inputs.commit || github.sha }}
     steps:
+      - name: Verify manual dispatch is from main
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ env.SOURCE_SHA }}
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::error::manual dispatches must run from refs/heads/main, got ${GITHUB_REF}"
+            exit 1
+          fi
+
+          response=$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/compare/main...${SOURCE_SHA}") || {
+            echo "::error::could not compare ${SOURCE_SHA} with main"
+            exit 1
+          }
+          status=$(jq -r '.status' <<<"${response}")
+          case "${status}" in
+            behind|identical)
+              echo "${SOURCE_SHA} is reachable from main (${status})"
+              ;;
+            *)
+              echo "::error::${SOURCE_SHA} is not reachable from main (compare status: ${status})"
+              exit 1
+              ;;
+          esac
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.commit || github.sha }}

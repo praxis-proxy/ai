@@ -37,6 +37,10 @@ Rust dependency graph on every push.
   `:sha-<commit>` tags.
 - `workflow_dispatch` accepts an optional `commit` input. A manual rebuild
   tags only `:sha-<commit>`; it never moves `:main`.
+- Manual dispatch must run from `refs/heads/main`, and the selected commit
+  must be reachable from `main`. The workflow rejects other refs and commits
+  before checkout, so unreviewed branch code cannot use the Quay builder
+  credentials or write into `main`'s build-cache scope.
 - The workflow is intended for branches in the canonical repository, where
   the Quay builder secrets are available. Do not expose those credentials to
   arbitrary fork code.
