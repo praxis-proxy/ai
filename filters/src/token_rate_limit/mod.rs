@@ -2856,16 +2856,6 @@ impl TokenRateLimitFilter {
             .get_metadata(META_RULE_INDEX)
             .and_then(|v| v.parse::<usize>().ok())
             .and_then(|index| self.rules.get(index))?;
-        #[cfg(feature = "token-quota-filter")]
-        if self.reconciliation_source == ReconciliationSource::SharedQuota
-            && crate::token_quota::decision(ctx).is_none()
-        {
-            tracing::warn!(
-                rule = rule.name,
-                "token_rate_limit: token quota policy produced no decision"
-            );
-            counter!("praxis_trl_quota_source_missing_total", "rule" => rule.name.clone()).increment(1);
-        }
         let actual = self.actual_cost(ctx, rule);
         if actual.is_none() {
             tracing::trace!("token_rate_limit: no usable token usage metadata at end of stream, charging at estimate");
@@ -2877,6 +2867,34 @@ impl TokenRateLimitFilter {
             now_ms: self.now_ms(),
         };
         Some((request, rule))
+    }
+
+    /// Record a missing shared-quota decision once for any response that has
+    /// a rule or hierarchy reservation to reconcile. Soft rule denials can
+    /// retain hierarchy reservations without retaining a rule reservation, so
+    /// this check must run before [`Self::reconciliation_context`] returns.
+    #[cfg(feature = "token-quota-filter")]
+    fn record_missing_quota_decision(&self, ctx: &HttpFilterContext<'_>) {
+        if self.reconciliation_source != ReconciliationSource::SharedQuota
+            || crate::token_quota::decision(ctx).is_some()
+        {
+            return;
+        }
+        let has_rule_reservation = parse_u64_meta(ctx, META_RESERVATION_ID).is_some();
+        let has_hierarchy_reservation = !Self::collect_hierarchy_stash(ctx).is_empty();
+        if !has_rule_reservation && !has_hierarchy_reservation {
+            return;
+        }
+        let rule_name = ctx
+            .get_metadata(META_RULE_INDEX)
+            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|index| self.rules.get(index))
+            .map_or("unknown", |rule| rule.name.as_str());
+        tracing::warn!(
+            rule = rule_name,
+            "token_rate_limit: token quota policy produced no decision"
+        );
+        counter!("praxis_trl_quota_source_missing_total", "rule" => rule_name.to_owned()).increment(1);
     }
 
     /// Reconcile a prior reservation against actual usage, if known.
@@ -3339,6 +3357,8 @@ impl HttpFilter for TokenRateLimitFilter {
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         if end_of_stream {
+            #[cfg(feature = "token-quota-filter")]
+            self.record_missing_quota_decision(ctx);
             if let Some(hierarchy) = &self.hierarchy {
                 let rule = ctx
                     .get_metadata(META_RULE_INDEX)
