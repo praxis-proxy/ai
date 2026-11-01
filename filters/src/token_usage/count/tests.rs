@@ -144,6 +144,34 @@ async fn on_response_handles_case_insensitive_content_type() {
 }
 
 #[tokio::test]
+async fn on_response_clears_stale_stream_state() {
+    let filter = make_filter(ProviderKind::OpenAi);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    ctx.filter_metadata
+        .insert(META_SSE_LINE_BUF.to_owned(), "data: stale".to_owned());
+    ctx.filter_metadata
+        .insert(META_SSE_DATA_HEX.to_owned(), "7374616c65".to_owned());
+    ctx.filter_metadata
+        .insert(META_SSE_SKIP.to_owned(), "not_skipping".to_owned());
+    ctx.filter_metadata.insert(META_INPUT.to_owned(), "42".to_owned());
+
+    let mut resp = make_response_with_content_type("text/event-stream");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    for key in [META_SSE_LINE_BUF, META_SSE_DATA_HEX, META_SSE_SKIP, META_INPUT] {
+        assert!(
+            !ctx.filter_metadata.contains_key(key),
+            "stale {key} must be cleared before a retry"
+        );
+    }
+    assert_eq!(ctx.get_metadata(META_MODE), Some("sse"));
+}
+
+#[tokio::test]
 async fn on_response_skips_non_success_status() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");

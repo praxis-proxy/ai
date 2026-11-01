@@ -400,10 +400,11 @@ impl HttpFilter for TokenCountFilter {
     /// other providers, detects the content-type to select the body
     /// extraction strategy used by `on_response_body`.
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        // A retry can reuse the request context; never let timing or
-        // finish-reason state from the previous response leak into this one.
+        // A retry can reuse the request context after an aborted response; clear
+        // all token_count working state, including the SSE scanner buffers, and
+        // drop the per-stream timing handles.
+        clear_all_metadata(ctx);
         ctx.extensions.remove::<StreamTimingState>();
-        ctx.filter_metadata.remove(META_FINISH_RECORDED);
 
         let is_success = ctx.response_header.as_ref().is_some_and(|r| r.status.is_success());
 
