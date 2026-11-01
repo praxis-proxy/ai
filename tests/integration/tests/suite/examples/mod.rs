@@ -56,6 +56,7 @@ mod full_flow_agentic;
 mod gcp_adc;
 mod guardrails;
 mod guardrails_response;
+mod guardrails_service_account;
 mod identity_header_guard;
 #[cfg(feature = "openai-responses")]
 mod inference_fallback;

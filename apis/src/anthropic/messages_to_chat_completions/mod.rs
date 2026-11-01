@@ -281,10 +281,18 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // Strip the caller's Anthropic wire credentials so they never reach a
+        // Chat Completions backend. SDK v1 sends the key as `x-api-key`; SDK
+        // v2 sends it as `authorization: Bearer`. Symmetric with
+        // `openai_chat_completions_to_anthropic`, which strips the caller's
+        // `authorization` on the reverse route. Operators who want a backend
+        // credential compose `credential_injection` after this filter.
         ctx.request_headers_to_remove
             .push(http::header::HeaderName::from_static("anthropic-version"));
         ctx.request_headers_to_remove
             .push(http::header::HeaderName::from_static("x-api-key"));
+        ctx.request_headers_to_remove
+            .push(http::header::HeaderName::from_static("authorization"));
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
 
         Ok(FilterAction::Continue)
@@ -1164,6 +1172,27 @@ mod tests {
             ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING),
             "response transformation requires an unencoded upstream representation"
         );
+    }
+
+    #[tokio::test]
+    async fn on_request_strips_caller_anthropic_credentials() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        // The caller's Anthropic wire credentials must not reach a Chat
+        // Completions backend, whichever header the SDK lane puts them on:
+        // `x-api-key` (SDK v1) or `authorization: Bearer` (SDK v2).
+        for header in ["anthropic-version", "x-api-key", "authorization"] {
+            assert!(
+                ctx.request_headers_to_remove
+                    .contains(&http::header::HeaderName::from_static(header)),
+                "caller credential header {header} must be stripped"
+            );
+        }
     }
 
     #[test]

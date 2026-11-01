@@ -17,6 +17,7 @@ publish = false
 # compile the standard proxy build to get it.
 default = ["dev"]
 dev = [
+    "pins",
     "dep:praxis-ai",
     "dep:praxis-ai-apis",
     "dep:praxis-core",
@@ -33,6 +34,9 @@ dev = [
     "praxis-ai-apis/full",
     "praxis-test-utils/full",
 ]
+# `check-pins` alone: parses the pin manifests without compiling the proxy, so
+# the GPU workflow's `pins` job stays fast.
+pins = ["dep:toml"]
 # Opt-in experimental OpenAI implementations used by conformance reports and
 # developer proxies. Does not affect default workspace builds.
 openai-all = ["dev", "praxis-ai/openai-all", "praxis-ai-apis/openai-all", "praxis-test-utils/openai-all"]
@@ -74,6 +78,7 @@ serde_yaml = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 syn = { workspace = true, optional = true }
 tempfile = { workspace = true }
+toml = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }

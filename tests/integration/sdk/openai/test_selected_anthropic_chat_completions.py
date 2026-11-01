@@ -47,16 +47,16 @@ class _BackendState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.scripted: deque[tuple[int, str, bytes]] = deque()
-        self.requests: list[tuple[str, dict]] = []
+        self.requests: list[tuple[str, dict[str, str], dict]] = []
 
     def script(self, status: int, content_type: str, body: dict | str) -> None:
         encoded = json.dumps(body).encode() if isinstance(body, dict) else body.encode()
         with self.lock:
             self.scripted.append((status, content_type, encoded))
 
-    def take(self, path: str, body: bytes) -> tuple[int, str, bytes]:
+    def take(self, path: str, headers: dict[str, str], body: bytes) -> tuple[int, str, bytes]:
         with self.lock:
-            self.requests.append((path, json.loads(body)))
+            self.requests.append((path, headers, json.loads(body)))
             return self.scripted.popleft()
 
 
@@ -73,7 +73,8 @@ def reset_backend_state():
 class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         length = int(self.headers["content-length"])
-        status, content_type, body = STATE.take(self.path, self.rfile.read(length))
+        headers = {key.lower(): value for key, value in self.headers.items()}
+        status, content_type, body = STATE.take(self.path, headers, self.rfile.read(length))
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -108,7 +109,7 @@ def _config(proxy_port: int, backend_port: int, api_translation_enabled: bool = 
                 {"filter": "openai_chat_completions_to_anthropic_stream", "max_partial_event_bytes": 1048576,
                  "max_tool_blocks": 256},
                 {"filter": "openai_chat_completions_to_anthropic", "api_translation_enabled": api_translation_enabled,
-                 "max_body_bytes": 1048576},
+                 "max_request_body_bytes": 2097152, "max_response_body_bytes": 1048576},
                 {"filter": "credential_inject", "credentials": [{
                     "name": "anthropic-fixture-secret", "namespace": "grid-fixture", "key": "api-key",
                     "strategy": "apikey", "header": "x-api-key", "value": "fixture-only-dummy-token"}]},
@@ -252,9 +253,101 @@ def test_json_and_cached_usage(client: OpenAI) -> None:
     assert response.usage.prompt_tokens == 1060, "cache tokens must count toward prompt usage"
     assert response.usage.completion_tokens == 4, "Anthropic output tokens must become completion tokens"
     assert response.usage.total_tokens == 1064, "total tokens must include cache and output tokens"
-    path, upstream = STATE.requests[-1]
+    path, _headers, upstream = STATE.requests[-1]
     assert path == "/v1/messages", "selected Anthropic requests must use the Messages path"
     assert upstream["model"] == "claude-fixture-model", "selected target model must reach Anthropic"
+
+
+def test_anthropic_backend_wire_headers(client: OpenAI) -> None:
+    STATE.script(200, "application/json", _message(
+        [{"type": "text", "text": "hello"}],
+        {"input_tokens": 10, "output_tokens": 4},
+    ))
+    client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16)
+    path, headers, _upstream = STATE.requests[-1]
+    assert path == "/v1/messages", "selected Anthropic requests must use the Messages path"
+    assert headers.get("anthropic-version") == "2023-06-01", (
+        "the selected Anthropic route must pin the API version on the backend request"
+    )
+    assert headers.get("x-api-key") == "fixture-only-dummy-token", (
+        "the injected provider credential must travel in x-api-key"
+    )
+    assert "authorization" not in headers, (
+        "the caller's OpenAI authorization header must not leak to the Anthropic backend"
+    )
+
+
+def test_legacy_omitted_tokens_and_ignored_openai_options(client: OpenAI) -> None:
+    STATE.script(200, "application/json", _message(
+        [{"type": "text", "text": "compatibility"}], {"input_tokens": 1, "output_tokens": 1},
+    ))
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": "hello"}],
+        user="customer-42",
+        n=2,
+        seed=17,
+        parallel_tool_calls=True,
+    )
+    assert response.choices[0].message.content == "compatibility", "accepted compatibility options must preserve the translated response"
+    assert len(response.choices) == 1, "ignored n does not request multiple completions from Anthropic"
+    _, _headers, upstream = STATE.requests[-1]
+    assert upstream["max_tokens"] == 4096, "omitted token limits must use the compatibility default"
+    assert upstream["model"] == "claude-fixture-model", "the selected provider model must replace the client model"
+    for field in ("user", "n", "seed", "parallel_tool_calls"):
+        assert field not in upstream, f"legacy compatibility field {field} must not leak into Anthropic JSON"
+
+
+def test_data_and_remote_image_urls_are_translated_without_fetching(client: OpenAI) -> None:
+    STATE.script(200, "application/json", _message(
+        [{"type": "text", "text": "image received"}], {"input_tokens": 2, "output_tokens": 2},
+    ))
+    client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": "before"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "detail": "high"}},
+            {"type": "text", "text": "after"},
+            {"type": "image_url", "image_url": {"url": "https://images.example.test/image.png"}},
+        ]}],
+        max_tokens=16,
+    )
+    path, _headers, upstream = STATE.requests[-1]
+    assert path == "/v1/messages", "image requests must use the Anthropic Messages endpoint"
+    content = upstream["messages"][0]["content"]
+    assert [block["type"] for block in content] == ["text", "image", "text", "image"], "conversion must preserve text and image ordering"
+    assert content[1]["source"] == {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}, "inline images must retain their original base64 data and media type"
+    assert content[3]["source"] == {"type": "url", "url": "https://images.example.test/image.png"}, "remote images must remain URL references"
+
+
+def test_assistant_image_is_rejected_before_provider_contact(client: OpenAI) -> None:
+    with pytest.raises(APIStatusError) as caught:
+        client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "image_url", "image_url": {"url": "https://images.example.test/image.png"}},
+                ]},
+            ],
+            max_tokens=16,
+        )
+    assert caught.value.status_code == 400, "unsupported or malformed images must return a client error"
+    assert "supported only in user messages" in str(caught.value), "assistant image rejection must explain the supported role"
+    assert not STATE.requests, "unsupported image roles must be rejected before provider contact"
+
+
+def test_malformed_image_is_rejected_before_provider_contact(client: OpenAI) -> None:
+    with pytest.raises(APIStatusError) as caught:
+        client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,%%%"}},
+            ]}],
+            max_tokens=16,
+        )
+    assert caught.value.status_code == 400, "unsupported or malformed images must return a client error"
+    assert not STATE.requests, "malformed image data must be rejected before contacting the provider"
 
 
 def test_null_cache_usage(client: OpenAI) -> None:
@@ -351,7 +444,7 @@ def test_tool_call_and_result_round_trip(client: OpenAI) -> None:
         {"role": "tool", "tool_call_id": call.id, "content": "sunny"},
     ], tools=tools, max_tokens=16)
     assert second.choices[0].message.content == "sunny", "tool-result round trip must return translated text"
-    assert STATE.requests[-1][1]["messages"][-1]["content"][0]["type"] == "tool_result", "OpenAI tool results must become Anthropic tool_result blocks"
+    assert STATE.requests[-1][2]["messages"][-1]["content"][0]["type"] == "tool_result", "OpenAI tool results must become Anthropic tool_result blocks"
 
 
 @pytest.mark.parametrize("status", [429, 529])

@@ -34,6 +34,16 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 const STREAMING_RESPONSE_GUARDRAIL_ERROR: &str =
     "ai_guardrails: streaming responses are not supported while a response guardrail is active";
 
+/// Per-request response-phase decision, kept in filter state so it survives
+/// `ExtProc` phase boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResponseScreening {
+    /// The request carried a body, so a 2xx response is model output.
+    Screen,
+    /// The response is not model output and is forwarded unevaluated.
+    Skip,
+}
+
 // -----------------------------------------------------------------------------
 // AiGuardrailsFilter
 // -----------------------------------------------------------------------------
@@ -91,11 +101,34 @@ const STREAMING_RESPONSE_GUARDRAIL_ERROR: &str =
 /// `"stream": true` are rejected with HTTP 422 until incremental SSE
 /// response evaluation is supported (see #1108).
 ///
+/// The response phase screens only 2xx responses to requests that carried a
+/// body. Responses to bodyless requests (for example `GET /v1/models`) and
+/// non-2xx responses are forwarded unevaluated, with their original status
+/// and body, so upstream errors and management endpoints sharing the
+/// listener still reach the client.
+///
 /// For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail
 /// configurations. When `provider.guardrails` is omitted, the request omits
 /// `config_ids` so the service can use its default configuration. Omit
 /// `provider.model` to leave the selected configuration's models unchanged;
 /// a non-empty value replaces or adds its main model.
+///
+/// In production, set `provider.endpoint` to `https://`. Set
+/// `provider.tls.ca_file` to the PEM bundle that signed the `NeMo` server
+/// certificate. That bundle is this peer's trust store, and hostname
+/// verification stays enabled. Without it, the call uses the trust store
+/// loaded for the Praxis process.
+///
+/// `provider.token_file` is optional. When set, Praxis reads that Kubernetes
+/// service account token at startup and sends it on the call to this `NeMo`
+/// address. The token is not on the request the outbound chain sees. Praxis
+/// adds `Authorization` after that chain runs, so a filter there cannot
+/// remove or replace it. An `http` endpoint is refused unless its host is
+/// loopback. A file that is missing, empty, or not a valid header value
+/// refuses to start. If the file later becomes unreadable, the `NeMo` call is
+/// refused and handled as a provider error: with the default
+/// `failure_mode: closed` the chat is rejected, and with `failure_mode: open`
+/// it is forwarded unscreened.
 ///
 /// # YAML configuration
 ///
@@ -104,9 +137,11 @@ const STREAMING_RESPONSE_GUARDRAIL_ERROR: &str =
 /// outbound_chain: nemo-outbound # optional
 /// provider:
 ///   type: nemo
-///   endpoint: "http://nemo:8000/v1/checks"
+///   endpoint: "https://nemo.default.svc:8443/v1/checks"
 ///   guardrails:
 ///     config_ids: ["your-config"]
+///   tls:
+///     ca_file: /var/run/secrets/nemo/ca.crt
 ///   timeout_ms: 5000
 /// phase:
 ///   request: true
@@ -313,6 +348,11 @@ impl HttpFilter for AiGuardrailsFilter {
             return Ok(FilterAction::Continue);
         }
 
+        if !response_is_model_output(ctx) {
+            ctx.insert_filter_state(ResponseScreening::Skip);
+            return Ok(FilterAction::Continue);
+        }
+
         if is_event_stream(ctx) {
             return Ok(FilterAction::Reject(
                 Rejection::status(502).with_body(STREAMING_RESPONSE_GUARDRAIL_ERROR),
@@ -363,6 +403,10 @@ impl HttpFilter for AiGuardrailsFilter {
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
+        }
+
+        if self.phase.response && body.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
+            ctx.insert_filter_state(ResponseScreening::Screen);
         }
 
         #[cfg(feature = "openai-responses")]
@@ -440,6 +484,10 @@ impl HttpFilter for AiGuardrailsFilter {
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream || !self.phase.response {
+            return Ok(FilterAction::Continue);
+        }
+
+        if ctx.get_filter_state::<ResponseScreening>() == Some(&ResponseScreening::Skip) {
             return Ok(FilterAction::Continue);
         }
 
@@ -961,6 +1009,20 @@ fn extract_response_messages(body: &Bytes) -> Result<Vec<serde_json::Value>, Fil
     }
 
     Err("ai_guardrails: response body does not contain recognizable choices".into())
+}
+
+/// Whether the response is model output the response phase must screen: a 2xx
+/// answer to a request that carried a body.
+///
+/// Bodyless requests such as `GET /v1/models` cannot carry a prompt, and error
+/// statuses carry upstream diagnostics rather than a completion.
+fn response_is_model_output(ctx: &HttpFilterContext<'_>) -> bool {
+    let request_had_body = ctx.get_filter_state::<ResponseScreening>() == Some(&ResponseScreening::Screen);
+    let success = ctx
+        .response_header
+        .as_ref()
+        .is_some_and(|response| response.status.is_success());
+    request_had_body && success
 }
 
 /// Whether the upstream response has a `text/event-stream` content type.

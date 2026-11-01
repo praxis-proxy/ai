@@ -527,6 +527,24 @@ class TestVertexGeminiChatCompletions:
         assert exc_info.value.status_code == 400
         assert FakeVertexGeminiHandler.last_request_body is None
 
+    def test_non_string_text_part_is_rejected_before_vertex(self, openai_client: OpenAI) -> None:
+        """A malformed text part is rejected, not silently dropped from the request."""
+        FakeVertexGeminiHandler.last_request_body = None
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.chat.completions.create(
+                model="gemini-2.0-flash",
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": None}],  # type: ignore[typeddict-item]
+                    },
+                    {"role": "user", "content": "continue"},
+                ],
+            )
+        assert exc_info.value.status_code == 400
+        assert "assistant text part is missing" in exc_info.value.message
+        assert FakeVertexGeminiHandler.last_request_body is None
+
     def test_non_streaming_basic(self, openai_client: OpenAI) -> None:
         """Non-streaming request translates correctly and response is OpenAI-shaped."""
         response = openai_client.chat.completions.create(

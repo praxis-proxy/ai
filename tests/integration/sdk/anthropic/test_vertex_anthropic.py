@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["anthropic>=0.40", "pytest>=8.0"]
+# dependencies = ["anthropic==1.17.0", "pytest>=8.0"]
 # ///
 """Anthropic SDK compatibility for Vertex error and streaming translation."""
 

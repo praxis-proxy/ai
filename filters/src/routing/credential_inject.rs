@@ -1435,7 +1435,8 @@ mod tests {
         assert_eq!(ctx.request_headers_to_set[0].1, "Bearer inside-token");
     }
 
-    #[cfg(unix)]
+    // APFS rejects non-UTF-8 filenames, so this cannot run on macOS.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn projected_secret_reads_preserve_non_utf8_canonical_paths() {
         use std::{
