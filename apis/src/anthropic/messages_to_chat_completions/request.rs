@@ -870,32 +870,41 @@ fn validate_content_blocks(blocks: &[Value], role: &str) -> Result<(), String> {
                 }
             },
             Some("tool_result") if role == "user" => {
-                let text_content = match block.get("content") {
-                    None | Some(Value::String(_)) => true,
-                    Some(Value::Array(parts)) => parts.iter().all(text_block_is_supported),
-                    _ => false,
-                };
-                if !block.get("tool_use_id").is_some_and(Value::is_string)
-                    || !text_content
-                    || block.get("is_error") == Some(&Value::Bool(true))
-                    || block
-                        .get("is_error")
-                        .is_some_and(|value| !value.is_boolean() && !value.is_null())
-                    || !has_only_keys(
-                        block,
-                        &[
-                            "type",
-                            "tool_use_id",
-                            "content",
-                            "is_error",
-                            "toolset_name",
-                            "cache_control",
-                        ],
-                    )
-                    || !null_or_absent(block, "toolset_name")
+                if !block.get("tool_use_id").is_some_and(Value::is_string) {
+                    return Err("tool_result block requires a string `tool_use_id`".to_owned());
+                }
+                match block.get("content") {
+                    None | Some(Value::String(_)) => {},
+                    Some(Value::Array(parts)) => {
+                        if let Some(part) = parts.iter().find(|part| !tool_result_part_is_supported(part)) {
+                            let kind = part.get("type").and_then(Value::as_str).unwrap_or("missing");
+                            return Err(format!("tool_result `content` has an unsupported part `{kind}`"));
+                        }
+                    },
+                    _ => {
+                        return Err("tool_result `content` must be a string or an array".to_owned());
+                    },
+                }
+                if block
+                    .get("is_error")
+                    .is_some_and(|value| !value.is_boolean() && !value.is_null())
+                {
+                    return Err("tool_result `is_error` must be a boolean or null".to_owned());
+                }
+                if !has_only_keys(
+                    block,
+                    &[
+                        "type",
+                        "tool_use_id",
+                        "content",
+                        "is_error",
+                        "toolset_name",
+                        "cache_control",
+                    ],
+                ) || !null_or_absent(block, "toolset_name")
                     || !null_or_absent(block, "cache_control")
                 {
-                    return Err("tool_result requires string `tool_use_id` and text `content`".to_owned());
+                    return Err("unsupported Anthropic tool_result field for Chat Completions translation".to_owned());
                 }
             },
             Some(kind) => return Err(format!("unsupported Anthropic content block `{kind}`")),
@@ -926,6 +935,22 @@ fn text_block_is_supported(block: &Value) -> bool {
 /// Nullable request metadata has no effect when absent or null.
 fn null_or_absent(value: &Value, key: &str) -> bool {
     value.get(key).is_none_or(Value::is_null)
+}
+
+/// Check a `tool_result` content part against what
+/// `split_tool_result_parts` translates: text, promoted images, and
+/// flattened `search_result`/`document` blocks. Anything else fails closed.
+fn tool_result_part_is_supported(part: &Value) -> bool {
+    match part.get("type").and_then(Value::as_str) {
+        Some("text") => text_block_is_supported(part),
+        Some("image") => {
+            part.get("source").is_some_and(image_source_is_supported)
+                && has_only_keys(part, &["type", "source", "cache_control"])
+                && null_or_absent(part, "cache_control")
+        },
+        Some("search_result" | "document") => true,
+        _ => false,
+    }
 }
 
 /// A direct caller is the only caller form this translator emits and consumes.
@@ -2080,17 +2105,128 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_error_is_rejected() {
+    fn tool_result_error_is_translated() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"cat: missing.txt: No such file or directory","is_error":true}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["messages"][0]["role"], "tool", "tool role");
+        assert_eq!(parsed["messages"][0]["tool_call_id"], "call_1", "tool_call_id");
+        assert_eq!(
+            parsed["messages"][0]["content"],
+            "Anthropic tool_result error:\ncat: missing.txt: No such file or directory",
+            "errored tool result content keeps the error marker"
+        );
+    }
+
+    #[test]
+    fn tool_result_image_is_promoted() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"chart"},{"type":"image","source":{"type":"url","url":"https://example.com/chart.png"}}]}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["messages"][0]["role"], "tool", "tool role");
+        assert_eq!(parsed["messages"][0]["tool_call_id"], "call_1", "tool_call_id");
+        assert_eq!(
+            parsed["messages"][0]["content"], "chart",
+            "text part stays in the tool message"
+        );
+
+        assert_eq!(parsed["messages"][1]["role"], "user", "promoted image role");
+        assert_eq!(
+            parsed["messages"][1]["content"][0]["type"], "image_url",
+            "promoted image part type"
+        );
+        assert_eq!(
+            parsed["messages"][1]["content"][0]["image_url"]["url"], "https://example.com/chart.png",
+            "promoted image url"
+        );
+    }
+
+    #[test]
+    fn tool_result_image_with_bad_source_is_rejected() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"image","source":{"type":"file","file_id":"file_abc"}}]}]}]}"#;
         let error = transform_bytes(body).unwrap_err();
         assert!(error.contains("tool_result"), "{error}");
     }
 
     #[test]
-    fn tool_result_image_is_rejected() {
-        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"chart"},{"type":"image","source":{"type":"url","url":"https://example.com/chart.png"}}]}]}]}"#;
+    fn tool_result_error_with_empty_content_uses_bare_marker() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"","is_error":true}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(
+            parsed["messages"][0]["content"], "Anthropic tool_result error",
+            "empty errored tool result uses the bare marker"
+        );
+    }
+
+    #[test]
+    fn tool_result_error_with_omitted_content_uses_bare_marker() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","is_error":true}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(
+            parsed["messages"][0]["content"], "Anthropic tool_result error",
+            "omitted errored tool result uses the bare marker"
+        );
+    }
+
+    #[test]
+    fn tool_result_false_and_null_is_error_leave_content_unchanged() {
+        for flag in ["false", "null"] {
+            let body = format!(
+                r#"{{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call_1","content":"72F sunny","is_error":{flag}}}]}}]}}"#
+            );
+            let result = transform_bytes(body.as_bytes()).unwrap();
+            let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+            assert_eq!(
+                parsed["messages"][0]["content"], "72F sunny",
+                "is_error: {flag} must not add the error marker"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_result_non_boolean_is_error_is_rejected() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"72F sunny","is_error":"yes"}]}]}"#;
         let error = transform_bytes(body).unwrap_err();
         assert!(error.contains("tool_result"), "{error}");
+        assert!(error.contains("is_error"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_promotion_preserves_message_order() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"get_chart","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"chart"},{"type":"image","source":{"type":"url","url":"https://example.com/chart.png"}}]}]},{"role":"user","content":"What does it show?"}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let roles: Vec<&str> = parsed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["assistant", "tool", "user", "user"], "message order");
+        assert_eq!(
+            parsed["messages"][2]["content"][0]["image_url"]["url"], "https://example.com/chart.png",
+            "promoted image lands directly after the tool message"
+        );
+        assert_eq!(
+            parsed["messages"][3]["content"], "What does it show?",
+            "subsequent message is intact"
+        );
+    }
+
+    #[test]
+    fn tool_result_unsupported_content_part_is_rejected() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"thinking","thinking":"internal"}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("tool_result"), "{error}");
+        assert!(error.contains("thinking"), "{error}");
     }
 
     #[test]
@@ -2101,17 +2237,31 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_search_result_is_rejected() {
+    fn tool_result_search_result_is_flattened() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"search_result","source":"kb://timeouts","title":"Timeout KB","content":[{"type":"text","text":"Timeouts default to 30 seconds."}]},{"type":"text","text":"Applies to version 2."}]}]}]}"#;
-        let error = transform_bytes(body).unwrap_err();
-        assert!(error.contains("tool_result"), "{error}");
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["messages"][0]["role"], "tool", "tool role");
+        assert_eq!(
+            parsed["messages"][0]["content"],
+            "Search result: \"Timeout KB\"\nSource: \"kb://timeouts\"\nContent:\nTimeouts default to 30 seconds.\nApplies to version 2.",
+            "search_result part is flattened into the tool message content"
+        );
     }
 
     #[test]
-    fn tool_result_document_is_rejected() {
+    fn tool_result_document_is_flattened() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"Before document."},{"type":"document","source":{"type":"content","content":[{"type":"text","text":"Nested document fact."}]},"title":"Nested Doc"},{"type":"text","text":"After document."}]}]}]}"#;
-        let error = transform_bytes(body).unwrap_err();
-        assert!(error.contains("tool_result"), "{error}");
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["messages"][0]["role"], "tool", "tool role");
+        assert_eq!(
+            parsed["messages"][0]["content"],
+            "Before document.\nDocument: \"Nested Doc\"\nContent:\nNested document fact.\nAfter document.",
+            "document part is flattened into the tool message content"
+        );
     }
 
     #[test]

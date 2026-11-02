@@ -422,11 +422,20 @@ filter_chains:
 The `anthropic_messages_to_chat_completions` filter:
 - Hoists `system` to an OpenAI system message
 - Translates text, user image, assistant `tool_use`,
-  and text-only user `tool_result` blocks; rejects
+  and user `tool_result` blocks; top-level
   `document`, `search_result`, and other blocks that
-  Chat Completions cannot represent
-- Rejects `tool_result.is_error: true` because Chat
-  Completions has no equivalent tool-result error flag
+  Chat Completions cannot represent are rejected
+- Translates `tool_result.is_error: true` by
+  prefixing the tool message content with
+  `Anthropic tool_result error:` (a bare marker when
+  the content is empty), because Chat Completions has
+  no equivalent tool-result error flag
+- Splits array-form `tool_result.content`: text
+  parts are joined into the tool message, image
+  parts are promoted to a follow-up user message,
+  and `search_result`/`document` parts are flattened
+  to text; unsupported part types and malformed image
+  sources are rejected
 - Maps `stop_sequences` to `stop`,
   `tool_choice` semantics, tool definitions
 - Reports a matched stop sequence as `stop_reason:

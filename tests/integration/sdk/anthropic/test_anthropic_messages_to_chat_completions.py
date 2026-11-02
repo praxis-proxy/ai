@@ -487,6 +487,78 @@ class TestRequestFieldHandling:
         assert upstream["messages"][1]["tool_calls"][0]["function"]["name"] == "lookup"
         assert upstream["messages"][2]["content"] == ""
 
+    def test_errored_tool_result_is_translated_not_rejected(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "cat: missing.txt: No such file or directory",
+                        "is_error": True,
+                    }],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tool_message = upstream["messages"][2]
+        assert tool_message["role"] == "tool"
+        assert tool_message["tool_call_id"] == "toolu_1"
+        assert tool_message["content"] == (
+            "Anthropic tool_result error:\ncat: missing.txt: No such file or directory"
+        )
+
+    def test_tool_result_image_content_is_promoted_to_user_message(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [
+                            {"type": "text", "text": "chart"},
+                            {
+                                "type": "image",
+                                "source": {"type": "url", "url": "https://example.com/chart.png"},
+                            },
+                        ],
+                    }],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tool_message = upstream["messages"][2]
+        assert tool_message["role"] == "tool"
+        assert tool_message["content"] == "chart"
+        image_message = upstream["messages"][3]
+        assert image_message["role"] == "user"
+        assert image_message["content"][0]["type"] == "image_url"
+        assert image_message["content"][0]["image_url"]["url"] == "https://example.com/chart.png"
+
     def test_empty_string_tool_arguments_become_empty_input(self, anthropic_client):
         RecordingBackend.bodies.clear()
         RecordingBackend.send_tool_reply_once = True
