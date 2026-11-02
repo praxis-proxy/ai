@@ -6754,6 +6754,7 @@ fn apply_patch_history_item_preserves_multiline_patch_bytes() {
     );
 }
 
+#[cfg(feature = "store")]
 #[test]
 fn stored_apply_patch_call_replays_through_existing_canonical_types() {
     // #1834 rides the existing custom_tool_call path, so a stored apply_patch call and

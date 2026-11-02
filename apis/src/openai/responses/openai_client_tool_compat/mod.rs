@@ -2763,12 +2763,21 @@ pub(crate) fn restore_output_item(
 /// that malformed backend output never becomes a completed call (`Text` always
 /// validates). Shared by the buffered and streaming restoration paths.
 pub(crate) fn decoded_input(arguments: &str, format: CustomInputFormat) -> Result<String, ()> {
-    let input = input_from_arguments_strict(arguments)?;
-    if custom_input::validate_decoded_input(format, &input) {
-        Ok(input)
-    } else {
-        Err(())
+    let input = input_from_arguments_strict(arguments).map_err(|()| {
+        tracing::warn!(
+            restore_failure = "invalid_arguments_envelope",
+            "backend custom tool call could not be restored"
+        );
+    })?;
+    if !custom_input::validate_decoded_input(format, &input) {
+        tracing::warn!(
+            restore_failure = "input_does_not_match_declared_format",
+            format = ?format,
+            "backend custom tool call could not be restored"
+        );
+        return Err(());
     }
+    Ok(input)
 }
 
 /// Restore a lowered `function_call` to a (possibly namespaced) `custom_tool_call`,
@@ -2804,11 +2813,17 @@ pub(crate) fn restore_custom_like(item: &Value, lowered: &LoweredClientTool) -> 
 pub(crate) fn restore_custom_call(item: &Value, format: CustomInputFormat) -> Result<Value, ()> {
     let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
     let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
-    let call_id = item
+    let Some(call_id) = item
         .get("call_id")
         .and_then(Value::as_str)
         .filter(|call_id| !call_id.trim().is_empty())
-        .ok_or(())?;
+    else {
+        tracing::warn!(
+            restore_failure = "missing_call_id",
+            "backend custom tool call could not be restored"
+        );
+        return Err(());
+    };
     let input = decoded_input(arguments, format)?;
     let mut out = json!({
         "type": "custom_tool_call",
