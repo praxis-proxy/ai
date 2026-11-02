@@ -23,11 +23,11 @@ use bytes::Bytes;
 #[cfg(any(test, feature = "openai-agentic-loop"))]
 use praxis_filter::{FilterAction, body::MAX_JSON_BODY_BYTES};
 
-use super::history::MessageHistory;
 #[cfg(feature = "openai-mcp-tools")]
 use super::mcp_classify::ApprovalFloor;
 #[cfg(any(test, feature = "openai-agentic-loop"))]
 use super::{bounded_json_size, error::responses_error_rejection, file_search_dispatch::citations::annotate_response};
+use super::{history::MessageHistory, openai_client_tool_compat::custom_input::CustomInputFormat};
 
 /// Internal persisted field identifying a Praxis-generated compaction item.
 ///
@@ -181,6 +181,10 @@ pub(crate) struct LoweredClientTool {
     pub namespace: Option<String>,
     /// The typed output item the returned `function_call` must be restored to.
     pub restore: ClientToolRestore,
+    /// The recognized input format of a lowered `custom`/`NamespaceCustom` tool,
+    /// used to validate the decoded `input` before a `custom_tool_call` is exposed.
+    /// Always [`CustomInputFormat::Text`] for the other restore kinds.
+    pub format: CustomInputFormat,
 }
 
 /// The canonical output-item type a lowered `function` call restores to (#1131).
