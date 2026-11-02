@@ -14,6 +14,17 @@
 # When the request declares no rich client tools the filter is a transparent
 # passthrough, so native traffic is unchanged.
 #
+# A custom tool whose format is the pinned Codex apply_patch Lark grammar (base or
+# the optional Environment ID variant) is lowered to a function whose input string
+# carries a JSON-Schema pattern that constrains the backend to the patch grammar;
+# the returned call is restored to a custom_tool_call carrying the raw patch, and
+# the decoded patch is validated before it reaches the client (malformed output
+# fails closed: 502 buffered, stream error streaming). Any other grammar is
+# rejected with HTTP 400 before any upstream call. custom_input_pattern_encoding
+# selects how the backend interprets that pattern (json_string for XGrammar/vLLM,
+# the default; decoded for a spec-compliant backend; none to rely on host
+# validation alone).
+#
 # openai_stream_events leads the inference step so it arms streaming restoration
 # (a request-phase marker) before this filter lowers tools. On a streaming
 # response (stream: true) the openai_stream_events owner restores the lowered
