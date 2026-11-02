@@ -20,6 +20,10 @@ Anthropic-compatible API. For Codex, Praxis keeps `/v1/responses` end to end
 and lowers only client-owned tool types that vLLM does not understand. Use a
 translated path for a backend that only exposes OpenAI Chat Completions.
 
+To run these clients inside NVIDIA OpenShell sandboxes while Praxis and vLLM
+stay on the host, follow this guide for vLLM and Praxis, then
+[Run your Code Harness in OpenShell through Praxis and vLLM](openshell-cli-vllm-through-praxis.md).
+
 ## 1. Start vLLM
 
 ### On-demand GPU endpoint
@@ -168,8 +172,11 @@ supports their respective endpoints.
 ### Serving all four clients from one gateway
 
 One proxy process can serve all four CLIs over their native paths at once.
-There is no example config for this, because it is the two native examples
-above placed in one file: the Claude Code, OpenCode, and pi chain from
+It is the two native examples above placed in one file:
+[`openshell/sandboxed-coding-clients.yaml`](../../examples/configs/openshell/sandboxed-coding-clients.yaml)
+is that file, with both listeners on `0.0.0.0` for sandboxed clients; change
+them to `127.0.0.1` to serve clients on the same host. It contains the Claude
+Code, OpenCode, and pi chain from
 `anthropic/messages-native-vllm.yaml` and the Codex chain from
 `openai/responses/client-tool-compat.yaml`, behind two listeners, pointed at
 the same vLLM server and sharing one `GATEWAY_AUTH_PASSWORD`.
