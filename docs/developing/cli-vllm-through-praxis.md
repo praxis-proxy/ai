@@ -347,11 +347,14 @@ to the copied config:
 2. Change the local vLLM endpoint from `127.0.0.1:8000` to
    `host.docker.internal:8000`, and pass
    `--add-host=host.docker.internal:host-gateway` on the command line.
-3. Add `allow_private_upstreams: true` beside the existing
-   `allow_private_endpoints: true`. The existing option covers literal private
-   endpoints written in the config; the new one is needed because that
-   hostname *resolves* to a private address, and without it the request fails
-   with `upstream hostname resolved to private/reserved IP address`.
+3. Add `host.docker.internal` to `trusted_private_endpoints` on both
+   `load_balancer` clusters (`vllm-backend` and `vllm-responses-backend`). The
+   existing `allow_private_endpoints` covers literal private endpoints written
+   in the config; the new entry is needed because that hostname *resolves* to a
+   private address. Without it, the request fails with
+   `upstream hostname resolved to private/reserved IP address`. Prefer this
+   scoped entry over `insecure_options.allow_private_upstreams`, which relaxes
+   the check for every upstream.
 
 ```console
 docker run -d --rm --name praxis-vllm \
@@ -364,7 +367,8 @@ docker run -d --rm --name praxis-vllm \
 
 With Podman, both commands work unchanged. Podman also resolves
 `host.containers.internal` on its own, so the published-port config can use
-that name and drop `--add-host`.
+that name and drop `--add-host` — and use the same name in
+`trusted_private_endpoints`.
 
 The on-demand GPU endpoint needs no backend-specific container handling: the
 tunnel hostname is public, so the `endpoints` and `tls.sni` edits above are the
