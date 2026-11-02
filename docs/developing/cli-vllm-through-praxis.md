@@ -1186,3 +1186,29 @@ kill "$PRAXIS_PID"
 - Claude startup probes may call `/v1/messages/count_tokens`. Native vLLM
   supports it; the translated Chat path can return 404 and Claude degrades
   gracefully.
+
+## Pinned client versions
+
+The integration tests pin one version of each client and one vLLM image. Each
+client's manifest under `tests/integration/fixtures/*/pin.toml` is the source
+of truth for that client; the vLLM image is pinned in the OpenCode 1.x and
+Claude Code manifests. `cargo xtask check-pins` (part of `make lint`) fails if
+any harness constant, workflow, checksum fixture, or image reference disagrees
+with them.
+
+To move every pin to its latest upstream release within each manifest's
+`major_series`:
+
+```console
+cargo xtask bump-pins --dry-run   # report available bumps, write nothing
+cargo xtask bump-pins             # or: --pin opencode --pin vllm ...
+```
+
+It rewrites every mechanical site, swaps the checksum fixtures, and validates
+the result before writing. It never changes behavioral pins: tool lists,
+exit-code semantics, version-conditioned test expectations, replay recordings,
+and "verified against" claims in this guide. Its report lists those as a
+re-validation checklist, together with every line that still names the old
+version. The weekly `Bump Pins` workflow runs it and opens a draft pull request
+with that checklist; the GPU acceptance lanes (`vllm-full-suite` label) gate it
+before review.

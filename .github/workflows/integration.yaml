@@ -692,11 +692,10 @@ jobs:
   # future startup fetch slip in unnoticed. Isolation is what makes that a
   # standing guarantee rather than a one-time observation.
   #
-  # Pins live in tests/integration/fixtures/opencode-cli/pin.toml. To bump the
-  # version, update that manifest, OPENCODE_PINNED_VERSION in
-  # tests/integration/tests/suite/harness.rs, and OPENCODE_VERSION below
-  # together; `pin_toml_version_matches_harness_const` and
-  # `opencode_lane_is_wired_in_ci` fail if any of the three drifts.
+  # Pins live in tests/integration/fixtures/opencode-cli/pin.toml. Bump with
+  # `cargo xtask bump-pins --pin opencode`, which rewrites the manifest,
+  # OPENCODE_PINNED_VERSION, OPENCODE_VERSION below, and the checksum fixture
+  # together; `cargo xtask check-pins` fails if any of them drifts.
   # ----------------------------------------------------------------------------
 
   opencode-cpu:
@@ -796,12 +795,10 @@ jobs:
   # it against the committed checksum, exactly as the GPU lane does, so both
   # lanes stage a byte-identical client.
   #
-  # Pins live in tests/integration/fixtures/opencode-cli-v2/pin.toml. To bump
-  # the version, update that manifest, its checksum fixture,
-  # OPENCODE_V2_PINNED_VERSION in tests/integration/tests/suite/harness.rs, and
-  # OPENCODE_V2_VERSION below together; `pin_toml_version_matches_harness_const`,
-  # `checksum_fixture_names_the_pinned_platform_tarball`, and
-  # `opencode_v2_lane_is_wired_in_ci` fail if any of them drifts.
+  # Pins live in tests/integration/fixtures/opencode-cli-v2/pin.toml. Bump with
+  # `cargo xtask bump-pins --pin opencode-v2`, which rewrites the manifest,
+  # OPENCODE_V2_PINNED_VERSION, OPENCODE_V2_VERSION below, and the checksum
+  # fixture together; `cargo xtask check-pins` fails if any of them drifts.
   # ----------------------------------------------------------------------------
 
   opencode-v2-cpu:
@@ -923,12 +920,10 @@ jobs:
   # The whole extracted directory is staged: the binary reads its version and
   # assets from beside itself.
   #
-  # Pins live in tests/integration/fixtures/pi-cli/pin.toml. To bump the
-  # version, update that manifest, its checksum fixture, PI_PINNED_VERSION in
-  # tests/integration/tests/suite/harness.rs, and PI_VERSION below together;
-  # `pin_toml_version_matches_harness_const`,
-  # `checksum_fixture_names_the_pinned_release_archive`, and
-  # `pi_lane_is_wired_in_ci` fail if any of them drifts.
+  # Pins live in tests/integration/fixtures/pi-cli/pin.toml. Bump with
+  # `cargo xtask bump-pins --pin pi`, which rewrites the manifest,
+  # PI_PINNED_VERSION, PI_VERSION below, and the checksum fixture together;
+  # `cargo xtask check-pins` fails if any of them drifts.
   # ----------------------------------------------------------------------------
 
   pi-cpu:
