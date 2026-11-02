@@ -5,3 +5,6 @@
 
 pub(crate) mod request;
 pub(crate) mod routes;
+mod streaming_selector;
+
+pub use streaming_selector::OpenaiChatCompletionsStreamingSelectorFilter;
