@@ -379,7 +379,7 @@ fn replay_claude_messages_thinking_fixture_translates_visible_text_for_openai() 
 }
 
 #[test]
-fn replay_claude_messages_tool_error_is_rejected_before_openai() {
+fn replay_claude_messages_tool_error_is_translated_for_openai() {
     let replay = SessionReplay::load("replay/claude/messages-tool-error.json");
     let turn = replay.single_turn();
     let mut translation_request: serde_json::Value =
@@ -393,7 +393,21 @@ fn replay_claude_messages_tool_error_is_rejected_before_openai() {
             "required": ["command"]
         }
     }]);
-    let backend = StatefulCapturingBackend::new(vec![(200, "{}".to_owned())]).start_with_shutdown();
+    let assistant_text = turn.response["content"][0]["text"]
+        .as_str()
+        .expect("fixture response should contain final assistant text");
+    let chat_response = json!({
+        "id": "chatcmpl_replay_tool_error",
+        "object": "chat.completion",
+        "model": turn.request["model"],
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": assistant_text},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 42, "completion_tokens": 9, "total_tokens": 51}
+    });
+    let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
     let proxy_port = free_port();
 
     let config = load_example_config(
@@ -406,7 +420,7 @@ fn replay_claude_messages_tool_error_is_rejected_before_openai() {
     let raw = http_send(proxy.addr(), &json_post(turn.path(), &translation_request.to_string()));
     let status = parse_status(&raw);
     let body = parse_body(&raw);
-    let error: serde_json::Value = serde_json::from_str(&body).expect("client error body should be JSON");
+    let transformed: serde_json::Value = serde_json::from_str(&body).expect("client body should be JSON");
 
     assert!(
         translation_request["tools"][0].get("type").is_none(),
@@ -417,18 +431,38 @@ fn replay_claude_messages_tool_error_is_rejected_before_openai() {
         "the native replay fixture should retain the original Anthropic built-in tool"
     );
     assert_eq!(
-        status, 400,
-        "tool_result.is_error cannot be represented in Chat Completions"
+        status, 200,
+        "errored tool_result should translate instead of killing the session"
     );
-    assert_eq!(error["error"]["type"], "invalid_request_error");
-    assert!(
-        error["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("tool_result"))
+    assert_eq!(
+        transformed["content"][0]["text"], assistant_text,
+        "Chat Completions response should translate back to Anthropic text content"
     );
-    assert!(
-        backend.requests().iter().all(|request| request.method != "POST"),
-        "rejected tool error must not reach the backend"
+    let requests = backend.requests();
+    let posts: Vec<&str> = requests
+        .iter()
+        .filter(|request| request.method == "POST")
+        .map(|request| request.body.as_str())
+        .collect();
+    assert_eq!(
+        posts.len(),
+        1,
+        "translated tool error should reach the backend exactly once"
+    );
+    let forwarded: serde_json::Value = serde_json::from_str(posts[0]).expect("captured backend body should be JSON");
+    let tool_message = forwarded["messages"]
+        .as_array()
+        .expect("OpenAI request should contain messages")
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("translated request should contain a tool message");
+    assert_eq!(
+        tool_message["tool_call_id"], "toolu_replay_bash_error_01",
+        "tool message should keep the tool_use id"
+    );
+    assert_eq!(
+        tool_message["content"], "Anthropic tool_result error:\ncat: fixtures/missing.txt: No such file or directory",
+        "errored tool_result content should carry the translation error marker"
     );
 }
 
