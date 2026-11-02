@@ -31,7 +31,7 @@ use tokio::{sync::Mutex, time::Instant};
 use tracing::{debug, warn};
 
 use super::{
-    config::{ModelCatalogConfig, UnconfiguredModels, UpstreamConfig, validate_id},
+    config::{ModelCatalogConfig, UnconfiguredModels, UpstreamConfig, UpstreamHeaderConfig, validate_id},
     listing::{Catalog, Overlay, UpstreamListing, UpstreamModel},
 };
 
@@ -74,7 +74,7 @@ struct Upstream {
     name: String,
     /// Model list URL.
     url: String,
-    /// Provider reported for models without an entry.
+    /// Provider reported in catalog metadata for models this upstream lists.
     provider: Option<String>,
     /// Request headers, credentials marked sensitive.
     headers: HeaderMap,
@@ -247,16 +247,7 @@ impl Upstream {
             );
         }
         for entry in cfg.headers {
-            let name = HeaderName::try_from(entry.name.as_str()).map_err(|error| -> FilterError {
-                format!("model_catalog: invalid header name '{}': {error}", entry.name).into()
-            })?;
-            let value = match (entry.value, entry.value_env_var) {
-                (Some(value), _) => HeaderValue::try_from(value).map_err(|error| -> FilterError {
-                    format!("model_catalog: invalid value for header '{name}': {error}").into()
-                })?,
-                (None, Some(var)) => sensitive_value(&read_env(&var, &cfg.name)?, &cfg.name)?,
-                (None, None) => continue,
-            };
+            let (name, value) = resolve_header(entry, &cfg.name)?;
             headers.insert(name, value);
         }
 
@@ -310,6 +301,29 @@ impl Upstream {
         });
         Ok(models)
     }
+}
+
+/// Resolve one configured header, reading env-backed values as credentials.
+fn resolve_header(entry: UpstreamHeaderConfig, upstream: &str) -> Result<(HeaderName, HeaderValue), FilterError> {
+    match entry {
+        UpstreamHeaderConfig::Literal { name, value } => {
+            let name = header_name(&name)?;
+            let value = HeaderValue::try_from(value).map_err(|error| -> FilterError {
+                format!("model_catalog: invalid value for header '{name}': {error}").into()
+            })?;
+            Ok((name, value))
+        },
+        UpstreamHeaderConfig::Env { name, value_env_var } => Ok((
+            header_name(&name)?,
+            sensitive_value(&read_env(&value_env_var, upstream)?, upstream)?,
+        )),
+    }
+}
+
+/// Parse a configured upstream header name.
+fn header_name(name: &str) -> Result<HeaderName, FilterError> {
+    HeaderName::try_from(name)
+        .map_err(|error| -> FilterError { format!("model_catalog: invalid header name '{name}': {error}").into() })
 }
 
 /// Read a credential from the environment at build time.

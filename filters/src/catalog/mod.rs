@@ -42,14 +42,15 @@ use self::{
 /// lists are fetched on first use and refreshed every `refresh_interval_secs`
 /// in the background, and an upstream that fails keeps its last known list.
 /// Configured `models` entries then only overlay client-facing IDs, aliases,
-/// metadata, and visibility; an entry no upstream reports is not listed.
-/// Without `upstreams`, the configured entries are the catalog. Each entry may
+/// and visibility; an entry no upstream reports is not listed. Without
+/// `upstreams`, the configured entries are the catalog. Each entry may
 /// restrict visibility to authenticated subjects, roles, or teams. Hidden and
 /// unknown models both return the same `404 model_not_found`, so callers
-/// cannot probe for models they cannot see. Catalog metadata (provider,
-/// version, capabilities, cost tier) is operator-declared and appears under a
-/// `praxis` key that OpenAI clients ignore. Other paths pass through
-/// untouched.
+/// cannot probe for models they cannot see. Model metadata is never declared
+/// in config: `created` and `owned_by` come from the upstream when it reports
+/// them, and the upstream's `provider` and an entry's aliases appear under a
+/// `praxis` key that OpenAI clients ignore. Anything the upstream does not
+/// report is omitted. Other paths pass through untouched.
 pub struct ModelCatalogFilter {
     /// Path serving the model list.
     list_path: String,
@@ -69,6 +70,17 @@ enum CatalogSource {
 
 impl ModelCatalogFilter {
     /// Build the filter from YAML config with an isolated sub-request client.
+    ///
+    /// ```
+    /// # use praxis_filter::HttpFilter as _;
+    /// let config = serde_yaml::from_str("models: [{id: gpt-4o}]").unwrap();
+    /// let filter = praxis_ai_filters::ModelCatalogFilter::from_config(&config).unwrap();
+    /// assert_eq!(
+    ///     filter.name(),
+    ///     "model_catalog",
+    ///     "the filter reports its config name"
+    /// );
+    /// ```
     ///
     /// # Errors
     ///
@@ -93,11 +105,7 @@ impl ModelCatalogFilter {
 
     /// Compile validated config into an overlay and catalog source.
     fn build(mut cfg: ModelCatalogConfig, client: SubRequestClient) -> Result<Self, FilterError> {
-        let overlay = Arc::new(Overlay::new(
-            std::mem::take(&mut cfg.models),
-            cfg.default_visibility,
-            cfg.created,
-        ));
+        let overlay = Arc::new(Overlay::new(std::mem::take(&mut cfg.models), cfg.default_visibility));
         let source = if cfg.upstreams.is_empty() {
             CatalogSource::Static(Catalog::from_entries(&overlay)?)
         } else {
@@ -160,7 +168,7 @@ impl HttpFilter for ModelCatalogFilter {
         let Some(route) = self.route(ctx.request.uri.path()) else {
             return Ok(FilterAction::Continue);
         };
-        if ctx.request.method != Method::GET {
+        if ctx.request.method != Method::GET && ctx.request.method != Method::HEAD {
             return Ok(FilterAction::TerminalResponse(Box::new(method_not_allowed())));
         }
 
@@ -195,7 +203,7 @@ enum CatalogRoute<'p> {
     Retrieve(&'p str),
 }
 
-/// `405` for any method other than `GET` on a catalog path.
+/// `405` for any method other than `GET` or `HEAD` on a catalog path.
 fn method_not_allowed() -> TerminalResponse {
     let mut response = json_response(
         405,
@@ -205,7 +213,9 @@ fn method_not_allowed() -> TerminalResponse {
             "method_not_allowed",
         ),
     );
-    response.headers.insert(header::ALLOW, HeaderValue::from_static("GET"));
+    response
+        .headers
+        .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
     response
 }
 

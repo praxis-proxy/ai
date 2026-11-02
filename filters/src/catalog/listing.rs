@@ -11,12 +11,15 @@ use praxis_filter::FilterError;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    config::{Capability, DefaultVisibility, ModelEntryConfig},
+    config::{DefaultVisibility, ModelEntryConfig},
     visibility::{PrincipalView, Visibility},
 };
 
-/// `owned_by` reported when neither config nor the upstream names an owner.
+/// `owned_by` reported when the upstream names neither an owner nor a provider.
 const DEFAULT_OWNED_BY: &str = "praxis";
+
+/// `created` reported when the upstream does not report one.
+const UNKNOWN_CREATED: u64 = 0;
 
 // -----------------------------------------------------------------------------
 // Overlay
@@ -35,13 +38,11 @@ pub(super) struct Overlay {
     by_upstream_id: HashMap<String, usize>,
     /// Every client-facing ID (entry IDs and aliases) the overlay claims.
     public_ids: HashSet<String>,
-    /// `created` reported when neither the entry nor the upstream sets one.
-    default_created: u64,
 }
 
 impl Overlay {
     /// Compile validated entries.
-    pub(super) fn new(mut entries: Vec<ModelEntryConfig>, default: DefaultVisibility, default_created: u64) -> Self {
+    pub(super) fn new(mut entries: Vec<ModelEntryConfig>, default: DefaultVisibility) -> Self {
         let mut visibilities = Vec::with_capacity(entries.len() + 1);
         let mut by_upstream_id = HashMap::with_capacity(entries.len());
         let mut public_ids = HashSet::new();
@@ -57,7 +58,6 @@ impl Overlay {
             visibilities,
             by_upstream_id,
             public_ids,
-            default_created,
         }
     }
 
@@ -94,7 +94,7 @@ pub(super) struct UpstreamModel {
 
 /// One upstream's last known model list, for [`Catalog::from_upstreams`].
 pub(super) struct UpstreamListing<'a> {
-    /// Provider reported for models without an entry.
+    /// Provider reported in catalog metadata for the listed models.
     pub provider: Option<&'a str>,
     /// Models the upstream reported.
     pub models: &'a [UpstreamModel],
@@ -121,16 +121,15 @@ impl Catalog {
     pub(super) fn from_entries(overlay: &Overlay) -> Result<Self, FilterError> {
         let mut catalog = Self::empty();
         for index in 0..overlay.entries.len() {
-            catalog.push_entry(overlay, index, None)?;
+            catalog.push_entry(overlay, index, None, None)?;
         }
         Ok(catalog)
     }
 
     /// List the models upstreams report, in upstream order.
     ///
-    /// A model with an entry takes that entry's ID, aliases, metadata, and
-    /// visibility; entries no upstream reports are not listed. A model
-    /// without an entry is listed as-is when `show_unconfigured` is set,
+    /// A model with an entry takes that entry's ID, aliases, and visibility; entries no upstream reports are not
+    /// listed. A model without an entry is listed as-is when `show_unconfigured` is set,
     /// unless an entry already claims its ID or an earlier upstream listed
     /// it.
     pub(super) fn from_upstreams(
@@ -144,7 +143,7 @@ impl Catalog {
             for model in listing.models {
                 if let Some(&index) = overlay.by_upstream_id.get(&model.id) {
                     if listed_entries.insert(index) {
-                        catalog.push_entry(overlay, index, Some(model))?;
+                        catalog.push_entry(overlay, index, Some(model), listing.provider)?;
                     }
                 } else if show_unconfigured
                     && !overlay.public_ids.contains(&model.id)
@@ -171,16 +170,14 @@ impl Catalog {
         overlay: &Overlay,
         index: usize,
         upstream: Option<&UpstreamModel>,
+        provider: Option<&str>,
     ) -> Result<(), FilterError> {
         let Some(entry) = overlay.entries.get(index) else {
             return Ok(());
         };
-        let (owned_by, created) = entry_identity(entry, upstream, overlay.default_created);
+        let (owned_by, created) = upstream_identity(upstream, provider);
         let meta = CatalogMeta {
-            provider: entry.provider.as_deref(),
-            version: entry.version.as_deref(),
-            capabilities: &entry.capabilities,
-            cost_tier: entry.cost_tier.as_deref(),
+            provider,
             aliases: &entry.aliases,
             alias_of: None,
         };
@@ -204,8 +201,7 @@ impl Catalog {
         model: &UpstreamModel,
         provider: Option<&str>,
     ) -> Result<(), FilterError> {
-        let owned_by = model.owned_by.as_deref().or(provider).unwrap_or(DEFAULT_OWNED_BY);
-        let created = model.created.unwrap_or(overlay.default_created);
+        let (owned_by, created) = upstream_identity(Some(model), provider);
         let meta = CatalogMeta {
             provider,
             ..CatalogMeta::EMPTY
@@ -253,23 +249,14 @@ impl Catalog {
 // Serialization
 // -----------------------------------------------------------------------------
 
-/// Resolve an entry's `owned_by` and `created`, preferring config, then the
-/// upstream's values, then defaults.
-fn entry_identity<'a>(
-    entry: &'a ModelEntryConfig,
-    upstream: Option<&'a UpstreamModel>,
-    default_created: u64,
-) -> (&'a str, u64) {
-    let owned_by = entry
-        .owned_by
-        .as_deref()
-        .or_else(|| upstream.and_then(|model| model.owned_by.as_deref()))
-        .or(entry.provider.as_deref())
+/// Resolve `owned_by` and `created` from what the upstream reports, falling
+/// back to its provider and then to defaults. Nothing is taken from config.
+fn upstream_identity<'a>(upstream: Option<&'a UpstreamModel>, provider: Option<&'a str>) -> (&'a str, u64) {
+    let owned_by = upstream
+        .and_then(|model| model.owned_by.as_deref())
+        .or(provider)
         .unwrap_or(DEFAULT_OWNED_BY);
-    let created = entry
-        .created
-        .or_else(|| upstream.and_then(|model| model.created))
-        .unwrap_or(default_created);
+    let created = upstream.and_then(|model| model.created).unwrap_or(UNKNOWN_CREATED);
     (owned_by, created)
 }
 
@@ -292,18 +279,9 @@ struct ModelObject<'a> {
 /// Catalog metadata under the `praxis` key.
 #[derive(Clone, Copy, Serialize)]
 struct CatalogMeta<'a> {
-    /// Provider serving the model.
+    /// Provider of the upstream that lists the model.
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<&'a str>,
-    /// Model version.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    version: Option<&'a str>,
-    /// Operator-declared API capabilities.
-    #[serde(skip_serializing_if = "<[_]>::is_empty")]
-    capabilities: &'a [Capability],
-    /// Coarse cost tier.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cost_tier: Option<&'a str>,
     /// Alias IDs of a canonical entry.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     aliases: &'a [String],
@@ -316,21 +294,13 @@ impl CatalogMeta<'_> {
     /// Metadata with no fields set.
     const EMPTY: CatalogMeta<'static> = CatalogMeta {
         provider: None,
-        version: None,
-        capabilities: &[],
-        cost_tier: None,
         aliases: &[],
         alias_of: None,
     };
 
     /// Whether no metadata field would be serialized.
     fn is_empty(&self) -> bool {
-        self.provider.is_none()
-            && self.version.is_none()
-            && self.capabilities.is_empty()
-            && self.cost_tier.is_none()
-            && self.aliases.is_empty()
-            && self.alias_of.is_none()
+        self.provider.is_none() && self.aliases.is_empty() && self.alias_of.is_none()
     }
 }
 

@@ -13,7 +13,7 @@ small local servers that only answer GET /v1/models, so the catalog is built
 from discovered model lists and any forwarded catalog request would fail.
 Asserts that the official OpenAI Python SDK can list and retrieve models, that
 the listing depends on the Basic Auth subject, that configured entries overlay
-discovered models, and that a hidden model raises the same NotFoundError as an
+aliases and visibility onto discovered models without adding metadata, and that a hidden model raises the same NotFoundError as an
 unknown one.
 
 Usage:
@@ -182,18 +182,18 @@ class TestOpenAIModels:
         assert model.created == 1715367049, "created comes from the upstream"
         assert model.owned_by == "system", "owned_by comes from the upstream"
         extra = model.model_extra or {}
-        assert extra["praxis"]["capabilities"] == ["chat_completions", "responses"]
-        assert extra["praxis"]["aliases"] == ["gpt4o"]
+        assert extra["praxis"] == {"provider": "openai", "aliases": ["gpt4o"]}, "no metadata is taken from config"
 
     def test_unconfigured_upstream_model_is_listed(self, viewer: OpenAI) -> None:
         model = viewer.models.retrieve("gpt-4o-mini")
         extra = model.model_extra or {}
-        assert extra["praxis"] == {"provider": "openai"}, "no capability is claimed for unconfigured models"
+        assert extra["praxis"] == {"provider": "openai"}, "unconfigured models take the upstream provider"
 
     def test_retrieve_visible_model(self, ml_engineer: OpenAI) -> None:
         model = ml_engineer.models.retrieve("llama-70b")
         assert model.id == "llama-70b"
         assert model.owned_by == "vllm"
+        assert model.created == 1735000000, "created comes from the upstream"
 
     def test_upstream_id_is_not_listed(self, ml_engineer: OpenAI) -> None:
         with pytest.raises(NotFoundError):

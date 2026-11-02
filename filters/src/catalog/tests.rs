@@ -25,26 +25,17 @@ use super::{
 };
 use crate::test_utils::{make_filter_context, make_request};
 
-const CATALOG: &str = r#"
-created: 1700000000
+const CATALOG: &str = "
 models:
   - id: gpt-4o
-    owned_by: openai
-    provider: openai
-    version: "2024-08-06"
-    capabilities: [chat_completions, responses]
-    cost_tier: standard
     aliases: [gpt4o]
   - id: meta-llama/Llama-3.1-8B
-    created: 1720000000
   - id: claude-sonnet-4-5
-    provider: vertex
-    capabilities: [messages]
     visible_to:
       subjects: [alice]
       roles: [ml-eng]
       teams: [research]
-"#;
+";
 
 fn parse(yaml: &str) -> ModelCatalogConfig {
     serde_yaml::from_str(yaml).expect("valid catalog yaml")
@@ -170,8 +161,17 @@ async fn non_get_methods_are_rejected_with_405() {
     let filter = build(CATALOG);
     let response = terminal(respond(&filter, Method::POST, "/v1/models").await);
     assert_eq!(response.status, 405);
-    assert_eq!(response.headers["allow"], "GET");
+    assert_eq!(response.headers["allow"], "GET, HEAD");
     assert_eq!(body_json(&response)["error"]["code"], "method_not_allowed");
+}
+
+#[tokio::test]
+async fn head_is_answered_like_get() {
+    let filter = build(CATALOG);
+    let list = terminal(respond(&filter, Method::HEAD, "/v1/models").await);
+    assert_eq!(list.status, 200, "HEAD on the list path is allowed");
+    let hidden = terminal(respond(&filter, Method::HEAD, "/v1/models/claude-sonnet-4-5").await);
+    assert_eq!(hidden.status, 404, "HEAD applies the same visibility as GET");
 }
 
 // -----------------------------------------------------------------------------
@@ -208,36 +208,23 @@ fn list_serializes_openai_shape_and_catalog_metadata() {
 
     let gpt = &body["data"][0];
     assert_eq!(gpt["object"], "model");
-    assert_eq!(gpt["created"], 1_700_000_000);
-    assert_eq!(gpt["owned_by"], "openai");
-    assert_eq!(gpt["praxis"]["provider"], "openai");
-    assert_eq!(gpt["praxis"]["version"], "2024-08-06");
+    assert_eq!(gpt["created"], 0, "static entries have no upstream to report created");
+    assert_eq!(gpt["owned_by"], "praxis");
     assert_eq!(
-        gpt["praxis"]["capabilities"],
-        serde_json::json!(["chat_completions", "responses"])
+        gpt["praxis"],
+        serde_json::json!({"aliases": ["gpt4o"]}),
+        "static entries report no provider metadata"
     );
-    assert_eq!(gpt["praxis"]["cost_tier"], "standard");
-    assert_eq!(gpt["praxis"]["aliases"], serde_json::json!(["gpt4o"]));
 
     let alias = &body["data"][1];
     assert_eq!(alias["praxis"]["alias_of"], "gpt-4o");
     assert!(alias["praxis"].get("aliases").is_none(), "aliases do not list aliases");
 
     let llama = &body["data"][2];
-    assert_eq!(llama["created"], 1_720_000_000);
-    assert_eq!(llama["owned_by"], "praxis");
     assert!(
         llama.get("praxis").is_none(),
         "entries without metadata omit the praxis key"
     );
-}
-
-#[test]
-fn owned_by_defaults_to_provider() {
-    let filter = build(CATALOG);
-    let empty = set(&[]);
-    let response = TerminalResponse::new(200).with_body(filter.list_body(Some(principal("alice", &empty, &empty))));
-    assert_eq!(body_json(&response)["data"][3]["owned_by"], "vertex");
 }
 
 // -----------------------------------------------------------------------------
@@ -339,9 +326,31 @@ fn unknown_fields_are_rejected() {
 }
 
 #[test]
-fn unknown_capability_is_rejected() {
-    let value: serde_yaml::Value = serde_yaml::from_str("models: [{id: m, capabilities: [telepathy]}]").expect("yaml");
-    assert!(ModelCatalogFilter::from_config(&value).is_err());
+fn per_model_metadata_is_not_configurable() {
+    for yaml in [
+        "created: 1700000000\nmodels: [{id: m}]",
+        "models: [{id: m, created: 1700000000}]",
+        "models: [{id: m, owned_by: openai}]",
+        "models: [{id: m, provider: openai}]",
+        "models: [{id: m, version: '2024-08-06'}]",
+        "models: [{id: m, capabilities: [chat_completions]}]",
+        "models: [{id: m, cost_tier: standard}]",
+    ] {
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).expect("yaml");
+        assert!(
+            ModelCatalogFilter::from_config(&value).is_err(),
+            "{yaml}: metadata must come from upstreams, not config"
+        );
+    }
+}
+
+#[test]
+fn upstream_headers_need_exactly_one_value_source() {
+    for headers in ["[{name: x-key}]", "[{name: x-key, value: v, value_env_var: V}]"] {
+        let yaml = format!("upstreams: [{{name: a, url: 'http://h/v1/models', headers: {headers}}}]");
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("yaml");
+        assert!(ModelCatalogFilter::from_config(&value).is_err(), "{yaml}");
+    }
 }
 
 #[test]
@@ -362,10 +371,6 @@ fn validation_rejects_invalid_catalogs() {
         ("models: [{id: m}, {id: m}]", "duplicate model id 'm'"),
         ("models: [{id: m, aliases: [n]}, {id: n}]", "duplicate model id 'n'"),
         ("models: [{id: m, visible_to: {}}]", "must list at least one"),
-        (
-            "models: [{id: m, cost_tier: ''}]",
-            "cost_tier for 'm' must not be empty",
-        ),
     ] {
         let error = validation_error(yaml);
         assert!(error.contains(expected), "{yaml}: expected '{expected}' in '{error}'");
@@ -373,7 +378,6 @@ fn validation_rejects_invalid_catalogs() {
 }
 
 #[test]
-#[expect(clippy::too_many_lines, reason = "table of rejected upstream configs")]
 fn validation_rejects_invalid_upstreams() {
     for (yaml, expected) in [
         (
@@ -395,14 +399,6 @@ fn validation_rejects_invalid_upstreams() {
         (
             "upstreams: [{name: a, url: 'http://h/v1/models'}]\nmodels: [{id: m, upstream_id: x}, {id: n, upstream_id: x}]",
             "upstream id 'x' is claimed by more than one entry",
-        ),
-        (
-            "upstreams: [{name: a, url: 'http://h/v1/models', headers: [{name: x-key}]}]",
-            "needs exactly one of value or value_env_var",
-        ),
-        (
-            "upstreams: [{name: a, url: 'http://h/v1/models', headers: [{name: x-key, value: v, value_env_var: V}]}]",
-            "needs exactly one of value or value_env_var",
         ),
     ] {
         let error = validation_error(yaml);
@@ -465,7 +461,6 @@ async fn overlay_fixture() -> (MockServer, MockServer, ModelCatalogFilter) {
         "
 models:
   - id: gpt-4o
-    capabilities: [chat_completions]
     aliases: [gpt4o]
   - id: llama-70b
     upstream_id: meta-llama/Llama-3.1-70B-Instruct
@@ -500,25 +495,30 @@ async fn discovered_catalog_lists_upstream_models_per_principal() {
 }
 
 #[tokio::test]
-async fn discovered_models_merge_upstream_fields_with_entry_metadata() {
+async fn discovered_models_report_only_upstream_metadata() {
     let (_openai, _vllm, filter) = overlay_fixture().await;
     let body = body_json(&alice_list(&filter).await);
 
     let gpt = &body["data"][0];
-    assert_eq!(gpt["created"], 1_715_000_000, "created falls back to the upstream");
-    assert_eq!(gpt["owned_by"], "system", "owned_by falls back to the upstream");
-    assert_eq!(gpt["praxis"]["capabilities"], json!(["chat_completions"]));
+    assert_eq!(gpt["created"], 1_715_000_000, "created comes from the upstream");
+    assert_eq!(gpt["owned_by"], "system", "owned_by comes from the upstream");
+    assert_eq!(
+        gpt["praxis"],
+        json!({"provider": "openai", "aliases": ["gpt4o"]}),
+        "configured entries take the upstream provider and nothing else"
+    );
 
     let mini = &body["data"][2];
     assert_eq!(
-        mini["praxis"]["provider"], "openai",
+        mini["praxis"],
+        json!({"provider": "openai"}),
         "unconfigured models take the upstream provider"
     );
-    assert!(
-        mini["praxis"].get("capabilities").is_none(),
-        "no capability is claimed for unconfigured models"
-    );
-    assert_eq!(body["data"][3]["owned_by"], "vllm");
+
+    let llama = &body["data"][3];
+    assert_eq!(llama["owned_by"], "vllm");
+    assert_eq!(llama["created"], 0, "created the upstream omits is reported as unknown");
+    assert_eq!(llama["praxis"]["provider"], "vllm");
 }
 
 #[tokio::test]

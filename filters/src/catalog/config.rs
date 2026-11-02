@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use praxis_filter::FilterError;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// Default path that serves the OpenAI-compatible model listing.
 pub(super) const DEFAULT_LIST_PATH: &str = "/v1/models";
@@ -33,14 +33,9 @@ const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 60;
 ///     allow_private: true
 /// models:
 ///   - id: gpt-4o
-///     version: "2024-08-06"
-///     capabilities: [chat_completions, responses]
-///     cost_tier: standard
 ///     aliases: [gpt4o]
 ///   - id: llama-70b
 ///     upstream_id: meta-llama/Llama-3.1-70B-Instruct
-///     capabilities: [chat_completions]
-///     cost_tier: premium
 ///     visible_to:
 ///       subjects: [alice]
 ///       roles: [ml-eng]
@@ -53,16 +48,12 @@ pub(super) struct ModelCatalogConfig {
     #[serde(default = "default_list_path")]
     pub list_path: String,
 
-    /// Unix timestamp reported as `created` when an entry omits its own.
-    #[serde(default)]
-    pub created: u64,
-
     /// Who may see entries that have no `visible_to` rule.
     #[serde(default)]
     pub default_visibility: DefaultVisibility,
 
     /// Upstream model list endpoints. When set, they decide which models
-    /// exist and `models` entries only overlay metadata and visibility.
+    /// exist and `models` entries only overlay IDs, aliases, and visibility.
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>,
 
@@ -90,7 +81,7 @@ pub(super) struct UpstreamConfig {
     /// Full URL of the upstream model list endpoint.
     pub url: String,
 
-    /// Provider reported in catalog metadata for models without an entry.
+    /// Provider reported in catalog metadata for models this upstream lists.
     #[serde(default)]
     pub provider: Option<String>,
 
@@ -109,18 +100,22 @@ pub(super) struct UpstreamConfig {
 
 /// One header sent with an upstream model list request.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct UpstreamHeaderConfig {
-    /// Header name.
-    pub name: String,
-
-    /// Literal header value.
-    #[serde(default)]
-    pub value: Option<String>,
-
-    /// Environment variable holding the header value.
-    #[serde(default)]
-    pub value_env_var: Option<String>,
+#[serde(untagged, deny_unknown_fields)]
+pub(super) enum UpstreamHeaderConfig {
+    /// Header with a literal value.
+    Literal {
+        /// Header name.
+        name: String,
+        /// Literal header value.
+        value: String,
+    },
+    /// Header whose value is read from an environment variable.
+    Env {
+        /// Header name.
+        name: String,
+        /// Environment variable holding the header value.
+        value_env_var: String,
+    },
 }
 
 /// Listing policy for upstream models that have no `models` entry.
@@ -145,32 +140,6 @@ pub(super) struct ModelEntryConfig {
     /// with `upstreams`; the upstream ID itself is not listed.
     #[serde(default)]
     pub upstream_id: Option<String>,
-
-    /// OpenAI `owned_by` value. Defaults to the upstream's value, then
-    /// `provider`, then `praxis`.
-    #[serde(default)]
-    pub owned_by: Option<String>,
-
-    /// Unix timestamp reported as `created`. Defaults to the upstream's
-    /// value, then the top-level value.
-    #[serde(default)]
-    pub created: Option<u64>,
-
-    /// Provider serving the model, reported in catalog metadata.
-    #[serde(default)]
-    pub provider: Option<String>,
-
-    /// Model version, reported in catalog metadata.
-    #[serde(default)]
-    pub version: Option<String>,
-
-    /// Operator-declared API capabilities. These are not verified upstream.
-    #[serde(default)]
-    pub capabilities: Vec<Capability>,
-
-    /// Coarse cost tier label, reported in catalog metadata.
-    #[serde(default)]
-    pub cost_tier: Option<String>,
 
     /// Additional IDs listed as their own objects with the same visibility.
     #[serde(default)]
@@ -222,30 +191,6 @@ pub(super) enum DefaultVisibility {
     Public,
     /// Visible only to callers with an authenticated identity.
     Authenticated,
-}
-
-/// API capability an operator declares for a model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum Capability {
-    /// `POST /v1/chat/completions`.
-    ChatCompletions,
-    /// `POST /v1/completions`.
-    Completions,
-    /// `POST /v1/responses`.
-    Responses,
-    /// `POST /v1/messages`.
-    Messages,
-    /// `POST /v1/embeddings`.
-    Embeddings,
-    /// `POST /v1/audio/speech`.
-    AudioSpeech,
-    /// `POST /v1/audio/transcriptions`.
-    AudioTranscriptions,
-    /// `POST /v1/images/generations`.
-    Images,
-    /// Realtime sessions.
-    Realtime,
 }
 
 /// Validate config at construction time.
@@ -319,15 +264,6 @@ fn validate_upstream(upstream: &UpstreamConfig) -> Result<(), FilterError> {
         )
         .into());
     }
-    for header in &upstream.headers {
-        if header.value.is_some() == header.value_env_var.is_some() {
-            return Err(format!(
-                "model_catalog: header '{}' for upstream '{}' needs exactly one of value or value_env_var",
-                header.name, upstream.name
-            )
-            .into());
-        }
-    }
     Ok(())
 }
 
@@ -345,16 +281,6 @@ fn validate_entry<'a>(entry: &'a ModelEntryConfig, seen: &mut HashSet<&'a str>) 
             entry.id
         )
         .into());
-    }
-    for (field, value) in [
-        ("owned_by", &entry.owned_by),
-        ("provider", &entry.provider),
-        ("version", &entry.version),
-        ("cost_tier", &entry.cost_tier),
-    ] {
-        if value.as_deref().is_some_and(str::is_empty) {
-            return Err(format!("model_catalog: {field} for '{}' must not be empty", entry.id).into());
-        }
     }
     Ok(())
 }

@@ -4,7 +4,7 @@
 //! Integration tests for the `model-catalog` example configuration.
 //!
 //! The catalog answers `GET /v1/models` from the model lists the upstreams
-//! report, overlaid with configured metadata and filtered by the subject
+//! report, overlaid with configured aliases and filtered by the subject
 //! `basic_auth` verified. Catalog requests are never forwarded; the only
 //! upstream traffic they cause is the catalog's own model list fetch. Listed
 //! IDs must stay routable through the `model_to_provider` chain behind it.
@@ -150,13 +150,16 @@ fn example_config_model_catalog_overlays_discovered_models() {
     let gpt: Value = serde_json::from_str(&parse_body(&raw)).expect("model is JSON");
     assert_eq!(gpt["created"], 1_715_367_049, "created comes from the upstream");
     assert_eq!(gpt["owned_by"], "system", "owned_by comes from the upstream");
-    assert_eq!(gpt["praxis"]["cost_tier"], "standard", "metadata comes from the entry");
+    assert_eq!(
+        gpt["praxis"],
+        serde_json::json!({"provider": "openai", "aliases": ["gpt4o"]}),
+        "no metadata is taken from config"
+    );
 
     let raw = harness.get("/v1/models/gpt-4o-mini", "viewer");
     assert_eq!(parse_status(&raw), 200, "unconfigured upstream models are listed");
     let mini: Value = serde_json::from_str(&parse_body(&raw)).expect("model is JSON");
-    assert_eq!(mini["praxis"]["provider"], "openai");
-    assert!(mini["praxis"].get("capabilities").is_none());
+    assert_eq!(mini["praxis"], serde_json::json!({"provider": "openai"}));
 
     let raw = harness.get("/v1/models/meta-llama%2FLlama-3.1-70B-Instruct", "ml-engineer");
     assert_eq!(
@@ -184,10 +187,8 @@ fn example_config_model_catalog_hides_restricted_model_lookup() {
     let visible: Value = serde_json::from_str(&parse_body(&visible)).expect("model is JSON");
     assert_eq!(visible["id"], "llama-70b");
     assert_eq!(visible["owned_by"], "vllm");
-    assert_eq!(
-        visible["praxis"]["capabilities"],
-        serde_json::json!(["chat_completions"])
-    );
+    assert_eq!(visible["created"], 1_735_000_000, "created comes from the upstream");
+    assert_eq!(visible["praxis"]["provider"], "vllm");
 
     harness.assert_only_model_list_fetches();
 }
