@@ -54,11 +54,10 @@ pub(crate) enum OnLookupMiss {
 }
 
 /// Task route store backend.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TaskRouteStore {
     /// In-process local store.
-    #[default]
     Local,
 }
 
@@ -90,13 +89,8 @@ pub(crate) struct TaskRoutingConfig {
     #[serde(default = "default_route_cluster_header")]
     pub route_cluster_header: String,
 
-    /// Storage backend for task routes.
-    #[serde(default)]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "validated at parse time, only local supported in this PR")
-    )]
-    pub store: TaskRouteStore,
+    /// Storage backend for task routes. Required when task routing is enabled.
+    pub store: Option<TaskRouteStore>,
 
     /// TTL in seconds for terminal task routes (0 = remove immediately).
     /// Must be at most 2,592,000 (30 days).
@@ -116,7 +110,7 @@ impl Default for TaskRoutingConfig {
             max_response_body_bytes: DEFAULT_MAX_RESPONSE_BODY_BYTES,
             on_lookup_miss: OnLookupMiss::default(),
             route_cluster_header: DEFAULT_ROUTE_CLUSTER_HEADER.to_owned(),
-            store: TaskRouteStore::default(),
+            store: None,
             terminal_ttl_seconds: DEFAULT_TERMINAL_TTL_SECONDS,
             ttl_seconds: DEFAULT_TTL_SECONDS,
         }
@@ -356,6 +350,13 @@ fn validate_a2a_headers(headers: &A2aHeaders) -> Result<(), FilterError> {
 
 /// Validate task routing configuration.
 fn validate_task_routing(tr: &TaskRoutingConfig) -> Result<(), FilterError> {
+    match tr.store {
+        Some(TaskRouteStore::Local) => {},
+        None => {
+            return Err("a2a: task_routing.store is required when task routing is enabled".into());
+        },
+    }
+
     validate_task_routing_ttl("ttl_seconds", tr.ttl_seconds, false)?;
     validate_task_routing_ttl("terminal_ttl_seconds", tr.terminal_ttl_seconds, true)?;
 
@@ -449,14 +450,9 @@ mod tests {
     }
 
     #[test]
-    fn task_route_store_defaults_to_local() {
+    fn task_route_store_parses_local() {
         let parsed: TaskRouteStore = serde_yaml::from_str("local").unwrap();
         assert_eq!(parsed, TaskRouteStore::Local, "explicit 'local' should parse");
-        assert_eq!(
-            TaskRouteStore::default(),
-            TaskRouteStore::Local,
-            "default should be Local"
-        );
     }
 
     #[test]
@@ -477,7 +473,7 @@ mod tests {
             cfg.route_cluster_header, DEFAULT_ROUTE_CLUSTER_HEADER,
             "route_cluster_header should use default constant"
         );
-        assert_eq!(cfg.store, TaskRouteStore::Local, "store should default to Local");
+        assert_eq!(cfg.store, None, "store should remain unset when omitted");
         assert_eq!(
             cfg.terminal_ttl_seconds, DEFAULT_TERMINAL_TTL_SECONDS,
             "terminal_ttl_seconds should use default constant"
@@ -822,6 +818,7 @@ method_aliases:
     fn validate_task_routing_rejects_zero_ttl() {
         let tr = TaskRoutingConfig {
             enabled: true,
+            store: Some(TaskRouteStore::Local),
             ttl_seconds: 0,
             ..TaskRoutingConfig::default()
         };
@@ -833,6 +830,7 @@ method_aliases:
     fn validate_task_routing_rejects_ttl_above_ceiling() {
         let tr = TaskRoutingConfig {
             enabled: true,
+            store: Some(TaskRouteStore::Local),
             ttl_seconds: u64::MAX,
             ..TaskRoutingConfig::default()
         };
@@ -847,6 +845,7 @@ method_aliases:
     fn validate_task_routing_rejects_terminal_ttl_above_ceiling() {
         let tr = TaskRoutingConfig {
             enabled: true,
+            store: Some(TaskRouteStore::Local),
             terminal_ttl_seconds: u64::MAX,
             ..TaskRoutingConfig::default()
         };
@@ -861,6 +860,7 @@ method_aliases:
     fn validate_task_routing_accepts_max_ttl() {
         let tr = TaskRoutingConfig {
             enabled: true,
+            store: Some(TaskRouteStore::Local),
             ttl_seconds: MAX_TTL_SECONDS,
             terminal_ttl_seconds: MAX_TTL_SECONDS,
             ..TaskRoutingConfig::default()
@@ -876,6 +876,7 @@ method_aliases:
         let tr = TaskRoutingConfig {
             enabled: true,
             max_response_body_bytes: 0,
+            store: Some(TaskRouteStore::Local),
             ..TaskRoutingConfig::default()
         };
         let result = validate_task_routing(&tr);
@@ -887,6 +888,7 @@ method_aliases:
         let tr = TaskRoutingConfig {
             enabled: true,
             route_cluster_header: "x-custom-header".to_owned(),
+            store: Some(TaskRouteStore::Local),
             ..TaskRoutingConfig::default()
         };
         let result = validate_task_routing(&tr);
@@ -897,11 +899,14 @@ method_aliases:
     }
 
     #[test]
-    fn validate_task_routing_valid_config() {
-        let tr = TaskRoutingConfig::default();
-        // Default has ttl_seconds > 0, valid header prefix, valid body bytes.
+    fn validate_task_routing_accepts_explicit_local_store() {
+        let tr = TaskRoutingConfig {
+            enabled: true,
+            store: Some(TaskRouteStore::Local),
+            ..TaskRoutingConfig::default()
+        };
         let result = validate_task_routing(&tr);
-        assert!(result.is_ok(), "default TaskRoutingConfig should be valid");
+        assert!(result.is_ok(), "explicit local store should be valid");
     }
 
     #[test]
@@ -910,6 +915,7 @@ method_aliases:
             r"
 task_routing:
   enabled: true
+  store: local
   ttl_seconds: 0
 ",
         )
