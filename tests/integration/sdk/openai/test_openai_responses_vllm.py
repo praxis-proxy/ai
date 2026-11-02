@@ -6484,6 +6484,7 @@ class TestClientToolCompatVLLM:
         # Request phase echo: the client sees its original ``custom`` tool back.
         assert any(t.type == "custom" for t in response.tools), response.tools
 
+    @requires_vllm_compat
     def test_apply_patch_grammar_tool_round_trip_constrains_and_restores(
         self, client_tool_compat_client
     ):
