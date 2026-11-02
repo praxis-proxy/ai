@@ -36,7 +36,7 @@ use tracing::{debug, warn};
 
 use crate::{
     buckets::{BucketLimits, BucketOutcome, LocalBuckets},
-    config::{EnmaasPolicyConfig, QosEnforcement, validate_config},
+    config::{CredentialMode, EnmaasPolicyConfig, QosEnforcement, validate_config},
     events::{EventReporter, RequestState, store_state, take_state, update_response},
     keys::{KeyRing, SelectedKey},
     policy::{CachedDecision, DenyReason, PolicyDecision, PolicyIdentity, PolicyRequest},
@@ -79,11 +79,15 @@ impl EnmaasPolicyFilter {
         let response_class_header = config.response_class_header_name()?;
         let credential_header = config.credential_header_name()?;
         let client = isolated_subrequest_client(4);
-        let default_key = env::var(&config.default_key_env)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| format!("{}{}", config.header_prefix, value.trim()));
-        let keys = KeyRing::load(config.key_file.as_deref(), &config.header_prefix, default_key)?;
+        let keys = if config.credential_mode == CredentialMode::Off {
+            KeyRing::default()
+        } else {
+            let default_key = env::var(&config.default_key_env)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| format!("{}{}", config.header_prefix, value.trim()));
+            KeyRing::load(config.key_file.as_deref(), &config.header_prefix, default_key)?
+        };
         let events = EventReporter::new(
             client.clone(),
             &config.metering_url,
@@ -340,13 +344,13 @@ impl EnmaasPolicyFilter {
         class: &str,
         subject: &str,
     ) -> Option<FilterAction> {
-        if !self.config.credential_enabled || !self.applies_to_key_cluster(ctx) {
+        if self.config.credential_mode == CredentialMode::Off || !self.applies_to_key_cluster(ctx) {
             return None;
         }
-        let alias = if self.config.credential_shadow {
-            Some("main")
-        } else {
-            decision.qos_key_alias.as_deref().or(Some(class))
+        let (alias, shadow) = match self.config.credential_mode {
+            CredentialMode::Off => return None,
+            CredentialMode::Shadow => (Some("main"), true),
+            CredentialMode::Active => (decision.qos_key_alias.as_deref().or(Some(class)), false),
         };
         let selected = self.keys.resolve(alias, subject).or_else(|| self.keys.default_key());
         let Some(SelectedKey { id, header_value }) = selected else {
@@ -361,7 +365,7 @@ impl EnmaasPolicyFilter {
             "enmaas_policy_key_selected_total",
             "requested_class" => class.to_owned(),
             "key_id" => id,
-            "shadow" => self.config.credential_shadow.to_string(),
+            "shadow" => shadow.to_string(),
         )
         .increment(1);
         None

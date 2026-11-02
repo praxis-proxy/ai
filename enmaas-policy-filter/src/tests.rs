@@ -70,7 +70,7 @@ fn defaults_are_stable() {
     assert_eq!(config.model_metadata, "model_to_provider.client_model");
     assert_eq!(config.timeout_seconds, 1);
     assert_eq!(config.response_class_header, "x-enmaas-qos-class");
-    assert!(!config.credential_enabled);
+    assert!(matches!(config.credential_mode, crate::config::CredentialMode::Off));
 }
 
 use std::{
@@ -376,7 +376,7 @@ async fn class_key_alias_is_injected() {
     let (policy_url, _captured, handle) = mock_policy(
         r#"{"version":1,"allowed":true,"qosClass":"main","qosSubject":"subject-1","qosKeyAlias":"main","cacheTtlSeconds":0}"#,
     );
-    let extra = format!("credential_enabled: true\nkey_file: {}\n", key_file.path().display());
+    let extra = format!("credential_mode: active\nkey_file: {}\n", key_file.path().display());
     let filter = build_filter_with(&policy_url, &extra);
     let request = make_request(Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&request);
@@ -391,5 +391,52 @@ async fn class_key_alias_is_injected() {
             .iter()
             .any(|(name, value)| name.eq_ignore_ascii_case("authorization") && value == "Bearer secret-main")
     );
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn shadow_injects_main_key_for_premium_request() {
+    let key_file = tempfile::NamedTempFile::new().expect("temp key file");
+    std::fs::write(
+        key_file.path(),
+        r#"{"premium":[{"id":"premium-0","key":"secret-premium"}],"main":[{"id":"main-0","key":"secret-main"}]}"#,
+    )
+    .expect("write key file");
+    let (policy_url, _captured, handle) = mock_policy(
+        r#"{"version":1,"allowed":true,"qosClass":"premium","qosSubject":"subject-1","qosKeyAlias":"premium","cacheTtlSeconds":0}"#,
+    );
+    let extra = format!("credential_mode: shadow\nkey_file: {}\n", key_file.path().display());
+    let filter = build_filter_with(&policy_url, &extra);
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.cluster = Some(Arc::from("cb-glm"));
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.extra_request_headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("authorization") && value == "Bearer secret-main")
+    );
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn off_does_not_inject_credentials() {
+    let (policy_url, _captured, handle) = mock_policy(
+        r#"{"version":1,"allowed":true,"qosClass":"premium","qosSubject":"subject-1","qosKeyAlias":"premium","cacheTtlSeconds":0}"#,
+    );
+    let filter = build_filter_with(&policy_url, "credential_mode: off\n");
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.cluster = Some(Arc::from("cb-glm"));
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(ctx.extra_request_headers.is_empty());
     handle.join().expect("mock policy thread");
 }

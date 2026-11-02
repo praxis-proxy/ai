@@ -42,6 +42,15 @@ pub(crate) enum QosEnforcement {
     Hard,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CredentialMode {
+    #[default]
+    Off,
+    Shadow,
+    Active,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EnmaasPolicyConfig {
@@ -144,10 +153,7 @@ pub(crate) struct EnmaasPolicyConfig {
     pub max_keys: usize,
 
     #[serde(default)]
-    pub credential_enabled: bool,
-
-    #[serde(default)]
-    pub credential_shadow: bool,
+    pub credential_mode: CredentialMode,
 
     #[serde(default)]
     pub key_file: Option<String>,
