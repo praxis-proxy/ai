@@ -1303,8 +1303,9 @@ jobs:
   #
   # This complements the required deterministic #1223 scripted-backend test:
   # that test remains the provider-wire oracle, while this job proves the real
-  # pinned client can select and execute a coding tool through Praxis against
-  # Qwen3-8B. The child runs in a namespace whose only route reaches Praxis, and
+  # pinned client can select and execute its grammar-constrained apply_patch
+  # tool through Praxis against Qwen3-8B on both paths. The child runs in a
+  # namespace whose only route reaches Praxis, and
   # vLLM requires a provider credential Codex never receives, proving Praxis
   # replaced the gateway credential. It reuses the full suite's on-disk model
   # cache when available and starts its own keyed container sequentially.
@@ -1548,8 +1549,8 @@ jobs:
           fi
           # An exact libtest selector otherwise succeeds when no test is compiled.
           for test_name in \
-            codex_http::pinned_codex_completes_native_vllm_coding_workflow_over_http \
-            codex_http::pinned_codex_completes_translated_vllm_coding_workflow_over_http \
+            codex_http::pinned_codex_completes_native_vllm_apply_patch_workflow_over_http \
+            codex_http::pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http \
             codex_http::pinned_codex_compaction_crosses_context_window_over_http; do
             if ! "$TEST_BIN" "$test_name" --list --exact | grep -Fx "$test_name: test"; then
               echo "::error::missing Codex acceptance test: $test_name"
@@ -1573,7 +1574,7 @@ jobs:
           set -uo pipefail
           sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
             "$TEST_BIN" \
-            codex_http::pinned_codex_completes_native_vllm_coding_workflow_over_http \
+            codex_http::pinned_codex_completes_native_vllm_apply_patch_workflow_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-native.log"
           test_status=${PIPESTATUS[0]}
           if [ "$test_status" -ne 0 ]; then
@@ -1597,7 +1598,7 @@ jobs:
           set -uo pipefail
           sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
             "$TEST_BIN" \
-            codex_http::pinned_codex_completes_translated_vllm_coding_workflow_over_http \
+            codex_http::pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-translated.log"
           test_status=${PIPESTATUS[0]}
           if [ "$test_status" -ne 0 ]; then

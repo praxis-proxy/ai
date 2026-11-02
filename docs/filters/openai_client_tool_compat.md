@@ -15,6 +15,7 @@ Enablement is by placement in the pipeline routed to a function-only Responses b
 |-------|------|---------|-------------|
 | `max_rewritten_body_bytes` | integer | no | Maximum size in bytes of the request body this filter *produces* after lowering rich client tool declarations to `function` entries, and of the response body it *produces* after restoring typed client-owned items. Raw request body size is governed by the pipeline's `body_limits`, not this field. Lowering absorbs provider fields into function descriptions, so the rewritten body can grow larger than the raw input. |
 | `max_client_tools` | integer | no | Maximum number of client-owned tool declarations lowered per request. |
+| `custom_input_pattern_encoding` | `json_string` \| `decoded` \| `none` | no | How the backend interprets a JSON-Schema string `pattern`, deciding the encoding of the constraint emitted on a lowered grammar tool's `input`. Defaults to `json_string` (`XGrammar`/`vLLM`, which matches the raw JSON-string body). Set `decoded` for a spec-compliant backend that matches the decoded value, or `none` to emit no backend `pattern` and rely solely on host-side validation of the decoded input. |
 
 ## Examples
 

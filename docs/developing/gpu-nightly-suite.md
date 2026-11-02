@@ -58,13 +58,19 @@ backend can serve the same client.
 
 Details per use case:
 
-- **Codex CLI — native vs translated.** A pinned Codex binary completes the same
-  coding workflow twice: once over vLLM's native `/v1/responses` (with a
-  PostgreSQL response store), once with Praxis translating Responses → Chat
-  Completions. Tests:
-  `codex_http::pinned_codex_completes_native_vllm_coding_workflow_over_http`
-  and `..._completes_chat_backend_coding_workflow_over_http`
-  (config `openai/responses/codex-http-chat-translation.yaml`).
+- **Codex CLI — native vs translated.** A pinned Codex binary uses its
+  grammar-constrained `apply_patch` tool to create `result.txt`, returns the
+  tool output through Praxis, and runs the verifier. The test covers vLLM's
+  native `/v1/responses` (with a PostgreSQL response store) and Praxis's
+  Responses-to-Chat translation:
+  `codex_http::pinned_codex_completes_native_vllm_apply_patch_workflow_over_http`
+  and
+  `codex_http::pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http`
+  (configs `openai/responses/client-tool-compat.yaml` and
+  `openai/responses/client-tool-compat-chat-completions.yaml`). The test selects
+  Codex's known `gpt-5.4` model metadata so the CLI exposes `apply_patch` without
+  requesting reasoning summaries, then rewrites the request's model field to the
+  live vLLM model; inference still runs against the configured Qwen backend.
 - **Claude Code — native vs translated.** A pinned Claude Code binary completes
   the same multi-step task under four scenarios: {native (`messages-native-vllm.yaml`)
   / transformed (`messages-to-openai-vllm.yaml`)} × {deterministic `acceptEdits`
