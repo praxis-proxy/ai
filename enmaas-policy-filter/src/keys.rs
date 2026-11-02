@@ -116,7 +116,7 @@ impl KeyRing {
             .map(|entry| {
                 let mut digest = Sha256::new();
                 digest.update(subject.as_bytes());
-                digest.update(&[0x1f]);
+                digest.update(&[0x1F]);
                 digest.update(entry.id.as_bytes());
                 (digest.finish(), entry)
             })
