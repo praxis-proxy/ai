@@ -261,7 +261,7 @@ fn default_version_header() -> Option<String> {
 
 /// YAML configuration for the A2A filter.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, try_from = "RawA2aConfig")]
 pub(crate) struct A2aConfig {
     /// Header names for A2A metadata promotion.
     ///
@@ -286,6 +286,54 @@ pub(crate) struct A2aConfig {
     /// Task-ownership routing configuration.
     #[serde(default)]
     pub task_routing: TaskRoutingConfig,
+}
+
+/// Raw A2A configuration converted into [`A2aConfig`] after checking the
+/// cross-field task-routing invariant.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawA2aConfig {
+    /// Header names for A2A metadata promotion.
+    ///
+    /// Must not be hop-by-hop, framing, Host, credential, API-key, or
+    /// other internal `x-praxis-*` names. Dedicated `x-praxis-a2a-*`
+    /// defaults remain allowed.
+    #[serde(default)]
+    headers: A2aHeaders,
+
+    /// Maximum body size in bytes for `StreamBuffer`.
+    #[serde(default = "default_max_body_bytes")]
+    max_body_bytes: usize,
+
+    /// Method aliases for compatibility (slash-delimited → `PascalCase`).
+    #[serde(default)]
+    method_aliases: BTreeMap<String, String>,
+
+    /// Invalid input handling behavior.
+    #[serde(default = "OnInvalidBehavior::default_reject")]
+    on_invalid: OnInvalidBehavior,
+
+    /// Task-ownership routing configuration.
+    #[serde(default)]
+    task_routing: TaskRoutingConfig,
+}
+
+impl TryFrom<RawA2aConfig> for A2aConfig {
+    type Error = String;
+
+    fn try_from(raw: RawA2aConfig) -> Result<Self, Self::Error> {
+        if raw.task_routing.enabled && raw.task_routing.store.is_none() {
+            return Err("a2a: task_routing.store is required when task routing is enabled".into());
+        }
+
+        Ok(Self {
+            headers: raw.headers,
+            max_body_bytes: raw.max_body_bytes,
+            method_aliases: raw.method_aliases,
+            on_invalid: raw.on_invalid,
+            task_routing: raw.task_routing,
+        })
+    }
 }
 
 /// Default max body bytes.
@@ -518,6 +566,23 @@ mod tests {
         assert!(
             !cfg.task_routing.enabled,
             "task_routing.enabled should default to false"
+        );
+    }
+
+    #[test]
+    fn a2a_config_rejects_enabled_task_routing_without_store_at_deserialization() {
+        let err = serde_yaml::from_str::<A2aConfig>(
+            r"
+task_routing:
+  enabled: true
+",
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("task_routing.store is required when task routing is enabled"),
+            "missing task route store should be rejected during deserialization: {err}"
         );
     }
 
