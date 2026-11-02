@@ -934,6 +934,26 @@ impl crate::store::ResponseStore for RecordingResponseStore {
             .cloned())
     }
 
+    async fn compare_and_swap_response_object(
+        &self,
+        owner: &crate::StateOwner,
+        id: &str,
+        expected_response_object: &serde_json::Value,
+        response_object: &serde_json::Value,
+    ) -> Result<crate::store::ResponseCasOutcome, crate::store::StoreError> {
+        let mut records = self.records.lock().expect("records mutex should not be poisoned");
+        // Owner-scoped like the real backends: another principal's record is
+        // reported as missing rather than swapped.
+        match records.get_mut(id).filter(|record| &record.owner == owner) {
+            Some(record) if &record.response_object == expected_response_object => {
+                record.response_object = response_object.clone();
+                Ok(crate::store::ResponseCasOutcome::Applied)
+            },
+            Some(_) => Ok(crate::store::ResponseCasOutcome::Mismatch),
+            None => Ok(crate::store::ResponseCasOutcome::NotFound),
+        }
+    }
+
     async fn delete_response(&self, _owner: &crate::StateOwner, _id: &str) -> Result<bool, crate::store::StoreError> {
         if self.failure == RecordingStoreFailure::Delete {
             return Err(crate::store::StoreError::Unavailable(

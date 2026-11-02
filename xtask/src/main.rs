@@ -47,6 +47,8 @@ mod openai_conformance;
 mod openai_conformance_gate;
 #[cfg(feature = "dev")]
 mod openresponses_coverage;
+#[cfg(feature = "pins")]
+mod pins;
 #[cfg(feature = "dev")]
 mod port;
 #[cfg(feature = "dev")]
@@ -81,6 +83,16 @@ enum Command {
     /// Validate inference fixture coverage.
     #[cfg(feature = "dev")]
     CheckInference(inference_fixtures::CheckArgs),
+
+    /// Check that the pinned coding clients and vLLM image agree across
+    /// manifests, harness constants, workflows, and checksum fixtures.
+    #[cfg(feature = "pins")]
+    CheckPins(pins::CheckArgs),
+
+    /// Bump the pinned coding clients and vLLM image to their latest
+    /// upstream releases, leaving behavioral re-validation to a checklist.
+    #[cfg(feature = "dev")]
+    BumpPins(pins::BumpArgs),
 
     /// Check the runtime Anthropic Messages operation registry
     /// against the pinned Anthropic specification.
@@ -219,6 +231,8 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Command::Fips(args) => fips::run(args),
+        #[cfg(feature = "pins")]
+        Command::CheckPins(args) => pins::run_check(&args),
         #[cfg(feature = "dev")]
         command => run_dev(command),
     }
@@ -250,6 +264,7 @@ fn run_dev(command: Command) {
 #[cfg(feature = "dev")]
 fn run_dev_continued(command: Command) {
     match command {
+        Command::BumpPins(args) => pins::run_bump(&args),
         Command::SyncExampleReadme(args) => sync_example_readme::run(&args),
         Command::GenerateFilterDocs(args) => filter_docs::generate(args),
         Command::LintFilterDocs(args) => filter_docs::lint(args),

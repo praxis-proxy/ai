@@ -58,6 +58,7 @@ endif
 	test test-unit test-unit-apis test-unit-filters test-unit-proxy \
 	test-schema test-integration test-integration-core test-integration-experimental \
 	test-inference-fixtures test-inference-fixtures-core test-inference-xtask bench-model-to-provider \
+	test-anthropic-sdk test-anthropic-sdk-v1 test-anthropic-sdk-v2 \
 	test-store-features test-store-features-check test-store-features-clippy \
 	test-store-features-clippy-group test-store-features-test print-store-clippy-groups \
 	test-responses-features \
@@ -287,6 +288,23 @@ test-inference-fixtures-core:
 test-inference-xtask:
 	cargo test -p xtask --features openai-all,store-all inference_fixtures $(_NOCAPTURE)
 
+# Anthropic SDK v1/v2 compatibility lanes for Messages routes (issue #1825).
+# The aggregate runs both pinned lanes serially for local use; CI runs the
+# lanes as sequential steps in the `anthropic-sdk` job of integration.yaml
+# after a single binary build. These per-lane targets build the binary
+# themselves, so a local lane run never depends on a sibling lane's build.
+test-anthropic-sdk: test-anthropic-sdk-v1 test-anthropic-sdk-v2
+
+test-anthropic-sdk-v1:
+	cargo build -p praxis-ai-proxy
+	uv run --with "anthropic==1.17.0" --with "pytest>=8.0" \
+		tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s --anthropic-sdk-version=1.x
+
+test-anthropic-sdk-v2:
+	cargo build -p praxis-ai-proxy
+	uv run --with "anthropic==2.3.0" --with "pytest>=8.0" \
+		tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s --anthropic-sdk-version=2.x
+
 # Every ignored test in praxis-ai-apis is a PostgreSQL store contract, so
 # --ignored alone selects them all: no name filter can drop one silently.
 # Backend history regressions run the same way with only PostgreSQL enabled.
@@ -391,6 +409,7 @@ setup-lint-toolchains:
 # isolates that build from the clippy passes so the two halves run in parallel.
 lint-xtask: lint-license-headers
 	cargo xtask lint-deps
+	cargo xtask check-pins
 	$(MAKE) fips-deps
 	cargo xtask lint-separators
 	cargo xtask lint-filter-docs
@@ -955,6 +974,9 @@ help:
 	@echo "  test-integration-experimental experimental-filter integration suite"
 	@echo "  test-inference-fixtures   inference fixtures, replay, and xtask tests"
 	@echo "  test-inference-xtask     inference fixture xtask tests"
+	@echo "  test-anthropic-sdk       Anthropic SDK v1+v2 Messages compatibility lanes"
+	@echo "  test-anthropic-sdk-v1    Anthropic SDK 1.17.0 Messages compatibility lane"
+	@echo "  test-anthropic-sdk-v2    Anthropic SDK 2.3.0 Messages compatibility lane"
 	@echo "  bench-model-to-provider  optimized mapped and fallback request-body timings"
 	@echo "  test-postgres-unit       postgres store unit tests (needs DATABASE_URL)"
 	@echo "  test-postgres-integration postgres store integration tests (needs container engine)"

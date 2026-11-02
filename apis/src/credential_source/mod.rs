@@ -4,8 +4,8 @@
 //! Shared credential source (`value | env_var | file`) with bounded reads,
 //! restart-free file rotation, and fail-closed publication.
 //!
-//! Used by the web-search filters (`apis`) and the external metering filter
-//! (`filters`).
+//! Used by the web-search filters (`apis`), the external metering filter, and
+//! the `NeMo` guardrails provider (`filters`).
 
 use std::sync::Arc;
 
@@ -257,6 +257,22 @@ pub fn build_one(
     }
 }
 
+/// Transform for [`build_one`] that publishes `Bearer {token}` as a complete
+/// `Authorization` value. `owner` and `field` name the configuration in the
+/// error raised when the result is not a valid header value.
+pub fn bearer_header(
+    owner: &'static str,
+    field: &'static str,
+) -> impl Fn(&str) -> Result<Zeroizing<String>, FilterError> + Send + Sync + 'static {
+    move |token| {
+        let header = Zeroizing::new(format!("Bearer {token}"));
+        http::HeaderValue::from_str(&header).map_err(|error| -> FilterError {
+            format!("{owner}: {field} is not a valid header value: {error}").into()
+        })?;
+        Ok(header)
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
@@ -403,6 +419,18 @@ mod tests {
         };
         let err = build_one(ctx, &src, transform).unwrap_err();
         assert!(err.to_string().contains("invalid API key header value"));
+    }
+
+    #[test]
+    fn bearer_header_prefixes_token_and_rejects_control_bytes() {
+        let transform = bearer_header("test_owner", "token_file");
+        assert_eq!(transform("tok").unwrap().as_str(), "Bearer tok");
+        let err = transform("bad\ntok").unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "test_owner: token_file is not a valid header value: failed to parse header value"
+        );
+        assert!(!err.contains("bad"), "{err}");
     }
 
     #[test]

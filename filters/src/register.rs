@@ -390,6 +390,10 @@ fn register_openai_filters(registry: &mut FilterRegistry) {
     );
     praxis_filter::register_filters!(
         @register registry,
+        http "openai_chat_completions_streaming_selector" => praxis_ai_apis::openai::OpenaiChatCompletionsStreamingSelectorFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
         http "ai_operation" => praxis_ai_apis::operation_classifier::AiOperationFilter::from_config
     );
 }
@@ -752,6 +756,7 @@ mod tests {
             "openai_responses_model_rewrite",
             "openai_tool_parse",
             "openai_chat_completions_request",
+            "openai_chat_completions_streaming_selector",
             "ai_operation",
             "a2a",
             "intelligent_route",
@@ -808,6 +813,33 @@ provider:
         let chains = HashMap::new();
         FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
             .expect("omitting outbound_chain should build an empty pass-through chain");
+    }
+
+    /// The post-auth config ai-gateway-controller compiles for an accepted
+    /// `AIGuardrail`. The controller pins the same file in its
+    /// `test/testdata/nemo-callout-contract`, so a provider field this
+    /// registry rejects fails here before an image ships.
+    #[test]
+    fn ai_gateway_controller_nemo_contract_builds() {
+        let directory = tempfile::tempdir().unwrap();
+        let token = directory.path().join("token");
+        std::fs::write(&token, "contract-token").unwrap();
+        let ca = directory.path().join("service-ca.crt");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        std::fs::write(&ca, params.self_signed(&key).unwrap().pem()).unwrap();
+
+        let source = include_str!("../testdata/ai-gateway-controller-extproc.yaml")
+            .replace("/var/run/secrets/tokens/nemo/token", token.to_str().unwrap())
+            .replace("/var/run/secrets/nemo-ca/service-ca.crt", ca.to_str().unwrap());
+        let config: serde_yaml::Value = serde_yaml::from_str(&source).unwrap();
+        let insecure: InsecureOptions = serde_yaml::from_value(config["insecure_options"].clone())
+            .expect("the controller's insecure_options must be fields Praxis accepts");
+        let mut entries: Vec<FilterEntry> =
+            serde_yaml::from_value(config["filter_chains"][0]["filters"].clone()).unwrap();
+        FilterPipeline::build_with_chains(&mut entries, &build_ai_registry(), &HashMap::new(), &insecure)
+            .expect("the controller-compiled NeMo callout must build");
     }
 
     #[test]
