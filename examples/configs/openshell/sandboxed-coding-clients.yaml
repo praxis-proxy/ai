@@ -2,8 +2,8 @@
 # Requires `--features openai-agentic-loop,store-sqlite` because the Codex chain's filters are opt-in.
 #
 # One host-side gateway for Codex, Claude Code, OpenCode, and pi running inside
-# NVIDIA OpenShell sandboxes, each over its native wire API with no body
-# translation.
+# NVIDIA OpenShell sandboxes, each over its native wire API, with Codex
+# client-tool compatibility applied to its tool payloads.
 #
 #   Claude Code -> :8080 POST /v1/messages         -> vLLM (native Anthropic Messages)
 #   OpenCode    -> :8080 POST /v1/chat/completions -> vLLM (native Chat Completions)

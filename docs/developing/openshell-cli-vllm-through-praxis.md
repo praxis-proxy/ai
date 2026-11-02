@@ -76,8 +76,10 @@ Start vLLM as in [section 1 of the base guide](cli-vllm-through-praxis.md#1-star
 and record `VLLM_URL` and `VLLM_MODEL`.
 
 Copy the sandbox gateway example. It serves Claude Code, OpenCode, and pi on
-port 8080 and Codex on port 8081, all over their native APIs, behind one
-`basic_auth` credential:
+port 8080 and Codex on port 8081, all over their native wire APIs, behind one
+`basic_auth` credential. Only the Codex chain transforms the body: its
+`openai_client_tool_compat` step lowers Codex's rich client tools to the vLLM
+tool representation and restores them on the way back.
 
 ```console
 cp examples/configs/openshell/sandboxed-coding-clients.yaml praxis-openshell.yaml
@@ -88,15 +90,33 @@ endpoint, change both `load_balancer` endpoints and add `tls.sni` as described
 in [section 2 of the base guide](cli-vllm-through-praxis.md#2-point-a-praxis-example-at-vllm).
 
 For a vLLM server elsewhere on your network, replace both `127.0.0.1:8000`
-endpoints with its `host:port`. If that hostname resolves to a private address,
-also add `allow_private_upstreams: true` beside the existing
-`allow_private_endpoints: true`. Without it, requests fail with
-`upstream hostname resolved to private/reserved IP address`.
+endpoints with its `host:port`. If that hostname resolves to an RFC 1918 or
+IPv6 unique-local address, add it to `trusted_private_endpoints` on both
+`load_balancer` clusters:
 
-Both listeners bind `0.0.0.0`, because traffic from sandboxes arrives on the
-host's container-bridge interface. Firewall ports 8080 and 8081 from external
-networks, or replace `0.0.0.0` with the bridge address your OpenShell driver
-uses (for example `docker0`'s address).
+```yaml
+- filter: load_balancer
+  clusters:
+    - name: "vllm-backend"
+      trusted_private_endpoints: ["vllm.internal"]
+      endpoints:
+        - "vllm.internal:8000"
+```
+
+Each entry must name one of that cluster's endpoint hostnames, and the entry
+scopes the exception to that host. Without it, requests fail with
+`upstream hostname resolved to private/reserved IP address`. Do not reach for
+`insecure_options.allow_private_upstreams` here: it disables the private-address
+check for every upstream, including the Codex chain's sub-requests.
+
+The example binds both listeners to `0.0.0.0` because traffic from sandboxes
+arrives on the host's container-bridge interface. Prefer replacing `0.0.0.0`
+with that bridge address before you start Praxis (for example `docker0`'s, or
+Podman's `podman0`), and firewall ports 8080 and 8081 on every other interface
+if you keep the wildcard bind. The gateway password crosses the bridge as plain
+HTTP Basic, so treat this `basic_auth` setup as a development and testing gate:
+put TLS in front of the listeners and a real identity provider behind them
+before exposing either one beyond the bridge.
 
 Set the two secrets in the shell that starts Praxis, then build and start it:
 

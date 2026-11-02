@@ -182,7 +182,7 @@ for how these are authored and regenerated.
 
 | File | Description |
 | ------ | ------------- |
-| [sandboxed-coding-clients.yaml](configs/openshell/sandboxed-coding-clients.yaml) | One host-side gateway for Codex, Claude Code, OpenCode, and pi running inside NVIDIA OpenShell sandboxes, each over its native wire API with no body translation |
+| [sandboxed-coding-clients.yaml](configs/openshell/sandboxed-coding-clients.yaml) | One host-side gateway for Codex, Claude Code, OpenCode, and pi running inside NVIDIA OpenShell sandboxes, each over its native wire API, with Codex client-tool compatibility applied to its tool payloads |
 
 ### Payload Processing
 
