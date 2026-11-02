@@ -80,6 +80,7 @@ use std::{
     thread,
 };
 
+use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use praxis_core::{id::IdGenerator, time::SystemTimeSource};
 use praxis_filter::{
@@ -438,5 +439,27 @@ async fn off_does_not_inject_credentials() {
     let action = filter.on_request(&mut ctx).await.expect("policy request");
     assert!(matches!(action, FilterAction::Continue));
     assert!(ctx.extra_request_headers.is_empty());
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn buffered_body_model_is_authoritative_when_metadata_is_absent() {
+    let (policy_url, captured, handle) =
+        mock_policy(r#"{"version":1,"allowed":true,"qosClass":"main","qosSubject":"subject-1","cacheTtlSeconds":0}"#);
+    let filter = build_filter(&policy_url);
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("x-tenant-model", "header-model");
+    ctx.buffered_request_body = Some(Bytes::from_static(br#"{"model":"body-model","messages":[]}"#));
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        captured
+            .lock()
+            .expect("capture lock")
+            .contains("\"model\":\"body-model\"")
+    );
     handle.join().expect("mock policy thread");
 }

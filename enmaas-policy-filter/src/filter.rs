@@ -124,6 +124,19 @@ impl EnmaasPolicyFilter {
         if let Some(model) = ctx.get_metadata(&self.config.model_metadata) {
             return model.to_owned();
         }
+        if let Some(model) = ctx
+            .buffered_request_body
+            .as_ref()
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+            .and_then(|value| {
+                value
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+        {
+            return model;
+        }
         if let Some(model) = ctx.get_metadata(&self.config.identity_model_metadata) {
             return model.to_owned();
         }
