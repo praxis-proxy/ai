@@ -12,6 +12,8 @@ use praxis_filter::{
 };
 use serde::Deserialize;
 
+use crate::operation::normalize_path;
+
 /// Registered filter identifier.
 const FILTER_NAME: &str = "openai_chat_completions_streaming_selector";
 
@@ -98,7 +100,7 @@ impl HttpFilter for OpenaiChatCompletionsStreamingSelectorFilter {
         }
 
         let stream = ctx.request.method == Method::POST
-            && ctx.request.uri.path() == "/v1/chat/completions"
+            && normalize_path(ctx.request.uri.path()) == "/v1/chat/completions"
             && body
                 .as_deref()
                 .and_then(|bytes| serde_json::from_slice::<StreamingRequest>(bytes).ok())
@@ -146,6 +148,19 @@ mod tests {
         assert!(matches!(action, FilterAction::Release));
         assert_eq!(
             streaming_ctx.subrequest_response_mode(),
+            SubRequestResponseMode::Streaming
+        );
+
+        let trailing_slash_request = crate::test_utils::make_request(Method::POST, "/v1/chat/completions/");
+        let mut trailing_slash_ctx = crate::test_utils::make_filter_context(&trailing_slash_request);
+        let mut trailing_slash_body = Some(Bytes::from_static(br#"{"stream":true}"#));
+        let action = filter()
+            .on_request_body(&mut trailing_slash_ctx, &mut trailing_slash_body, true)
+            .await
+            .unwrap();
+        assert!(matches!(action, FilterAction::Release));
+        assert_eq!(
+            trailing_slash_ctx.subrequest_response_mode(),
             SubRequestResponseMode::Streaming
         );
 
