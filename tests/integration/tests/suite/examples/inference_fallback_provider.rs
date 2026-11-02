@@ -215,8 +215,8 @@ fn openai_primary_stream_reaches_client_before_upstream_completes() {
         proxy.addr(),
         chat_request(true),
         "\"content\":\"primary\"",
-        first_sent,
-        release,
+        &first_sent,
+        &release,
     );
 
     assert_eq!(parse_status(&raw), 200, "primary stream should return 200: {raw}");
@@ -251,8 +251,8 @@ fn anthropic_fallback_stream_reaches_client_before_upstream_completes() {
         proxy.addr(),
         chat_request(true),
         "chat.completion.chunk",
-        first_sent,
-        release,
+        &first_sent,
+        &release,
     );
 
     assert_eq!(parse_status(&raw), 200, "fallback stream should return 200: {raw}");
@@ -371,8 +371,8 @@ fn read_stream_before_upstream_fin(
     proxy_addr: &str,
     request: String,
     needle: &str,
-    first_sent: mpsc::Receiver<()>,
-    release: mpsc::Sender<()>,
+    first_sent: &mpsc::Receiver<()>,
+    release: &mpsc::Sender<()>,
 ) -> String {
     let (observed_tx, observed_rx) = mpsc::channel();
     let (complete_tx, complete_rx) = mpsc::channel();
