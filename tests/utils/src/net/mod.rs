@@ -18,10 +18,10 @@ pub use backend::{
     Backend, BackendGuard, CapturedHttpRequest, CapturedRequest, CapturedWsMessage, CapturingBackendGuard,
     HttpBackendEvent, HttpBackendGuard, HttpServerAction, RoutedBackend, StatefulBackend, StatefulBackendGuard,
     StatefulCapturingBackend, StatefulCapturingGuard, WsBackendEvent, WsBackendGuard, WsServerAction, start_backend,
-    start_backend_v6, start_backend_with_shutdown, start_capturing_backend, start_echo_backend,
-    start_header_echo_backend, start_keepalive_backend, start_scripted_http_backend, start_scripted_http_backend_turns,
-    start_scripted_websocket_backend, start_scripted_websocket_backend_turns, start_slow_backend,
-    start_stateful_backend, start_uri_echo_backend,
+    start_backend_v6, start_backend_with_shutdown, start_body_aware_backend, start_capturing_backend,
+    start_echo_backend, start_header_echo_backend, start_keepalive_backend, start_scripted_http_backend,
+    start_scripted_http_backend_turns, start_scripted_websocket_backend, start_scripted_websocket_backend_turns,
+    start_slow_backend, start_stateful_backend, start_uri_echo_backend,
 };
 #[cfg(feature = "llmd-ext-proc")]
 pub use ext_proc_mock::{MockProcessorGuard, start_mock_routing_processor};

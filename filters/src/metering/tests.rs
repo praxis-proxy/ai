@@ -754,6 +754,25 @@ fn guard_identity_blocks_raw_header_fallback() {
 }
 
 #[test]
+fn guard_group_only_blocks_raw_header_username() {
+    let mut req = make_request(http::Method::POST, "/v1/chat/completions");
+    req.headers
+        .insert("x-tenant-username", "header-mallory".parse().unwrap());
+
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("identity.x-tenant-group".to_owned(), "ml".to_owned());
+
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+
+    assert_eq!(state.group, "ml", "guard group must survive");
+    assert!(
+        state.username.is_empty(),
+        "raw header must not extend a partial guard identity"
+    );
+}
+
+#[test]
 fn group_falls_back_to_subscription() {
     let mut req = make_request(http::Method::POST, "/v1/chat/completions");
     req.headers.insert("x-tenant-username", "alice".parse().unwrap());

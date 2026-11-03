@@ -164,6 +164,7 @@ truthful provider, model, and provenance metadata.
 
 ## Key Patterns
 
+- **Filter callouts**: use `FilteredSubrequestExecutor` for every outbound call made by a filter. It runs the configured outbound filter chain around the HTTP exchange, including credential injection and other outbound policies. `SubRequestClient::execute_url()` performs the HTTP exchange without running a configured filter pipeline.
 - **Classify → route → branch**: classifier filters
   promote facts to internal headers
   (`x-praxis-ai-*`) and the router matches those
