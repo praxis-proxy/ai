@@ -105,9 +105,9 @@ use crate::{
 /// Step-local metadata carrying the configured response fan-out cap to the owner.
 const MAX_CALLS_METADATA: &str = "responses.mcp_max_calls_per_round";
 
-/// A minimal JSON-RPC `initialize` reply needs roughly 150 KiB of lexical
-/// parser headroom under the shared node charge. Reserve a little more before
-/// a single-use approval can be consumed.
+/// A minimal JSON-RPC `initialize` reply needs roughly 13 KiB under
+/// `mcp_result_charge`. Keep a generous floor before a single-use approval
+/// can be consumed.
 const MIN_MCP_INITIALIZE_PARSE_CHARGE: usize = 256 * 1_024;
 
 /// A budget failure must terminate the request even when an MCP server or
