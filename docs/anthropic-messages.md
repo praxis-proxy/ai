@@ -290,7 +290,8 @@ neither reaches a Chat Completions backend in either lane.
 
 The OpenAI -> Anthropic Messages direction is driven by the OpenAI SDK as the
 client, so it does not vary on the Anthropic SDK axis; its backend wire
-headers (pinned `anthropic-version: 2023-06-01`, injected `x-api-key`,
+headers (operator-selected `anthropic-version` via `api_version`,
+defaulting to `2023-06-01`, injected `x-api-key`,
 stripped caller `authorization`) are asserted in
 [`tests/integration/sdk/openai/test_selected_anthropic_chat_completions.py`](../tests/integration/sdk/openai/test_selected_anthropic_chat_completions.py).
 
