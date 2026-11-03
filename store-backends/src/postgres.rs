@@ -2652,7 +2652,7 @@ async fn pg_invalidate_messages(
     let update_sql = format!(
         "UPDATE {conv_table} SET messages = '[]' \
          WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
-         AND messages <> '[]' AND left(messages, 19) <> '{{\"legacy_messages\":'"
+         AND (messages IS NULL OR (messages <> '[]' AND left(messages, 19) <> '{{\"legacy_messages\":'))"
     );
     sqlx::query(AssertSqlSafe(update_sql.as_str()))
         .bind(conversation_id)
@@ -2985,6 +2985,40 @@ mod tests {
     use std::sync::{Arc, Mutex, Weak};
 
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    async fn invalidation_clears_null_cache_in_nullable_conversations_table() {
+        let url = std::env::var("DATABASE_URL").expect("disposable test database");
+        let pool = PgPoolOptions::new().connect(&url).await.unwrap();
+        let owner = StateOwner::from_trusted_parts("tenant", "issuer", "subject").unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "CREATE TEMP TABLE nullable_conversations (\
+             conversation_id TEXT, tenant_id TEXT, owner_issuer TEXT, owner_subject TEXT, messages TEXT)",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO nullable_conversations \
+             (conversation_id, tenant_id, owner_issuer, owner_subject, messages) \
+             VALUES ('c', 'tenant', 'issuer', 'subject', NULL)",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        pg_invalidate_messages(&mut tx, "nullable_conversations", &owner, "c")
+            .await
+            .unwrap();
+        let messages: Option<String> =
+            sqlx::query_scalar("SELECT messages FROM nullable_conversations WHERE conversation_id = 'c'")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(messages.as_deref(), Some("[]"));
+    }
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
