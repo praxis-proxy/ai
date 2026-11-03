@@ -2988,36 +2988,55 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-    async fn invalidation_clears_null_cache_in_nullable_conversations_table() {
+    #[expect(clippy::too_many_lines, reason = "one cache-state matrix observes row updates")]
+    async fn invalidation_updates_only_stale_or_null_caches() {
         let url = std::env::var("DATABASE_URL").expect("disposable test database");
         let pool = PgPoolOptions::new().connect(&url).await.unwrap();
         let owner = StateOwner::from_trusted_parts("tenant", "issuer", "subject").unwrap();
         let mut tx = pool.begin().await.unwrap();
         sqlx::query(
-            "CREATE TEMP TABLE nullable_conversations (\
-             conversation_id TEXT, tenant_id TEXT, owner_issuer TEXT, owner_subject TEXT, messages TEXT)",
-        )
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO nullable_conversations \
-             (conversation_id, tenant_id, owner_issuer, owner_subject, messages) \
-             VALUES ('c', 'tenant', 'issuer', 'subject', NULL)",
+            "CREATE TEMP TABLE nullable_conversations AS SELECT 'c'::text AS conversation_id, \
+             'tenant'::text AS tenant_id, 'issuer'::text AS owner_issuer, 'subject'::text AS owner_subject, \
+             NULL::text AS messages",
         )
         .execute(&mut *tx)
         .await
         .unwrap();
 
-        pg_invalidate_messages(&mut tx, "nullable_conversations", &owner, "c")
-            .await
-            .unwrap();
-        let messages: Option<String> =
-            sqlx::query_scalar("SELECT messages FROM nullable_conversations WHERE conversation_id = 'c'")
-                .fetch_one(&mut *tx)
+        for (cache, expected, writes) in [
+            (None, "[]", 1),
+            (Some("[]"), "[]", 0),
+            (Some("{\"legacy_messages\":[]}"), "{\"legacy_messages\":[]}", 0),
+            (Some("[1]"), "[]", 1),
+        ] {
+            sqlx::query("UPDATE nullable_conversations SET messages = $1 WHERE conversation_id = 'c'")
+                .bind(cache)
+                .execute(&mut *tx)
                 .await
                 .unwrap();
-        assert_eq!(messages.as_deref(), Some("[]"));
+            let updates_before: i64 = sqlx::query_scalar(
+                "SELECT pg_stat_get_xact_tuples_updated('pg_temp.nullable_conversations'::regclass)",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            pg_invalidate_messages(&mut tx, "nullable_conversations", &owner, "c")
+                .await
+                .unwrap();
+            let updates_after: i64 = sqlx::query_scalar(
+                "SELECT pg_stat_get_xact_tuples_updated('pg_temp.nullable_conversations'::regclass)",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            assert_eq!(updates_after - updates_before, writes, "cache: {cache:?}");
+            let messages: Option<String> =
+                sqlx::query_scalar("SELECT messages FROM nullable_conversations WHERE conversation_id = 'c'")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_eq!(messages.as_deref(), Some(expected));
+        }
     }
 
     #[tokio::test]
