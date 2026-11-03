@@ -219,6 +219,75 @@ fn selected_anthropic_sse_is_converted_incrementally_to_openai_sse() {
     );
 }
 
+#[test]
+fn selected_anthropic_version_example_rejects_sampling_before_dispatch() {
+    let backend = StatefulCapturingBackend::new(vec![(200, ANTHROPIC_JSON.to_owned())]).start_with_shutdown();
+    let example = example_config_path("openai-selected-provider-version-fixture.yaml");
+    let overlay = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/inference/routing/openai-to-anthropic.json");
+    let yaml = std::fs::read_to_string(&example)
+        .expect("read version-aware example")
+        .replace("0.0.0.0:8080", &format!("127.0.0.1:{}", free_port()))
+        .replace("127.0.0.1:8001", &format!("127.0.0.1:{}", backend.port()))
+        .replace(
+            "tests/integration/fixtures/inference/routing/openai-to-anthropic.json",
+            overlay.to_str().expect("UTF-8 overlay path"),
+        );
+    let config = Config::from_yaml(&yaml).expect("version-aware example must parse");
+    let proxy = start_proxy(&config);
+    let mut body = json!({
+        "model":"fixture-openai-model", "messages":[{"role":"user","content":"hi"}], "max_tokens":16
+    });
+    for field in ["temperature", "top_p", "top_k"] {
+        for stream in [false, true] {
+            body[field] = json!(1);
+            body["stream"] = json!(stream);
+            let encoded = serde_json::to_string(&body).expect("serialize rejected request");
+            let request = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{encoded}",
+                encoded.len()
+            );
+            let response = http_send(proxy.addr(), &request);
+            assert_eq!(
+                parse_status(&response),
+                400,
+                "new contract must reject {field}: {response}"
+            );
+            let error: Value = serde_json::from_str(&parse_body(&response)).expect("OpenAI error JSON");
+            let message = error["error"]["message"].as_str().expect("error message");
+            assert!(message.contains(field), "error must name unsupported field: {message}");
+            assert!(
+                message.contains("2026-10-21"),
+                "error must name selected version: {message}"
+            );
+            body.as_object_mut().expect("request object").remove(field);
+        }
+    }
+    assert!(
+        backend.requests().iter().all(|request| request.method != "POST"),
+        "rejected requests must make no upstream inference calls"
+    );
+    body["stream"] = json!(false);
+    let encoded = serde_json::to_string(&body).expect("serialize accepted request");
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAnthropic-Version: 2023-06-01\r\nConnection: close\r\n\r\n{encoded}",
+        encoded.len()
+    );
+    let response = http_send(proxy.addr(), &request);
+    assert_eq!(
+        parse_status(&response),
+        200,
+        "omitted sampling must succeed: {response}"
+    );
+    let upstream = post_request(&backend.requests());
+    assert!(
+        upstream
+            .headers
+            .to_ascii_lowercase()
+            .contains("anthropic-version: 2026-10-21"),
+        "configured version must override the caller header"
+    );
+}
+
 /// Render the checked-in example with isolated test listener and credential paths.
 fn example_yaml(
     listener_port: u16,

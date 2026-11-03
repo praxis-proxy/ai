@@ -114,9 +114,17 @@ struct BufferedJsonResponse {
 /// ```yaml
 /// filter: openai_chat_completions_to_anthropic
 /// api_translation_enabled: true
+/// api_version: "2023-06-01"
 /// max_request_body_bytes: 2097152
 /// max_response_body_bytes: 1048576
 /// ```
+///
+/// `api_version` selects the backend contract independently of caller headers.
+/// It defaults to `2023-06-01`, which preserves numeric `temperature` and
+/// `top_p`. Selecting `2026-10-21` rejects any `temperature`, `top_p`, or
+/// `top_k` field with HTTP 400 before dispatch, including defaults and nulls.
+/// Unknown versions fail configuration parsing. OpenAI-compatible candidates
+/// and native Messages passthrough are unaffected.
 ///
 /// The compatibility contract defaults an omitted token limit to 4096 and
 /// ignores `user`, `n`, `seed`,
@@ -176,7 +184,7 @@ impl OpenaiChatCompletionsToAnthropicFilter {
     }
 
     /// Apply the selected provider path and Anthropic request headers.
-    fn set_path_and_headers(ctx: &mut HttpFilterContext<'_>, profile: &SelectedProfile) {
+    fn set_path_and_headers(&self, ctx: &mut HttpFilterContext<'_>, profile: &SelectedProfile) {
         let mut path = profile.path.clone();
         if let Some(query) = ctx.request.uri.query() {
             path.push('?');
@@ -190,7 +198,7 @@ impl OpenaiChatCompletionsToAnthropicFilter {
             ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
             ctx.request_headers_to_set.push((
                 HeaderName::from_static("anthropic-version"),
-                HeaderValue::from_static("2023-06-01"),
+                HeaderValue::from_static(self.config.api_version.as_str()),
             ));
             ctx.request_headers_to_set
                 .push((http::header::CONTENT_TYPE, HeaderValue::from_static("application/json")));
@@ -257,7 +265,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
                 &error.to_string(),
             )));
         }
-        Self::set_path_and_headers(ctx, &profile);
+        self.set_path_and_headers(ctx, &profile);
         Ok(FilterAction::Continue)
     }
 
@@ -328,16 +336,17 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
             }
             return Ok(SelectedUpstreamBodyOutcome::Continue);
         }
-        let (translated, request) = match request::translate_request(bytes, &profile.target_model) {
-            Ok(result) => result,
-            Err(error) => {
-                return Ok(SelectedUpstreamBodyOutcome::Reject(Self::openai_error_rejection(
-                    400,
-                    "invalid_request_error",
-                    &error,
-                )));
-            },
-        };
+        let (translated, request) =
+            match request::translate_request(bytes, &profile.target_model, self.config.api_version) {
+                Ok(result) => result,
+                Err(error) => {
+                    return Ok(SelectedUpstreamBodyOutcome::Reject(Self::openai_error_rejection(
+                        400,
+                        "invalid_request_error",
+                        &error,
+                    )));
+                },
+            };
         ctx.set_metadata(REQUEST_STREAM, request.stream.to_string());
         ctx.set_metadata(CLIENT_MODEL, request.client_model);
         ctx.set_metadata(INCLUDE_USAGE, request.include_usage.to_string());

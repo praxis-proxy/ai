@@ -21,6 +21,11 @@ pub(crate) struct OpenaiChatCompletionsToAnthropicConfig {
     /// fail closed when this is false (the default).
     #[serde(default)]
     pub(crate) api_translation_enabled: bool,
+    /// Operator-selected Anthropic contract: `2023-06-01` (default) or
+    /// `2026-10-21`. Independent of caller headers; the new version rejects
+    /// sampling controls before dispatch.
+    #[serde(default)]
+    pub(crate) api_version: AnthropicApiVersion,
     /// Compatibility setting for the former shared request/response limit.
     /// A direction-specific limit takes precedence when set.
     pub(crate) max_body_bytes: Option<usize>,
@@ -28,6 +33,28 @@ pub(crate) struct OpenaiChatCompletionsToAnthropicConfig {
     pub(crate) max_request_body_bytes: Option<usize>,
     /// Maximum complete Anthropic JSON response body retained for conversion.
     pub(crate) max_response_body_bytes: Option<usize>,
+}
+
+/// Supported contracts for requests translated to Anthropic Messages.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+pub(crate) enum AnthropicApiVersion {
+    /// Preserve the existing sampling-compatible contract.
+    #[default]
+    #[serde(rename = "2023-06-01")]
+    Legacy,
+    /// Reject sampling controls before dispatch.
+    #[serde(rename = "2026-10-21")]
+    October2026,
+}
+
+impl AnthropicApiVersion {
+    /// Version sent to the selected Messages backend.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "2023-06-01",
+            Self::October2026 => "2026-10-21",
+        }
+    }
 }
 
 impl OpenaiChatCompletionsToAnthropicConfig {
@@ -62,7 +89,22 @@ impl OpenaiChatCompletionsToAnthropicConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::OpenaiChatCompletionsToAnthropicConfig;
+    use super::{AnthropicApiVersion, OpenaiChatCompletionsToAnthropicConfig};
+
+    #[test]
+    fn version_selection_is_explicit_and_rejects_unknown_contracts() {
+        assert_eq!(
+            OpenaiChatCompletionsToAnthropicConfig::default().api_version,
+            AnthropicApiVersion::Legacy,
+            "existing routes must retain the legacy contract"
+        );
+        for version in ["2023-06-01", "2026-10-21"] {
+            let config = parse_config(&format!("api_version: '{version}'"));
+            assert_eq!(config.api_version.as_str(), version, "configured version must be used");
+        }
+        let unknown = serde_yaml::from_str::<OpenaiChatCompletionsToAnthropicConfig>("api_version: '2099-01-01'");
+        assert!(unknown.is_err(), "unknown contracts must fail configuration parsing");
+    }
 
     #[test]
     fn defaults_request_and_response_limits_independently() {

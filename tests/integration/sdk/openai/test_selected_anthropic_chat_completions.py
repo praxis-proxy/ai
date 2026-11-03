@@ -122,15 +122,17 @@ def _config(proxy_port: int, backend_port: int, api_translation_enabled: bool = 
     }
 
 
-@pytest.fixture(scope="module")
-def client():
+@pytest.fixture(scope="module", params=["2023-06-01", "2026-10-21"])
+def client(request):
     proxy_port, backend_port = _port(), _port()
     backend = ThreadingHTTPServer(("127.0.0.1", backend_port), _Handler)
     thread = threading.Thread(target=backend.serve_forever, daemon=True)
     thread.start()
     with tempfile.TemporaryDirectory() as directory:
         config = Path(directory) / "praxis.yaml"
-        config.write_text(json.dumps(_config(proxy_port, backend_port)))
+        settings = _config(proxy_port, backend_port)
+        settings["filter_chains"][0]["filters"][3]["api_version"] = request.param
+        config.write_text(json.dumps(settings))
         proc = subprocess.Popen([_binary(), "-c", str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             deadline = time.monotonic() + 10
@@ -144,6 +146,7 @@ def client():
                 raise TimeoutError("Praxis did not start")
             with OpenAI(api_key="caller-only", base_url=f"http://127.0.0.1:{proxy_port}/v1",
                         max_retries=0, timeout=10) as sdk:
+                sdk.selected_anthropic_version = request.param
                 yield sdk
         finally:
             proc.send_signal(signal.SIGINT)
@@ -207,10 +210,13 @@ def test_anthropic_backend_wire_headers(client: OpenAI) -> None:
         [{"type": "text", "text": "hello"}],
         {"input_tokens": 10, "output_tokens": 4},
     ))
-    client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16)
+    client.chat.completions.create(
+        model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16,
+        extra_headers={"anthropic-version": "caller-version"},
+    )
     path, headers, _upstream = STATE.requests[-1]
     assert path == "/v1/messages", "selected Anthropic requests must use the Messages path"
-    assert headers.get("anthropic-version") == "2023-06-01", (
+    assert headers.get("anthropic-version") == client.selected_anthropic_version, (
         "the selected Anthropic route must pin the API version on the backend request"
     )
     assert headers.get("x-api-key") == "fixture-only-dummy-token", (
@@ -306,8 +312,8 @@ def test_null_cache_usage(client: OpenAI) -> None:
     assert response.usage.total_tokens == 14, "null cache counters must add no total tokens"
 
 
-def test_streaming_and_terminal_usage(client: OpenAI) -> None:
-    events = (
+def _anthropic_events() -> str:
+    return (
         'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_sdk",'
         '"usage":{"input_tokens":10,"cache_read_input_tokens":1000,'
         '"cache_creation_input_tokens":50}}}\n\n'
@@ -320,6 +326,10 @@ def test_streaming_and_terminal_usage(client: OpenAI) -> None:
         '"usage":{"output_tokens":4}}\n\n'
         'event: message_stop\ndata: {"type":"message_stop"}\n\n'
     )
+
+
+def test_streaming_and_terminal_usage(client: OpenAI) -> None:
+    events = _anthropic_events()
     STATE.script(200, "text/event-stream", events)
     chunks = list(client.chat.completions.create(
         model=MODEL, messages=[{"role": "user", "content": "hi"}], stream=True,
@@ -376,6 +386,43 @@ def test_disabled_translation_names_platform_administrator(translation_disabled_
     assert error["code"] == "api_translation_disabled"
     assert "platform administrator has forbidden translation" in error["message"]
     assert not STATE.requests, "disabled translation must reject before contacting the provider"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("temperature", 0), ("temperature", 1), ("temperature", 0.5),
+    ("top_p", 1), ("top_p", 0.9), ("top_k", 40),
+    ("temperature", None), ("top_p", None), ("top_k", None),
+])
+@pytest.mark.parametrize("stream", [False, True])
+def test_version_specific_sampling_before_dispatch(client: OpenAI, field, value, stream) -> None:
+    legacy_supported = client.selected_anthropic_version == "2023-06-01" and field != "top_k" and value is not None
+    if legacy_supported:
+        if stream:
+            STATE.script(200, "text/event-stream", _anthropic_events())
+        else:
+            STATE.script(200, "application/json", _message(
+                [{"type": "text", "text": "hello"}], {"input_tokens": 1, "output_tokens": 1},
+            ))
+        response = client.chat.completions.create(
+            model=MODEL, messages=[{"role": "user", "content": "hi"}],
+            max_tokens=16, stream=stream, extra_body={field: value},
+        )
+        if stream:
+            assert list(response), "legacy sampling must support streaming"
+        else:
+            assert response.choices[0].message.content == "hello"
+        assert STATE.requests[-1][2][field] == value, "legacy sampling must not change"
+        return
+    with pytest.raises(APIStatusError) as exc:
+        client.chat.completions.create(
+            model=MODEL, messages=[{"role": "user", "content": "hi"}],
+            max_tokens=16, stream=stream, extra_body={field: value},
+        )
+    assert exc.value.status_code == 400, "unsupported sampling must be a client error"
+    assert field in exc.value.response.json()["error"]["message"], "error must identify the unsupported field"
+    if client.selected_anthropic_version == "2026-10-21":
+        assert "2026-10-21" in exc.value.response.json()["error"]["message"], "error must identify the version"
+    assert STATE.requests == [], "rejected sampling must never reach the backend"
 
 
 if __name__ == "__main__":

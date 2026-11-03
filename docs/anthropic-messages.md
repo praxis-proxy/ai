@@ -305,6 +305,21 @@ uv run --with "anthropic==2.3.0" tests/integration/sdk/anthropic/test_anthropic_
 CI runs both lanes as sequential steps in the `anthropic-sdk` job of
 [`integration.yaml`](../.github/workflows/integration.yaml).
 
+## API version compatibility
+
+Native passthrough preserves a caller-supplied `anthropic-version` and the
+request body. `anthropic_messages_protocol.default_version` fills in a
+missing version; it does not override the caller or enforce version-specific
+body restrictions. A backend selecting `2026-10-21` may reject sampling
+fields even when they contain defaults.
+
+For Chat Completions clients translated to Anthropic Messages, the operator
+selects `openai_chat_completions_to_anthropic.api_version`. Its default is
+`2023-06-01`; selecting `2026-10-21` rejects sampling controls before sending
+the request upstream. Compatible Messages-to-Chat Completions and native vLLM
+routes retain their sampling support. See the
+[version and sampling contract](developing/openai-anthropic-compatibility.md#api-version-and-sampling).
+
 ## Passthrough to Anthropic API
 
 Route to `api.anthropic.com` with credential
