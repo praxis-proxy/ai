@@ -67,7 +67,7 @@ pub(crate) enum TaskRouteStore {
 
 /// Configuration for A2A task-ownership routing.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, try_from = "RawTaskRoutingConfig")]
 pub(crate) struct TaskRoutingConfig {
     /// Whether task routing is enabled.
     #[serde(default)]
@@ -101,6 +101,60 @@ pub(crate) struct TaskRoutingConfig {
     /// than 0 and at most 2,592,000 (30 days).
     #[serde(default = "default_ttl_seconds")]
     pub ttl_seconds: u64,
+}
+
+/// Raw task-routing configuration converted after checking the store invariant.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTaskRoutingConfig {
+    /// Whether task routing is enabled.
+    #[serde(default)]
+    enabled: bool,
+
+    /// Maximum response body bytes to buffer for task route capture.
+    #[serde(default = "default_max_response_body_bytes")]
+    max_response_body_bytes: usize,
+
+    /// Behavior when a task route lookup misses.
+    #[serde(default)]
+    on_lookup_miss: OnLookupMiss,
+
+    /// Internal header name injected on task or context route hit.
+    #[serde(default = "default_route_cluster_header")]
+    route_cluster_header: String,
+
+    /// Storage backend for task routes. Required when task routing is enabled.
+    store: Option<TaskRouteStore>,
+
+    /// TTL in seconds for terminal task routes (0 = remove immediately).
+    /// Must be at most 2,592,000 (30 days).
+    #[serde(default = "default_terminal_ttl_seconds")]
+    terminal_ttl_seconds: u64,
+
+    /// TTL in seconds for non-terminal task routes. Must be greater
+    /// than 0 and at most 2,592,000 (30 days).
+    #[serde(default = "default_ttl_seconds")]
+    ttl_seconds: u64,
+}
+
+impl TryFrom<RawTaskRoutingConfig> for TaskRoutingConfig {
+    type Error = String;
+
+    fn try_from(raw: RawTaskRoutingConfig) -> Result<Self, Self::Error> {
+        if raw.enabled && raw.store.is_none() {
+            return Err("a2a: task_routing.store is required when task routing is enabled".into());
+        }
+
+        Ok(Self {
+            enabled: raw.enabled,
+            max_response_body_bytes: raw.max_response_body_bytes,
+            on_lookup_miss: raw.on_lookup_miss,
+            route_cluster_header: raw.route_cluster_header,
+            store: raw.store,
+            terminal_ttl_seconds: raw.terminal_ttl_seconds,
+            ttl_seconds: raw.ttl_seconds,
+        })
+    }
 }
 
 impl Default for TaskRoutingConfig {
@@ -261,7 +315,7 @@ fn default_version_header() -> Option<String> {
 
 /// YAML configuration for the A2A filter.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, try_from = "RawA2aConfig")]
+#[serde(deny_unknown_fields)]
 pub(crate) struct A2aConfig {
     /// Header names for A2A metadata promotion.
     ///
@@ -286,54 +340,6 @@ pub(crate) struct A2aConfig {
     /// Task-ownership routing configuration.
     #[serde(default)]
     pub task_routing: TaskRoutingConfig,
-}
-
-/// Raw A2A configuration converted into [`A2aConfig`] after checking the
-/// cross-field task-routing invariant.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawA2aConfig {
-    /// Header names for A2A metadata promotion.
-    ///
-    /// Must not be hop-by-hop, framing, Host, credential, API-key, or
-    /// other internal `x-praxis-*` names. Dedicated `x-praxis-a2a-*`
-    /// defaults remain allowed.
-    #[serde(default)]
-    headers: A2aHeaders,
-
-    /// Maximum body size in bytes for `StreamBuffer`.
-    #[serde(default = "default_max_body_bytes")]
-    max_body_bytes: usize,
-
-    /// Method aliases for compatibility (slash-delimited → `PascalCase`).
-    #[serde(default)]
-    method_aliases: BTreeMap<String, String>,
-
-    /// Invalid input handling behavior.
-    #[serde(default = "OnInvalidBehavior::default_reject")]
-    on_invalid: OnInvalidBehavior,
-
-    /// Task-ownership routing configuration.
-    #[serde(default)]
-    task_routing: TaskRoutingConfig,
-}
-
-impl TryFrom<RawA2aConfig> for A2aConfig {
-    type Error = String;
-
-    fn try_from(raw: RawA2aConfig) -> Result<Self, Self::Error> {
-        if raw.task_routing.enabled && raw.task_routing.store.is_none() {
-            return Err("a2a: task_routing.store is required when task routing is enabled".into());
-        }
-
-        Ok(Self {
-            headers: raw.headers,
-            max_body_bytes: raw.max_body_bytes,
-            method_aliases: raw.method_aliases,
-            on_invalid: raw.on_invalid,
-            task_routing: raw.task_routing,
-        })
-    }
 }
 
 /// Default max body bytes.
@@ -570,11 +576,10 @@ mod tests {
     }
 
     #[test]
-    fn a2a_config_rejects_enabled_task_routing_without_store_at_deserialization() {
-        let err = serde_yaml::from_str::<A2aConfig>(
+    fn task_routing_config_rejects_enabled_without_store_at_deserialization() {
+        let err = serde_yaml::from_str::<TaskRoutingConfig>(
             r"
-task_routing:
-  enabled: true
+enabled: true
 ",
         )
         .unwrap_err();
