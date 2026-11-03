@@ -69,8 +69,10 @@ transport, request-body, and storage safeguards remain in effect.
 
 Adding or deleting items assigns positions and invalidates the retired `messages`
 cache in the same transaction without decoding other item payloads. Clearing the
-cache after the last deletion prevents stale items from reappearing. Existing
-per-request item limits and exact tenant/issuer/subject isolation are unchanged.
+cache after the last deletion prevents stale items from reappearing. An already
+empty cache or preserved legacy prefix is left untouched, so ordinary mutations
+do not rewrite the conversation row. Existing per-request item limits and exact
+tenant/issuer/subject isolation are unchanged.
 
 The schema and its version are unchanged. Existing conversations that have both
 item rows and a cache replay from item rows. Cache-only legacy records remain

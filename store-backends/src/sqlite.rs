@@ -2477,9 +2477,10 @@ async fn sqlite_delete_item_and_sync(
     Ok(true)
 }
 
-/// Clear the retired cache in the mutation transaction, including after the last
-/// item is deleted so old cached rows cannot reappear. The affected-row check
-/// preserves rollback when the parent disappears before mutation.
+/// Clear a stale array in the mutation transaction, including after the last
+/// item is deleted so old cached rows cannot reappear. The caller checked the
+/// parent under `BEGIN IMMEDIATE`; skip the write when the cache is already
+/// empty or holds the preserved legacy prefix.
 async fn sqlite_invalidate_messages(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     conv_table: &str,
@@ -2487,10 +2488,11 @@ async fn sqlite_invalidate_messages(
     conversation_id: &str,
 ) -> Result<(), StoreError> {
     let update_sql = format!(
-        "UPDATE {conv_table} SET messages = CASE WHEN substr(messages, 1, 19) = '{{\"legacy_messages\":' THEN messages ELSE '[]' END \
-         WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?"
+        "UPDATE {conv_table} SET messages = '[]' \
+         WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ? \
+         AND messages <> '[]' AND substr(messages, 1, 19) <> '{{\"legacy_messages\":'"
     );
-    let updated = sqlx::query(AssertSqlSafe(update_sql.as_str()))
+    sqlx::query(AssertSqlSafe(update_sql.as_str()))
         .bind(conversation_id)
         .bind(owner.tenant_id())
         .bind(owner.issuer())
@@ -2498,12 +2500,6 @@ async fn sqlite_invalidate_messages(
         .execute(&mut **tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
-
-    if updated.rows_affected() == 0 {
-        return Err(StoreError::Database(format!(
-            "conversation disappeared during message sync: {conversation_id}"
-        )));
-    }
 
     Ok(())
 }
