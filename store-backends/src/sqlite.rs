@@ -2843,11 +2843,18 @@ mod tests {
             (Some("{\"legacy_messages\":[]}"), "{\"legacy_messages\":[]}", 0),
             (Some("[1]"), "[]", 1),
         ] {
-            sqlx::query("UPDATE nullable_conversations SET messages = ? WHERE conversation_id = 'c'")
-                .bind(cache)
-                .execute(&mut *tx)
-                .await
-                .unwrap();
+            sqlx::query(
+                "UPDATE nullable_conversations SET messages = ? \
+                 WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            )
+            .bind(cache)
+            .bind("c")
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
             sqlite_invalidate_messages(&mut tx, "nullable_conversations", &owner, "c")
                 .await
                 .unwrap();
@@ -2856,11 +2863,17 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(changed, writes, "cache: {cache:?}");
-            let messages: Option<String> =
-                sqlx::query_scalar("SELECT messages FROM nullable_conversations WHERE conversation_id = 'c'")
-                    .fetch_one(&mut *tx)
-                    .await
-                    .unwrap();
+            let messages: Option<String> = sqlx::query_scalar(
+                "SELECT messages FROM nullable_conversations \
+                 WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            )
+            .bind("c")
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
             assert_eq!(messages.as_deref(), Some(expected));
         }
     }

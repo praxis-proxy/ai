@@ -3009,11 +3009,18 @@ mod tests {
             (Some("{\"legacy_messages\":[]}"), "{\"legacy_messages\":[]}", 0),
             (Some("[1]"), "[]", 1),
         ] {
-            sqlx::query("UPDATE nullable_conversations SET messages = $1 WHERE conversation_id = 'c'")
-                .bind(cache)
-                .execute(&mut *tx)
-                .await
-                .unwrap();
+            sqlx::query(
+                "UPDATE nullable_conversations SET messages = $1 \
+                 WHERE conversation_id = $2 AND tenant_id = $3 AND owner_issuer = $4 AND owner_subject = $5",
+            )
+            .bind(cache)
+            .bind("c")
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
             let updates_before: i64 = sqlx::query_scalar(
                 "SELECT pg_stat_get_xact_tuples_updated('pg_temp.nullable_conversations'::regclass)",
             )
@@ -3030,11 +3037,17 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(updates_after - updates_before, writes, "cache: {cache:?}");
-            let messages: Option<String> =
-                sqlx::query_scalar("SELECT messages FROM nullable_conversations WHERE conversation_id = 'c'")
-                    .fetch_one(&mut *tx)
-                    .await
-                    .unwrap();
+            let messages: Option<String> = sqlx::query_scalar(
+                "SELECT messages FROM nullable_conversations \
+                 WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4",
+            )
+            .bind("c")
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
             assert_eq!(messages.as_deref(), Some(expected));
         }
     }
