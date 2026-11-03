@@ -4,13 +4,15 @@
 //! Token usage extraction and exposure filters.
 //!
 //! This module owns the complete in-process token usage flow: parsing
-//! provider responses, storing normalized counts in filter metadata, and
-//! optionally exposing those counts as downstream response headers.
+//! provider responses, storing normalized counts in filter metadata,
+//! optionally exposing those counts as downstream response headers, and
+//! optionally emitting per-tenant Prometheus counters.
 
 #[cfg(feature = "token-ceiling-filter")]
 mod ceiling;
 mod count;
 mod headers;
+mod metrics;
 mod providers;
 mod stream_usage;
 mod streaming;
@@ -19,6 +21,7 @@ mod streaming;
 pub use ceiling::TokenCeilingFilter;
 pub use count::TokenCountFilter;
 pub use headers::TokenUsageHeadersFilter;
+pub use metrics::TokenUsageMetricsFilter;
 use praxis_filter::HttpFilterContext;
 pub use stream_usage::StreamUsageInjectFilter;
 

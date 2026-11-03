@@ -100,6 +100,11 @@ const COMPACTION_XFAIL_CHILD_TIMEOUT: Duration = Duration::from_secs(180);
 /// See docs/developing/gpu-nightly-suite.md.
 const COMPACTION_XFAIL_MODEL: &str = "qwen3-8b";
 
+/// Pinned Codex model-catalog entry that enables `apply_patch` without requesting
+/// reasoning summaries, which the Responses-to-Chat path cannot translate.
+/// The live test rewrites this client-facing slug to the configured vLLM model.
+const CODEX_APPLY_PATCH_MODEL: &str = "gpt-5.4";
+
 /// Codex output item types that would indicate an attempted tool call.
 const TOOL_ITEM_TYPES: &[&str] = &["command_execution", "file_change", "mcp_tool_call", "web_search"];
 
@@ -128,6 +133,8 @@ const CODEX_SUMMARIZATION_PROMPT_NEEDLE: &[u8] = b"You are performing a CONTEXT 
 /// summary traversed Praxis after compaction.
 const CODEX_SUMMARY_PREFIX_NEEDLE: &[u8] =
     b"Another language model started to solve this problem and produced a summary of its thinking process.";
+/// Custom-tool result Codex sends back after its local `apply_patch` handler runs.
+const CODEX_APPLY_PATCH_OUTPUT_NEEDLE: &[u8] = b"custom_tool_call_output";
 
 /// Advertised context window for the compaction run, kept under the Codex GPU
 /// job's vLLM `--max-model-len 16384` so real requests are never rejected.
@@ -254,14 +261,14 @@ async fn pinned_codex_completes_chat_backend_coding_workflow_over_http() {
     assert_coding_codex_jsonl(&output.stdout);
 }
 
-/// Prove pinned Codex completes a real coding/tool workflow through Praxis and
-/// vLLM's native Responses endpoint on the GPU runner.
+/// Prove pinned Codex applies a patch through Praxis and vLLM's native
+/// Responses endpoint on the GPU runner.
 ///
-/// Codex streams rich client-owned tools. The client-tool compatibility filter
-/// lowers those declarations to private functions for vLLM, while the shared
-/// stream owner restores the canonical tool lifecycle before Codex sees it.
+/// Codex declares `apply_patch` as a grammar-constrained custom tool. The
+/// client-tool compatibility filter lowers it to a private function for vLLM,
+/// then restores the canonical tool lifecycle before Codex sees it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pinned_codex_completes_native_vllm_coding_workflow_over_http() {
+async fn pinned_codex_completes_native_vllm_apply_patch_workflow_over_http() {
     let Some(live) = CodexLiveConfig::from_env() else {
         return;
     };
@@ -280,13 +287,14 @@ async fn pinned_codex_completes_native_vllm_coding_workflow_over_http() {
             .as_deref()
             .unwrap_or_else(|| panic!("{LIVE_DATABASE_URL_ENV} must be set for the native vLLM acceptance test")),
     );
+    let patched = patch_live_apply_patch_model_alias(&patched, &live.model);
     let config = praxis_core::config::Config::from_yaml(&patched).expect("live native Codex config should parse");
 
-    run_live_codex_coding_workflow(&live, proxy_port, config).await;
+    run_live_codex_apply_patch_workflow(&live, proxy_port, config).await;
 }
 
-/// Prove pinned Codex completes the same real coding/tool workflow through
-/// Praxis's rich-client-tool Responses-to-Chat composition against live vLLM.
+/// Prove pinned Codex applies the same patch through Praxis's rich-client-tool
+/// Responses-to-Chat composition against live vLLM.
 ///
 /// The backend requires a fresh credential from [`LIVE_BACKEND_TOKEN_ENV`],
 /// while Codex only receives [`TEST_API_KEY`]. A successful turn therefore also
@@ -295,7 +303,7 @@ async fn pinned_codex_completes_native_vllm_coding_workflow_over_http() {
 /// this test adds real-model and real-client behavior without asserting
 /// model-dependent prose or turn count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pinned_codex_completes_translated_vllm_coding_workflow_over_http() {
+async fn pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http() {
     let Some(live) = CodexLiveConfig::from_env() else {
         return;
     };
@@ -316,9 +324,10 @@ async fn pinned_codex_completes_translated_vllm_coding_workflow_over_http() {
             .as_deref()
             .unwrap_or_else(|| panic!("{LIVE_DATABASE_URL_ENV} must be set for the translated vLLM acceptance test")),
     );
+    let patched = patch_live_apply_patch_model_alias(&patched, &live.model);
     let config = praxis_core::config::Config::from_yaml(&patched).expect("live Codex config should parse");
 
-    run_live_codex_coding_workflow(&live, proxy_port, config).await;
+    run_live_codex_apply_patch_workflow(&live, proxy_port, config).await;
 }
 
 /// Prove a pinned Codex session crosses its own context limit mid-task, performs
@@ -358,9 +367,15 @@ async fn pinned_codex_compaction_crosses_context_window_over_http() {
     run_live_codex_compaction_workflow(&live, proxy_port, config).await;
 }
 
-/// Drive the common pinned-Codex coding task through one live Praxis pipeline.
-async fn run_live_codex_coding_workflow(live: &CodexLiveConfig, proxy_port: u16, config: praxis_core::config::Config) {
+/// Drive a pinned-Codex apply_patch task through one live Praxis pipeline.
+async fn run_live_codex_apply_patch_workflow(
+    live: &CodexLiveConfig,
+    proxy_port: u16,
+    config: praxis_core::config::Config,
+) {
     let workspace = TempWorkspace::new().expect("temporary coding workspace should be created");
+    std::fs::remove_file(workspace.path().join("result.txt"))
+        .expect("apply_patch target should be absent so Codex must create it");
     let _proxy = start_proxy(&config);
     let observer = HttpTransportObserver::start_on(proxy_port, live.listen_address).await;
 
@@ -368,18 +383,23 @@ async fn run_live_codex_coding_workflow(live: &CodexLiveConfig, proxy_port: u16,
         verify_egress_isolation(namespace);
     }
 
-    let prompt = r#"Use exec_command immediately to run exactly this single command:
-python3 -c 'import json, pathlib; data = json.load(open("input.json")); pathlib.Path("result.txt").write_text(data["expected_content"])' && ./verify.sh
-Do not run a different command and do not answer before it succeeds. Then summarize what changed. /no_think"#;
+    let prompt = format!(
+        "You MUST use the apply_patch tool exactly once with this exact patch to add result.txt:\n\
+         *** Begin Patch\n*** Add File: result.txt\n+{}\n*** End Patch\n\n\
+         Do not use exec_command or another tool to write or edit files.\n\
+         After apply_patch succeeds, use exec_command only to run exactly `./verify.sh`.\n\
+         Do not answer before verification succeeds. Then summarize what changed. /no_think",
+        workspace.expected_content(),
+    );
     let proxy_base_url = format!("http://{}:{}", live.listen_address, observer.port());
     let no_proxy = format!("127.0.0.1,localhost,{}", live.listen_address);
     let output = run_codex(
         &live.codex_bin,
         CodexRunOptions {
             proxy_base_url: &proxy_base_url,
-            model: &live.model,
+            model: CODEX_APPLY_PATCH_MODEL,
             working_dir: workspace.path(),
-            prompt,
+            prompt: &prompt,
             sandbox: "danger-full-access",
             execution_timeout: LIVE_CHILD_TIMEOUT,
             no_proxy: &no_proxy,
@@ -398,7 +418,17 @@ Do not run a different command and do not answer before it succeeds. Then summar
     );
 
     observer.assert_http_only();
-    assert_live_coding_codex_jsonl(&output.stdout);
+    // Check the client-visible tool lifecycle and workspace result before the wire
+    // observer assertion. If the model completes without returning a client-tool
+    // result, this reports Codex's JSONL trace instead of masking it with the more
+    // generic missing-wire-output error.
+    assert_live_apply_patch_codex_jsonl(&output.stdout);
+    assert_eq!(
+        workspace.read_result().expect("result.txt should be readable"),
+        format!("{}\n", workspace.expected_content()),
+        "the apply_patch call should create the exact expected file content",
+    );
+    observer.assert_apply_patch_output_traversed_praxis();
     workspace.assert_successful_completion();
 }
 
@@ -532,12 +562,15 @@ fn live_codex_config_replaces_the_provider_credential() {
     let backend_token = "ephemeral-backend-token-for-this-test";
     let database_url = "postgres://praxis:praxis@127.0.0.1:5432/praxis";
     let patched = patch_live_codex_config(&yaml, 18_080, "127.0.0.1:8000", backend_token, database_url);
+    let patched = patch_live_apply_patch_model_alias(&patched, "qwen3-8b");
 
+    assert_apply_patch_model_alias_precedes_state_initialization(&patched);
     assert!(patched.contains(backend_token));
     assert!(!patched.contains(TEST_PROVIDER_API_KEY));
     assert!(patched.contains(database_url));
     assert!(patched.contains("backend: postgres"));
     assert!(patched.contains("allow_private_database_url: true"));
+    assert!(patched.contains("\"gpt-5.4\": \"qwen3-8b\""));
     assert!(!patched.contains("sqlite://responses.db?mode=rwc"));
     praxis_core::config::Config::from_yaml(&patched).expect("patched live Codex config should parse");
 }
@@ -551,12 +584,15 @@ fn live_native_codex_config_injects_the_provider_credential() {
     let backend_token = "ephemeral-native-backend-token-for-this-test";
     let database_url = "postgres://praxis:praxis@127.0.0.1:5432/praxis";
     let patched = patch_live_native_codex_config(&yaml, 18_080, "127.0.0.1:8000", backend_token, database_url);
+    let patched = patch_live_apply_patch_model_alias(&patched, "qwen3-8b");
 
+    assert_apply_patch_model_alias_precedes_state_initialization(&patched);
     assert!(patched.contains(backend_token));
     assert!(patched.contains("strip_client_credential: true"));
     assert!(patched.contains(database_url));
     assert!(patched.contains("backend: postgres"));
     assert!(patched.contains("allow_private_database_url: true"));
+    assert!(patched.contains("\"gpt-5.4\": \"qwen3-8b\""));
     assert!(!patched.contains("sqlite://responses.db?mode=rwc"));
     praxis_core::config::Config::from_yaml(&patched).expect("patched live native Codex config should parse");
 }
@@ -887,6 +923,53 @@ fn patch_live_codex_config(
         )
 }
 
+/// Give Codex the pinned catalog metadata that enables its grammar-based
+/// `apply_patch` tool, while routing its inference to the actual vLLM model.
+fn patch_live_apply_patch_model_alias(yaml: &str, backend_model: &str) -> String {
+    const MARKER: &str = concat!(
+        "      - filter: openai_responses_request\n",
+        "        on_invalid: reject\n",
+        "        headers:\n",
+        "          format: ~\n",
+        "          model: ~\n",
+        "          stream: ~\n",
+        "          mode: ~\n",
+    );
+    let marker_count = yaml.matches(MARKER).count();
+    assert_eq!(
+        marker_count, 1,
+        "client-tool example should have one request-state initialization filter"
+    );
+
+    let backend_model = serde_json::to_string(backend_model).expect("backend model should serialize as a YAML string");
+    let insertion = format!(
+        "      - filter: openai_responses_model_rewrite\n        model_aliases:\n          \"{CODEX_APPLY_PATCH_MODEL}\": {backend_model}\n{MARKER}"
+    );
+    yaml.replacen(MARKER, &insertion, 1)
+}
+
+/// The translated request must build its managed state from the rewritten model.
+fn assert_apply_patch_model_alias_precedes_state_initialization(yaml: &str) {
+    const REWRITE: &str = "      - filter: openai_responses_model_rewrite\n";
+    const STATE_INITIALIZATION: &str = concat!(
+        "      - filter: openai_responses_request\n",
+        "        on_invalid: reject\n",
+        "        headers:\n",
+        "          format: ~\n",
+        "          model: ~\n",
+        "          stream: ~\n",
+        "          mode: ~\n",
+    );
+    let rewrite_position = yaml.find(REWRITE).expect("model alias filter should be present");
+    let state_position = yaml
+        .find(STATE_INITIALIZATION)
+        .expect("Responses state initializer should be present");
+    assert!(
+        rewrite_position < state_position,
+        "model alias rewrite must precede Responses state initialization"
+    );
+}
+
 /// Patch the native Responses example for a keyed, slower live vLLM backend.
 fn patch_live_native_codex_config(
     yaml: &str,
@@ -1075,6 +1158,8 @@ struct HttpTransportObserver {
     summarization_request_seen: Arc<AtomicBool>,
     /// Whether client->upstream traffic carried the post-compaction summary prefix.
     summary_prefix_seen: Arc<AtomicBool>,
+    /// Whether Codex returned a custom-tool result in a follow-up request.
+    apply_patch_output_seen: Arc<AtomicBool>,
     /// At the instant the summarization request was first seen on the wire,
     /// whether `result.txt` was still empty (the marker not yet written). Codex
     /// drains all outstanding tool calls before it decides to compact, so an empty
@@ -1113,11 +1198,13 @@ impl HttpTransportObserver {
         let websocket_attempted = Arc::new(AtomicBool::new(false));
         let summarization_request_seen = Arc::new(AtomicBool::new(false));
         let summary_prefix_seen = Arc::new(AtomicBool::new(false));
+        let apply_patch_output_seen = Arc::new(AtomicBool::new(false));
         let result_empty_at_compaction = Arc::new(AtomicBool::new(false));
         let signals = ObservedConnectionSignals {
             websocket_attempted: Arc::clone(&websocket_attempted),
             summarization_request_seen: Arc::clone(&summarization_request_seen),
             summary_prefix_seen: Arc::clone(&summary_prefix_seen),
+            apply_patch_output_seen: Arc::clone(&apply_patch_output_seen),
             result_empty_at_compaction: Arc::clone(&result_empty_at_compaction),
             compaction_workspace: workspace.map(Arc::<Path>::from),
         };
@@ -1142,6 +1229,7 @@ impl HttpTransportObserver {
             websocket_attempted,
             summarization_request_seen,
             summary_prefix_seen,
+            apply_patch_output_seen,
             result_empty_at_compaction,
         }
     }
@@ -1172,6 +1260,14 @@ impl HttpTransportObserver {
     /// Whether a post-compaction request carrying the summary prefix traversed Praxis.
     fn summary_prefix_seen(&self) -> bool {
         self.summary_prefix_seen.load(Ordering::SeqCst)
+    }
+
+    /// Assert Codex sent the result of its client-owned patch tool back through Praxis.
+    fn assert_apply_patch_output_traversed_praxis(&self) {
+        assert!(
+            self.apply_patch_output_seen.load(Ordering::SeqCst),
+            "Codex should send a custom_tool_call_output after applying its patch; no tool result was observed on the wire"
+        );
     }
 
     /// Assert the wire evidence that Codex compacted and then kept working through Praxis.
@@ -1220,6 +1316,8 @@ struct ObservedConnectionSignals {
     summarization_request_seen: Arc<AtomicBool>,
     /// Set when client->upstream bytes contain the summary prefix needle.
     summary_prefix_seen: Arc<AtomicBool>,
+    /// Set when client->upstream bytes contain a custom-tool output item.
+    apply_patch_output_seen: Arc<AtomicBool>,
     /// Snapshot of `result.txt`-is-empty taken when the summarization needle is first seen.
     result_empty_at_compaction: Arc<AtomicBool>,
     /// Compaction workspace to probe at that instant; `None` for non-compaction observers.
@@ -1235,8 +1333,8 @@ impl Drop for HttpTransportObserver {
     }
 }
 
-/// Longest compaction needle, bounding the client->upstream sliding-window carry.
-const MAX_COMPACTION_NEEDLE_LEN: usize = CODEX_SUMMARY_PREFIX_NEEDLE.len();
+/// Longest observed Codex request needle, bounding the client->upstream sliding-window carry.
+const MAX_CODEX_REQUEST_NEEDLE_LEN: usize = CODEX_SUMMARY_PREFIX_NEEDLE.len();
 
 /// Inspect one connection's opening request and client->upstream bytes, then
 /// forward both directions unchanged.
@@ -1274,7 +1372,7 @@ async fn forward_observed_connection(
     if request_head_has_websocket_upgrade(&opening) {
         signals.websocket_attempted.store(true, Ordering::SeqCst);
     }
-    scan_compaction_needles(&opening, &signals);
+    scan_codex_request_needles(&opening, &signals);
     if upstream_wr.write_all(&opening).await.is_err() {
         return;
     }
@@ -1283,7 +1381,7 @@ async fn forward_observed_connection(
     // head/body boundary is still detected.
     let carry_start = opening
         .len()
-        .saturating_sub(MAX_COMPACTION_NEEDLE_LEN.saturating_sub(1));
+        .saturating_sub(MAX_CODEX_REQUEST_NEEDLE_LEN.saturating_sub(1));
     let carry_seed = opening[carry_start..].to_vec();
     let scan_signals = signals.clone();
     let client_to_upstream = async move {
@@ -1296,8 +1394,10 @@ async fn forward_observed_connection(
             };
             let mut window = carry;
             window.extend_from_slice(&buffer[..read]);
-            scan_compaction_needles(&window, &scan_signals);
-            let keep = window.len().saturating_sub(MAX_COMPACTION_NEEDLE_LEN.saturating_sub(1));
+            scan_codex_request_needles(&window, &scan_signals);
+            let keep = window
+                .len()
+                .saturating_sub(MAX_CODEX_REQUEST_NEEDLE_LEN.saturating_sub(1));
             carry = window.split_off(keep);
             if upstream_wr.write_all(&buffer[..read]).await.is_err() {
                 break;
@@ -1312,12 +1412,12 @@ async fn forward_observed_connection(
     tokio::join!(client_to_upstream, upstream_to_client);
 }
 
-/// Set each compaction signal whose needle appears in `haystack`.
+/// Set each Codex request signal whose needle appears in `haystack`.
 ///
 /// The first time the summarization needle is seen, snapshot the compaction
 /// workspace (result still empty) BEFORE the caller forwards the request upstream.
 /// `compare_exchange` guarantees exactly one snapshot even if two connections race.
-fn scan_compaction_needles(haystack: &[u8], signals: &ObservedConnectionSignals) {
+fn scan_codex_request_needles(haystack: &[u8], signals: &ObservedConnectionSignals) {
     if !signals.summarization_request_seen.load(Ordering::SeqCst)
         && contains_subslice(haystack, CODEX_SUMMARIZATION_PROMPT_NEEDLE)
         && signals
@@ -1332,6 +1432,11 @@ fn scan_compaction_needles(haystack: &[u8], signals: &ObservedConnectionSignals)
     }
     if !signals.summary_prefix_seen.load(Ordering::SeqCst) && contains_subslice(haystack, CODEX_SUMMARY_PREFIX_NEEDLE) {
         signals.summary_prefix_seen.store(true, Ordering::SeqCst);
+    }
+    if !signals.apply_patch_output_seen.load(Ordering::SeqCst)
+        && contains_subslice(haystack, CODEX_APPLY_PATCH_OUTPUT_NEEDLE)
+    {
+        signals.apply_patch_output_seen.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1351,30 +1456,36 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 #[test]
-fn scan_compaction_needles_sets_each_flag_once_when_its_needle_appears() {
+fn scan_codex_request_needles_sets_each_flag_once_when_its_needle_appears() {
     let signals = ObservedConnectionSignals {
         websocket_attempted: Arc::new(AtomicBool::new(false)),
         summarization_request_seen: Arc::new(AtomicBool::new(false)),
         summary_prefix_seen: Arc::new(AtomicBool::new(false)),
+        apply_patch_output_seen: Arc::new(AtomicBool::new(false)),
         result_empty_at_compaction: Arc::new(AtomicBool::new(false)),
         compaction_workspace: None,
     };
 
     // Ordinary request bytes leave both compaction flags clear.
-    scan_compaction_needles(b"POST /v1/responses HTTP/1.1\r\n\r\n{\"input\":\"hi\"}", &signals);
+    scan_codex_request_needles(b"POST /v1/responses HTTP/1.1\r\n\r\n{\"input\":\"hi\"}", &signals);
     assert!(!signals.summarization_request_seen.load(Ordering::SeqCst));
     assert!(!signals.summary_prefix_seen.load(Ordering::SeqCst));
+    assert!(!signals.apply_patch_output_seen.load(Ordering::SeqCst));
 
     // The summarization prompt sets only its own flag.
     let mut summarization = b"{\"instructions\":\"".to_vec();
     summarization.extend_from_slice(CODEX_SUMMARIZATION_PROMPT_NEEDLE);
-    scan_compaction_needles(&summarization, &signals);
+    scan_codex_request_needles(&summarization, &signals);
     assert!(signals.summarization_request_seen.load(Ordering::SeqCst));
     assert!(!signals.summary_prefix_seen.load(Ordering::SeqCst));
 
     // The replayed summary prefix sets its flag too.
-    scan_compaction_needles(CODEX_SUMMARY_PREFIX_NEEDLE, &signals);
+    scan_codex_request_needles(CODEX_SUMMARY_PREFIX_NEEDLE, &signals);
     assert!(signals.summary_prefix_seen.load(Ordering::SeqCst));
+
+    // The apply_patch tool result sets its own independent signal.
+    scan_codex_request_needles(CODEX_APPLY_PATCH_OUTPUT_NEEDLE, &signals);
+    assert!(signals.apply_patch_output_seen.load(Ordering::SeqCst));
 }
 
 #[test]
@@ -1415,36 +1526,37 @@ fn compaction_probe_signals(workspace: &Path) -> ObservedConnectionSignals {
         websocket_attempted: Arc::new(AtomicBool::new(false)),
         summarization_request_seen: Arc::new(AtomicBool::new(false)),
         summary_prefix_seen: Arc::new(AtomicBool::new(false)),
+        apply_patch_output_seen: Arc::new(AtomicBool::new(false)),
         result_empty_at_compaction: Arc::new(AtomicBool::new(false)),
         compaction_workspace: Some(Arc::from(workspace)),
     }
 }
 
 #[test]
-fn scan_compaction_needles_snapshots_a_sound_boundary_once() {
+fn scan_codex_request_needles_snapshots_a_sound_boundary_once() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(dir.path().join("result.txt"), "").expect("seed result");
     let signals = compaction_probe_signals(dir.path());
 
-    scan_compaction_needles(&summarization_needle_bytes(), &signals);
+    scan_codex_request_needles(&summarization_needle_bytes(), &signals);
     assert!(signals.result_empty_at_compaction.load(Ordering::SeqCst));
 
     // A write that lands AFTER the first summarization must not retroactively flip
     // the snapshot: compare_exchange snapshots exactly once at the true boundary.
     std::fs::write(dir.path().join("result.txt"), "MARKER").expect("write result");
-    scan_compaction_needles(&summarization_needle_bytes(), &signals);
+    scan_codex_request_needles(&summarization_needle_bytes(), &signals);
     assert!(signals.result_empty_at_compaction.load(Ordering::SeqCst));
 }
 
 #[test]
-fn scan_compaction_needles_flags_a_result_written_before_compaction() {
+fn scan_codex_request_needles_flags_a_result_written_before_compaction() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     // The marker was already written (e.g. a batched pre-compaction write) when the
     // summarization request crosses the wire: result.txt is non-empty.
     std::fs::write(dir.path().join("result.txt"), "MARKER").expect("write result");
     let signals = compaction_probe_signals(dir.path());
 
-    scan_compaction_needles(&summarization_needle_bytes(), &signals);
+    scan_codex_request_needles(&summarization_needle_bytes(), &signals);
     assert!(
         !signals.result_empty_at_compaction.load(Ordering::SeqCst),
         "a result written before compaction must fail the boundary check"
@@ -2296,10 +2408,10 @@ fn assert_coding_codex_jsonl(stdout: &str) {
     );
 }
 
-/// Validate model-independent lifecycle invariants from the live Codex turn.
-fn assert_live_coding_codex_jsonl(stdout: &str) {
-    let mut started_commands = Vec::new();
-    let mut saw_correlated_successful_command = false;
+/// Validate that live Codex completed its apply_patch file-change lifecycle.
+fn assert_live_apply_patch_codex_jsonl(stdout: &str) {
+    let mut started_result_file_changes = Vec::new();
+    let mut saw_completed_result_file_change = false;
     let mut saw_summary = false;
     let mut saw_completed_turn = false;
     let mut saw_usage = false;
@@ -2313,18 +2425,41 @@ fn assert_live_coding_codex_jsonl(stdout: &str) {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
 
-        if event_type == Some("item.started") && item_type == Some("command_execution") && !item_id.is_empty() {
-            started_commands.push(item_id.to_owned());
+        if event_type == Some("item.started") && item_type == Some("file_change") && !item_id.is_empty() {
+            let adds_result_file = event
+                .pointer("/item/changes")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|changes| {
+                    changes.iter().any(|change| {
+                        change
+                            .pointer("/path")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|path| path.ends_with("result.txt"))
+                            && change.pointer("/kind").and_then(serde_json::Value::as_str) == Some("add")
+                    })
+                });
+            if adds_result_file {
+                started_result_file_changes.push(item_id.to_owned());
+            }
         }
-        if event_type == Some("item.completed") && item_type == Some("command_execution") {
-            let command = event
-                .pointer("/item/command")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let exit_code = event.pointer("/item/exit_code").and_then(serde_json::Value::as_i64);
-            saw_correlated_successful_command |= !command.is_empty()
-                && exit_code == Some(0)
-                && started_commands.iter().any(|started| started == item_id);
+        if event_type == Some("item.completed")
+            && item_type == Some("file_change")
+            && event.pointer("/item/status").and_then(serde_json::Value::as_str) == Some("completed")
+        {
+            let adds_result_file = event
+                .pointer("/item/changes")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|changes| {
+                    changes.iter().any(|change| {
+                        change
+                            .pointer("/path")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|path| path.ends_with("result.txt"))
+                            && change.pointer("/kind").and_then(serde_json::Value::as_str) == Some("add")
+                    })
+                });
+            saw_completed_result_file_change |=
+                adds_result_file && started_result_file_changes.iter().any(|started| started == item_id);
         }
         saw_summary |= event_type == Some("item.completed")
             && item_type == Some("agent_message")
@@ -2346,8 +2481,8 @@ fn assert_live_coding_codex_jsonl(stdout: &str) {
     }
 
     assert!(
-        saw_correlated_successful_command,
-        "Codex must emit a correlated command_execution start/completion with exit code 0; stdout:\n{stdout}"
+        saw_completed_result_file_change,
+        "Codex must emit a correlated, completed file_change adding result.txt via apply_patch; stdout:\n{stdout}"
     );
     assert!(
         saw_summary,
@@ -2361,6 +2496,45 @@ fn assert_live_coding_codex_jsonl(stdout: &str) {
         saw_usage,
         "Codex must receive nonzero usage from live vLLM through Praxis; stdout:\n{stdout}"
     );
+}
+
+#[test]
+fn live_apply_patch_codex_jsonl_requires_a_completed_result_file_change() {
+    let events = [
+        serde_json::json!({
+            "type": "item.started",
+            "item": {
+                "id": "item_1",
+                "type": "file_change",
+                "status": "in_progress",
+                "changes": [{"path": "/tmp/result.txt", "kind": "add"}]
+            }
+        }),
+        serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_1",
+                "type": "file_change",
+                "status": "completed",
+                "changes": [{"path": "/tmp/result.txt", "kind": "add"}]
+            }
+        }),
+        serde_json::json!({
+            "type": "item.completed",
+            "item": {"id": "item_2", "type": "agent_message", "text": "Done."}
+        }),
+        serde_json::json!({
+            "type": "turn.completed",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }),
+    ];
+    let stdout = events
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_live_apply_patch_codex_jsonl(&stdout);
 }
 
 /// Validate the compaction run's JSONL.

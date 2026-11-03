@@ -53,7 +53,7 @@ use sse_stream::{Error as SseError, Sse};
 use super::{McpBudgetedCallLimits, McpClientError, McpDisplayUrl};
 use crate::{
     StateOwner, callout_target::AddressPolicy, is_event_stream_content_type,
-    openai::responses::agentic_loop::budget::output_charge,
+    openai::responses::agentic_loop::budget::mcp_result_charge,
 };
 
 /// Wire byte ceiling for a control-plane MCP response.
@@ -1378,7 +1378,7 @@ fn admit_json_parse_charge(
     signal: &Arc<OnceLock<TransportSignal>>,
 ) -> Result<(), StreamableHttpError<McpTransportError>> {
     if let Some(limit) = parse_charge_limit
-        && output_charge(bytes).is_none_or(|charge| charge > limit)
+        && mcp_result_charge(bytes).is_none_or(|charge| charge > limit)
     {
         signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit });
         return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
@@ -1390,12 +1390,12 @@ fn admit_json_parse_charge(
 /// parsing under the budgeted parse-charge limit.
 ///
 /// Unlike [`admit_json_parse_charge`], a body over the limit is NOT a 413 and
-/// records NO size signal: an oversize (or `output_charge`-incomputable) error
+/// records NO size signal: an oversize (or `mcp_result_charge`-incomputable) error
 /// body is simply left unparsed so the response falls back to its upstream HTTP
 /// status, rather than masking that status with a spurious `ResponseTooLarge`.
 fn error_body_fits_parse_charge(bytes: &[u8], parse_charge_limit: Option<usize>) -> bool {
     match parse_charge_limit {
-        Some(limit) => output_charge(bytes).is_some_and(|charge| charge <= limit),
+        Some(limit) => mcp_result_charge(bytes).is_some_and(|charge| charge <= limit),
         None => true,
     }
 }
@@ -2055,8 +2055,8 @@ mod tests {
             vec!["0"; 100].join(",")
         );
         let body = format!(": \"\n\ndata: {payload}\n\n");
-        let limit = output_charge(body.as_bytes()).unwrap();
-        assert!(output_charge(payload.as_bytes()).unwrap() > limit);
+        let limit = mcp_result_charge(body.as_bytes()).unwrap();
+        assert!(mcp_result_charge(payload.as_bytes()).unwrap() > limit);
         let signal = test_signal();
         assert!(matches!(
             parse_buffered_sse_terminal(body.as_bytes(), Some(limit), &signal),

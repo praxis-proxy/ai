@@ -6,6 +6,7 @@
 use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use serde::Deserialize;
 
+use super::custom_input::CustomInputPatternEncoding;
 use crate::openai::responses::body_limits::validate_size_limit;
 
 // -----------------------------------------------------------------------------
@@ -45,6 +46,16 @@ pub(crate) struct ClientToolCompatConfig {
     /// Maximum number of client-owned tool declarations lowered per request.
     #[serde(default = "default_max_client_tools")]
     pub max_client_tools: usize,
+
+    /// How the backend interprets a JSON-Schema string `pattern`, deciding the
+    /// encoding of the constraint emitted on a lowered grammar tool's `input`.
+    ///
+    /// Defaults to `json_string` (`XGrammar`/`vLLM`, which matches the raw JSON-string
+    /// body). Set `decoded` for a spec-compliant backend that matches the decoded
+    /// value, or `none` to emit no backend `pattern` and rely solely on host-side
+    /// validation of the decoded input.
+    #[serde(default)]
+    pub custom_input_pattern_encoding: CustomInputPatternEncoding,
 }
 
 impl Default for ClientToolCompatConfig {
@@ -52,6 +63,7 @@ impl Default for ClientToolCompatConfig {
         Self {
             max_rewritten_body_bytes: default_max_rewritten_body_bytes(),
             max_client_tools: default_max_client_tools(),
+            custom_input_pattern_encoding: CustomInputPatternEncoding::default(),
         }
     }
 }
@@ -96,7 +108,7 @@ mod tests {
     fn rejects_zero_rewritten_body_bytes() {
         let cfg = ClientToolCompatConfig {
             max_rewritten_body_bytes: 0,
-            max_client_tools: 1,
+            ..Default::default()
         };
         let err = build_config(cfg).unwrap_err();
         assert!(
@@ -108,8 +120,8 @@ mod tests {
     #[test]
     fn rejects_zero_max_client_tools() {
         let cfg = ClientToolCompatConfig {
-            max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
             max_client_tools: 0,
+            ..Default::default()
         };
         let err = build_config(cfg).unwrap_err();
         assert!(
@@ -122,13 +134,28 @@ mod tests {
     fn rejects_above_ceiling() {
         let cfg = ClientToolCompatConfig {
             max_rewritten_body_bytes: MAX_JSON_BODY_BYTES + 1,
-            max_client_tools: 1,
+            ..Default::default()
         };
         let err = build_config(cfg).unwrap_err();
         assert!(
             err.to_string().contains("exceeds maximum"),
             "the error explains the ceiling: {err}"
         );
+    }
+
+    #[test]
+    fn custom_input_pattern_encoding_defaults_and_parses() {
+        assert_eq!(
+            ClientToolCompatConfig::default().custom_input_pattern_encoding,
+            CustomInputPatternEncoding::JsonString,
+            "the default encoding targets `XGrammar`/`vLLM`",
+        );
+        let cfg = serde_yaml::from_str::<ClientToolCompatConfig>("custom_input_pattern_encoding: decoded")
+            .expect("decoded encoding parses");
+        assert_eq!(cfg.custom_input_pattern_encoding, CustomInputPatternEncoding::Decoded);
+        let cfg = serde_yaml::from_str::<ClientToolCompatConfig>("custom_input_pattern_encoding: none")
+            .expect("none encoding parses");
+        assert_eq!(cfg.custom_input_pattern_encoding, CustomInputPatternEncoding::None);
     }
 
     #[test]
