@@ -11,7 +11,9 @@
 # GATEWAY_AUTH_PASSWORD comes from the attached `praxis` provider and is an
 # OpenShell placeholder, not the password. Every header below is built from
 # that placeholder; the OpenShell proxy substitutes the real password inside
-# the Basic credential on its way to the gateway, and nowhere else.
+# the Basic credential on its way to the gateway, and nowhere else. If the
+# variable does not look like a placeholder, the real password was passed with
+# --env and is already inside the sandbox, so this script exits.
 #
 # Optional overrides: PRAXIS_GATEWAY_HOST (default host.openshell.internal),
 # PRAXIS_MESSAGES_PORT (8080), PRAXIS_RESPONSES_PORT (8081),
@@ -22,10 +24,15 @@ set -eu
 : "${GATEWAY_AUTH_PASSWORD:?attach the Praxis gateway provider with --provider}"
 : "${VLLM_MODEL:?set --env VLLM_MODEL=<served model name>}"
 
+# Fail closed: a raw password came from --env, so the real secret is already
+# inside the sandbox. Refuse to configure a harness with it.
 case "$GATEWAY_AUTH_PASSWORD" in
   *openshell:resolve:env:* | *OPENSHELL-RESOLVE-ENV-*) ;;
-  *) echo "praxis-harness-env: GATEWAY_AUTH_PASSWORD is not an OpenShell placeholder;" \
-       "pass it through a provider, not --env" >&2 ;;
+  *)
+    echo "praxis-harness-env: GATEWAY_AUTH_PASSWORD is not an OpenShell placeholder;" \
+      "pass it through a provider, not --env" >&2
+    exit 1
+    ;;
 esac
 
 host="${PRAXIS_GATEWAY_HOST:-host.openshell.internal}"

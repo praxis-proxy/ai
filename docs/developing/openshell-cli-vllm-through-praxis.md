@@ -191,8 +191,8 @@ gateway configuration and then runs the command you give it:
 - It writes the Codex `config.toml` (pointed at port 8081, with
   `env_http_headers`, no `env_key`, and Codex's inner sandbox off; see
   [Codex](#codex)), the OpenCode 1.x `opencode.json`, and the pi `models.json`.
-- It warns if `GATEWAY_AUTH_PASSWORD` is not an OpenShell placeholder, which
-  means the real password was passed with `--env`.
+- It refuses to start if `GATEWAY_AUTH_PASSWORD` is not an OpenShell
+  placeholder, which means the real password was passed with `--env`.
 
 `VLLM_MODEL` is required. `PRAXIS_MODEL_CONTEXT` (default 32768) and
 `PRAXIS_MODEL_MAX_OUTPUT` (default 8192) set the context and output limits the
@@ -337,8 +337,9 @@ kill "$PRAXIS_PID"
 - **401 from Praxis with a placeholder in the request:** substitution did not
   happen. The header must be built inside the sandbox from the provider's
   `GATEWAY_AUTH_PASSWORD`, and the endpoint must use `protocol: rest` so
-  OpenShell inspects it. A password passed with `--env` is sent as typed, and
-  `praxis-harness-env` warns about it.
+  OpenShell inspects it. This is also why `praxis-harness-env` refuses to
+  start unless it sees a placeholder: a password passed with `--env` would
+  otherwise be sent as typed.
 - **401 from Praxis after rotating the password:** update both the Praxis
   process environment and the provider, then start a new process in the
   sandbox; running processes keep their environment.
