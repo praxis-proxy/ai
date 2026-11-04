@@ -264,8 +264,12 @@ fn assert_prompt_template_rejection(action: FilterAction) {
 
 /// Assert that Code Interpreter is rejected with the gateway's OpenAI error envelope.
 fn assert_unsupported_tool_rejection(action: FilterAction) {
+    assert!(
+        matches!(&action, FilterAction::Reject(_)),
+        "unsupported Responses tools must be rejected before upstream contact"
+    );
     let FilterAction::Reject(rejection) = action else {
-        panic!("unsupported Responses tools must be rejected before upstream contact");
+        return;
     };
     assert_eq!(rejection.status, 400);
     let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
