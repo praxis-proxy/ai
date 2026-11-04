@@ -2342,7 +2342,13 @@ def provider_compaction_client(tmp_path_factory, request):
         os.unlink(config_path)
 
 
-def _reasoning_capture_session(tmp_path_factory, request):
+def _reasoning_capture_session(
+    tmp_path_factory,
+    request,
+    *,
+    pre_routing_filter=True,
+    reasoning_dialect=None,
+):
     """Start the reasoning example with a capturing mock Chat backend.
 
     Yields ``(client, captured_bodies)`` where ``captured_bodies`` accumulates
@@ -2371,13 +2377,46 @@ def _reasoning_capture_session(tmp_path_factory, request):
     # openai_responses_to_chat_completions (so the "agentic" param needs no extra
     # wiring). Map that param onto the vLLM dialect; "none" disables it.
     param = getattr(request, "param", "vllm")
+    dialect = reasoning_dialect or ("vllm" if param == "agentic" else param)
     config_path = _write_full_flow_config(
         port,
         db_path,
         backend_endpoint=f"127.0.0.1:{backend_port}",
         chat_translation_model=VLLM_MODEL,
-        reasoning_dialect="vllm" if param == "agentic" else param,
+        reasoning_dialect=dialect,
     )
+    if not pre_routing_filter:
+        with open(config_path) as config_file:
+            config = config_file.read()
+        pre_routing_request_filter = (
+            "      - filter: openai_responses_request\n"
+            "        initialize_state: false\n"
+            "        on_invalid: continue\n"
+            "        headers:\n"
+            "          format: x-praxis-ai-format\n"
+            "          model: x-praxis-ai-model\n"
+            "          stream: x-praxis-ai-stream\n"
+            "          mode: x-praxis-responses-mode\n"
+        )
+        assert config.count(pre_routing_request_filter) == 1, config
+        config = config.replace(pre_routing_request_filter, "", 1)
+        # Without the pre-routing classifier, bind this isolated integration
+        # lane to its mock Chat backend by path so the managed request filter
+        # can be exercised independently.
+        route_marker = (
+            '          - path_prefix: "/v1/vector_stores"\n'
+            '            cluster: "vector-stores-backend"\n'
+        )
+        assert config.count(route_marker) == 1, config
+        config = config.replace(
+            route_marker,
+            '          - path: "/v1/responses"\n'
+            '            cluster: "chat-completions-backend"\n'
+            + route_marker,
+            1,
+        )
+        with open(config_path, "w") as config_file:
+            config_file.write(config)
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -2417,6 +2456,17 @@ def _reasoning_capture_session(tmp_path_factory, request):
 def reasoning_capture_client(tmp_path_factory, request):
     """Function-scoped reasoning proxy with a capturing mock Chat backend."""
     yield from _reasoning_capture_session(tmp_path_factory, request)
+
+
+@pytest.fixture()
+def code_interpreter_capture_client(tmp_path_factory, request):
+    """Capture SDK requests with either the pre-routing or managed request filter."""
+    yield from _reasoning_capture_session(
+        tmp_path_factory,
+        request,
+        pre_routing_filter=request.param == "pre-routing",
+        reasoning_dialect="vllm",
+    )
 
 
 @pytest.fixture(scope="session")
@@ -2532,6 +2582,54 @@ def web_search_chat_streaming_client(web_search_chat_streaming_proxy):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "code_interpreter_capture_client",
+    ["pre-routing", "managed"],
+    indirect=True,
+    ids=["pre-routing-role", "managed-role"],
+)
+@pytest.mark.parametrize("stream", [False, True], ids=["finite", "streaming"])
+def test_code_interpreter_is_rejected_before_backend_contact(
+    code_interpreter_capture_client, stream
+):
+    client, forwarded = code_interpreter_capture_client
+
+    with pytest.raises(BadRequestError) as error:
+        client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="Compute 1 + 1.",
+            store=False,
+            stream=stream,
+            tools=[{"type": "code_interpreter", "container": {"type": "auto"}}],
+        )
+
+    assert error.value.status_code == 400
+    error_body = error.value.response.json()["error"]
+    assert error_body["type"] == "invalid_request_error"
+    assert error_body["code"] == "unsupported_tool_type"
+    assert error_body["message"] == "The code_interpreter tool is not supported by this gateway."
+    assert forwarded == [], "rejected Code Interpreter requests must not reach the backend"
+
+    # A supported client function tool remains accepted through the same role
+    # and proves the rejection is specific to Code Interpreter.
+    response = client.responses.create(
+        model=CHAT_TRANSLATION_MODEL,
+        input="Answer directly.",
+        store=False,
+        tools=[
+            {
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+        tool_choice="none",
+    )
+    assert response.status == "completed"
+    assert len(forwarded) == 1
+    assert forwarded[0]["tools"][0]["function"]["name"] == "lookup"
 
 
 class TestOpenAIResponsesStoreCompression:

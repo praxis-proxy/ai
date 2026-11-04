@@ -262,6 +262,80 @@ fn assert_prompt_template_rejection(action: FilterAction) {
     }
 }
 
+/// Assert that Code Interpreter is rejected with the gateway's OpenAI error envelope.
+fn assert_unsupported_tool_rejection(action: FilterAction) {
+    let FilterAction::Reject(rejection) = action else {
+        panic!("unsupported Responses tools must be rejected before upstream contact");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        body.pointer("/error/type").and_then(serde_json::Value::as_str),
+        Some("invalid_request_error")
+    );
+    assert_eq!(
+        body.pointer("/error/code").and_then(serde_json::Value::as_str),
+        Some("unsupported_tool_type")
+    );
+    assert_eq!(
+        body.pointer("/error/message").and_then(serde_json::Value::as_str),
+        Some("The code_interpreter tool is not supported by this gateway.")
+    );
+}
+
+#[tokio::test]
+async fn code_interpreter_is_rejected_in_both_filter_roles_and_stream_modes() {
+    for initialize_state in [true, false] {
+        let request_filter = if initialize_state {
+            default_filter()
+        } else {
+            filter("initialize_state: false")
+        };
+
+        for stream in [false, true] {
+            let request = create_request();
+            let mut ctx = classified_context(&request).await;
+            let original = json!({
+                "model": "gpt-4.1",
+                "input": "Compute 1 + 1.",
+                "stream": stream,
+                "tools": [{"type": "code_interpreter", "container": {"type": "auto"}}]
+            });
+            let original_bytes = serde_json::to_vec(&original).unwrap();
+            let mut body = Some(Bytes::from(original_bytes.clone()));
+
+            let action = request_filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+            assert_unsupported_tool_rejection(action);
+            assert_eq!(body.as_deref(), Some(original_bytes.as_slice()));
+            assert!(
+                ctx.extensions.get::<ResponsesState>().is_none(),
+                "unsupported tools must be rejected before managed response state is initialized"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn supported_function_tool_is_not_rejected_by_shared_tool_policy() {
+    for initialize_state in [true, false] {
+        let request_filter = if initialize_state {
+            default_filter()
+        } else {
+            filter("initialize_state: false")
+        };
+        let request = create_request();
+        let mut ctx = classified_context(&request).await;
+        let mut body = Some(Bytes::from_static(
+            br#"{"model":"gpt-4.1","input":"Call nothing.","tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}],"tool_choice":"none"}"#,
+        ));
+
+        let action = request_filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Release));
+    }
+}
+
 /// Drive one streaming create request and return its context.
 async fn run_streaming_create<'a>(filter: &dyn HttpFilter, request: &'a Request) -> HttpFilterContext<'a> {
     let mut ctx = classified_context(request).await;
