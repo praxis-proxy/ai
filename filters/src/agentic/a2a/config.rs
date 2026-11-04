@@ -103,7 +103,10 @@ pub(crate) struct TaskRoutingConfig {
     pub ttl_seconds: u64,
 }
 
-/// Raw task-routing configuration converted after checking the store invariant.
+/// Raw task-routing YAML shape, converted after checking the store invariant.
+///
+/// Keeping `store` optional here preserves the input shape until conversion
+/// can require it when task routing is enabled.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTaskRoutingConfig {
