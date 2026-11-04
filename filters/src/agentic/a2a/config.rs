@@ -67,18 +67,15 @@ pub(crate) enum TaskRouteStore {
 
 /// Configuration for A2A task-ownership routing.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, try_from = "RawTaskRoutingConfig")]
+#[serde(try_from = "RawTaskRoutingConfig")]
 pub(crate) struct TaskRoutingConfig {
     /// Whether task routing is enabled.
-    #[serde(default)]
     pub enabled: bool,
 
     /// Maximum response body bytes to buffer for task route capture.
-    #[serde(default = "default_max_response_body_bytes")]
     pub max_response_body_bytes: usize,
 
     /// Behavior when a task route lookup misses.
-    #[serde(default)]
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "validated at parse time, used in follow-up PRs")
@@ -86,7 +83,6 @@ pub(crate) struct TaskRoutingConfig {
     pub on_lookup_miss: OnLookupMiss,
 
     /// Internal header name injected on task or context route hit.
-    #[serde(default = "default_route_cluster_header")]
     pub route_cluster_header: String,
 
     /// Storage backend for task routes. Required when task routing is enabled.
@@ -94,12 +90,10 @@ pub(crate) struct TaskRoutingConfig {
 
     /// TTL in seconds for terminal task routes (0 = remove immediately).
     /// Must be at most 2,592,000 (30 days).
-    #[serde(default = "default_terminal_ttl_seconds")]
     pub terminal_ttl_seconds: u64,
 
     /// TTL in seconds for non-terminal task routes. Must be greater
     /// than 0 and at most 2,592,000 (30 days).
-    #[serde(default = "default_ttl_seconds")]
     pub ttl_seconds: u64,
 }
 
