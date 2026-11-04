@@ -5,12 +5,6 @@
 
 Integrates with an external metering service for pre-request balance checks and post-response token usage reporting.
 
-## Configuration Notes
-
-Tenant identity is resolved from the highest-trust source available: verified `{prefix}*` metadata written by an authentication filter, then the `identity_header_guard` filter's namespaced `{namespace}.{prefix}*` metadata, then raw `{prefix}*` request headers. A higher tier always wins, so forged client headers can never override verified claims, and identity headers plus client credentials are always stripped before the request is forwarded. Both event types carry `data.organization_id` and `data.cost_center` from `{prefix}organization-id` and `{prefix}cost-center`. When absent, those fields are empty strings rather than invented defaults.
-
-When no `{prefix}model` identity header names the model and `model_to_provider` mapped the request, balance checks and usage events use the client-facing model ID it recorded rather than the provider target. That filter buffers the request body, so its body pass completes before this filter's request hook runs the balance check.
-
 ## Configuration
 
 | Field | Type | Required | Description |
@@ -21,7 +15,9 @@ When no `{prefix}model` identity header names the model and `model_to_provider` 
 | `feature_key` | string | no | Entitlement feature key used in balance check URL path. |
 | `source` | string | no | `CloudEvents` `source` field value. |
 | `provider` | string | no | Static provider name attributed to emitted `CloudEvents`. |
-| `fail_open` | bool | no | When `true` (default), requests proceed if the metering service is unavailable. When `false`, requests are rejected with 503. |
+| `fail_open` | bool | no | When `true` (default), requests proceed if the metering service is unavailable. When `false`, requests are rejected with 503. This is the *billing* gate's availability policy. |
+| `model_policy_check` | bool | no | When `true`, the entitlement preflight also enforces the metering service's model-policy verdict (`modelAllowed` in the response): an explicit denial rejects with 403 before any provider request, regardless of `fail_open`. Disabled by default for compatibility with services that return only `hasAccess`. When enabled, every metered request needs a trusted tenant identity and a resolvable public model; the request body is pre-read (bounded by the standard JSON body limit) so the verdict is decided before provider dispatch. |
+| `model_policy_fail_open` | bool | no | Availability policy for the model-policy gate when `model_policy_check` is enabled, independent of the billing `fail_open`: when the model verdict is unavailable (missing, `null`, wrongly typed, unusable payload, non-2xx, timeout, transport error), `true` admits the request and `false` (default) rejects with 503. An explicit `modelAllowed: false` rejection is never affected by this setting. |
 | `identity_header_prefix` | string | no | Prefix for tenant identity headers to capture and strip. Expected headers: `{prefix}username`, `{prefix}group`, `{prefix}subscription`, `{prefix}model`, `{prefix}organization-id`, `{prefix}cost-center`. |
 | `identity_metadata_namespace` | string | no | Metadata namespace the `identity_header_guard` filter writes captured identity headers under. Must match that filter's `metadata_namespace` setting when both run in one pipeline. |
 | `default_username` | string | no | Fallback username when no identity header is present. If set, requests without `{prefix}username` are still metered under this name. If unset, metering is skipped entirely. |
@@ -42,4 +38,6 @@ identity_header_prefix: "x-tenant-"
 identity_metadata_namespace: "identity"
 default_username: "anonymous"
 default_model: "unknown"
+model_policy_check: true
+model_policy_fail_open: false
 ```

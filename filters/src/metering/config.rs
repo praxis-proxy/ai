@@ -33,9 +33,18 @@ const DEFAULT_SOURCE: &str = "ai-gateway";
 /// identity_metadata_namespace: "identity"
 /// default_username: "anonymous"
 /// default_model: "unknown"
+/// model_policy_check: true
+/// model_policy_fail_open: false
+/// default_model: "unknown"
+/// model_policy_check: true
+/// model_policy_fail_open: false
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent billing and model-policy availability controls"
+)]
 pub(super) struct ExternalMeteringConfig {
     /// Base URL of the external metering service (required).
     pub metering_url: String,
@@ -65,8 +74,32 @@ pub(super) struct ExternalMeteringConfig {
 
     /// When `true` (default), requests proceed if the metering service
     /// is unavailable. When `false`, requests are rejected with 503.
+    /// This is the *billing* gate's availability policy.
     #[serde(default = "default_true")]
     pub fail_open: bool,
+
+    /// When `true`, the entitlement preflight also enforces the metering
+    /// service's model-policy verdict (`modelAllowed` in the response): an
+    /// explicit denial rejects with 403 before any provider request,
+    /// regardless of `fail_open`. Disabled by default for compatibility
+    /// with services that return only `hasAccess`.
+    ///
+    /// When enabled, every metered request needs a trusted tenant identity
+    /// and a resolvable public model; the request body is pre-read (bounded
+    /// by the standard JSON body limit) so the verdict is decided before
+    /// provider dispatch.
+    #[serde(default)]
+    pub model_policy_check: bool,
+
+    /// Availability policy for the model-policy gate when
+    /// `model_policy_check` is enabled, independent of the billing
+    /// `fail_open`: when the model verdict is unavailable (missing, `null`,
+    /// wrongly typed, unusable payload, non-2xx, timeout, transport error),
+    /// `true` admits the request and `false` (default) rejects with 503.
+    /// An explicit `modelAllowed: false` rejection is never affected by
+    /// this setting.
+    #[serde(default)]
+    pub model_policy_fail_open: bool,
 
     /// Prefix for tenant identity headers to capture and strip.
     /// Expected headers: `{prefix}username`, `{prefix}group`,

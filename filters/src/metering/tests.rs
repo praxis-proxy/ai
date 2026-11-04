@@ -352,41 +352,350 @@ unknown_field: true
 #[test]
 fn balance_response_has_access_continues() {
     let body = br#"{"hasAccess": true, "balance": 9000.0, "usage": 1000.0}"#;
-    let action = parse_balance_result(body, true);
+    let action = parse_balance_result(body, billing_only(true));
     assert!(matches!(action, FilterAction::Continue));
 }
 
 #[test]
 fn balance_response_no_access_rejects() {
     let body = br#"{"hasAccess": false, "balance": 0.0, "usage": 10000.0}"#;
-    let action = parse_balance_result(body, true);
+    let action = parse_balance_result(body, billing_only(true));
     assert!(matches!(action, FilterAction::Reject(_)));
 }
 
 #[test]
 fn balance_response_invalid_json_fail_open() {
     let body = b"not json";
-    let action = parse_balance_result(body, true);
+    let action = parse_balance_result(body, billing_only(true));
     assert!(matches!(action, FilterAction::Continue));
 }
 
 #[test]
 fn balance_response_invalid_json_fail_closed() {
     let body = b"not json";
-    let action = parse_balance_result(body, false);
+    let action = parse_balance_result(body, billing_only(false));
     assert!(matches!(action, FilterAction::Reject(_)));
 }
 
 #[test]
 fn balance_response_empty_body_fail_open() {
-    let action = parse_balance_result(b"", true);
+    let action = parse_balance_result(b"", billing_only(true));
     assert!(matches!(action, FilterAction::Continue));
 }
 
 #[test]
 fn balance_response_empty_body_fail_closed() {
-    let action = parse_balance_result(b"", false);
+    let action = parse_balance_result(b"", billing_only(false));
     assert!(matches!(action, FilterAction::Reject(_)));
+}
+
+// -----------------------------------------------------------------------------
+// Model Policy Gate
+// -----------------------------------------------------------------------------
+
+/// Policy with model-policy enforcement disabled — the legacy billing-only
+/// contract, used by the tests above this section.
+fn billing_only(fail_open: bool) -> AdmissionPolicy {
+    AdmissionPolicy {
+        billing_fail_open: fail_open,
+        model_policy_check: false,
+        model_policy_fail_open: false,
+    }
+}
+
+/// Model-policy-enabled policy.
+fn model_policy(billing_fail_open: bool, model_policy_fail_open: bool) -> AdmissionPolicy {
+    AdmissionPolicy {
+        billing_fail_open,
+        model_policy_check: true,
+        model_policy_fail_open,
+    }
+}
+
+/// Assert a rejection carries the given status and body.
+fn assert_reject(action: FilterAction, status: u16, body: &str) {
+    match action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, status, "unexpected rejection status");
+            assert_eq!(
+                rejection.body.as_deref(),
+                Some(body.as_bytes()),
+                "unexpected rejection body"
+            );
+        },
+        other => panic!("expected Reject({status}) with body {body:?}, got {other:?}"),
+    }
+}
+
+#[test]
+fn model_policy_defaults_to_disabled() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+"#,
+    )
+    .unwrap();
+    let filter = build_filter(&yaml).unwrap();
+
+    assert!(!filter.model_policy_check, "model policy must default to disabled");
+    assert!(
+        !filter.model_policy_fail_open,
+        "model policy must default to fail-closed"
+    );
+}
+
+#[test]
+fn model_policy_fields_parse() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+model_policy_check: true
+model_policy_fail_open: true
+"#,
+    )
+    .unwrap();
+    let filter = build_filter(&yaml).unwrap();
+
+    assert!(filter.model_policy_check);
+    assert!(filter.model_policy_fail_open);
+}
+
+#[test]
+fn model_denial_rejects_despite_budget_and_billing_fail_open() {
+    // The headline case of issue #1719: budget remains, the model is denied.
+    let body = br#"{"hasAccess": true, "modelAllowed": false}"#;
+    let action = parse_balance_result(body, model_policy(true, false));
+    assert_reject(action, 403, "model not allowed for this user");
+}
+
+#[test]
+fn model_denial_takes_precedence_over_budget_exhaustion() {
+    let body = br#"{"hasAccess": false, "modelAllowed": false}"#;
+    let action = parse_balance_result(body, model_policy(false, true));
+    assert_reject(action, 403, "model not allowed for this user");
+}
+
+#[test]
+fn budget_denial_with_model_allow_rejects_429() {
+    let body = br#"{"hasAccess": false, "modelAllowed": true}"#;
+    let action = parse_balance_result(body, model_policy(true, false));
+    assert_reject(action, 429, "token budget exhausted");
+}
+
+#[test]
+fn model_and_budget_allow_continues() {
+    let body = br#"{"hasAccess": true, "modelAllowed": true}"#;
+    let action = parse_balance_result(body, model_policy(false, false));
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[test]
+fn missing_model_verdict_fails_closed_when_policy_enabled() {
+    // A legacy response carrying only `hasAccess` leaves the model gate
+    // without a verdict — never an implicit allow.
+    let body = br#"{"hasAccess": true}"#;
+    let action = parse_balance_result(body, model_policy(true, false));
+    assert_reject(action, 503, "metering system unavailable");
+}
+
+#[test]
+fn missing_model_verdict_fails_open_when_configured() {
+    let body = br#"{"hasAccess": true}"#;
+    let action = parse_balance_result(body, model_policy(true, true));
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[test]
+fn null_and_wrong_typed_model_verdicts_are_unavailable() {
+    for body in [
+        r#"{"hasAccess": true, "modelAllowed": null}"#,
+        r#"{"hasAccess": true, "modelAllowed": "yes"}"#,
+        r#"{"hasAccess": true, "modelAllowed": 1}"#,
+    ] {
+        let action = parse_balance_result(body.as_bytes(), model_policy(true, false));
+        assert_reject(action, 503, "metering system unavailable");
+    }
+}
+
+#[test]
+fn wrong_typed_model_verdict_preserves_budget_verdict() {
+    // Per-gate parsing: an unusable `modelAllowed` must not discard a valid
+    // explicit budget denial.
+    let body = br#"{"hasAccess": false, "modelAllowed": "yes"}"#;
+    let action = parse_balance_result(body, model_policy(true, true));
+    assert_reject(action, 429, "token budget exhausted");
+}
+
+#[test]
+fn billing_fail_open_with_model_fail_closed_rejects_on_unusable_payload() {
+    // Independence check: billing fail-open must not drag the model gate open.
+    let action = parse_balance_result(b"", model_policy(true, false));
+    assert_reject(action, 503, "metering system unavailable");
+}
+
+#[test]
+fn unusable_payload_admits_only_when_all_gates_fail_open() {
+    let action = parse_balance_result(b"", model_policy(true, true));
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[test]
+fn policy_disabled_preserves_legacy_missing_verdict_behavior() {
+    let body = br#"{"hasAccess": true}"#;
+    let action = parse_balance_result(body, billing_only(true));
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[test]
+fn verdicts_extract_both_fields() {
+    let verdicts = parse_balance_verdicts(br#"{"hasAccess": true, "modelAllowed": false}"#);
+    assert_eq!(verdicts.has_access, Some(true));
+    assert_eq!(verdicts.model_allowed, Some(false));
+}
+
+#[test]
+fn verdicts_treat_missing_fields_as_unavailable() {
+    let verdicts = parse_balance_verdicts(br#"{"hasAccess": true}"#);
+    assert_eq!(verdicts.has_access, Some(true));
+    assert_eq!(verdicts.model_allowed, None);
+}
+
+#[test]
+fn verdicts_treat_wrong_types_as_unavailable() {
+    let verdicts = parse_balance_verdicts(br#"{"hasAccess": "true", "modelAllowed": 7}"#);
+    assert_eq!(verdicts.has_access, None);
+    assert_eq!(verdicts.model_allowed, None);
+}
+
+#[test]
+fn verdicts_on_unparseable_body_are_all_unavailable() {
+    for body in ["", "not json", r#"{"truncated:"#] {
+        let verdicts = parse_balance_verdicts(body.as_bytes());
+        assert_eq!(verdicts.has_access, None);
+        assert_eq!(verdicts.model_allowed, None);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Model Policy — Request Phase
+// -----------------------------------------------------------------------------
+
+fn model_policy_filter_yaml(extra: &str) -> serde_yaml::Value {
+    serde_yaml::from_str(&format!(
+        r#"
+metering_url: "http://127.0.0.1:1"
+allow_private_endpoint: true
+fail_open: true
+identity_header_prefix: "x-tenant-"
+default_username: "anonymous"
+default_model: "unknown"
+model_policy_check: true
+{extra}
+"#
+    ))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn model_policy_rejects_missing_identity_before_callout() {
+    // Reporting defaults must not stand in for a trusted identity when the
+    // model gate is enabled; the skip-metering path must not bypass it either.
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert_reject(action, 403, "tenant identity required for model authorization");
+}
+
+#[tokio::test]
+async fn model_policy_rejects_unresolvable_model() {
+    // `default_model` is a reporting fallback only — it must never be
+    // authorized in place of the actual requested model.
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    let mut req = make_request(http::Method::POST, "/v1/chat/completions");
+    req.headers
+        .insert("x-tenant-username", http::HeaderValue::from_static("alice"));
+    let mut ctx = make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert_reject(action, 403, "request model required for model authorization");
+}
+
+#[tokio::test]
+async fn model_policy_resolves_model_from_buffered_body() {
+    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    let mut req = make_request(http::Method::POST, "/v1/chat/completions");
+    req.headers
+        .insert("x-tenant-username", http::HeaderValue::from_static("alice"));
+    let mut ctx = make_filter_context(&req);
+    ctx.buffered_request_body = Some(Bytes::from_static(br#"{"model": "gpt-4o", "messages": []}"#));
+
+    // metering_url points at a dead port, so the callout fails and both gates
+    // fail open; the stored state still records the resolved model.
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx
+        .filter_state
+        .get(&0)
+        .and_then(|s| s.downcast_ref::<MeteringState>())
+        .expect("state should be stored after the callout");
+    assert_eq!(
+        state.model, "gpt-4o",
+        "the public body model must be resolved for the preflight"
+    );
+    assert_eq!(state.username, "alice");
+}
+
+#[tokio::test]
+async fn model_policy_verified_identity_model_wins_over_forged_header() {
+    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    let mut req = make_request(http::Method::POST, "/v1/chat/completions");
+    // Forged raw header, lower trust tier than verified metadata.
+    req.headers
+        .insert("x-tenant-model", http::HeaderValue::from_static("forged-model"));
+    req.headers
+        .insert("x-tenant-username", http::HeaderValue::from_static("alice"));
+    let mut ctx = make_filter_context(&req);
+    // A verification filter mapped both claims; the raw forged model header
+    // is in a lower trust tier and must be ignored entirely.
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "verified-model".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx
+        .filter_state
+        .get(&0)
+        .and_then(|s| s.downcast_ref::<MeteringState>())
+        .expect("state should be stored after the callout");
+    assert_eq!(
+        state.model, "verified-model",
+        "a forged raw model header must never override verified identity metadata"
+    );
+}
+
+#[test]
+fn request_body_mode_is_stream_buffer_when_model_policy_enabled() {
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    assert!(matches!(
+        filter.request_body_mode(),
+        BodyMode::StreamBuffer { max_bytes: Some(_) }
+    ));
+}
+
+#[test]
+fn request_body_mode_is_stream_when_model_policy_disabled() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+"#,
+    )
+    .unwrap();
+    let filter = build_filter(&yaml).unwrap();
+    assert!(matches!(filter.request_body_mode(), BodyMode::Stream));
 }
 
 // -----------------------------------------------------------------------------
