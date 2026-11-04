@@ -549,6 +549,9 @@ while the same candidate remains eligible. If it disappears or becomes excluded,
 the filter attempts a new selection and records failover. If no candidate can
 accept a new session, the request receives HTTP 404.
 
+Affinity has no implicit storage default. Enabling it requires `store: local`,
+which explicitly opts into process-local lifetime and consistency semantics.
+
 Bindings live in memory in one filter instance; they do not provide affinity
 across replicas or restarts. The table is bounded to 10,000 bindings and evicts
 expired entries when full. If no room remains, routing continues without storing

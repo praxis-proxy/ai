@@ -3115,8 +3115,9 @@ mod tests {
     fn session_affinity_rejects_unsupported_store() {
         let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  store: redis\n  header: x-session-id\n";
         let err = parse_err(yaml);
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("unknown variant") || err.to_string().contains("expected"),
+            message.contains("unknown variant `redis`") && message.contains("expected `local`"),
             "unsupported affinity store should be rejected: {err}"
         );
     }
