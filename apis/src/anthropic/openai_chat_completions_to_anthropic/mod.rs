@@ -196,6 +196,11 @@ impl OpenaiChatCompletionsToAnthropicFilter {
                 .push(HeaderName::from_static("authorization"));
             ctx.request_headers_to_remove.push(HeaderName::from_static("x-api-key"));
             ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
+            // Native protocol defaults are queued during request-head processing.
+            // For a selected Messages provider, this translator owns the contract;
+            // extra headers are applied after set headers and would override it.
+            ctx.extra_request_headers
+                .retain(|(name, _)| !name.eq_ignore_ascii_case("anthropic-version"));
             ctx.request_headers_to_set.push((
                 HeaderName::from_static("anthropic-version"),
                 HeaderValue::from_static(self.config.api_version.as_str()),

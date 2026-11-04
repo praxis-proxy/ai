@@ -1,6 +1,6 @@
 version: 1
 id: openai_legacy/anthropic-version-sampling
-description: Operator-selected Anthropic API version rejects sampling before dispatch and accepts requests without sampling.
+description: Operator-selected Anthropic API version overrides a conflicting native protocol default, rejects sampling before dispatch, and accepts requests without sampling.
 protocol: openai_chat_completions
 example_config: openai-selected-provider-version-fixture.yaml
 upstream_authority: 127.0.0.1:8001

@@ -18,16 +18,26 @@ api_version: "2026-10-21"
 
 `api_version` defaults to `2023-06-01`. Only `2023-06-01` and `2026-10-21`
 are accepted; unknown versions fail configuration parsing. The selected value
-overrides any caller-supplied `anthropic-version` on translated requests.
+overrides any caller-supplied `anthropic-version` and any co-configured
+`anthropic_messages_protocol.default_version` on translated requests,
+regardless of the order of those two filters. Native passthrough retains its
+own version behavior.
+
+Version selection is scoped to the translator's filter configuration, not to
+individual provider entries in the routing overlay. Use separate configured
+routes for Anthropic-compatible backends requiring different API versions.
 OpenAI-compatible provider selections are unaffected by this setting.
 
 Under `2023-06-01`, numeric `temperature` and `top_p` values are forwarded
 unchanged. The existing rejection of `top_k` on this Chat Completions bridge
 remains in place. Under `2026-10-21`, the presence of `temperature`, `top_p`,
 or `top_k` causes HTTP 400 before dispatch, including default values and
-`null`. The OpenAI error identifies the field and API version. No sampling
-field is silently removed. Omit unsupported fields or configure a contract
-supported by the selected backend.
+`null`. This is deliberately strict: even clients that automatically send
+`temperature: 1` or `top_p: 1` must omit those fields for the new contract.
+Version-specific errors identify the field and API version; `top_k` instead
+reports that the bridge cannot preserve it, under either version. No sampling
+field is silently removed. Omit unsupported fields or ask the platform
+administrator to configure a contract supported by the selected backend.
 
 Native Messages passthrough has a different contract:
 `anthropic_messages_protocol` preserves caller-supplied `anthropic-version`

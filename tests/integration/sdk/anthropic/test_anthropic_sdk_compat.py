@@ -546,7 +546,8 @@ class TestTranslatedToChatCompletions:
             messages=[{"role": "user", "content": "Hi"}],
         )
 
-        _path, _headers, body = TRANSLATED_STATE.requests[-1]
+        _path, headers, body = TRANSLATED_STATE.requests[-1]
+        assert "anthropic-version" not in headers, "caller version must not reach a Chat Completions backend"
         assert body["temperature"] == 0.5
         assert body["top_p"] == 0.9
         assert body["stop"] == ["\n"], "stop_sequences must become the Chat Completions stop"

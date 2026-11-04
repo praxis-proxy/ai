@@ -255,10 +255,21 @@ fn selected_anthropic_version_example_rejects_sampling_before_dispatch() {
             let error: Value = serde_json::from_str(&parse_body(&response)).expect("OpenAI error JSON");
             let message = error["error"]["message"].as_str().expect("error message");
             assert!(message.contains(field), "error must name unsupported field: {message}");
-            assert!(
-                message.contains("2026-10-21"),
-                "error must name selected version: {message}"
-            );
+            if field == "top_k" {
+                assert!(
+                    message.contains("cannot be preserved"),
+                    "top_k is a bridge limitation: {message}"
+                );
+            } else {
+                assert!(
+                    message.contains("2026-10-21"),
+                    "error must name selected version: {message}"
+                );
+                assert!(
+                    message.contains("platform administrator"),
+                    "version configuration is administrator-owned: {message}"
+                );
+            }
             body.as_object_mut().expect("request object").remove(field);
         }
     }

@@ -73,17 +73,17 @@ pub(crate) fn translate_request(
     let object = value
         .as_object_mut()
         .ok_or("Chat Completions request must be a JSON object")?;
-    if api_version == AnthropicApiVersion::October2026 {
+    reject_unknown_fields(object)?;
+    if api_version == AnthropicApiVersion::V20261021 {
         for field in ["temperature", "top_p", "top_k"] {
             if object.contains_key(field) {
                 return Err(format!(
-                    "Anthropic API version {} does not support {field}; remove this field or configure a compatible api_version",
+                    "Anthropic API version {} does not support {field}; remove this field or contact the platform administrator to configure a compatible api_version",
                     api_version.as_str()
                 ));
             }
         }
     }
-    reject_unknown_fields(object)?;
     validate_ignored_legacy_fields(object)?;
 
     let client_model = take_string(object, "model")?;

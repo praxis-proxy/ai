@@ -30,7 +30,7 @@ const INPUT: &str = r#"{
 
 #[test]
 fn converts_legacy_request_direction_and_binds_target_model() {
-    let (bytes, profile) = translate_request(INPUT.as_bytes(), "claude-test", AnthropicApiVersion::Legacy).unwrap();
+    let (bytes, profile) = translate_request(INPUT.as_bytes(), "claude-test", AnthropicApiVersion::V20230601).unwrap();
     let translated: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(translated["model"], "claude-test");
     assert_eq!(translated["max_tokens"], 90);
@@ -56,13 +56,20 @@ fn sampling_fields_follow_the_selected_api_contract() {
             let mut input = json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
             input[field] = value.clone();
             let bytes = serde_json::to_vec(&input).unwrap();
-            let error = translate_request(&bytes, "provider-model", AnthropicApiVersion::October2026).unwrap_err();
+            let error = translate_request(&bytes, "provider-model", AnthropicApiVersion::V20261021).unwrap_err();
             assert!(error.contains(field), "error must identify {field}: {error}");
             assert!(
-                error.contains("2026-10-21"),
+                field == "top_k" || error.contains("2026-10-21"),
                 "error must identify the selected version: {error}"
             );
-            let legacy = translate_request(&bytes, "provider-model", AnthropicApiVersion::Legacy);
+            let legacy = translate_request(&bytes, "provider-model", AnthropicApiVersion::V20230601);
+            if field == "top_k" {
+                assert_eq!(
+                    legacy.as_ref().unwrap_err(),
+                    &error,
+                    "top_k is unsupported by the bridge under either version"
+                );
+            }
             if field == "top_k" || value.is_null() {
                 assert!(
                     legacy.is_err(),
@@ -78,7 +85,7 @@ fn sampling_fields_follow_the_selected_api_contract() {
             }
         }
     }
-    let (bytes, _) = translate_request(INPUT.as_bytes(), "claude-test", AnthropicApiVersion::October2026).unwrap();
+    let (bytes, _) = translate_request(INPUT.as_bytes(), "claude-test", AnthropicApiVersion::V20261021).unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert!(body.get("temperature").is_none(), "omitted sampling must stay omitted");
     assert_eq!(
@@ -98,10 +105,19 @@ async fn configured_version_overrides_caller_version() {
             .insert("anthropic-version", HeaderValue::from_static("caller-version"));
         let mut ctx = crate::test_utils::make_filter_context(&request);
         selected_profile_metadata(&mut ctx);
+        ctx.extra_request_headers
+            .push(("Anthropic-Version".into(), "native-default".to_owned()));
+        ctx.extra_request_headers
+            .push(("x-unrelated".into(), "preserved".to_owned()));
         assert!(matches!(
             filter.on_request(&mut ctx).await.unwrap(),
             FilterAction::Continue
         ));
+        assert_eq!(
+            ctx.extra_request_headers,
+            vec![("x-unrelated".into(), "preserved".to_owned())],
+            "translation must remove competing version extras while preserving unrelated headers"
+        );
         assert!(
             ctx.request_headers_to_set
                 .iter()
@@ -116,7 +132,7 @@ fn rejects_unmapped_fields_but_preserves_supported_image_content() {
     let unsupported =
         br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"frequency_penalty":0.3}"#;
     assert!(
-        translate_request(unsupported, "provider-model", AnthropicApiVersion::Legacy)
+        translate_request(unsupported, "provider-model", AnthropicApiVersion::V20230601)
             .unwrap_err()
             .contains("frequency_penalty")
     );
@@ -126,7 +142,7 @@ fn rejects_unmapped_fields_but_preserves_supported_image_content() {
 fn invalid_tool_arguments_still_fail() {
     let invalid = br#"{"model":"m","messages":[{"role":"assistant","tool_calls":[{"id":"call","type":"function","function":{"name":"f","arguments":"[]"}}]}],"max_tokens":8}"#;
     assert!(
-        translate_request(invalid, "provider-model", AnthropicApiVersion::Legacy)
+        translate_request(invalid, "provider-model", AnthropicApiVersion::V20230601)
             .unwrap_err()
             .contains("JSON object")
     );
@@ -136,7 +152,7 @@ fn invalid_tool_arguments_still_fail() {
 fn defaults_missing_max_tokens_and_preserves_alias_precedence() {
     let base = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]"#;
     let defaulted = format!("{base}}}");
-    let (bytes, _) = translate_request(defaulted.as_bytes(), "provider-model", AnthropicApiVersion::Legacy).unwrap();
+    let (bytes, _) = translate_request(defaulted.as_bytes(), "provider-model", AnthropicApiVersion::V20230601).unwrap();
     assert_eq!(
         serde_json::from_slice::<Value>(&bytes).unwrap()["max_tokens"],
         4096,
@@ -145,7 +161,7 @@ fn defaults_missing_max_tokens_and_preserves_alias_precedence() {
 
     for (field, expected) in [("max_tokens", 12), ("max_completion_tokens", 13)] {
         let input = format!("{base},\"{field}\":{expected}}}");
-        let (bytes, _) = translate_request(input.as_bytes(), "provider-model", AnthropicApiVersion::Legacy).unwrap();
+        let (bytes, _) = translate_request(input.as_bytes(), "provider-model", AnthropicApiVersion::V20230601).unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&bytes).unwrap()["max_tokens"],
             expected,
@@ -153,14 +169,14 @@ fn defaults_missing_max_tokens_and_preserves_alias_precedence() {
         );
     }
     let equal = format!("{base},\"max_tokens\":14,\"max_completion_tokens\":14}}");
-    let (bytes, _) = translate_request(equal.as_bytes(), "provider-model", AnthropicApiVersion::Legacy).unwrap();
+    let (bytes, _) = translate_request(equal.as_bytes(), "provider-model", AnthropicApiVersion::V20230601).unwrap();
     assert_eq!(
         serde_json::from_slice::<Value>(&bytes).unwrap()["max_tokens"],
         14,
         "equal token aliases must preserve their explicit value"
     );
     let conflict = format!("{base},\"max_tokens\":15,\"max_completion_tokens\":16}}");
-    let (bytes, _) = translate_request(conflict.as_bytes(), "provider-model", AnthropicApiVersion::Legacy).unwrap();
+    let (bytes, _) = translate_request(conflict.as_bytes(), "provider-model", AnthropicApiVersion::V20230601).unwrap();
     assert_eq!(
         serde_json::from_slice::<Value>(&bytes).unwrap()["max_tokens"],
         16,
@@ -184,7 +200,7 @@ fn rejects_invalid_token_values() {
     ] {
         let input = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"{field}":{value}}}"#);
         assert!(
-            translate_request(input.as_bytes(), "provider-model", AnthropicApiVersion::Legacy)
+            translate_request(input.as_bytes(), "provider-model", AnthropicApiVersion::V20230601)
                 .unwrap_err()
                 .contains("positive integer"),
             "{field} value {value} should be rejected"
@@ -203,7 +219,7 @@ fn accepts_and_drops_only_the_legacy_ignored_options() {
         let input = format!(
             r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"max_tokens":8,"{field}":{value}}}"#
         );
-        let (bytes, _) = translate_request(input.as_bytes(), "provider-model", AnthropicApiVersion::Legacy).unwrap();
+        let (bytes, _) = translate_request(input.as_bytes(), "provider-model", AnthropicApiVersion::V20230601).unwrap();
         let output: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(
             output.get(field).is_none(),
@@ -211,7 +227,7 @@ fn accepts_and_drops_only_the_legacy_ignored_options() {
         );
     }
     let combined = br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"user":"u","n":3,"seed":-7,"parallel_tool_calls":false}"#;
-    let (bytes, _) = translate_request(combined, "provider-model", AnthropicApiVersion::Legacy).unwrap();
+    let (bytes, _) = translate_request(combined, "provider-model", AnthropicApiVersion::V20230601).unwrap();
     let output: Value = serde_json::from_slice(&bytes).unwrap();
     for field in ["user", "n", "seed", "parallel_tool_calls"] {
         assert!(
@@ -234,7 +250,7 @@ fn rejects_malformed_ignored_options() {
             r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"max_tokens":8,"{field}":{value}}}"#
         );
         assert!(
-            translate_request(input.as_bytes(), "provider-model", AnthropicApiVersion::Legacy).is_err(),
+            translate_request(input.as_bytes(), "provider-model", AnthropicApiVersion::V20230601).is_err(),
             "invalid {field} must be rejected"
         );
     }
@@ -243,7 +259,7 @@ fn rejects_malformed_ignored_options() {
 #[test]
 fn translates_base64_and_remote_image_sources_in_content_order() {
     let input = br#"{"model":"client-model","messages":[{"role":"user","content":[{"type":"text","text":"first"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC","detail":"high"}},{"type":"text","text":"last"},{"type":"image_url","image_url":{"url":"https://images.example.test/photo.png"}}]}]}"#;
-    let (bytes, profile) = translate_request(input, "provider-model", AnthropicApiVersion::Legacy).unwrap();
+    let (bytes, profile) = translate_request(input, "provider-model", AnthropicApiVersion::V20230601).unwrap();
     let output: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
         output["model"], "provider-model",
@@ -299,7 +315,7 @@ fn rejects_assistant_images_without_relabeling_or_dropping_them() {
             translate_request(
                 input.to_string().as_bytes(),
                 "provider-model",
-                AnthropicApiVersion::Legacy
+                AnthropicApiVersion::V20230601
             )
             .unwrap_err()
             .contains("supported only in user messages"),
@@ -317,7 +333,7 @@ fn rejects_invalid_preferred_token_alias_even_with_valid_legacy_alias() {
             translate_request(
                 input.to_string().as_bytes(),
                 "provider-model",
-                AnthropicApiVersion::Legacy
+                AnthropicApiVersion::V20230601
             )
             .unwrap_err()
             .contains("positive integer"),
@@ -340,7 +356,7 @@ fn validates_base64_beyond_the_image_signature_and_preserves_encoded_data() {
     let (translated, _) = translate_request(
         request(&encoded).as_bytes(),
         "provider-model",
-        AnthropicApiVersion::Legacy,
+        AnthropicApiVersion::V20230601,
     )
     .unwrap();
     let translated: Value = serde_json::from_slice(&translated).unwrap();
@@ -357,7 +373,7 @@ fn validates_base64_beyond_the_image_signature_and_preserves_encoded_data() {
             translate_request(
                 request(&invalid).as_bytes(),
                 "provider-model",
-                AnthropicApiVersion::Legacy
+                AnthropicApiVersion::V20230601
             )
             .unwrap_err()
             .contains("invalid base64"),
@@ -385,7 +401,7 @@ fn rejects_malformed_or_unsupported_images() {
             r#"{{"model":"m","messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"{url}"}}}}]}}]}}"#
         );
         assert!(
-            translate_request(input.as_bytes(), "provider-model", AnthropicApiVersion::Legacy)
+            translate_request(input.as_bytes(), "provider-model", AnthropicApiVersion::V20230601)
                 .unwrap_err()
                 .contains(reason),
             "{url} should fail with {reason}"
@@ -396,7 +412,7 @@ fn rejects_malformed_or_unsupported_images() {
 #[test]
 fn tool_choice_none_preserves_tools_for_existing_tool_history() {
     let input = br#"{"model":"m","messages":[{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call-1","content":"done"},{"role":"user","content":"continue"}],"max_tokens":8,"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],"tool_choice":"none"}"#;
-    let (bytes, _) = translate_request(input, "provider-model", AnthropicApiVersion::Legacy).unwrap();
+    let (bytes, _) = translate_request(input, "provider-model", AnthropicApiVersion::V20230601).unwrap();
     let translated: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(translated["tools"][0]["name"], "f");
     assert_eq!(translated["tool_choice"], json!({"type":"none"}));
@@ -408,7 +424,7 @@ fn tool_choice_none_preserves_tools_for_existing_tool_history() {
 #[test]
 fn empty_assistant_text_is_omitted_when_tool_calls_are_present() {
     let input = br#"{"model":"m","messages":[{"role":"assistant","content":"","tool_calls":[{"id":"call-1","type":"function","function":{"name":"f","arguments":"{}"}}]}],"max_tokens":8,"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]}"#;
-    let (bytes, _) = translate_request(input, "provider-model", AnthropicApiVersion::Legacy).unwrap();
+    let (bytes, _) = translate_request(input, "provider-model", AnthropicApiVersion::V20230601).unwrap();
     let translated: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(translated["messages"][0]["content"].as_array().unwrap().len(), 1);
     assert_eq!(translated["messages"][0]["content"][0]["type"], "tool_use");

@@ -6,6 +6,8 @@
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
+use crate::anthropic::{API_VERSION_2023_06_01, API_VERSION_2026_10_21};
+
 /// Maximum accepted request or response body limit.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Default maximum translated Chat Completions request size.
@@ -37,22 +39,35 @@ pub(crate) struct OpenaiChatCompletionsToAnthropicConfig {
 
 /// Supported contracts for requests translated to Anthropic Messages.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(try_from = "String")]
 pub(crate) enum AnthropicApiVersion {
     /// Preserve the existing sampling-compatible contract.
     #[default]
-    #[serde(rename = "2023-06-01")]
-    Legacy,
+    V20230601,
     /// Reject sampling controls before dispatch.
-    #[serde(rename = "2026-10-21")]
-    October2026,
+    V20261021,
 }
 
 impl AnthropicApiVersion {
     /// Version sent to the selected Messages backend.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::Legacy => "2023-06-01",
-            Self::October2026 => "2026-10-21",
+            Self::V20230601 => API_VERSION_2023_06_01,
+            Self::V20261021 => API_VERSION_2026_10_21,
+        }
+    }
+}
+
+impl TryFrom<String> for AnthropicApiVersion {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.as_str() {
+            API_VERSION_2023_06_01 => Ok(Self::V20230601),
+            API_VERSION_2026_10_21 => Ok(Self::V20261021),
+            _ => Err(format!(
+                "unsupported Anthropic api_version {value:?}; expected {API_VERSION_2023_06_01} or {API_VERSION_2026_10_21}"
+            )),
         }
     }
 }
@@ -95,7 +110,7 @@ mod tests {
     fn version_selection_is_explicit_and_rejects_unknown_contracts() {
         assert_eq!(
             OpenaiChatCompletionsToAnthropicConfig::default().api_version,
-            AnthropicApiVersion::Legacy,
+            AnthropicApiVersion::V20230601,
             "existing routes must retain the legacy contract"
         );
         for version in ["2023-06-01", "2026-10-21"] {

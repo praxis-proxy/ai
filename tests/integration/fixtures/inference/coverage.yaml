@@ -872,6 +872,7 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  # Covers strict sampling rejection and a conflicting native protocol default.
   - id: external_model.anthropic.request.version_sampling
     scopes:
       - openai_chat_completions_to_anthropic_messages

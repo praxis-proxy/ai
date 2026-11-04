@@ -180,7 +180,7 @@
             "kind": "json",
             "value": {
               "error": {
-                "message": "Anthropic API version 2026-10-21 does not support temperature; remove this field or configure a compatible api_version",
+                "message": "Anthropic API version 2026-10-21 does not support temperature; remove this field or contact the platform administrator to configure a compatible api_version",
                 "type": "invalid_request_error",
                 "code": "invalid_request_error"
               }
@@ -244,7 +244,7 @@
             "kind": "json",
             "value": {
               "error": {
-                "message": "Anthropic API version 2026-10-21 does not support top_p; remove this field or configure a compatible api_version",
+                "message": "Anthropic API version 2026-10-21 does not support top_p; remove this field or contact the platform administrator to configure a compatible api_version",
                 "type": "invalid_request_error",
                 "code": "invalid_request_error"
               }
@@ -308,7 +308,7 @@
             "kind": "json",
             "value": {
               "error": {
-                "message": "Anthropic API version 2026-10-21 does not support top_k; remove this field or configure a compatible api_version",
+                "message": "unsupported Chat Completions field \"top_k\" cannot be preserved by Anthropic Messages",
                 "type": "invalid_request_error",
                 "code": "invalid_request_error"
               }
@@ -372,7 +372,7 @@
             "kind": "json",
             "value": {
               "error": {
-                "message": "Anthropic API version 2026-10-21 does not support temperature; remove this field or configure a compatible api_version",
+                "message": "Anthropic API version 2026-10-21 does not support temperature; remove this field or contact the platform administrator to configure a compatible api_version",
                 "type": "invalid_request_error",
                 "code": "invalid_request_error"
               }

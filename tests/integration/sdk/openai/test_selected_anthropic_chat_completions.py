@@ -135,7 +135,31 @@ def _failover_config(proxy_port: int, primary_port: int, fallback_port: int) -> 
 
 
 @pytest.fixture(scope="module", params=["2023-06-01", "2026-10-21"])
-def client(request):
+def api_version(request):
+    """Expose the selected contract independently of the SDK client."""
+    return request.param
+
+
+@pytest.fixture(scope="module")
+def client(api_version):
+    yield from _versioned_client(api_version)
+
+
+@pytest.fixture(params=[
+    ("2023-06-01", "2026-10-21", True),
+    ("2023-06-01", "2026-10-21", False),
+    ("2026-10-21", "2023-06-01", True),
+    ("2026-10-21", "2023-06-01", False),
+])
+def protocol_client(request):
+    """Exercise conflicting native defaults in either filter order."""
+    version, default, first = request.param
+    for sdk in _versioned_client(version, default, first):
+        yield sdk, version
+
+
+def _versioned_client(version, protocol_version=None, protocol_first=True):
+    """Run a translated route with an optional native protocol filter."""
     proxy_port, backend_port = _port(), _port()
     backend = ThreadingHTTPServer(("127.0.0.1", backend_port), _Handler)
     thread = threading.Thread(target=backend.serve_forever, daemon=True)
@@ -143,7 +167,13 @@ def client(request):
     with tempfile.TemporaryDirectory() as directory:
         config = Path(directory) / "praxis.yaml"
         settings = _config(proxy_port, backend_port)
-        settings["filter_chains"][0]["filters"][3]["api_version"] = request.param
+        filters = settings["filter_chains"][0]["filters"]
+        translator = next(f for f in filters if f["filter"] == "openai_chat_completions_to_anthropic")
+        translator["api_version"] = version
+        if protocol_version is not None:
+            protocol = {"filter": "anthropic_messages_protocol", "default_version": protocol_version}
+            position = filters.index(translator) + (0 if protocol_first else 1)
+            filters.insert(position, protocol)
         config.write_text(json.dumps(settings))
         proc = subprocess.Popen([_binary(), "-c", str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
@@ -158,7 +188,6 @@ def client(request):
                 raise TimeoutError("Praxis did not start")
             with OpenAI(api_key="caller-only", base_url=f"http://127.0.0.1:{proxy_port}/v1",
                         max_retries=0, timeout=10) as sdk:
-                sdk.selected_anthropic_version = request.param
                 yield sdk
         finally:
             proc.send_signal(signal.SIGINT)
@@ -261,7 +290,7 @@ def test_json_and_cached_usage(client: OpenAI) -> None:
     assert upstream["model"] == "claude-fixture-model", "selected target model must reach Anthropic"
 
 
-def test_anthropic_backend_wire_headers(client: OpenAI) -> None:
+def test_anthropic_backend_wire_headers(client: OpenAI, api_version) -> None:
     STATE.script(200, "application/json", _message(
         [{"type": "text", "text": "hello"}],
         {"input_tokens": 10, "output_tokens": 4},
@@ -272,7 +301,7 @@ def test_anthropic_backend_wire_headers(client: OpenAI) -> None:
     )
     path, headers, _upstream = STATE.requests[-1]
     assert path == "/v1/messages", "selected Anthropic requests must use the Messages path"
-    assert headers.get("anthropic-version") == client.selected_anthropic_version, (
+    assert headers.get("anthropic-version") == api_version, (
         "the selected Anthropic route must pin the API version on the backend request"
     )
     assert headers.get("x-api-key") == "fixture-only-dummy-token", (
@@ -487,8 +516,8 @@ def test_disabled_translation_names_platform_administrator(translation_disabled_
     ("temperature", None), ("top_p", None), ("top_k", None),
 ])
 @pytest.mark.parametrize("stream", [False, True])
-def test_version_specific_sampling_before_dispatch(client: OpenAI, field, value, stream) -> None:
-    legacy_supported = client.selected_anthropic_version == "2023-06-01" and field != "top_k" and value is not None
+def test_version_specific_sampling_before_dispatch(client: OpenAI, api_version, field, value, stream) -> None:
+    legacy_supported = api_version == "2023-06-01" and field != "top_k" and value is not None
     if legacy_supported:
         if stream:
             STATE.script(200, "text/event-stream", _anthropic_events())
@@ -513,9 +542,38 @@ def test_version_specific_sampling_before_dispatch(client: OpenAI, field, value,
         )
     assert exc.value.status_code == 400, "unsupported sampling must be a client error"
     assert field in exc.value.response.json()["error"]["message"], "error must identify the unsupported field"
-    if client.selected_anthropic_version == "2026-10-21":
+    if api_version == "2026-10-21" and field != "top_k":
         assert "2026-10-21" in exc.value.response.json()["error"]["message"], "error must identify the version"
     assert STATE.requests == [], "rejected sampling must never reach the backend"
+
+
+@pytest.mark.parametrize("caller_version", [None, "caller-version"])
+def test_protocol_default_cannot_override_translation(protocol_client, caller_version):
+    """Wire version and pre-dispatch validation must use the same contract."""
+    sdk, version = protocol_client
+    headers = {} if caller_version is None else {"anthropic-version": caller_version}
+    if version == "2026-10-21":
+        with pytest.raises(APIStatusError) as exc:
+            sdk.chat.completions.create(
+                model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16,
+                extra_headers=headers, extra_body={"temperature": 0.5},
+            )
+        assert exc.value.status_code == 400
+        assert STATE.requests == [], "new-version sampling must be rejected before dispatch"
+        sampling = {}
+    else:
+        sampling = {"temperature": 0.5}
+    STATE.script(200, "application/json", _message(
+        [{"type": "text", "text": "hello"}], {"input_tokens": 1, "output_tokens": 1},
+    ))
+    sdk.chat.completions.create(
+        model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16,
+        extra_headers=headers, extra_body=sampling,
+    )
+    _path, wire_headers, body = STATE.requests[-1]
+    assert wire_headers["anthropic-version"] == version, "translator must own the wire contract"
+    if sampling:
+        assert body["temperature"] == 0.5, "legacy sampling must survive a conflicting native default"
 
 
 if __name__ == "__main__":

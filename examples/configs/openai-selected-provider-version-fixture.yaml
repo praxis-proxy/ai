@@ -28,6 +28,10 @@ filter_chains:
         api_version: "2026-10-21"
         max_body_bytes: 1048576
 
+      # A native Messages default must not override the translated contract.
+      - filter: anthropic_messages_protocol
+        default_version: "2023-06-01"
+
       - filter: credential_inject
         credentials:
           - name: anthropic-fixture-secret
