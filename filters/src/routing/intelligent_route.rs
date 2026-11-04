@@ -238,7 +238,7 @@ struct SessionAffinityConfig {
     ttl_secs: u64,
 }
 
-/// Session affinity binding store.
+/// Storage backend selected for session-affinity bindings.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum SessionAffinityStore {
