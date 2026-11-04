@@ -259,7 +259,7 @@ jobs:
           cache-suffix: vllm-cpu-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every
@@ -461,7 +461,7 @@ jobs:
           cache-suffix: vllm-cpu-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -706,7 +706,7 @@ jobs:
 
       - name: Install uv for Anthropic SDK acceptance
         id: anthropic_sdk_uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: "3.12"
           enable-cache: true
@@ -2775,7 +2775,7 @@ jobs:
           done
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           # The GPU AMI ships Python 3.9; ogx[starter] needs >=3.12, so pin the
           # interpreter setup-uv provisions. Cache is repo-scoped (GH cache
@@ -3152,7 +3152,7 @@ jobs:
         uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every

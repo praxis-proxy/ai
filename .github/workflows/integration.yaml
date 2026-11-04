@@ -288,7 +288,7 @@ jobs:
           cache-target: "false"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: tests/integration/sdk/openai/test_bedrock_converse_chat_completions.py
@@ -414,7 +414,7 @@ jobs:
           cache-suffix: azure-sdk-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: tests/integration/sdk/openai/test_azure_chat_completions.py
@@ -454,7 +454,7 @@ jobs:
           cache-suffix: agents-sdk-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: tests/integration/sdk/openai/test_openai_conversations.py
@@ -495,7 +495,7 @@ jobs:
           cache-target: "false"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: tests/integration/sdk/openai/test_openai_agents_sdk.py
@@ -529,7 +529,7 @@ jobs:
           cache-suffix: anthropic-sdk-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: tests/integration/sdk/anthropic/*.py
@@ -1056,7 +1056,7 @@ jobs:
           cache-suffix: vertex-gemini-sdk-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: tests/integration/sdk/openai/test_vertex_gemini_chat_completions.py
@@ -1088,7 +1088,7 @@ jobs:
           cache-suffix: selected-anthropic-sdk-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: tests/integration/sdk/openai/test_selected_anthropic_chat_completions.py
