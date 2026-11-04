@@ -104,7 +104,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Publish container image
-        uses: praxis-proxy/conventions/.github/actions/ghcr-publish@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/ghcr-publish@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           image-name: ${{ github.repository }}
 
