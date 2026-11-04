@@ -31,6 +31,7 @@ fn from_config_all_providers() {
         "bedrock",
         "bedrock_invoke_model",
         "azure",
+        "auto",
     ] {
         let yaml = format!("provider: {provider}");
         let config: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
@@ -1841,6 +1842,237 @@ async fn json_stream_buffer_released_fallback_beyond_limit_sets_overflow_status(
         "an oversized released capture must report overflow, not zero usage"
     );
     assert_capture_cleared(&ctx);
+}
+
+// -----------------------------------------------------------------------------
+// Automatic Provider Selection (`provider: auto`)
+// -----------------------------------------------------------------------------
+
+#[test]
+fn for_path_resolves_each_dialect() {
+    use ProviderKind::{Anthropic, Bedrock, BedrockInvokeModel, Google, OpenAi};
+
+    assert_eq!(ProviderKind::for_path("/v1/chat/completions"), Some(OpenAi));
+    assert_eq!(ProviderKind::for_path("/v1/completions"), Some(OpenAi));
+    assert_eq!(ProviderKind::for_path("/v1/responses"), Some(OpenAi));
+    assert_eq!(
+        ProviderKind::for_path("/openai/deployments/my-deploy/chat/completions"),
+        Some(OpenAi),
+        "Azure exposes OpenAI paths with the OpenAI usage schema"
+    );
+    assert_eq!(ProviderKind::for_path("/v1/messages"), Some(Anthropic));
+    assert_eq!(
+        ProviderKind::for_path("/v1/models/gemini-pro:generateContent"),
+        Some(Google)
+    );
+    assert_eq!(
+        ProviderKind::for_path("/v1/models/gemini-pro:streamGenerateContent"),
+        Some(Google)
+    );
+    assert_eq!(ProviderKind::for_path("/model/converse"), Some(Bedrock));
+    assert_eq!(ProviderKind::for_path("/model/converse-stream"), Some(Bedrock));
+    assert_eq!(ProviderKind::for_path("/model/invoke"), Some(BedrockInvokeModel));
+    assert_eq!(
+        ProviderKind::for_path("/model/invoke-with-response-stream"),
+        Some(BedrockInvokeModel)
+    );
+}
+
+#[test]
+fn for_path_rejects_unmeterable_paths() {
+    for path in [
+        "/healthz",
+        "/v1/models",
+        "/v1/messages/count_tokens",
+        "/v1/embeddings",
+        "/",
+    ] {
+        assert!(
+            ProviderKind::for_path(path).is_none(),
+            "path '{path}' must not be metered by auto"
+        );
+    }
+}
+
+#[test]
+fn provider_meta_round_trip() {
+    for kind in [
+        ProviderKind::OpenAi,
+        ProviderKind::Anthropic,
+        ProviderKind::Google,
+        ProviderKind::Bedrock,
+        ProviderKind::BedrockInvokeModel,
+        ProviderKind::Azure,
+    ] {
+        assert_eq!(
+            ProviderKind::from_meta(kind.as_str()),
+            Some(kind),
+            "as_str/from_meta must round-trip for {kind:?}"
+        );
+    }
+    assert_eq!(ProviderKind::from_meta("auto"), None, "auto never round-trips");
+    assert_eq!(ProviderKind::from_meta("nonsense"), None);
+}
+
+/// Like [`run_json_extraction`], but with the request path under the
+/// caller's control so `provider: auto` can resolve a dialect from it.
+async fn run_json_extraction_at_path(
+    path: &str,
+    body_bytes: &[u8],
+) -> (Option<String>, Option<String>, Option<String>) {
+    let filter = make_filter(ProviderKind::Auto);
+    let req = crate::test_utils::make_request(http::Method::POST, path);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let mut body = Some(Bytes::copy_from_slice(body_bytes));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    (
+        ctx.get_metadata("token.input").map(str::to_owned),
+        ctx.get_metadata("token.output").map(str::to_owned),
+        ctx.get_metadata("token.total").map(str::to_owned),
+    )
+}
+
+#[tokio::test]
+async fn auto_meters_openai_dialect_on_anthropic_style_route() {
+    // A mixed-dialect listener: an OpenAI Responses call on a base URL that
+    // also serves Anthropic traffic. The static provider would be wrong for
+    // one of the two dialects; auto resolves per request from the path.
+    let json =
+        br#"{"id":"resp_1","object":"response","usage":{"input_tokens":15,"output_tokens":42,"total_tokens":57}}"#;
+
+    let (input, output, total) = run_json_extraction_at_path("/v1/responses", json).await;
+
+    assert_eq!(input.as_deref(), Some("15"), "auto resolves the OpenAI parser");
+    assert_eq!(output.as_deref(), Some("42"));
+    assert_eq!(total.as_deref(), Some("57"));
+}
+
+#[tokio::test]
+async fn auto_meters_anthropic_dialect() {
+    let json = br#"{"usage":{"input_tokens":15,"output_tokens":42}}"#;
+
+    let (input, output, total) = run_json_extraction_at_path("/v1/messages", json).await;
+
+    assert_eq!(input.as_deref(), Some("15"), "auto resolves the Anthropic parser");
+    assert_eq!(output.as_deref(), Some("42"));
+    assert_eq!(total.as_deref(), Some("57"));
+}
+
+#[tokio::test]
+async fn auto_meters_google_dialect() {
+    let json = br#"{"usageMetadata":{"promptTokenCount":15,"candidatesTokenCount":42,"totalTokenCount":57}}"#;
+
+    let (input, ..) = run_json_extraction_at_path("/v1/models/gemini-pro:generateContent", json).await;
+
+    assert_eq!(input.as_deref(), Some("15"), "auto resolves the Google parser");
+}
+
+#[tokio::test]
+async fn auto_meters_bedrock_converse_dialect() {
+    let json = br#"{"usage":{"inputTokens":15,"outputTokens":42}}"#;
+
+    let (input, ..) = run_json_extraction_at_path("/model/converse", json).await;
+
+    assert_eq!(input.as_deref(), Some("15"), "auto resolves the Bedrock parser");
+}
+
+#[tokio::test]
+async fn auto_skips_unmeterable_path_without_metadata() {
+    let json = br#"{"usage":{"input_tokens":15,"output_tokens":42}}"#;
+
+    let filter = make_filter(ProviderKind::Auto);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/models");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let mut body = Some(Bytes::copy_from_slice(json));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    assert!(
+        ctx.get_metadata("token.input").is_none(),
+        "an unmeterable path must stay unmetered rather than guessed"
+    );
+    assert!(
+        ctx.get_metadata(META_PROVIDER).is_none(),
+        "no parser is stashed for a skipped response"
+    );
+}
+
+#[tokio::test]
+async fn auto_bedrock_invoke_model_meters_from_headers() {
+    let filter = make_filter(ProviderKind::Auto);
+    let req = crate::test_utils::make_request(http::Method::POST, "/model/invoke");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_status_and_content_type(http::StatusCode::OK, "application/json");
+    resp.headers
+        .insert("x-amzn-bedrock-input-token-count", HeaderValue::from_static("17"));
+    resp.headers
+        .insert("x-amzn-bedrock-output-token-count", HeaderValue::from_static("34"));
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let mut body = Some(Bytes::from_static(br#"{"body":"no usage here"}"#));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    assert_eq!(ctx.get_metadata("token.input"), Some("17"), "InvokeModel headers meter");
+    assert_eq!(ctx.get_metadata("token.output"), Some("34"));
+}
+
+#[tokio::test]
+async fn auto_sse_anthropic_accumulates_events() {
+    let filter = make_filter(ProviderKind::Auto);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("text/event-stream");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let events =
+        b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n\
+                   data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":30}}\n\n";
+    let mut body = Some(Bytes::from_static(events));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    assert_eq!(
+        ctx.get_metadata("token.input"),
+        Some("25"),
+        "auto resolves the Anthropic streaming parser from the path"
+    );
+    assert_eq!(ctx.get_metadata("token.output"), Some("30"));
+    assert_eq!(ctx.get_metadata("token.total"), Some("55"));
+}
+
+#[tokio::test]
+async fn auto_non_success_response_meters_nothing() {
+    let filter = make_filter(ProviderKind::Auto);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_status_and_content_type(http::StatusCode::BAD_REQUEST, "application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    assert!(ctx.get_metadata("token.input").is_none());
+    assert!(
+        ctx.get_metadata(META_PROVIDER).is_none(),
+        "no parser stashed on error responses"
+    );
 }
 
 // -----------------------------------------------------------------------------

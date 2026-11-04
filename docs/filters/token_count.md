@@ -9,11 +9,13 @@ Extracts token usage from AI inference responses and writes unified counts to [`
 
 Supports both streaming (SSE) and non-streaming (JSON) responses across five providers (OpenAI, Anthropic, Google, Bedrock Converse, Azure), plus a header-only extraction path for Bedrock `InvokeModel`.
 
+`provider: auto` selects the dialect per request from the endpoint path, for routes that serve several API formats behind one base URL. Paths with no usage format (health checks, `/v1/models`, `count_tokens`) are skipped and remain unmetered.
+
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `provider` | `openai` \| `anthropic` \| `google` \| `bedrock` \| `bedrock_invoke_model` \| `azure` | yes | AI provider whose response format to parse. |
+| `provider` | `openai` \| `anthropic` \| `google` \| `bedrock` \| `bedrock_invoke_model` \| `azure` \| `auto` | yes | AI provider whose response format to parse. |
 | `max_body_bytes` | integer | no | Maximum bytes to buffer for a non-streaming JSON response before giving up on locating its usage field. Must be greater than 0 and at most 64 MiB. |
 | `max_scratch_bytes` | integer | no | Maximum scratch bytes (buffered line + in-progress event data) for the SSE scanner before an event is discarded as oversized. Must be greater than 0 and at most 64 MiB. |
 
@@ -21,7 +23,7 @@ Supports both streaming (SSE) and non-streaming (JSON) responses across five pro
 
 ```yaml
 filter: token_count
-provider: openai   # openai | anthropic | google | bedrock | bedrock_invoke_model | azure
+provider: openai   # openai | anthropic | google | bedrock | bedrock_invoke_model | azure | auto
 max_body_bytes: 1048576    # optional, JSON capture limit
 max_scratch_bytes: 1048576 # optional, SSE per-event capture limit; must fit
                            # the largest usage event (Responses-API

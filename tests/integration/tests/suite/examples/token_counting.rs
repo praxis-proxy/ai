@@ -352,6 +352,117 @@ fn example_config_token_counting_openai() {
 }
 
 // -----------------------------------------------------------------------------
+// Automatic provider selection (`provider: auto`)
+// -----------------------------------------------------------------------------
+//
+// A mixed-dialect listener: one chain with `provider: auto` serves every
+// dialect below on the same base URL, and each request meters with the
+// parser its endpoint implies.
+
+#[test]
+fn auto_anthropic_non_streaming_body_passes_through() {
+    let backend = Backend::fixed(ANTHROPIC_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = token_count_config(proxy_port, backend.port(), "auto");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/messages", "{}"));
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(parse_body(&raw), ANTHROPIC_JSON, "body should pass through unchanged");
+}
+
+#[test]
+fn auto_openai_responses_non_streaming_body_passes_through() {
+    let backend = Backend::fixed(OPENAI_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = token_count_config(proxy_port, backend.port(), "auto");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", "{}"));
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(parse_body(&raw), OPENAI_JSON, "body should pass through unchanged");
+}
+
+#[test]
+fn auto_google_non_streaming_body_passes_through() {
+    let backend = Backend::fixed(GOOGLE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = token_count_config(proxy_port, backend.port(), "auto");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1beta/models/gemini-pro:generateContent", "{}"),
+    );
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(parse_body(&raw), GOOGLE_JSON, "body should pass through unchanged");
+}
+
+#[test]
+fn auto_bedrock_converse_non_streaming_body_passes_through() {
+    let backend = Backend::fixed(BEDROCK_CONVERSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = token_count_config(proxy_port, backend.port(), "auto");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post("/model/anthropic.claude-3/converse", "{}"));
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(
+        parse_body(&raw),
+        BEDROCK_CONVERSE_JSON,
+        "body should pass through unchanged"
+    );
+}
+
+#[test]
+fn auto_anthropic_streaming_body_passes_through() {
+    let backend = Backend::fixed(ANTHROPIC_SSE)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = token_count_config(proxy_port, backend.port(), "auto");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/messages", r#"{"stream":true}"#));
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(
+        parse_body(&raw),
+        ANTHROPIC_SSE,
+        "SSE body should pass through unchanged"
+    );
+}
+
+/// An unmeterable path under `provider: auto` must pass through and stay
+/// unmetered: no parser is guessed from the body, and no token headers are
+/// injected.
+#[test]
+fn auto_unmeterable_path_passes_through_unmetered() {
+    let backend = Backend::fixed(OPENAI_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = token_count_config(proxy_port, backend.port(), "auto");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/models", "{}"));
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(parse_body(&raw), OPENAI_JSON, "body should pass through unchanged");
+    assert!(
+        parse_header(&raw, "praxis-token-input").is_none(),
+        "praxis-token-input must be absent on an unmeterable path"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Example config model-labeled metrics
 // -----------------------------------------------------------------------------
 
