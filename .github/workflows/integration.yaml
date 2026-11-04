@@ -126,7 +126,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: test-schema-cargo
 
@@ -148,7 +148,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: test-inference-cargo
 
@@ -179,7 +179,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: ci-split-registry
           cache-target: "false"
@@ -206,7 +206,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: test-integration-cargo
 
@@ -250,7 +250,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: ci-split-registry
           cache-target: "false"
@@ -282,7 +282,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: ci-split-registry
           cache-target: "false"
@@ -340,7 +340,7 @@ jobs:
 
       - name: Setup Rust
         if: steps.scope.outputs.run == 'true'
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: test-environment-cargo
       - name: Environment tests
@@ -382,7 +382,7 @@ jobs:
 
       - name: Setup Rust
         if: steps.scope.outputs.run == 'true'
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: ci-split-registry
           cache-target: "false"
@@ -409,7 +409,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: azure-sdk-cargo
 
@@ -449,7 +449,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: agents-sdk-cargo
 
@@ -489,7 +489,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: ci-split-registry
           cache-target: "false"
@@ -524,7 +524,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: anthropic-sdk-cargo
 
@@ -580,7 +580,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: codex-http-cargo
 
@@ -715,7 +715,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: opencode-cpu-cargo
 
@@ -819,7 +819,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: opencode-v2-cpu-cargo
 
@@ -944,7 +944,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: pi-cpu-cargo
 
@@ -1051,7 +1051,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: vertex-gemini-sdk-cargo
 
@@ -1083,7 +1083,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: selected-anthropic-sdk-cargo
 
@@ -1124,7 +1124,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: codex-websocket-cargo
 
