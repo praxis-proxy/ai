@@ -129,6 +129,23 @@ const STATUS_AUTHZ_INPUT_REQUIRED: u16 = 403;
 /// Integrates with an external metering service for pre-request balance
 /// checks and post-response token usage reporting.
 ///
+/// Tenant identity is resolved from the highest-trust source available:
+/// verified `{prefix}*` metadata written by an authentication filter,
+/// then the `identity_header_guard` filter's namespaced
+/// `{namespace}.{prefix}*` metadata, then raw `{prefix}*` request
+/// headers. A higher tier always wins, so forged client headers can
+/// never override verified claims, and identity headers plus client
+/// credentials are always stripped before the request is forwarded.
+/// Both event types carry `data.organization_id` and `data.cost_center`
+/// from `{prefix}organization-id` and `{prefix}cost-center`. When absent,
+/// those fields are empty strings rather than invented defaults.
+///
+/// When no `{prefix}model` identity header names the model and
+/// `model_to_provider` mapped the request, balance checks and usage events use
+/// the client-facing model ID it recorded rather than the provider target.
+/// That filter buffers the request body, so its body pass completes before
+/// this filter's request hook runs the balance check.
+///
 /// # Model policy (optional)
 ///
 /// With `model_policy_check: true`, the same entitlement preflight also
@@ -148,23 +165,6 @@ const STATUS_AUTHZ_INPUT_REQUIRED: u16 = 403;
 /// With `model_policy_check: false` (default), the legacy contract is
 /// preserved exactly: only `hasAccess` decides, budget denial is 429, and
 /// the billing `fail_open` governs availability.
-///
-/// Tenant identity is resolved from the highest-trust source available:
-/// verified `{prefix}*` metadata written by an authentication filter,
-/// then the `identity_header_guard` filter's namespaced
-/// `{namespace}.{prefix}*` metadata, then raw `{prefix}*` request
-/// headers. A higher tier always wins, so forged client headers can
-/// never override verified claims, and identity headers plus client
-/// credentials are always stripped before the request is forwarded.
-/// Both event types carry `data.organization_id` and `data.cost_center`
-/// from `{prefix}organization-id` and `{prefix}cost-center`. When absent,
-/// those fields are empty strings rather than invented defaults.
-///
-/// When no `{prefix}model` identity header names the model and
-/// `model_to_provider` mapped the request, balance checks and usage events use
-/// the client-facing model ID it recorded rather than the provider target.
-/// That filter buffers the request body, so its body pass completes before
-/// this filter's request hook runs the balance check.
 ///
 /// # YAML
 ///
@@ -1197,14 +1197,33 @@ fn build_envelope(ctx: &EventContext<'_>, event_type: &str) -> serde_json::Value
 fn extract_model_from_bytes(bytes: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut scanner = TopLevelKeyScanner::new(text);
+    let mut model = None;
 
     while let Some(key) = scanner.next_top_level_key() {
-        if key == "model" {
-            return scanner.string_value().map(str::to_owned);
+        if key_decodes_to_model(key) {
+            // A second member decoding to `model` is a duplicate key: JSON
+            // parsers pick their own winner, so the preflight must not guess
+            // which value authorizes the request.
+            if model.is_some() {
+                return None;
+            }
+            model = Some(scanner.string_value()?.to_owned());
         }
     }
 
-    None
+    model
+}
+
+/// Compare a raw (still escaped) top-level object key against `"model"`.
+///
+/// JSON member names compare after escape decoding, so an escaped spelling
+/// such as `"\u006dodel"` names the same member as `"model"`. Only a key
+/// containing a backslash can decode differently from its raw text.
+fn key_decodes_to_model(raw: &str) -> bool {
+    if raw == "model" {
+        return true;
+    }
+    raw.contains('\\') && serde_json::from_str::<String>(&format!("\"{raw}\"")).is_ok_and(|decoded| decoded == "model")
 }
 
 /// Incremental scanner over the top-level keys of a JSON object fragment.

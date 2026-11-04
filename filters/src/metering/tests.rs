@@ -486,7 +486,10 @@ fn budget_denial_with_model_allow_rejects_429() {
 fn model_and_budget_allow_continues() {
     let body = br#"{"hasAccess": true, "modelAllowed": true}"#;
     let action = parse_balance_result(body, model_policy(false, false));
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "both gates allow, so the request continues"
+    );
 }
 
 #[test]
@@ -502,7 +505,10 @@ fn missing_model_verdict_fails_closed_when_policy_enabled() {
 fn missing_model_verdict_fails_open_when_configured() {
     let body = br#"{"hasAccess": true}"#;
     let action = parse_balance_result(body, model_policy(true, true));
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "the model gate fails open as configured"
+    );
 }
 
 #[test]
@@ -536,43 +542,76 @@ fn billing_fail_open_with_model_fail_closed_rejects_on_unusable_payload() {
 #[test]
 fn unusable_payload_admits_only_when_all_gates_fail_open() {
     let action = parse_balance_result(b"", model_policy(true, true));
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "an unusable payload admits only when every gate fails open"
+    );
 }
 
 #[test]
 fn policy_disabled_preserves_legacy_missing_verdict_behavior() {
     let body = br#"{"hasAccess": true}"#;
     let action = parse_balance_result(body, billing_only(true));
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "policy disabled: a missing modelAllowed must not affect admission"
+    );
 }
 
 #[test]
 fn verdicts_extract_both_fields() {
     let verdicts = parse_balance_verdicts(br#"{"hasAccess": true, "modelAllowed": false}"#);
-    assert_eq!(verdicts.has_access, Some(true));
-    assert_eq!(verdicts.model_allowed, Some(false));
+    assert_eq!(
+        verdicts.has_access,
+        Some(true),
+        "hasAccess must be extracted when present"
+    );
+    assert_eq!(
+        verdicts.model_allowed,
+        Some(false),
+        "modelAllowed must be extracted when present"
+    );
 }
 
 #[test]
 fn verdicts_treat_missing_fields_as_unavailable() {
     let verdicts = parse_balance_verdicts(br#"{"hasAccess": true}"#);
-    assert_eq!(verdicts.has_access, Some(true));
-    assert_eq!(verdicts.model_allowed, None);
+    assert_eq!(
+        verdicts.has_access,
+        Some(true),
+        "hasAccess must survive a missing modelAllowed"
+    );
+    assert_eq!(
+        verdicts.model_allowed, None,
+        "a missing modelAllowed leaves the model gate without a verdict"
+    );
 }
 
 #[test]
 fn verdicts_treat_wrong_types_as_unavailable() {
     let verdicts = parse_balance_verdicts(br#"{"hasAccess": "true", "modelAllowed": 7}"#);
-    assert_eq!(verdicts.has_access, None);
-    assert_eq!(verdicts.model_allowed, None);
+    assert_eq!(
+        verdicts.has_access, None,
+        "a wrongly typed hasAccess is unavailable, not false"
+    );
+    assert_eq!(
+        verdicts.model_allowed, None,
+        "a wrongly typed modelAllowed is unavailable, not false"
+    );
 }
 
 #[test]
 fn verdicts_on_unparseable_body_are_all_unavailable() {
     for body in ["", "not json", r#"{"truncated:"#] {
         let verdicts = parse_balance_verdicts(body.as_bytes());
-        assert_eq!(verdicts.has_access, None);
-        assert_eq!(verdicts.model_allowed, None);
+        assert_eq!(
+            verdicts.has_access, None,
+            "an unparseable body leaves hasAccess without a verdict"
+        );
+        assert_eq!(
+            verdicts.model_allowed, None,
+            "an unparseable body leaves modelAllowed without a verdict"
+        );
     }
 }
 
@@ -631,10 +670,12 @@ async fn model_policy_resolves_model_from_buffered_body() {
     let mut ctx = make_filter_context(&req);
     ctx.buffered_request_body = Some(Bytes::from_static(br#"{"model": "gpt-4o", "messages": []}"#));
 
-    // metering_url points at a dead port, so the callout fails and both gates
-    // fail open; the stored state still records the resolved model.
+    // metering_url points at a dead port, so the callout fails.
     let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "both gates fail open against the dead metering port"
+    );
     let state = ctx
         .filter_state
         .get(&0)
@@ -665,7 +706,10 @@ async fn model_policy_verified_identity_model_wins_over_forged_header() {
         .insert("x-tenant-username".to_owned(), "alice".to_owned());
 
     let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "the verified identity model must pass the fail-open gates"
+    );
     let state = ctx
         .filter_state
         .get(&0)
@@ -1183,6 +1227,36 @@ fn extract_model_returns_none_on_non_utf8() {
 fn extract_model_returns_none_on_non_string_value() {
     let body = br#"{"model":null}"#;
     assert!(extract_model_from_bytes(body).is_none());
+}
+
+#[test]
+fn extracts_model_from_escaped_key() {
+    // `"\u006dodel"` decodes to `"model"`, so it names the same member.
+    let body = br#"{ "stream": true, "\u006dodel": "gpt-4o" }"#;
+    assert_eq!(
+        extract_model_from_bytes(body).as_deref(),
+        Some("gpt-4o"),
+        "an escaped key spelling must still resolve the model"
+    );
+}
+
+#[test]
+fn extract_model_returns_none_on_duplicate_raw_keys() {
+    let body = br#"{"model":"gpt-4o","model":"claude-sonnet-4"}"#;
+    assert!(
+        extract_model_from_bytes(body).is_none(),
+        "duplicate model keys must not be attributed: the provider's parser picks its own winner"
+    );
+}
+
+#[test]
+fn extract_model_returns_none_on_duplicate_decoded_keys() {
+    // The raw and escaped spellings both decode to `model`.
+    let body = br#"{"model":"gpt-4o","\u006dodel":"claude-sonnet-4"}"#;
+    assert!(
+        extract_model_from_bytes(body).is_none(),
+        "a raw and an escaped `model` key are duplicates and must not be attributed"
+    );
 }
 
 // -----------------------------------------------------------------------------

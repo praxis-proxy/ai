@@ -35,9 +35,6 @@ const DEFAULT_SOURCE: &str = "ai-gateway";
 /// default_model: "unknown"
 /// model_policy_check: true
 /// model_policy_fail_open: false
-/// default_model: "unknown"
-/// model_policy_check: true
-/// model_policy_fail_open: false
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
