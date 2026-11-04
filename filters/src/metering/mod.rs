@@ -1207,7 +1207,14 @@ fn extract_model_from_bytes(bytes: &[u8]) -> Option<String> {
             if model.is_some() {
                 return None;
             }
-            model = Some(scanner.string_value()?.to_owned());
+            // Escaped values are not decoded, and the provider would parse a
+            // different name than the preflight extracted: reject rather than
+            // authorize under a spelling the policy never sees.
+            let value = scanner.string_value()?;
+            if value.contains('\\') {
+                return None;
+            }
+            model = Some(value.to_owned());
         }
     }
 

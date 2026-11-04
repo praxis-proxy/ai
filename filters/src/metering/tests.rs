@@ -1241,6 +1241,17 @@ fn extracts_model_from_escaped_key() {
 }
 
 #[test]
+fn extract_model_returns_none_on_escaped_value() {
+    // The provider decodes this member to `gpt-4`; the raw extractor must
+    // not authorize under the escaped spelling the policy never sees.
+    let body = br#"{"model":"gpt\u002d4"}"#;
+    assert!(
+        extract_model_from_bytes(body).is_none(),
+        "an escaped model value must fail closed rather than authorize a different name"
+    );
+}
+
+#[test]
 fn extract_model_returns_none_on_duplicate_raw_keys() {
     let body = br#"{"model":"gpt-4o","model":"claude-sonnet-4"}"#;
     assert!(
