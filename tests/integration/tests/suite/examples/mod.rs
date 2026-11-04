@@ -60,6 +60,7 @@ mod guardrails_service_account;
 mod identity_header_guard;
 #[cfg(feature = "openai-responses")]
 mod inference_fallback;
+mod inference_fallback_provider;
 #[cfg(feature = "inflight-tracker-filter")]
 mod inflight_tracking;
 mod intelligent_route_hardening;
@@ -181,6 +182,7 @@ mod token_rate_limit;
 #[cfg(feature = "token-rate-limit-filter")]
 mod token_rate_limit_sentinel;
 mod token_usage_headers;
+mod token_usage_metrics;
 mod vector_stores_routing;
 #[cfg(feature = "vertex-anthropic-filter")]
 mod vertex_anthropic;

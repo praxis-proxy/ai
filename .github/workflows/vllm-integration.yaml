@@ -247,7 +247,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           # vllm-responses and vllm-live-cpu build the identical
           # standard,openai-all,store-sqlite proxy, but had no cache-suffix, so
@@ -259,7 +259,7 @@ jobs:
           cache-suffix: vllm-cpu-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every
@@ -454,14 +454,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           # Shares the store-sqlite rust-cache with vllm-responses (identical
           # standard,openai-all,store-sqlite proxy). See that job for rationale.
           cache-suffix: vllm-cpu-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -581,7 +581,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: pins-cargo
 
@@ -702,11 +702,11 @@ jobs:
           fi
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
 
       - name: Install uv for Anthropic SDK acceptance
         id: anthropic_sdk_uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: "3.12"
           enable-cache: true
@@ -1303,8 +1303,9 @@ jobs:
   #
   # This complements the required deterministic #1223 scripted-backend test:
   # that test remains the provider-wire oracle, while this job proves the real
-  # pinned client can select and execute a coding tool through Praxis against
-  # Qwen3-8B. The child runs in a namespace whose only route reaches Praxis, and
+  # pinned client can select and execute its grammar-constrained apply_patch
+  # tool through Praxis against Qwen3-8B on both paths. The child runs in a
+  # namespace whose only route reaches Praxis, and
   # vLLM requires a provider credential Codex never receives, proving Praxis
   # replaced the gateway credential. It reuses the full suite's on-disk model
   # cache when available and starts its own keyed container sequentially.
@@ -1357,7 +1358,7 @@ jobs:
           fi
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: codex-gpu-acceptance-cargo
 
@@ -1548,8 +1549,8 @@ jobs:
           fi
           # An exact libtest selector otherwise succeeds when no test is compiled.
           for test_name in \
-            codex_http::pinned_codex_completes_native_vllm_coding_workflow_over_http \
-            codex_http::pinned_codex_completes_translated_vllm_coding_workflow_over_http \
+            codex_http::pinned_codex_completes_native_vllm_apply_patch_workflow_over_http \
+            codex_http::pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http \
             codex_http::pinned_codex_compaction_crosses_context_window_over_http; do
             if ! "$TEST_BIN" "$test_name" --list --exact | grep -Fx "$test_name: test"; then
               echo "::error::missing Codex acceptance test: $test_name"
@@ -1573,7 +1574,7 @@ jobs:
           set -uo pipefail
           sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
             "$TEST_BIN" \
-            codex_http::pinned_codex_completes_native_vllm_coding_workflow_over_http \
+            codex_http::pinned_codex_completes_native_vllm_apply_patch_workflow_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-native.log"
           test_status=${PIPESTATUS[0]}
           if [ "$test_status" -ne 0 ]; then
@@ -1597,7 +1598,7 @@ jobs:
           set -uo pipefail
           sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
             "$TEST_BIN" \
-            codex_http::pinned_codex_completes_translated_vllm_coding_workflow_over_http \
+            codex_http::pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-translated.log"
           test_status=${PIPESTATUS[0]}
           if [ "$test_status" -ne 0 ]; then
@@ -1831,7 +1832,7 @@ jobs:
           done
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: opencode-gpu-acceptance
 
@@ -2296,7 +2297,7 @@ jobs:
           done
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: pi-gpu-acceptance
 
@@ -2746,7 +2747,7 @@ jobs:
           hugging-face-token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
 
       - name: Start PostgreSQL response store
         run: |
@@ -2774,7 +2775,7 @@ jobs:
           done
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           # The GPU AMI ships Python 3.9; ogx[starter] needs >=3.12, so pin the
           # interpreter setup-uv provisions. Cache is repo-scoped (GH cache
@@ -3148,10 +3149,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every

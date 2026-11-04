@@ -24,7 +24,7 @@ use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IdentityHeaderGuardFilter,
     InFlightRegistry, IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter, ModelToHeaderFilter,
     ModelToProviderFilter, PromptEnrichFilter, ProviderRouteFilter, StreamUsageInjectFilter, TimeToFirstTokenFilter,
-    TokenCountFilter, TokenUsageHeadersFilter,
+    TokenCountFilter, TokenUsageHeadersFilter, TokenUsageMetricsFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -260,6 +260,10 @@ fn register_token_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "token_usage_headers" => TokenUsageHeadersFilter::from_config
     );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "token_usage_metrics" => TokenUsageMetricsFilter::from_config
+    );
     #[cfg(feature = "token-rate-limit-filter")]
     praxis_filter::register_filters!(
         @register registry,
@@ -385,6 +389,10 @@ fn register_openai_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "openai_chat_completions_request" => praxis_ai_apis::openai::OpenaiChatCompletionsRequestFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_chat_completions_streaming_selector" => praxis_ai_apis::openai::OpenaiChatCompletionsStreamingSelectorFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -750,6 +758,7 @@ mod tests {
             "openai_responses_model_rewrite",
             "openai_tool_parse",
             "openai_chat_completions_request",
+            "openai_chat_completions_streaming_selector",
             "ai_operation",
             "a2a",
             "intelligent_route",
@@ -757,6 +766,8 @@ mod tests {
             "credential_inject",
             "anthropic_web_search",
             "request_id",
+            "token_usage_headers",
+            "token_usage_metrics",
             "openai_chat_completions_to_azureai_chat_completions",
             "openai_chat_completions_to_vertexai_gemini",
         ];
