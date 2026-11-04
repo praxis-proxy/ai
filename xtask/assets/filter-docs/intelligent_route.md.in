@@ -536,6 +536,7 @@ Without session affinity, the gateway has no stored binding to reuse, so
 ```yaml
 session_affinity:
   enabled: true
+  store: local
   header: X-Session-ID
   cookie: session_id
   ttl_secs: 3600
@@ -687,7 +688,8 @@ The configuration rejects unknown fields.
 | `skip_paths` | See lookup section | Management path prefixes; an explicit list replaces defaults |
 | `management_cluster` | Unset | Upstream for skipped paths; requires nonempty `skip_paths` |
 | `provider_hop_clusters` | `[]` | Clusters using the authenticated provider-hop protocol |
-| `session_affinity.enabled` | `false` | Enable process-local session bindings |
+| `session_affinity.enabled` | `false` | Enable session bindings |
+| `session_affinity.store` | Unset | Storage backend; required when enabled (`local` is currently supported) |
 | `session_affinity.header` | Unset | Session key header |
 | `session_affinity.cookie` | Unset | Session key cookie; fallback after the header |
 | `session_affinity.ttl_secs` | `3600` | Binding TTL in seconds, from `1` through `86400` |

@@ -213,11 +213,12 @@ impl Default for ReloadConfig {
 /// Subsequent requests with the same key reuse the bound candidate
 /// as long as it remains eligible and the binding has not expired.
 ///
-/// **Scope:** bindings are stored in-memory (single-process).
+/// **Scope:** bindings are stored in the selected store. The only currently
+/// supported store is in-memory (single-process).
 /// They are not shared across gateway instances and are lost on
 /// restart.  This is sufficient for the POC/demo scope.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, try_from = "RawSessionAffinityConfig")]
 struct SessionAffinityConfig {
     /// Name of a cookie to extract the session key from.
     cookie: Option<String>,
@@ -229,9 +230,62 @@ struct SessionAffinityConfig {
     /// Header name to extract the session key from.
     header: Option<String>,
 
+    /// Storage backend for session bindings. Required when affinity is enabled.
+    store: Option<SessionAffinityStore>,
+
     /// Binding TTL in seconds (default: 3600, max: 86400).
     #[serde(default = "default_ttl_secs")]
     ttl_secs: u64,
+}
+
+/// Session affinity binding store.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SessionAffinityStore {
+    /// Process-local storage backed by a concurrent map.
+    Local,
+}
+
+/// Raw session-affinity YAML shape converted after checking the store invariant.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSessionAffinityConfig {
+    /// Name of a cookie to extract the session key from.
+    cookie: Option<String>,
+
+    /// Whether session affinity is enabled (default: `false`).
+    #[serde(default)]
+    enabled: bool,
+
+    /// Header name to extract the session key from.
+    header: Option<String>,
+
+    /// Storage backend for session bindings. Required when affinity is enabled.
+    store: Option<SessionAffinityStore>,
+
+    /// Binding TTL in seconds (default: 3600, max: 86400).
+    #[serde(default = "default_ttl_secs")]
+    ttl_secs: u64,
+}
+
+impl TryFrom<RawSessionAffinityConfig> for SessionAffinityConfig {
+    type Error = String;
+
+    fn try_from(raw: RawSessionAffinityConfig) -> Result<Self, Self::Error> {
+        if raw.enabled && raw.store.is_none() {
+            return Err(
+                "intelligent_route: session_affinity.store is required when session affinity is enabled".into(),
+            );
+        }
+
+        Ok(Self {
+            cookie: raw.cookie,
+            enabled: raw.enabled,
+            header: raw.header,
+            store: raw.store,
+            ttl_secs: raw.ttl_secs,
+        })
+    }
 }
 
 /// Default session affinity TTL (1 hour).
@@ -835,6 +889,9 @@ fn build_session_affinity(config: Option<SessionAffinityConfig>) -> Result<Optio
     };
     if !cfg.enabled {
         return Ok(None);
+    }
+    if !matches!(cfg.store, Some(SessionAffinityStore::Local)) {
+        return Err("intelligent_route: session_affinity.store is required when session affinity is enabled".into());
     }
     validate_session_affinity_config(&cfg)?;
     let header = cfg
@@ -1602,7 +1659,7 @@ mod tests {
         let config = serde_json::json!({
             "overlay_file": path.to_string_lossy(),
             "reload": { "enabled": true, "debounce_ms": 10 },
-            "session_affinity": { "enabled": true, "header": "x-session-id" },
+            "session_affinity": { "enabled": true, "store": "local", "header": "x-session-id" },
         });
         let filter = IntelligentRouteFilter::from_config(&serde_yaml::to_value(config).unwrap()).unwrap();
 
@@ -3036,7 +3093,7 @@ mod tests {
 
     #[test]
     fn session_affinity_enabled_requires_source() {
-        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n";
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  store: local\n";
         let err = parse_err(yaml);
         assert!(
             err.to_string().contains("requires at least one"),
@@ -3045,8 +3102,28 @@ mod tests {
     }
 
     #[test]
+    fn session_affinity_enabled_requires_store() {
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  header: x-session-id\n";
+        let err = parse_err(yaml);
+        assert!(
+            err.to_string().contains("session_affinity.store is required"),
+            "enabled affinity without a store should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn session_affinity_rejects_unsupported_store() {
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  store: redis\n  header: x-session-id\n";
+        let err = parse_err(yaml);
+        assert!(
+            err.to_string().contains("unknown variant") || err.to_string().contains("expected"),
+            "unsupported affinity store should be rejected: {err}"
+        );
+    }
+
+    #[test]
     fn session_affinity_blank_header_rejected() {
-        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  header: \"   \"\n";
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  store: local\n  header: \"   \"\n";
         let err = parse_err(yaml);
         assert!(
             err.to_string().contains("requires at least one"),
@@ -3056,14 +3133,14 @@ mod tests {
 
     #[test]
     fn session_affinity_ttl_bounds() {
-        let yaml_zero = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  header: x-session-id\n  ttl_secs: 0\n";
+        let yaml_zero = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  store: local\n  header: x-session-id\n  ttl_secs: 0\n";
         let err = parse_err(yaml_zero);
         assert!(
             err.to_string().contains("ttl_secs must be"),
             "zero ttl should be rejected: {err}"
         );
 
-        let yaml_high = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  header: x-session-id\n  ttl_secs: 100000\n";
+        let yaml_high = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  store: local\n  header: x-session-id\n  ttl_secs: 100000\n";
         let err2 = parse_err(yaml_high);
         assert!(
             err2.to_string().contains("ttl_secs must be"),
@@ -3073,13 +3150,13 @@ mod tests {
 
     #[test]
     fn session_affinity_valid_with_header() {
-        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  header: x-session-id\n";
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  store: local\n  header: x-session-id\n";
         assert!(parse(yaml).is_ok(), "valid session_affinity with header should parse");
     }
 
     #[test]
     fn session_affinity_valid_with_cookie() {
-        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  cookie: session_id\n";
+        let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\nsession_affinity:\n  enabled: true\n  store: local\n  cookie: session_id\n";
         assert!(parse(yaml).is_ok(), "valid session_affinity with cookie should parse");
     }
 
@@ -3749,7 +3826,7 @@ mod tests {
     #[tokio::test]
     async fn reused_session_records_reused_outcome() {
         let f = parse(
-            "local_site: site-a\nsession_affinity:\n  enabled: true\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n",
+            "local_site: site-a\nsession_affinity:\n  enabled: true\n  store: local\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n",
         )
         .unwrap();
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
@@ -3772,7 +3849,7 @@ mod tests {
     fn decision_metrics_count_outcomes_selections_and_sessions() {
         let (_filter_kept_alive, snapshot) = metrics_emitted_by(async {
             let f = parse(
-                "local_site: site-a\nsession_affinity:\n  enabled: true\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n  - kind: inference_model\n    name: granite\n    site: site-a\n    cluster: inf-b\n    fresh: true\n",
+                "local_site: site-a\nsession_affinity:\n  enabled: true\n  store: local\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n  - kind: inference_model\n    name: granite\n    site: site-a\n    cluster: inf-b\n    fresh: true\n",
             )
             .unwrap();
             let _first = route_path_model_with_session(f.as_ref(), "llama", "session-1").await;
@@ -3874,7 +3951,7 @@ mod tests {
     #[tokio::test]
     async fn switching_capability_starts_a_new_binding_rather_than_a_failover() {
         let f = parse(
-            "local_site: site-a\nsession_affinity:\n  enabled: true\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n  - kind: inference_model\n    name: granite\n    site: site-a\n    cluster: inf-b\n    fresh: true\n",
+            "local_site: site-a\nsession_affinity:\n  enabled: true\n  store: local\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n  - kind: inference_model\n    name: granite\n    site: site-a\n    cluster: inf-b\n    fresh: true\n",
         )
         .unwrap();
         let _first = route_path_model_with_session(f.as_ref(), "llama", "sess-1").await;
@@ -3893,7 +3970,7 @@ mod tests {
     #[test]
     fn session_table_gauge_adds_up_across_instances_and_shrinks_on_drop() {
         let (_first_kept_alive, snapshot) = metrics_emitted_by(async {
-            let yaml = "local_site: site-a\nsession_affinity:\n  enabled: true\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n";
+            let yaml = "local_site: site-a\nsession_affinity:\n  enabled: true\n  store: local\n  header: x-session-id\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf-a\n    fresh: true\n";
             let first = parse(yaml).unwrap();
             let second = parse(yaml).unwrap();
             let _unused = route_path_model_with_session(first.as_ref(), "llama", "sess-1").await;
