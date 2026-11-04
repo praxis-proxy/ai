@@ -247,7 +247,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           # vllm-responses and vllm-live-cpu build the identical
           # standard,openai-all,store-sqlite proxy, but had no cache-suffix, so
@@ -454,7 +454,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           # Shares the store-sqlite rust-cache with vllm-responses (identical
           # standard,openai-all,store-sqlite proxy). See that job for rationale.
@@ -581,7 +581,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: pins-cargo
 
@@ -702,7 +702,7 @@ jobs:
           fi
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
 
       - name: Install uv for Anthropic SDK acceptance
         id: anthropic_sdk_uv
@@ -1358,7 +1358,7 @@ jobs:
           fi
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: codex-gpu-acceptance-cargo
 
@@ -1832,7 +1832,7 @@ jobs:
           done
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: opencode-gpu-acceptance
 
@@ -2297,7 +2297,7 @@ jobs:
           done
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: pi-gpu-acceptance
 
@@ -2747,7 +2747,7 @@ jobs:
           hugging-face-token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
 
       - name: Start PostgreSQL response store
         run: |
@@ -3149,7 +3149,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
 
       - name: Install uv
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
