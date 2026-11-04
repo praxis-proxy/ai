@@ -25,7 +25,9 @@ For a complete setup where the Praxis Policy Engine (`policy` filter) verifies a
 | `feature_key` | string | no | Entitlement feature key used in balance check URL path. |
 | `source` | string | no | `CloudEvents` `source` field value. |
 | `provider` | string | no | Static provider name attributed to emitted `CloudEvents`. |
-| `fail_open` | bool | no | When `true` (default), requests proceed if the metering service is unavailable. When `false`, requests are rejected with 503. |
+| `fail_open` | bool | no | When `true` (default), requests proceed if the metering service is unavailable. When `false`, requests are rejected with 503. This is the *billing* gate's availability policy. |
+| `model_policy_check` | bool | no | When `true`, the entitlement preflight also enforces the metering service's model-policy verdict (`modelAllowed` in the response): an explicit denial rejects with 403 before any provider request, regardless of `fail_open`. Disabled by default for compatibility with services that return only `hasAccess`. When enabled, every metered request needs a trusted tenant identity and a resolvable public model; the request body is pre-read (bounded by the standard JSON body limit) so the verdict is decided before provider dispatch. |
+| `model_policy_fail_open` | bool | no | Availability policy for the model-policy gate when `model_policy_check` is enabled, independent of the billing `fail_open`: when the model verdict is unavailable (missing, `null`, wrongly typed, unusable payload, non-2xx, timeout, transport error), `true` admits the request and `false` (default) rejects with 503. An explicit `modelAllowed: false` rejection is never affected by this setting. |
 | `identity_header_prefix` | string | no | Prefix for tenant identity headers to capture and strip. Expected headers: `{prefix}username`, `{prefix}group`, `{prefix}subscription`, `{prefix}model`, `{prefix}organization-id`, `{prefix}cost-center`. |
 | `identity_metadata_namespace` | string | no | Metadata namespace the `identity_header_guard` filter writes captured identity headers under. Must match that filter's `metadata_namespace` setting when both run in one pipeline. |
 | `identity_username_claim` | string | no | Custom claim on a policy/auth filter's verified identity (tier 0) to meter as the tenant username. When unset, the verified subject id is used. Only consulted when an upstream filter (e.g. the `policy` engine) published an `AuthenticatedIdentity` for the request. |
@@ -50,6 +52,8 @@ identity_header_prefix: "x-tenant-"
 identity_metadata_namespace: "identity"
 default_username: "anonymous"
 default_model: "unknown"
+model_policy_check: true
+model_policy_fail_open: false
 ```
 
 ### Example 2

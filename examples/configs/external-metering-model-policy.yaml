@@ -1,0 +1,81 @@
+# External Metering — Model Policy
+#
+# Same preflight as external-metering.yaml, with model-policy enforcement
+# enabled: the entitlement response's `modelAllowed` verdict decides whether
+# the tenant may use the requested public model, independently of budget.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/external-metering-model-policy.yaml
+#   curl -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -H "x-tenant-username: alice" \
+#     -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+#
+# Entitlement response contract (both verdicts are optional per gate, but a
+# missing one is never an implicit allow):
+#   {"hasAccess": true|false, "modelAllowed": true|false}
+#
+# Decision contract with model_policy_check enabled:
+#   - modelAllowed: false            -> 403 before any provider request,
+#                                       regardless of billing fail_open, and
+#                                       taking precedence over budget denial
+#   - hasAccess: false               -> 429 token budget exhausted
+#   - verdict unavailable (missing,  -> model_policy_fail_open decides:
+#     null, wrong type, unusable        503 by default (fail-closed); the
+#     payload, non-2xx, timeout,        setting is independent of the billing
+#     transport error)                  fail_open below
+#
+# Model resolution for the preflight: the trusted {prefix}model identity
+# header, then the model_to_provider client model, then the request body's
+# top-level "model" field (bounded pre-read). Reporting fallbacks
+# (default_username / default_model) are never authorized: when model policy
+# is enabled, a request without a trusted tenant identity or a resolvable
+# public model is rejected with 403 before dispatch.
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      - filter: external_metering
+        metering_url: "http://127.0.0.1:9090"
+        # The metering service in this example listens on loopback, a
+        # non-public address, so callouts must be explicitly opted in.
+        allow_private_endpoint: true
+        timeout_seconds: 5
+        feature_key: "inference-tokens"
+        source: "ai-gateway"
+        provider: "openai"
+        # Billing gate availability: admit when the metering service is
+        # unreachable or returns an unusable budget verdict.
+        fail_open: true
+        identity_header_prefix: "x-tenant-"
+        # Model-policy gate: enforce the modelAllowed verdict. Disabled by
+        # default; enabling it requires a trusted tenant identity and a
+        # resolvable public model on every metered request.
+        model_policy_check: true
+        # Model-gate availability, independent of billing fail_open above:
+        # fail closed (503) when the model verdict is unavailable. Set to
+        # true to admit instead — an explicit model denial still rejects.
+        model_policy_fail_open: false
+
+      - filter: token_count
+        provider: openai
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends
