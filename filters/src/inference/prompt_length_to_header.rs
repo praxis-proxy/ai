@@ -3,7 +3,7 @@
 
 //! Prompt-length routing fact derived from provider-neutral request content.
 
-use std::{borrow::Cow, collections::HashMap};
+use std::{borrow::Cow, collections::HashMap, fmt};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -13,7 +13,10 @@ use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::DEFAULT_JSON_BODY_MAX_BYTES,
     builtins::http::payload_processing::config_validation::validate_max_body_bytes, parse_filter_config,
 };
-use serde::Deserialize;
+use serde::{
+    Deserialize, Deserializer,
+    de::{IgnoredAny, MapAccess, SeqAccess, Visitor},
+};
 use serde_json::Value;
 
 /// Default header carrying the configured overflow route key.
@@ -26,6 +29,20 @@ const MAX_ROUTES: usize = 1024;
 const META_ESTIMATED_TOKENS: &str = "prompt_length_to_header.estimated_tokens";
 /// Metadata key carrying the selected overflow route.
 const META_OVERFLOW_ROUTE: &str = "prompt_length_to_header.overflow_route";
+/// Top-level fields whose nested strings contribute to the routing estimate.
+const PROMPT_FIELDS: [&str; 11] = [
+    "messages",
+    "prompt",
+    "input",
+    "system",
+    "instructions",
+    "tools",
+    "functions",
+    "response_format",
+    "text",
+    "output_config",
+    "output_format",
+];
 
 /// Deserialized configuration for prompt-length routing.
 #[derive(Debug, Deserialize)]
@@ -62,14 +79,22 @@ struct PromptLengthRoute {
     overflow: String,
 }
 
+/// Borrowed model lookup used to bypass full JSON allocation for unknown models.
+struct ModelProbe<'a>(Option<Cow<'a, str>>);
+
+/// A string value when present, or `None` after consuming any other JSON value.
+struct OptionalString<'a>(Option<Cow<'a, str>>);
+
 /// Estimates prompt length and promotes a route key when a model limit is exceeded.
 ///
 /// The estimate is deliberately provider-neutral and conservative. It counts
-/// text in common prompt-bearing fields (`messages`, `prompt`, `input`,
-/// `system`, and `instructions`). ASCII text is rounded up at three characters
-/// per token; non-ASCII text is charged at one token per UTF-8 byte so emoji
-/// and CJK input cannot be silently underestimated. It is a routing heuristic,
-/// not a billing or quota token count.
+/// text in common prompt-bearing and schema-bearing fields: `messages`,
+/// `prompt`, `input`, `system`, `instructions`, `tools`, `functions`,
+/// `response_format`, `text`, `output_config`, and `output_format`. ASCII text
+/// is rounded up at three characters per token; non-ASCII text is charged at
+/// one token per UTF-8 byte so emoji and CJK input cannot be silently
+/// underestimated. It is a routing heuristic, not a billing or quota token
+/// count.
 ///
 /// The filter removes any client-supplied copy of its output header before it
 /// publishes a derived value. A following core `router` can exact-match the
@@ -101,6 +126,19 @@ impl PromptLengthToHeaderFilter {
     ///
     /// Returns an error for an empty or duplicate route table, unsafe routing
     /// values, zero token limits, an unsafe header, or an invalid body limit.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use praxis_ai_filters::PromptLengthToHeaderFilter;
+    ///
+    /// let config = serde_yaml::from_str(
+    ///     "routes:\n  - model: small-model\n    max_input_tokens: 8192\n    overflow: large-context",
+    /// )
+    /// .unwrap();
+    /// let filter = PromptLengthToHeaderFilter::from_config(&config).unwrap();
+    /// assert_eq!(filter.name(), "prompt_length_to_header");
+    /// ```
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let config: PromptLengthToHeaderConfig = parse_filter_config("prompt_length_to_header", config)?;
         validate_max_body_bytes("prompt_length_to_header", config.max_body_bytes)?;
@@ -152,13 +190,13 @@ impl HttpFilter for PromptLengthToHeaderFilter {
         let Some(raw) = body.as_ref() else {
             return Ok(FilterAction::Continue);
         };
+        let Ok(ModelProbe(Some(model))) = serde_json::from_slice::<ModelProbe<'_>>(raw) else {
+            return Ok(FilterAction::Continue);
+        };
+        let Some(route) = self.routes.get(model.as_ref()) else {
+            return Ok(FilterAction::Continue);
+        };
         let Ok(value) = serde_json::from_slice::<Value>(raw) else {
-            return Ok(FilterAction::Continue);
-        };
-        let Some(model) = value.get("model").and_then(Value::as_str) else {
-            return Ok(FilterAction::Continue);
-        };
-        let Some(route) = self.routes.get(model) else {
             return Ok(FilterAction::Continue);
         };
 
@@ -171,6 +209,109 @@ impl HttpFilter for PromptLengthToHeaderFilter {
         }
 
         Ok(FilterAction::Continue)
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelProbe<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ModelProbeVisitor)
+    }
+}
+
+/// Visits only the top-level model field and skips every unrelated value.
+struct ModelProbeVisitor;
+
+impl<'de> Visitor<'de> for ModelProbeVisitor {
+    type Value = ModelProbe<'de>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object containing an optional model field")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut model = None;
+        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+            if key == "model" {
+                model = map.next_value::<OptionalString<'de>>()?.0;
+            } else {
+                let _ = map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(ModelProbe(model))
+    }
+}
+
+impl<'de> Deserialize<'de> for OptionalString<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(OptionalStringVisitor)
+    }
+}
+
+/// Retains a borrowed string and consumes non-string JSON without allocation.
+struct OptionalStringVisitor;
+
+impl<'de> Visitor<'de> for OptionalStringVisitor {
+    type Value = OptionalString<'de>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+
+    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E> {
+        Ok(OptionalString(Some(Cow::Borrowed(v))))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(OptionalString(Some(Cow::Owned(v.to_owned()))))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+        Ok(OptionalString(Some(Cow::Owned(v))))
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(OptionalString(None))
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(OptionalString(None))
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(OptionalString(None))
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(OptionalString(None))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(OptionalString(None))
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(OptionalString(None))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(OptionalString(None))
     }
 }
 
@@ -223,7 +364,7 @@ fn validate_route_value(field: &str, value: &str) -> Result<(), FilterError> {
 
 /// Estimate input tokens from provider-neutral prompt-bearing fields.
 fn estimate_prompt_tokens(body: &Value) -> usize {
-    ["messages", "prompt", "input", "system", "instructions"]
+    PROMPT_FIELDS
         .into_iter()
         .filter_map(|field| body.get(field))
         .fold(0_usize, |total, value| {
@@ -293,6 +434,24 @@ mod tests {
             "prompt": "mno"
         });
         assert_eq!(estimate_prompt_tokens(&body), 9);
+    }
+
+    #[test]
+    fn model_probe_uses_the_last_duplicate_model_value() {
+        let probe = serde_json::from_slice::<ModelProbe<'_>>(
+            br#"{"ignored":{"nested":[1,2,3]},"model":"old","model":"small-model"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(probe.0.as_deref(), Some("small-model"));
+    }
+
+    #[test]
+    fn model_probe_treats_a_non_string_last_model_as_missing() {
+        let probe =
+            serde_json::from_slice::<ModelProbe<'_>>(br#"{"model":"small-model","model":{"name":"other"}}"#).unwrap();
+
+        assert!(probe.0.is_none());
     }
 
     #[test]
@@ -368,6 +527,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_and_structured_output_fields_trigger_overflow() {
+        for field in [
+            "tools",
+            "functions",
+            "response_format",
+            "text",
+            "output_config",
+            "output_format",
+        ] {
+            let filter = PromptLengthToHeaderFilter::from_config(&config(2)).unwrap();
+            let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+            let mut context = crate::test_utils::make_filter_context(&request);
+            let mut body = Some(Bytes::from(format!(
+                r#"{{"model":"small-model","{field}":{{"schema":"a deliberately large schema"}}}}"#
+            )));
+
+            drop(filter.on_request_body(&mut context, &mut body, true).await.unwrap());
+
+            assert_eq!(
+                context.get_metadata(META_OVERFLOW_ROUTE),
+                Some("large-context"),
+                "field {field} should contribute to the estimate"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn small_prompt_stays_on_default_route() {
         let filter = PromptLengthToHeaderFilter::from_config(&config(100)).unwrap();
         let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
@@ -401,6 +587,27 @@ mod tests {
                 .any(|name| name == "x-prompt-route")
         );
         assert!(context.extra_request_headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_or_missing_models_continue_without_promoting() {
+        for raw in [
+            b"not json".as_slice(),
+            b"[]".as_slice(),
+            b"{}".as_slice(),
+            br#"{"model":42,"prompt":"large"}"#.as_slice(),
+        ] {
+            let filter = PromptLengthToHeaderFilter::from_config(&config(1)).unwrap();
+            let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+            let mut context = crate::test_utils::make_filter_context(&request);
+            let mut body = Some(Bytes::copy_from_slice(raw));
+
+            let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+            assert!(matches!(action, FilterAction::Continue));
+            assert!(context.extra_request_headers.is_empty());
+            assert_eq!(context.get_metadata(META_ESTIMATED_TOKENS), None);
+        }
     }
 
     #[tokio::test]
