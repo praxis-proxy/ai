@@ -17,13 +17,12 @@
 //!
 //! - A pre-routing fact publisher (`initialize_state: false`) classifies the body and promotes the model, stream,
 //!   store, and stateful/stateless mode facts the router needs. It mints no identifiers and enforces no managed-path
-//!   policy, so provider-owned traffic the router may still bind to a direct upstream keeps its fields intact. The
-//!   shared classification pass does reject `code_interpreter` before routing because this gateway does not execute
-//!   that tool. It caches its one parse in request extensions for a later managed pass to reuse; on a chain with no
-//!   managed owner that cache is released, unconsumed, when the request ends.
-//! - The managed owner (`initialize_state: true`, the default) additionally rejects `background=true` and non-null
-//!   `prompt` — which Praxis does not implement on gateway-managed paths — and builds [`ResponsesState`]. When a
-//!   pre-routing pass cached its parse, the managed pass reuses it rather than deserializing the body a second time.
+//!   policy, so provider-owned traffic the router may still bind to a direct upstream keeps its fields intact. It
+//!   caches its one parse in request extensions for a later managed pass to reuse; on a chain with no managed owner
+//!   that cache is released, unconsumed, when the request ends.
+//! - The managed owner (`initialize_state: true`, the default) rejects `code_interpreter`, `background=true`, and
+//!   non-null `prompt` — which Praxis does not implement on gateway-managed paths — and builds [`ResponsesState`]. When
+//!   a pre-routing pass cached its parse, the managed pass reuses it rather than deserializing the body a second time.
 //!
 //! Classification metadata is published under this filter's `openai_responses_request`
 //! namespace, which downstream filters read. Filter results are published under
@@ -81,10 +80,10 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// and the `WebSocket` handshake — are released untouched, as is Conversations
 /// API traffic. `on_invalid` governs only bodies that fail to parse.
 ///
-/// Rejects `code_interpreter` with a 400 in both pre-routing and managed roles
-/// because the gateway does not execute that tool. The managed owner also
-/// rejects `background=true` and non-null `prompt` with a 400, the managed-path
-/// policy this filter now owns. A non-null `prompt` is the
+/// On managed paths, rejects `code_interpreter`, `background=true`, and non-null
+/// `prompt` with a 400 because the gateway does not implement them. The
+/// pre-routing fact publisher leaves these fields intact for direct upstreams.
+/// A non-null `prompt` is the
 /// deprecated OpenAI reusable prompt object (`{ id, version, variables }`);
 /// OpenAI retires reusable prompts and `v1/prompts` on 2026-11-30, so clients
 /// should move its content into `input` rather than rely on the gateway to
@@ -135,6 +134,9 @@ impl OpenaiResponsesRequestFilter {
         } = cached;
 
         if let Some(action) = reject_unsupported_managed_fields(&classified, &parsed) {
+            return action;
+        }
+        if let Some(action) = reject_unsupported_responses_tools(&parsed) {
             return action;
         }
         if let Some(action) = reject_conflicting_history_selectors(&parsed) {
@@ -197,10 +199,6 @@ impl OpenaiResponsesRequestFilter {
             Ok(pair) => pair,
             Err(format) => return handle_unclassifiable(ctx, format, &self.config.shared),
         };
-
-        if let Some(action) = reject_unsupported_responses_tools(&parsed) {
-            return Ok(action);
-        }
 
         // Routing facts are published for every entry, in whichever phase it
         // runs, so the router and downstream consumers read the same
@@ -725,7 +723,7 @@ fn reject_conflicting_history_selectors(body: &serde_json::Value) -> Option<Filt
     })
 }
 
-/// Reject Responses hosted tools the gateway cannot execute before routing.
+/// Reject Responses hosted tools the gateway cannot execute on managed paths.
 fn reject_unsupported_responses_tools(body: &serde_json::Value) -> Option<FilterAction> {
     let has_code_interpreter = body
         .get("tools")

@@ -1171,8 +1171,11 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
         if request_body and request_body.get("background") is True:
             self._send_background_response(request_body)
             return
-        if request_body and request_body.get("prompt") is not None:
-            self._send_prompt_response(request_body)
+        if request_body and (
+            request_body.get("prompt") is not None
+            or any(tool.get("type") == "code_interpreter" for tool in (request_body.get("tools") or []))
+        ):
+            self._send_provider_owned_response(request_body)
             return
         if request_body and request_body.get("model") in {
             "sdk-conversation-stream",
@@ -1253,8 +1256,8 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
         self.wfile.flush()
 
-    def _send_prompt_response(self, request_body):
-        """Serve an OpenAI-owned prompt-template response."""
+    def _send_provider_owned_response(self, request_body):
+        """Serve a deterministic response for OpenAI-owned capabilities."""
         response = {
             "id": f"resp_sdk_prompt_{time.time_ns()}",
             "object": "response",
@@ -2460,11 +2463,11 @@ def reasoning_capture_client(tmp_path_factory, request):
 
 @pytest.fixture()
 def code_interpreter_capture_client(tmp_path_factory, request):
-    """Capture SDK requests with either the pre-routing or managed request filter."""
+    """Capture managed SDK requests with or without a preceding facts-only pass."""
     yield from _reasoning_capture_session(
         tmp_path_factory,
         request,
-        pre_routing_filter=request.param == "pre-routing",
+        pre_routing_filter=request.param == "two-phase",
         reasoning_dialect="vllm",
     )
 
@@ -2586,15 +2589,15 @@ def web_search_chat_streaming_client(web_search_chat_streaming_proxy):
 
 @pytest.mark.parametrize(
     "code_interpreter_capture_client",
-    ["pre-routing", "managed"],
+    ["two-phase", "managed"],
     indirect=True,
-    ids=["pre-routing-role", "managed-role"],
+    ids=["pre-routing-and-managed", "managed-only"],
 )
 @pytest.mark.parametrize("stream", [False, True], ids=["finite", "streaming"])
 def test_code_interpreter_is_rejected_before_backend_contact(
     code_interpreter_capture_client, stream
 ):
-    """Unsupported tools fail through the SDK before any backend request."""
+    """Managed requests reject unsupported tools with either request-filter layout."""
     client, forwarded = code_interpreter_capture_client
 
     with pytest.raises(BadRequestError) as error:
@@ -2636,6 +2639,32 @@ def test_code_interpreter_is_rejected_before_backend_contact(
     assert len(forwarded) == 1, "only the supported-tool request must reach the backend"
     assert forwarded[0]["tools"][0]["function"]["name"] == "lookup", (
         "the supported function tool must be preserved in the backend request"
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["finite", "streaming"])
+def test_openai_bound_code_interpreter_is_forwarded_unchanged(witness_backend_client, stream):
+    """Direct OpenAI routes preserve Code Interpreter through the stock full-flow pipeline."""
+    client, forwarded = witness_backend_client
+    request_body = {
+        "model": "gpt-5",
+        "input": "Compute 1 + 1.",
+        "store": False,
+        "stream": stream,
+        "tools": [{"type": "code_interpreter", "container": {"type": "auto"}}],
+    }
+
+    response = client.responses.create(**request_body)
+    if stream:
+        events = list(response)
+        assert [event.type for event in events] == ["response.created", "response.completed"], (
+            "direct OpenAI streams must retain the provider's response lifecycle"
+        )
+        response = events[-1].response
+
+    assert response.status == "completed", "direct OpenAI requests must receive the provider's response"
+    assert forwarded == [request_body], (
+        "the direct OpenAI route must forward the complete Code Interpreter request unchanged"
     )
 
 

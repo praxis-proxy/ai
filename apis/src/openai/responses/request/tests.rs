@@ -264,8 +264,12 @@ fn assert_prompt_template_rejection(action: FilterAction) {
 
 /// Assert that Code Interpreter is rejected with the gateway's OpenAI error envelope.
 fn assert_unsupported_tool_rejection(action: FilterAction) {
+    assert!(
+        matches!(&action, FilterAction::Reject(_)),
+        "unsupported Responses tools must be rejected before upstream contact"
+    );
     let FilterAction::Reject(rejection) = action else {
-        panic!("unsupported Responses tools must be rejected before upstream contact");
+        unreachable!("the assertion above requires a rejection");
     };
     assert_eq!(
         rejection.status, 400,
@@ -289,34 +293,45 @@ fn assert_unsupported_tool_rejection(action: FilterAction) {
     );
 }
 
-/// Both roles must reject unsupported tools before state creation, regardless of streaming.
-#[tokio::test]
-async fn code_interpreter_is_rejected_in_both_filter_roles_and_stream_modes() {
-    for initialize_state in [true, false] {
-        let request_filter = if initialize_state {
-            default_filter()
-        } else {
-            filter("initialize_state: false")
-        };
+/// Build a Code Interpreter request in either stream mode.
+fn code_interpreter_body(model: &str, stream: bool) -> Bytes {
+    Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": model,
+            "input": "Compute 1 + 1.",
+            "stream": stream,
+            "tools": [{"type": "code_interpreter", "container": {"type": "auto"}}]
+        }))
+        .unwrap(),
+    )
+}
 
+/// The managed owner must reject unsupported tools with either a fresh or cached parse.
+#[tokio::test]
+async fn code_interpreter_is_rejected_only_by_the_managed_owner() {
+    for pre_routing in [false, true] {
         for stream in [false, true] {
             let request = create_request();
             let mut ctx = classified_context(&request).await;
-            let original = json!({
-                "model": "gpt-4.1",
-                "input": "Compute 1 + 1.",
-                "stream": stream,
-                "tools": [{"type": "code_interpreter", "container": {"type": "auto"}}]
-            });
-            let original_bytes = serde_json::to_vec(&original).unwrap();
-            let mut body = Some(Bytes::from(original_bytes.clone()));
+            let original = code_interpreter_body("gpt-4.1", stream);
+            let mut body = Some(original.clone());
 
-            let action = request_filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+            if pre_routing {
+                let facts = filter("initialize_state: false");
+                let action = facts.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+                assert!(
+                    matches!(action, FilterAction::Release),
+                    "the facts-only pass must leave tool policy to the selected provider"
+                );
+            }
+
+            let managed = default_filter();
+            let action = managed.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
             assert_unsupported_tool_rejection(action);
             assert_eq!(
                 body.as_deref(),
-                Some(original_bytes.as_slice()),
+                Some(original.as_ref()),
                 "rejecting an unsupported tool must leave the request body unchanged"
             );
             assert!(
@@ -327,9 +342,43 @@ async fn code_interpreter_is_rejected_in_both_filter_roles_and_stream_modes() {
     }
 }
 
+/// A facts-only chain must preserve provider-owned tools, even across repeated classification.
+#[tokio::test]
+async fn code_interpreter_is_preserved_by_facts_only_passes() {
+    let facts = filter("initialize_state: false");
+    for stream in [false, true] {
+        let request = create_request();
+        let mut ctx = classified_context(&request).await;
+        let original = code_interpreter_body("gpt-5", stream);
+        let mut body = Some(original.clone());
+
+        for _ in 0..2 {
+            let action = facts.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+            assert!(
+                matches!(action, FilterAction::Release),
+                "facts-only passes must preserve Code Interpreter for the selected provider"
+            );
+            assert_eq!(
+                body.as_deref(),
+                Some(original.as_ref()),
+                "facts-only passes must forward provider-owned tool declarations unchanged"
+            );
+            assert_eq!(
+                ctx.get_metadata("openai_responses_request.model"),
+                Some("gpt-5"),
+                "Code Interpreter must not suppress the facts needed to route to OpenAI"
+            );
+            assert!(
+                ctx.extensions.get::<ResponsesState>().is_none(),
+                "facts-only passes must not initialize managed state"
+            );
+        }
+    }
+}
+
 /// The hosted-tool restriction must preserve client-owned function tools in either role.
 #[tokio::test]
-async fn supported_function_tool_is_not_rejected_by_shared_tool_policy() {
+async fn supported_function_tool_is_not_rejected_by_managed_tool_policy() {
     for initialize_state in [true, false] {
         let request_filter = if initialize_state {
             default_filter()
