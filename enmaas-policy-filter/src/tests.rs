@@ -12,7 +12,7 @@ use praxis_filter::FilterRegistry;
 use crate::{
     config::EnmaasPolicyConfig,
     filter::EnmaasPolicyFilter,
-    policy::{DenyReason, PolicyDecision},
+    policy::{DenyReason, MeteringEntitlement},
 };
 
 #[test]
@@ -25,43 +25,39 @@ fn exports_enmaas_policy() {
 #[test]
 fn parses_minimal_config() {
     let yaml: serde_yaml::Value =
-        serde_yaml::from_str("policy_url: http://127.0.0.1:1\nallow_private_endpoint: true\n").expect("config yaml");
+        serde_yaml::from_str("metering_url: http://127.0.0.1:1\nallow_private_endpoint: true\n").expect("config yaml");
     let filter = EnmaasPolicyFilter::from_config(&yaml).expect("filter builds");
     assert_eq!(filter.name(), "enmaas_policy");
 }
 
 #[test]
-fn parses_policy_decision() {
-    let decision: PolicyDecision = serde_json::from_str(
+fn parses_metering_entitlement() {
+    let entitlement: MeteringEntitlement = serde_json::from_str(
         r#"{
-            "version": 1,
-            "allowed": false,
+            "hasAccess": false,
+            "modelAllowed": false,
             "denyReason": "model_not_allowed",
+            "quotaRetryAfter": 12,
             "qosClass": "ratelimit",
             "qosSubject": "subject-1",
-            "retryAfterSeconds": 12,
-            "qosKeyAlias": "main",
-            "cacheTtlSeconds": 3
+            "qosRetryAfter": 17,
+            "qosKeyAlias": "main"
         }"#,
     )
-    .expect("decision parses");
+    .expect("entitlement parses");
+    let decision = entitlement.into_decision("main", "premium", "main", "main");
     assert!(!decision.allowed);
     assert_eq!(decision.deny_reason, Some(DenyReason::ModelNotAllowed));
     assert_eq!(decision.normalized_class("main"), "ratelimit");
-    assert_eq!(decision.retry_after_seconds, Some(12));
-}
-
-#[test]
-fn rejects_unknown_decision_fields() {
-    let decision =
-        serde_json::from_str::<PolicyDecision>(r#"{"version":1,"allowed":true,"qosClass":"main","extra":1}"#);
-    assert!(decision.is_err());
+    assert_eq!(decision.retry_after_seconds, Some(17));
+    assert_eq!(decision.qos_key_alias.as_deref(), Some("main"));
 }
 
 #[test]
 fn defaults_are_stable() {
     let config: EnmaasPolicyConfig =
-        serde_yaml::from_str("policy_url: http://127.0.0.1:1\nallow_private_endpoint: true\n").expect("config parses");
+        serde_yaml::from_str("metering_url: http://127.0.0.1:1\nallow_private_endpoint: true\n")
+            .expect("config parses");
     assert!(config.enabled);
     assert!(config.fail_open);
     assert_eq!(config.default_class, "main");
@@ -70,7 +66,9 @@ fn defaults_are_stable() {
     assert_eq!(config.model_metadata, "model_to_provider.client_model");
     assert_eq!(config.timeout_seconds, 1);
     assert_eq!(config.response_class_header, "x-enmaas-qos-class");
+    assert_eq!(config.metering_feature_key, "inference-tokens");
     assert!(matches!(config.credential_mode, crate::config::CredentialMode::Off));
+    assert_eq!(config.qos_clusters, vec!["cb-glm".to_owned()]);
 }
 
 use std::{
@@ -104,7 +102,7 @@ fn make_filter_context(req: &Request) -> HttpFilterContext<'_> {
         branch_iterations: std::collections::HashMap::new(),
         grpc_completion: None,
         client_addr: None,
-        cluster: None,
+        cluster: Some(Arc::from("cb-glm")),
         current_filter_id: None,
         downstream_tls: false,
         extensions: RequestExtensions::default(),
@@ -189,7 +187,7 @@ fn mock_policy(body: &'static str) -> (String, Arc<Mutex<String>>, thread::JoinH
         );
         stream.write_all(response.as_bytes()).expect("write policy response");
     });
-    (format!("http://{address}/v1/policy/decide"), captured, handle)
+    (format!("http://{address}"), captured, handle)
 }
 
 fn build_filter(policy_url: &str) -> Box<dyn HttpFilter> {
@@ -198,7 +196,7 @@ fn build_filter(policy_url: &str) -> Box<dyn HttpFilter> {
 
 fn build_filter_with(policy_url: &str, extra: &str) -> Box<dyn HttpFilter> {
     let yaml = serde_yaml::from_str(&format!(
-        "policy_url: {policy_url}\nallow_private_endpoint: true\n{extra}"
+        "metering_url: {policy_url}\nallow_private_endpoint: true\n{extra}"
     ))
     .expect("filter yaml");
     EnmaasPolicyFilter::from_config(&yaml).expect("filter builds")
@@ -207,7 +205,7 @@ fn build_filter_with(policy_url: &str, extra: &str) -> Box<dyn HttpFilter> {
 #[tokio::test]
 async fn callout_uses_body_model_and_publishes_class() {
     let (policy_url, captured, handle) = mock_policy(
-        r#"{"version":1,"allowed":true,"qosClass":"main","qosSubject":"subject-1","qosKeyAlias":"main","cacheTtlSeconds":5}"#,
+        r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"main","qosSubject":"subject-1","qosKeyAlias":"main"}"#,
     );
     let filter = build_filter(&policy_url);
     let request = make_request(Method::POST, "/v1/chat/completions");
@@ -222,7 +220,7 @@ async fn callout_uses_body_model_and_publishes_class() {
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(ctx.get_metadata("qos.class"), Some("main"));
     assert_eq!(ctx.get_metadata("qos.subject"), Some("subject-1"));
-    assert!(captured.lock().expect("capture lock").contains("\"model\":\"model-a\""));
+    assert!(captured.lock().expect("capture lock").contains("model=model-a"));
     handle.join().expect("mock policy thread");
 
     let mut response = Response {
@@ -244,7 +242,7 @@ async fn callout_uses_body_model_and_publishes_class() {
 #[tokio::test]
 async fn model_denial_rejects_with_403() {
     let (policy_url, _captured, handle) =
-        mock_policy(r#"{"version":1,"allowed":false,"denyReason":"model_not_allowed","qosClass":"main"}"#);
+        mock_policy(r#"{"hasAccess":true,"modelAllowed":false,"denyReason":"model_not_allowed","qosClass":"main"}"#);
     let filter = build_filter(&policy_url);
     let request = make_request(Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&request);
@@ -272,7 +270,7 @@ async fn model_denial_rejects_with_403() {
 #[tokio::test]
 async fn quota_denial_uses_retry_after() {
     let (policy_url, _captured, handle) = mock_policy(
-        r#"{"version":1,"allowed":false,"denyReason":"quota_exhausted","qosClass":"main","qosSubject":"subject-1","retryAfterSeconds":42,"cacheTtlSeconds":0}"#,
+        r#"{"hasAccess":false,"modelAllowed":true,"denyReason":"quota_exhausted","qosClass":"main","qosSubject":"subject-1","quotaRetryAfter":42}"#,
     );
     let filter = build_filter(&policy_url);
     let request = make_request(Method::POST, "/v1/chat/completions");
@@ -301,7 +299,7 @@ async fn quota_denial_uses_retry_after() {
 #[tokio::test]
 async fn hard_ratelimit_rejects_with_policy_retry() {
     let (policy_url, _captured, handle) = mock_policy(
-        r#"{"version":1,"allowed":true,"qosClass":"ratelimit","qosSubject":"subject-1","retryAfterSeconds":17,"cacheTtlSeconds":0}"#,
+        r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"ratelimit","qosSubject":"subject-1","qosRetryAfter":17}"#,
     );
     let filter = build_filter_with(&policy_url, "qos_enforcement: hard\n");
     let request = make_request(Method::POST, "/v1/chat/completions");
@@ -330,7 +328,7 @@ async fn hard_ratelimit_rejects_with_policy_retry() {
 #[tokio::test]
 async fn soft_ratelimit_passes_and_publishes_class() {
     let (policy_url, _captured, handle) = mock_policy(
-        r#"{"version":1,"allowed":true,"qosClass":"ratelimit","qosSubject":"subject-1","retryAfterSeconds":17,"cacheTtlSeconds":0}"#,
+        r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"ratelimit","qosSubject":"subject-1","qosRetryAfter":17}"#,
     );
     let filter = build_filter(&policy_url);
     let request = make_request(Method::POST, "/v1/chat/completions");
@@ -347,7 +345,7 @@ async fn soft_ratelimit_passes_and_publishes_class() {
 #[tokio::test]
 async fn local_bucket_rejects_after_burst() {
     let (policy_url, _captured, handle) =
-        mock_policy(r#"{"version":1,"allowed":true,"qosClass":"main","qosSubject":"subject-1","cacheTtlSeconds":5}"#);
+        mock_policy(r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"main","qosSubject":"subject-1"}"#);
     let filter = build_filter_with(
         &policy_url,
         "qos_enforcement: hard\nmain_burst: 1\nmain_refill_per_second: 0.001\n",
@@ -375,7 +373,7 @@ async fn class_key_alias_is_injected() {
     let key_file = tempfile::NamedTempFile::new().expect("temp key file");
     std::fs::write(key_file.path(), r#"{"main":[{"id":"main-0","key":"secret-main"}]}"#).expect("write key file");
     let (policy_url, _captured, handle) = mock_policy(
-        r#"{"version":1,"allowed":true,"qosClass":"main","qosSubject":"subject-1","qosKeyAlias":"main","cacheTtlSeconds":0}"#,
+        r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"main","qosSubject":"subject-1","qosKeyAlias":"main"}"#,
     );
     let extra = format!("credential_mode: active\nkey_file: {}\n", key_file.path().display());
     let filter = build_filter_with(&policy_url, &extra);
@@ -404,7 +402,7 @@ async fn shadow_injects_main_key_for_premium_request() {
     )
     .expect("write key file");
     let (policy_url, _captured, handle) = mock_policy(
-        r#"{"version":1,"allowed":true,"qosClass":"premium","qosSubject":"subject-1","qosKeyAlias":"premium","cacheTtlSeconds":0}"#,
+        r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"premium","qosSubject":"subject-1","qosKeyAlias":"premium"}"#,
     );
     let extra = format!("credential_mode: shadow\nkey_file: {}\n", key_file.path().display());
     let filter = build_filter_with(&policy_url, &extra);
@@ -427,7 +425,7 @@ async fn shadow_injects_main_key_for_premium_request() {
 #[tokio::test]
 async fn off_does_not_inject_credentials() {
     let (policy_url, _captured, handle) = mock_policy(
-        r#"{"version":1,"allowed":true,"qosClass":"premium","qosSubject":"subject-1","qosKeyAlias":"premium","cacheTtlSeconds":0}"#,
+        r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"premium","qosSubject":"subject-1","qosKeyAlias":"premium"}"#,
     );
     let filter = build_filter_with(&policy_url, "credential_mode: off\n");
     let request = make_request(Method::POST, "/v1/chat/completions");
@@ -445,7 +443,7 @@ async fn off_does_not_inject_credentials() {
 #[tokio::test]
 async fn buffered_body_model_is_authoritative_when_metadata_is_absent() {
     let (policy_url, captured, handle) =
-        mock_policy(r#"{"version":1,"allowed":true,"qosClass":"main","qosSubject":"subject-1","cacheTtlSeconds":0}"#);
+        mock_policy(r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"main","qosSubject":"subject-1"}"#);
     let filter = build_filter(&policy_url);
     let request = make_request(Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&request);
@@ -455,11 +453,66 @@ async fn buffered_body_model_is_authoritative_when_metadata_is_absent() {
 
     let action = filter.on_request(&mut ctx).await.expect("policy request");
     assert!(matches!(action, FilterAction::Continue));
-    assert!(
-        captured
-            .lock()
-            .expect("capture lock")
-            .contains("\"model\":\"body-model\"")
+    assert!(captured.lock().expect("capture lock").contains("model=body-model"));
+    handle.join().expect("mock policy thread");
+}
+
+
+#[tokio::test]
+async fn qos_scope_does_not_enforce_ratelimit_on_external_cluster() {
+    let (policy_url, _captured, handle) = mock_policy(
+        r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"ratelimit","qosSubject":"subject-1","qosRetryAfter":17}"#,
     );
+    let filter = build_filter_with(&policy_url, "qos_enforcement: hard\n");
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.cluster = Some(Arc::from("openai"));
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.get_metadata("qos.class"), None);
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn qos_scope_does_not_bucket_external_cluster() {
+    let (policy_url, _captured, handle) =
+        mock_policy(r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"main","qosSubject":"subject-1"}"#);
+    let filter = build_filter_with(
+        &policy_url,
+        "qos_enforcement: hard\nmain_burst: 1\nmain_refill_per_second: 0.001\n",
+    );
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    for _ in 0..2 {
+        let mut ctx = make_filter_context(&request);
+        ctx.cluster = Some(Arc::from("openai"));
+        ctx.set_metadata("x-tenant-username", "alice");
+        ctx.set_metadata("model_to_provider.client_model", "model-a");
+        let action = filter.on_request(&mut ctx).await.expect("policy request");
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(ctx.get_metadata("qos.class"), None);
+    }
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn quota_denial_remains_global_for_external_cluster() {
+    let (policy_url, _captured, handle) = mock_policy(
+        r#"{"hasAccess":false,"modelAllowed":true,"denyReason":"quota_exhausted","qosClass":"main","qosSubject":"subject-1","quotaRetryAfter":42}"#,
+    );
+    let filter = build_filter(&policy_url);
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.cluster = Some(Arc::from("openai"));
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    match action {
+        FilterAction::Reject(rejection) => assert_eq!(rejection.status, 429),
+        other => panic!("expected quota rejection, got {other:?}"),
+    }
     handle.join().expect("mock policy thread");
 }

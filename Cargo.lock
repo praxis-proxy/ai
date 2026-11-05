@@ -1454,6 +1454,7 @@ dependencies = [
  "dashmap",
  "http",
  "metrics",
+ "percent-encoding",
  "praxis-ai-apis",
  "praxis-proxy-core",
  "praxis-proxy-filter",

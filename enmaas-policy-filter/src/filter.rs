@@ -17,11 +17,9 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::{
-    HeaderName, HeaderValue,
-    header::{AUTHORIZATION, CONTENT_TYPE},
-};
+use http::{HeaderName, HeaderValue, header::AUTHORIZATION};
 use metrics::{counter, histogram};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use praxis_ai_apis::{
     callout_target::AddressPolicy,
     subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
@@ -39,10 +37,21 @@ use crate::{
     config::{CredentialMode, EnmaasPolicyConfig, QosEnforcement, validate_config},
     events::{EventReporter, RequestState, store_state, take_state, update_response},
     keys::{KeyRing, SelectedKey},
-    policy::{CachedDecision, DenyReason, PolicyDecision, PolicyIdentity, PolicyRequest},
+    policy::{CachedDecision, DenyReason, MeteringEntitlement, PolicyDecision},
 };
 
 const MAX_POLICY_RESPONSE_BYTES: usize = 64 * 1024;
+const PATH_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}');
+const QUERY_VALUE: &AsciiSet = &PATH_SEGMENT.add(b'&').add(b'=').add(b'+');
 const STATUS_BUDGET_EXHAUSTED: u16 = 429;
 const STATUS_MODEL_DENIED: u16 = 403;
 const STATUS_POLICY_UNAVAILABLE: u16 = 503;
@@ -52,11 +61,12 @@ pub(crate) struct EnmaasPolicyFilter {
     config: EnmaasPolicyConfig,
     address_policy: AddressPolicy,
     client: SubRequestClient,
-    policy_auth_token: Option<HeaderValue>,
+    metering_auth_token: Option<HeaderValue>,
     promoted_model_header: HeaderName,
     response_class_header: Option<HeaderName>,
     credential_header: HeaderName,
     key_clusters: Vec<String>,
+    qos_clusters: Vec<String>,
     keys: KeyRing,
     events: EventReporter,
     buckets: LocalBuckets,
@@ -73,7 +83,6 @@ impl EnmaasPolicyFilter {
         } else {
             AddressPolicy::PublicOnly
         };
-        let policy_auth_token = config.policy_auth_token()?;
         let metering_auth_token = config.metering_auth_token()?;
         let promoted_model_header = config.promoted_model_header_name()?;
         let response_class_header = config.response_class_header_name()?;
@@ -93,7 +102,7 @@ impl EnmaasPolicyFilter {
             &config.metering_url,
             config.timeout(),
             address_policy,
-            metering_auth_token,
+            metering_auth_token.clone(),
             config.source.clone(),
             config.provider.clone(),
             config.default_model.clone(),
@@ -106,10 +115,11 @@ impl EnmaasPolicyFilter {
 
         Ok(Box::new(Self {
             key_clusters: config.key_clusters.clone(),
+            qos_clusters: config.qos_clusters.clone(),
             config,
             address_policy,
             client,
-            policy_auth_token,
+            metering_auth_token,
             promoted_model_header,
             response_class_header,
             credential_header,
@@ -152,6 +162,12 @@ impl EnmaasPolicyFilter {
             .is_some_and(|cluster| self.key_clusters.iter().any(|candidate| candidate == cluster))
     }
 
+    fn applies_to_qos_cluster(&self, ctx: &HttpFilterContext<'_>) -> bool {
+        ctx.cluster
+            .as_deref()
+            .is_some_and(|cluster| self.qos_clusters.iter().any(|candidate| candidate == cluster))
+    }
+
     async fn cached(&self, key: &str) -> Option<PolicyDecision> {
         if self.config.decision_cache_ttl_seconds == 0 {
             return None;
@@ -187,43 +203,31 @@ impl EnmaasPolicyFilter {
         );
     }
 
-    async fn fetch_decision(
-        &self,
-        username: &str,
-        group: &str,
-        subscription: &str,
-        model: &str,
-        path: &str,
-    ) -> Result<PolicyDecision, String> {
-        let request = PolicyRequest {
-            version: 1,
-            identity: PolicyIdentity {
-                username,
-                group,
-                subscription,
-            },
-            model,
-            path,
-        };
-        let body = serde_json::to_vec(&request).map_err(|error| format!("request serialization failed: {error}"))?;
+    async fn fetch_decision(&self, username: &str, model: &str) -> Result<PolicyDecision, String> {
+        let customer = utf8_percent_encode(username, PATH_SEGMENT);
+        let feature = utf8_percent_encode(&self.config.metering_feature_key, PATH_SEGMENT);
+        let model_value = utf8_percent_encode(model, QUERY_VALUE);
+        let url = format!(
+            "{}/api/v1/customers/{customer}/entitlements/{feature}/value?model={model_value}",
+            self.config.metering_url.trim_end_matches('/')
+        );
 
         let mut headers = http::HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if let Some(token) = &self.policy_auth_token {
+        if let Some(token) = &self.metering_auth_token {
             headers.insert(AUTHORIZATION, token.clone());
         }
 
         let request = SubRequest {
-            method: http::Method::POST,
+            method: http::Method::GET,
             uri: http::Uri::default(),
             headers,
-            body: Bytes::from(body),
+            body: Bytes::new(),
         };
 
         let started = Instant::now();
         let response: SubResponse = subrequest::execute_configured_url(
             &self.client,
-            &self.config.policy_url,
+            &url,
             request,
             MAX_POLICY_RESPONSE_BYTES,
             self.config.timeout(),
@@ -232,17 +236,20 @@ impl EnmaasPolicyFilter {
         .await
         .map_err(|error| describe_subrequest_error(&error))?;
         histogram!("enmaas_policy_callout_duration_seconds").record(started.elapsed().as_secs_f64());
+        histogram!("enmaas_policy_metering_duration_seconds").record(started.elapsed().as_secs_f64());
 
         if !(200..300).contains(&response.status) {
-            return Err(format!("policy service returned HTTP {}", response.status));
+            return Err(format!("metering service returned HTTP {}", response.status));
         }
 
-        let decision: PolicyDecision = serde_json::from_slice(&response.body)
-            .map_err(|error| format!("policy response was not valid JSON: {error}"))?;
-        if decision.version != 1 {
-            return Err(format!("unsupported policy version {}", decision.version));
-        }
-        Ok(decision)
+        let entitlement: MeteringEntitlement = serde_json::from_slice(&response.body)
+            .map_err(|error| format!("metering response was not valid JSON: {error}"))?;
+        Ok(entitlement.into_decision(
+            &self.config.default_class,
+            &self.config.key_alias_premium,
+            &self.config.key_alias_main,
+            &self.config.key_alias_ratelimit,
+        ))
     }
 
     fn apply_decision(
@@ -259,13 +266,16 @@ impl EnmaasPolicyFilter {
             .filter(|value| !value.is_empty())
             .unwrap_or(username)
             .to_owned();
-        ctx.set_metadata(self.config.class_metadata.as_str(), class.clone());
-        ctx.set_metadata(self.config.subject_metadata.as_str(), subject.clone());
-        if let Some(retry_after) = decision.retry_after_seconds {
-            ctx.set_metadata(self.config.retry_after_metadata.as_str(), retry_after.to_string());
-        }
-        if let Some(alias) = &decision.qos_key_alias {
-            ctx.set_metadata(self.config.key_alias_metadata.as_str(), alias.clone());
+        let qos_in_scope = self.applies_to_qos_cluster(ctx);
+        if qos_in_scope {
+            ctx.set_metadata(self.config.class_metadata.as_str(), class.clone());
+            ctx.set_metadata(self.config.subject_metadata.as_str(), subject.clone());
+            if let Some(retry_after) = decision.retry_after_seconds {
+                ctx.set_metadata(self.config.retry_after_metadata.as_str(), retry_after.to_string());
+            }
+            if let Some(alias) = &decision.qos_key_alias {
+                ctx.set_metadata(self.config.key_alias_metadata.as_str(), alias.clone());
+            }
         }
 
         let reason = if decision.allowed {
@@ -294,53 +304,55 @@ impl EnmaasPolicyFilter {
             };
         }
 
-        if class == "ratelimit" {
-            match self.config.qos_enforcement {
-                QosEnforcement::Hard => {
-                    counter!(
-                        "enmaas_policy_enforcement_total",
-                        "class" => class.clone(),
-                        "result" => "denied",
-                    )
-                    .increment(1);
-                    return reject_ratelimit(&class, decision.retry_after_seconds);
-                },
-                QosEnforcement::Soft | QosEnforcement::Off => {
-                    counter!(
-                        "enmaas_policy_enforcement_total",
-                        "class" => class.clone(),
-                        "result" => "soft",
-                    )
-                    .increment(1);
-                },
+        if qos_in_scope {
+            if class == "ratelimit" {
+                match self.config.qos_enforcement {
+                    QosEnforcement::Hard => {
+                        counter!(
+                            "enmaas_policy_enforcement_total",
+                            "class" => class.clone(),
+                            "result" => "denied",
+                        )
+                        .increment(1);
+                        return reject_ratelimit(&class, decision.retry_after_seconds);
+                    },
+                    QosEnforcement::Soft | QosEnforcement::Off => {
+                        counter!(
+                            "enmaas_policy_enforcement_total",
+                            "class" => class.clone(),
+                            "result" => "soft",
+                        )
+                        .increment(1);
+                    },
+                }
+            } else if self.config.qos_enforcement == QosEnforcement::Hard {
+                match self.buckets.admit(&class, &subject) {
+                    BucketOutcome::Admitted => {
+                        counter!(
+                            "enmaas_policy_enforcement_total",
+                            "class" => class.clone(),
+                            "result" => "admitted",
+                        )
+                        .increment(1);
+                    },
+                    BucketOutcome::Rejected { retry_after } => {
+                        counter!(
+                            "enmaas_policy_enforcement_total",
+                            "class" => class.clone(),
+                            "result" => "denied",
+                        )
+                        .increment(1);
+                        return reject_ratelimit(&class, Some(retry_after));
+                    },
+                }
+            } else {
+                counter!(
+                    "enmaas_policy_enforcement_total",
+                    "class" => class.clone(),
+                    "result" => "soft",
+                )
+                .increment(1);
             }
-        } else if self.config.qos_enforcement == QosEnforcement::Hard {
-            match self.buckets.admit(&class, &subject) {
-                BucketOutcome::Admitted => {
-                    counter!(
-                        "enmaas_policy_enforcement_total",
-                        "class" => class.clone(),
-                        "result" => "admitted",
-                    )
-                    .increment(1);
-                },
-                BucketOutcome::Rejected { retry_after } => {
-                    counter!(
-                        "enmaas_policy_enforcement_total",
-                        "class" => class.clone(),
-                        "result" => "denied",
-                    )
-                    .increment(1);
-                    return reject_ratelimit(&class, Some(retry_after));
-                },
-            }
-        } else {
-            counter!(
-                "enmaas_policy_enforcement_total",
-                "class" => class.clone(),
-                "result" => "soft",
-            )
-            .increment(1);
         }
 
         if let Some(action) = self.inject_key(ctx, decision, &class, &subject) {
@@ -436,22 +448,19 @@ impl HttpFilter for EnmaasPolicyFilter {
             self.apply_decision(ctx, &decision, &username, true)
         } else {
             counter!("enmaas_policy_cache_requests_total", "result" => "miss").increment(1);
-            match self
-                .fetch_decision(&username, &group, &subscription, &model, &path)
-                .await
-            {
+            match self.fetch_decision(&username, &model).await {
                 Ok(decision) => {
                     self.store(cache_key, decision.clone()).await;
                     self.apply_decision(ctx, &decision, &username, false)
                 },
                 Err(error) => {
                     counter!("enmaas_policy_callout_failures_total", "reason" => "callout").increment(1);
-                    warn!(%error, "enmaas_policy: policy callout failed");
+                    warn!(%error, "enmaas_policy: metering callout failed");
                     if self.config.fail_open {
                         let decision = PolicyDecision::fail_open(&self.config.default_class, &username);
                         self.apply_decision(ctx, &decision, &username, false)
                     } else {
-                        reject_unavailable("policy service unavailable")
+                        reject_unavailable("metering service unavailable")
                     }
                 },
             }
@@ -534,7 +543,7 @@ fn isolated_subrequest_client(pool_size: usize) -> SubRequestClient {
 }
 
 fn describe_subrequest_error(error: &SubRequestError) -> String {
-    format!("policy callout failed: {error}")
+    format!("metering callout failed: {error}")
 }
 
 fn reject_budget(class: &str, retry_after: Option<u64>) -> FilterAction {

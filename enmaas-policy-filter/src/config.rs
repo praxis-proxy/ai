@@ -54,8 +54,6 @@ pub(crate) enum CredentialMode {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EnmaasPolicyConfig {
-    pub policy_url: String,
-
     #[serde(default)]
     pub allow_private_endpoint: bool,
 
@@ -113,17 +111,26 @@ pub(crate) struct EnmaasPolicyConfig {
     #[serde(default)]
     pub qos_enforcement: QosEnforcement,
 
-    #[serde(default = "default_policy_auth_file")]
-    pub policy_auth_file: Option<String>,
-
     #[serde(default = "default_allow_missing_model")]
     pub allow_missing_model: bool,
 
     #[serde(default = "default_metering_url")]
     pub metering_url: String,
 
+    #[serde(default = "default_feature_key")]
+    pub metering_feature_key: String,
+
     #[serde(default)]
     pub metering_auth_file: Option<String>,
+
+    #[serde(default = "default_key_alias_premium")]
+    pub key_alias_premium: String,
+
+    #[serde(default = "default_key_alias_main")]
+    pub key_alias_main: String,
+
+    #[serde(default = "default_key_alias_ratelimit")]
+    pub key_alias_ratelimit: String,
 
     #[serde(default = "default_source")]
     pub source: String,
@@ -161,6 +168,9 @@ pub(crate) struct EnmaasPolicyConfig {
     #[serde(default = "default_key_clusters")]
     pub key_clusters: Vec<String>,
 
+    #[serde(default = "default_qos_clusters")]
+    pub qos_clusters: Vec<String>,
+
     #[serde(default = "default_credential_header")]
     pub credential_header: String,
 
@@ -180,10 +190,6 @@ impl EnmaasPolicyConfig {
         HeaderName::from_bytes(self.promoted_model_header.as_bytes()).map_err(|error| -> FilterError {
             format!("enmaas_policy: promoted_model_header is invalid: {error}").into()
         })
-    }
-
-    pub(crate) fn policy_auth_token(&self) -> Result<Option<HeaderValue>, FilterError> {
-        read_bearer_token(self.policy_auth_file.as_deref(), "policy_auth_file")
     }
 
     pub(crate) fn metering_auth_token(&self) -> Result<Option<HeaderValue>, FilterError> {
@@ -208,9 +214,6 @@ impl EnmaasPolicyConfig {
 }
 
 pub(crate) fn validate_config(cfg: &EnmaasPolicyConfig) -> Result<(), FilterError> {
-    if cfg.policy_url.trim().is_empty() {
-        return Err("enmaas_policy: policy_url must not be empty".into());
-    }
     if cfg.metering_url.trim().is_empty() {
         return Err("enmaas_policy: metering_url must not be empty".into());
     }
@@ -233,6 +236,10 @@ pub(crate) fn validate_config(cfg: &EnmaasPolicyConfig) -> Result<(), FilterErro
         ("source", &cfg.source),
         ("default_model", &cfg.default_model),
         ("default_key_env", &cfg.default_key_env),
+        ("metering_feature_key", &cfg.metering_feature_key),
+        ("key_alias_premium", &cfg.key_alias_premium),
+        ("key_alias_main", &cfg.key_alias_main),
+        ("key_alias_ratelimit", &cfg.key_alias_ratelimit),
     ] {
         if value.trim().is_empty() {
             return Err(format!("enmaas_policy: {name} must not be empty").into());
@@ -249,11 +256,13 @@ pub(crate) fn validate_config(cfg: &EnmaasPolicyConfig) -> Result<(), FilterErro
     if cfg.key_clusters.is_empty() || cfg.key_clusters.iter().any(|value| value.trim().is_empty()) {
         return Err("enmaas_policy: key_clusters must contain at least one non-empty name".into());
     }
+    if cfg.qos_clusters.is_empty() || cfg.qos_clusters.iter().any(|value| value.trim().is_empty()) {
+        return Err("enmaas_policy: qos_clusters must contain at least one non-empty name".into());
+    }
     if cfg.header_prefix.chars().any(char::is_control) {
         return Err("enmaas_policy: header_prefix must not contain control characters".into());
     }
     cfg.promoted_model_header_name()?;
-    cfg.policy_auth_token()?;
     cfg.metering_auth_token()?;
     cfg.response_class_header_name()?;
     cfg.credential_header_name()?;
@@ -357,16 +366,28 @@ fn default_metering_url() -> String {
     DEFAULT_METERING_URL.to_owned()
 }
 
+fn default_feature_key() -> String {
+    "inference-tokens".to_owned()
+}
+
+fn default_key_alias_premium() -> String {
+    "premium".to_owned()
+}
+
+fn default_key_alias_main() -> String {
+    "main".to_owned()
+}
+
+fn default_key_alias_ratelimit() -> String {
+    "main".to_owned()
+}
+
 fn default_source() -> String {
     DEFAULT_SOURCE.to_owned()
 }
 
 fn default_model() -> String {
     DEFAULT_MODEL.to_owned()
-}
-
-fn default_policy_auth_file() -> Option<String> {
-    None
 }
 
 fn default_response_class_header() -> String {
@@ -386,6 +407,10 @@ fn default_max_keys() -> usize {
 }
 
 fn default_key_clusters() -> Vec<String> {
+    vec!["cb-glm".to_owned()]
+}
+
+fn default_qos_clusters() -> Vec<String> {
     vec!["cb-glm".to_owned()]
 }
 
