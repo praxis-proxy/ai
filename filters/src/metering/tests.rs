@@ -907,6 +907,77 @@ async fn model_policy_allows_absent_body_model_alongside_identity_model() {
     );
 }
 
+/// Build a valid JSON body carrying `gpt-4o`, padded to exactly `len` bytes.
+fn padded_json_body(len: usize) -> Bytes {
+    let prefix = br#"{"model":"gpt-4o","pad":""#;
+    let suffix = br#""}"#;
+    let mut body = prefix.to_vec();
+    body.extend(std::iter::repeat_n(b'x', len - prefix.len() - suffix.len()));
+    body.extend_from_slice(suffix);
+    Bytes::from(body)
+}
+
+#[tokio::test]
+async fn model_policy_rejects_body_above_pre_read_bound_regardless_of_pipeline_buffers() {
+    // The pipeline merges `StreamBuffer` limits by keeping the largest
+    // requested bound, so another filter can raise (or remove) the cap the
+    // framework enforces on this filter's behalf. The documented bound must
+    // hold regardless: the filter rejects the oversized buffer itself,
+    // before any callout.
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.buffered_request_body = Some(Bytes::from(vec![b'x'; DEFAULT_JSON_BODY_MAX_BYTES + 1]));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    match action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(
+                rejection.status, 413,
+                "a body above the pre-read bound must reject with 413"
+            );
+            assert_eq!(
+                rejection.body, None,
+                "the 413 mirrors the framework's bare pre-read overflow rejection"
+            );
+        },
+        other => panic!("expected Reject(413) for an oversized body, got {other:?}"),
+    }
+    assert!(
+        ctx.filter_state.is_empty(),
+        "an oversized body must reject before any balance callout stores state"
+    );
+}
+
+#[tokio::test]
+async fn model_policy_allows_body_at_pre_read_bound() {
+    // Control: a body exactly at the bound is within the documented cap and
+    // must flow through the (fail-open) gates, not reject.
+    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.buffered_request_body = Some(padded_json_body(DEFAULT_JSON_BODY_MAX_BYTES));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a body exactly at the pre-read bound is within the cap, not above it"
+    );
+    let state = ctx
+        .filter_state
+        .get(&0)
+        .and_then(|s| s.downcast_ref::<MeteringState>())
+        .expect("state should be stored after the callout");
+    assert_eq!(
+        state.model, "gpt-4o",
+        "the at-bound body's model must still resolve for the preflight"
+    );
+}
+
 #[tokio::test]
 async fn model_policy_ignores_body_once_client_model_is_recorded() {
     // `model_to_provider` records the client-facing model and rewrites the
@@ -1532,7 +1603,11 @@ fn extract_model_is_absent_when_only_nested() {
 #[test]
 fn extract_model_is_absent_when_no_model_member() {
     let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
-    assert!(matches!(extract_model_from_bytes(body), BodyModel::Absent));
+    assert!(
+        matches!(extract_model_from_bytes(body), BodyModel::Absent),
+        "a body with no top-level model member must read as absent, not unusable: \
+         absence leaves the identity model authoritative"
+    );
 }
 
 #[test]

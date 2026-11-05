@@ -122,6 +122,11 @@ const STATUS_MODEL_NOT_ALLOWED: u16 = 403;
 /// be evaluated: no trusted tenant identity or no resolvable public model.
 const STATUS_AUTHZ_INPUT_REQUIRED: u16 = 403;
 
+/// Status returned when the request body exceeds the model-policy pre-read
+/// bound. The bare status (no body) matches the framework's own pre-read
+/// overflow rejection so clients see one shape either way.
+const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
+
 // -----------------------------------------------------------------------------
 // ExternalMeteringFilter
 // -----------------------------------------------------------------------------
@@ -169,7 +174,9 @@ const STATUS_AUTHZ_INPUT_REQUIRED: u16 = 403;
 ///
 /// Buffering: with model policy enabled the request body is pre-read once,
 /// bounded by the standard JSON body maximum (10 MiB); requests exceeding the
-/// bound reject with 413. Only the top-level `"model"` field is inspected —
+/// bound reject with 413. The bound is enforced by the filter itself, so
+/// other filters in the pipeline that buffer more cannot raise it. Only the
+/// top-level `"model"` field is inspected —
 /// the body is never re-serialized or copied for the preflight. Once
 /// `model_to_provider` recorded a client-facing model, the buffered body has
 /// already been rewritten to the *provider* target, so it is no longer a
@@ -508,6 +515,13 @@ impl HttpFilter for ExternalMeteringFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // The framework's pre-read 413 only holds when this filter's bound
+        // is the pipeline's effective one (see `body_exceeds_pre_read_bound`),
+        // so the documented bound is enforced here too, before any callout.
+        if self.model_policy_check && body_exceeds_pre_read_bound(ctx) {
+            return Ok(reject_body_too_large());
+        }
+
         let mut state = capture_identity(ctx, &self.identity_header_prefix, &self.identity_metadata_namespace);
         if resolve_request_model(ctx, &mut state, self.model_policy_check) == ModelResolution::Conflict {
             return Ok(reject_model_conflict());
@@ -552,7 +566,10 @@ impl HttpFilter for ExternalMeteringFilter {
         // Model-policy enforcement must decide before provider dispatch, so
         // the public model has to be known during `on_request`. The bounded
         // pre-read makes the body available there; requests exceeding the
-        // bound reject with 413. Pipelines whose body mode already buffers
+        // bound reject with 413 — enforced again in `on_request`, because
+        // the pipeline merges `StreamBuffer` limits by keeping the largest
+        // requested bound, so another filter could otherwise raise the
+        // effective cap. Pipelines whose body mode already buffers
         // (e.g. because of `model_to_provider`) need no extra buffering.
         if self.model_policy_check {
             BodyMode::StreamBuffer {
@@ -840,9 +857,9 @@ fn resolve_request_model(
         model.clone_into(&mut state.model);
     }
     if state.model.is_empty()
-        && let BodyModel::Usable(model) = &body_model
+        && let BodyModel::Usable(model) = body_model
     {
-        state.model.clone_from(model);
+        state.model = model;
     }
     ModelResolution::Continue
 }
@@ -1027,6 +1044,31 @@ fn reject_model_conflict() -> FilterAction {
         Rejection::status(STATUS_AUTHZ_INPUT_REQUIRED)
             .with_body(Bytes::from_static(b"conflicting model inputs for model authorization")),
     )
+}
+
+/// Reject with a 413 because the request body exceeds the model-policy
+/// pre-read bound. The pipeline merges `StreamBuffer` limits by taking the
+/// largest requested bound, so another filter can raise (or remove) the cap
+/// the framework enforces on this filter's behalf; enforcing it here keeps
+/// the documented bound independent of the pipeline's other buffer needs.
+fn reject_body_too_large() -> FilterAction {
+    debug!("request body exceeds the model-policy pre-read bound");
+    FilterAction::Reject(Rejection::status(STATUS_PAYLOAD_TOO_LARGE))
+}
+
+/// Whether the buffered request body exceeds the model-policy pre-read
+/// bound.
+///
+/// The pipeline merges `StreamBuffer` limits by keeping the largest
+/// requested bound — and dropping the cap entirely when another filter
+/// buffers without one — so the framework's pre-read 413 only holds when
+/// this filter's bound is the effective one. The documented bound must
+/// survive any pipeline composition, which is why the filter checks the
+/// buffered length itself instead of relying on the framework's rejection.
+fn body_exceeds_pre_read_bound(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.buffered_request_body
+        .as_ref()
+        .is_some_and(|body| body.len() > DEFAULT_JSON_BODY_MAX_BYTES)
 }
 
 /// Reject with a 503 because metering could not authorize the request.
