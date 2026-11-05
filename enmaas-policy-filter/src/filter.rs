@@ -298,8 +298,8 @@ impl EnmaasPolicyFilter {
 
         if !decision.allowed {
             return match decision.deny_reason {
-                Some(DenyReason::QuotaExhausted) => reject_budget(&class, decision.retry_after_seconds),
-                Some(DenyReason::ModelNotAllowed) => reject_model(&class),
+                Some(DenyReason::QuotaExhausted) => reject_budget(&class, decision.retry_after_seconds, qos_in_scope),
+                Some(DenyReason::ModelNotAllowed) => reject_model(&class, qos_in_scope),
                 None => reject_unavailable("policy decision missing deny reason"),
             };
         }
@@ -431,7 +431,10 @@ impl HttpFilter for EnmaasPolicyFilter {
             .to_owned();
         let model = self.resolve_model(ctx);
         if model.is_empty() && !self.config.allow_missing_model {
-            return Ok(reject_model(&self.config.default_class));
+            return Ok(reject_model(
+                &self.config.default_class,
+                self.applies_to_qos_cluster(ctx),
+            ));
         }
         let path = ctx.request.uri.path().to_owned();
         let cache_key = format!("{username}\u{1f}{model}\u{1f}{path}");
@@ -546,7 +549,7 @@ fn describe_subrequest_error(error: &SubRequestError) -> String {
     format!("metering callout failed: {error}")
 }
 
-fn reject_budget(class: &str, retry_after: Option<u64>) -> FilterAction {
+fn reject_budget(class: &str, retry_after: Option<u64>, include_class: bool) -> FilterAction {
     reject(
         STATUS_BUDGET_EXHAUSTED,
         class,
@@ -554,6 +557,7 @@ fn reject_budget(class: &str, retry_after: Option<u64>) -> FilterAction {
         "token budget exhausted",
         "rate_limit_error",
         "token_budget_exhausted",
+        include_class,
     )
 }
 
@@ -565,10 +569,11 @@ fn reject_ratelimit(class: &str, retry_after: Option<u64>) -> FilterAction {
         "request rate exceeded for this QoS class",
         "rate_limit_error",
         "qos_rate_limited",
+        true,
     )
 }
 
-fn reject_model(class: &str) -> FilterAction {
+fn reject_model(class: &str, include_class: bool) -> FilterAction {
     let body = serde_json::json!({
         "error": {
             "message": "model is not authorized for this user",
@@ -576,15 +581,22 @@ fn reject_model(class: &str) -> FilterAction {
             "code": "model_not_allowed"
         }
     });
-    FilterAction::Reject(
-        Rejection::status(STATUS_MODEL_DENIED)
-            .with_header("Content-Type", "application/json")
-            .with_header("X-EnMaaS-QoS-Class", class.to_owned())
-            .with_body(Bytes::from(body.to_string())),
-    )
+    let mut rejection = Rejection::status(STATUS_MODEL_DENIED).with_header("Content-Type", "application/json");
+    if include_class {
+        rejection = rejection.with_header("X-EnMaaS-QoS-Class", class.to_owned());
+    }
+    FilterAction::Reject(rejection.with_body(Bytes::from(body.to_string())))
 }
 
-fn reject(status: u16, class: &str, retry_after: u64, message: &str, error_type: &str, code: &str) -> FilterAction {
+fn reject(
+    status: u16,
+    class: &str,
+    retry_after: u64,
+    message: &str,
+    error_type: &str,
+    code: &str,
+    include_class: bool,
+) -> FilterAction {
     let body = serde_json::json!({
         "error": {
             "message": message,
@@ -592,13 +604,13 @@ fn reject(status: u16, class: &str, retry_after: u64, message: &str, error_type:
             "code": code
         }
     });
-    FilterAction::Reject(
-        Rejection::status(status)
-            .with_header("Content-Type", "application/json")
-            .with_header("Retry-After", retry_after.to_string())
-            .with_header("X-EnMaaS-QoS-Class", class.to_owned())
-            .with_body(Bytes::from(body.to_string())),
-    )
+    let mut rejection = Rejection::status(status)
+        .with_header("Content-Type", "application/json")
+        .with_header("Retry-After", retry_after.to_string());
+    if include_class {
+        rejection = rejection.with_header("X-EnMaaS-QoS-Class", class.to_owned());
+    }
+    FilterAction::Reject(rejection.with_body(Bytes::from(body.to_string())))
 }
 
 fn reject_unavailable(message: &str) -> FilterAction {

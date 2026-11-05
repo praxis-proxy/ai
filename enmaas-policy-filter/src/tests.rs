@@ -190,6 +190,23 @@ fn mock_policy(body: &'static str) -> (String, Arc<Mutex<String>>, thread::JoinH
     (format!("http://{address}"), captured, handle)
 }
 
+fn mock_metering(status: &'static str, body: &'static str) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock metering");
+    let address = listener.local_addr().expect("mock metering address");
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept metering request");
+        let mut buffer = [0_u8; 4096];
+        let _ = stream.read(&mut buffer).expect("read metering request");
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).expect("write metering response");
+    });
+    (format!("http://{address}"), handle)
+}
+
 fn build_filter(policy_url: &str) -> Box<dyn HttpFilter> {
     build_filter_with(policy_url, "")
 }
@@ -289,6 +306,14 @@ async fn quota_denial_uses_retry_after() {
                     .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
                     .map(|(_, value)| value.as_str()),
                 Some("42")
+            );
+            assert_eq!(
+                rejection
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("x-enmaas-qos-class"))
+                    .map(|(_, value)| value.as_str()),
+                Some("main")
             );
         },
         other => panic!("expected quota rejection, got {other:?}"),
@@ -511,8 +536,140 @@ async fn quota_denial_remains_global_for_external_cluster() {
 
     let action = filter.on_request(&mut ctx).await.expect("policy request");
     match action {
-        FilterAction::Reject(rejection) => assert_eq!(rejection.status, 429),
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 429);
+            assert!(
+                rejection
+                    .headers
+                    .iter()
+                    .all(|(name, _)| !name.eq_ignore_ascii_case("x-enmaas-qos-class"))
+            );
+        },
         other => panic!("expected quota rejection, got {other:?}"),
     }
     handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn model_denial_remains_global_without_class_header_on_external_cluster() {
+    let (policy_url, _captured, handle) =
+        mock_policy(r#"{"hasAccess":true,"modelAllowed":false,"denyReason":"model_not_allowed","qosClass":"main"}"#);
+    let filter = build_filter(&policy_url);
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.cluster = Some(Arc::from("openai"));
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    match action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 403);
+            assert!(
+                rejection
+                    .headers
+                    .iter()
+                    .all(|(name, _)| !name.eq_ignore_ascii_case("x-enmaas-qos-class"))
+            );
+        },
+        other => panic!("expected model rejection, got {other:?}"),
+    }
+    handle.join().expect("mock policy thread");
+}
+
+
+#[tokio::test]
+async fn metering_5xx_fails_open() {
+    let (url, handle) = mock_metering("503 Service Unavailable", "upstream down");
+    let filter = build_filter(&url);
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.get_metadata("qos.class"), Some("main"));
+    handle.join().expect("mock metering thread");
+}
+
+#[tokio::test]
+async fn metering_malformed_json_fails_open() {
+    let (url, handle) = mock_metering("200 OK", "not-json");
+    let filter = build_filter(&url);
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    handle.join().expect("mock metering thread");
+}
+
+#[tokio::test]
+async fn metering_5xx_fail_closed_rejects() {
+    let (url, handle) = mock_metering("503 Service Unavailable", "upstream down");
+    let filter = build_filter_with(&url, "fail_open: false\n");
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    match action {
+        FilterAction::Reject(rejection) => assert_eq!(rejection.status, 503),
+        other => panic!("expected fail-closed rejection, got {other:?}"),
+    }
+    handle.join().expect("mock metering thread");
+}
+
+#[tokio::test]
+async fn missing_identity_fails_open_by_default() {
+    let filter = build_filter("http://127.0.0.1:1");
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.get_metadata("qos.class"), None);
+}
+
+#[tokio::test]
+async fn missing_identity_fail_closed_rejects() {
+    let filter = build_filter_with("http://127.0.0.1:1", "fail_open: false\n");
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    match action {
+        FilterAction::Reject(rejection) => assert_eq!(rejection.status, 503),
+        other => panic!("expected missing-identity rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn missing_model_rejected_when_disallowed() {
+    let filter = build_filter_with("http://127.0.0.1:1", "allow_missing_model: false\n");
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.set_metadata("x-tenant-username", "alice");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    match action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 403);
+            assert_eq!(
+                rejection
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("x-enmaas-qos-class"))
+                    .map(|(_, value)| value.as_str()),
+                Some("main")
+            );
+        },
+        other => panic!("expected missing-model rejection, got {other:?}"),
+    }
 }
