@@ -570,10 +570,14 @@ The `anthropic_messages_to_chat_completions` filter:
   no equivalent tool-result error flag
 - Splits array-form `tool_result.content`: text
   parts are joined into the tool message, image
-  parts are promoted to a follow-up user message,
-  and `search_result`/`document` parts are flattened
-  to text; unsupported part types and malformed image
-  sources are rejected
+  parts are promoted to a follow-up user message
+  emitted after every tool message of the same
+  Anthropic message (Chat Completions requires all
+  tool replies to follow the assistant `tool_calls`
+  message directly), and `search_result`/`document`
+  parts are flattened to text; unsupported part
+  types, malformed image sources, and parts that
+  would flatten to nothing are rejected
 - Maps `stop_sequences` to `stop`,
   `tool_choice` semantics, tool definitions
 - Reports a matched stop sequence as `stop_reason:
