@@ -136,10 +136,10 @@ impl OpenaiResponsesRequestFilter {
         if let Some(action) = reject_unsupported_managed_fields(&classified, &parsed) {
             return action;
         }
-        if operation == ResponsesOperation::CreateResponse {
-            if let Some(action) = reject_unsupported_responses_tools(&parsed) {
-                return action;
-            }
+        if operation == ResponsesOperation::CreateResponse
+            && let Some(action) = reject_unsupported_responses_tools(&parsed)
+        {
+            return action;
         }
         if let Some(action) = reject_conflicting_history_selectors(&parsed) {
             return action;
