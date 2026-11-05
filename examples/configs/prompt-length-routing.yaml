@@ -1,0 +1,38 @@
+# Prompt Length Routing
+#
+# Estimates prompt tokens with a conservative character heuristic and routes
+# requests that exceed a model-specific input limit to a larger-context
+# cluster. Small prompts continue to the default cluster.
+
+listeners:
+  - name: gateway
+    address: "127.0.0.1:3000"
+    filter_chains: [main]
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: prompt_length_to_header
+        routes:
+          - model: small-model
+            max_input_tokens: 10
+            overflow: large-context
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            headers:
+              x-prompt-route: large-context
+            cluster: large-context
+          - path_prefix: "/"
+            cluster: default
+      - filter: load_balancer
+        clusters:
+          - name: large-context
+            endpoints:
+              - "127.0.0.1:3001"
+          - name: default
+            endpoints:
+              - "127.0.0.1:3002"
+
+insecure_options:
+  allow_private_endpoints: true
