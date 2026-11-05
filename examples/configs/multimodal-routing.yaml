@@ -1,0 +1,49 @@
+# Multimodal Content Routing
+#
+# Derives a proxy-owned modality fact from OpenAI-style message content. Image,
+# audio, combined image/audio, and text-only requests can be routed to backends
+# with matching capabilities. The internal fact namespace cannot be supplied by
+# clients, and the filter replaces any previously staged copy before routing.
+
+listeners:
+  - name: gateway
+    address: "127.0.0.1:3000"
+    filter_chains: [main]
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: multimodal_to_header
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            headers:
+              x-praxis-ai-modality: image_audio
+            cluster: image-audio
+          - path_prefix: "/"
+            headers:
+              x-praxis-ai-modality: image
+            cluster: image
+          - path_prefix: "/"
+            headers:
+              x-praxis-ai-modality: audio
+            cluster: audio
+          - path_prefix: "/"
+            cluster: text
+      - filter: load_balancer
+        clusters:
+          - name: image-audio
+            endpoints:
+              - "127.0.0.1:3001"
+          - name: image
+            endpoints:
+              - "127.0.0.1:3002"
+          - name: audio
+            endpoints:
+              - "127.0.0.1:3003"
+          - name: text
+            endpoints:
+              - "127.0.0.1:3004"
+
+insecure_options:
+  allow_private_endpoints: true
