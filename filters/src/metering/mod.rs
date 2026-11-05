@@ -146,6 +146,35 @@ const STATUS_AUTHZ_INPUT_REQUIRED: u16 = 403;
 /// That filter buffers the request body, so its body pass completes before
 /// this filter's request hook runs the balance check.
 ///
+/// Ordering: declare `external_metering` *before* `token_count` in the filter
+/// chain so response hooks (which run in reverse order) execute after token
+/// extraction, and after any verification filter (`identity_header_guard`,
+/// authentication) so captured identity metadata is already present. The
+/// model-policy preflight always runs before provider dispatch: after a
+/// rejection, zero provider requests have been made.
+///
+/// Response contract (stable bodies): an explicit budget denial rejects with
+/// 429 and body `token budget exhausted`; an explicit model denial rejects
+/// with 403 and body `model not allowed for this user`, regardless of either
+/// `fail_open` setting and with precedence over budget exhaustion; a verdict
+/// unavailable under a fail-closed gate rejects with 503 and body
+/// `metering system unavailable`. With model policy enabled, a missing trusted
+/// identity rejects with 403 and body `tenant identity required for model
+/// authorization`; an unresolvable model rejects with 403 and body `request
+/// model required for model authorization`; conflicting model sources reject
+/// with 403 and body `conflicting model inputs for model authorization`; and a
+/// request body larger than the pre-read bound rejects with 413 before
+/// dispatch.
+///
+/// Buffering: with model policy enabled the request body is pre-read once,
+/// bounded by the standard JSON body maximum (10 MiB); requests exceeding the
+/// bound reject with 413. Only the top-level `"model"` field is inspected —
+/// the body is never re-serialized or copied for the preflight. Once
+/// `model_to_provider` recorded a client-facing model, the buffered body has
+/// already been rewritten to the *provider* target, so it is no longer a
+/// model source: the preflight then compares the identity claim against the
+/// recorded client-facing model alone.
+///
 /// # Model policy (optional)
 ///
 /// With `model_policy_check: true`, the same entitlement preflight also
@@ -157,10 +186,12 @@ const STATUS_AUTHZ_INPUT_REQUIRED: u16 = 403;
 ///   or a transport error — is governed by `model_policy_fail_open` (default **fail-closed, 503**), independent of the
 ///   billing `fail_open`. Admission on a shared callout failure requires every enabled gate's availability policy to
 ///   permit it.
-/// - Every metered request then needs a trusted tenant identity and a resolvable public model (identity header,
-///   `model_to_provider` client model, or the request body's top-level `"model"`, read from a bounded pre-read).
-///   Reporting fallbacks (`default_username`, `default_model`) and the skip-metering path never bypass authorization:
-///   such requests reject with 403 before dispatch.
+/// - Every metered request then needs a trusted tenant identity and a resolvable public model, and every available
+///   model source — the identity header, the `model_to_provider` client model, and (when no client model was recorded)
+///   the request body's top-level `"model"` (bounded pre-read) — must agree; conflicting non-empty sources reject with
+///   403 before dispatch, since authorizing one source would not authorize the model the provider receives. Reporting
+///   fallbacks (`default_username`, `default_model`) and the skip-metering path never bypass authorization: such
+///   requests reject with 403 before dispatch.
 ///
 /// With `model_policy_check: false` (default), the legacy contract is
 /// preserved exactly: only `hasAccess` decides, budget denial is 429, and
@@ -473,7 +504,9 @@ impl HttpFilter for ExternalMeteringFilter {
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let mut state = capture_identity(ctx, &self.identity_header_prefix, &self.identity_metadata_namespace);
-        resolve_request_model(ctx, &mut state, self.model_policy_check);
+        if resolve_request_model(ctx, &mut state, self.model_policy_check) == ModelResolution::Conflict {
+            return Ok(reject_model_conflict());
+        }
 
         if state.username.is_empty() {
             if self.model_policy_check {
@@ -738,30 +771,85 @@ struct AdmissionPolicy {
 // Identity Header Capture
 // -----------------------------------------------------------------------------
 
+/// Outcome of resolving the public model for the entitlement preflight.
+#[derive(PartialEq)]
+enum ModelResolution {
+    /// Resolution succeeded, or no model is available (the caller applies the
+    /// missing-model rejection when enforcement needs one).
+    Continue,
+    /// Non-empty model sources disagree: authorizing either one would admit a
+    /// request whose provider-bound body names a different model.
+    Conflict,
+}
+
 /// Resolve the public model for the entitlement preflight.
 ///
-/// Precedence: the trusted `{prefix}model` identity header (captured by
-/// [`capture_identity`]), then the `model_to_provider` client-facing model
-/// (the public alias, recorded before any provider rewrite), then — only
-/// when model-policy enforcement needs the model before dispatch — the
-/// request body's top-level `"model"` field from the bounded pre-read
-/// buffer. `default_model` is deliberately not consulted: it is a reporting
-/// fallback, never an authorization input.
-fn resolve_request_model(ctx: &HttpFilterContext<'_>, state: &mut MeteringState, model_policy_check: bool) {
+/// Sources: the trusted `{prefix}model` identity header (captured by
+/// [`capture_identity`]), the `model_to_provider` client-facing model (the
+/// public alias, recorded before any provider rewrite), and — only when
+/// model-policy enforcement needs the model before dispatch and
+/// `model_to_provider` recorded no client-facing model — the request body's
+/// top-level `"model"` field from the bounded pre-read buffer. The body is
+/// skipped once a client-facing model exists because that filter's rewrite
+/// has already replaced it with the *provider* target, which legitimately
+/// differs from the public alias. With enforcement enabled every available
+/// source must name the same model: a conflict rejects rather than
+/// authorizing a model the request does not actually use. With enforcement
+/// disabled the legacy reporting contract is preserved: the identity model,
+/// then the client-facing model, and the body is consulted later for
+/// attribution only. `default_model` is deliberately not consulted: it is a
+/// reporting fallback, never an authorization input.
+fn resolve_request_model(
+    ctx: &HttpFilterContext<'_>,
+    state: &mut MeteringState,
+    model_policy_check: bool,
+) -> ModelResolution {
+    let client_model = ctx
+        .get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
+        .filter(|model| !model.is_empty());
+    let body_model = if client_model.is_none() && model_policy_check {
+        ctx.buffered_request_body
+            .as_ref()
+            .and_then(|body| extract_model_from_bytes(body))
+    } else {
+        None
+    };
+
+    if model_policy_check && model_sources_conflict(&state.model, client_model, body_model.as_deref()) {
+        return ModelResolution::Conflict;
+    }
+    // Fill by precedence. With enforcement disabled `body_model` is always
+    // `None`, so this is exactly the legacy identity-then-client contract.
     if state.model.is_empty()
-        && let Some(model) = ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
+        && let Some(model) = client_model
     {
         model.clone_into(&mut state.model);
     }
     if state.model.is_empty()
-        && model_policy_check
-        && let Some(model) = ctx
-            .buffered_request_body
-            .as_ref()
-            .and_then(|body| extract_model_from_bytes(body))
+        && let Some(model) = body_model
     {
         state.model = model;
     }
+    ModelResolution::Continue
+}
+
+/// Whether non-empty model sources disagree.
+///
+/// Trust in the identity source does not establish that the other sources
+/// name the same model, so the first observed model must match every later
+/// one; a disagreement means authorizing either one would admit a request
+/// whose provider-bound body names a different model.
+fn model_sources_conflict(identity: &str, client: Option<&str>, body: Option<&str>) -> bool {
+    let sources = [(!identity.is_empty()).then_some(identity), client, body];
+    let mut agreed: Option<&str> = None;
+    for model in sources.into_iter().flatten() {
+        match agreed {
+            None => agreed = Some(model),
+            Some(previous) if previous == model => {},
+            Some(_) => return true,
+        }
+    }
+    false
 }
 
 /// Capture tenant identity from the configured headers and mark those headers,
@@ -911,6 +999,19 @@ fn reject_model_required() -> FilterAction {
     FilterAction::Reject(
         Rejection::status(STATUS_AUTHZ_INPUT_REQUIRED)
             .with_body(Bytes::from_static(b"request model required for model authorization")),
+    )
+}
+
+/// Reject with a 403 because the available model sources disagree: the
+/// trusted identity claim, the `model_to_provider` client-facing model, and
+/// (when no client model was recorded) the request body must name the same
+/// model, since authorizing one of them would not authorize the model the
+/// provider actually receives.
+fn reject_model_conflict() -> FilterAction {
+    debug!("conflicting model inputs: identity, client, and body models disagree");
+    FilterAction::Reject(
+        Rejection::status(STATUS_AUTHZ_INPUT_REQUIRED)
+            .with_body(Bytes::from_static(b"conflicting model inputs for model authorization")),
     )
 }
 

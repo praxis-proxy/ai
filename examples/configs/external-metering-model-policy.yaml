@@ -26,11 +26,23 @@
 #     transport error)                  fail_open below
 #
 # Model resolution for the preflight: the trusted {prefix}model identity
-# header, then the model_to_provider client model, then the request body's
-# top-level "model" field (bounded pre-read). Reporting fallbacks
+# header, the model_to_provider client model, and (when no client model was
+# recorded — a recorded rewrite leaves the body naming the provider target)
+# the request body's top-level "model" field (bounded pre-read, 10 MiB;
+# larger bodies reject with 413) must all agree when present. Reporting
+# fallbacks
 # (default_username / default_model) are never authorized: when model policy
 # is enabled, a request without a trusted tenant identity or a resolvable
-# public model is rejected with 403 before dispatch.
+# public model is rejected with 403 before dispatch, and so is a request
+# whose model sources conflict (403 "conflicting model inputs for model
+# authorization") — authorizing one source would not authorize the model
+# the provider receives.
+#
+# Stable rejection bodies: 403 "model not allowed for this user" (explicit
+# denial), 429 "token budget exhausted", 503 "metering system unavailable"
+# (unavailable verdict under a fail-closed gate), 403 "tenant identity
+# required for model authorization" / "request model required for model
+# authorization" / "conflicting model inputs for model authorization".
 
 listeners:
   - name: default

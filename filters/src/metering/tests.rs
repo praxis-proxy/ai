@@ -548,6 +548,94 @@ fn unusable_payload_admits_only_when_all_gates_fail_open() {
     );
 }
 
+// -----------------------------------------------------------------------------
+// Availability — Transport-Level Callout Failures (issue #1719 coverage)
+// -----------------------------------------------------------------------------
+
+/// A synthetic metering callout response.
+fn sub_response(status: u16, body: &str) -> SubResponse {
+    SubResponse {
+        status,
+        version: http::Version::HTTP_11,
+        headers: http::HeaderMap::new(),
+        body: Bytes::copy_from_slice(body.as_bytes()),
+    }
+}
+
+/// A model-policy filter with the given billing and model-gate availability
+/// policies; `metering_url` points nowhere because these tests inject the
+/// callout result directly.
+fn availability_filter(billing_fail_open: bool, model_policy_fail_open: bool) -> ExternalMeteringFilter {
+    filter_from_yaml(&format!(
+        "metering_url: \"http://127.0.0.1:1\"\nallow_private_endpoint: true\nfail_open: {billing_fail_open}\nmodel_policy_check: true\nmodel_policy_fail_open: {model_policy_fail_open}\n"
+    ))
+}
+
+/// Every transport-level failure leaves both gates without verdicts, so
+/// billing fail-open with model-policy fail-closed must reject with 503.
+#[test]
+fn model_gate_fails_closed_on_timeout_despite_billing_fail_open() {
+    let filter = availability_filter(true, false);
+    let action = filter.interpret_balance(Err(SubRequestError::DeadlineExceeded));
+    assert_reject(action, 503, "metering system unavailable");
+}
+
+#[test]
+fn model_gate_fails_closed_on_non_2xx_despite_billing_fail_open() {
+    let filter = availability_filter(true, false);
+    let action = filter.interpret_balance(Ok(sub_response(500, "internal error")));
+    assert_reject(action, 503, "metering system unavailable");
+}
+
+#[test]
+fn model_gate_fails_closed_on_oversized_response_despite_billing_fail_open() {
+    // A metering response above the 64 KiB callout cap is truncated by the
+    // transport and surfaces as a `ResponseTooLarge` error, never as
+    // verdicts.
+    let filter = availability_filter(true, false);
+    let action = filter.interpret_balance(Err(SubRequestError::ResponseTooLarge {
+        actual: MAX_CALLOUT_RESPONSE_BYTES + 1,
+        limit: MAX_CALLOUT_RESPONSE_BYTES,
+    }));
+    assert_reject(action, 503, "metering system unavailable");
+}
+
+#[test]
+fn transport_failures_admit_only_when_every_gate_fails_open() {
+    // Independence in the other direction: a model gate failing open must
+    // not drag the billing gate open with it.
+    let make_failure = |case: usize| match case {
+        0 => Err(SubRequestError::DeadlineExceeded),
+        1 => Err(SubRequestError::ResponseTooLarge {
+            actual: MAX_CALLOUT_RESPONSE_BYTES + 1,
+            limit: MAX_CALLOUT_RESPONSE_BYTES,
+        }),
+        _ => Ok(sub_response(503, "overloaded")),
+    };
+    for case in 0..3 {
+        let both_open = availability_filter(true, true);
+        assert!(
+            matches!(both_open.interpret_balance(make_failure(case)), FilterAction::Continue),
+            "a shared callout failure admits only when every gate fails open"
+        );
+        let billing_closed = availability_filter(false, true);
+        assert_reject(
+            billing_closed.interpret_balance(make_failure(case)),
+            503,
+            "metering system unavailable",
+        );
+    }
+}
+
+#[test]
+fn transport_failures_never_authorize_an_explicit_denial_path() {
+    // Sanity: an explicit `modelAllowed: false` on a usable 2xx payload still
+    // wins over every availability policy.
+    let filter = availability_filter(true, true);
+    let action = filter.interpret_balance(Ok(sub_response(200, r#"{"hasAccess": true, "modelAllowed": false}"#)));
+    assert_reject(action, 403, "model not allowed for this user");
+}
+
 #[test]
 fn policy_disabled_preserves_legacy_missing_verdict_behavior() {
     let body = br#"{"hasAccess": true}"#;
@@ -686,6 +774,141 @@ async fn model_policy_resolves_model_from_buffered_body() {
         "the public body model must be resolved for the preflight"
     );
     assert_eq!(state.username, "alice");
+}
+
+#[tokio::test]
+async fn model_policy_rejects_identity_model_conflicting_with_client_model() {
+    // Regression for the divergence the model gate must close: a trusted
+    // identity claim naming model A while `model_to_provider` recorded (and
+    // the provider will receive) requested model B must not authorize A.
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "identity-model".to_owned());
+    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "requested-model");
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert_reject(action, 403, "conflicting model inputs for model authorization");
+    assert!(
+        ctx.filter_state.is_empty(),
+        "a model conflict must reject before any balance callout stores state"
+    );
+}
+
+#[tokio::test]
+async fn model_policy_rejects_identity_model_conflicting_with_body_model() {
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "identity-model".to_owned());
+    ctx.buffered_request_body = Some(Bytes::from_static(br#"{"model": "body-model", "messages": []}"#));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert_reject(action, 403, "conflicting model inputs for model authorization");
+}
+
+#[tokio::test]
+async fn model_policy_ignores_body_once_client_model_is_recorded() {
+    // `model_to_provider` records the client-facing model and rewrites the
+    // buffered body to the provider target during the pre-read, so by the
+    // time this filter's request hook runs the body legitimately names a
+    // different (provider) model. The body is not a comparison source once
+    // a client-facing model exists: the preflight must authorize the
+    // client-facing alias — the model the provider rewrite preserves.
+    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5");
+    // The body as it looks after model_to_provider rewrote it to the target.
+    ctx.buffered_request_body = Some(Bytes::from_static(
+        br#"{"model": "claude-sonnet-4-5@20250929", "messages": []}"#,
+    ));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a provider-side rewrite is not a model conflict; both gates fail open here"
+    );
+    let state = ctx
+        .filter_state
+        .get(&0)
+        .and_then(|s| s.downcast_ref::<MeteringState>())
+        .expect("state should be stored after the callout");
+    assert_eq!(
+        state.model, "claude-sonnet-4-5",
+        "the preflight must authorize the client-facing alias, never the provider target"
+    );
+}
+
+#[tokio::test]
+async fn model_policy_agreeing_model_sources_authorize_the_requested_model() {
+    // The positive direction of non-divergence: when every source names the
+    // same model, the preflight authorizes exactly that model — the one the
+    // provider receives (modulo the provider-side rewrite, which preserves
+    // the client-facing alias).
+    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "requested-model".to_owned());
+    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "requested-model");
+    ctx.buffered_request_body = Some(Bytes::from_static(br#"{"model": "requested-model", "messages": []}"#));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "agreeing sources must admit through the fail-open gates"
+    );
+    let state = ctx
+        .filter_state
+        .get(&0)
+        .and_then(|s| s.downcast_ref::<MeteringState>())
+        .expect("state should be stored after the callout");
+    assert_eq!(
+        state.model, "requested-model",
+        "the preflight must authorize the model every source agrees on"
+    );
+}
+
+#[tokio::test]
+async fn model_policy_disabled_preserves_identity_model_precedence_for_reporting() {
+    // Legacy contract: without enforcement, a conflicting identity model
+    // still wins for metering attribution — no rejection, no comparison.
+    let filter = filter_from_yaml(
+        "metering_url: \"http://127.0.0.1:1\"\nallow_private_endpoint: true\nfail_open: true\nidentity_header_prefix: \"x-tenant-\"\n",
+    );
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "identity-model".to_owned());
+    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "requested-model");
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "policy disabled: conflicting sources must not reject, the legacy contract is unchanged"
+    );
+    let state = ctx
+        .filter_state
+        .get(&0)
+        .and_then(|s| s.downcast_ref::<MeteringState>())
+        .expect("state should be stored after the callout");
+    assert_eq!(
+        state.model, "identity-model",
+        "policy disabled: the trusted identity model remains the reporting attribution"
+    );
 }
 
 #[tokio::test]

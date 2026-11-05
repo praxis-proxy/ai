@@ -83,8 +83,14 @@ pub(super) struct ExternalMeteringConfig {
     ///
     /// When enabled, every metered request needs a trusted tenant identity
     /// and a resolvable public model; the request body is pre-read (bounded
-    /// by the standard JSON body limit) so the verdict is decided before
-    /// provider dispatch.
+    /// by the standard JSON body limit, 10 MiB; larger bodies reject with
+    /// 413) so the verdict is decided before provider dispatch. Every
+    /// available model source — the identity header, the
+    /// `model_to_provider` client model, and (when no client model was
+    /// recorded, since a recorded rewrite leaves the body naming the
+    /// provider target) the request body — must agree: conflicting
+    /// non-empty sources reject with 403 rather than authorizing a model
+    /// the provider does not receive.
     #[serde(default)]
     pub model_policy_check: bool,
 
