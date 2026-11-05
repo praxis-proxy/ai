@@ -27,7 +27,7 @@ pub(crate) const CLAUDE_CODE_PINNED_VERSION: &str = "2.1.278";
 /// compare against that full line, not this bare value. Kept in sync with
 /// `tests/integration/fixtures/codex-cli/pin.toml` by
 /// `codex_pin::pin_toml_version_matches_harness_const`.
-pub(crate) const CODEX_PINNED_VERSION: &str = "0.144.1";
+pub(crate) const CODEX_PINNED_VERSION: &str = "0.166.0";
 
 /// Pinned version of the OpenCode CLI executable used for E2E acceptance tests.
 ///
