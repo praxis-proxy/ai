@@ -20,9 +20,9 @@
 //!   policy, so provider-owned traffic the router may still bind to a direct upstream keeps its fields intact. It
 //!   caches its one parse in request extensions for a later managed pass to reuse; on a chain with no managed owner
 //!   that cache is released, unconsumed, when the request ends.
-//! - The managed owner (`initialize_state: true`, the default) additionally rejects `background=true` and non-null
-//!   `prompt` — which Praxis does not implement on gateway-managed paths — and builds [`ResponsesState`]. When a
-//!   pre-routing pass cached its parse, the managed pass reuses it rather than deserializing the body a second time.
+//! - The managed owner (`initialize_state: true`, the default) rejects `code_interpreter`, `background=true`, and
+//!   non-null `prompt` — which Praxis does not implement on gateway-managed paths — and builds [`ResponsesState`]. When
+//!   a pre-routing pass cached its parse, the managed pass reuses it rather than deserializing the body a second time.
 //!
 //! Classification metadata is published under this filter's `openai_responses_request`
 //! namespace, which downstream filters read. Filter results are published under
@@ -55,7 +55,7 @@ use tracing::{debug, trace};
 use super::{
     bound_body_outcome,
     config::{ResponsesClassificationConfig, ResponsesRequestConfig, build_config},
-    error::responses_error_rejection_with_code,
+    error::{responses_error_rejection, responses_error_rejection_with_code},
     extract_conversation_id,
     routes::{self as responses_routes, ResponsesOperation},
     state::ResponsesState,
@@ -80,8 +80,10 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// and the `WebSocket` handshake — are released untouched, as is Conversations
 /// API traffic. `on_invalid` governs only bodies that fail to parse.
 ///
-/// Rejects `background=true` and non-null `prompt` with a 400, the
-/// managed-path policy this filter now owns. A non-null `prompt` is the
+/// On managed paths, rejects `code_interpreter`, `background=true`, and non-null
+/// `prompt` with a 400 because the gateway does not implement them. The
+/// pre-routing fact publisher leaves these fields intact for direct upstreams.
+/// A non-null `prompt` is the
 /// deprecated OpenAI reusable prompt object (`{ id, version, variables }`);
 /// OpenAI retires reusable prompts and `v1/prompts` on 2026-11-30, so clients
 /// should move its content into `input` rather than rely on the gateway to
@@ -132,6 +134,11 @@ impl OpenaiResponsesRequestFilter {
         } = cached;
 
         if let Some(action) = reject_unsupported_managed_fields(&classified, &parsed) {
+            return action;
+        }
+        if operation == ResponsesOperation::CreateResponse
+            && let Some(action) = reject_unsupported_responses_tools(&parsed)
+        {
             return action;
         }
         if let Some(action) = reject_conflicting_history_selectors(&parsed) {
@@ -714,6 +721,26 @@ fn reject_conflicting_history_selectors(body: &serde_json::Value) -> Option<Filt
             "invalid_request_error",
             "mutually_exclusive_parameters",
             "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
+        ))
+    })
+}
+
+/// Reject Responses hosted tools the gateway cannot execute on managed paths.
+fn reject_unsupported_responses_tools(body: &serde_json::Value) -> Option<FilterAction> {
+    let has_code_interpreter = body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.get("type").and_then(serde_json::Value::as_str) == Some("code_interpreter"))
+        });
+
+    has_code_interpreter.then(|| {
+        FilterAction::Reject(responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "The code_interpreter tool is not supported by this gateway.",
         ))
     })
 }
