@@ -1003,7 +1003,10 @@ fn reject_budget_exhausted() -> FilterAction {
 /// tenant. An explicit denial: returned regardless of any fail-open setting
 /// and with precedence over budget exhaustion.
 fn reject_model_not_allowed() -> FilterAction {
-    debug!("requested model is not allowed for this user");
+    // Authorization denials are security-relevant: someone probing the
+    // model gate (escaped spellings, duplicate keys, identity spoofing)
+    // must be visible in the logs at the default level, not just debug.
+    warn!("requested model is not allowed for this user");
     FilterAction::Reject(
         Rejection::status(STATUS_MODEL_NOT_ALLOWED).with_body(Bytes::from_static(b"model not allowed for this user")),
     )
@@ -1014,7 +1017,7 @@ fn reject_model_not_allowed() -> FilterAction {
 /// `default_username` never satisfy this: authorization cannot be evaluated
 /// for an invented identity, so it fails closed.
 fn reject_identity_required() -> FilterAction {
-    debug!("model policy enabled but no tenant identity is present");
+    warn!("model policy enabled but no tenant identity is present");
     FilterAction::Reject(
         Rejection::status(STATUS_AUTHZ_INPUT_REQUIRED)
             .with_body(Bytes::from_static(b"tenant identity required for model authorization")),
@@ -1026,7 +1029,7 @@ fn reject_identity_required() -> FilterAction {
 /// fallback only; authorizing it would not authorize the model actually
 /// being requested.
 fn reject_model_required() -> FilterAction {
-    debug!("model policy enabled but no public model could be resolved");
+    warn!("model policy enabled but no public model could be resolved");
     FilterAction::Reject(
         Rejection::status(STATUS_AUTHZ_INPUT_REQUIRED)
             .with_body(Bytes::from_static(b"request model required for model authorization")),
@@ -1039,7 +1042,7 @@ fn reject_model_required() -> FilterAction {
 /// model, since authorizing one of them would not authorize the model the
 /// provider actually receives.
 fn reject_model_conflict() -> FilterAction {
-    debug!("conflicting model inputs: identity, client, and body models disagree");
+    warn!("conflicting model inputs: identity, client, and body models disagree");
     FilterAction::Reject(
         Rejection::status(STATUS_AUTHZ_INPUT_REQUIRED)
             .with_body(Bytes::from_static(b"conflicting model inputs for model authorization")),
@@ -1052,7 +1055,7 @@ fn reject_model_conflict() -> FilterAction {
 /// the framework enforces on this filter's behalf; enforcing it here keeps
 /// the documented bound independent of the pipeline's other buffer needs.
 fn reject_body_too_large() -> FilterAction {
-    debug!("request body exceeds the model-policy pre-read bound");
+    warn!("request body exceeds the model-policy pre-read bound");
     FilterAction::Reject(Rejection::status(STATUS_PAYLOAD_TOO_LARGE))
 }
 

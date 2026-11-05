@@ -1679,6 +1679,173 @@ fn extract_model_is_unusable_on_duplicate_decoded_keys() {
 }
 
 // -----------------------------------------------------------------------------
+// Model Extraction — Differential Coverage
+// -----------------------------------------------------------------------------
+
+/// The top-level `model` a strict JSON parse assigns, mirroring what a
+/// provider's parser would read from the same bytes.
+fn serde_json_model(bytes: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()?
+        .get("model")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Hand-curated adversarial corpus: every way a body can be ambiguous,
+/// undecodable, misleading, or simply malformed about its model.
+const ADVERSARIAL_BODIES: &[&[u8]] = &[
+    br#"{"model":"gpt-4o","messages":[]}"#,
+    br#"{ "model" : "claude-sonnet-4" , "stream": true }"#,
+    br#"{"stream":true,"model":"gpt-4o-mini"}"#,
+    br#"{"model":"gpt-4o","model":"claude-sonnet-4"}"#,
+    br#"{"model":"gpt-4o","\u006dodel":"claude-sonnet-4"}"#,
+    br#"{"model":"gpt\u002d4o"}"#,
+    br#"{ "\u006dodel" : "gpt-4o" }"#,
+    br#"{"messages":[{"role":"user","model":"decoy"}],"model":"gpt-4o"}"#,
+    br#"{"prompt":"say \"model\": \"decoy\" back","model":"gpt-4o"}"#,
+    br#"{"model":"gp\"t-4"}"#,
+    br#"{"model":"gpt-4\\o"}"#,
+    br#"{"model":null}"#,
+    br#"{"model":42}"#,
+    br#"{"model":true}"#,
+    br#"{"messages":[]}"#,
+    br#"{"messages":[{"model":"decoy"}]}"#,
+    br#"{}"#,
+    br#"[]"#,
+    br#"null"#,
+    br#"42"#,
+    b"   ",
+    b"",
+    br#"{"model":"gpt-4"#,
+    br#"{"mod"#,
+    br#"{"model":"x"} trailing"#,
+    b"\xFF\xFE\x00\x01",
+];
+
+/// Deterministic xorshift PRNG so a failing generation reproduces exactly.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        usize::try_from(self.0 % n as u64).expect("reduced modulo n always fits usize")
+    }
+
+    fn pick_str<'a>(&mut self, items: &'a [&'a str]) -> &'a str {
+        items[self.below(items.len())]
+    }
+}
+
+/// A scalar JSON value; strings deliberately include escapes, quotes, and
+/// non-ASCII text that stress the scanner's string tracking.
+fn scalar(rng: &mut Rng) -> String {
+    match rng.below(6) {
+        0 => "null".to_owned(),
+        1 => rng.below(9999).to_string(),
+        2 if rng.below(2) == 0 => "true".to_owned(),
+        2 => "false".to_owned(),
+        3 => r#""has \"escaped\" quotes and \\ backslashes""#.to_owned(),
+        4 => "\"unicode ünïcödé → ✓\"".to_owned(),
+        _ => format!("\"plain string {}\"", rng.below(9999)),
+    }
+}
+
+/// A filler JSON value; nested levels may carry decoy `model` keys, which
+/// must never surface as the top-level model.
+fn filler_value(rng: &mut Rng, depth: u8) -> String {
+    if depth >= 3 || rng.below(3) == 0 {
+        return scalar(rng);
+    }
+    if rng.below(2) == 0 {
+        let members: Vec<String> = (0..rng.below(4))
+            .map(|_| {
+                if rng.below(4) == 0 {
+                    format!(r#""model":"decoy-{}""#, rng.below(99))
+                } else {
+                    format!(r#""key-{}":{}"#, rng.below(99), filler_value(rng, depth + 1))
+                }
+            })
+            .collect();
+        format!("{{{}}}", members.join(","))
+    } else {
+        let items: Vec<String> = (0..rng.below(4)).map(|_| filler_value(rng, depth + 1)).collect();
+        format!("[{}]", items.join(","))
+    }
+}
+
+/// Deterministically generate a valid JSON body with exactly one top-level
+/// `model` member — plain or escaped-key spelling, plain string value —
+/// alongside the model a JSON parser must read from it.
+fn generated_body(rng: &mut Rng) -> (Vec<u8>, String) {
+    const MODELS: &[&str] = &["gpt-4o", "claude-sonnet-4-5", "llama3.1:70b", "模型-x", "a.b/c-d_e"];
+    const KEYS: &[&str] = &[r#""model""#, r#""\u006dodel""#];
+    const FILLER_KEYS: &[&str] = &["messages", "stream", "temperature", "prompt", "tools", "user"];
+    let expected = rng.pick_str(MODELS).to_owned();
+    let model_member = format!(r#"{}:"{}""#, rng.pick_str(KEYS), expected);
+    let mut members: Vec<String> = (0..rng.below(5))
+        .map(|_| {
+            let key = rng.pick_str(FILLER_KEYS);
+            format!(r#""{key}":{}"#, filler_value(rng, 0))
+        })
+        .collect();
+    members.insert(rng.below(members.len() + 1), model_member);
+    let separator = if rng.below(2) == 0 { ", " } else { "," };
+    (format!("{{{}}}", members.join(separator)).into_bytes(), expected)
+}
+
+#[test]
+fn extractor_never_claims_a_model_a_parser_would_not_read() {
+    // Security property (CWE-436 interpretation conflict): whenever the
+    // extractor reports a usable model, any JSON parser that accepts the
+    // body must read the exact same value — the provider must never see a
+    // model the preflight did not compare. Bodies a parser rejects are
+    // unconstrained: the provider refuses them too, so no divergence is
+    // possible.
+    let mut rng = Rng(0x5EED_1719);
+    let mut corpus: Vec<Vec<u8>> = ADVERSARIAL_BODIES.iter().map(|b| b.to_vec()).collect();
+    corpus.extend((0..500).map(|_| generated_body(&mut rng).0));
+    for body in corpus {
+        if let BodyModel::Usable(claimed) = extract_model_from_bytes(&body)
+            && let Some(parsed) = serde_json_model(&body)
+        {
+            assert_eq!(
+                parsed,
+                claimed,
+                "extractor and JSON parser disagree on {:?}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+}
+
+#[test]
+fn extractor_resolves_every_unambiguous_model() {
+    // Completeness: a valid body whose single top-level `model` member has
+    // a plain string value must resolve to exactly what a JSON parser
+    // reads — a miss would spuriously reject well-formed requests.
+    let mut rng = Rng(0x1719_5EED);
+    for _ in 0..500 {
+        let (body, expected) = generated_body(&mut rng);
+        let parsed = serde_json_model(&body).unwrap_or_else(|| {
+            panic!(
+                "generated body must be valid JSON: {:?}",
+                String::from_utf8_lossy(&body)
+            )
+        });
+        assert_eq!(parsed, expected, "generator and parser disagree on {body:?}");
+        assert_eq!(
+            extracted(&body).as_deref(),
+            Some(expected.as_str()),
+            "extractor missed the unambiguous model in {:?}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Token Metadata Reading
 // -----------------------------------------------------------------------------
 
