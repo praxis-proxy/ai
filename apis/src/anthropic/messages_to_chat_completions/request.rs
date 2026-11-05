@@ -563,13 +563,17 @@ fn degrade_mid_conversation_system(body: &mut Map<String, Value>) -> Result<bool
 /// Consume a message into its text-only system content parts when it is a
 /// movable system message, or hand the untouched message back.
 ///
-/// Movable means: a `system`-role message that follows a non-system turn and
-/// whose content is a string or an array of text blocks. Anything else —
-/// including a non-text content a strict backend would also reject — is
-/// returned unchanged so the strict validator produces its own error.
+/// Movable means: a `system`-role message that follows a non-system turn,
+/// carries no field beyond `role`/`content`, and whose content is a string
+/// or an array of text blocks the strict validator accepts (apart from a
+/// `cache_control` marker, which is carried). Anything else — including a
+/// field or block shape the strict validator would reject — is returned
+/// unchanged so the strict validator produces its own error instead of the
+/// fold silently dropping it.
 fn take_movable_system_content(message: Value, seen_non_system: bool) -> Result<SystemParts, Value> {
     let is_movable_system = message.get("role").and_then(Value::as_str) == Some("system")
         && seen_non_system
+        && has_only_keys(&message, &["role", "content"])
         && message.get("content").is_some_and(content_is_text_only);
     if !is_movable_system {
         return Err(message);
@@ -631,12 +635,17 @@ fn existing_system_groups(existing: Option<Value>) -> Result<(Vec<SystemParts>, 
         Some(Value::Array(blocks)) => {
             let mut group = Vec::with_capacity(blocks.len());
             for block in blocks {
+                // A block the strict validator would reject (unknown keys,
+                // non-empty citations) fails here with the same message
+                // instead of having those fields silently dropped by the
+                // merge. A `cache_control` marker is allowed: it is carried
+                // onto the merged block so validation still sees it.
+                if !text_block_is_foldable(&block) {
+                    return Err(SYSTEM_SHAPE_ERROR.to_owned());
+                }
                 let Value::Object(mut block) = block else {
                     return Err(SYSTEM_SHAPE_ERROR.to_owned());
                 };
-                if block.get("type").and_then(Value::as_str) != Some("text") {
-                    return Err(SYSTEM_SHAPE_ERROR.to_owned());
-                }
                 let Some(text) = take_string(&mut block, "text") else {
                     return Err(SYSTEM_SHAPE_ERROR.to_owned());
                 };
@@ -666,13 +675,12 @@ fn system_blocks_from_group(group: SystemParts) -> Vec<Value> {
         .collect()
 }
 
-/// Whether a message content is a string or an array of text blocks.
+/// Whether a message content is a string or an array of foldable text blocks
+/// (see [`text_block_is_foldable`]).
 fn content_is_text_only(content: &Value) -> bool {
     match content {
         Value::String(_) => true,
-        Value::Array(blocks) => blocks.iter().all(|block| {
-            block.get("type").and_then(Value::as_str) == Some("text") && block.get("text").is_some_and(Value::is_string)
-        }),
+        Value::Array(blocks) => blocks.iter().all(text_block_is_foldable),
         _ => false,
     }
 }
@@ -923,12 +931,20 @@ fn has_only_keys(value: &Value, keys: &[&str]) -> bool {
 
 /// Null or empty citations carry no source information to preserve.
 fn text_block_is_supported(block: &Value) -> bool {
+    text_block_is_foldable(block) && null_or_absent(block, "cache_control")
+}
+
+/// Whether a block is a text block the strict validator accepts, apart from a
+/// `cache_control` marker: the mid-conversation system fold carries a
+/// surviving marker onto the merged `system` so validation still fails closed
+/// when `prompt_caching` is not allowlisted (see
+/// [`degrade_mid_conversation_system`]).
+fn text_block_is_foldable(block: &Value) -> bool {
     block.get("type").and_then(Value::as_str) == Some("text")
         && block.get("text").is_some_and(Value::is_string)
         && block
             .get("citations")
             .is_none_or(|citations| citations.is_null() || citations.as_array().is_some_and(Vec::is_empty))
-        && null_or_absent(block, "cache_control")
         && has_only_keys(block, &["type", "text", "citations", "cache_control"])
 }
 
@@ -948,9 +964,84 @@ fn tool_result_part_is_supported(part: &Value) -> bool {
                 && has_only_keys(part, &["type", "source", "cache_control"])
                 && null_or_absent(part, "cache_control")
         },
-        Some("search_result" | "document") => true,
+        Some("search_result") => search_result_part_is_supported(part),
+        Some("document") => document_part_is_supported(part),
         _ => false,
     }
+}
+
+/// Check a `search_result` part of a `tool_result` against what
+/// `flatten_search_result` translates. A part whose `title`, `source`, and
+/// `content` are all absent or empty flattens to nothing, so the tool
+/// message would silently lose it; such a part fails closed here instead.
+/// A `citations` config or `cache_control` marker the flattener would drop
+/// is likewise rejected rather than silently discarded.
+fn search_result_part_is_supported(part: &Value) -> bool {
+    null_or_absent(part, "citations")
+        && null_or_absent(part, "cache_control")
+        && has_only_keys(
+            part,
+            &["type", "title", "source", "content", "citations", "cache_control"],
+        )
+        && (non_empty_string_field(part, "title")
+            || non_empty_string_field(part, "source")
+            || part
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| blocks.iter().any(text_block_has_text)))
+}
+
+/// Check a `document` part of a `tool_result` against what `flatten_document`
+/// translates. A part with no `title`, `context`, or translatable `source`
+/// would be silently dropped from the tool message, so it fails closed here
+/// instead, as does a `citations` config or `cache_control` marker the
+/// flattener would drop.
+fn document_part_is_supported(part: &Value) -> bool {
+    null_or_absent(part, "citations")
+        && null_or_absent(part, "cache_control")
+        && has_only_keys(
+            part,
+            &["type", "title", "context", "source", "citations", "cache_control"],
+        )
+        && (non_empty_string_field(part, "title")
+            || non_empty_string_field(part, "context")
+            || part.get("source").is_some_and(document_source_is_supported))
+}
+
+/// Check a `document` part's `source` against what `flatten_document_source`
+/// translates: a known source type carrying its extractable field.
+fn document_source_is_supported(source: &Value) -> bool {
+    let Some(fields) = source.as_object() else {
+        return false;
+    };
+    match fields.get("type").and_then(Value::as_str) {
+        Some("text") => non_empty_string_field(source, "data"),
+        Some("content") => fields
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| blocks.iter().any(text_block_has_text)),
+        Some("url") => non_empty_string_field(source, "url"),
+        Some("file") => non_empty_string_field(source, "file_id"),
+        Some("base64") => non_empty_string_field(source, "media_type"),
+        _ => false,
+    }
+}
+
+/// Whether a block is a text block with non-empty text.
+fn text_block_has_text(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("text")
+        && block
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+}
+
+/// Whether `value` carries a non-empty string at `key`.
+fn non_empty_string_field(value: &Value, key: &str) -> bool {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .is_some_and(|field| !field.is_empty())
 }
 
 /// A direct caller is the only caller form this translator emits and consumes.
@@ -1153,6 +1244,13 @@ fn convert_messages(messages: &mut Vec<Value>, source: Option<Value>) {
 fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
     let mut content_parts = Vec::new();
     let mut tool_calls = Vec::new();
+    // Images promoted out of `tool_result` parts are deferred until every
+    // tool message of this Anthropic message has been emitted: Chat
+    // Completions requires all tool replies to follow the assistant
+    // `tool_calls` message directly, so with parallel tool calls a user
+    // message may only appear after the last tool message, never between
+    // two of them.
+    let mut promoted_images = Vec::new();
 
     for block in blocks {
         let mut block = match block {
@@ -1160,7 +1258,22 @@ fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Val
             _ => Map::new(),
         };
         let block_type = take_string(&mut block, "type").unwrap_or_default();
-        convert_single_block(block, &block_type, messages, role, &mut content_parts, &mut tool_calls);
+        convert_single_block(
+            block,
+            &block_type,
+            messages,
+            role,
+            &mut content_parts,
+            &mut tool_calls,
+            &mut promoted_images,
+        );
+    }
+
+    if !promoted_images.is_empty() {
+        let mut image_message = Map::new();
+        image_message.insert("role".to_owned(), Value::String("user".to_owned()));
+        image_message.insert("content".to_owned(), Value::Array(promoted_images));
+        messages.push(Value::Object(image_message));
     }
 
     finalize_content_blocks(messages, role, &mut content_parts, tool_calls);
@@ -1178,6 +1291,7 @@ fn convert_single_block(
     role: &str,
     content_parts: &mut Vec<Value>,
     tool_calls: &mut Vec<Value>,
+    promoted_images: &mut Vec<Value>,
 ) {
     match block_type {
         "text" => convert_text_block(block, content_parts),
@@ -1187,7 +1301,7 @@ fn convert_single_block(
         "tool_use" => convert_tool_use_block(block, tool_calls),
         "tool_result" => {
             flush_content_parts(messages, content_parts, role);
-            convert_tool_result_block(block, messages);
+            convert_tool_result_block(block, messages, promoted_images);
         },
         "thinking" | "redacted_thinking" => {
             warn!(block_type, "dropping unsupported Anthropic content block");
@@ -1274,7 +1388,15 @@ fn convert_tool_use_block(mut block: Map<String, Value>, tool_calls: &mut Vec<Va
 }
 
 /// Convert a `tool_result` content block to a Chat Completions tool message.
-fn convert_tool_result_block(mut block: Map<String, Value>, messages: &mut Vec<Value>) {
+///
+/// Image parts cannot live in a tool message, so they are handed to
+/// `promoted_images` and emitted as one follow-up user message after every
+/// tool message of this Anthropic message (see [`convert_content_blocks`]).
+fn convert_tool_result_block(
+    mut block: Map<String, Value>,
+    messages: &mut Vec<Value>,
+    promoted_images: &mut Vec<Value>,
+) {
     let tool_call_id = take_string(&mut block, "tool_use_id").unwrap_or_default();
     let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
 
@@ -1290,12 +1412,7 @@ fn convert_tool_result_block(mut block: Map<String, Value>, messages: &mut Vec<V
     tool_message.insert("content".to_owned(), Value::String(result_content));
     messages.push(Value::Object(tool_message));
 
-    if !image_content.is_empty() {
-        let mut image_message = Map::new();
-        image_message.insert("role".to_owned(), Value::String("user".to_owned()));
-        image_message.insert("content".to_owned(), Value::Array(image_content));
-        messages.push(Value::Object(image_message));
-    }
+    promoted_images.extend(image_content);
 }
 
 /// Emit the final message for accumulated content and tool calls.
@@ -1369,7 +1486,8 @@ fn convert_image_source(source: Value) -> Option<String> {
 // -----------------------------------------------------------------------------
 
 /// Split a `tool_result` block's `content` into its flattened text and the
-/// image parts promoted to a follow-up user message.
+/// image parts promoted to a follow-up user message emitted after every tool
+/// message of the containing Anthropic message.
 fn split_tool_result_content(content: Option<Value>) -> (String, Vec<Value>) {
     match content {
         Some(Value::String(text)) => (text, Vec::new()),
@@ -2222,6 +2340,42 @@ mod tests {
     }
 
     #[test]
+    fn parallel_tool_result_images_follow_all_tool_messages() {
+        // With parallel tool calls, one Anthropic user message carries several
+        // tool_result blocks. Chat Completions requires every tool reply to
+        // follow the assistant `tool_calls` message directly, so an image
+        // promoted out of the first result may only appear as a user message
+        // after the last tool message — never between two tool messages.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"render_chart","input":{}},{"type":"tool_use","id":"call_2","name":"get_status","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"chart"},{"type":"image","source":{"type":"url","url":"https://example.com/chart.png"}}]},{"type":"tool_result","tool_use_id":"call_2","content":"ready"}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let roles: Vec<&str> = parsed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            ["assistant", "tool", "tool", "user"],
+            "both tool replies precede the promoted image: {roles:?}"
+        );
+        assert_eq!(
+            parsed["messages"][1]["tool_call_id"], "call_1",
+            "first tool reply keeps its id"
+        );
+        assert_eq!(
+            parsed["messages"][2]["tool_call_id"], "call_2",
+            "second tool reply keeps its id"
+        );
+        assert_eq!(
+            parsed["messages"][3]["content"][0]["image_url"]["url"], "https://example.com/chart.png",
+            "promoted image follows the last tool message"
+        );
+    }
+
+    #[test]
     fn tool_result_unsupported_content_part_is_rejected() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"thinking","thinking":"internal"}]}]}]}"#;
         let error = transform_bytes(body).unwrap_err();
@@ -2261,6 +2415,77 @@ mod tests {
             parsed["messages"][0]["content"],
             "Before document.\nDocument: \"Nested Doc\"\nContent:\nNested document fact.\nAfter document.",
             "document part is flattened into the tool message content"
+        );
+    }
+
+    #[test]
+    fn tool_result_empty_search_result_part_is_rejected() {
+        // A search_result part with no title, source, or content flattens to
+        // nothing; rejecting it here fails closed instead of silently
+        // dropping the result from the tool message.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"search_result"}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("search_result"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_search_result_part_with_dropped_fields_is_rejected() {
+        // A citations config or cache_control marker on a search_result part
+        // is not translated, so it must fail closed rather than be dropped.
+        for (field, value) in [
+            ("citations", json!({"enabled": true})),
+            ("cache_control", json!({"type": "ephemeral"})),
+        ] {
+            let mut part = json!({"type": "search_result", "source": "kb://timeouts", "title": "Timeout KB"});
+            part.as_object_mut().unwrap().insert(field.to_owned(), value);
+            let body = json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": [part]
+                }]}]
+            });
+            let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+            assert!(error.contains("search_result"), "{error}");
+        }
+    }
+
+    #[test]
+    fn tool_result_empty_document_part_is_rejected() {
+        // A document part with no title, context, or translatable source
+        // flattens to nothing and must fail closed instead of silently
+        // disappearing from the tool message.
+        for source in [
+            json!({"type": "unknown"}),
+            json!({"type": "url", "url": ""}),
+            json!({"type": "text", "data": ""}),
+        ] {
+            let body = json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": [{"type": "document", "source": source}]
+                }]}]
+            });
+            let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+            assert!(error.contains("document"), "{error}");
+        }
+    }
+
+    #[test]
+    fn tool_result_document_source_only_part_is_flattened() {
+        // A document part whose source alone carries extractable data (here a
+        // file reference) still translates, so it must not be rejected.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","source":{"type":"file","file_id":"file_abc"}}]}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(
+            parsed["messages"][0]["content"], "Document\nSource: \"file:file_abc\"",
+            "source-only document part is flattened into the tool message"
         );
     }
 
@@ -3324,6 +3549,75 @@ mod tests {
             error.contains("image"),
             "left in place, the strict validator rejects the block: {error}"
         );
+    }
+
+    #[test]
+    fn mid_conversation_system_extra_message_field_left_for_strict_validation() {
+        // A system message carrying a field beyond role/content is not moved:
+        // folding it would silently drop the field the strict validator
+        // rejects, so it stays in place and fails closed.
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "Be terse.", "name": "env"}
+            ]
+        });
+        let error = degrade(body, MIDSYS).unwrap_err();
+        assert!(
+            error.contains("unsupported Anthropic message field"),
+            "left in place, the strict validator rejects the extra field: {error}"
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_block_shape_left_for_strict_validation() {
+        // Text blocks with non-empty citations or unknown fields are not
+        // foldable: the strict validator rejects them instead of the fold
+        // silently dropping the field.
+        for block in [
+            json!({"type": "text", "text": "Be terse.", "citations": [{"type": "char_location", "cited_text": "t"}]}),
+            json!({"type": "text", "text": "Be terse.", "extra": "field"}),
+        ] {
+            let body = json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {"role": "system", "content": [block]}
+                ]
+            });
+            let error = degrade(body, MIDSYS).unwrap_err();
+            assert!(
+                error.contains("text"),
+                "left in place, the strict validator rejects the block: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn mid_conversation_system_top_level_block_shape_fails_closed() {
+        // When folding, the existing top-level system blocks are held to the
+        // same standard as strict validation: a non-empty citation or unknown
+        // field fails with the strict system shape error rather than being
+        // silently dropped by the merge.
+        for block in [
+            json!({"type": "text", "text": "Part 1", "citations": [{"type": "char_location", "cited_text": "t"}]}),
+            json!({"type": "text", "text": "Part 1", "extra": "field"}),
+        ] {
+            let body = json!({
+                "model": "m",
+                "system": [block],
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {"role": "system", "content": "Part 2"}
+                ]
+            });
+            let error = degrade(body, MIDSYS).unwrap_err();
+            assert!(
+                error.contains("`system` must be a string or array of text blocks"),
+                "the malformed top-level block must fail closed: {error}"
+            );
+        }
     }
 
     #[test]

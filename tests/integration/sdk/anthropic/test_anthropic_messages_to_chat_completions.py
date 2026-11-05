@@ -271,6 +271,7 @@ def _write_config(proxy_port: int, backend_port: int, allow_lossy: bool = False)
             + "        allow_lossy_features:\n"
             + "          - prompt_caching\n"
             + "          - extended_thinking\n"
+            + "          - mid_conversation_system\n"
         )
         replaced = config.replace(marker, replacement)
         assert replaced != config, f"example drift: translation filter block not found in {CONFIG_PATH}"
@@ -559,6 +560,59 @@ class TestRequestFieldHandling:
         assert image_message["content"][0]["type"] == "image_url"
         assert image_message["content"][0]["image_url"]["url"] == "https://example.com/chart.png"
 
+    def test_parallel_tool_result_images_follow_all_tool_messages(self, anthropic_client):
+        # Chat Completions requires every tool reply to follow the assistant
+        # `tool_calls` message directly, so an image promoted out of the first
+        # of two parallel tool results may only appear as a user message after
+        # the last tool message — never between two tool messages.
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}},
+                        {"type": "tool_use", "id": "toolu_2", "name": "lookup", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [
+                                {"type": "text", "text": "chart"},
+                                {
+                                    "type": "image",
+                                    "source": {"type": "url", "url": "https://example.com/chart.png"},
+                                },
+                            ],
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_2",
+                            "content": "ready",
+                        },
+                    ],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        roles = [message["role"] for message in upstream["messages"]]
+        assert roles == ["user", "assistant", "tool", "tool", "user"], upstream["messages"]
+        assert upstream["messages"][2]["tool_call_id"] == "toolu_1"
+        assert upstream["messages"][3]["tool_call_id"] == "toolu_2"
+        image_message = upstream["messages"][4]
+        assert image_message["role"] == "user"
+        assert image_message["content"][0]["image_url"]["url"] == "https://example.com/chart.png"
+
     def test_empty_string_tool_arguments_become_empty_input(self, anthropic_client):
         RecordingBackend.bodies.clear()
         RecordingBackend.send_tool_reply_once = True
@@ -833,6 +887,38 @@ class TestOperatorApprovedDegradation:
 
         [upstream] = RecordingBackend.bodies
         assert "thinking" not in upstream, f"thinking must be stripped: {upstream}"
+
+    def test_mid_conversation_system_is_folded_and_reported(self, degrading_client):
+        RecordingBackend.bodies.clear()
+
+        # The typed SDK surface cannot send a mid-conversation system message,
+        # so override the serialized `messages` with one that carries it
+        # (Claude Code's shape).
+        raw = degrading_client.messages.with_raw_response.create(
+            model=MODEL,
+            max_tokens=64,
+            system="You are helpful.",
+            messages=[{"role": "user", "content": "placeholder"}],
+            extra_body={
+                "messages": [
+                    {"role": "user", "content": "Call lookup"},
+                    {"role": "system", "content": "# Environment\ncwd: /tmp"},
+                    {"role": "user", "content": "Reply with exactly: OK"},
+                ]
+            },
+        )
+
+        assert raw.http_response.status_code == 200
+        assert "mid_conversation_system" in raw.http_response.headers.get(DEGRADED_HEADER, "")
+        message = raw.parse()
+        assert message.content[0].text == "4"
+
+        [upstream] = RecordingBackend.bodies
+        roles = [m["role"] for m in upstream["messages"]]
+        assert roles == ["system", "user", "user"], upstream["messages"]
+        assert upstream["messages"][0]["content"] == (
+            "You are helpful.\n\n# Environment\ncwd: /tmp"
+        ), "mid-conversation system text merges into the leading system message"
 
     def test_both_features_reported_together(self, degrading_client):
         RecordingBackend.bodies.clear()

@@ -207,7 +207,7 @@ surfaces:
     cells:
       text-chat:
         status: translated
-        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:799-860
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:807-868
       system-prompt:
         status: translated-lossy
         note: >-
@@ -216,7 +216,7 @@ surfaces:
           rejected 400 by default; with allow_lossy_features: [prompt_caching]
           the marker is stripped and signalled (see the request-side controls
           row).
-        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:838-860; apis/src/anthropic/messages_to_chat_completions/request.rs:476-481; apis/src/anthropic/messages_to_chat_completions/request.rs:682-690
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:846-868; apis/src/anthropic/messages_to_chat_completions/request.rs:476-481; apis/src/anthropic/messages_to_chat_completions/request.rs:690-698
       multi-turn:
         status: translated
         note: >-
@@ -228,19 +228,19 @@ surfaces:
           chat templates reject a mid-conversation system message (vLLM "System
           message must be at the beginning"); a leading system message is
           never moved.
-        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:751-753; apis/src/anthropic/messages_to_chat_completions/request.rs:523-561
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:759-761; apis/src/anthropic/messages_to_chat_completions/request.rs:523-561
       multimodal-image:
         status: translated
         note: >-
           User messages only. An image in an assistant message, or in any
           message that also carries tool_use, is rejected 400.
-        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:606-620; apis/src/anthropic/messages_to_chat_completions/request.rs:667
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:855-864
       multimodal-audio:
         status: n-a
       documents-files:
         status: rejected
         note: All document source types rejected 400; no PDF support.
-        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:667
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:918
       function-tools:
         status: translated
         note: >-
@@ -259,7 +259,7 @@ surfaces:
         note: >-
           tools[].type must be absent or "custom"; typed server tools
           (web_search, bash, computer, code_execution) are rejected 400.
-        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:533-540
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:771-801
       structured-output:
         status: translated-lossy
         note: >-
