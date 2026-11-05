@@ -376,6 +376,34 @@ async fn code_interpreter_is_preserved_by_facts_only_passes() {
     }
 }
 
+/// Token counting accepts tools without executing them, so Code Interpreter declarations pass through.
+#[tokio::test]
+async fn code_interpreter_is_preserved_for_input_token_counting() {
+    let request = make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = classified_context(&request).await;
+    let original = code_interpreter_body("gpt-4.1", false);
+    let mut body = Some(original.clone());
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "token counting must allow Code Interpreter declarations"
+    );
+    assert_eq!(
+        body.as_deref(),
+        Some(original.as_ref()),
+        "the complete token-count request must pass through unchanged"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "token counting does not initialize response creation state"
+    );
+}
+
 /// The hosted-tool restriction must preserve client-owned function tools in either role.
 #[tokio::test]
 async fn supported_function_tool_is_not_rejected_by_managed_tool_policy() {
