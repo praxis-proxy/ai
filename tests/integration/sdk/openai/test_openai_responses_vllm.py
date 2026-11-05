@@ -2594,6 +2594,7 @@ def web_search_chat_streaming_client(web_search_chat_streaming_proxy):
 def test_code_interpreter_is_rejected_before_backend_contact(
     code_interpreter_capture_client, stream
 ):
+    """Unsupported tools fail through the SDK before any backend request."""
     client, forwarded = code_interpreter_capture_client
 
     with pytest.raises(BadRequestError) as error:
@@ -2605,15 +2606,19 @@ def test_code_interpreter_is_rejected_before_backend_contact(
             tools=[{"type": "code_interpreter", "container": {"type": "auto"}}],
         )
 
-    assert error.value.status_code == 400
+    assert error.value.status_code == 400, "unsupported tools must return a client error"
     error_body = error.value.response.json()["error"]
-    assert error_body["type"] == "invalid_request_error"
-    assert error_body["code"] == "unsupported_tool_type"
-    assert error_body["message"] == "The code_interpreter tool is not supported by this gateway."
+    assert error_body["type"] == "invalid_request_error", (
+        "unsupported tools must use the OpenAI invalid-request error type"
+    )
+    assert error_body["code"] == "invalid_request_error", (
+        "unsupported tools must use the same error code as Chat Completions translation"
+    )
+    assert error_body["message"] == "The code_interpreter tool is not supported by this gateway.", (
+        "the request filter must identify the tool the gateway cannot execute"
+    )
     assert forwarded == [], "rejected Code Interpreter requests must not reach the backend"
 
-    # A supported client function tool remains accepted through the same role
-    # and proves the rejection is specific to Code Interpreter.
     response = client.responses.create(
         model=CHAT_TRANSLATION_MODEL,
         input="Answer directly.",
@@ -2627,9 +2632,11 @@ def test_code_interpreter_is_rejected_before_backend_contact(
         ],
         tool_choice="none",
     )
-    assert response.status == "completed"
-    assert len(forwarded) == 1
-    assert forwarded[0]["tools"][0]["function"]["name"] == "lookup"
+    assert response.status == "completed", "supported client function tools must remain accepted"
+    assert len(forwarded) == 1, "only the supported-tool request must reach the backend"
+    assert forwarded[0]["tools"][0]["function"]["name"] == "lookup", (
+        "the supported function tool must be preserved in the backend request"
+    )
 
 
 class TestOpenAIResponsesStoreCompression:

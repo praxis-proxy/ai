@@ -56,7 +56,7 @@ use tracing::{debug, trace};
 use super::{
     bound_body_outcome,
     config::{ResponsesClassificationConfig, ResponsesRequestConfig, build_config},
-    error::responses_error_rejection_with_code,
+    error::{responses_error_rejection, responses_error_rejection_with_code},
     extract_conversation_id,
     routes::{self as responses_routes, ResponsesOperation},
     state::ResponsesState,
@@ -737,10 +737,9 @@ fn reject_unsupported_responses_tools(body: &serde_json::Value) -> Option<Filter
         });
 
     has_code_interpreter.then(|| {
-        FilterAction::Reject(responses_error_rejection_with_code(
+        FilterAction::Reject(responses_error_rejection(
             400,
             "invalid_request_error",
-            "unsupported_tool_type",
             "The code_interpreter tool is not supported by this gateway.",
         ))
     })

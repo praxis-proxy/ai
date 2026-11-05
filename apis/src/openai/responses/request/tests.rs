@@ -264,29 +264,32 @@ fn assert_prompt_template_rejection(action: FilterAction) {
 
 /// Assert that Code Interpreter is rejected with the gateway's OpenAI error envelope.
 fn assert_unsupported_tool_rejection(action: FilterAction) {
-    assert!(
-        matches!(&action, FilterAction::Reject(_)),
-        "unsupported Responses tools must be rejected before upstream contact"
-    );
     let FilterAction::Reject(rejection) = action else {
-        return;
+        panic!("unsupported Responses tools must be rejected before upstream contact");
     };
-    assert_eq!(rejection.status, 400);
+    assert_eq!(
+        rejection.status, 400,
+        "unsupported tool rejection must be a client error"
+    );
     let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(
         body.pointer("/error/type").and_then(serde_json::Value::as_str),
-        Some("invalid_request_error")
+        Some("invalid_request_error"),
+        "unsupported tool rejection must use the OpenAI invalid-request error type"
     );
     assert_eq!(
         body.pointer("/error/code").and_then(serde_json::Value::as_str),
-        Some("unsupported_tool_type")
+        Some("invalid_request_error"),
+        "unsupported tool rejection must use the same error code as Chat Completions translation"
     );
     assert_eq!(
         body.pointer("/error/message").and_then(serde_json::Value::as_str),
-        Some("The code_interpreter tool is not supported by this gateway.")
+        Some("The code_interpreter tool is not supported by this gateway."),
+        "unsupported tool rejection must identify the tool the gateway cannot execute"
     );
 }
 
+/// Both roles must reject unsupported tools before state creation, regardless of streaming.
 #[tokio::test]
 async fn code_interpreter_is_rejected_in_both_filter_roles_and_stream_modes() {
     for initialize_state in [true, false] {
@@ -311,7 +314,11 @@ async fn code_interpreter_is_rejected_in_both_filter_roles_and_stream_modes() {
             let action = request_filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
             assert_unsupported_tool_rejection(action);
-            assert_eq!(body.as_deref(), Some(original_bytes.as_slice()));
+            assert_eq!(
+                body.as_deref(),
+                Some(original_bytes.as_slice()),
+                "rejecting an unsupported tool must leave the request body unchanged"
+            );
             assert!(
                 ctx.extensions.get::<ResponsesState>().is_none(),
                 "unsupported tools must be rejected before managed response state is initialized"
@@ -320,6 +327,7 @@ async fn code_interpreter_is_rejected_in_both_filter_roles_and_stream_modes() {
     }
 }
 
+/// The hosted-tool restriction must preserve client-owned function tools in either role.
 #[tokio::test]
 async fn supported_function_tool_is_not_rejected_by_shared_tool_policy() {
     for initialize_state in [true, false] {
@@ -336,7 +344,10 @@ async fn supported_function_tool_is_not_rejected_by_shared_tool_policy() {
 
         let action = request_filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-        assert!(matches!(action, FilterAction::Release));
+        assert!(
+            matches!(action, FilterAction::Release),
+            "the unsupported-tool policy must accept client function tools in both filter roles"
+        );
     }
 }
 
