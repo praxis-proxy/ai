@@ -367,6 +367,10 @@ fn external_metering_model_policy_fails_closed_on_malformed_payload_despite_bill
         backend.requests().is_empty(),
         "no provider request may be dispatched when the payload is unusable"
     );
+    assert!(
+        metering.requests().iter().any(|r| r.method == "GET"),
+        "the preflight must still have consulted the metering service before failing closed"
+    );
 }
 
 #[test]
@@ -407,6 +411,10 @@ fn external_metering_model_policy_fails_closed_on_oversized_payload_despite_bill
     assert!(
         backend.requests().is_empty(),
         "no provider request may be dispatched when the payload is cut off at the response bound"
+    );
+    assert!(
+        metering.requests().iter().any(|r| r.method == "GET"),
+        "the preflight must still have consulted the metering service before failing closed"
     );
 }
 

@@ -814,6 +814,100 @@ async fn model_policy_rejects_identity_model_conflicting_with_body_model() {
 }
 
 #[tokio::test]
+async fn model_policy_rejects_escaped_body_model_value_alongside_identity_model() {
+    // Regression: an undecodable body model must not read as model-absent.
+    // The provider decodes the member to `gpt-4o`, so authorizing the
+    // trusted identity claim `gpt-4o-mini` would admit a request for a
+    // model the preflight never compared.
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "gpt-4o-mini".to_owned());
+    ctx.buffered_request_body = Some(Bytes::from_static(br#"{"model":"gpt\u002d4o","messages":[]}"#));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert_reject(action, 403, "conflicting model inputs for model authorization");
+    assert!(
+        ctx.filter_state.is_empty(),
+        "an unusable body model must reject before any balance callout stores state"
+    );
+}
+
+#[tokio::test]
+async fn model_policy_rejects_duplicate_body_model_keys_alongside_identity_model() {
+    // Regression: duplicate `model` keys leave the provider's parser to pick
+    // a winner, so neither value may be authorized against the identity
+    // claim — including when one of them agrees with it.
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "gpt-4o-mini".to_owned());
+    ctx.buffered_request_body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4o-mini","model":"gpt-4o","messages":[]}"#,
+    ));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert_reject(action, 403, "conflicting model inputs for model authorization");
+    assert!(
+        ctx.filter_state.is_empty(),
+        "ambiguous duplicate model keys must reject before any balance callout stores state"
+    );
+}
+
+#[tokio::test]
+async fn model_policy_rejects_escaped_body_model_key_alongside_identity_model() {
+    // An escaped key spelling still names `model`, so its value is a real
+    // model source and must conflict-check like a plain spelling.
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "gpt-4o-mini".to_owned());
+    ctx.buffered_request_body = Some(Bytes::from_static(br#"{ "stream": true, "\u006dodel": "gpt-4o" }"#));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert_reject(action, 403, "conflicting model inputs for model authorization");
+}
+
+#[tokio::test]
+async fn model_policy_allows_absent_body_model_alongside_identity_model() {
+    // Control for the unusable-body rejections: a body with no `model`
+    // member at all is genuinely absent, so the identity model alone
+    // authorizes (here through the fail-open gates).
+    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "gpt-4o-mini".to_owned());
+    ctx.buffered_request_body = Some(Bytes::from_static(br#"{"prompt": "hi"}"#));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a body without a model member is absent, not conflicting"
+    );
+    let state = ctx
+        .filter_state
+        .get(&0)
+        .and_then(|s| s.downcast_ref::<MeteringState>())
+        .expect("state should be stored after the callout");
+    assert_eq!(
+        state.model, "gpt-4o-mini",
+        "an absent body model must leave the identity model authoritative"
+    );
+}
+
+#[tokio::test]
 async fn model_policy_ignores_body_once_client_model_is_recorded() {
     // `model_to_provider` records the client-facing model and rewrites the
     // buffered body to the provider target during the pre-read, so by the
@@ -1378,22 +1472,30 @@ fn strips_accept_encoding_to_keep_response_readable() {
 // Model Extraction
 // -----------------------------------------------------------------------------
 
+/// The usable model the extractor resolves, if any.
+fn extracted(body: &[u8]) -> Option<String> {
+    match extract_model_from_bytes(body) {
+        BodyModel::Usable(model) => Some(model),
+        BodyModel::Absent | BodyModel::Unusable => None,
+    }
+}
+
 #[test]
 fn extracts_model_from_compact_json() {
     let body = br#"{"model":"gpt-4","messages":[]}"#;
-    assert_eq!(extract_model_from_bytes(body).as_deref(), Some("gpt-4"));
+    assert_eq!(extracted(body).as_deref(), Some("gpt-4"));
 }
 
 #[test]
 fn extracts_model_with_whitespace_around_colon() {
     let body = br#"{ "model" : "claude-sonnet-4" , "stream": true }"#;
-    assert_eq!(extract_model_from_bytes(body).as_deref(), Some("claude-sonnet-4"));
+    assert_eq!(extracted(body).as_deref(), Some("claude-sonnet-4"));
 }
 
 #[test]
 fn extracts_model_when_not_first_field() {
     let body = br#"{"stream":true,"max_tokens":100,"model":"gpt-4o-mini"}"#;
-    assert_eq!(extract_model_from_bytes(body).as_deref(), Some("gpt-4o-mini"));
+    assert_eq!(extracted(body).as_deref(), Some("gpt-4o-mini"));
 }
 
 #[test]
@@ -1402,7 +1504,7 @@ fn extract_model_ignores_nested_decoy() {
     // top-level field, regardless of field order.
     let body = br#"{"messages":[{"role":"user","content":"hi","model":"decoy"}],"model":"gpt-4"}"#;
     assert_eq!(
-        extract_model_from_bytes(body).as_deref(),
+        extracted(body).as_deref(),
         Some("gpt-4"),
         "nested decoy must not shadow the top-level model"
     );
@@ -1412,44 +1514,52 @@ fn extract_model_ignores_nested_decoy() {
 fn extract_model_ignores_decoy_inside_string_value() {
     let body = br#"{"prompt":"please say \"model\": \"decoy\" back","model":"gpt-4o"}"#;
     assert_eq!(
-        extract_model_from_bytes(body).as_deref(),
+        extracted(body).as_deref(),
         Some("gpt-4o"),
         "a quoted decoy inside a string value must be skipped"
     );
 }
 
 #[test]
-fn extract_model_returns_none_when_only_nested() {
+fn extract_model_is_absent_when_only_nested() {
     let body = br#"{"messages":[{"model":"decoy","content":"hi"}]}"#;
     assert!(
-        extract_model_from_bytes(body).is_none(),
+        matches!(extract_model_from_bytes(body), BodyModel::Absent),
         "a nested-only model key must not be attributed"
     );
 }
 
 #[test]
-fn extract_model_returns_none_when_absent() {
+fn extract_model_is_absent_when_no_model_member() {
     let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
-    assert!(extract_model_from_bytes(body).is_none());
+    assert!(matches!(extract_model_from_bytes(body), BodyModel::Absent));
 }
 
 #[test]
-fn extract_model_returns_none_on_truncated_chunk() {
-    // A streamed first chunk may cut off mid-value.
+fn extract_model_is_unusable_on_truncated_value() {
     let body = br#"{"model":"gpt-4"#;
-    assert!(extract_model_from_bytes(body).is_none());
+    assert!(
+        matches!(extract_model_from_bytes(body), BodyModel::Unusable),
+        "a cut-off model value must be unusable, not absent: the provider would parse a complete name"
+    );
 }
 
 #[test]
-fn extract_model_returns_none_on_non_utf8() {
+fn extract_model_is_unusable_on_non_utf8() {
     let body = &[0xFF_u8, 0xFE, 0x00, 0x01];
-    assert!(extract_model_from_bytes(body).is_none());
+    assert!(
+        matches!(extract_model_from_bytes(body), BodyModel::Unusable),
+        "a non-UTF-8 body cannot be JSON the provider parses; it must not read as model-absent"
+    );
 }
 
 #[test]
-fn extract_model_returns_none_on_non_string_value() {
+fn extract_model_is_unusable_on_non_string_value() {
     let body = br#"{"model":null}"#;
-    assert!(extract_model_from_bytes(body).is_none());
+    assert!(
+        matches!(extract_model_from_bytes(body), BodyModel::Unusable),
+        "a non-string model value is present but undecodable, not absent"
+    );
 }
 
 #[test]
@@ -1457,38 +1567,38 @@ fn extracts_model_from_escaped_key() {
     // `"\u006dodel"` decodes to `"model"`, so it names the same member.
     let body = br#"{ "stream": true, "\u006dodel": "gpt-4o" }"#;
     assert_eq!(
-        extract_model_from_bytes(body).as_deref(),
+        extracted(body).as_deref(),
         Some("gpt-4o"),
         "an escaped key spelling must still resolve the model"
     );
 }
 
 #[test]
-fn extract_model_returns_none_on_escaped_value() {
+fn extract_model_is_unusable_on_escaped_value() {
     // The provider decodes this member to `gpt-4`; the raw extractor must
     // not authorize under the escaped spelling the policy never sees.
     let body = br#"{"model":"gpt\u002d4"}"#;
     assert!(
-        extract_model_from_bytes(body).is_none(),
+        matches!(extract_model_from_bytes(body), BodyModel::Unusable),
         "an escaped model value must fail closed rather than authorize a different name"
     );
 }
 
 #[test]
-fn extract_model_returns_none_on_duplicate_raw_keys() {
+fn extract_model_is_unusable_on_duplicate_raw_keys() {
     let body = br#"{"model":"gpt-4o","model":"claude-sonnet-4"}"#;
     assert!(
-        extract_model_from_bytes(body).is_none(),
+        matches!(extract_model_from_bytes(body), BodyModel::Unusable),
         "duplicate model keys must not be attributed: the provider's parser picks its own winner"
     );
 }
 
 #[test]
-fn extract_model_returns_none_on_duplicate_decoded_keys() {
+fn extract_model_is_unusable_on_duplicate_decoded_keys() {
     // The raw and escaped spellings both decode to `model`.
     let body = br#"{"model":"gpt-4o","\u006dodel":"claude-sonnet-4"}"#;
     assert!(
-        extract_model_from_bytes(body).is_none(),
+        matches!(extract_model_from_bytes(body), BodyModel::Unusable),
         "a raw and an escaped `model` key are duplicates and must not be attributed"
     );
 }

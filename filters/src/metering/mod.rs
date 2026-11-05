@@ -161,8 +161,9 @@ const STATUS_AUTHZ_INPUT_REQUIRED: u16 = 403;
 /// `metering system unavailable`. With model policy enabled, a missing trusted
 /// identity rejects with 403 and body `tenant identity required for model
 /// authorization`; an unresolvable model rejects with 403 and body `request
-/// model required for model authorization`; conflicting model sources reject
-/// with 403 and body `conflicting model inputs for model authorization`; and a
+/// model required for model authorization`; conflicting or ambiguous model
+/// sources reject with 403 and body `conflicting model inputs for model
+/// authorization`; and a
 /// request body larger than the pre-read bound rejects with 413 before
 /// dispatch.
 ///
@@ -186,12 +187,16 @@ const STATUS_AUTHZ_INPUT_REQUIRED: u16 = 403;
 ///   or a transport error — is governed by `model_policy_fail_open` (default **fail-closed, 503**), independent of the
 ///   billing `fail_open`. Admission on a shared callout failure requires every enabled gate's availability policy to
 ///   permit it.
-/// - Every metered request then needs a trusted tenant identity and a resolvable public model, and every available
+/// - Every metered request then needs a trusted tenant identity and a resolvable public model. If the identity comes
+///   from raw `{prefix}*` request headers, the ingress boundary must delete client-supplied copies and set those
+///   headers from authenticated data before this filter runs: the filter cannot distinguish client-supplied headers
+///   from trusted ones, so a client-set header would choose the identity used for model authorization. Every available
 ///   model source — the identity header, the `model_to_provider` client model, and (when no client model was recorded)
-///   the request body's top-level `"model"` (bounded pre-read) — must agree; conflicting non-empty sources reject with
-///   403 before dispatch, since authorizing one source would not authorize the model the provider receives. Reporting
-///   fallbacks (`default_username`, `default_model`) and the skip-metering path never bypass authorization: such
-///   requests reject with 403 before dispatch.
+///   the request body's top-level `"model"` (bounded pre-read) — must agree; conflicting non-empty sources, or a body
+///   `"model"` member that is ambiguous (duplicate or escaped key spellings) or undecodable (escaped or non-string
+///   value), reject with 403 before dispatch, since authorizing one source would not authorize the model the provider
+///   receives. Reporting fallbacks (`default_username`, `default_model`) and the skip-metering path never bypass
+///   authorization: such requests reject with 403 before dispatch.
 ///
 /// With `model_policy_check: false` (default), the legacy contract is
 /// preserved exactly: only `hasAccess` decides, budget denial is 429, and
@@ -566,11 +571,11 @@ impl HttpFilter for ExternalMeteringFilter {
     ) -> Result<FilterAction, FilterError> {
         // The identity header wins when present; only fall back to the body so
         // that clients that do not send a model header are still attributed.
+        // An unusable body model contributes nothing: with enforcement
+        // enabled it already rejected during `on_request`, and without it the
+        // attribution must not guess either.
         let unresolved = !ctx.filter_metadata.contains_key(META_METERING_MODEL);
-        if let Some(model) = body
-            .as_ref()
-            .filter(|_| unresolved)
-            .and_then(|chunk| extract_model_from_bytes(chunk))
+        if unresolved && let Some(BodyModel::Usable(model)) = body.as_ref().map(|chunk| extract_model_from_bytes(chunk))
         {
             ctx.filter_metadata.insert(META_METERING_MODEL.to_owned(), model);
         }
@@ -793,8 +798,11 @@ enum ModelResolution {
 /// skipped once a client-facing model exists because that filter's rewrite
 /// has already replaced it with the *provider* target, which legitimately
 /// differs from the public alias. With enforcement enabled every available
-/// source must name the same model: a conflict rejects rather than
-/// authorizing a model the request does not actually use. With enforcement
+/// source must name the same model: a conflict — or a body `"model"` member
+/// that is ambiguous (duplicate or escaped key spellings) or undecodable
+/// (escaped or non-string value), which the provider's parser may resolve
+/// differently — rejects rather than authorizing a model the request does not
+/// actually use. With enforcement
 /// disabled the legacy reporting contract is preserved: the identity model,
 /// then the client-facing model, and the body is consulted later for
 /// attribution only. `default_model` is deliberately not consulted: it is a
@@ -807,28 +815,34 @@ fn resolve_request_model(
     let client_model = ctx
         .get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
         .filter(|model| !model.is_empty());
-    let body_model = if client_model.is_none() && model_policy_check {
-        ctx.buffered_request_body
-            .as_ref()
-            .and_then(|body| extract_model_from_bytes(body))
-    } else {
-        None
+    let body_model = match ctx.buffered_request_body.as_ref() {
+        Some(body) if client_model.is_none() && model_policy_check => extract_model_from_bytes(body),
+        _ => BodyModel::Absent,
     };
 
-    if model_policy_check && model_sources_conflict(&state.model, client_model, body_model.as_deref()) {
-        return ModelResolution::Conflict;
+    if model_policy_check {
+        // An unusable body model must not be treated as absent: the
+        // provider's parser resolves the ambiguity its own way, so the
+        // request may carry a model the preflight never compared against
+        // the identity or client claim.
+        if matches!(body_model, BodyModel::Unusable) {
+            return ModelResolution::Conflict;
+        }
+        if model_sources_conflict(&state.model, client_model, body_model.usable()) {
+            return ModelResolution::Conflict;
+        }
     }
     // Fill by precedence. With enforcement disabled `body_model` is always
-    // `None`, so this is exactly the legacy identity-then-client contract.
+    // `Absent`, so this is exactly the legacy identity-then-client contract.
     if state.model.is_empty()
         && let Some(model) = client_model
     {
         model.clone_into(&mut state.model);
     }
     if state.model.is_empty()
-        && let Some(model) = body_model
+        && let BodyModel::Usable(model) = &body_model
     {
-        state.model = model;
+        state.model.clone_from(model);
     }
     ModelResolution::Continue
 }
@@ -1286,17 +1300,47 @@ fn build_envelope(ctx: &EventContext<'_>, event_type: &str) -> serde_json::Value
 // Helpers
 // -----------------------------------------------------------------------------
 
+/// Outcome of scanning a request body for its top-level `model` member.
+enum BodyModel {
+    /// No top-level `"model"` member was found.
+    Absent,
+
+    /// A model value the preflight and the provider read identically.
+    Usable(String),
+
+    /// A `"model"` member exists but cannot be attributed safely: duplicate
+    /// or escaped key spellings, an escaped or non-string value, or a
+    /// non-UTF-8 / truncated body. The provider's parser may resolve the
+    /// member differently, so the value must not feed authorization.
+    Unusable,
+}
+
+impl BodyModel {
+    /// The usable model value, if any.
+    fn usable(&self) -> Option<&str> {
+        match self {
+            Self::Usable(model) => Some(model),
+            Self::Absent | Self::Unusable => None,
+        }
+    }
+}
+
 /// Extract the top-level `model` field from a JSON body fragment.
 ///
 /// Request bodies arrive in chunks and can be megabytes long, so this scans
 /// with a string- and depth-aware state machine instead of buffering and
 /// deserializing the whole document. Only a `"model"` key belonging to the
 /// top-level object is matched, so `"model"` occurrences nested inside
-/// `messages` content can never misattribute the request. Returns `None`
-/// when the chunk does not contain the complete top-level `"model": "..."`
-/// pair.
-fn extract_model_from_bytes(bytes: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(bytes).ok()?;
+/// `messages` content can never misattribute the request. Returns
+/// [`BodyModel::Absent`] when the fragment contains no top-level `"model"`
+/// member, and [`BodyModel::Unusable`] when one exists but cannot be
+/// attributed safely (duplicate or escaped key spellings, an escaped or
+/// non-string value, or a body that is not valid UTF-8 or is cut off mid
+/// value).
+fn extract_model_from_bytes(bytes: &[u8]) -> BodyModel {
+    let Some(text) = std::str::from_utf8(bytes).ok() else {
+        return BodyModel::Unusable;
+    };
     let mut scanner = TopLevelKeyScanner::new(text);
     let mut model = None;
 
@@ -1306,20 +1350,27 @@ fn extract_model_from_bytes(bytes: &[u8]) -> Option<String> {
             // parsers pick their own winner, so the preflight must not guess
             // which value authorizes the request.
             if model.is_some() {
-                return None;
+                return BodyModel::Unusable;
             }
             // Escaped values are not decoded, and the provider would parse a
             // different name than the preflight extracted: reject rather than
-            // authorize under a spelling the policy never sees.
-            let value = scanner.string_value()?;
+            // authorize under a spelling the policy never sees. The same
+            // applies to a non-string value, which no provider accepts as a
+            // model name.
+            let Some(value) = scanner.string_value() else {
+                return BodyModel::Unusable;
+            };
             if value.contains('\\') {
-                return None;
+                return BodyModel::Unusable;
             }
             model = Some(value.to_owned());
         }
     }
 
-    model
+    match model {
+        Some(model) => BodyModel::Usable(model),
+        None => BodyModel::Absent,
+    }
 }
 
 /// Compare a raw (still escaped) top-level object key against `"model"`.
