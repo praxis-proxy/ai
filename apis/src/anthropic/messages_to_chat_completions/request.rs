@@ -737,18 +737,19 @@ fn text_block_shape_is_supported(block: &Value) -> bool {
 
 /// The rejection for a block whose `cache_control` marker cannot be translated.
 ///
-/// For a recognized marker, names the `allow_lossy_features` opt-in that
-/// degrades it, so an operator can resolve the rejection from the error alone
-/// instead of reverse-engineering the cause from a generic shape error (issue
-/// #1856). An unrecognized marker is rejected by the degradation path too, so
-/// recommending the opt-in would be misleading; report it as unsupported
-/// instead.
+/// The error is client-facing, so it stays actionable for the caller: remove
+/// the caching markers, or ask the platform administrator when the client adds
+/// them automatically. It must not surface server-side configuration such as
+/// `allow_lossy_features`, which only the operator can change (issue #1856).
+/// An unrecognized marker is rejected by the degradation path too, so it is
+/// reported as unsupported rather than as removable prompt caching.
 fn cache_control_rejection(position: &str, block: &Value) -> String {
     let marker = block.get("cache_control");
     if marker.is_some_and(cache_control_marker_is_recognized) {
         format!(
-            "`{position}` block carries `cache_control`, which cannot be translated; \
-             add `prompt_caching` to `allow_lossy_features` to degrade it"
+            "prompt caching (cache_control) on a `{position}` block is not supported by this endpoint. \
+             Remove the caching markers from your request, or contact your platform administrator \
+             if your client adds them automatically"
         )
     } else {
         format!("`{position}` block carries an unsupported `cache_control` marker, which cannot be translated")
@@ -1681,22 +1682,30 @@ mod tests {
     }
 
     #[test]
-    fn system_cache_control_rejection_names_marker_and_opt_in() {
-        // Without the `prompt_caching` allowlist, a `system` block marker is the
-        // rejection cause and must be reported with the opt-in that degrades
-        // it, not as a generic shape error (issue #1856).
+    fn system_cache_control_rejection_gives_client_guidance() {
+        // Without the `prompt_caching` allowlist, a `system` block marker is
+        // the rejection cause and must be reported with client-actionable
+        // guidance, not as a generic shape error or server-side configuration
+        // (issue #1856).
         let body = json!({
             "model": "m",
             "system": [{"type": "text", "text": "You are helpful", "cache_control": {"type": "ephemeral"}}],
             "messages": [{"role": "user", "content": "Hi"}]
         });
         let error = transform_request(body).unwrap_err();
-        assert!(error.contains("`system` block carries `cache_control`"), "{error}");
-        assert!(error.contains("`prompt_caching` to `allow_lossy_features`"), "{error}");
+        assert!(
+            error.contains("prompt caching (cache_control) on a `system` block is not supported"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Remove the caching markers from your request"),
+            "{error}"
+        );
+        assert!(!error.contains("allow_lossy_features"), "{error}");
     }
 
     #[test]
-    fn content_cache_control_rejection_names_marker_and_opt_in() {
+    fn content_cache_control_rejection_gives_client_guidance() {
         let body = json!({
             "model": "m",
             "messages": [{"role": "user", "content": [
@@ -1704,8 +1713,15 @@ mod tests {
             ]}]
         });
         let error = transform_request(body).unwrap_err();
-        assert!(error.contains("`content` block carries `cache_control`"), "{error}");
-        assert!(error.contains("`prompt_caching` to `allow_lossy_features`"), "{error}");
+        assert!(
+            error.contains("prompt caching (cache_control) on a `content` block is not supported"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Remove the caching markers from your request"),
+            "{error}"
+        );
+        assert!(!error.contains("allow_lossy_features"), "{error}");
     }
 
     #[test]

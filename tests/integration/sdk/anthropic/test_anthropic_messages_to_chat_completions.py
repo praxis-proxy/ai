@@ -456,11 +456,14 @@ class TestRequestFieldHandling:
             )
 
         assert excinfo.value.status_code == 400
-        assert "`system` block carries `cache_control`" in str(excinfo.value), (
-            "error message must name the cache_control marker"
+        assert "prompt caching (cache_control) on a `system` block is not supported" in str(excinfo.value), (
+            "error message must name the cache_control marker and the block position"
         )
-        assert "prompt_caching" in str(excinfo.value), (
-            "error message must name the allow_lossy_features opt-in that degrades it"
+        assert "Remove the caching markers from your request" in str(excinfo.value), (
+            "error message must give the client actionable guidance"
+        )
+        assert "allow_lossy_features" not in str(excinfo.value), (
+            "error message must not surface server-side configuration"
         )
         assert RecordingBackend.bodies == []
 
