@@ -11860,6 +11860,83 @@ def test_native_chat_completions_ttft_labeled_by_request_model(ttft_proxy):
     )
 
 
+@pytest.fixture()
+def native_guardrails_client(tmp_path, request):
+    """Use the request guardrail example with passing NeMo and native backend mocks."""
+    class GuardrailChecksHandler(NemoGuardrailsHandler):
+        requests: ClassVar[list[dict[str, Any]]] = []
+        request_count = 0
+
+    class NativeBackendHandler(_FileResolveBackendHandler):
+        captured: ClassVar[list[dict]] = []
+
+    servers = []
+    for handler in (GuardrailChecksHandler, NativeBackendHandler):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        request.addfinalizer(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        request.addfinalizer(server.shutdown)
+        servers.append(server)
+
+    port = _free_port()
+    config = Path("examples/configs/nemo-guardrails.yaml").read_text()
+    config = config.replace("0.0.0.0:8080", f"127.0.0.1:{port}")
+    config = config.replace("127.0.0.1:3001", f"127.0.0.1:{servers[0].server_port}")
+    config = config.replace("127.0.0.1:3000", f"127.0.0.1:{servers[1].server_port}")
+    config_path = tmp_path / "guardrails.yaml"
+    config_path.write_text(config)
+    log_path = tmp_path / "praxis.log"
+    with log_path.open("w") as log_file:
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", str(config_path)],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        started = False
+        try:
+            _wait_for_proxy(port, proc, str(log_path))
+            started = True
+            with _make_openai_client(port, timeout=30) as client:
+                yield client, GuardrailChecksHandler.requests, NativeBackendHandler.captured
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            if not started or request.session.testsfailed > 0:
+                log_file.flush()
+                print(f"\n=== Native guardrails Praxis logs ===\n{log_path.read_text()}", file=sys.stderr)
+
+
+@pytest.mark.parametrize(
+    "input_value",
+    ["Hello", [{"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}]],
+    ids=["string-input", "message-input"],
+)
+def test_guardrails_preserves_native_responses_options(native_guardrails_client, input_value):
+    """Native options must reach the model after a real SDK request is screened."""
+    client, checks, forwarded = native_guardrails_client
+    body = {
+        "model": "test",
+        "input": input_value,
+        "instructions": "Follow policy.",
+        "truncation": "auto",
+        "background": True,
+        "tools": [{"type": "code_interpreter", "container": {"type": "auto"}}],
+        "tool_choice": {"type": "code_interpreter"},
+    }
+    response = client.responses.create(**body)
+    assert response.status == "completed", "the native mock response should reach the SDK"
+    assert len(checks) == 1, "the request must actually reach NeMo before forwarding"
+    assert checks[0]["messages"] == [
+        {"role": "system", "content": "Follow policy."},
+        {"role": "user", "content": "Hello"},
+    ], "only canonical conversation messages should be sent for evaluation"
+    assert forwarded == [body], "the upstream must receive all original native request options"
+
+
 if __name__ == "__main__":
     sys.exit(
         pytest.main(
