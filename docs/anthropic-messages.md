@@ -115,7 +115,7 @@ succeed instead of failing closed with a 400:
     - mid_conversation_system
 ```
 
-Each listed feature's wire markers are validated and then stripped, and the
+Each listed feature is validated and then degraded as described below, and the
 degradation is reported to the operator — one `WARN` log per request, a
 `praxis_anthropic_messages_to_chat_completions_degraded_total` counter per
 feature, and an `x-degraded-features` response header. `prompt_caching`

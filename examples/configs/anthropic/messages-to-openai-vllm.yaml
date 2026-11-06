@@ -8,7 +8,8 @@
 # filter) so the Anthropic-only features Claude Code sends by default — prompt
 # caching (`cache_control` markers), extended thinking (`thinking`), and
 # mid-conversation `system` messages (the environment block it sends after the
-# first user turn) — are stripped or folded and reported instead of rejected. Without that allowlist such
+# first user turn) — are stripped or folded and reported instead of rejected.
+# Without that allowlist such
 # requests fail closed with a 400 (the strict default of
 # `messages-to-openai.yaml`). The client speaks the Anthropic wire format;
 # Praxis rewrites both the request and the response, and vLLM only sees Chat

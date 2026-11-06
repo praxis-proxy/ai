@@ -112,9 +112,12 @@ const DEGRADED_FEATURES_HEADER: &str = "x-degraded-features";
 /// represent it faithfully.
 ///
 /// `allow_lossy_features` opts specific Anthropic-only features into
-/// operator-approved degradation instead of that 400. A listed feature's wire
-/// markers are validated and then stripped so an unmodified client (for example
-/// Claude Code, which always sends `cache_control` and `thinking`) can still
+/// operator-approved degradation instead of that 400. Each listed feature is
+/// validated and then degraded as the feature requires — most have their wire
+/// markers stripped, while `mid_conversation_system` folds mid-conversation
+/// `system` messages into the leading system message — so an unmodified
+/// client (for example Claude Code, which always sends `cache_control` and
+/// `thinking`) can still
 /// drive a Chat Completions backend. Each degradation is reported to the
 /// operator — one `WARN` log per request, a
 /// `praxis_anthropic_messages_to_chat_completions_degraded_total` counter per
@@ -123,9 +126,12 @@ const DEGRADED_FEATURES_HEADER: &str = "x-degraded-features";
 /// removes `cache_control` markers (prompt and tool content are preserved, but
 /// explicit cache breakpoints are not honored, so cost and latency may differ);
 /// `extended_thinking` removes `thinking` and thinking-only `context_management`
-/// edits (the translated response carries no thinking blocks). Features absent
-/// from the allowlist, malformed markers, and other `context_management` edits
-/// are still rejected with a 400.
+/// edits (the translated response carries no thinking blocks);
+/// `mid_conversation_system` folds each `system` message that appears after
+/// the first non-system turn into the single leading system message, for
+/// backends whose chat templates reject a mid-conversation system message.
+/// Features absent from the allowlist, malformed markers, and other
+/// `context_management` edits are still rejected with a 400.
 ///
 /// # YAML
 ///

@@ -119,8 +119,9 @@ pub(crate) fn transform_request(value: Value) -> Result<Vec<u8>, String> {
 ///
 /// Every top-level field falls into one of these buckets:
 /// - mapped fields are translated to their Chat Completions equivalent;
-/// - allowlisted lossy features are stripped after their wire markers are validated, and the removal is recorded in
-///   [`TransformOutput::degraded`];
+/// - allowlisted lossy features are degraded — most have their wire markers validated and then stripped;
+///   `mid_conversation_system` instead folds mid-conversation `system` messages into the leading one — and the
+///   degradation is recorded in [`TransformOutput::degraded`];
 /// - [`UNREPRESENTABLE_FIELDS`] reject the request with an error message, because the proxy would otherwise fabricate
 ///   their effect in the translated response;
 /// - [`UNMAPPABLE_FIELDS`] reject when they carry a value and are not allowlisted;
@@ -138,12 +139,13 @@ pub(crate) fn transform_request_degrading(
         return Err("request body is not a JSON object".to_owned());
     };
 
-    // Degrade allowlisted features first: validate each feature's wire markers,
-    // strip them in place, and record what was actually removed. The strict
-    // validation below then runs on the cleaned body, so a leftover marker in an
-    // unrecognized position still fails closed. The strippers walk only
-    // Anthropic-structured positions and never descend into user-controlled tool
-    // `input` or `input_schema` JSON (see [`degrade_prompt_caching`]).
+    // Degrade allowlisted features first: validate each feature's wire
+    // markers, strip or fold them in place, and record what was actually
+    // degraded. The strict validation below then runs on the cleaned body, so
+    // a leftover marker in an unrecognized position still fails closed. The
+    // degraders walk only Anthropic-structured positions and never descend
+    // into user-controlled tool `input` or `input_schema` JSON (see
+    // [`degrade_prompt_caching`]).
     let mut degraded = DegradedFeatures::default();
     if allow.extended_thinking {
         degraded.extended_thinking = degrade_extended_thinking(&mut body)?;
@@ -520,6 +522,13 @@ const SYSTEM_SHAPE_ERROR: &str = "`system` must be a string or array of text blo
 /// not `prompt_caching` still fails closed in validation instead of silently
 /// losing cache breakpoints. (When `prompt_caching` is allowlisted it runs
 /// first and strips those markers, so nothing is carried.)
+///
+/// Only what the strict validator would fully accept may move: a message
+/// carrying fields beyond `role`/`content`, or a text block with non-empty
+/// `citations` or an unknown field, is left in place so its rejection keeps
+/// the strict error. The empty directive forms (`content: []` or `""`, which
+/// real clients send mid-array) count as movable: folding removes the
+/// message, which is exactly the position fix the feature promises.
 fn degrade_mid_conversation_system(body: &mut Map<String, Value>) -> Result<bool, String> {
     // Only take the field when it is an array; any other shape is put back
     // untouched for the strict validator, which rejects non-array `messages`.
@@ -568,20 +577,26 @@ fn degrade_mid_conversation_system(body: &mut Map<String, Value>) -> Result<bool
 /// including a non-text content a strict backend would also reject — is
 /// returned unchanged so the strict validator produces its own error.
 fn take_movable_system_content(message: Value, seen_non_system: bool) -> Result<SystemParts, Value> {
-    let is_movable_system = message.get("role").and_then(Value::as_str) == Some("system")
-        && seen_non_system
-        && message.get("content").is_some_and(content_is_text_only);
-    if !is_movable_system {
-        return Err(message);
-    }
-    // A message whose `role` was readable is an object, and `is_movable_system`
-    // confirmed its `content` is present, so both branches below are total.
-    let Value::Object(mut message) = message else {
-        return Err(Value::Object(Map::new()));
-    };
-    match message.remove("content") {
-        Some(content) => Ok(system_parts_from_content(content)),
-        None => Err(Value::Object(message)),
+    // The message field set is part of the gate: a message carrying anything
+    // beyond `role` and `content` is never moved, so it still fails closed in
+    // the strict validator below instead of being silently widened by the
+    // allowlist (e.g. an unknown `name` field must keep its 400).
+    match message {
+        Value::Object(mut fields)
+            if seen_non_system
+                && fields.len() == 2
+                && fields.get("role").and_then(Value::as_str) == Some("system")
+                && fields.get("content").is_some_and(content_is_text_only) =>
+        {
+            // The guard requires `content` to be present, so the `None` arm
+            // is unreachable; handing the message back keeps it total without
+            // a panic.
+            match fields.remove("content") {
+                Some(content) => Ok(system_parts_from_content(content)),
+                None => Err(Value::Object(fields)),
+            }
+        },
+        other => Err(other),
     }
 }
 
@@ -593,6 +608,12 @@ fn take_movable_system_content(message: Value, seen_non_system: bool) -> Result<
 /// representation so validation can still see them. A `system` value the
 /// strict validator would reject fails here with the same message; the
 /// request is answered 400 either way, so no state needs restoring.
+///
+/// The join deliberately depends on the representation: groups in a string
+/// system are separated by a blank line, while blocks appended to a block
+/// array are joined by [`hoist_system`]'s single-newline block join. The fold
+/// must not change how an existing block array is joined, so it inherits
+/// that join instead of re-separating pre-existing blocks.
 fn merge_mid_conversation_system(body: &mut Map<String, Value>, moved: Vec<SystemParts>) -> Result<(), String> {
     let existing = body.remove("system").filter(|value| !value.is_null());
     let (mut groups, existing_is_blocks) = existing_system_groups(existing)?;
@@ -631,12 +652,16 @@ fn existing_system_groups(existing: Option<Value>) -> Result<(Vec<SystemParts>, 
         Some(Value::Array(blocks)) => {
             let mut group = Vec::with_capacity(blocks.len());
             for block in blocks {
+                // Only a block whose full shape the strict validator
+                // recognizes may be rebuilt here; an unsupported field (for
+                // example non-empty `citations`) must keep its 400 rather
+                // than be silently dropped because a message was folded.
+                if !foldable_text_block(&block) {
+                    return Err(SYSTEM_SHAPE_ERROR.to_owned());
+                }
                 let Value::Object(mut block) = block else {
                     return Err(SYSTEM_SHAPE_ERROR.to_owned());
                 };
-                if block.get("type").and_then(Value::as_str) != Some("text") {
-                    return Err(SYSTEM_SHAPE_ERROR.to_owned());
-                }
                 let Some(text) = take_string(&mut block, "text") else {
                     return Err(SYSTEM_SHAPE_ERROR.to_owned());
                 };
@@ -666,15 +691,31 @@ fn system_blocks_from_group(group: SystemParts) -> Vec<Value> {
         .collect()
 }
 
-/// Whether a message content is a string or an array of text blocks.
+/// Whether a message content is a string or an array of foldable text blocks.
 fn content_is_text_only(content: &Value) -> bool {
     match content {
         Value::String(_) => true,
-        Value::Array(blocks) => blocks.iter().all(|block| {
-            block.get("type").and_then(Value::as_str) == Some("text") && block.get("text").is_some_and(Value::is_string)
-        }),
+        Value::Array(blocks) => blocks.iter().all(foldable_text_block),
         _ => false,
     }
+}
+
+/// A text-block shape the fold may rebuild: the strict validator's
+/// [`text_block_is_supported`] minus its null-`cache_control` requirement.
+///
+/// [`text_block_is_supported`] cannot be reused as-is because this feature
+/// deliberately carries a surviving `cache_control` marker forward, so an
+/// operator who allowlisted the fold but not `prompt_caching` still fails
+/// closed in validation instead of silently losing cache breakpoints. The
+/// remaining checks — key set and null-or-empty `citations` — keep the fold
+/// from silently dropping anything the strict validator would reject.
+fn foldable_text_block(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("text")
+        && block.get("text").is_some_and(Value::is_string)
+        && block
+            .get("citations")
+            .is_none_or(|citations| citations.is_null() || citations.as_array().is_some_and(Vec::is_empty))
+        && has_only_keys(block, &["type", "text", "citations", "cache_control"])
 }
 
 /// Consume a text-only content value into `(text, cache_control marker)` parts.
@@ -3098,8 +3139,8 @@ mod tests {
             ]
         });
         let error = degrade(body, MIDSYS).unwrap_err();
-        assert!(
-            error.contains("`system`"),
+        assert_eq!(
+            error, "`system` must be a string or array of text blocks",
             "the carried marker must fail closed with the system shape error: {error}"
         );
     }
@@ -3174,6 +3215,107 @@ mod tests {
             error.contains("image"),
             "left in place, the strict validator rejects the block: {error}"
         );
+    }
+
+    #[test]
+    fn mid_conversation_system_rejects_unknown_message_field() {
+        // The fold must not widen the allowlist into "drop arbitrary message
+        // fields": a message beyond `{role, content}` is left for the strict
+        // validator, which rejects it exactly as without the feature.
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "Be terse.", "name": "bob"}
+            ]
+        });
+        let error = degrade(body, MIDSYS).unwrap_err();
+        assert!(
+            error.contains("unsupported Anthropic message field"),
+            "an extra message field must keep the strict rejection: {error}"
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_rejects_nonempty_citations_on_moved_block() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "Be terse.", "citations": [{"url": "https://example.test"}]}
+                ]}
+            ]
+        });
+        let error = degrade(body, MIDSYS).unwrap_err();
+        assert!(
+            error.contains("text"),
+            "non-empty citations must keep the strict rejection: {error}"
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_rejects_unknown_block_field_on_moved_block() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "Be terse.", "x_extra": true}
+                ]}
+            ]
+        });
+        let error = degrade(body, MIDSYS).unwrap_err();
+        assert!(
+            error.contains("text"),
+            "an unknown block field must keep the strict rejection: {error}"
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_rejects_citations_on_existing_system_block() {
+        // Rebuilding the existing top-level system must not silently drop a
+        // field the strict validator rejects just because a message moved.
+        let body = json!({
+            "model": "m",
+            "system": [
+                {"type": "text", "text": "Be brief", "citations": [{"url": "https://example.test"}]}
+            ],
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "Be terse."}
+            ]
+        });
+        let error = degrade(body, MIDSYS).unwrap_err();
+        assert_eq!(
+            error, "`system` must be a string or array of text blocks",
+            "the existing block must keep the strict rejection: {error}"
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_folds_empty_directive_forms() {
+        // Real clients send the directive form `content: []` mid-array
+        // (#1859); folding removes the message, which is the position fix
+        // the feature promises, and reports the degradation.
+        for content in [json!([]), json!("")] {
+            let body = json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {"role": "system", "content": content},
+                    {"role": "user", "content": "Reply with exactly: OK"}
+                ]
+            });
+            let (translated, degraded) = degrade(body, MIDSYS).unwrap();
+            assert!(
+                degraded.mid_conversation_system,
+                "the empty directive message was folded: {translated}"
+            );
+            let messages = translated["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 2, "the message must not survive: {messages:?}");
+            assert_eq!(messages[0], json!({"role": "user", "content": "Hi"}));
+        }
     }
 
     #[test]
