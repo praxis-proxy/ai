@@ -76,6 +76,10 @@ token-ceiling-filter = ["experimental", "dep:tiktoken-rs"]
 # backing store is still an open question, so the filter itself stays gated
 # until both land. Activates the `experimental` marker.
 inflight-tracker-filter = ["experimental"]
+# Experimental: the model_catalog filter, serving a principal-filtered
+# GET /v1/models discovered from upstream model lists or static config
+# (ai#1067). Activates the `experimental` marker.
+model-catalog-filter = ["experimental"]
 # Marker feature activated transitively by any experimental feature, mirroring
 # praxis core's server crate. Lets consumers gate on "anything experimental".
 experimental = ["praxis-ai-apis/experimental"]
