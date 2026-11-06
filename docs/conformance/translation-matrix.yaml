@@ -218,7 +218,7 @@ surfaces:
           row).
         evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:838-860; apis/src/anthropic/messages_to_chat_completions/request.rs:476-481; apis/src/anthropic/messages_to_chat_completions/request.rs:682-690
       multi-turn:
-        status: translated
+        status: translated-lossy
         note: >-
           In-array system messages are accepted deliberately (Claude Code
           emits them) and preserved in position by default. With
@@ -227,7 +227,8 @@ surfaces:
           system message in encounter order and signalled, for backends whose
           chat templates reject a mid-conversation system message (vLLM "System
           message must be at the beginning"); a leading system message is
-          never moved.
+          never moved. The fold loses the original system message positions,
+          which is why the cell is lossy.
         evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:751-753; apis/src/anthropic/messages_to_chat_completions/request.rs:523-561
       multimodal-image:
         status: translated

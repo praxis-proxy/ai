@@ -271,6 +271,7 @@ def _write_config(proxy_port: int, backend_port: int, allow_lossy: bool = False)
             + "        allow_lossy_features:\n"
             + "          - prompt_caching\n"
             + "          - extended_thinking\n"
+            + "          - mid_conversation_system\n"
         )
         replaced = config.replace(marker, replacement)
         assert replaced != config, f"example drift: translation filter block not found in {CONFIG_PATH}"
@@ -776,6 +777,34 @@ class TestOperatorApprovedDegradation:
         assert raw.http_response.status_code == 200
         reported = raw.http_response.headers.get(DEGRADED_HEADER, "")
         assert "prompt_caching" in reported and "extended_thinking" in reported, reported
+
+    def test_mid_conversation_system_is_folded_and_reported(self, degrading_client):
+        RecordingBackend.bodies.clear()
+
+        # Claude Code sends a text-only `system` message after the first user
+        # turn; vLLM chat templates reject it ("System message must be at the
+        # beginning"), so the allowlisted fold moves it into the single
+        # leading system message.
+        raw = degrading_client.messages.with_raw_response.create(
+            model=MODEL,
+            max_tokens=64,
+            system="Be brief",
+            messages=[
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "system", "content": "Answer tersely."},
+            ],
+        )
+
+        assert raw.http_response.status_code == 200
+        assert "mid_conversation_system" in raw.http_response.headers.get(DEGRADED_HEADER, "")
+        message = raw.parse()
+        assert message.content[0].text == "4"
+
+        [upstream] = RecordingBackend.bodies
+        system_messages = [m for m in upstream["messages"] if m["role"] == "system"]
+        assert system_messages == [
+            {"role": "system", "content": "Be brief\n\nAnswer tersely."}
+        ], f"the fold must merge into one leading system message: {upstream['messages']}"
 
     def test_streaming_request_is_degraded_and_reported(self, degrading_client):
         RecordingBackend.bodies.clear()
