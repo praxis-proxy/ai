@@ -310,6 +310,16 @@ CI runs both lanes as sequential steps in the `anthropic-sdk` job of
 Route to `api.anthropic.com` with credential
 injection for the `x-api-key` header.
 
+A pure passthrough forwards whichever credential header the caller sent, so an
+SDK v2 client's `Authorization: Bearer` key reaches Anthropic unchanged. That is
+intended when the caller supplies its own key. When the gateway owns the
+upstream credential instead, add `authorization` to a `headers` `request_remove`
+in the same chain. `credential_injection` only replaces the header it is
+configured for, so a client Bearer would otherwise reach Anthropic too, and the
+request may then authenticate as the caller rather than as the gateway. Filter
+order does not matter here: pending removals are applied before injected values
+in `apply_pending_header_mutations`.
+
 ```yaml
 listeners:
   - name: gateway
@@ -329,6 +339,8 @@ filter_chains:
         request_set:
           - name: Host
             value: "api.anthropic.com"
+        request_remove:
+          - authorization
 
       - filter: router
         routes:
@@ -413,6 +425,11 @@ filter_chains:
 ```
 
 The `anthropic_messages_to_chat_completions` filter:
+- Removes both client credential forms (the legacy `x-api-key` header and the
+  `Authorization: Bearer` header SDK v2 sends) because a Chat Completions
+  backend cannot tell an Anthropic key from its own. Removal is queued before
+  any injected credential, so a later `credential_injection` still installs the
+  backend's own token
 - Hoists `system` to an OpenAI system message
 - Translates text, user image, assistant `tool_use`,
   and text-only user `tool_result` blocks; rejects

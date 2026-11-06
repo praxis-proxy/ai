@@ -137,8 +137,8 @@ filter_chains:
             cluster: "chat-completions-backend"
 
       # Inject the backend's own credential after routing selects the cluster.
-      # `strip_client_credential` (default true) removes any client-supplied
-      # `Authorization` before injection.
+      # Injection replaces any client-supplied `Authorization`, so a caller's
+      # credential cannot survive alongside the backend token.
       - filter: credential_injection
         clusters:
           - name: chat-completions-backend
