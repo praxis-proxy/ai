@@ -401,7 +401,9 @@ fn clear_thinking_keep_is_recognized(keep: Option<&Value>) -> bool {
 ///
 /// Walks only the positions the Anthropic schema places cache markers in: the
 /// top-level request `cache_control`, `system` text blocks, `tools` definitions,
-/// message content blocks, and the nested text parts of a `tool_result`. It
+/// message content blocks, and the nested text parts of a `tool_result` —
+/// including the `content` of a `search_result` part and the `source.content`
+/// of a `document` part. It
 /// never descends into a `tool_use` block's `input` or a tool's `input_schema`,
 /// because a `cache_control` key there is user data, not Anthropic metadata. A
 /// present but malformed marker is rejected with a specific 400.
@@ -433,19 +435,49 @@ fn degrade_prompt_caching(body: &mut Map<String, Value>) -> Result<bool, String>
             for block in blocks.iter_mut() {
                 strip_cache_control(block, &mut degraded)?;
                 // A tool_result's content is itself an array of Anthropic text
-                // blocks, each a valid marker position.
+                // blocks, each a valid marker position; a `search_result` part
+                // and a `document` part nest text blocks one level deeper (see
+                // [`strip_tool_result_part_markers`]).
                 if block.get("type").and_then(Value::as_str) == Some("tool_result")
                     && let Some(Value::Array(parts)) = block.get_mut("content")
                 {
-                    for part in parts.iter_mut() {
-                        strip_cache_control(part, &mut degraded)?;
-                    }
+                    strip_tool_result_part_markers(parts, &mut degraded)?;
                 }
             }
         }
     }
 
     Ok(degraded)
+}
+
+/// Strip cache markers from a `tool_result` block's content parts.
+///
+/// A `search_result` part carries a further nested `content` array and a
+/// `document` part a `source.content` array; their text blocks are valid
+/// marker positions too, so each is stripped in place like its parent part.
+fn strip_tool_result_part_markers(parts: &mut [Value], degraded: &mut bool) -> Result<(), String> {
+    for part in parts.iter_mut() {
+        strip_cache_control(part, degraded)?;
+        let nested = if part.get("type").and_then(Value::as_str) == Some("search_result") {
+            part.get_mut("content")
+        } else if part.get("type").and_then(Value::as_str) == Some("document")
+            && part
+                .get("source")
+                .and_then(|source| source.get("type"))
+                .and_then(Value::as_str)
+                == Some("content")
+        {
+            part.get_mut("source").and_then(|source| source.get_mut("content"))
+        } else {
+            None
+        };
+        if let Some(Value::Array(blocks)) = nested {
+            for block in blocks.iter_mut() {
+                strip_cache_control(block, degraded)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Remove a recognized `cache_control` marker from one block in place.
@@ -976,8 +1008,9 @@ fn tool_result_part_is_supported(part: &Value) -> bool {
 /// message would silently lose it; such a part fails closed here instead.
 /// A `citations` config or `cache_control` marker the flattener would drop
 /// is likewise rejected rather than silently discarded, as is a `content`
-/// holding non-text blocks: the pinned spec allows only `text` items there,
-/// and the flattener would drop anything else without an error.
+/// holding non-text blocks or blocks carrying fields the flattener drops:
+/// the pinned spec allows only `text` items there, and `extract_text_blocks`
+/// keeps just each block's `text`.
 fn search_result_part_is_supported(part: &Value) -> bool {
     null_or_absent(part, "citations")
         && null_or_absent(part, "cache_control")
@@ -985,11 +1018,10 @@ fn search_result_part_is_supported(part: &Value) -> bool {
             part,
             &["type", "title", "source", "content", "citations", "cache_control"],
         )
-        && part.get("content").and_then(Value::as_array).is_none_or(|blocks| {
-            blocks
-                .iter()
-                .all(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-        })
+        && part
+            .get("content")
+            .and_then(Value::as_array)
+            .is_none_or(|blocks| blocks.iter().all(text_block_is_supported))
         && (non_empty_string_field(part, "title")
             || non_empty_string_field(part, "source")
             || part
@@ -1026,7 +1058,9 @@ fn document_part_is_supported(part: &Value) -> bool {
 /// field. A `base64` source is rejected because the flattener keeps only its
 /// media type and drops the encoded payload, which would silently empty the
 /// document; `url` and `file` sources keep their reference string and stay
-/// accepted.
+/// accepted. A `content` source must hold only strictly translatable text
+/// blocks, so nested `citations`, `cache_control`, or unknown fields that the
+/// flattener would drop fail closed instead.
 fn document_source_is_supported(source: &Value) -> bool {
     let Some(fields) = source.as_object() else {
         return false;
@@ -1036,7 +1070,7 @@ fn document_source_is_supported(source: &Value) -> bool {
         Some("content") => fields
             .get("content")
             .and_then(Value::as_array)
-            .is_some_and(|blocks| blocks.iter().any(text_block_has_text)),
+            .is_some_and(|blocks| blocks.iter().all(text_block_is_supported) && blocks.iter().any(text_block_has_text)),
         Some("url") => non_empty_string_field(source, "url"),
         Some("file") => non_empty_string_field(source, "file_id"),
         _ => false,
@@ -2512,6 +2546,87 @@ mod tests {
         // block fails closed even when a title would keep the part alive.
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"search_result","title":"Timeout KB","content":[{"type":"text","text":"Timeouts default to 30 seconds."},{"type":"image","source":{"type":"url","url":"https://example.test/chart.png"}}]}]}]}]}"#;
         let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("search_result"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_search_result_nested_block_fields_are_rejected() {
+        // A nested text block carrying a citations config, a cache marker,
+        // or an unknown field would be flattened to its `text` only, so the
+        // dropped fields fail closed instead of being silently discarded.
+        for extra in [
+            json!({"citations": [{"type": "char_location", "cited_text": "t", "start_index": 0, "end_index": 1}]}),
+            json!({"cache_control": {"type": "ephemeral"}}),
+            json!({"unknown_field": "value"}),
+        ] {
+            let mut block = json!({"type": "text", "text": "Timeouts default to 30 seconds."});
+            block
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())));
+            let body = json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": [{
+                        "type": "search_result",
+                        "title": "Timeout KB",
+                        "content": [block]
+                    }]
+                }]}]
+            });
+            let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+            assert!(error.contains("search_result"), "{error}");
+        }
+    }
+
+    #[test]
+    fn tool_result_document_source_nested_block_fields_are_rejected() {
+        // A text block inside a document's `source.content` carrying fields
+        // the flattener drops fails closed, mirroring the search_result rule.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","title":"Nested Doc","source":{"type":"content","content":[{"type":"text","text":"Nested fact.","citations":[{"type":"char_location","cited_text":"t","start_index":0,"end_index":1}]}]}}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("document"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_nested_cache_markers_stripped_when_prompt_caching_allowlisted() {
+        // With prompt_caching allowlisted, cache markers on the nested text
+        // blocks of search_result and document parts are stripped and
+        // recorded as degraded, so the parts still translate; without the
+        // allowlist the same request fails closed.
+        let body = json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call_1",
+                "content": [
+                    {"type": "search_result", "title": "Timeout KB", "content": [
+                        {"type": "text", "text": "Timeouts default to 30 seconds.", "cache_control": {"type": "ephemeral"}}
+                    ]},
+                    {"type": "document", "title": "Nested Doc", "source": {"type": "content", "content": [
+                        {"type": "text", "text": "Nested fact.", "cache_control": {"type": "ephemeral"}}
+                    ]}}
+                ]
+            }]}]
+        });
+
+        let output = transform_request_degrading(body.clone(), CACHE).unwrap();
+        assert!(
+            output.degraded.prompt_caching,
+            "nested markers must be recorded as degraded"
+        );
+        let parsed: Value = serde_json::from_slice(&output.body).unwrap();
+        assert_eq!(
+            parsed["messages"][0]["content"],
+            "Search result: \"Timeout KB\"\nContent:\nTimeouts default to 30 seconds.\nDocument: \"Nested Doc\"\nContent:\nNested fact.",
+            "marker-carrying nested blocks still translate under the allowlist"
+        );
+
+        let error = transform_request_degrading(body, LossyFeatureAllowlist::default()).unwrap_err();
         assert!(error.contains("search_result"), "{error}");
     }
 

@@ -1009,6 +1009,101 @@ class TestOperatorApprovedDegradation:
         # The prompt content survives the degradation.
         assert any(m["role"] == "system" and m["content"] == "Be brief" for m in upstream["messages"])
 
+    def test_tool_result_nested_cache_markers_are_degraded_and_reported(self, degrading_client):
+        RecordingBackend.bodies.clear()
+
+        raw = degrading_client.messages.with_raw_response.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [
+                            {
+                                "type": "search_result",
+                                "title": "Timeout KB",
+                                "content": [
+                                    {"type": "text", "text": "Timeouts default to 30 seconds.", "cache_control": {"type": "ephemeral"}},
+                                ],
+                            },
+                            {
+                                "type": "document",
+                                "title": "Nested Doc",
+                                "source": {
+                                    "type": "content",
+                                    "content": [
+                                        {"type": "text", "text": "Nested fact.", "cache_control": {"type": "ephemeral"}},
+                                    ],
+                                },
+                            },
+                        ],
+                    }],
+                },
+            ],
+        )
+
+        assert raw.http_response.status_code == 200
+        assert "prompt_caching" in raw.http_response.headers.get(DEGRADED_HEADER, "")
+        message = raw.parse()
+        assert message.content[0].text == "4"
+
+        [upstream] = RecordingBackend.bodies
+        serialized = json.dumps(upstream)
+        assert "cache_control" not in serialized, f"nested markers must be stripped: {serialized}"
+        tool_message = upstream["messages"][2]
+        assert tool_message["content"] == (
+            'Search result: "Timeout KB"\nContent:\nTimeouts default to 30 seconds.\n'
+            'Document: "Nested Doc"\nContent:\nNested fact.'
+        )
+
+    def test_tool_result_nested_block_citations_are_rejected(self, anthropic_client):
+        # A citations config on a nested search_result text block is dropped
+        # by the flattener, so it must fail closed instead.
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[
+                    {"role": "user", "content": "Call lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{
+                                "type": "search_result",
+                                "title": "Timeout KB",
+                                "content": [
+                                    {"type": "text", "text": "Timeouts default to 30 seconds.", "citations": []},
+                                    {
+                                        "type": "text",
+                                        "text": "Cited fact.",
+                                        "citations": [{"type": "char_location", "cited_text": "t", "start_index": 0, "end_index": 1}],
+                                    },
+                                ],
+                            }],
+                        }],
+                    },
+                ],
+            )
+
+        assert "search_result" in str(excinfo.value), "error message must name the search_result part"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
+
     def test_extended_thinking_is_degraded_and_reported(self, degrading_client):
         RecordingBackend.bodies.clear()
 
