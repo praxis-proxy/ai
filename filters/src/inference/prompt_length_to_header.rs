@@ -29,13 +29,10 @@ const MAX_ROUTES: usize = 1024;
 const META_ESTIMATED_TOKENS: &str = "prompt_length_to_header.estimated_tokens";
 /// Metadata key carrying the selected overflow route.
 const META_OVERFLOW_ROUTE: &str = "prompt_length_to_header.overflow_route";
-/// Top-level fields whose nested strings contribute to the routing estimate.
-const PROMPT_FIELDS: [&str; 11] = [
-    "messages",
-    "prompt",
-    "input",
-    "system",
-    "instructions",
+/// Prompt-bearing fields whose nested string values contribute to the estimate.
+const PROMPT_FIELDS: [&str; 5] = ["messages", "prompt", "input", "system", "instructions"];
+/// Schema-bearing fields whose nested keys and string values contribute.
+const SCHEMA_FIELDS: [&str; 6] = [
     "tools",
     "functions",
     "response_format",
@@ -93,8 +90,13 @@ struct OptionalString<'a>(Option<Cow<'a, str>>);
 /// `response_format`, `text`, `output_config`, and `output_format`. ASCII text
 /// is rounded up at three characters per token; non-ASCII text is charged at
 /// one token per UTF-8 byte so emoji and CJK input cannot be silently
-/// underestimated. It is a routing heuristic, not a billing or quota token
-/// count.
+/// underestimated. Object keys under schema-bearing fields are also counted so
+/// JSON Schema property names contribute to the estimate. It is a routing
+/// heuristic, not a billing or quota token count.
+///
+/// Place body-writing filters such as `prompt_enrich` before this filter. The
+/// estimate reflects the body produced by earlier filters in the chain, so the
+/// recommended order is body writers, `prompt_length_to_header`, then `router`.
 ///
 /// The filter removes any client-supplied copy of its output header before it
 /// publishes a derived value. A following core `router` can exact-match the
@@ -364,32 +366,44 @@ fn validate_route_value(field: &str, value: &str) -> Result<(), FilterError> {
 
 /// Estimate input tokens from provider-neutral prompt-bearing fields.
 fn estimate_prompt_tokens(body: &Value) -> usize {
-    PROMPT_FIELDS
+    let prompt_tokens = PROMPT_FIELDS
         .into_iter()
         .filter_map(|field| body.get(field))
         .fold(0_usize, |total, value| {
-            total.saturating_add(string_token_estimate(value))
+            total.saturating_add(string_token_estimate(value, false))
+        });
+    SCHEMA_FIELDS
+        .into_iter()
+        .filter_map(|field| body.get(field))
+        .fold(prompt_tokens, |total, value| {
+            total.saturating_add(string_token_estimate(value, true))
         })
 }
 
-/// Estimate tokens in every string nested under a prompt-bearing field.
-fn string_token_estimate(value: &Value) -> usize {
+/// Estimate tokens in every string and, for schemas, every nested object key.
+fn string_token_estimate(value: &Value, count_object_keys: bool) -> usize {
     match value {
-        Value::String(text) => {
-            let ascii_bytes = text.bytes().filter(u8::is_ascii).count();
-            let non_ascii_bytes = text.len().saturating_sub(ascii_bytes);
-            ascii_bytes
-                .div_ceil(ASCII_CHARS_PER_TOKEN)
-                .saturating_add(non_ascii_bytes)
-        },
+        Value::String(text) => text_token_estimate(text),
         Value::Array(values) => values.iter().fold(0_usize, |total, value| {
-            total.saturating_add(string_token_estimate(value))
+            total.saturating_add(string_token_estimate(value, count_object_keys))
         }),
-        Value::Object(values) => values.values().fold(0_usize, |total, value| {
-            total.saturating_add(string_token_estimate(value))
+        Value::Object(values) => values.iter().fold(0_usize, |total, (key, value)| {
+            let key_tokens = if count_object_keys { text_token_estimate(key) } else { 0 };
+            total
+                .saturating_add(key_tokens)
+                .saturating_add(string_token_estimate(value, count_object_keys))
         }),
         Value::Null | Value::Bool(_) | Value::Number(_) => 0,
     }
+}
+
+/// Conservatively convert one string to the routing token estimate.
+fn text_token_estimate(text: &str) -> usize {
+    let ascii_bytes = text.bytes().filter(u8::is_ascii).count();
+    let non_ascii_bytes = text.len().saturating_sub(ascii_bytes);
+    ascii_bytes
+        .div_ceil(ASCII_CHARS_PER_TOKEN)
+        .saturating_add(non_ascii_bytes)
 }
 
 #[cfg(test)]
@@ -458,6 +472,29 @@ mod tests {
     fn estimate_conservatively_charges_non_ascii_bytes() {
         let body = serde_json::json!({"prompt": "你好🙂"});
         assert_eq!(estimate_prompt_tokens(&body), 10);
+    }
+
+    #[test]
+    fn estimate_counts_schema_property_names() {
+        let long_property_name = "p".repeat(3_000);
+        let body = serde_json::json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            (long_property_name): {"type": "string"}
+                        }
+                    }
+                }
+            }
+        });
+
+        assert!(
+            estimate_prompt_tokens(&body) > 100,
+            "a long schema property name must affect overflow routing"
+        );
     }
 
     #[test]

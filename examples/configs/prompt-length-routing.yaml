@@ -12,6 +12,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      # Body writers such as prompt_enrich must run before this estimator.
       - filter: prompt_length_to_header
         routes:
           - model: small-model

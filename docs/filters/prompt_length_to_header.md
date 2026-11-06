@@ -7,7 +7,9 @@ Estimates prompt length and promotes a route key when a model limit is exceeded.
 
 ## Configuration Notes
 
-The estimate is deliberately provider-neutral and conservative. It counts text in common prompt-bearing and schema-bearing fields: `messages`, `prompt`, `input`, `system`, `instructions`, `tools`, `functions`, `response_format`, `text`, `output_config`, and `output_format`. ASCII text is rounded up at three characters per token; non-ASCII text is charged at one token per UTF-8 byte so emoji and CJK input cannot be silently underestimated. It is a routing heuristic, not a billing or quota token count.
+The estimate is deliberately provider-neutral and conservative. It counts text in common prompt-bearing and schema-bearing fields: `messages`, `prompt`, `input`, `system`, `instructions`, `tools`, `functions`, `response_format`, `text`, `output_config`, and `output_format`. ASCII text is rounded up at three characters per token; non-ASCII text is charged at one token per UTF-8 byte so emoji and CJK input cannot be silently underestimated. Object keys under schema-bearing fields are also counted so JSON Schema property names contribute to the estimate. It is a routing heuristic, not a billing or quota token count.
+
+Place body-writing filters such as `prompt_enrich` before this filter. The estimate reflects the body produced by earlier filters in the chain, so the recommended order is body writers, `prompt_length_to_header`, then `router`.
 
 The filter removes any client-supplied copy of its output header before it publishes a derived value. A following core `router` can exact-match the configured `overflow` key and select a larger-context cluster.
 
