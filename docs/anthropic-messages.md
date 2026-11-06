@@ -122,7 +122,8 @@ feature, and an `x-degraded-features` response header. `prompt_caching`
 preserves all prompt and tool content but does not honor explicit cache
 breakpoints, so cost and latency may differ; `extended_thinking` means the
 translated response carries no thinking blocks; `mid_conversation_system`
-folds each `system` message that appears after the first non-system turn into
+folds each eligible text-only `system` message with exactly `role` and
+`content` fields that appears after the first non-system turn into
 the single leading system message (real OpenAI accepts mid-array `system`
 messages, but vLLM chat templates answer "System message must be at the
 beginning"). Remove an entry to make that
