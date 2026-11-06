@@ -456,15 +456,18 @@ surfaces:
           400 and upstream reasoning fields are not read. Under the `vllm`
           dialect reasoning round-trips on both the finite and the streaming
           path (delta.reasoning and delta.reasoning_content become
-          response.reasoning_text events). reasoning.summary is rejected
-          unconditionally — no dialect reports supports_safe_summary.
-        evidence: apis/src/openai/translation/reasoning.rs:57-62; apis/src/openai/translation/reasoning.rs:106-123; apis/src/openai/translation/reasoning.rs:186-205; apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:700-741
+          response.reasoning_text events). reasoning.summary `auto` is a
+          best-effort request and is accepted (the backend simply produces no
+          summary items); explicit summary values are rejected 400 because no
+          dialect reports supports_safe_summary.
+        evidence: apis/src/openai/translation/reasoning.rs:57-62; apis/src/openai/translation/reasoning.rs:106-123; apis/src/openai/translation/reasoning.rs:186-212; apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:700-741
       request-reasoning-cache-controls:
         status: translated
         note: >-
           reasoning.effort maps to reasoning_effort regardless of dialect.
           prompt_cache_key, prompt_cache_retention and prompt_cache_options
-          are copied verbatim. reasoning.summary is rejected 400 (see
+          are copied verbatim. reasoning.summary `auto` translates as a
+          best-effort request; explicit summary values are rejected 400 (see
           reasoning-content).
         evidence: apis/src/openai/translation/chat_completions.rs:557-561; apis/src/openai/translation/chat_completions.rs:453-456
       stop-sequences:

@@ -2435,7 +2435,10 @@ fn unknown_reasoning_config_key_is_rejected() {
 }
 
 #[tokio::test]
-async fn reasoning_summary_request_is_rejected_for_dialect_without_safe_summary() {
+async fn reasoning_summary_auto_request_is_accepted_as_best_effort() {
+    // Codex CLI >= 0.166.0 sends `reasoning.summary: "auto"` for every model,
+    // so the translated route must accept it; the backend without a
+    // safe-summary contract simply produces no summary items.
     let yaml = serde_yaml::from_str("reasoning:\n  dialect: vllm").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -2448,6 +2451,33 @@ async fn reasoning_summary_request_is_rejected_for_dialect_without_safe_summary(
     })));
     let mut body = Some(Bytes::from_static(
         br#"{"model":"deepseek-r1","input":"hello","reasoning":{"summary":"auto"}}"#,
+    ));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "auto summary is a best-effort request and must translate"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_summary_explicit_value_is_rejected_for_dialect_without_safe_summary() {
+    let yaml = serde_yaml::from_str("reasoning:\n  dialect: vllm").unwrap();
+    let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_request.format", "openai_responses");
+    context.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "deepseek-r1",
+        "input": "hello",
+        "reasoning": {"summary": "concise"}
+    })));
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"deepseek-r1","input":"hello","reasoning":{"summary":"concise"}}"#,
     ));
 
     let action = filter
@@ -2566,7 +2596,6 @@ async fn default_dialect_leaves_reasoning_content_unextracted() {
     assert_eq!(output[0]["type"], "message");
     assert!(output.iter().all(|item| item["type"] != "reasoning"));
 }
-
 
 #[test]
 fn translated_late_reasoning_tracks_each_round_in_request_state() {
