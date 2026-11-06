@@ -352,41 +352,782 @@ unknown_field: true
 #[test]
 fn balance_response_has_access_continues() {
     let body = br#"{"hasAccess": true, "balance": 9000.0, "usage": 1000.0}"#;
-    let action = parse_balance_result(body, true);
+    let action = parse_balance_result(body, billing_only(true));
     assert!(matches!(action, FilterAction::Continue));
 }
 
 #[test]
 fn balance_response_no_access_rejects() {
     let body = br#"{"hasAccess": false, "balance": 0.0, "usage": 10000.0}"#;
-    let action = parse_balance_result(body, true);
+    let action = parse_balance_result(body, billing_only(true));
     assert!(matches!(action, FilterAction::Reject(_)));
 }
 
 #[test]
 fn balance_response_invalid_json_fail_open() {
     let body = b"not json";
-    let action = parse_balance_result(body, true);
+    let action = parse_balance_result(body, billing_only(true));
     assert!(matches!(action, FilterAction::Continue));
 }
 
 #[test]
 fn balance_response_invalid_json_fail_closed() {
     let body = b"not json";
-    let action = parse_balance_result(body, false);
+    let action = parse_balance_result(body, billing_only(false));
     assert!(matches!(action, FilterAction::Reject(_)));
 }
 
 #[test]
 fn balance_response_empty_body_fail_open() {
-    let action = parse_balance_result(b"", true);
+    let action = parse_balance_result(b"", billing_only(true));
     assert!(matches!(action, FilterAction::Continue));
 }
 
 #[test]
 fn balance_response_empty_body_fail_closed() {
-    let action = parse_balance_result(b"", false);
+    let action = parse_balance_result(b"", billing_only(false));
     assert!(matches!(action, FilterAction::Reject(_)));
+}
+
+// -----------------------------------------------------------------------------
+// Model Policy Gate
+// -----------------------------------------------------------------------------
+
+/// Policy with model-policy enforcement disabled — the legacy billing-only
+/// contract, used by the tests above this section.
+fn billing_only(fail_open: bool) -> AdmissionPolicy {
+    AdmissionPolicy {
+        billing_fail_open: fail_open,
+        model_policy_check: false,
+        model_policy_fail_open: false,
+    }
+}
+
+/// Model-policy-enabled policy.
+fn model_policy(billing_fail_open: bool, model_policy_fail_open: bool) -> AdmissionPolicy {
+    AdmissionPolicy {
+        billing_fail_open,
+        model_policy_check: true,
+        model_policy_fail_open,
+    }
+}
+
+/// Assert a rejection carries the given status and body.
+fn assert_reject(action: FilterAction, status: u16, body: &str) {
+    match action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, status, "unexpected rejection status");
+            assert_eq!(
+                rejection.body.as_deref(),
+                Some(body.as_bytes()),
+                "unexpected rejection body"
+            );
+        },
+        other => panic!("expected Reject({status}) with body {body:?}, got {other:?}"),
+    }
+}
+
+#[test]
+fn model_policy_defaults_to_disabled() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+"#,
+    )
+    .unwrap();
+    let filter = build_filter(&yaml).unwrap();
+
+    assert!(!filter.model_policy_check, "model policy must default to disabled");
+    assert!(
+        !filter.model_policy_fail_open,
+        "model policy must default to fail-closed"
+    );
+}
+
+#[test]
+fn model_policy_fields_parse() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+model_policy_check: true
+model_policy_fail_open: true
+"#,
+    )
+    .unwrap();
+    let filter = build_filter(&yaml).unwrap();
+
+    assert!(filter.model_policy_check);
+    assert!(filter.model_policy_fail_open);
+}
+
+#[test]
+fn model_denial_rejects_despite_budget_and_billing_fail_open() {
+    // The headline case of issue #1719: budget remains, the model is denied.
+    let body = br#"{"hasAccess": true, "modelAllowed": false}"#;
+    let action = parse_balance_result(body, model_policy(true, false));
+    assert_reject(action, 403, "model not allowed for this user");
+}
+
+#[test]
+fn model_denial_takes_precedence_over_budget_exhaustion() {
+    let body = br#"{"hasAccess": false, "modelAllowed": false}"#;
+    let action = parse_balance_result(body, model_policy(false, true));
+    assert_reject(action, 403, "model not allowed for this user");
+}
+
+#[test]
+fn budget_denial_with_model_allow_rejects_429() {
+    let body = br#"{"hasAccess": false, "modelAllowed": true}"#;
+    let action = parse_balance_result(body, model_policy(true, false));
+    assert_reject(action, 429, "token budget exhausted");
+}
+
+#[test]
+fn model_and_budget_allow_continues() {
+    let body = br#"{"hasAccess": true, "modelAllowed": true}"#;
+    let action = parse_balance_result(body, model_policy(false, false));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "both gates allow, so the request continues"
+    );
+}
+
+#[test]
+fn missing_model_verdict_fails_closed_when_policy_enabled() {
+    // A legacy response carrying only `hasAccess` leaves the model gate
+    // without a verdict — never an implicit allow.
+    let body = br#"{"hasAccess": true}"#;
+    let action = parse_balance_result(body, model_policy(true, false));
+    assert_reject(action, 503, "metering system unavailable");
+}
+
+#[test]
+fn missing_model_verdict_fails_open_when_configured() {
+    let body = br#"{"hasAccess": true}"#;
+    let action = parse_balance_result(body, model_policy(true, true));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "the model gate fails open as configured"
+    );
+}
+
+#[test]
+fn null_and_wrong_typed_model_verdicts_are_unavailable() {
+    for body in [
+        r#"{"hasAccess": true, "modelAllowed": null}"#,
+        r#"{"hasAccess": true, "modelAllowed": "yes"}"#,
+        r#"{"hasAccess": true, "modelAllowed": 1}"#,
+    ] {
+        let action = parse_balance_result(body.as_bytes(), model_policy(true, false));
+        assert_reject(action, 503, "metering system unavailable");
+    }
+}
+
+#[test]
+fn wrong_typed_model_verdict_preserves_budget_verdict() {
+    // Per-gate parsing: an unusable `modelAllowed` must not discard a valid
+    // explicit budget denial.
+    let body = br#"{"hasAccess": false, "modelAllowed": "yes"}"#;
+    let action = parse_balance_result(body, model_policy(true, true));
+    assert_reject(action, 429, "token budget exhausted");
+}
+
+#[test]
+fn billing_fail_open_with_model_fail_closed_rejects_on_unusable_payload() {
+    // Independence check: billing fail-open must not drag the model gate open.
+    let action = parse_balance_result(b"", model_policy(true, false));
+    assert_reject(action, 503, "metering system unavailable");
+}
+
+#[test]
+fn unusable_payload_admits_only_when_all_gates_fail_open() {
+    let action = parse_balance_result(b"", model_policy(true, true));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "an unusable payload admits only when every gate fails open"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Availability — Transport-Level Callout Failures (issue #1719 coverage)
+// -----------------------------------------------------------------------------
+
+/// A synthetic metering callout response.
+fn sub_response(status: u16, body: &str) -> SubResponse {
+    SubResponse {
+        status,
+        version: http::Version::HTTP_11,
+        headers: http::HeaderMap::new(),
+        body: Bytes::copy_from_slice(body.as_bytes()),
+    }
+}
+
+/// A model-policy filter with the given billing and model-gate availability
+/// policies; `metering_url` points nowhere because these tests inject the
+/// callout result directly.
+fn availability_filter(billing_fail_open: bool, model_policy_fail_open: bool) -> ExternalMeteringFilter {
+    filter_from_yaml(&format!(
+        "metering_url: \"http://127.0.0.1:1\"\nallow_private_endpoint: true\nfail_open: {billing_fail_open}\nmodel_policy_check: true\nmodel_policy_fail_open: {model_policy_fail_open}\n"
+    ))
+}
+
+/// Every transport-level failure leaves both gates without verdicts, so
+/// billing fail-open with model-policy fail-closed must reject with 503.
+#[test]
+fn model_gate_fails_closed_on_timeout_despite_billing_fail_open() {
+    let filter = availability_filter(true, false);
+    let action = filter.interpret_balance(Err(SubRequestError::DeadlineExceeded));
+    assert_reject(action, 503, "metering system unavailable");
+}
+
+#[test]
+fn model_gate_fails_closed_on_non_2xx_despite_billing_fail_open() {
+    let filter = availability_filter(true, false);
+    let action = filter.interpret_balance(Ok(sub_response(500, "internal error")));
+    assert_reject(action, 503, "metering system unavailable");
+}
+
+#[test]
+fn model_gate_fails_closed_on_oversized_response_despite_billing_fail_open() {
+    // A metering response above the 64 KiB callout cap is truncated by the
+    // transport and surfaces as a `ResponseTooLarge` error, never as
+    // verdicts.
+    let filter = availability_filter(true, false);
+    let action = filter.interpret_balance(Err(SubRequestError::ResponseTooLarge {
+        actual: MAX_CALLOUT_RESPONSE_BYTES + 1,
+        limit: MAX_CALLOUT_RESPONSE_BYTES,
+    }));
+    assert_reject(action, 503, "metering system unavailable");
+}
+
+#[test]
+fn transport_failures_admit_only_when_every_gate_fails_open() {
+    // Independence in the other direction: a model gate failing open must
+    // not drag the billing gate open with it.
+    let make_failure = |case: usize| match case {
+        0 => Err(SubRequestError::DeadlineExceeded),
+        1 => Err(SubRequestError::ResponseTooLarge {
+            actual: MAX_CALLOUT_RESPONSE_BYTES + 1,
+            limit: MAX_CALLOUT_RESPONSE_BYTES,
+        }),
+        _ => Ok(sub_response(503, "overloaded")),
+    };
+    for case in 0..3 {
+        let both_open = availability_filter(true, true);
+        assert!(
+            matches!(both_open.interpret_balance(make_failure(case)), FilterAction::Continue),
+            "a shared callout failure admits only when every gate fails open"
+        );
+        let billing_closed = availability_filter(false, true);
+        assert_reject(
+            billing_closed.interpret_balance(make_failure(case)),
+            503,
+            "metering system unavailable",
+        );
+    }
+}
+
+#[test]
+fn transport_failures_never_authorize_an_explicit_denial_path() {
+    // Sanity: an explicit `modelAllowed: false` on a usable 2xx payload still
+    // wins over every availability policy.
+    let filter = availability_filter(true, true);
+    let action = filter.interpret_balance(Ok(sub_response(200, r#"{"hasAccess": true, "modelAllowed": false}"#)));
+    assert_reject(action, 403, "model not allowed for this user");
+}
+
+#[test]
+fn policy_disabled_preserves_legacy_missing_verdict_behavior() {
+    let body = br#"{"hasAccess": true}"#;
+    let action = parse_balance_result(body, billing_only(true));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "policy disabled: a missing modelAllowed must not affect admission"
+    );
+}
+
+#[test]
+fn verdicts_extract_both_fields() {
+    let verdicts = parse_balance_verdicts(br#"{"hasAccess": true, "modelAllowed": false}"#);
+    assert_eq!(
+        verdicts.has_access,
+        Some(true),
+        "hasAccess must be extracted when present"
+    );
+    assert_eq!(
+        verdicts.model_allowed,
+        Some(false),
+        "modelAllowed must be extracted when present"
+    );
+}
+
+#[test]
+fn verdicts_treat_missing_fields_as_unavailable() {
+    let verdicts = parse_balance_verdicts(br#"{"hasAccess": true}"#);
+    assert_eq!(
+        verdicts.has_access,
+        Some(true),
+        "hasAccess must survive a missing modelAllowed"
+    );
+    assert_eq!(
+        verdicts.model_allowed, None,
+        "a missing modelAllowed leaves the model gate without a verdict"
+    );
+}
+
+#[test]
+fn verdicts_treat_wrong_types_as_unavailable() {
+    let verdicts = parse_balance_verdicts(br#"{"hasAccess": "true", "modelAllowed": 7}"#);
+    assert_eq!(
+        verdicts.has_access, None,
+        "a wrongly typed hasAccess is unavailable, not false"
+    );
+    assert_eq!(
+        verdicts.model_allowed, None,
+        "a wrongly typed modelAllowed is unavailable, not false"
+    );
+}
+
+#[test]
+fn verdicts_on_unparseable_body_are_all_unavailable() {
+    for body in ["", "not json", r#"{"truncated:"#] {
+        let verdicts = parse_balance_verdicts(body.as_bytes());
+        assert_eq!(
+            verdicts.has_access, None,
+            "an unparseable body leaves hasAccess without a verdict"
+        );
+        assert_eq!(
+            verdicts.model_allowed, None,
+            "an unparseable body leaves modelAllowed without a verdict"
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Model Policy — Request Phase
+// -----------------------------------------------------------------------------
+
+fn model_policy_filter_yaml(extra: &str) -> serde_yaml::Value {
+    serde_yaml::from_str(&format!(
+        r#"
+metering_url: "http://127.0.0.1:1"
+allow_private_endpoint: true
+fail_open: true
+identity_header_prefix: "x-tenant-"
+default_username: "anonymous"
+default_model: "unknown"
+model_policy_check: true
+{extra}
+"#
+    ))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn model_policy_rejects_missing_identity_before_callout() {
+    // Reporting defaults must not stand in for a trusted identity when the
+    // model gate is enabled; the skip-metering path must not bypass it either.
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert_reject(action, 403, "tenant identity required for model authorization");
+}
+
+#[tokio::test]
+async fn model_policy_rejects_unresolvable_model() {
+    // `default_model` is a reporting fallback only — it must never be
+    // authorized in place of the actual requested model.
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    let mut req = make_request(http::Method::POST, "/v1/chat/completions");
+    req.headers
+        .insert("x-tenant-username", http::HeaderValue::from_static("alice"));
+    let mut ctx = make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert_reject(action, 403, "request model required for model authorization");
+}
+
+#[tokio::test]
+async fn model_policy_resolves_model_from_buffered_body() {
+    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    let mut req = make_request(http::Method::POST, "/v1/chat/completions");
+    req.headers
+        .insert("x-tenant-username", http::HeaderValue::from_static("alice"));
+    let mut ctx = make_filter_context(&req);
+    ctx.buffered_request_body = Some(Bytes::from_static(br#"{"model": "gpt-4o", "messages": []}"#));
+
+    // metering_url points at a dead port, so the callout fails.
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "both gates fail open against the dead metering port"
+    );
+    let state = ctx
+        .filter_state
+        .get(&0)
+        .and_then(|s| s.downcast_ref::<MeteringState>())
+        .expect("state should be stored after the callout");
+    assert_eq!(
+        state.model, "gpt-4o",
+        "the public body model must be resolved for the preflight"
+    );
+    assert_eq!(state.username, "alice");
+}
+
+#[tokio::test]
+async fn model_policy_rejects_identity_model_conflicting_with_client_model() {
+    // Regression for the divergence the model gate must close: a trusted
+    // identity claim naming model A while `model_to_provider` recorded (and
+    // the provider will receive) requested model B must not authorize A.
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "identity-model".to_owned());
+    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "requested-model");
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert_reject(action, 403, "conflicting model inputs for model authorization");
+    assert!(
+        ctx.filter_state.is_empty(),
+        "a model conflict must reject before any balance callout stores state"
+    );
+}
+
+#[tokio::test]
+async fn model_policy_rejects_identity_model_conflicting_with_body_model() {
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "identity-model".to_owned());
+    ctx.buffered_request_body = Some(Bytes::from_static(br#"{"model": "body-model", "messages": []}"#));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert_reject(action, 403, "conflicting model inputs for model authorization");
+}
+
+#[tokio::test]
+async fn model_policy_rejects_escaped_body_model_value_alongside_identity_model() {
+    // Regression: an undecodable body model must not read as model-absent.
+    // The provider decodes the member to `gpt-4o`, so authorizing the
+    // trusted identity claim `gpt-4o-mini` would admit a request for a
+    // model the preflight never compared.
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "gpt-4o-mini".to_owned());
+    ctx.buffered_request_body = Some(Bytes::from_static(br#"{"model":"gpt\u002d4o","messages":[]}"#));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert_reject(action, 403, "conflicting model inputs for model authorization");
+    assert!(
+        ctx.filter_state.is_empty(),
+        "an unusable body model must reject before any balance callout stores state"
+    );
+}
+
+#[tokio::test]
+async fn model_policy_rejects_duplicate_body_model_keys_alongside_identity_model() {
+    // Regression: duplicate `model` keys leave the provider's parser to pick
+    // a winner, so neither value may be authorized against the identity
+    // claim — including when one of them agrees with it.
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "gpt-4o-mini".to_owned());
+    ctx.buffered_request_body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4o-mini","model":"gpt-4o","messages":[]}"#,
+    ));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert_reject(action, 403, "conflicting model inputs for model authorization");
+    assert!(
+        ctx.filter_state.is_empty(),
+        "ambiguous duplicate model keys must reject before any balance callout stores state"
+    );
+}
+
+#[tokio::test]
+async fn model_policy_rejects_escaped_body_model_key_alongside_identity_model() {
+    // An escaped key spelling still names `model`, so its value is a real
+    // model source and must conflict-check like a plain spelling.
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "gpt-4o-mini".to_owned());
+    ctx.buffered_request_body = Some(Bytes::from_static(br#"{ "stream": true, "\u006dodel": "gpt-4o" }"#));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert_reject(action, 403, "conflicting model inputs for model authorization");
+}
+
+#[tokio::test]
+async fn model_policy_allows_absent_body_model_alongside_identity_model() {
+    // Control for the unusable-body rejections: a body with no `model`
+    // member at all is genuinely absent, so the identity model alone
+    // authorizes (here through the fail-open gates).
+    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "gpt-4o-mini".to_owned());
+    ctx.buffered_request_body = Some(Bytes::from_static(br#"{"prompt": "hi"}"#));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a body without a model member is absent, not conflicting"
+    );
+    let state = ctx
+        .filter_state
+        .get(&0)
+        .and_then(|s| s.downcast_ref::<MeteringState>())
+        .expect("state should be stored after the callout");
+    assert_eq!(
+        state.model, "gpt-4o-mini",
+        "an absent body model must leave the identity model authoritative"
+    );
+}
+
+/// Build a valid JSON body carrying `gpt-4o`, padded to exactly `len` bytes.
+fn padded_json_body(len: usize) -> Bytes {
+    let prefix = br#"{"model":"gpt-4o","pad":""#;
+    let suffix = br#""}"#;
+    let mut body = prefix.to_vec();
+    body.extend(std::iter::repeat_n(b'x', len - prefix.len() - suffix.len()));
+    body.extend_from_slice(suffix);
+    Bytes::from(body)
+}
+
+#[tokio::test]
+async fn model_policy_rejects_body_above_pre_read_bound_regardless_of_pipeline_buffers() {
+    // The pipeline merges `StreamBuffer` limits by keeping the largest
+    // requested bound, so another filter can raise (or remove) the cap the
+    // framework enforces on this filter's behalf. The documented bound must
+    // hold regardless: the filter rejects the oversized buffer itself,
+    // before any callout.
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.buffered_request_body = Some(Bytes::from(vec![b'x'; DEFAULT_JSON_BODY_MAX_BYTES + 1]));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    match action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(
+                rejection.status, 413,
+                "a body above the pre-read bound must reject with 413"
+            );
+            assert_eq!(
+                rejection.body, None,
+                "the 413 mirrors the framework's bare pre-read overflow rejection"
+            );
+        },
+        other => panic!("expected Reject(413) for an oversized body, got {other:?}"),
+    }
+    assert!(
+        ctx.filter_state.is_empty(),
+        "an oversized body must reject before any balance callout stores state"
+    );
+}
+
+#[tokio::test]
+async fn model_policy_allows_body_at_pre_read_bound() {
+    // Control: a body exactly at the bound is within the documented cap and
+    // must flow through the (fail-open) gates, not reject.
+    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.buffered_request_body = Some(padded_json_body(DEFAULT_JSON_BODY_MAX_BYTES));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a body exactly at the pre-read bound is within the cap, not above it"
+    );
+    let state = ctx
+        .filter_state
+        .get(&0)
+        .and_then(|s| s.downcast_ref::<MeteringState>())
+        .expect("state should be stored after the callout");
+    assert_eq!(
+        state.model, "gpt-4o",
+        "the at-bound body's model must still resolve for the preflight"
+    );
+}
+
+#[tokio::test]
+async fn model_policy_ignores_body_once_client_model_is_recorded() {
+    // `model_to_provider` records the client-facing model and rewrites the
+    // buffered body to the provider target during the pre-read, so by the
+    // time this filter's request hook runs the body legitimately names a
+    // different (provider) model. The body is not a comparison source once
+    // a client-facing model exists: the preflight must authorize the
+    // client-facing alias — the model the provider rewrite preserves.
+    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5");
+    // The body as it looks after model_to_provider rewrote it to the target.
+    ctx.buffered_request_body = Some(Bytes::from_static(
+        br#"{"model": "claude-sonnet-4-5@20250929", "messages": []}"#,
+    ));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a provider-side rewrite is not a model conflict; both gates fail open here"
+    );
+    let state = ctx
+        .filter_state
+        .get(&0)
+        .and_then(|s| s.downcast_ref::<MeteringState>())
+        .expect("state should be stored after the callout");
+    assert_eq!(
+        state.model, "claude-sonnet-4-5",
+        "the preflight must authorize the client-facing alias, never the provider target"
+    );
+}
+
+#[tokio::test]
+async fn model_policy_agreeing_model_sources_authorize_the_requested_model() {
+    // The positive direction of non-divergence: when every source names the
+    // same model, the preflight authorizes exactly that model — the one the
+    // provider receives (modulo the provider-side rewrite, which preserves
+    // the client-facing alias).
+    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "requested-model".to_owned());
+    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "requested-model");
+    ctx.buffered_request_body = Some(Bytes::from_static(br#"{"model": "requested-model", "messages": []}"#));
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "agreeing sources must admit through the fail-open gates"
+    );
+    let state = ctx
+        .filter_state
+        .get(&0)
+        .and_then(|s| s.downcast_ref::<MeteringState>())
+        .expect("state should be stored after the callout");
+    assert_eq!(
+        state.model, "requested-model",
+        "the preflight must authorize the model every source agrees on"
+    );
+}
+
+#[tokio::test]
+async fn model_policy_disabled_preserves_identity_model_precedence_for_reporting() {
+    // Legacy contract: without enforcement, a conflicting identity model
+    // still wins for metering attribution — no rejection, no comparison.
+    let filter = filter_from_yaml(
+        "metering_url: \"http://127.0.0.1:1\"\nallow_private_endpoint: true\nfail_open: true\nidentity_header_prefix: \"x-tenant-\"\n",
+    );
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "identity-model".to_owned());
+    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "requested-model");
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "policy disabled: conflicting sources must not reject, the legacy contract is unchanged"
+    );
+    let state = ctx
+        .filter_state
+        .get(&0)
+        .and_then(|s| s.downcast_ref::<MeteringState>())
+        .expect("state should be stored after the callout");
+    assert_eq!(
+        state.model, "identity-model",
+        "policy disabled: the trusted identity model remains the reporting attribution"
+    );
+}
+
+#[tokio::test]
+async fn model_policy_verified_identity_model_wins_over_forged_header() {
+    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    let mut req = make_request(http::Method::POST, "/v1/chat/completions");
+    // Forged raw header, lower trust tier than verified metadata.
+    req.headers
+        .insert("x-tenant-model", http::HeaderValue::from_static("forged-model"));
+    req.headers
+        .insert("x-tenant-username", http::HeaderValue::from_static("alice"));
+    let mut ctx = make_filter_context(&req);
+    // A verification filter mapped both claims; the raw forged model header
+    // is in a lower trust tier and must be ignored entirely.
+    ctx.filter_metadata
+        .insert("x-tenant-model".to_owned(), "verified-model".to_owned());
+    ctx.filter_metadata
+        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "the verified identity model must pass the fail-open gates"
+    );
+    let state = ctx
+        .filter_state
+        .get(&0)
+        .and_then(|s| s.downcast_ref::<MeteringState>())
+        .expect("state should be stored after the callout");
+    assert_eq!(
+        state.model, "verified-model",
+        "a forged raw model header must never override verified identity metadata"
+    );
+}
+
+#[test]
+fn request_body_mode_is_stream_buffer_when_model_policy_enabled() {
+    let filter = build_filter(&model_policy_filter_yaml("")).unwrap();
+    assert!(matches!(
+        filter.request_body_mode(),
+        BodyMode::StreamBuffer { max_bytes: Some(_) }
+    ));
+}
+
+#[test]
+fn request_body_mode_is_stream_when_model_policy_disabled() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+"#,
+    )
+    .unwrap();
+    let filter = build_filter(&yaml).unwrap();
+    assert!(matches!(filter.request_body_mode(), BodyMode::Stream));
 }
 
 // -----------------------------------------------------------------------------
@@ -802,22 +1543,30 @@ fn strips_accept_encoding_to_keep_response_readable() {
 // Model Extraction
 // -----------------------------------------------------------------------------
 
+/// The usable model the extractor resolves, if any.
+fn extracted(body: &[u8]) -> Option<String> {
+    match extract_model_from_bytes(body) {
+        BodyModel::Usable(model) => Some(model),
+        BodyModel::Absent | BodyModel::Unusable => None,
+    }
+}
+
 #[test]
 fn extracts_model_from_compact_json() {
     let body = br#"{"model":"gpt-4","messages":[]}"#;
-    assert_eq!(extract_model_from_bytes(body).as_deref(), Some("gpt-4"));
+    assert_eq!(extracted(body).as_deref(), Some("gpt-4"));
 }
 
 #[test]
 fn extracts_model_with_whitespace_around_colon() {
     let body = br#"{ "model" : "claude-sonnet-4" , "stream": true }"#;
-    assert_eq!(extract_model_from_bytes(body).as_deref(), Some("claude-sonnet-4"));
+    assert_eq!(extracted(body).as_deref(), Some("claude-sonnet-4"));
 }
 
 #[test]
 fn extracts_model_when_not_first_field() {
     let body = br#"{"stream":true,"max_tokens":100,"model":"gpt-4o-mini"}"#;
-    assert_eq!(extract_model_from_bytes(body).as_deref(), Some("gpt-4o-mini"));
+    assert_eq!(extracted(body).as_deref(), Some("gpt-4o-mini"));
 }
 
 #[test]
@@ -826,7 +1575,7 @@ fn extract_model_ignores_nested_decoy() {
     // top-level field, regardless of field order.
     let body = br#"{"messages":[{"role":"user","content":"hi","model":"decoy"}],"model":"gpt-4"}"#;
     assert_eq!(
-        extract_model_from_bytes(body).as_deref(),
+        extracted(body).as_deref(),
         Some("gpt-4"),
         "nested decoy must not shadow the top-level model"
     );
@@ -836,44 +1585,264 @@ fn extract_model_ignores_nested_decoy() {
 fn extract_model_ignores_decoy_inside_string_value() {
     let body = br#"{"prompt":"please say \"model\": \"decoy\" back","model":"gpt-4o"}"#;
     assert_eq!(
-        extract_model_from_bytes(body).as_deref(),
+        extracted(body).as_deref(),
         Some("gpt-4o"),
         "a quoted decoy inside a string value must be skipped"
     );
 }
 
 #[test]
-fn extract_model_returns_none_when_only_nested() {
+fn extract_model_is_absent_when_only_nested() {
     let body = br#"{"messages":[{"model":"decoy","content":"hi"}]}"#;
     assert!(
-        extract_model_from_bytes(body).is_none(),
+        matches!(extract_model_from_bytes(body), BodyModel::Absent),
         "a nested-only model key must not be attributed"
     );
 }
 
 #[test]
-fn extract_model_returns_none_when_absent() {
+fn extract_model_is_absent_when_no_model_member() {
     let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
-    assert!(extract_model_from_bytes(body).is_none());
+    assert!(
+        matches!(extract_model_from_bytes(body), BodyModel::Absent),
+        "a body with no top-level model member must read as absent, not unusable: \
+         absence leaves the identity model authoritative"
+    );
 }
 
 #[test]
-fn extract_model_returns_none_on_truncated_chunk() {
-    // A streamed first chunk may cut off mid-value.
+fn extract_model_is_unusable_on_truncated_value() {
     let body = br#"{"model":"gpt-4"#;
-    assert!(extract_model_from_bytes(body).is_none());
+    assert!(
+        matches!(extract_model_from_bytes(body), BodyModel::Unusable),
+        "a cut-off model value must be unusable, not absent: the provider would parse a complete name"
+    );
 }
 
 #[test]
-fn extract_model_returns_none_on_non_utf8() {
+fn extract_model_is_unusable_on_non_utf8() {
     let body = &[0xFF_u8, 0xFE, 0x00, 0x01];
-    assert!(extract_model_from_bytes(body).is_none());
+    assert!(
+        matches!(extract_model_from_bytes(body), BodyModel::Unusable),
+        "a non-UTF-8 body cannot be JSON the provider parses; it must not read as model-absent"
+    );
 }
 
 #[test]
-fn extract_model_returns_none_on_non_string_value() {
+fn extract_model_is_unusable_on_non_string_value() {
     let body = br#"{"model":null}"#;
-    assert!(extract_model_from_bytes(body).is_none());
+    assert!(
+        matches!(extract_model_from_bytes(body), BodyModel::Unusable),
+        "a non-string model value is present but undecodable, not absent"
+    );
+}
+
+#[test]
+fn extracts_model_from_escaped_key() {
+    // `"\u006dodel"` decodes to `"model"`, so it names the same member.
+    let body = br#"{ "stream": true, "\u006dodel": "gpt-4o" }"#;
+    assert_eq!(
+        extracted(body).as_deref(),
+        Some("gpt-4o"),
+        "an escaped key spelling must still resolve the model"
+    );
+}
+
+#[test]
+fn extract_model_is_unusable_on_escaped_value() {
+    // The provider decodes this member to `gpt-4`; the raw extractor must
+    // not authorize under the escaped spelling the policy never sees.
+    let body = br#"{"model":"gpt\u002d4"}"#;
+    assert!(
+        matches!(extract_model_from_bytes(body), BodyModel::Unusable),
+        "an escaped model value must fail closed rather than authorize a different name"
+    );
+}
+
+#[test]
+fn extract_model_is_unusable_on_duplicate_raw_keys() {
+    let body = br#"{"model":"gpt-4o","model":"claude-sonnet-4"}"#;
+    assert!(
+        matches!(extract_model_from_bytes(body), BodyModel::Unusable),
+        "duplicate model keys must not be attributed: the provider's parser picks its own winner"
+    );
+}
+
+#[test]
+fn extract_model_is_unusable_on_duplicate_decoded_keys() {
+    // The raw and escaped spellings both decode to `model`.
+    let body = br#"{"model":"gpt-4o","\u006dodel":"claude-sonnet-4"}"#;
+    assert!(
+        matches!(extract_model_from_bytes(body), BodyModel::Unusable),
+        "a raw and an escaped `model` key are duplicates and must not be attributed"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Model Extraction — Differential Coverage
+// -----------------------------------------------------------------------------
+
+/// The top-level `model` a strict JSON parse assigns, mirroring what a
+/// provider's parser would read from the same bytes.
+fn serde_json_model(bytes: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()?
+        .get("model")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Hand-curated adversarial corpus: every way a body can be ambiguous,
+/// undecodable, misleading, or simply malformed about its model.
+const ADVERSARIAL_BODIES: &[&[u8]] = &[
+    br#"{"model":"gpt-4o","messages":[]}"#,
+    br#"{ "model" : "claude-sonnet-4" , "stream": true }"#,
+    br#"{"stream":true,"model":"gpt-4o-mini"}"#,
+    br#"{"model":"gpt-4o","model":"claude-sonnet-4"}"#,
+    br#"{"model":"gpt-4o","\u006dodel":"claude-sonnet-4"}"#,
+    br#"{"model":"gpt\u002d4o"}"#,
+    br#"{ "\u006dodel" : "gpt-4o" }"#,
+    br#"{"messages":[{"role":"user","model":"decoy"}],"model":"gpt-4o"}"#,
+    br#"{"prompt":"say \"model\": \"decoy\" back","model":"gpt-4o"}"#,
+    br#"{"model":"gp\"t-4"}"#,
+    br#"{"model":"gpt-4\\o"}"#,
+    br#"{"model":null}"#,
+    br#"{"model":42}"#,
+    br#"{"model":true}"#,
+    br#"{"messages":[]}"#,
+    br#"{"messages":[{"model":"decoy"}]}"#,
+    br#"{}"#,
+    br#"[]"#,
+    br#"null"#,
+    br#"42"#,
+    b"   ",
+    b"",
+    br#"{"model":"gpt-4"#,
+    br#"{"mod"#,
+    br#"{"model":"x"} trailing"#,
+    b"\xFF\xFE\x00\x01",
+];
+
+/// Deterministic xorshift PRNG so a failing generation reproduces exactly.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        usize::try_from(self.0 % n as u64).expect("reduced modulo n always fits usize")
+    }
+
+    fn pick_str<'a>(&mut self, items: &'a [&'a str]) -> &'a str {
+        items[self.below(items.len())]
+    }
+}
+
+/// A scalar JSON value; strings deliberately include escapes, quotes, and
+/// non-ASCII text that stress the scanner's string tracking.
+fn scalar(rng: &mut Rng) -> String {
+    match rng.below(6) {
+        0 => "null".to_owned(),
+        1 => rng.below(9999).to_string(),
+        2 if rng.below(2) == 0 => "true".to_owned(),
+        2 => "false".to_owned(),
+        3 => r#""has \"escaped\" quotes and \\ backslashes""#.to_owned(),
+        4 => "\"unicode ünïcödé → ✓\"".to_owned(),
+        _ => format!("\"plain string {}\"", rng.below(9999)),
+    }
+}
+
+/// A filler JSON value; nested levels may carry decoy `model` keys, which
+/// must never surface as the top-level model.
+fn filler_value(rng: &mut Rng, depth: u8) -> String {
+    if depth >= 3 || rng.below(3) == 0 {
+        return scalar(rng);
+    }
+    if rng.below(2) == 0 {
+        let members: Vec<String> = (0..rng.below(4))
+            .map(|_| {
+                if rng.below(4) == 0 {
+                    format!(r#""model":"decoy-{}""#, rng.below(99))
+                } else {
+                    format!(r#""key-{}":{}"#, rng.below(99), filler_value(rng, depth + 1))
+                }
+            })
+            .collect();
+        format!("{{{}}}", members.join(","))
+    } else {
+        let items: Vec<String> = (0..rng.below(4)).map(|_| filler_value(rng, depth + 1)).collect();
+        format!("[{}]", items.join(","))
+    }
+}
+
+/// Deterministically generate a valid JSON body with exactly one top-level
+/// `model` member — plain or escaped-key spelling, plain string value —
+/// alongside the model a JSON parser must read from it.
+fn generated_body(rng: &mut Rng) -> (Vec<u8>, String) {
+    const MODELS: &[&str] = &["gpt-4o", "claude-sonnet-4-5", "llama3.1:70b", "模型-x", "a.b/c-d_e"];
+    const KEYS: &[&str] = &[r#""model""#, r#""\u006dodel""#];
+    const FILLER_KEYS: &[&str] = &["messages", "stream", "temperature", "prompt", "tools", "user"];
+    let expected = rng.pick_str(MODELS).to_owned();
+    let model_member = format!(r#"{}:"{}""#, rng.pick_str(KEYS), expected);
+    let mut members: Vec<String> = (0..rng.below(5))
+        .map(|_| {
+            let key = rng.pick_str(FILLER_KEYS);
+            format!(r#""{key}":{}"#, filler_value(rng, 0))
+        })
+        .collect();
+    members.insert(rng.below(members.len() + 1), model_member);
+    let separator = if rng.below(2) == 0 { ", " } else { "," };
+    (format!("{{{}}}", members.join(separator)).into_bytes(), expected)
+}
+
+#[test]
+fn extractor_never_claims_a_model_a_parser_would_not_read() {
+    // Security property (CWE-436 interpretation conflict): whenever the
+    // extractor reports a usable model, any JSON parser that accepts the
+    // body must read the exact same value — the provider must never see a
+    // model the preflight did not compare. Bodies a parser rejects are
+    // unconstrained: the provider refuses them too, so no divergence is
+    // possible.
+    let mut rng = Rng(0x5EED_1719);
+    let mut corpus: Vec<Vec<u8>> = ADVERSARIAL_BODIES.iter().map(|b| b.to_vec()).collect();
+    corpus.extend((0..500).map(|_| generated_body(&mut rng).0));
+    for body in corpus {
+        if let BodyModel::Usable(claimed) = extract_model_from_bytes(&body)
+            && let Some(parsed) = serde_json_model(&body)
+        {
+            assert_eq!(
+                parsed,
+                claimed,
+                "extractor and JSON parser disagree on {:?}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+}
+
+#[test]
+fn extractor_resolves_every_unambiguous_model() {
+    // Completeness: a valid body whose single top-level `model` member has
+    // a plain string value must resolve to exactly what a JSON parser
+    // reads — a miss would spuriously reject well-formed requests.
+    let mut rng = Rng(0x1719_5EED);
+    for _ in 0..500 {
+        let (body, expected) = generated_body(&mut rng);
+        let parsed = serde_json_model(&body).unwrap_or_else(|| {
+            panic!(
+                "generated body must be valid JSON: {:?}",
+                String::from_utf8_lossy(&body)
+            )
+        });
+        assert_eq!(parsed, expected, "generator and parser disagree on {body:?}");
+        assert_eq!(
+            extracted(&body).as_deref(),
+            Some(expected.as_str()),
+            "extractor missed the unambiguous model in {:?}",
+            String::from_utf8_lossy(&body)
+        );
+    }
 }
 
 // -----------------------------------------------------------------------------

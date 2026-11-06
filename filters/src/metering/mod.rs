@@ -43,9 +43,9 @@ use praxis_ai_apis::{
     subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
 };
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    body::DEFAULT_JSON_BODY_MAX_BYTES, parse_filter_config,
 };
-use serde::Deserialize;
 use tracing::{debug, trace, warn};
 
 use self::config::{ExternalMeteringConfig, validate_config};
@@ -114,6 +114,19 @@ const STATUS_BUDGET_EXHAUSTED: u16 = 429;
 /// Status returned when metering is unreachable and `fail_open` is disabled.
 const STATUS_METERING_UNAVAILABLE: u16 = 503;
 
+/// Status returned when the model-policy gate explicitly denies the
+/// requested model.
+const STATUS_MODEL_NOT_ALLOWED: u16 = 403;
+
+/// Status returned when model policy is enabled but authorization cannot
+/// be evaluated: no trusted tenant identity or no resolvable public model.
+const STATUS_AUTHZ_INPUT_REQUIRED: u16 = 403;
+
+/// Status returned when the request body exceeds the model-policy pre-read
+/// bound. The bare status (no body) matches the framework's own pre-read
+/// overflow rejection so clients see one shape either way.
+const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
+
 // -----------------------------------------------------------------------------
 // ExternalMeteringFilter
 // -----------------------------------------------------------------------------
@@ -138,6 +151,64 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// That filter buffers the request body, so its body pass completes before
 /// this filter's request hook runs the balance check.
 ///
+/// Ordering: declare `external_metering` *before* `token_count` in the filter
+/// chain so response hooks (which run in reverse order) execute after token
+/// extraction, and after any verification filter (`identity_header_guard`,
+/// authentication) so captured identity metadata is already present. The
+/// model-policy preflight always runs before provider dispatch: after a
+/// rejection, zero provider requests have been made.
+///
+/// Response contract (stable bodies): an explicit budget denial rejects with
+/// 429 and body `token budget exhausted`; an explicit model denial rejects
+/// with 403 and body `model not allowed for this user`, regardless of either
+/// `fail_open` setting and with precedence over budget exhaustion; a verdict
+/// unavailable under a fail-closed gate rejects with 503 and body
+/// `metering system unavailable`. With model policy enabled, a missing trusted
+/// identity rejects with 403 and body `tenant identity required for model
+/// authorization`; an unresolvable model rejects with 403 and body `request
+/// model required for model authorization`; conflicting or ambiguous model
+/// sources reject with 403 and body `conflicting model inputs for model
+/// authorization`; and a
+/// request body larger than the pre-read bound rejects with 413 before
+/// dispatch.
+///
+/// Buffering: with model policy enabled the request body is pre-read once,
+/// bounded by the standard JSON body maximum (10 MiB); requests exceeding the
+/// bound reject with 413. The bound is enforced by the filter itself, so
+/// other filters in the pipeline that buffer more cannot raise it. Only the
+/// top-level `"model"` field is inspected —
+/// the body is never re-serialized or copied for the preflight. Once
+/// `model_to_provider` recorded a client-facing model, the buffered body has
+/// already been rewritten to the *provider* target, so it is no longer a
+/// model source: the preflight then compares the identity claim against the
+/// recorded client-facing model alone.
+///
+/// # Model policy (optional)
+///
+/// With `model_policy_check: true`, the same entitlement preflight also
+/// enforces the metering service's model-policy verdict (`modelAllowed`):
+///
+/// - `modelAllowed: false` rejects with **403** before any provider request, regardless of the billing `fail_open` and
+///   with precedence over budget exhaustion (`hasAccess: false` still rejects with 429 on its own).
+/// - An unavailable model verdict — missing, `null`, wrongly typed, an unusable payload, a non-2xx response, a timeout,
+///   or a transport error — is governed by `model_policy_fail_open` (default **fail-closed, 503**), independent of the
+///   billing `fail_open`. Admission on a shared callout failure requires every enabled gate's availability policy to
+///   permit it.
+/// - Every metered request then needs a trusted tenant identity and a resolvable public model. If the identity comes
+///   from raw `{prefix}*` request headers, the ingress boundary must delete client-supplied copies and set those
+///   headers from authenticated data before this filter runs: the filter cannot distinguish client-supplied headers
+///   from trusted ones, so a client-set header would choose the identity used for model authorization. Every available
+///   model source — the identity header, the `model_to_provider` client model, and (when no client model was recorded)
+///   the request body's top-level `"model"` (bounded pre-read) — must agree; conflicting non-empty sources, or a body
+///   `"model"` member that is ambiguous (duplicate or escaped key spellings) or undecodable (escaped or non-string
+///   value), reject with 403 before dispatch, since authorizing one source would not authorize the model the provider
+///   receives. Reporting fallbacks (`default_username`, `default_model`) and the skip-metering path never bypass
+///   authorization: such requests reject with 403 before dispatch.
+///
+/// With `model_policy_check: false` (default), the legacy contract is
+/// preserved exactly: only `hasAccess` decides, budget denial is 429, and
+/// the billing `fail_open` governs availability.
+///
 /// # YAML
 ///
 /// ```yaml
@@ -152,7 +223,13 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// identity_metadata_namespace: "identity"
 /// default_username: "anonymous"
 /// default_model: "unknown"
+/// model_policy_check: true
+/// model_policy_fail_open: false
 /// ```
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent billing and model-policy fail-open controls"
+)]
 pub struct ExternalMeteringFilter {
     /// Connect-time policy for the metering endpoint. Rejects non-public
     /// addresses unless the operator sets `allow_private_endpoint`.
@@ -193,6 +270,15 @@ pub struct ExternalMeteringFilter {
 
     /// Base URL of the external metering service.
     metering_url: String,
+
+    /// Whether the entitlement preflight enforces the model-policy verdict
+    /// (`modelAllowed`). See [`ExternalMeteringConfig::model_policy_check`].
+    model_policy_check: bool,
+
+    /// Availability policy for the model-policy gate, independent of the
+    /// billing `fail_open`. See
+    /// [`ExternalMeteringConfig::model_policy_fail_open`].
+    model_policy_fail_open: bool,
 
     /// Static provider name for emitted events. Takes precedence over the
     /// routed cluster name; the only source of provider attribution on the
@@ -259,6 +345,8 @@ impl ExternalMeteringFilter {
             identity_header_prefix: cfg.identity_header_prefix.to_ascii_lowercase(),
             identity_metadata_namespace: cfg.identity_metadata_namespace,
             metering_url: cfg.metering_url,
+            model_policy_check: cfg.model_policy_check,
+            model_policy_fail_open: cfg.model_policy_fail_open,
             provider: cfg.provider,
             source: cfg.source,
             subrequest_client,
@@ -266,13 +354,15 @@ impl ExternalMeteringFilter {
         })
     }
 
-    /// Ask the metering service whether the tenant may spend more tokens.
+    /// Ask the metering service whether the tenant may spend more tokens
+    /// and, when model policy is enabled, whether the tenant may use the
+    /// requested model.
     ///
     /// The metering service expresses denial only through a `2xx` response
-    /// whose body carries `hasAccess: false`. Any non-`2xx` status means the
-    /// service itself is misbehaving (bad route, internal error), so it is
-    /// handled by the availability policy (`fail_open`) rather than treated
-    /// as a denial.
+    /// whose body carries `hasAccess: false` (budget) or `modelAllowed:
+    /// false` (model policy). Any non-`2xx` status means the service itself
+    /// is misbehaving (bad route, internal error), so it is handled by each
+    /// gate's availability policy rather than treated as a denial.
     async fn check_balance(&self, state: &MeteringState) -> FilterAction {
         let url = build_balance_url(&self.metering_url, &state.username, &self.feature_key, &state.model);
         // Resolve the internal-auth header (fail closed if a configured token
@@ -303,11 +393,12 @@ impl ExternalMeteringFilter {
 
     /// Interpret the balance callout transport result into a filter action.
     ///
-    /// A `2xx` response is a real decision (`hasAccess`); any other status or a
-    /// transport error means the service is misbehaving, handled by `fail_open`.
+    /// A `2xx` response carries real per-gate verdicts; any other status or a
+    /// transport error means the service is misbehaving, so every gate's
+    /// availability policy applies.
     fn interpret_balance(&self, result: Result<SubResponse, SubRequestError>) -> FilterAction {
         match result {
-            Ok(resp) if is_success(resp.status) => parse_balance_result(&resp.body, self.fail_open),
+            Ok(resp) if is_success(resp.status) => parse_balance_result(&resp.body, self.admission_policy()),
             Ok(resp) => {
                 warn!(status = resp.status, "balance check returned a non-2xx status");
                 self.on_metering_unavailable()
@@ -319,13 +410,19 @@ impl ExternalMeteringFilter {
         }
     }
 
-    /// Resolve the action to take when the balance check cannot be completed.
+    /// Resolve the action to take when the balance check cannot be completed:
+    /// no gate has a verdict, so admission requires every enabled gate's
+    /// availability policy to permit it.
     fn on_metering_unavailable(&self) -> FilterAction {
-        if self.fail_open {
-            trace!("admitting request (fail-open)");
-            FilterAction::Continue
-        } else {
-            reject_unavailable()
+        decide_admission(&BalanceVerdicts::unavailable(), self.admission_policy())
+    }
+
+    /// Per-gate admission settings resolved from this filter's config.
+    fn admission_policy(&self) -> AdmissionPolicy {
+        AdmissionPolicy {
+            billing_fail_open: self.fail_open,
+            model_policy_check: self.model_policy_check,
+            model_policy_fail_open: self.model_policy_fail_open,
         }
     }
 
@@ -341,7 +438,8 @@ impl ExternalMeteringFilter {
 
     /// Resolve the balance callout headers, or the fail-closed action when a
     /// configured token is currently unavailable — never dial unauthenticated.
-    /// The token gap is treated as a callout failure, so `fail_open` decides.
+    /// The token gap is treated as a callout failure, so each gate's
+    /// availability policy decides.
     fn balance_callout_headers(&self, outcome: AuthOutcome) -> Result<http::HeaderMap, FilterAction> {
         authed_headers(outcome).ok_or_else(|| {
             warn!("internal metering auth token unavailable; balance check failing closed");
@@ -417,19 +515,36 @@ impl HttpFilter for ExternalMeteringFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // The framework's pre-read 413 only holds when this filter's bound
+        // is the pipeline's effective one (see `body_exceeds_pre_read_bound`),
+        // so the documented bound is enforced here too, before any callout.
+        if self.model_policy_check && body_exceeds_pre_read_bound(ctx) {
+            return Ok(reject_body_too_large());
+        }
+
         let mut state = capture_identity(ctx, &self.identity_header_prefix, &self.identity_metadata_namespace);
-        if state.model.is_empty()
-            && let Some(model) = ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
-        {
-            state.model = model.to_owned();
+        if resolve_request_model(ctx, &mut state, self.model_policy_check) == ModelResolution::Conflict {
+            return Ok(reject_model_conflict());
         }
 
         if state.username.is_empty() {
+            if self.model_policy_check {
+                // Authorization cannot be evaluated without a trusted tenant
+                // identity, and reporting fallbacks must not stand in for
+                // one — reject before dispatch rather than skip.
+                return Ok(reject_identity_required());
+            }
             let Some(fallback) = self.default_username.as_ref() else {
                 trace!("no tenant identity header, skipping metering");
                 return Ok(FilterAction::Continue);
             };
             state.username.clone_from(fallback);
+        }
+
+        if self.model_policy_check && state.model.is_empty() {
+            // `default_model` is a reporting fallback only; authorizing it
+            // would not authorize the model actually being requested.
+            return Ok(reject_model_required());
         }
 
         if !state.model.is_empty() {
@@ -448,7 +563,21 @@ impl HttpFilter for ExternalMeteringFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
-        BodyMode::Stream
+        // Model-policy enforcement must decide before provider dispatch, so
+        // the public model has to be known during `on_request`. The bounded
+        // pre-read makes the body available there; requests exceeding the
+        // bound reject with 413 — enforced again in `on_request`, because
+        // the pipeline merges `StreamBuffer` limits by keeping the largest
+        // requested bound, so another filter could otherwise raise the
+        // effective cap. Pipelines whose body mode already buffers
+        // (e.g. because of `model_to_provider`) need no extra buffering.
+        if self.model_policy_check {
+            BodyMode::StreamBuffer {
+                max_bytes: Some(DEFAULT_JSON_BODY_MAX_BYTES),
+            }
+        } else {
+            BodyMode::Stream
+        }
     }
 
     async fn on_request_body(
@@ -459,11 +588,11 @@ impl HttpFilter for ExternalMeteringFilter {
     ) -> Result<FilterAction, FilterError> {
         // The identity header wins when present; only fall back to the body so
         // that clients that do not send a model header are still attributed.
+        // An unusable body model contributes nothing: with enforcement
+        // enabled it already rejected during `on_request`, and without it the
+        // attribution must not guess either.
         let unresolved = !ctx.filter_metadata.contains_key(META_METERING_MODEL);
-        if let Some(model) = body
-            .as_ref()
-            .filter(|_| unresolved)
-            .and_then(|chunk| extract_model_from_bytes(chunk))
+        if unresolved && let Some(BodyModel::Usable(model)) = body.as_ref().map(|chunk| extract_model_from_bytes(chunk))
         {
             ctx.filter_metadata.insert(META_METERING_MODEL.to_owned(), model);
         }
@@ -612,17 +741,147 @@ struct EventContext<'a> {
     state: &'a MeteringState,
 }
 
-/// JSON response from the metering service balance check endpoint.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BalanceResponse {
+/// JSON response from the metering service balance check endpoint, parsed
+/// per gate so one unusable verdict never discards the other.
+///
+/// `None` means the gate has no verdict: the field was missing, `null`, or
+/// wrongly typed, or the whole payload was unusable. An unavailable verdict
+/// is never an implicit allow and never an explicit denial.
+struct BalanceVerdicts {
     /// Whether the tenant may spend more tokens.
-    has_access: bool,
+    has_access: Option<bool>,
+
+    /// Whether the tenant may use the requested model.
+    model_allowed: Option<bool>,
+}
+
+impl BalanceVerdicts {
+    /// Verdicts for a callout that produced no usable response at all
+    /// (transport error, non-2xx status, empty or malformed body).
+    fn unavailable() -> Self {
+        Self {
+            has_access: None,
+            model_allowed: None,
+        }
+    }
+}
+
+/// Per-gate admission settings resolved from the filter config.
+///
+/// The billing gate is always enabled; the model-policy gate is opt-in and
+/// carries its own availability policy, so a billing `fail_open` can never
+/// silently drag the model gate open (or closed).
+#[derive(Clone, Copy)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "per-gate enable and availability controls that must stay independent"
+)]
+struct AdmissionPolicy {
+    /// Billing-gate availability: admit when the budget verdict is
+    /// unavailable (the legacy `fail_open` setting).
+    billing_fail_open: bool,
+
+    /// Whether the model-policy verdict (`modelAllowed`) is enforced.
+    model_policy_check: bool,
+
+    /// Model-gate availability: admit when the model verdict is
+    /// unavailable. Independent of `billing_fail_open`.
+    model_policy_fail_open: bool,
 }
 
 // -----------------------------------------------------------------------------
 // Identity Header Capture
 // -----------------------------------------------------------------------------
+
+/// Outcome of resolving the public model for the entitlement preflight.
+#[derive(PartialEq)]
+enum ModelResolution {
+    /// Resolution succeeded, or no model is available (the caller applies the
+    /// missing-model rejection when enforcement needs one).
+    Continue,
+    /// Non-empty model sources disagree: authorizing either one would admit a
+    /// request whose provider-bound body names a different model.
+    Conflict,
+}
+
+/// Resolve the public model for the entitlement preflight.
+///
+/// Sources: the trusted `{prefix}model` identity header (captured by
+/// [`capture_identity`]), the `model_to_provider` client-facing model (the
+/// public alias, recorded before any provider rewrite), and — only when
+/// model-policy enforcement needs the model before dispatch and
+/// `model_to_provider` recorded no client-facing model — the request body's
+/// top-level `"model"` field from the bounded pre-read buffer. The body is
+/// skipped once a client-facing model exists because that filter's rewrite
+/// has already replaced it with the *provider* target, which legitimately
+/// differs from the public alias. With enforcement enabled every available
+/// source must name the same model: a conflict — or a body `"model"` member
+/// that is ambiguous (duplicate or escaped key spellings) or undecodable
+/// (escaped or non-string value), which the provider's parser may resolve
+/// differently — rejects rather than authorizing a model the request does not
+/// actually use. With enforcement
+/// disabled the legacy reporting contract is preserved: the identity model,
+/// then the client-facing model, and the body is consulted later for
+/// attribution only. `default_model` is deliberately not consulted: it is a
+/// reporting fallback, never an authorization input.
+fn resolve_request_model(
+    ctx: &HttpFilterContext<'_>,
+    state: &mut MeteringState,
+    model_policy_check: bool,
+) -> ModelResolution {
+    let client_model = ctx
+        .get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
+        .filter(|model| !model.is_empty());
+    let body_model = match ctx.buffered_request_body.as_ref() {
+        Some(body) if client_model.is_none() && model_policy_check => extract_model_from_bytes(body),
+        _ => BodyModel::Absent,
+    };
+
+    if model_policy_check {
+        // An unusable body model must not be treated as absent: the
+        // provider's parser resolves the ambiguity its own way, so the
+        // request may carry a model the preflight never compared against
+        // the identity or client claim.
+        if matches!(body_model, BodyModel::Unusable) {
+            return ModelResolution::Conflict;
+        }
+        if model_sources_conflict(&state.model, client_model, body_model.usable()) {
+            return ModelResolution::Conflict;
+        }
+    }
+    // Fill by precedence. With enforcement disabled `body_model` is always
+    // `Absent`, so this is exactly the legacy identity-then-client contract.
+    if state.model.is_empty()
+        && let Some(model) = client_model
+    {
+        model.clone_into(&mut state.model);
+    }
+    if state.model.is_empty()
+        && let BodyModel::Usable(model) = body_model
+    {
+        state.model = model;
+    }
+    ModelResolution::Continue
+}
+
+/// Whether non-empty model sources disagree.
+///
+/// Trust in the identity source does not establish that the other sources
+/// name the same model, so the first observed model must match every later
+/// one; a disagreement means authorizing either one would admit a request
+/// whose provider-bound body names a different model.
+fn model_sources_conflict(identity: &str, client: Option<&str>, body: Option<&str>) -> bool {
+    let sources = [(!identity.is_empty()).then_some(identity), client, body];
+    let mut agreed: Option<&str> = None;
+    for model in sources.into_iter().flatten() {
+        match agreed {
+            None => agreed = Some(model),
+            Some(previous) if previous == model => {},
+            Some(_) => return true,
+        }
+    }
+    false
+}
 
 /// Capture tenant identity from the configured headers and mark those headers,
 /// along with client credentials, for removal before the request is forwarded.
@@ -674,34 +933,62 @@ fn strip_client_credentials(ctx: &mut HttpFilterContext<'_>) {
 // Balance Check
 // -----------------------------------------------------------------------------
 
-/// Interpret a balance check response body.
-fn parse_balance_result(body: &[u8], fail_open: bool) -> FilterAction {
-    let Some(balance) = decode_balance(body) else {
-        return admit_or_reject(fail_open);
-    };
+/// Interpret a balance check response body against the admission policy.
+fn parse_balance_result(body: &[u8], policy: AdmissionPolicy) -> FilterAction {
+    decide_admission(&parse_balance_verdicts(body), policy)
+}
 
-    if balance.has_access {
-        trace!("balance check passed");
-        FilterAction::Continue
-    } else {
-        reject_budget_exhausted()
+/// Extract the per-gate verdicts from an entitlement payload.
+///
+/// Parsing is lenient per field: a valid `hasAccess` still decides the budget
+/// gate when `modelAllowed` is missing or wrongly typed, and vice versa. A
+/// body that is not a JSON object at all leaves both gates without verdicts.
+fn parse_balance_verdicts(body: &[u8]) -> BalanceVerdicts {
+    if body.is_empty() {
+        debug!("balance check returned an empty body");
+        return BalanceVerdicts::unavailable();
+    }
+
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(serde_json::Value::Object(fields)) => BalanceVerdicts {
+            has_access: fields.get("hasAccess").and_then(serde_json::Value::as_bool),
+            model_allowed: fields.get("modelAllowed").and_then(serde_json::Value::as_bool),
+        },
+        Ok(_) => {
+            debug!("balance response was valid JSON but not an object");
+            BalanceVerdicts::unavailable()
+        },
+        Err(e) => {
+            debug!("balance response parse error: {e}");
+            BalanceVerdicts::unavailable()
+        },
     }
 }
 
-/// Decode a balance payload, logging why an unusable one was discarded.
-fn decode_balance(body: &[u8]) -> Option<BalanceResponse> {
-    if body.is_empty() {
-        debug!("balance check returned an empty body");
-        return None;
+/// Combine both gates' verdicts into one admission decision.
+///
+/// Order matters: an explicit model denial wins over budget exhaustion and
+/// over every availability policy, a budget denial beats every availability
+/// policy, and admission on unavailable verdicts requires *every* enabled
+/// gate's own fail-open setting to permit it.
+fn decide_admission(verdicts: &BalanceVerdicts, policy: AdmissionPolicy) -> FilterAction {
+    if policy.model_policy_check && verdicts.model_allowed == Some(false) {
+        return reject_model_not_allowed();
     }
 
-    match serde_json::from_slice::<BalanceResponse>(body) {
-        Ok(balance) => Some(balance),
-        Err(e) => {
-            debug!("balance response parse error: {e}");
-            None
-        },
+    if verdicts.has_access == Some(false) {
+        return reject_budget_exhausted();
     }
+
+    if verdicts.has_access.is_none() && !policy.billing_fail_open {
+        return reject_unavailable();
+    }
+
+    if policy.model_policy_check && verdicts.model_allowed.is_none() && !policy.model_policy_fail_open {
+        return reject_unavailable();
+    }
+
+    FilterAction::Continue
 }
 
 /// Reject with a 429 because the tenant has no remaining token budget.
@@ -712,13 +999,79 @@ fn reject_budget_exhausted() -> FilterAction {
     )
 }
 
-/// Admit the request when configured to fail open, reject it otherwise.
-fn admit_or_reject(fail_open: bool) -> FilterAction {
-    if fail_open {
-        FilterAction::Continue
-    } else {
-        reject_unavailable()
-    }
+/// Reject with a 403 because the requested model is not allowed for the
+/// tenant. An explicit denial: returned regardless of any fail-open setting
+/// and with precedence over budget exhaustion.
+fn reject_model_not_allowed() -> FilterAction {
+    // Authorization denials are security-relevant: someone probing the
+    // model gate (escaped spellings, duplicate keys, identity spoofing)
+    // must be visible in the logs at the default level, not just debug.
+    warn!("requested model is not allowed for this user");
+    FilterAction::Reject(
+        Rejection::status(STATUS_MODEL_NOT_ALLOWED).with_body(Bytes::from_static(b"model not allowed for this user")),
+    )
+}
+
+/// Reject with a 403 because model policy is enabled but no trusted tenant
+/// identity is available to authorize. Reporting fallbacks such as
+/// `default_username` never satisfy this: authorization cannot be evaluated
+/// for an invented identity, so it fails closed.
+fn reject_identity_required() -> FilterAction {
+    warn!("model policy enabled but no tenant identity is present");
+    FilterAction::Reject(
+        Rejection::status(STATUS_AUTHZ_INPUT_REQUIRED)
+            .with_body(Bytes::from_static(b"tenant identity required for model authorization")),
+    )
+}
+
+/// Reject with a 403 because model policy is enabled but the public
+/// requested model could not be resolved. `default_model` is a reporting
+/// fallback only; authorizing it would not authorize the model actually
+/// being requested.
+fn reject_model_required() -> FilterAction {
+    warn!("model policy enabled but no public model could be resolved");
+    FilterAction::Reject(
+        Rejection::status(STATUS_AUTHZ_INPUT_REQUIRED)
+            .with_body(Bytes::from_static(b"request model required for model authorization")),
+    )
+}
+
+/// Reject with a 403 because the available model sources disagree: the
+/// trusted identity claim, the `model_to_provider` client-facing model, and
+/// (when no client model was recorded) the request body must name the same
+/// model, since authorizing one of them would not authorize the model the
+/// provider actually receives.
+fn reject_model_conflict() -> FilterAction {
+    warn!("conflicting model inputs: identity, client, and body models disagree");
+    FilterAction::Reject(
+        Rejection::status(STATUS_AUTHZ_INPUT_REQUIRED)
+            .with_body(Bytes::from_static(b"conflicting model inputs for model authorization")),
+    )
+}
+
+/// Reject with a 413 because the request body exceeds the model-policy
+/// pre-read bound. The pipeline merges `StreamBuffer` limits by taking the
+/// largest requested bound, so another filter can raise (or remove) the cap
+/// the framework enforces on this filter's behalf; enforcing it here keeps
+/// the documented bound independent of the pipeline's other buffer needs.
+fn reject_body_too_large() -> FilterAction {
+    warn!("request body exceeds the model-policy pre-read bound");
+    FilterAction::Reject(Rejection::status(STATUS_PAYLOAD_TOO_LARGE))
+}
+
+/// Whether the buffered request body exceeds the model-policy pre-read
+/// bound.
+///
+/// The pipeline merges `StreamBuffer` limits by keeping the largest
+/// requested bound — and dropping the cap entirely when another filter
+/// buffers without one — so the framework's pre-read 413 only holds when
+/// this filter's bound is the effective one. The documented bound must
+/// survive any pipeline composition, which is why the filter checks the
+/// buffered length itself instead of relying on the framework's rejection.
+fn body_exceeds_pre_read_bound(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.buffered_request_body
+        .as_ref()
+        .is_some_and(|body| body.len() > DEFAULT_JSON_BODY_MAX_BYTES)
 }
 
 /// Reject with a 503 because metering could not authorize the request.
@@ -992,26 +1345,89 @@ fn build_envelope(ctx: &EventContext<'_>, event_type: &str) -> serde_json::Value
 // Helpers
 // -----------------------------------------------------------------------------
 
+/// Outcome of scanning a request body for its top-level `model` member.
+enum BodyModel {
+    /// No top-level `"model"` member was found.
+    Absent,
+
+    /// A model value the preflight and the provider read identically.
+    Usable(String),
+
+    /// A `"model"` member exists but cannot be attributed safely: duplicate
+    /// or escaped key spellings, an escaped or non-string value, or a
+    /// non-UTF-8 / truncated body. The provider's parser may resolve the
+    /// member differently, so the value must not feed authorization.
+    Unusable,
+}
+
+impl BodyModel {
+    /// The usable model value, if any.
+    fn usable(&self) -> Option<&str> {
+        match self {
+            Self::Usable(model) => Some(model),
+            Self::Absent | Self::Unusable => None,
+        }
+    }
+}
+
 /// Extract the top-level `model` field from a JSON body fragment.
 ///
 /// Request bodies arrive in chunks and can be megabytes long, so this scans
 /// with a string- and depth-aware state machine instead of buffering and
 /// deserializing the whole document. Only a `"model"` key belonging to the
 /// top-level object is matched, so `"model"` occurrences nested inside
-/// `messages` content can never misattribute the request. Returns `None`
-/// when the chunk does not contain the complete top-level `"model": "..."`
-/// pair.
-fn extract_model_from_bytes(bytes: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(bytes).ok()?;
+/// `messages` content can never misattribute the request. Returns
+/// [`BodyModel::Absent`] when the fragment contains no top-level `"model"`
+/// member, and [`BodyModel::Unusable`] when one exists but cannot be
+/// attributed safely (duplicate or escaped key spellings, an escaped or
+/// non-string value, or a body that is not valid UTF-8 or is cut off mid
+/// value).
+fn extract_model_from_bytes(bytes: &[u8]) -> BodyModel {
+    let Some(text) = std::str::from_utf8(bytes).ok() else {
+        return BodyModel::Unusable;
+    };
     let mut scanner = TopLevelKeyScanner::new(text);
+    let mut model = None;
 
     while let Some(key) = scanner.next_top_level_key() {
-        if key == "model" {
-            return scanner.string_value().map(str::to_owned);
+        if key_decodes_to_model(key) {
+            // A second member decoding to `model` is a duplicate key: JSON
+            // parsers pick their own winner, so the preflight must not guess
+            // which value authorizes the request.
+            if model.is_some() {
+                return BodyModel::Unusable;
+            }
+            // Escaped values are not decoded, and the provider would parse a
+            // different name than the preflight extracted: reject rather than
+            // authorize under a spelling the policy never sees. The same
+            // applies to a non-string value, which no provider accepts as a
+            // model name.
+            let Some(value) = scanner.string_value() else {
+                return BodyModel::Unusable;
+            };
+            if value.contains('\\') {
+                return BodyModel::Unusable;
+            }
+            model = Some(value.to_owned());
         }
     }
 
-    None
+    match model {
+        Some(model) => BodyModel::Usable(model),
+        None => BodyModel::Absent,
+    }
+}
+
+/// Compare a raw (still escaped) top-level object key against `"model"`.
+///
+/// JSON member names compare after escape decoding, so an escaped spelling
+/// such as `"\u006dodel"` names the same member as `"model"`. Only a key
+/// containing a backslash can decode differently from its raw text.
+fn key_decodes_to_model(raw: &str) -> bool {
+    if raw == "model" {
+        return true;
+    }
+    raw.contains('\\') && serde_json::from_str::<String>(&format!("\"{raw}\"")).is_ok_and(|decoded| decoded == "model")
 }
 
 /// Incremental scanner over the top-level keys of a JSON object fragment.
