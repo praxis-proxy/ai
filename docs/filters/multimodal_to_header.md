@@ -11,6 +11,8 @@ Detection covers typed OpenAI content parts (`image_url`, `input_image`, `input_
 
 The filter removes a client-supplied copy of its output header before publishing `image`, `audio`, or `image_audio`. A following core `router` can exact-match those values to keep multimodal content away from text-only backends.
 
+Bodies larger than `max_body_bytes` are rejected with HTTP 413 before routing. The default is 10 MiB. Operators should account for base64 expansion when sizing this limit for image and audio payloads.
+
 ## Configuration
 
 | Field | Type | Required | Description |
@@ -23,5 +25,6 @@ The filter removes a client-supplied copy of its output header before publishing
 ```yaml
 filter: multimodal_to_header
 header: X-Praxis-AI-Modality
-max_body_bytes: 1048576
+# Base64 expands media payloads; size this for the largest accepted request.
+max_body_bytes: 16777216 # 16 MiB
 ```
