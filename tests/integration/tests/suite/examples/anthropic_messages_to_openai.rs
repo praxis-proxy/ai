@@ -19,10 +19,9 @@
 
 use std::collections::HashMap;
 
-use praxis_core::config::Config;
 use praxis_test_utils::{
     CapturedRequest, StatefulCapturingBackend, StatefulCapturingGuard, free_port, http_send, parse_body, parse_status,
-    patch_yaml, start_proxy,
+    start_proxy,
 };
 use serde_json::Value;
 
@@ -45,23 +44,16 @@ const CHAT_COMPLETION_RESPONSE: &str = concat!(
     r#""usage":{"prompt_tokens":5,"completion_tokens":6,"total_tokens":11}}"#,
 );
 
-/// Build the example config with the listener and backend ports patched.
-fn translate_config(proxy_port: u16, backend_port: u16) -> Config {
-    let path = praxis_test_utils::example_config_path(CONFIG);
-    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:8000", backend_port)]));
-    Config::from_yaml(&patched).unwrap_or_else(|e| panic!("parse {CONFIG}: {e}"))
+/// Start a backend that records every request and answers with a canned
+/// Chat Completion. Pingora's health-check probe is answered separately, so one
+/// scripted response is enough for the single translated request.
+fn capturing_chat_backend() -> StatefulCapturingGuard {
+    StatefulCapturingBackend::new(vec![(200, CHAT_COMPLETION_RESPONSE.to_owned())]).start_with_shutdown()
 }
 
-/// Start a backend that records every request and answers with a canned
-/// Chat Completion. The extra copies cover Pingora's health-check probe.
-fn capturing_chat_backend() -> StatefulCapturingGuard {
-    StatefulCapturingBackend::new(vec![
-        (200, CHAT_COMPLETION_RESPONSE.to_owned()),
-        (200, CHAT_COMPLETION_RESPONSE.to_owned()),
-        (200, CHAT_COMPLETION_RESPONSE.to_owned()),
-    ])
-    .start_with_shutdown()
+/// Build the example config for a proxy port and a capturing backend.
+fn translate_config(proxy_port: u16, backend: &StatefulCapturingGuard) -> praxis_core::config::Config {
+    load_example_config(CONFIG, proxy_port, HashMap::from([("127.0.0.1:8000", backend.port())]))
 }
 
 /// Send one Anthropic Messages request carrying exactly the caller headers the
@@ -93,18 +85,25 @@ fn captured_header_names(request: &CapturedRequest) -> Vec<String> {
         .collect()
 }
 
-/// The one POST the backend received, failing loudly when translation never
-/// reached it.
+/// The single POST the backend received, failing loudly on none or on more.
+///
+/// Checking only the first POST would let a retry that carried the caller
+/// credential pass every assertion below.
 fn forwarded_post(backend: &StatefulCapturingGuard) -> CapturedRequest {
-    backend
+    let posts: Vec<CapturedRequest> = backend
         .requests()
         .into_iter()
-        .find(|request| request.method == "POST")
+        .filter(|request| request.method == "POST")
+        .collect();
+    assert_eq!(posts.len(), 1, "the backend must receive exactly one POST");
+    posts
+        .into_iter()
+        .next()
         .expect("the translated request must reach the Chat Completions backend")
 }
 
 #[test]
-fn openai_config_parses() {
+fn messages_to_openai_config_parses() {
     let config = load_example_config(CONFIG, 29960, HashMap::from([("127.0.0.1:8000", 29961_u16)]));
 
     assert_eq!(config.listeners.len(), 1, "should have 1 listener");
@@ -118,7 +117,7 @@ fn openai_config_parses() {
 fn legacy_x_api_key_never_reaches_the_chat_backend() {
     let backend = capturing_chat_backend();
     let proxy_port = free_port();
-    let config = translate_config(proxy_port, backend.port());
+    let config = translate_config(proxy_port, &backend);
     let proxy = start_proxy(&config);
 
     let raw = post_message(&proxy, &format!("x-api-key: {CLIENT_SECRET}\r\n"));
@@ -153,7 +152,7 @@ fn legacy_x_api_key_never_reaches_the_chat_backend() {
 fn sdk_v2_bearer_credential_never_reaches_the_chat_backend() {
     let backend = capturing_chat_backend();
     let proxy_port = free_port();
-    let config = translate_config(proxy_port, backend.port());
+    let config = translate_config(proxy_port, &backend);
     let proxy = start_proxy(&config);
 
     // Anthropic SDK v2 sends its API key as a bearer token instead of x-api-key.
@@ -187,7 +186,7 @@ fn both_sdk_credential_forms_stop_at_the_translator_on_one_chain() {
     // sends both at once (some SDK wrappers add one while the key sets the other).
     let backend = capturing_chat_backend();
     let proxy_port = free_port();
-    let config = translate_config(proxy_port, backend.port());
+    let config = translate_config(proxy_port, &backend);
     let proxy = start_proxy(&config);
 
     let raw = post_message(

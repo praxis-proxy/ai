@@ -350,7 +350,7 @@ fn native_vllm_strips_client_credentials_and_injects_backend_bearer() {
 fn native_vllm_rejects_unauthenticated_gateway_request() {
     // `basic_auth` runs first and gates every path: a caller with no gateway
     // credential is rejected before any routing or credential injection happens.
-    let backend = start_header_echo_backend();
+    let backend = StatefulCapturingBackend::new(vec![(200, "{}".to_owned())]).start_with_shutdown();
     let proxy_port = free_port();
     let config = native_vllm_config(proxy_port, backend.port());
     let proxy = start_proxy(&config);
@@ -366,6 +366,14 @@ fn native_vllm_rejects_unauthenticated_gateway_request() {
         401,
         "an unauthenticated caller must be rejected by the gateway"
     );
+    let forwarded_posts = backend
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "POST")
+        .count();
+    assert_eq!(forwarded_posts, 0, "a rejected request must never reach the backend");
+
+    drop(proxy);
 }
 
 /// Anthropic SDK v2 sends its API key as `Authorization: Bearer`, the other
