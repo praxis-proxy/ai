@@ -10,12 +10,13 @@ use bytes::Bytes;
 use http::HeaderName;
 use praxis_ai_apis::promotion::parse_dedicated_promotion_header;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::DEFAULT_JSON_BODY_MAX_BYTES,
-    builtins::http::payload_processing::config_validation::validate_max_body_bytes, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    body::DEFAULT_JSON_BODY_MAX_BYTES, builtins::http::payload_processing::config_validation::validate_max_body_bytes,
+    parse_filter_config,
 };
 use serde::{
     Deserialize, Deserializer,
-    de::{self, Visitor},
+    de::{self, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::value::RawValue;
 
@@ -134,6 +135,11 @@ impl HttpFilter for MultimodalToHeaderFilter {
         let Some(raw) = body.as_ref() else {
             return Ok(FilterAction::Continue);
         };
+        // The pipeline merges body modes across filters, so another filter may
+        // permit a larger buffer. Preserve this filter's independent contract.
+        if raw.len() > self.max_body_bytes {
+            return Ok(FilterAction::Reject(Rejection::status(413)));
+        }
         let Some(modality) = detect_content_modality(raw) else {
             return Ok(FilterAction::Continue);
         };
@@ -184,12 +190,12 @@ impl Deref for JsonString<'_> {
 }
 
 impl<'de: 'a, 'a> Deserialize<'de> for JsonString<'a> {
-    /// Borrow unescaped strings and allocate only when decoding is required.
+    /// Borrow strings, allocating only for escapes, and ignore other JSON types.
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_str(JsonStringVisitor(PhantomData))
+        deserializer.deserialize_any(JsonStringVisitor(PhantomData))
     }
 }
 
@@ -201,7 +207,7 @@ impl<'de: 'a, 'a> Visitor<'de> for JsonStringVisitor<'a> {
 
     /// Describe the accepted JSON value.
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON string")
+        formatter.write_str("any JSON value")
     }
 
     /// Preserve a string borrowed from the request body.
@@ -226,6 +232,64 @@ impl<'de: 'a, 'a> Visitor<'de> for JsonStringVisitor<'a> {
         E: de::Error,
     {
         Ok(JsonString::Owned(v))
+    }
+
+    /// Ignore a boolean in a field that normally carries a string.
+    fn visit_bool<E>(self, _v: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(JsonString::Borrowed(""))
+    }
+
+    /// Ignore a signed integer in a field that normally carries a string.
+    fn visit_i64<E>(self, _v: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(JsonString::Borrowed(""))
+    }
+
+    /// Ignore an unsigned integer in a field that normally carries a string.
+    fn visit_u64<E>(self, _v: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(JsonString::Borrowed(""))
+    }
+
+    /// Ignore a floating-point number in a field that normally carries a string.
+    fn visit_f64<E>(self, _v: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(JsonString::Borrowed(""))
+    }
+
+    /// Ignore null in a field that normally carries a string.
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(JsonString::Borrowed(""))
+    }
+
+    /// Consume and ignore an array in a field that normally carries a string.
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while seq.next_element::<de::IgnoredAny>()?.is_some() {}
+        Ok(JsonString::Borrowed(""))
+    }
+
+    /// Consume and ignore an object in a field that normally carries a string.
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while map.next_entry::<de::IgnoredAny, de::IgnoredAny>()?.is_some() {}
+        Ok(JsonString::Borrowed(""))
     }
 }
 
@@ -662,6 +726,23 @@ mod tests {
         assert_eq!(detect_content_modality(body), Some(ContentModality::Image));
     }
 
+    /// Ignore a wrongly typed optional field without losing a valid media source.
+    #[test]
+    fn wrongly_typed_data_does_not_hide_image_source() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.test/image.png"},
+                    "data": 1
+                }]
+            }]
+        });
+
+        assert_eq!(detect_json(&body), Some(ContentModality::Image));
+    }
+
     /// Leave plain text requests unclassified.
     #[test]
     fn text_only_content_has_no_modality() {
@@ -834,6 +915,23 @@ mod tests {
                 .any(|name| name == "x-praxis-ai-modality"),
             "malformed bodies must not preserve a staged modality fact"
         );
+        Ok(())
+    }
+
+    /// Enforce this filter's limit even when the pipeline buffered more bytes.
+    #[tokio::test]
+    async fn oversized_buffer_is_rejected_at_filter_boundary() -> Result<(), FilterError> {
+        let config = serde_yaml::from_str("max_body_bytes: 16").expect("fixture should parse");
+        let filter = MultimodalToHeaderFilter::from_config(&config)?;
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+        let mut context = crate::test_utils::make_filter_context(&request);
+        let mut body = Some(Bytes::from_static(
+            br#"{"messages":[{"content":"larger than the configured filter limit"}]}"#,
+        ));
+
+        let action = filter.on_request_body(&mut context, &mut body, true).await?;
+
+        assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
         Ok(())
     }
 }
