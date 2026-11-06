@@ -94,7 +94,7 @@ impl MeteringEntitlement {
             .deny_reason
             .as_deref()
             .and_then(DenyReason::parse)
-            .or(derive_deny_reason(self.has_access, self.model_allowed));
+            .or_else(|| derive_deny_reason(self.has_access, self.model_allowed));
         let allowed = self.allowed.unwrap_or(self.has_access && self.model_allowed);
         let retry_after_seconds = match deny_reason {
             Some(DenyReason::QuotaExhausted) => self.quota_retry_after,
