@@ -21,8 +21,10 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576; // 1 MiB
 ///
 /// Absent from the allowlist, each of these keeps the strict reject behavior:
 /// a request that uses the feature is answered with a 400 before any backend
-/// call. Listed, the translator removes the feature's wire markers (after
-/// validating their shape), reports the degradation to the operator, and
+/// call. Listed, the translator degrades the feature — most have their wire
+/// markers validated and then removed; `mid_conversation_system` instead
+/// folds mid-conversation `system` messages into the leading system message —
+/// reports the degradation to the operator, and
 /// completes the translation so an unmodified client can still drive the
 /// Chat Completions backend.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]

@@ -49,7 +49,7 @@ surface section. These facts change what a cell means in a given deployment.
 | --- | --- | --- | --- | --- | --- |
 | Plain text completion | `translated` | `translated` | `translated` | `passthrough` | `translated` |
 | System / developer instructions | `lossy` | `translated` | `translated` | `passthrough` | `translated` |
-| Multi-turn history | `translated` | `translated` | `translated` | `passthrough` | [`gap`](#known-gaps) |
+| Multi-turn history | `lossy` | `translated` | `translated` | `passthrough` | [`gap`](#known-gaps) |
 | Image input | `translated` | `translated` | `lossy` | `passthrough` | `rejected` |
 | Audio input | `n/a` | `rejected` | `rejected` | `passthrough` | `rejected` |
 | Document / file input | `rejected` | `translated` | `rejected` | `passthrough` | `rejected` |
@@ -129,7 +129,7 @@ defects, not support levels.
 | --- | --- | --- | --- |
 | Plain text completion | `translated` |  | `apis/src/anthropic/messages_to_chat_completions/request.rs:820-881` |
 | System / developer instructions | `lossy` | An array of text blocks is joined with newlines into one string, so per-block boundaries are lost. A block carrying cache_control is rejected 400 by default; with allow_lossy_features: [prompt_caching] the marker is stripped and signalled (see the request-side controls row). | `apis/src/anthropic/messages_to_chat_completions/request.rs:859-881; apis/src/anthropic/messages_to_chat_completions/request.rs:497-502; apis/src/anthropic/messages_to_chat_completions/request.rs:703-711` |
-| Multi-turn history | `translated` | In-array system messages are accepted deliberately (Claude Code emits them) and preserved in position by default. With allow_lossy_features: [mid_conversation_system] each system message after the first non-system turn is folded into the single leading system message in encounter order and signalled, for backends whose chat templates reject a mid-conversation system message (vLLM "System message must be at the beginning"); a leading system message is never moved. | `apis/src/anthropic/messages_to_chat_completions/request.rs:751-753; apis/src/anthropic/messages_to_chat_completions/request.rs:523-561` |
+| Multi-turn history | `lossy` | In-array system messages are accepted deliberately (Claude Code emits them) and preserved in position by default. With allow_lossy_features: [mid_conversation_system] each system message after the first non-system turn is folded into the single leading system message in encounter order and signalled, for backends whose chat templates reject a mid-conversation system message (vLLM "System message must be at the beginning"); a leading system message is never moved. The fold loses the original system message positions, which is why the cell is lossy. | `apis/src/anthropic/messages_to_chat_completions/request.rs:792-795; apis/src/anthropic/messages_to_chat_completions/request.rs:532-692` |
 | Image input | `translated` | User messages only. An image in an assistant message, or in any message that also carries tool_use, is rejected 400. | `apis/src/anthropic/messages_to_chat_completions/request.rs:627-641; apis/src/anthropic/messages_to_chat_completions/request.rs:688` |
 | Audio input | `n/a` |  |  |
 | Document / file input | `rejected` | All document source types rejected 400; no PDF support. | `apis/src/anthropic/messages_to_chat_completions/request.rs:688` |
