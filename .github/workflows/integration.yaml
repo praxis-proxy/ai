@@ -571,7 +571,7 @@ jobs:
     env:
       # Keep in sync with tests/integration/fixtures/codex-cli/pin.toml; the
       # offline test `codex_pin::codex_lanes_are_wired_in_ci` enforces it.
-      CODEX_VERSION: "0.144.1"
+      CODEX_VERSION: "0.166.0"
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
     steps:
@@ -1115,7 +1115,7 @@ jobs:
     env:
       # Keep in sync with tests/integration/fixtures/codex-cli/pin.toml; the
       # offline test `codex_pin::codex_lanes_are_wired_in_ci` enforces it.
-      CODEX_VERSION: "0.144.1"
+      CODEX_VERSION: "0.166.0"
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
     steps:
