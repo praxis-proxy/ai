@@ -16,7 +16,7 @@ use praxis_filter::{
 };
 use serde::{
     Deserialize, Deserializer,
-    de::{self, MapAccess, SeqAccess, Visitor},
+    de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::value::RawValue;
 
@@ -279,7 +279,7 @@ impl<'de: 'a, 'a> Visitor<'de> for JsonStringVisitor<'a> {
     where
         A: SeqAccess<'de>,
     {
-        while seq.next_element::<de::IgnoredAny>()?.is_some() {}
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
         Ok(JsonString::Borrowed(""))
     }
 
@@ -288,18 +288,19 @@ impl<'de: 'a, 'a> Visitor<'de> for JsonStringVisitor<'a> {
     where
         A: MapAccess<'de>,
     {
-        while map.next_entry::<de::IgnoredAny, de::IgnoredAny>()?.is_some() {}
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
         Ok(JsonString::Borrowed(""))
     }
 }
 
-/// Borrowed request fields needed for message-content classification.
-#[derive(Deserialize)]
-struct MultimodalRequest<'a> {
-    /// OpenAI-style conversation messages.
-    #[serde(borrow, default)]
-    messages: Vec<Message<'a>>,
-}
+/// Result of incrementally scanning the top-level request object.
+struct MultimodalRequestScan(DetectedModalities);
+
+/// Result of incrementally scanning one `messages` array.
+struct MessagesScan(DetectedModalities);
+
+/// Result of incrementally scanning one content-parts array.
+struct ContentPartsScan(DetectedModalities);
 
 /// Borrowed message fields needed for content classification.
 #[derive(Deserialize)]
@@ -353,6 +354,125 @@ struct MediaSourceFields<'a> {
     /// Remote or data URL.
     #[serde(borrow, default)]
     url: Option<JsonString<'a>>,
+}
+
+impl<'de> Deserialize<'de> for MultimodalRequestScan {
+    /// Walk the request object without materializing its message array.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(MultimodalRequestVisitor)
+    }
+}
+
+/// Top-level visitor that applies last-value semantics to duplicate `messages`.
+struct MultimodalRequestVisitor;
+
+impl<'de> Visitor<'de> for MultimodalRequestVisitor {
+    type Value = MultimodalRequestScan;
+
+    /// Describe the expected request envelope.
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON request object")
+    }
+
+    /// Scan each `messages` value in place and retain only the last result.
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut detected = DetectedModalities::default();
+        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+            if key == "messages" {
+                let messages = map.next_value::<&RawValue>()?;
+                detected = serde_json::from_str::<MessagesScan>(messages.get())
+                    .map(|scan| scan.0)
+                    .unwrap_or_default();
+            } else {
+                let _ = map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(MultimodalRequestScan(detected))
+    }
+}
+
+impl<'de> Deserialize<'de> for MessagesScan {
+    /// Walk messages one at a time instead of collecting borrowed entries.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(MessagesVisitor)
+    }
+}
+
+/// Streaming visitor for a request's messages array.
+struct MessagesVisitor;
+
+impl<'de> Visitor<'de> for MessagesVisitor {
+    type Value = MessagesScan;
+
+    /// Describe the expected messages value.
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a messages array")
+    }
+
+    /// Inspect each message and consume the rest without allocating after completion.
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut detected = DetectedModalities::default();
+        while let Some(message) = seq.next_element::<Message<'de>>()? {
+            if let Some(content) = message.content {
+                detect_message_content(content, &mut detected);
+            }
+            if detected.is_complete() {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                break;
+            }
+        }
+        Ok(MessagesScan(detected))
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentPartsScan {
+    /// Walk content parts one at a time instead of collecting borrowed entries.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(ContentPartsVisitor)
+    }
+}
+
+/// Streaming visitor for one message's structured content array.
+struct ContentPartsVisitor;
+
+impl<'de> Visitor<'de> for ContentPartsVisitor {
+    type Value = ContentPartsScan;
+
+    /// Describe the expected structured-content value.
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a content-parts array")
+    }
+
+    /// Inspect each content part and consume the rest after both modalities appear.
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut detected = DetectedModalities::default();
+        while let Some(part) = seq.next_element::<&RawValue>()? {
+            detect_content_part(part, &mut detected);
+            if detected.is_complete() {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                break;
+            }
+        }
+        Ok(ContentPartsScan(detected))
+    }
 }
 
 /// A bounded routing value derived from detected request content.
@@ -427,6 +547,12 @@ impl DetectedModalities {
         } else if starts_with_ascii_case_insensitive(value, "data:audio/") {
             self.audio = true;
         }
+    }
+
+    /// Merge signals found by a nested streaming visitor.
+    fn merge(&mut self, other: &Self) {
+        self.audio |= other.audio;
+        self.image |= other.image;
     }
 }
 
@@ -504,33 +630,15 @@ fn default_max_body_bytes() -> usize {
 
 /// Detect image and audio signals under top-level message content fields.
 fn detect_content_modality(body: &[u8]) -> Option<ContentModality> {
-    let request = serde_json::from_slice::<MultimodalRequest<'_>>(body).ok()?;
-    let mut detected = DetectedModalities::default();
-
-    for message in request.messages {
-        if let Some(content) = message.content {
-            detect_message_content(content, &mut detected);
-        }
-        if detected.is_complete() {
-            break;
-        }
-    }
-
-    detected.modality()
+    serde_json::from_slice::<MultimodalRequestScan>(body).ok()?.0.modality()
 }
 
 /// Inspect a message content object or array through borrowed raw JSON slices.
 fn detect_message_content(content: &RawValue, detected: &mut DetectedModalities) {
     let json = content.get().trim_start();
     if json.starts_with('[') {
-        let Ok(parts) = serde_json::from_str::<Vec<&RawValue>>(json) else {
-            return;
-        };
-        for part in parts {
-            detect_content_part(part, detected);
-            if detected.is_complete() {
-                break;
-            }
+        if let Ok(parts) = serde_json::from_str::<ContentPartsScan>(json) {
+            detected.merge(&parts.0);
         }
     } else if json.starts_with('{') {
         detect_content_part(content, detected);
@@ -699,16 +807,10 @@ mod tests {
     /// Keep an unescaped media payload borrowed from the buffered request.
     #[test]
     fn media_payload_is_borrowed() {
-        let body = br#"{"messages":[{"content":[{"type":"input_audio","input_audio":{"data":"UklGRg=="}}]}]}"#;
-        let request = serde_json::from_slice::<MultimodalRequest<'_>>(body).expect("fixture should parse");
-        let content = request
-            .messages
-            .first()
-            .and_then(|message| message.content)
-            .expect("fixture should contain message content");
-        let parts = serde_json::from_str::<Vec<&RawValue>>(content.get()).expect("content parts should parse");
-        let part = parts.first().expect("fixture should contain one part");
-        let part = serde_json::from_str::<ContentPart<'_>>(part.get()).expect("content part should parse");
+        let body = br#"{"content":{"type":"input_audio","input_audio":{"data":"UklGRg=="}}}"#;
+        let message = serde_json::from_slice::<Message<'_>>(body).expect("fixture should parse");
+        let content = message.content.expect("fixture should contain message content");
+        let part = serde_json::from_str::<ContentPart<'_>>(content.get()).expect("content part should parse");
         let source = part.input_audio.expect("fixture should contain an audio source");
         let source = serde_json::from_str::<MediaSourceFields<'_>>(source.get()).expect("audio source should parse");
 
@@ -741,6 +843,28 @@ mod tests {
         });
 
         assert_eq!(detect_json(&body), Some(ContentModality::Image));
+    }
+
+    /// Follow `serde_json`'s last-value behavior for duplicate top-level fields.
+    #[test]
+    fn duplicate_messages_use_the_last_value() {
+        let image_last = br#"{"messages":[{"content":"text"}],"messages":[{"content":[{"image_url":{"url":"https://example.test/image.png"}}]}]}"#;
+        let text_last = br#"{"messages":[{"content":[{"image_url":{"url":"https://example.test/image.png"}}]}],"messages":[{"content":"text"}]}"#;
+
+        assert_eq!(detect_content_modality(image_last), Some(ContentModality::Image));
+        assert_eq!(detect_content_modality(text_last), None);
+    }
+
+    /// Scan a large messages array without building a message-entry vector.
+    #[test]
+    fn large_messages_array_is_scanned_incrementally() {
+        let mut body = String::from(r#"{"messages":["#);
+        for _ in 0..4_096 {
+            body.push_str(r#"{"content":""},"#);
+        }
+        body.push_str(r#"{"content":[{"audio_url":{"url":"https://example.test/audio.wav"}}]}]}"#);
+
+        assert_eq!(detect_content_modality(body.as_bytes()), Some(ContentModality::Audio));
     }
 
     /// Leave plain text requests unclassified.
