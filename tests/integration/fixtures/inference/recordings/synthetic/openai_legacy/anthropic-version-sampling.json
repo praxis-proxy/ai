@@ -1,0 +1,402 @@
+{
+  "version": 1,
+  "protocol": "openai_chat_completions",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "fixture-openai-model",
+    "source_id": "controlled-anthropic-version-sampling"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "chatcmpl-msg_json": "chatcmpl-recorded-0001",
+      "msg_json": "msg_recorded_0002"
+    }
+  },
+  "scenario_id": "openai_legacy/anthropic-version-sampling",
+  "turns": [
+    {
+      "name": "without-sampling",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": "Say hello.",
+                  "role": "user"
+                }
+              ],
+              "model": "fixture-openai-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "index": 0,
+                  "message": {
+                    "content": "fixture hello",
+                    "role": "assistant"
+                  }
+                }
+              ],
+              "created": 0,
+              "id": "chatcmpl-recorded-0001",
+              "model": "fixture-openai-model",
+              "object": "chat.completion",
+              "usage": {
+                "completion_tokens": 2,
+                "prompt_tokens": 1060,
+                "prompt_tokens_details": {
+                  "cached_tokens": 1000
+                },
+                "total_tokens": 1062
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "anthropic-version": [
+              "2026-10-21"
+            ],
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": [
+                    {
+                      "text": "Say hello.",
+                      "type": "text"
+                    }
+                  ],
+                  "role": "user"
+                }
+              ],
+              "model": "claude-fixture-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "content": [
+                {
+                  "text": "fixture hello",
+                  "type": "text"
+                }
+              ],
+              "id": "msg_recorded_0002",
+              "model": "claude-fixture-model",
+              "role": "assistant",
+              "stop_reason": "end_turn",
+              "type": "message",
+              "usage": {
+                "cache_creation_input_tokens": 50,
+                "cache_read_input_tokens": 1000,
+                "input_tokens": 10,
+                "output_tokens": 2
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "temperature-rejected",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": "Say hello.",
+                  "role": "user"
+                }
+              ],
+              "model": "fixture-openai-model",
+              "stream": false,
+              "temperature": 1
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "message": "Anthropic API version 2026-10-21 does not support temperature; remove this field or contact the platform administrator to configure a compatible api_version",
+                "type": "invalid_request_error",
+                "code": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    },
+    {
+      "name": "top_p-rejected",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": "Say hello.",
+                  "role": "user"
+                }
+              ],
+              "model": "fixture-openai-model",
+              "stream": false,
+              "top_p": 0.9
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "message": "Anthropic API version 2026-10-21 does not support top_p; remove this field or contact the platform administrator to configure a compatible api_version",
+                "type": "invalid_request_error",
+                "code": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    },
+    {
+      "name": "top_k-rejected",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": "Say hello.",
+                  "role": "user"
+                }
+              ],
+              "model": "fixture-openai-model",
+              "stream": false,
+              "top_k": 40
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "message": "unsupported Chat Completions field \"top_k\" cannot be preserved by Anthropic Messages",
+                "type": "invalid_request_error",
+                "code": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    },
+    {
+      "name": "temperature-null",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 16,
+              "messages": [
+                {
+                  "content": "Say hello.",
+                  "role": "user"
+                }
+              ],
+              "model": "fixture-openai-model",
+              "stream": false,
+              "temperature": null
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "message": "Anthropic API version 2026-10-21 does not support temperature; remove this field or contact the platform administrator to configure a compatible api_version",
+                "type": "invalid_request_error",
+                "code": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -9,6 +9,8 @@ use base64::{engine::general_purpose::STANDARD, read::DecoderReader};
 use serde_json::{Map, Value, json};
 use url::Url;
 
+use super::config::AnthropicApiVersion;
+
 /// Request details retained for response JSON and SSE conversion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RequestProfile {
@@ -61,13 +63,27 @@ pub(crate) fn rewrite_openai_target_model(bytes: &[u8], target_model: &str) -> R
     clippy::too_many_lines,
     reason = "The strict request mapping keeps validation adjacent to each field conversion"
 )]
-pub(crate) fn translate_request(bytes: &[u8], target_model: &str) -> Result<(Vec<u8>, RequestProfile), String> {
+pub(crate) fn translate_request(
+    bytes: &[u8],
+    target_model: &str,
+    api_version: AnthropicApiVersion,
+) -> Result<(Vec<u8>, RequestProfile), String> {
     let mut value: Value =
         serde_json::from_slice(bytes).map_err(|error| format!("invalid Chat Completions JSON: {error}"))?;
     let object = value
         .as_object_mut()
         .ok_or("Chat Completions request must be a JSON object")?;
     reject_unknown_fields(object)?;
+    if api_version == AnthropicApiVersion::V20261021 {
+        for field in ["temperature", "top_p", "top_k"] {
+            if object.contains_key(field) {
+                return Err(format!(
+                    "Anthropic API version {} does not support {field}; remove this field or contact the platform administrator to configure a compatible api_version",
+                    api_version.as_str()
+                ));
+            }
+        }
+    }
     validate_ignored_legacy_fields(object)?;
 
     let client_model = take_string(object, "model")?;

@@ -290,7 +290,8 @@ neither reaches a Chat Completions backend in either lane.
 
 The OpenAI -> Anthropic Messages direction is driven by the OpenAI SDK as the
 client, so it does not vary on the Anthropic SDK axis; its backend wire
-headers (pinned `anthropic-version: 2023-06-01`, injected `x-api-key`,
+headers (operator-selected `anthropic-version` via `api_version`,
+defaulting to `2023-06-01`, injected `x-api-key`,
 stripped caller `authorization`) are asserted in
 [`tests/integration/sdk/openai/test_selected_anthropic_chat_completions.py`](../tests/integration/sdk/openai/test_selected_anthropic_chat_completions.py).
 
@@ -304,6 +305,24 @@ uv run --with "anthropic==2.3.0" tests/integration/sdk/anthropic/test_anthropic_
 
 CI runs both lanes as sequential steps in the `anthropic-sdk` job of
 [`integration.yaml`](../.github/workflows/integration.yaml).
+
+## API version compatibility
+
+Native passthrough preserves a caller-supplied `anthropic-version` and the
+request body. `anthropic_messages_protocol.default_version` fills in a
+missing version; it does not override the caller or enforce version-specific
+body restrictions. A backend selecting `2026-10-21` may reject sampling
+fields even when they contain defaults.
+
+For Chat Completions clients translated to Anthropic Messages, the operator
+selects `openai_chat_completions_to_anthropic.api_version`. Its default is
+`2023-06-01`; selecting `2026-10-21` rejects sampling controls before sending
+the request upstream, including explicit default values and nulls. This
+translator setting wins over a co-configured native protocol default in either
+filter order. It applies to the whole translator configuration, not individual
+routing-overlay providers. Compatible Messages-to-Chat Completions and native vLLM
+routes retain their sampling support. See the
+[version and sampling contract](developing/openai-anthropic-compatibility.md#api-version-and-sampling).
 
 ## Passthrough to Anthropic API
 

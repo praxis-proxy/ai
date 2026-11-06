@@ -46,7 +46,9 @@
                 }
               ],
               "model": "fixture-openai-model",
-              "stream": false
+              "stream": false,
+              "temperature": 0.5,
+              "top_p": 0.9
             }
           }
         },
@@ -114,7 +116,9 @@
                 }
               ],
               "model": "claude-fixture-model",
-              "stream": false
+              "stream": false,
+              "temperature": 0.5,
+              "top_p": 0.9
             }
           }
         },

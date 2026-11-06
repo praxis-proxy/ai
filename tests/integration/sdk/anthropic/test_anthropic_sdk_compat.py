@@ -421,6 +421,20 @@ class TestNativePassthrough:
                 f"SDK {lane} must not send {name} alongside its own auth scheme"
             )
 
+    @pytest.mark.parametrize("version", ["2023-06-01", "2026-10-21"])
+    @pytest.mark.parametrize("field,value", [("temperature", 0.5), ("top_p", 0.9), ("top_k", 40)])
+    def test_native_sampling_and_version_reach_backend_unchanged(self, native_client, version, field, value):
+        native_client.messages.create(
+            model=MODEL, max_tokens=64,
+            messages=[{"role": "user", "content": "Hi"}],
+            extra_headers={"anthropic-version": version},
+            extra_body={field: value},
+        )
+        path, headers, body = NATIVE_STATE.requests[-1]
+        assert path == "/v1/messages"
+        assert headers["anthropic-version"] == version, "native caller-selected version must be preserved"
+        assert body[field] == value, "native passthrough leaves version restrictions to the backend"
+
     def test_json_message_round_trip(self, native_client):
         response = native_client.messages.create(
             model=MODEL,
@@ -611,7 +625,8 @@ class TestTranslatedToChatCompletions:
         )
         assert translated_history[-1]["tool_call_id"] == tool_use.id
 
-    def test_sampling_parameters_are_translated(self, translated_client):
+    @pytest.mark.parametrize("version", ["2023-06-01", "2026-10-21"])
+    def test_sampling_parameters_are_translated(self, translated_client, version):
         # Sampling parameters are no longer typed SDK fields; they travel as
         # request-body fields via extra_body on both lanes.
         translated_client.messages.create(
@@ -619,10 +634,12 @@ class TestTranslatedToChatCompletions:
             max_tokens=64,
             stop_sequences=["\n"],
             extra_body={"temperature": 0.5, "top_p": 0.9, "top_k": 40},
+            extra_headers={"anthropic-version": version},
             messages=[{"role": "user", "content": "Hi"}],
         )
 
-        _path, _headers, body = TRANSLATED_STATE.requests[-1]
+        _path, headers, body = TRANSLATED_STATE.requests[-1]
+        assert "anthropic-version" not in headers, "caller version must not reach a Chat Completions backend"
         assert body["temperature"] == 0.5
         assert body["top_p"] == 0.9
         assert body["stop"] == ["\n"], "stop_sequences must become the Chat Completions stop"
