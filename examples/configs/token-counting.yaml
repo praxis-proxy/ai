@@ -56,7 +56,12 @@
 # other response-phase filters in the same pipeline.
 #
 # Supported provider values:
-#   openai | anthropic | google | bedrock | azure
+#   openai | anthropic | google | bedrock | bedrock_invoke_model | azure | auto
+#
+# "auto" selects the parser per request from the endpoint path, for
+# routes that serve several API dialects behind one base URL. Paths
+# with no usage format (health checks, /v1/models, count_tokens) are
+# skipped and remain unmetered.
 
 # The health and metrics endpoints (/healthy, /ready, /metrics) bind here;
 # scrape the praxis_ai_* token metrics (labeled by model and cluster) from
@@ -92,7 +97,7 @@ filter_chains:
       - filter: token_usage_headers
 
       - filter: token_count
-        provider: openai   # openai | anthropic | google | bedrock | azure
+        provider: openai   # openai | anthropic | google | bedrock | bedrock_invoke_model | azure | auto
 
       - filter: access_log
 
