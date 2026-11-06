@@ -84,6 +84,7 @@ for how these are authored and regenerated.
 | [token-rate-limit-soft-tiers.yaml](configs/token-rate-limit-soft-tiers.yaml) | Extends token-rate-limit.yaml with graduated enforcement tiers (proposal S1, ai#881) |
 | [token-rate-limit.yaml](configs/token-rate-limit.yaml) | Reserves an estimated token cost at admission time and reconciles that reservation against actual provider-reported usage once the response completes |
 | [token-usage-headers.yaml](configs/token-usage-headers.yaml) | Inject Praxis-Token-Input, Praxis-Token-Output, and Praxis-Token-Total headers into downstream responses when token counts are available in filter metadata |
+| [token-usage-metrics.yaml](configs/token-usage-metrics.yaml) | Opt-in, cardinality-bounded per-tenant token counters |
 
 ### Anthropic
 
@@ -118,6 +119,7 @@ for how these are authored and regenerated.
 
 | File | Description |
 | ------ | ------------- |
+| [fallback-with-provider-translation.yaml](configs/inference/fallback-with-provider-translation.yaml) | Demonstrates provider failover from an OpenAI-compatible backend to an Anthropic Messages provider with JSON and streaming SSE translation using the iterative_request_router |
 | [fallback-with-translation.yaml](configs/inference/fallback-with-translation.yaml) | Demonstrates provider failover with Responses-to-Chat Completions protocol translation using the iterative_request_router |
 
 ### OpenAI
@@ -176,6 +178,12 @@ for how these are authored and regenerated.
 | [web-search-file-key.yaml](configs/openai/responses/web-search-file-key.yaml) | A variant of web-search-chat-completions.yaml that sources the shared Brave provider key from a projected FILE instead of an environment variable |
 | [web-search-scoped-credentials.yaml](configs/openai/responses/web-search-scoped-credentials.yaml) | A scoped-credentials variant of web-search-chat-completions.yaml |
 | [web-search.yaml](configs/openai/responses/web-search.yaml) | Demonstrates the `openai_web_search_dispatch` filter configuration |
+
+### OpenShell
+
+| File | Description |
+| ------ | ------------- |
+| [sandboxed-coding-clients.yaml](configs/openshell/sandboxed-coding-clients.yaml) | One host-side gateway for Codex, Claude Code, OpenCode, and pi running inside NVIDIA OpenShell sandboxes, each over its native wire API, with Codex client-tool compatibility applied to its tool payloads |
 
 ### Payload Processing
 

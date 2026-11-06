@@ -1441,11 +1441,29 @@ fn task_routing_disabled_by_default() {
 }
 
 #[test]
-fn task_routing_enabled_parses_defaults() {
+fn task_routing_enabled_rejects_missing_store() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        task_routing:
+          enabled: true
+        "#,
+    )
+    .unwrap();
+    let err = A2aFilter::from_config(&yaml).err().expect("should fail");
+    assert!(
+        err.to_string()
+            .contains("task_routing.store is required when task routing is enabled"),
+        "missing task route store should be rejected: {err}"
+    );
+}
+
+#[test]
+fn task_routing_enabled_with_local_store_parses_defaults() {
     let cfg: A2aConfig = serde_yaml::from_str(
         r#"
         task_routing:
           enabled: true
+          store: local
         "#,
     )
     .unwrap();
@@ -1489,6 +1507,7 @@ fn task_routing_rejects_invalid_route_cluster_header() {
         r#"
         task_routing:
           enabled: true
+          store: local
           route_cluster_header: "invalid header with spaces"
         "#,
     )
@@ -1506,6 +1525,7 @@ fn task_routing_rejects_zero_ttl() {
         r#"
         task_routing:
           enabled: true
+          store: local
           ttl_seconds: 0
         "#,
     )
@@ -1523,6 +1543,7 @@ fn task_routing_rejects_ttl_above_ceiling() {
         r#"
         task_routing:
           enabled: true
+          store: local
           ttl_seconds: 18446744073709551615
         "#,
     )
@@ -1540,6 +1561,7 @@ fn task_routing_rejects_terminal_ttl_above_ceiling() {
         r#"
         task_routing:
           enabled: true
+          store: local
           terminal_ttl_seconds: 18446744073709551615
         "#,
     )
@@ -1557,6 +1579,7 @@ fn task_routing_rejects_zero_max_response_body_bytes() {
         r#"
         task_routing:
           enabled: true
+          store: local
           max_response_body_bytes: 0
         "#,
     )
@@ -1574,6 +1597,7 @@ fn task_routing_rejects_non_reserved_route_cluster_header() {
         r#"
         task_routing:
           enabled: true
+          store: local
           route_cluster_header: "x-custom-route"
         "#,
     )
@@ -1591,6 +1615,7 @@ fn task_routing_allows_zero_terminal_ttl() {
         r#"
         task_routing:
           enabled: true
+          store: local
           terminal_ttl_seconds: 0
         "#,
     )
@@ -1837,7 +1862,7 @@ async fn multibyte_char_split_across_chunks_still_captures_route() {
 #[tokio::test]
 async fn oversized_response_passes_through_without_route_capture() {
     let filter = make_task_routing_filter_with_config(
-        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "max_response_body_bytes": 32}}"#,
+        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "store": "local", "max_response_body_bytes": 32}}"#,
     );
     let store = filter.task_route_store.as_ref().unwrap();
 
@@ -2377,7 +2402,7 @@ async fn non_streaming_task_response_stores_task_and_context_routes() {
 #[tokio::test]
 async fn terminal_task_zero_ttl_removes_task_but_keeps_context_route() {
     let filter = make_task_routing_filter_with_config(
-        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "terminal_ttl_seconds": 0}}"#,
+        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "store": "local", "terminal_ttl_seconds": 0}}"#,
     );
     let store = filter.task_route_store.as_ref().unwrap();
 
@@ -2404,7 +2429,7 @@ async fn terminal_task_zero_ttl_removes_task_but_keeps_context_route() {
 async fn completed_task_context_uses_normal_ttl() {
     // Seeding a terminal task response should store context with normal TTL, not terminal TTL.
     let filter = make_task_routing_filter_with_config(
-        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "ttl_seconds": 3600, "terminal_ttl_seconds": 1}}"#,
+        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "store": "local", "ttl_seconds": 3600, "terminal_ttl_seconds": 1}}"#,
     );
     let store = filter.task_route_store.as_ref().unwrap();
 
@@ -2469,7 +2494,7 @@ async fn split_json_response_with_context_stores_context_route() {
 #[tokio::test]
 async fn oversized_response_does_not_store_context_route() {
     let filter = make_task_routing_filter_with_config(
-        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "max_response_body_bytes": 32}}"#,
+        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "store": "local", "max_response_body_bytes": 32}}"#,
     );
     let store = filter.task_route_store.as_ref().unwrap();
 
@@ -2846,7 +2871,7 @@ async fn sse_streaming_capture_invalid_json_does_not_fail() {
 #[tokio::test]
 async fn sse_streaming_capture_oversized_scratch_drops_event_and_continues() {
     let filter = make_task_routing_filter_with_config(
-        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "max_response_body_bytes": 32}}"#,
+        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "store": "local", "max_response_body_bytes": 32}}"#,
     );
     let store = filter.task_route_store.as_ref().unwrap();
 
@@ -2872,7 +2897,7 @@ async fn sse_streaming_capture_oversized_scratch_drops_event_and_continues() {
 #[tokio::test]
 async fn sse_streaming_capture_terminal_state_uses_terminal_ttl() {
     let filter = make_task_routing_filter_with_config(
-        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "terminal_ttl_seconds": 0}}"#,
+        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "store": "local", "terminal_ttl_seconds": 0}}"#,
     );
     let store = filter.task_route_store.as_ref().unwrap();
 
@@ -3161,7 +3186,7 @@ async fn sse_streaming_capture_status_update_event() {
 #[tokio::test]
 async fn sse_streaming_capture_terminal_status_update() {
     let filter = make_task_routing_filter_with_config(
-        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "terminal_ttl_seconds": 0}}"#,
+        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "store": "local", "terminal_ttl_seconds": 0}}"#,
     );
     let store = filter.task_route_store.as_ref().unwrap();
 
@@ -3218,7 +3243,7 @@ async fn sse_streaming_capture_artifact_update_event() {
 #[tokio::test]
 async fn valid_task_before_and_after_oversized_sse_frame_are_both_stored() {
     let filter = make_task_routing_filter_with_config(
-        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "max_response_body_bytes": 128}}"#,
+        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "store": "local", "max_response_body_bytes": 128}}"#,
     );
     let store = filter.task_route_store.as_ref().unwrap();
 
@@ -3564,7 +3589,9 @@ fn assert_capture_scratch_cleared(ctx: &praxis_filter::HttpFilterContext<'_>) {
 }
 
 fn make_task_routing_filter() -> A2aFilter {
-    make_task_routing_filter_with_config(r#"{"on_invalid": "continue", "task_routing": {"enabled": true}}"#)
+    make_task_routing_filter_with_config(
+        r#"{"on_invalid": "continue", "task_routing": {"enabled": true, "store": "local"}}"#,
+    )
 }
 
 fn make_task_routing_filter_with_config(yaml: &str) -> A2aFilter {

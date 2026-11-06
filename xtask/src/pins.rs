@@ -17,15 +17,23 @@
 //! ```console
 //! cargo run -p xtask --no-default-features --features pins -- check-pins
 //! ```
+//!
+//! `cargo xtask bump-pins` (see `bump`) moves every pin to its latest upstream
+//! release through the same site table, and validates the result with these
+//! checks before writing anything.
 
+#[cfg(feature = "dev")]
+mod bump;
 mod check;
 mod manifest;
 mod sites;
 #[cfg(test)]
 mod tests;
+#[cfg(feature = "dev")]
+mod upstream;
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write as _,
     path::{Path, PathBuf},
@@ -33,6 +41,8 @@ use std::{
 
 use clap::Parser;
 
+#[cfg(feature = "dev")]
+pub(crate) use self::bump::{BumpArgs, run as run_bump};
 use self::manifest::Manifests;
 
 // -----------------------------------------------------------------------------
@@ -137,16 +147,18 @@ fn outputs(manifests: &Manifests) -> Vec<(&'static str, String)> {
 // Repository Access
 // -----------------------------------------------------------------------------
 
-/// Read access to the repository, with optional in-memory overrides.
+/// Read access to the repository, with staged in-memory changes.
 ///
-/// The overrides let tests mutate one file of the real repository and assert
-/// the matching invariant fails, without touching disk.
+/// `bump-pins` stages every rewrite here and validates the staged tree with
+/// `check-pins` before anything reaches disk. Tests use the same staging to
+/// mutate one file of the real repository and assert the matching invariant
+/// fails.
 pub(crate) struct Repo {
     /// Repository root.
     root: PathBuf,
 
-    /// Replacement contents keyed by repository-relative path.
-    overrides: HashMap<String, String>,
+    /// Staged contents keyed by repository-relative path; `None` is a removal.
+    staged: BTreeMap<String, Option<String>>,
 }
 
 impl Repo {
@@ -154,32 +166,75 @@ impl Repo {
     pub(crate) fn new(root: PathBuf) -> Self {
         Self {
             root,
-            overrides: HashMap::new(),
+            staged: BTreeMap::new(),
         }
     }
 
-    /// Read a repository-relative file.
+    /// Read a repository-relative file, staged changes first.
     pub(crate) fn read(&self, path: &str) -> Result<String, String> {
-        if let Some(contents) = self.overrides.get(path) {
-            return Ok(contents.clone());
+        match self.staged.get(path) {
+            Some(Some(contents)) => Ok(contents.clone()),
+            Some(None) => Err(format!("{path}: removed")),
+            None => fs::read_to_string(self.root.join(path)).map_err(|e| format!("{path}: {e}")),
         }
-        fs::read_to_string(self.root.join(path)).map_err(|e| format!("{path}: {e}"))
+    }
+
+    /// Stage new contents for one file.
+    #[cfg(any(test, feature = "dev"))]
+    pub(crate) fn stage(&mut self, path: &str, contents: String) {
+        self.staged.insert(path.to_owned(), Some(contents));
+    }
+
+    /// Stage the removal of one file.
+    #[cfg(any(test, feature = "dev"))]
+    pub(crate) fn stage_removal(&mut self, path: &str) {
+        self.staged.insert(path.to_owned(), None);
     }
 
     /// Replace one file's contents in memory.
     #[cfg(test)]
     pub(crate) fn with_override(mut self, path: &str, contents: String) -> Self {
-        self.overrides.insert(path.to_owned(), contents);
+        self.stage(path, contents);
         self
     }
 
-    /// File names in a repository-relative directory, sorted.
+    /// File names in a repository-relative directory, staged changes
+    /// included, sorted.
     pub(crate) fn list(&self, dir: &str) -> Result<Vec<String>, String> {
-        let mut names: Vec<String> = fs::read_dir(self.root.join(dir))
+        let mut names: BTreeSet<String> = fs::read_dir(self.root.join(dir))
             .map_err(|e| format!("{dir}: {e}"))?
             .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
             .collect();
-        names.sort();
-        Ok(names)
+        for (path, contents) in &self.staged {
+            let Some(name) = path.strip_prefix(dir).and_then(|rest| rest.strip_prefix('/')) else {
+                continue;
+            };
+            if contents.is_some() {
+                names.insert(name.to_owned());
+            } else {
+                names.remove(name);
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
+
+    /// Write every staged change to disk.
+    #[cfg(feature = "dev")]
+    pub(crate) fn commit(&self) -> Result<(), String> {
+        for (path, contents) in &self.staged {
+            let target = self.root.join(path);
+            match contents {
+                Some(contents) => fs::write(&target, contents),
+                None => fs::remove_file(&target),
+            }
+            .map_err(|e| format!("{path}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Repository-relative paths with staged changes.
+    #[cfg(feature = "dev")]
+    pub(crate) fn staged_paths(&self) -> impl Iterator<Item = &str> {
+        self.staged.keys().map(String::as_str)
     }
 }

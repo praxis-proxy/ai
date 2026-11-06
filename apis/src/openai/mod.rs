@@ -27,6 +27,7 @@ pub(crate) mod translation;
 pub(crate) mod vector_stores;
 
 pub use chat_completions::{
+    OpenaiChatCompletionsStreamingSelectorFilter,
     request::OpenaiChatCompletionsRequestFilter,
     routes::{
         ChatCompletionsOperation, ChatCompletionsOperationSpec, operation_specs as chat_completions_operation_specs,

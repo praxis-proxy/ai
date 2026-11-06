@@ -7,9 +7,15 @@ use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_ai_apis::json_body::replace_json_body;
 #[cfg(feature = "openai-responses")]
 use praxis_ai_apis::openai::{local_tool_guardrail_messages, record_local_tool_guardrail_failure};
+use praxis_ai_apis::{
+    guardrail_messages::{GuardrailMessageDirection, extract_guardrail_messages},
+    json_body::replace_json_body,
+    openai::{ChatCompletionsOperation, chat_completions_operation_specs},
+    operation::Transport,
+    operation_classifier::AiOperationMatch,
+};
 use praxis_core::{
     config::InsecureOptions,
     subrequest::{DEPTH_HEADER, SubRequestClient},
@@ -60,11 +66,11 @@ pub(super) enum ResponseScreening {
 ///
 /// Request `conditions:` are rejected for the same reason: a security filter
 /// must not be skipped for non-matching requests. Body hooks do not run
-/// inside a branch, so a router branch is not a substitute. A non-empty
-/// request body without a Chat Completions `messages` array fails the
-/// request with 500. Serve `/v1/responses` and `/v1/embeddings` from a
-/// listener that does not include this filter; put `ai_guardrails` only on
-/// a listener whose routes are Chat Completions.
+/// inside a branch, so a router branch is not a substitute. A guarded
+/// pipeline must run `ai_operation` before this filter. The operation match
+/// selects the protocol-specific extractor for request and response bodies;
+/// guardrails never classifies arbitrary JSON itself. A missing match,
+/// unsupported operation, or malformed body fails closed.
 ///
 /// Every provider callout runs through Praxis's filtered-subrequest executor.
 /// The optional `outbound_chain` adds destination-bound authentication,
@@ -77,23 +83,41 @@ pub(super) enum ResponseScreening {
 /// pre-read body as untrusted input and configure an outbound chain whenever
 /// the provider requires destination-bound policy enforcement.
 ///
-/// **Wire format:** client request/response evaluation supports Chat
-/// Completions only (`messages` on requests, `choices[].message` on
-/// responses). `phase.tool_results` separately evaluates canonical local
-/// Responses tool results inside an IRR step. Other Responses content,
-/// Anthropic Messages, and MCP wire bodies are not supported yet (see ai#1043).
-/// For `phase.tool_results`, a provider `modified` verdict fails closed with
-/// `502 guardrail_error`; sanitized text is not forwarded because it cannot
+/// **Wire format:** client request/response evaluation dispatches from the
+/// authoritative `ai_operation` match. Chat Completions, selected OpenAI
+/// Responses operations, and selected Anthropic Messages text content are
+/// supported by the shared extractor. MCP requires its protocol filter to
+/// publish `mcp_jsonrpc` identity before it can be extracted (see ai#1043).
+/// `phase.tool_results` separately evaluates canonical local Responses tool
+/// results inside an IRR step.
+/// For `phase.tool_results`, a provider verdict that modifies text fails closed
+/// with `502 guardrail_error`; sanitized text is not forwarded because it cannot
 /// yet be safely mapped back to the canonical tool-result items. Only a
 /// `passed` verdict permits model re-entry.
 ///
-/// A provider `modified` verdict on the request rewrites each targeted user
-/// message and forwards the masked body. A request rewrite that cannot be
-/// applied is rejected with HTTP 502 so the original text is not sent
-/// upstream. On the response, each targeted choice is rebuilt from `index`,
-/// `finish_reason`, and a message containing only `role` and the masked
-/// `content`. A choice whose message has array `content`, `tool_calls`, or
-/// `function_call` cannot be redacted; the client receives the original HTTP
+/// Visible reasoning is not yet supported by the text extractor. Responses
+/// output with non-empty reasoning `summary` or `content`, and Anthropic
+/// thinking blocks, replace the entire response with an `evaluation_failed`
+/// error document. Opaque Responses reasoning state with no visible text can
+/// accompany otherwise supported message output.
+///
+/// Request checks retain the conversation prefix through each user turn.
+/// Response checks send each extracted assistant output separately, retaining
+/// its original index when combining verdicts and applying Chat redaction.
+/// A `modified` verdict whose content exactly equals the checked string is
+/// treated as passed because no rewrite is needed. Blocked verdicts and
+/// actual text changes keep their normal enforcement.
+///
+/// Redaction rewriting currently supports Chat Completions wire bodies only.
+/// A provider `modified` verdict on a Chat request rewrites each targeted user
+/// message and forwards the masked body. A `modified` verdict that changes text
+/// for any other protocol is explicitly rejected before attempting a Chat
+/// rewrite. A request rewrite that cannot be applied is also rejected with HTTP 502
+/// so the original text is not sent upstream. On a Chat response, each targeted
+/// choice is rebuilt from `index`, `finish_reason`, and a message containing
+/// only `role` and the masked `content`. A choice whose message has array
+/// `content`, `tool_calls`, or `function_call` cannot be redacted; as with
+/// other supported response protocols, the client receives the original HTTP
 /// 200 with an `evaluation_failed` error document. `on_response` drops
 /// `Content-Length` so core reframes the buffered body at its natural size.
 ///
@@ -133,20 +157,24 @@ pub(super) enum ResponseScreening {
 /// # YAML configuration
 ///
 /// ```yaml
-/// filter: ai_guardrails
-/// outbound_chain: nemo-outbound # optional
-/// provider:
-///   type: nemo
-///   endpoint: "https://nemo.default.svc:8443/v1/checks"
-///   guardrails:
-///     config_ids: ["your-config"]
-///   tls:
-///     ca_file: /var/run/secrets/nemo/ca.crt
-///   timeout_ms: 5000
-/// phase:
-///   request: true
-///   response: true
-///   tool_results: false
+/// filters:
+///   # Required: publishes the trusted protocol and operation identity.
+///   - filter: ai_operation
+///
+///   - filter: ai_guardrails
+///     outbound_chain: nemo-outbound # optional
+///     provider:
+///       type: nemo
+///       endpoint: "https://nemo.default.svc:8443/v1/checks"
+///       guardrails:
+///         config_ids: ["your-config"]
+///       tls:
+///         ca_file: /var/run/secrets/nemo/ca.crt
+///       timeout_ms: 5000
+///     phase:
+///       request: true
+///       response: true
+///       tool_results: false
 /// ```
 pub struct AiGuardrailsFilter {
     /// Guard provider instance.
@@ -455,7 +483,15 @@ impl HttpFilter for AiGuardrailsFilter {
             ));
         }
 
-        let messages = request.into_messages()?;
+        let operation = ctx
+            .extensions
+            .get::<AiOperationMatch>()
+            .copied()
+            .ok_or_else(|| -> FilterError {
+                "ai_guardrails: request extraction requires an ai_operation match".into()
+            })?;
+        let messages = extract_guardrail_messages(operation, GuardrailMessageDirection::Request, bytes)
+            .map_err(|error| -> FilterError { format!("ai_guardrails: {error}").into() })?;
         let runtime = self.callout_runtime(ctx);
         let result = self.evaluate(messages, GuardPhase::Request, &runtime).await?;
         record_verdict(ctx, body, result, GuardPhase::Request)
@@ -506,13 +542,24 @@ impl HttpFilter for AiGuardrailsFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let evaluation = extract_response_messages(bytes).and_then(|messages| {
-            let handle = tokio::runtime::Handle::current();
-            let runtime = self.callout_runtime(ctx);
-            // `on_response_body` is sync (Pingora constraint); use `block_in_place`
-            // to bridge into async. See #51 for the plan to make this truly async.
-            tokio::task::block_in_place(|| handle.block_on(self.evaluate(messages, GuardPhase::Response, &runtime)))
-        });
+        let evaluation = ctx
+            .extensions
+            .get::<AiOperationMatch>()
+            .copied()
+            .ok_or_else(|| -> FilterError {
+                "ai_guardrails: response extraction requires an ai_operation match".into()
+            })
+            .and_then(|operation| {
+                extract_guardrail_messages(operation, GuardrailMessageDirection::Response, bytes)
+                    .map_err(|error| -> FilterError { format!("ai_guardrails: {error}").into() })
+            })
+            .and_then(|messages| {
+                let handle = tokio::runtime::Handle::current();
+                let runtime = self.callout_runtime(ctx);
+                // `on_response_body` is sync (Pingora constraint); use `block_in_place`
+                // to bridge into async. See #51 for the plan to make this truly async.
+                tokio::task::block_in_place(|| handle.block_on(self.evaluate(messages, GuardPhase::Response, &runtime)))
+            });
 
         match evaluation {
             Ok(result) => record_verdict(ctx, body, result, GuardPhase::Response),
@@ -630,7 +677,34 @@ fn record_verdict(
         GuardResult::Block { reason } => Ok(enforce_block(body, reason, phase, verdict)),
         GuardResult::Redact { replacements, reason } => {
             tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict");
+            if !supports_chat_redaction(ctx) {
+                return Ok(reject_unsupported_redaction(body, phase));
+            }
             Ok(apply_redaction(body, replacements, phase))
+        },
+    }
+}
+
+/// Require the trusted Chat operation before interpreting redaction indices as Chat indices.
+fn supports_chat_redaction(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions.get::<AiOperationMatch>().is_some_and(|operation| {
+        operation.transport == Transport::Http
+            && chat_completions_operation_specs().iter().any(|spec| {
+                spec.operation == ChatCompletionsOperation::CreateChatCompletion
+                    && spec.application_protocol() == operation.application_protocol
+                    && spec.operation_id() == operation.operation_id
+            })
+    })
+}
+
+/// Reject unsupported rewrites explicitly so a fail-open policy cannot forward the original text.
+fn reject_unsupported_redaction(body: &mut Option<Bytes>, phase: GuardPhase) -> FilterAction {
+    let message = "Guardrail redaction failed: rewriting is supported only for Chat Completions";
+    match phase {
+        GuardPhase::Request => FilterAction::Reject(Rejection::status(502).with_body(message)),
+        GuardPhase::Response => {
+            replace_body_with_error(body, message, "guardrail_error", "evaluation_failed");
+            FilterAction::Continue
         },
     }
 }
@@ -939,18 +1013,6 @@ struct GuardrailsRequest {
     /// Whether the upstream should stream its response.
     #[serde(default)]
     stream: Option<serde_json::Value>,
-    /// Chat Completion messages evaluated by request guardrails.
-    messages: Option<serde_json::Value>,
-}
-
-impl GuardrailsRequest {
-    /// Extract the request messages for guardrail evaluation.
-    fn into_messages(self) -> Result<Vec<serde_json::Value>, FilterError> {
-        match self.messages {
-            Some(serde_json::Value::Array(messages)) => Ok(messages),
-            _ => Err("ai_guardrails: request body does not contain recognizable messages".into()),
-        }
-    }
 }
 
 /// Whether the stream field requests a streamed response.
@@ -982,33 +1044,6 @@ fn request_body_parse_error(error: &serde_json::Error) -> FilterError {
         error.column()
     )
     .into()
-}
-
-/// Extract assistant messages from an OpenAI Chat Completion response body.
-fn extract_response_messages(body: &Bytes) -> Result<Vec<serde_json::Value>, FilterError> {
-    let mut json: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|e| -> FilterError { format!("ai_guardrails: response body is not valid JSON: {e}").into() })?;
-
-    if let Some(choices) = json.get_mut("choices").and_then(|c| c.as_array_mut()) {
-        let num_choices = choices.len();
-        let messages: Vec<serde_json::Value> = choices
-            .iter_mut()
-            .filter_map(|c| c.get_mut("message").map(std::mem::take))
-            .collect();
-        if messages.is_empty() {
-            return Err("ai_guardrails: response body does not contain recognizable choices".into());
-        }
-        if messages.len() != num_choices {
-            return Err(format!(
-                "ai_guardrails: {num_choices} choices but only {} contain a message field",
-                messages.len(),
-            )
-            .into());
-        }
-        return Ok(messages);
-    }
-
-    Err("ai_guardrails: response body does not contain recognizable choices".into())
 }
 
 /// Whether the response is model output the response phase must screen: a 2xx
@@ -1101,18 +1136,13 @@ mod streaming_tests {
     }
 
     #[test]
-    fn request_phase_parses_stream_and_messages_together() {
-        let body = Bytes::from_static(br#"{"model":"m","messages":[{"role":"user","content":"hello"}],"stream":true}"#);
+    fn request_phase_parses_stream() {
+        let body = Bytes::from_static(br#"{"model":"m","stream":true}"#);
         let request = parse_request(&body).unwrap();
 
         assert!(
             stream_requested(request.stream.as_ref()),
             "stream=true should request streaming"
-        );
-        assert_eq!(
-            request.into_messages().unwrap().len(),
-            1,
-            "messages should be available from the same parse"
         );
     }
 }
