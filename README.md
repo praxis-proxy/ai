@@ -36,7 +36,9 @@ backends and applies policy.
 - **Code harness support.** Run Codex through OpenAI Responses, Claude Code
   through Anthropic Messages, and OpenCode and pi through Chat Completions. The
   [coding client guide](docs/developing/cli-vllm-through-praxis.md) shows each
-  client reaching native vLLM endpoints or Chat Completions through translation.
+  client reaching native vLLM endpoints or Chat Completions through translation,
+  and the [OpenShell guide](docs/developing/openshell-cli-vllm-through-praxis.md)
+  runs the same clients inside NVIDIA OpenShell sandboxes.
 - **Manage OpenAI response state.** Persist and rehydrate Responses history,
   serve Conversations endpoints locally, and use PostgreSQL or SQLite for
   storage. Fully supports both OpenAI Python SDK 2.x and 3.x client versions. See the [response store guide](docs/architecture/response-store.md)
