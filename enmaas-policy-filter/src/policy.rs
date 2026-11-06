@@ -90,31 +90,20 @@ impl MeteringEntitlement {
         ratelimit_alias: &str,
     ) -> PolicyDecision {
         let qos_class = self.qos_class.unwrap_or_else(|| default_class.to_owned());
-        let deny_reason = self.deny_reason.as_deref().and_then(DenyReason::parse).or_else(|| {
-            if !self.model_allowed {
-                Some(DenyReason::ModelNotAllowed)
-            } else if !self.has_access {
-                Some(DenyReason::QuotaExhausted)
-            } else {
-                None
-            }
-        });
+        let deny_reason = self
+            .deny_reason
+            .as_deref()
+            .and_then(DenyReason::parse)
+            .or(derive_deny_reason(self.has_access, self.model_allowed));
         let allowed = self.allowed.unwrap_or(self.has_access && self.model_allowed);
         let retry_after_seconds = match deny_reason {
             Some(DenyReason::QuotaExhausted) => self.quota_retry_after,
             _ if qos_class == "ratelimit" => self.qos_retry_after.or(Some(30)),
             _ => None,
         };
-        let qos_key_alias = self.qos_key_alias.or_else(|| {
-            Some(
-                match qos_class.as_str() {
-                    "premium" => premium_alias,
-                    "ratelimit" => ratelimit_alias,
-                    _ => main_alias,
-                }
-                .to_owned(),
-            )
-        });
+        let qos_key_alias = self
+            .qos_key_alias
+            .or_else(|| Some(class_alias(&qos_class, premium_alias, main_alias, ratelimit_alias)));
 
         PolicyDecision {
             allowed,
@@ -126,6 +115,25 @@ impl MeteringEntitlement {
             cache_ttl_seconds: None,
         }
     }
+}
+
+fn derive_deny_reason(has_access: bool, model_allowed: bool) -> Option<DenyReason> {
+    if !model_allowed {
+        Some(DenyReason::ModelNotAllowed)
+    } else if !has_access {
+        Some(DenyReason::QuotaExhausted)
+    } else {
+        None
+    }
+}
+
+fn class_alias(class: &str, premium_alias: &str, main_alias: &str, ratelimit_alias: &str) -> String {
+    match class {
+        "premium" => premium_alias,
+        "ratelimit" => ratelimit_alias,
+        _ => main_alias,
+    }
+    .to_owned()
 }
 
 impl DenyReason {
