@@ -127,9 +127,11 @@ const DEGRADED_FEATURES_HEADER: &str = "x-degraded-features";
 /// explicit cache breakpoints are not honored, so cost and latency may differ);
 /// `extended_thinking` removes `thinking` and thinking-only `context_management`
 /// edits (the translated response carries no thinking blocks);
-/// `mid_conversation_system` folds each `system` message that appears after
-/// the first non-system turn into the single leading system message, for
-/// backends whose chat templates reject a mid-conversation system message.
+/// `mid_conversation_system` folds each eligible text-only `system` message
+/// with exactly `role` and `content` fields that appears after the first
+/// non-system turn into the single leading system message; other message or
+/// content shapes remain subject to strict validation and can be rejected
+/// with a 400.
 /// Features absent from the allowlist, malformed markers, and other
 /// `context_management` edits are still rejected with a 400.
 ///
