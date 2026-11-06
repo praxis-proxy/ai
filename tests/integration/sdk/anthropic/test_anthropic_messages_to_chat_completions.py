@@ -613,6 +613,145 @@ class TestRequestFieldHandling:
         assert image_message["role"] == "user"
         assert image_message["content"][0]["image_url"]["url"] == "https://example.com/chart.png"
 
+    def test_tool_result_search_result_part_is_flattened(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{
+                            "type": "search_result",
+                            "source": "kb://timeouts",
+                            "title": "Timeout KB",
+                            "content": [{"type": "text", "text": "Timeouts default to 30 seconds."}],
+                        }],
+                    }],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tool_message = upstream["messages"][2]
+        assert tool_message["role"] == "tool"
+        assert tool_message["content"] == (
+            'Search result: "Timeout KB"\nSource: "kb://timeouts"\nContent:\nTimeouts default to 30 seconds.'
+        )
+
+    def test_tool_result_document_part_is_flattened(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{
+                            "type": "document",
+                            "title": "Nested Doc",
+                            "source": {"type": "content", "content": [{"type": "text", "text": "Nested document fact."}]},
+                        }],
+                    }],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tool_message = upstream["messages"][2]
+        assert tool_message["role"] == "tool"
+        assert tool_message["content"] == (
+            'Document: "Nested Doc"\nContent:\nNested document fact.'
+        )
+
+    def test_tool_result_empty_document_part_is_rejected(self, anthropic_client):
+        # A document part whose source carries nothing extractable flattens
+        # to nothing; it must fail closed instead of silently disappearing
+        # from the tool message.
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[
+                    {"role": "user", "content": "Call lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{"type": "document", "source": {"type": "url", "url": ""}}],
+                        }],
+                    },
+                ],
+            )
+
+        assert "document" in str(excinfo.value), "error message must name the document part"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
+
+    def test_tool_result_document_base64_source_is_rejected(self, anthropic_client):
+        # A base64 document source keeps only its media type when flattened,
+        # dropping the encoded payload, so the part must fail closed instead
+        # of forwarding a document label with no content.
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[
+                    {"role": "user", "content": "Call lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{
+                                "type": "document",
+                                "title": "Contract",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "application/pdf",
+                                    "data": "JVBERi0xLjcK",
+                                },
+                            }],
+                        }],
+                    },
+                ],
+            )
+
+        assert "document" in str(excinfo.value), "error message must name the document part"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
+
     def test_empty_string_tool_arguments_become_empty_input(self, anthropic_client):
         RecordingBackend.bodies.clear()
         RecordingBackend.send_tool_reply_once = True

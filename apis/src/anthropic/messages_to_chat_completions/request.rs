@@ -975,7 +975,9 @@ fn tool_result_part_is_supported(part: &Value) -> bool {
 /// `content` are all absent or empty flattens to nothing, so the tool
 /// message would silently lose it; such a part fails closed here instead.
 /// A `citations` config or `cache_control` marker the flattener would drop
-/// is likewise rejected rather than silently discarded.
+/// is likewise rejected rather than silently discarded, as is a `content`
+/// holding non-text blocks: the pinned spec allows only `text` items there,
+/// and the flattener would drop anything else without an error.
 fn search_result_part_is_supported(part: &Value) -> bool {
     null_or_absent(part, "citations")
         && null_or_absent(part, "cache_control")
@@ -983,6 +985,11 @@ fn search_result_part_is_supported(part: &Value) -> bool {
             part,
             &["type", "title", "source", "content", "citations", "cache_control"],
         )
+        && part.get("content").and_then(Value::as_array).is_none_or(|blocks| {
+            blocks
+                .iter()
+                .all(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        })
         && (non_empty_string_field(part, "title")
             || non_empty_string_field(part, "source")
             || part
@@ -995,7 +1002,9 @@ fn search_result_part_is_supported(part: &Value) -> bool {
 /// translates. A part with no `title`, `context`, or translatable `source`
 /// would be silently dropped from the tool message, so it fails closed here
 /// instead, as does a `citations` config or `cache_control` marker the
-/// flattener would drop.
+/// flattener would drop. A present `source` must itself be translatable:
+/// the flattener drops an unsupported source even when a `title` or
+/// `context` survives, so the whole part fails closed rather than lose it.
 fn document_part_is_supported(part: &Value) -> bool {
     null_or_absent(part, "citations")
         && null_or_absent(part, "cache_control")
@@ -1003,13 +1012,21 @@ fn document_part_is_supported(part: &Value) -> bool {
             part,
             &["type", "title", "context", "source", "citations", "cache_control"],
         )
+        && part
+            .get("source")
+            .filter(|source| !source.is_null())
+            .is_none_or(document_source_is_supported)
         && (non_empty_string_field(part, "title")
             || non_empty_string_field(part, "context")
-            || part.get("source").is_some_and(document_source_is_supported))
+            || part.get("source").is_some_and(|source| !source.is_null()))
 }
 
 /// Check a `document` part's `source` against what `flatten_document_source`
-/// translates: a known source type carrying its extractable field.
+/// translates without data loss: a known source type carrying its extractable
+/// field. A `base64` source is rejected because the flattener keeps only its
+/// media type and drops the encoded payload, which would silently empty the
+/// document; `url` and `file` sources keep their reference string and stay
+/// accepted.
 fn document_source_is_supported(source: &Value) -> bool {
     let Some(fields) = source.as_object() else {
         return false;
@@ -1022,7 +1039,6 @@ fn document_source_is_supported(source: &Value) -> bool {
             .is_some_and(|blocks| blocks.iter().any(text_block_has_text)),
         Some("url") => non_empty_string_field(source, "url"),
         Some("file") => non_empty_string_field(source, "file_id"),
-        Some("base64") => non_empty_string_field(source, "media_type"),
         _ => false,
     }
 }
@@ -2487,6 +2503,35 @@ mod tests {
             parsed["messages"][0]["content"], "Document\nSource: \"file:file_abc\"",
             "source-only document part is flattened into the tool message"
         );
+    }
+
+    #[test]
+    fn tool_result_search_result_non_text_content_is_rejected() {
+        // The pinned spec allows only `text` blocks in a search_result's
+        // content, and the flattener would drop anything else, so a non-text
+        // block fails closed even when a title would keep the part alive.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"search_result","title":"Timeout KB","content":[{"type":"text","text":"Timeouts default to 30 seconds."},{"type":"image","source":{"type":"url","url":"https://example.test/chart.png"}}]}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("search_result"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_document_base64_source_is_rejected() {
+        // The flattener keeps only the media type of a base64 source and
+        // drops the encoded payload, so the part fails closed instead of
+        // forwarding a document label with no content — even with a title.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","title":"Contract","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjcK"}}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("document"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_document_unsupported_source_with_title_is_rejected() {
+        // The flattener drops an unsupported source even when a title
+        // survives, so the whole part fails closed rather than lose it.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","title":"Contract","source":{"type":"unknown","data":"ignored"}}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("document"), "{error}");
     }
 
     #[test]
