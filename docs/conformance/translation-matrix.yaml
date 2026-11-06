@@ -237,7 +237,8 @@ surfaces:
         note: >-
           In-array system messages are accepted deliberately (Claude Code
           emits them) and preserved in position by default. With
-          allow_lossy_features: [mid_conversation_system] each system message
+          allow_lossy_features: [mid_conversation_system] each eligible
+          system message
           after the first non-system turn is folded into the single leading
           system message in encounter order and signalled, for backends whose
           chat templates reject a mid-conversation system message (vLLM "System
