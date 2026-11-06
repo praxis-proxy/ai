@@ -1,0 +1,142 @@
+name: Tests (Kuadrant MCP Gateway acceptance)
+
+# ------------------------------------------------------------------------------
+# Issue #1673 acceptance: stand up a real Kuadrant MCP Gateway (no full k8s) in
+# containers and prove per-user tool authorization end-to-end through Praxis's
+# Responses agentic loop. Split out (like postgres.yaml / valkey.yaml) so the
+# common fast lanes don't pay for the container stack on unrelated changes.
+# ------------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+    paths: &paths
+      - "tests/integration/kuadrant/**"
+      - "tests/integration/sdk/openai/test_openai_responses_mcp_kuadrant.py"
+      - "tests/integration/tests/suite/examples/mcp_kuadrant_gateway.rs"
+      - "examples/configs/openai/responses/mcp-kuadrant-gateway.yaml"
+      - "examples/configs/openai/responses/full-flow-agentic.yaml"
+      - "apis/src/openai/responses/mcp_tool_resolve/**"
+      - "apis/src/openai/responses/mcp_dispatch/**"
+      - "apis/src/mcp_client/**"
+      - "apis/src/callout_credentials.rs"
+      - "apis/src/callout_identity.rs"
+      - "apis/Cargo.toml"
+      - "filters/Cargo.toml"
+      - "server/Cargo.toml"
+      - "tests/integration/Cargo.toml"
+      - "tests/utils/Cargo.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - ".github/workflows/kuadrant.yaml"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths: *paths
+  merge_group:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: "Enable verbose test output (V=1)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  V: ${{ inputs.debug && '1' || '' }}
+  # CI uses docker; stack_up.sh otherwise probes podman first.
+  CONTAINER_ENGINE: docker
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Path filter for merge_group (which does not support on.paths)
+  # ----------------------------------------------------------------------------
+  changes:
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect relevant path changes
+        id: filter
+        run: |
+          CHANGED=$(git diff --name-only "${{ github.event.merge_group.base_sha }}" \
+                                         "${{ github.event.merge_group.head_sha }}" -- \
+            'tests/integration/kuadrant/' \
+            'tests/integration/sdk/openai/test_openai_responses_mcp_kuadrant.py' \
+            'tests/integration/tests/suite/examples/mcp_kuadrant_gateway.rs' \
+            'examples/configs/openai/responses/mcp-kuadrant-gateway.yaml' \
+            'examples/configs/openai/responses/full-flow-agentic.yaml' \
+            'apis/src/openai/responses/mcp_tool_resolve/' \
+            'apis/src/openai/responses/mcp_dispatch/' \
+            'apis/src/mcp_client/' \
+            'apis/src/callout_credentials.rs' \
+            'apis/src/callout_identity.rs' \
+            'apis/Cargo.toml' \
+            'filters/Cargo.toml' \
+            'server/Cargo.toml' \
+            'tests/integration/Cargo.toml' \
+            'tests/utils/Cargo.toml' \
+            'Cargo.toml' \
+            'Cargo.lock' \
+            'Makefile' \
+            '.github/workflows/kuadrant.yaml')
+          if [ -n "$CHANGED" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ----------------------------------------------------------------------------
+  # Real-gateway acceptance (containers spun up by stack_up.sh)
+  # ----------------------------------------------------------------------------
+  acceptance:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      - name: Pre-pull gateway images
+        run: |
+          for img in \
+            ghcr.io/kuadrant/mcp-gateway:v1.0.2 \
+            quay.io/kuadrant/authorino:v0.28.0 \
+            quay.io/coreos/etcd:v3.5.17 \
+            registry.k8s.io/kube-apiserver:v1.33.6 \
+            docker.io/envoyproxy/envoy:v1.35.0 \
+            docker.io/library/python:3.12-slim ; do
+            docker pull "$img"
+          done
+
+      - name: Kuadrant MCP Gateway acceptance
+        run: make test-kuadrant-acceptance

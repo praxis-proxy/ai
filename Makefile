@@ -65,6 +65,7 @@ endif
 	test-postgres-unit test-postgres-integration test-environment test-environment-suite \
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
 	test-token-rate-limit-sentinel-integration \
+	test-kuadrant-acceptance \
 	openai-conformance check-openai-conformance-reference test-openai-conformance \
 	test-responses-conformance \
 	lint lint-clippy lint-xtask lint-lean check-dep-budget fmt doc audit coverage-check \
@@ -349,6 +350,17 @@ test-token-rate-limit-valkey-integration:
 		mixed_algorithm_rules_valkey_backend_isolates_budgets_across_gateway_replicas $(_NOCAPTURE)
 	cargo test -p praxis-tests-integration --features basic-auth-filter,token-rate-limit-filter --test suite \
 		authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas $(_NOCAPTURE)
+
+# Kuadrant MCP Gateway authorization acceptance (issue #1673). Builds the binary,
+# stands up the real gateway stack in containers, drives the per-user authorization
+# matrix through the Responses agentic loop, then tears the stack down. Needs a
+# container engine (CONTAINER_ENGINE, default: podman then docker), kubectl, uv,
+# openssl, curl.
+test-kuadrant-acceptance:
+	cargo build -p praxis-ai-proxy --features full,openai-all,store-sqlite
+	bash tests/integration/kuadrant/stack_up.sh
+	uv run tests/integration/sdk/openai/test_openai_responses_mcp_kuadrant.py $(if $(V),-v,-q) ; \
+		status=$$? ; bash tests/integration/kuadrant/teardown.sh ; exit $$status
 
 openai-conformance:
 	cargo xtask openai-conformance $(OPENAI_CONFORMANCE_ARGS)
@@ -983,6 +995,7 @@ help:
 	@echo "  test-token-rate-limit-valkey-unit        token_rate_limit Valkey unit tests (needs TOKEN_RATE_LIMIT_VALKEY_URL)"
 	@echo "  test-token-rate-limit-valkey-integration token_rate_limit Valkey integration test (needs TOKEN_RATE_LIMIT_VALKEY_URL)"
 	@echo "  test-token-rate-limit-sentinel-integration Sentinel fixture smoke (needs SENTINEL_IMAGE; failover with SENTINEL_FAILOVER_BEFORE_COMMAND=1)"
+	@echo "  test-kuadrant-acceptance Kuadrant MCP Gateway per-user authz acceptance (needs container engine, kubectl, uv)"
 	@echo "  test-environment          llm-d ext_proc environment tests"
 	@echo "  test-environment-suite    llmd-ext-proc integration suite"
 	@echo "  openai-conformance   compare registered API areas with OpenAI's OpenAPI spec"

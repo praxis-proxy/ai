@@ -1,0 +1,145 @@
+# Part 2 Envoy: full chain ext_proc(router) -> ext_authz(Authorino) -> router, with
+# authority-based routing so the router's rewritten :authority reaches the right upstream.
+#  - :authority = weather.local            -> weather_backend (weather-backend:9001) [tools/call + hairpin init]
+#  - everything else (mcp.local:8080, envoy:8080) -> broker_http (mcp-broker:8080)   [initialize + tools/list]
+# Listener on 8080 so the broker's --mcp-gateway-private-host=envoy:8080 hairpin lands here.
+admin:
+  address: {socket_address: {address: 0.0.0.0, port_value: 9901}}
+static_resources:
+  listeners:
+    - name: main
+      address: {socket_address: {address: 0.0.0.0, port_value: 8080}}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: upstream_weather
+                      domains: ["weather.local", "weather.local:*"]
+                      routes:
+                        - match: {prefix: "/"}
+                          route: {cluster: weather_backend, timeout: 60s}
+                    - name: gateway
+                      domains: ["*"]
+                      routes:
+                        - match: {prefix: "/"}
+                          route: {cluster: broker_http, timeout: 60s}
+                http_filters:
+                  # Ingress observer part 1 (item 7): runs FIRST, before the MCP router
+                  # strips x-mcp-authorized on the dispatch (tools/call) path and before
+                  # Authorino replaces it, so a test can prove the SAME forwarded Bearer
+                  # + x-mcp-authorized reach both discovery and dispatch. It captures a
+                  # one-way fingerprint of each into dynamic metadata; part 2 (after the
+                  # router, which sets x-mcp-method) logs them labeled by method.
+                  # djb2 (not SHA-256) is deliberate: Envoy's inline Lua has no crypto
+                  # stdlib, and a 32-bit fingerprint is enough to compare equality of two
+                  # values from the SAME request while never exposing the raw credential.
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      default_source_code:
+                        inline_string: |
+                          function djb2(s)
+                            if s == nil or s == "" then return "0" end
+                            local h = 5381
+                            for i = 1, #s do
+                              h = (h * 33 + string.byte(s, i)) % 4294967296
+                            end
+                            return string.format("%08x", h)
+                          end
+                          function envoy_on_request(handle)
+                            local hdr = handle:headers()
+                            local md = handle:streamInfo():dynamicMetadata()
+                            md:set("mcp.ingress", "bearer", djb2(hdr:get("authorization")))
+                            md:set("mcp.ingress", "wristband", djb2(hdr:get("x-mcp-authorized")))
+                          end
+                  - name: envoy.filters.http.ext_proc
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                      failure_mode_allow: false
+                      allow_mode_override: true
+                      mutation_rules:
+                        allow_all_routing: true
+                      message_timeout: 15s
+                      processing_mode:
+                        request_header_mode: SEND
+                        response_header_mode: SEND
+                        request_body_mode: BUFFERED
+                        response_body_mode: NONE
+                        request_trailer_mode: SKIP
+                        response_trailer_mode: SKIP
+                      grpc_service:
+                        envoy_grpc: {cluster_name: router_grpc}
+                  # Ingress observer part 2 (item 7): runs AFTER the router sets
+                  # x-mcp-method, reads the pre-strip digests captured in dynamic
+                  # metadata, and logs them labeled by the JSON-RPC method.
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      default_source_code:
+                        inline_string: |
+                          function envoy_on_request(handle)
+                            local hdr = handle:headers()
+                            local md = handle:streamInfo():dynamicMetadata():get("mcp.ingress") or {}
+                            handle:logWarn("MCPINGRESS method=" .. (hdr:get("x-mcp-method") or "?") ..
+                              " bearer=" .. (md["bearer"] or "0") ..
+                              " wristband=" .. (md["wristband"] or "0"))
+                          end
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      failure_mode_allow: false
+                      grpc_service:
+                        envoy_grpc: {cluster_name: authorino_grpc}
+                        timeout: 5s
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: broker_http
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: broker_http
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {address: {socket_address: {address: mcp-broker, port_value: 8080}}}
+    - name: weather_backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: weather_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {address: {socket_address: {address: weather-backend, port_value: 9001}}}
+    - name: router_grpc
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: router_grpc
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {address: {socket_address: {address: mcp-broker, port_value: 50051}}}
+    - name: authorino_grpc
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: authorino_grpc
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {address: {socket_address: {address: authorino, port_value: 50051}}}
