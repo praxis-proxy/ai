@@ -390,6 +390,74 @@ fn transform_vllm_degrades_allowlisted_features_and_reports_them() {
     drop(proxy);
 }
 
+#[test]
+fn transform_vllm_folds_mid_conversation_system_message() {
+    // Claude Code puts a text-only `system` message inside the `messages`
+    // array after the first user turn (its environment block). The example
+    // config allows `mid_conversation_system`, so the fold must keep the
+    // forwarded body compatible with strict vLLM chat templates: exactly one
+    // system message, in the leading position, carrying the merged text.
+    let backend = start_chat_backend();
+    let proxy_port = free_port();
+    let config = transform_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "claude-opus-4-8",
+        "max_tokens": 128,
+        "system": "You are a coding assistant.",
+        "messages": [
+            {"role": "user", "content": "Hi"},
+            {"role": "system", "content": "# Environment\nworking directory: /tmp"},
+            {"role": "user", "content": "Reply with exactly: OK"}
+        ],
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header("/v1/messages", &request.to_string(), &gateway_auth_line()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "a degraded-but-translatable request still succeeds: {raw}"
+    );
+
+    let degraded = parse_header(&raw, "x-degraded-features").expect("the proxy must advertise the degraded features");
+    assert!(
+        degraded.contains("mid_conversation_system"),
+        "the folded system message must be reported: {degraded}"
+    );
+
+    let requests = backend.requests();
+    let forwarded = requests
+        .iter()
+        .find(|r| r.method == "POST")
+        .expect("backend should receive a POST request");
+    let body: Value = serde_json::from_str(&forwarded.body).expect("forwarded body should be JSON");
+    let messages = body["messages"]
+        .as_array()
+        .expect("translated body should carry a Chat Completions `messages` array");
+    assert_eq!(
+        messages.len(),
+        3,
+        "the mid-conversation system message must not survive in place: {messages:?}"
+    );
+    assert_eq!(
+        messages[0],
+        serde_json::json!({"role": "system", "content": "You are a coding assistant.\n\n# Environment\nworking directory: /tmp"}),
+        "the moved text merges into the single leading system message: {messages:?}"
+    );
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[2]["role"], "user");
+    assert!(
+        messages[1..].iter().all(|m| m["role"] != "system"),
+        "no system message may follow a non-system message: {messages:?}"
+    );
+
+    drop(proxy);
+}
+
 // -----------------------------------------------------------------------------
 // Credential isolation
 // -----------------------------------------------------------------------------

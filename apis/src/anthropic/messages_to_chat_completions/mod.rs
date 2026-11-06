@@ -482,6 +482,9 @@ fn record_degraded_features(ctx: &mut HttpFilterContext<'_>, degraded: request::
     if degraded.extended_thinking {
         features.push("extended_thinking");
     }
+    if degraded.mid_conversation_system {
+        features.push("mid_conversation_system");
+    }
     for feature in &features {
         counter!(
             "praxis_anthropic_messages_to_chat_completions_degraded_total",
@@ -1621,6 +1624,103 @@ mod tests {
         );
     }
 
+    /// An allowlisted mid-conversation system message drives the same operator
+    /// signal path as the other degradable features: the moved text lands in
+    /// the single leading system message of the forwarded body, the
+    /// per-feature counter fires, and the response header advertises it.
+    #[test]
+    fn mid_conversation_system_degradation_emits_counter_metadata_and_response_header() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str("allow_lossy_features:\n  - mid_conversation_system").unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
+
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        let anthropic_body = serde_json::json!({
+            "model": "claude-x",
+            "max_tokens": 2048,
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "# Environment\nworking directory: /tmp"},
+                {"role": "user", "content": "Reply with exactly: OK"}
+            ]
+        });
+        let mut body = Some(Bytes::from(serde_json::to_vec(&anthropic_body).unwrap()));
+        let mut response = make_response();
+
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let outcome = filter
+                    .on_selected_upstream_request_body(&mut ctx, &mut body)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(outcome, SelectedUpstreamBodyOutcome::Continue),
+                    "a degraded-but-translatable request continues with a rewritten body"
+                );
+
+                // The forwarded Chat Completions body has exactly one system
+                // message, in the leading position.
+                let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+                let messages = translated["messages"].as_array().unwrap();
+                assert_eq!(messages.len(), 3, "no system message may remain in history");
+                assert_eq!(messages[0]["role"], "system");
+                assert_eq!(
+                    messages[0]["content"],
+                    "You are helpful.\n\n# Environment\nworking directory: /tmp"
+                );
+                assert_eq!(messages[1]["role"], "user");
+                assert_eq!(messages[2]["role"], "user");
+
+                assert_eq!(
+                    ctx.get_metadata(DEGRADED_FEATURES_KEY),
+                    Some("mid_conversation_system"),
+                    "the moved system message should be recorded in metadata"
+                );
+
+                ctx.response_header = Some(&mut response);
+                let action = filter.on_response(&mut ctx).await.unwrap();
+                assert!(
+                    matches!(action, FilterAction::Continue),
+                    "response phase should continue"
+                );
+            });
+        });
+
+        assert_eq!(
+            response
+                .headers
+                .get(DEGRADED_FEATURES_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("mid_conversation_system"),
+            "the forwarded response should advertise the degraded feature"
+        );
+
+        let snapshot: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(key, _, _, value)| (key, value))
+            .collect();
+        let fired = snapshot.iter().any(|(key, value)| {
+            key.key().name() == "praxis_anthropic_messages_to_chat_completions_degraded_total"
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "feature" && label.value() == "mid_conversation_system")
+                && matches!(value, metrics_util::debugging::DebugValue::Counter(1))
+        });
+        assert!(fired, "the mid_conversation_system counter must fire once");
+    }
+
     /// Without an allowlist the filter keeps the strict #1584 behavior: a request
     /// that uses an Anthropic-only feature is rejected before any backend call,
     /// and no degradation signal is produced.
@@ -1723,6 +1823,7 @@ mod tests {
         let degraded = request::DegradedFeatures {
             prompt_caching: true,
             extended_thinking: true,
+            mid_conversation_system: false,
         };
 
         let events = capture_warn_events(|| record_degraded_features(&mut ctx, degraded));

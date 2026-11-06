@@ -550,12 +550,16 @@ claude --model "$VLLM_MODEL"
 the Praxis process. The other variables configure Claude Code.
 
 The translated `messages-to-openai-vllm.yaml` route enables
-`allow_lossy_features: [prompt_caching, extended_thinking]`, so you do **not**
+`allow_lossy_features: [prompt_caching, extended_thinking, mid_conversation_system]`, so you do **not**
 need to disable Anthropic thinking or prompt caching in Claude Code. Chat
 Completions cannot represent either feature, so Praxis strips the wire markers an
 unmodified client sends and reports the loss (a `WARN` log, the
 `praxis_anthropic_messages_to_chat_completions_degraded_total` counter, and an
 `x-degraded-features` response header) instead of rejecting the request.
+Claude Code also sends a `system` message after its first user turn (the
+environment block); real OpenAI accepts that shape, but vLLM chat templates
+reject it ("System message must be at the beginning"), so the same allowlist
+entry folds it into the leading system message.
 
 To see the strict behavior instead — a 400 when either feature appears — use the
 `messages-to-openai.yaml` route (empty allowlist) and disable both features in
