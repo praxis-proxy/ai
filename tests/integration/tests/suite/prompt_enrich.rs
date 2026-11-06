@@ -5,8 +5,8 @@
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    free_port, http_send, json_post, parse_body, parse_status, start_echo_backend, start_header_echo_backend,
-    start_proxy,
+    free_port, http_send, json_post, parse_body, parse_status, start_backend_with_shutdown, start_echo_backend,
+    start_header_echo_backend, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -235,6 +235,31 @@ fn prompt_enrichment_before_model_to_header_composes() {
     );
 }
 
+#[test]
+fn prompt_enrichment_before_prompt_length_routing_counts_injected_content() {
+    let large_guard = start_backend_with_shutdown("large-context");
+    let default_guard = start_backend_with_shutdown("default");
+    let proxy_port = free_port();
+    let yaml = prompt_length_compose_yaml(proxy_port, large_guard.port(), default_guard.port());
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/chat/completions",
+            r#"{"model":"small-model","messages":[{"role":"user","content":"Hi"}]}"#,
+        ),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "compose test should return 200");
+    assert_eq!(
+        parse_body(&raw),
+        "large-context",
+        "prompt_length_to_header must estimate the body after prompt_enrich writes it"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
@@ -390,6 +415,47 @@ filter_chains:
           - name: "backend"
             endpoints:
               - "127.0.0.1:{backend_port}"
+insecure_options:
+  allow_private_endpoints: true
+"#
+    )
+}
+
+fn prompt_length_compose_yaml(proxy_port: u16, large_port: u16, default_port: u16) -> String {
+    format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: prompt_enrich
+        prepend:
+          - role: system
+            content: "This injected instruction is intentionally long enough to overflow."
+      - filter: prompt_length_to_header
+        routes:
+          - model: small-model
+            max_input_tokens: 10
+            overflow: large-context
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            headers:
+              x-prompt-route: large-context
+            cluster: large-context
+          - path_prefix: "/"
+            cluster: default
+      - filter: load_balancer
+        clusters:
+          - name: large-context
+            endpoints:
+              - "127.0.0.1:{large_port}"
+          - name: default
+            endpoints:
+              - "127.0.0.1:{default_port}"
 insecure_options:
   allow_private_endpoints: true
 "#

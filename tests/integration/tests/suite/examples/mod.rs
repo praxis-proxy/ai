@@ -157,6 +157,7 @@ mod openai_tool_parse;
 mod openshell_sandboxed_coding_clients;
 mod project_state_owner_headers;
 mod prompt_enrichment;
+mod prompt_length_routing;
 mod provider_route;
 #[cfg(feature = "store-sqlite")]
 mod rehydrate;
