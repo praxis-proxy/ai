@@ -41,6 +41,7 @@ COPY store-lifecycle/Cargo.toml ./store-lifecycle/Cargo.toml
 COPY store-backends/Cargo.toml ./store-backends/Cargo.toml
 COPY apis/Cargo.toml ./apis/Cargo.toml
 COPY filters/Cargo.toml ./filters/Cargo.toml
+COPY enmaas-policy-filter/Cargo.toml ./enmaas-policy-filter/Cargo.toml
 COPY server/Cargo.toml ./server/Cargo.toml
 COPY server/build_support/Cargo.toml ./server/build_support/Cargo.toml
 
@@ -67,12 +68,13 @@ RUN sed -i '/xtask/d; /tests\//d; /benchmarks/d' Cargo.toml
 # Create stub source files for the crates whose real source isn't
 # needed until after dependencies are cached.
 RUN mkdir -p store/src store-lifecycle/src store-backends/src \
-        apis/src filters/src server/src integrations/llmd/ext-proc/src \
+        apis/src filters/src enmaas-policy-filter/src server/src integrations/llmd/ext-proc/src \
     && echo '//! stub' > store/src/lib.rs \
     && echo '//! stub' > store-lifecycle/src/lib.rs \
     && echo '//! stub' > store-backends/src/lib.rs \
     && echo '//! stub' > apis/src/lib.rs \
     && echo '//! stub' > filters/src/lib.rs \
+    && echo '//! stub' > enmaas-policy-filter/src/lib.rs \
     && echo '//! stub' > server/src/lib.rs \
     && echo '//! stub' > integrations/llmd/ext-proc/src/lib.rs \
     && printf '//! stub\nfn main() {}\n' > server/src/main.rs
@@ -94,11 +96,12 @@ COPY store-lifecycle/src ./store-lifecycle/src
 COPY store-backends/src ./store-backends/src
 COPY apis/src ./apis/src
 COPY filters/src ./filters/src
+COPY enmaas-policy-filter/src ./enmaas-policy-filter/src
 COPY server/src ./server/src
 COPY integrations/llmd/ext-proc/src ./integrations/llmd/ext-proc/src
 
 RUN find store/src store-lifecycle/src store-backends/src \
-        apis/src filters/src server/src integrations/llmd/ext-proc/src \
+        apis/src filters/src enmaas-policy-filter/src server/src integrations/llmd/ext-proc/src \
     -name '*.rs' -exec touch {} +
 
 # ------------------------------------------------------------------------------
