@@ -112,8 +112,8 @@ const TOOL_ITEM_TYPES: &[&str] = &["command_execution", "file_change", "mcp_tool
 // Compaction acceptance constants
 // -----------------------------------------------------------------------------
 //
-// Codex 0.144.1 against a provider named `praxis` does not qualify for remote
-// compaction (`supports_remote_compaction()` is false unless the provider is
+// Pinned Codex (verified 0.144.1 through 0.166.0) against a provider named
+// `praxis` does not qualify for remote compaction (`supports_remote_compaction()` is false unless the provider is
 // `openai`/Azure), and the `token_budget` window-reset feature ships disabled by
 // default. Auto-compaction therefore takes the local inline path
 // (`run_inline_auto_compact_task`), which POSTs the summarization prompt to
@@ -2539,8 +2539,9 @@ fn live_apply_patch_codex_jsonl_requires_a_completed_result_file_change() {
 
 /// Validate the compaction run's JSONL.
 ///
-/// Pinned Codex 0.144.1 emits exactly one `turn.completed` for the whole
-/// submitted prompt (covering every tool round), so accepted-turn growth is
+/// Pinned Codex (verified 0.144.1 through 0.166.0) emits exactly one
+/// `turn.completed` for the whole submitted prompt (covering every tool
+/// round), so accepted-turn growth is
 /// proven by counting correlated successful `command_execution` items, not
 /// `turn.completed` events.
 ///
@@ -2577,8 +2578,9 @@ fn chapter_labels(command: &str) -> Vec<&str> {
 }
 
 /// Unwraps a single `<shell> -c/-lc '<inner>'` layer and returns the command
-/// Codex actually executed. Pinned Codex 0.144.1 records shell-wrapped
-/// invocations such as `/bin/bash -lc './verify.sh'`; the unit fixtures use the
+/// Codex actually executed. Pinned Codex (verified 0.144.1 through 0.166.0)
+/// records shell-wrapped invocations such as `/bin/bash -lc './verify.sh'`;
+/// the unit fixtures use the
 /// bare form. Only one quoting layer is stripped, which is all Codex adds.
 fn unwrap_shell_command(command: &str) -> &str {
     let trimmed = command.trim();
