@@ -70,6 +70,7 @@ vertex-anthropic-filter = ["praxis-ai-filters/vertex-anthropic-filter", "experim
 basic-auth-filter = ["praxis-filter/basic-auth-filter", "experimental"]
 # Experimental: the token_rate_limit filter (see praxis-ai-filters).
 token-rate-limit-filter = ["praxis-ai-filters/token-rate-limit-filter", "experimental"]
+token-quota-filter = ["praxis-ai-filters/token-quota-filter", "experimental"]
 token-ceiling-filter = ["praxis-ai-filters/token-ceiling-filter", "experimental"]
 # Experimental: the inflight_tracker filter (see praxis-ai-filters).
 inflight-tracker-filter = ["praxis-ai-filters/inflight-tracker-filter", "experimental"]

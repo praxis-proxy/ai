@@ -98,7 +98,7 @@
     clippy::too_many_lines,
     reason = "tests"
 )]
-mod tests;
+pub(crate) mod tests;
 
 mod backend;
 mod config;
@@ -143,6 +143,8 @@ use self::{
     },
     weights::{TokenWeights, UsageCounts, parse_u64_meta, weighted_cost},
 };
+#[cfg(feature = "token-quota-filter")]
+use crate::token_quota::TokenQuotaResultStatus;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -1076,6 +1078,15 @@ struct AccountingPolicy {
     weights: TokenWeights,
     /// Stable digest of the filter-wide budget-key policy.
     key_fingerprint: String,
+}
+
+/// Source of the final response-phase reconciliation charge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconciliationSource {
+    /// Preserve the legacy filter/rule token-weight calculation.
+    LegacyWeights,
+    /// Consume the shared PPE token-quota result.
+    SharedQuota,
 }
 
 /// Extract `max_tokens` (preferred) or `max_completion_tokens` from a
@@ -2096,6 +2107,8 @@ fn compile_rule(
 ///   cached_input: 0.1                # prompt-cache hits (token.cache_read)
 ///   cache_write: 1.25                # prompt-cache writes (token.cache_write)
 ///   reasoning: 0.9                   # thinking tokens (token.reasoning)
+/// # use_token_quota: true            # alternatively consume PPE quota output;
+///                                    # mutually exclusive with all weights
 /// rules:
 ///   - name: team-alpha                 # human-readable, unique per filter instance
 ///     match:                           # optional: omit for a catch-all rule
@@ -2147,6 +2160,9 @@ pub struct TokenRateLimitFilter {
     /// Optional compiled hierarchy levels (org, team, user).
     hierarchy: Option<Vec<CompiledHierarchyLevel>>,
 
+    /// Authoritative source for the response-phase reconciliation charge.
+    reconciliation_source: ReconciliationSource,
+
     /// Expected shared-backend failure behavior for admission.
     on_failure: BackendOnFailure,
 }
@@ -2174,6 +2190,16 @@ impl TokenRateLimitFilter {
                 return Err(format!("token_rate_limit: duplicate rule name '{}'", rule.name).into());
             }
         }
+        if cfg.use_token_quota
+            && (!cfg.default_weights.is_empty() || cfg.rules.iter().any(|rule| !rule.weights.is_empty()))
+        {
+            return Err(
+                "token_rate_limit: use_token_quota cannot be combined with default_weights or per-rule weights".into(),
+            );
+        }
+        if cfg.use_token_quota && !cfg!(feature = "token-quota-filter") {
+            return Err("token_rate_limit: use_token_quota requires the token-quota-filter feature".into());
+        }
 
         let backend = build_backend_resource(&cfg.backend)?;
         let filter_defaults = TokenWeights::UNITY.overlay(&cfg.default_weights, "default_weights")?;
@@ -2186,7 +2212,10 @@ impl TokenRateLimitFilter {
             validate_rule_estimates_fit_hierarchy(&cfg.rules, levels)?;
         }
         let key_spec = compile_key_spec(cfg.key)?;
-        let key_fingerprint = key_spec.config_fingerprint();
+        let mut key_fingerprint = key_spec.config_fingerprint();
+        if cfg.use_token_quota {
+            key_fingerprint.push_str(":quota");
+        }
         let rules = cfg
             .rules
             .into_iter()
@@ -2208,6 +2237,11 @@ impl TokenRateLimitFilter {
             epoch: Instant::now(),
             valkey_clock: matches!(backend, BackendResource::Shared { .. }),
             hierarchy,
+            reconciliation_source: if cfg.use_token_quota {
+                ReconciliationSource::SharedQuota
+            } else {
+                ReconciliationSource::LegacyWeights
+            },
             on_failure: cfg.backend.on_failure,
         }))
     }
@@ -2233,6 +2267,19 @@ impl TokenRateLimitFilter {
     /// by `headers`, alongside its index for reconciliation.
     fn matching_rule(&self, headers: &http::HeaderMap) -> Option<(usize, &CompiledRule)> {
         self.rules.iter().enumerate().find(|(_, rule)| rule.matches(headers))
+    }
+
+    /// Resolve the final per-request quota charge from the configured source.
+    fn actual_cost(&self, ctx: &HttpFilterContext<'_>, rule: &CompiledRule) -> Option<u64> {
+        if self.reconciliation_source == ReconciliationSource::SharedQuota {
+            #[cfg(feature = "token-quota-filter")]
+            {
+                return crate::token_quota::decision(ctx).and_then(shared_quota_cost);
+            }
+            #[cfg(not(feature = "token-quota-filter"))]
+            return None;
+        }
+        weighted_cost(UsageCounts::from_context(ctx), rule.weights)
     }
 
     /// Resolve an opaque backend bucket key from request state.
@@ -2809,7 +2856,7 @@ impl TokenRateLimitFilter {
             .get_metadata(META_RULE_INDEX)
             .and_then(|v| v.parse::<usize>().ok())
             .and_then(|index| self.rules.get(index))?;
-        let actual = weighted_cost(UsageCounts::from_context(ctx), rule.weights);
+        let actual = self.actual_cost(ctx, rule);
         if actual.is_none() {
             tracing::trace!("token_rate_limit: no usable token usage metadata at end of stream, charging at estimate");
         }
@@ -2820,6 +2867,34 @@ impl TokenRateLimitFilter {
             now_ms: self.now_ms(),
         };
         Some((request, rule))
+    }
+
+    /// Record a missing shared-quota decision once for any response that has
+    /// a rule or hierarchy reservation to reconcile. Soft rule denials can
+    /// retain hierarchy reservations without retaining a rule reservation, so
+    /// this check must run before [`Self::reconciliation_context`] returns.
+    #[cfg(feature = "token-quota-filter")]
+    fn record_missing_quota_decision(&self, ctx: &HttpFilterContext<'_>) {
+        if self.reconciliation_source != ReconciliationSource::SharedQuota
+            || crate::token_quota::decision(ctx).is_some()
+        {
+            return;
+        }
+        let has_rule_reservation = parse_u64_meta(ctx, META_RESERVATION_ID).is_some();
+        let has_hierarchy_reservation = !Self::collect_hierarchy_stash(ctx).is_empty();
+        if !has_rule_reservation && !has_hierarchy_reservation {
+            return;
+        }
+        let rule_name = ctx
+            .get_metadata(META_RULE_INDEX)
+            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|index| self.rules.get(index))
+            .map_or("unknown", |rule| rule.name.as_str());
+        tracing::warn!(
+            rule = rule_name,
+            "token_rate_limit: token quota policy produced no decision"
+        );
+        counter!("praxis_trl_quota_source_missing_total", "rule" => rule_name.to_owned()).increment(1);
     }
 
     /// Reconcile a prior reservation against actual usage, if known.
@@ -2859,6 +2934,20 @@ impl TokenRateLimitFilter {
             tracing::error!(%error, rule = rule.name, "token_rate_limit: failed to enqueue reconciliation");
         }
     }
+}
+
+/// Accept only successfully evaluated PPE quota decisions.
+#[cfg(feature = "token-quota-filter")]
+fn shared_quota_cost(decision: crate::token_quota::TokenQuotaDecision) -> Option<u64> {
+    if decision.status != TokenQuotaResultStatus::Evaluated {
+        tracing::trace!(
+            status = decision.status.as_str(),
+            "token_rate_limit: token quota decision was not evaluated"
+        );
+    }
+    (decision.status == TokenQuotaResultStatus::Evaluated)
+        .then_some(decision.value)
+        .flatten()
 }
 
 /// Denial details from a completed `reserve()`, bundled so
@@ -3268,12 +3357,14 @@ impl HttpFilter for TokenRateLimitFilter {
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         if end_of_stream {
+            #[cfg(feature = "token-quota-filter")]
+            self.record_missing_quota_decision(ctx);
             if let Some(hierarchy) = &self.hierarchy {
                 let rule = ctx
                     .get_metadata(META_RULE_INDEX)
                     .and_then(|v| v.parse::<usize>().ok())
                     .and_then(|index| self.rules.get(index));
-                let actual = rule.and_then(|r| weighted_cost(UsageCounts::from_context(ctx), r.weights));
+                let actual = rule.and_then(|rule| self.actual_cost(ctx, rule));
                 reconcile_hierarchy(hierarchy, ctx, actual, self.now_ms());
                 Self::clear_hierarchy_metadata(ctx);
             }
@@ -3411,6 +3502,7 @@ mod backend_injection_tests {
             epoch: std::time::Instant::now() - std::time::Duration::from_secs(5),
             valkey_clock: false,
             hierarchy: None,
+            reconciliation_source: super::ReconciliationSource::LegacyWeights,
             on_failure: super::config::BackendOnFailure::Closed,
         };
         assert!(
@@ -3529,6 +3621,7 @@ mod backend_injection_tests {
             epoch: std::time::Instant::now(),
             valkey_clock: false,
             hierarchy: None,
+            reconciliation_source: super::ReconciliationSource::LegacyWeights,
             on_failure: super::config::BackendOnFailure::Closed,
         };
 

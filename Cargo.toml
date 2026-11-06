@@ -122,11 +122,13 @@ zstd = "0.14.0"
 # Policy Engine) and the pure-Rust cryptography its plugins carry; praxis-ai
 # forwards that engine through its own `policy-engine` feature instead, on by
 # default and off in the FIPS build (see FIPS_FEATURES in the Makefile).
-praxis-core = { version = "0.7.5", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.7.5", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
-praxis-protocol = { version = "0.7.5", package = "praxis-proxy-protocol" }
-praxis-tls = { version = "0.7.5", package = "praxis-proxy-tls" }
-praxis = { version = "0.7.5", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api", "pingora"] }
+# Pin the prerequisite for ai#1812 until praxis#1456 is released.
+praxis-core = { version = "0.7.5", git = "https://github.com/praxis-proxy/praxis.git", rev = "828f9749fe0b63075a3be8029ec8644a53d754c5", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.7.5", git = "https://github.com/praxis-proxy/praxis.git", rev = "828f9749fe0b63075a3be8029ec8644a53d754c5", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
+praxis-protocol = { version = "0.7.5", git = "https://github.com/praxis-proxy/praxis.git", rev = "828f9749fe0b63075a3be8029ec8644a53d754c5", package = "praxis-proxy-protocol" }
+praxis-tls = { version = "0.7.5", git = "https://github.com/praxis-proxy/praxis.git", rev = "828f9749fe0b63075a3be8029ec8644a53d754c5", package = "praxis-proxy-tls" }
+praxis = { version = "0.7.5", git = "https://github.com/praxis-proxy/praxis.git", rev = "828f9749fe0b63075a3be8029ec8644a53d754c5", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api", "pingora"] }
+ppe = { version = "0.4.1", package = "praxis-policy" }
 praxis-test-utils = { path = "tests/utils", default-features = false }
 
 # AI-owned llm-d ext_proc compatibility layer
@@ -152,6 +154,11 @@ metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
 cargo_metadata = "0.23.1"
+
+[patch.crates-io]
+quixotic-plecostomus-error = { git = "https://github.com/praxis-proxy/pingora", rev = "4fde8bb89a96c54ee19134d66d91f03e81f67f0a" }
+quixotic-plecostomus-header-serde = { git = "https://github.com/praxis-proxy/pingora", rev = "4fde8bb89a96c54ee19134d66d91f03e81f67f0a" }
+quixotic-plecostomus-http = { git = "https://github.com/praxis-proxy/pingora", rev = "4fde8bb89a96c54ee19134d66d91f03e81f67f0a" }
 
 [profile.release]
 codegen-units = 1
