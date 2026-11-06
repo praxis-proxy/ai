@@ -129,6 +129,7 @@ For a JSON body with `B` wire bytes and `E` counted JSON syntax elements:
 | Retained output per continued round | `32 × O` bytes for the `O` serialized bytes the round keeps in `accumulated_output`; another `16 × O` with Store | Kept items stay in the final output list; some also enter model-facing history. These charges accumulate across continued rounds. A terminal round keeps its round-local charge until the request ends. |
 | Store input | Another charge equal to the initial request-body charge | Reserves for the independently owned input snapshot when `store` is omitted or `true`. `store: false` avoids this and the Store output charges above. |
 | Streamed provider response (round-local) | `32 × C` for cumulative raw SSE bytes `C`, plus `512 × F` for counted JSON elements `F` in completed frames; Store adds `32 × C + 256 × F` | Covers the stream's transport and parsed frames for this round. Each incoming chunk also checks a temporary `16 × chunk bytes` peak; that peak is not accumulated. |
+| MCP server reply | `16 × B + 512 × E` bytes for each JSON body, SSE event `data`, or error body, checked before rmcp parses it | Covers the raw body, SSE framing, rmcp parsing, and result conversion; measured peak is about `8 × B + 250 × E`. Before dispatching `N` calls in a round, the dispatcher reserves a slot of `remaining ÷ 2 ÷ N` per call. Each reply's charge may use half its slot, and its wire limit is that half divided by 16. |
 | Iterative-router response buffer | `3 × (limit ÷ 8)` bytes | Reserves for the core buffer and possible spare capacity before the provider responds. This is 24 MiB at the default 64 MiB limit. |
 
 For a create that restores history, Store receives the remaining ledger
@@ -268,7 +269,7 @@ request limits, transport caps, and operational capacity controls still apply.
 | Tool execution | [`openai_file_search_dispatch`] | Charge search fanout, raw and parsed results, model context, public output, and citations. |
 | Tool execution | [`openai_web_search_dispatch`] | Limit provider response bytes from remaining headroom and charge results and both model-facing and public output. |
 | Translation | [`openai_responses_to_chat_completions`] | Charge translated Chat requests and responses, including streaming converter frames and snapshots. |
-| Completion | [`openai_conversations`] | Reserve the completed turn and bound transactional conversation-cache rebuild before append-back. |
+| Completion | [`openai_conversations`] | Reserve the completed turn and bound the transactional item append, including a one-time legacy-cache copy when needed. |
 | Completion | [`openai_responses_store`] | Bound buffered output, require the ledger before input capture, and skip success persistence after budget failure. |
 | Compatibility | [`anthropic_web_search`] | Treat the shared provider's new retained-limit outcome as a failed tool result; Anthropic requests do not use this ledger. |
 

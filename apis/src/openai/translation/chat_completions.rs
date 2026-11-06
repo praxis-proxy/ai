@@ -370,6 +370,22 @@ pub(crate) fn responses_request_to_chat_request(
     translate_responses_request(request, RequestOverrides::default(), reasoning)
 }
 
+/// Map only Responses instructions and input to canonical conversation messages.
+///
+/// Standalone guardrail checks need this content even when unrelated request
+/// options cannot be represented by a Chat Completions backend. Callers must
+/// still validate that the mapped content is supported by their evaluator.
+pub(crate) fn responses_request_to_chat_messages(
+    request: &Value,
+    reasoning: &ReasoningOptions,
+) -> Result<Vec<Value>, TranslationError> {
+    let obj = request
+        .as_object()
+        .ok_or(TranslationError::ExpectedObject("Responses request"))?;
+    validate_input_container(obj.get("input"))?;
+    build_chat_messages(obj, None, reasoning)
+}
+
 /// Convert canonical Responses state into a Chat Completions request.
 pub(crate) fn responses_state_to_chat_request<'a>(
     request: &Value,

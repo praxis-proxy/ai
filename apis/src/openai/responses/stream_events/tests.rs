@@ -25,6 +25,7 @@ use crate::{
     openai::{
         responses::{
             agentic_loop::budget::SimpleBudget,
+            openai_client_tool_compat::custom_input::CustomInputFormat,
             state::{ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, SynthesisKind},
         },
         sse::{SseFrameParser, SseParseError},
@@ -197,6 +198,7 @@ fn repeated_lowered_done_retains_one_completion_snapshot_per_item() {
             original_name: "read".to_owned(),
             namespace: Some("fs".to_owned()),
             restore: ClientToolRestore::NamespaceCustom,
+            format: CustomInputFormat::Text,
         },
     );
     ctx.extensions.insert(state);
@@ -934,6 +936,7 @@ fn canonicalize_restores_lowered_client_tool_terminal_snapshot() {
                 original_name: "run_python".to_owned(),
                 namespace: None,
                 restore: ClientToolRestore::Custom,
+                format: CustomInputFormat::Text,
             },
         )]),
         client_tool_echo: Some(ClientToolEcho {
@@ -991,6 +994,7 @@ fn canonicalize_fails_closed_on_lossy_terminal_client_tool_restore() {
                 original_name: "run_python".to_owned(),
                 namespace: None,
                 restore: ClientToolRestore::Custom,
+                format: CustomInputFormat::Text,
             },
         )]),
         response_object: json!({
@@ -1876,6 +1880,7 @@ async fn staged_byte_budget_fails_closed_without_committing_delivery() {
             original_name: "shell".to_owned(),
             namespace: None,
             restore: ClientToolRestore::Shell,
+            format: CustomInputFormat::Text,
         },
     );
     ctx.extensions.insert(responses);
@@ -4993,6 +4998,7 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
             key: "item:call_1".to_owned(),
             private_name: "custom_run_python".to_owned(),
             restore: ClientToolRestore::Custom,
+            format: CustomInputFormat::Text,
             phase: ClientToolPhase::Opened, // never reached Done
             output_index: 0,
             item_id: Some("call_1".to_owned()),
@@ -6582,6 +6588,7 @@ async fn namespace_lowered_call_retyped_in_place_through_commit_never_leaks_priv
                 original_name: "read".to_owned(),
                 namespace: Some("fs".to_owned()),
                 restore: ClientToolRestore::Namespace,
+                format: CustomInputFormat::Text,
             },
         );
 
@@ -6682,6 +6689,7 @@ async fn custom_lowered_call_restored_to_custom_tool_call_lifecycle_through_comm
                 original_name: "run_python".to_owned(),
                 namespace: None,
                 restore: ClientToolRestore::Custom,
+                format: CustomInputFormat::Text,
             },
         );
 
@@ -6811,6 +6819,7 @@ async fn namespace_custom_lowered_call_restored_through_commit_never_leaks_priva
                 original_name: "run".to_owned(),
                 namespace: Some("code".to_owned()),
                 restore: ClientToolRestore::NamespaceCustom,
+                format: CustomInputFormat::Text,
             },
         );
 
@@ -6934,6 +6943,7 @@ async fn shell_lowered_call_restored_to_shell_call_lifecycle_through_commit() {
                 original_name: "shell".to_owned(),
                 namespace: None,
                 restore: ClientToolRestore::Shell,
+                format: CustomInputFormat::Text,
             },
         );
 
@@ -7058,6 +7068,7 @@ async fn tool_search_lowered_call_restored_to_tool_search_call_lifecycle_through
                 original_name: "tool_search".to_owned(),
                 namespace: None,
                 restore: ClientToolRestore::ToolSearch,
+                format: CustomInputFormat::Text,
             },
         );
 
@@ -7189,6 +7200,7 @@ async fn poisoned_stream_never_leaks_rolled_back_lowered_name_on_later_done() {
                 original_name: "apply_patch".to_owned(),
                 namespace: None,
                 restore: ClientToolRestore::Custom,
+                format: CustomInputFormat::Text,
             },
         );
 
@@ -7330,4 +7342,151 @@ fn make_armed_context_with_filter(
     ctx.current_filter_id = Some(0);
     filter.arm(&mut ctx);
     (filter, ctx)
+}
+
+// #1834: end-to-end streaming proof for a lowered `apply_patch` grammar `custom`
+// tool. A valid decoded patch is restored to the canonical `custom_tool_call`
+// input lifecycle; a malformed patch fails the stream closed at `arguments.done`
+// (the live `plan_custom_arguments_done` validation) so no successful terminal
+// response is produced.
+#[tokio::test]
+async fn apply_patch_stream_restores_valid_patch() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(ResponsesState::from_request_body(
+        json!({"model": "m", "input": "hi", "stream": true}),
+    ));
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .client_tool_lowering
+        .insert(
+            "apply_patch".to_owned(),
+            LoweredClientTool {
+                original_name: "apply_patch".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+                format: CustomInputFormat::ApplyPatch,
+            },
+        );
+    filter.arm(&mut ctx);
+
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({"response": {"id": "resp_1", "status": "in_progress", "output": []}, "sequence_number": 0}),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+
+    let patch = "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\n";
+    let args = json!({ "input": patch }).to_string();
+    let added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({"output_index": 0, "item": {"type": "function_call", "name": "apply_patch", "call_id": "c1", "id": "fc_1"}, "sequence_number": 1}),
+    );
+    let args_done = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({"output_index": 0, "item_id": "fc_1", "arguments": args, "sequence_number": 2}),
+    );
+    let item_done = make_sse_chunk(
+        "response.output_item.done",
+        &json!({"output_index": 0, "item": {"type": "function_call", "name": "apply_patch", "call_id": "c1", "id": "fc_1", "arguments": args, "status": "completed"}, "sequence_number": 3}),
+    );
+    let mut chunk = Some({
+        let mut buf = added.to_vec();
+        buf.extend_from_slice(&args_done);
+        buf.extend_from_slice(&item_done);
+        Bytes::from(buf)
+    });
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+
+    let emitted = String::from_utf8(chunk.unwrap().to_vec()).unwrap();
+    assert!(
+        emitted.contains(r#""type":"custom_tool_call""#),
+        "restored type reaches the client: {emitted}"
+    );
+    assert!(
+        emitted.contains("response.custom_tool_call_input.done"),
+        "synthesized input done emitted: {emitted}"
+    );
+    assert!(
+        emitted.contains("*** Begin Patch"),
+        "the decoded patch reaches the client: {emitted}"
+    );
+    assert!(
+        !emitted.contains("fc_1"),
+        "the private lowered id never leaks: {emitted}"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_stream_fails_closed_on_malformed_patch() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(ResponsesState::from_request_body(
+        json!({"model": "m", "input": "hi", "stream": true}),
+    ));
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .client_tool_lowering
+        .insert(
+            "apply_patch".to_owned(),
+            LoweredClientTool {
+                original_name: "apply_patch".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+                format: CustomInputFormat::ApplyPatch,
+            },
+        );
+    filter.arm(&mut ctx);
+
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({"response": {"id": "resp_1", "status": "in_progress", "output": []}, "sequence_number": 0}),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+
+    // The backend emitted a syntactically invalid patch inside the envelope.
+    let args = json!({ "input": "this is not a patch" }).to_string();
+    let added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({"output_index": 0, "item": {"type": "function_call", "name": "apply_patch", "call_id": "c1", "id": "fc_1"}, "sequence_number": 1}),
+    );
+    let args_done = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({"output_index": 0, "item_id": "fc_1", "arguments": args, "sequence_number": 2}),
+    );
+    let mut chunk = Some({
+        let mut buf = added.to_vec();
+        buf.extend_from_slice(&args_done);
+        Bytes::from(buf)
+    });
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+
+    // Fail-closed in the live stream poisons the logical stream (metadata), surfaces a
+    // client-safe restore cause, and suppresses the successful custom-input events —
+    // it does not return an error from on_response_body.
+    assert_eq!(
+        ctx.get_metadata("responses.stream_parse_error"),
+        Some("true"),
+        "a malformed streamed patch poisons the stream",
+    );
+    assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
+    assert!(
+        ctx.get_metadata("responses.stream_error_message")
+            .unwrap_or_default()
+            .contains("client tool restoration failed"),
+        "the fail-closed cause is the client-tool restore error",
+    );
+    let emitted = String::from_utf8(chunk.map(|c| c.to_vec()).unwrap_or_default()).unwrap();
+    assert!(
+        !emitted.contains("response.custom_tool_call_input.done"),
+        "no successful custom input is emitted for a malformed patch: {emitted}",
+    );
 }

@@ -1,0 +1,115 @@
+# Inference Fallback with Cross-Provider Translation
+#
+# Demonstrates provider failover from an OpenAI-compatible backend to an
+# Anthropic Messages provider with JSON and streaming SSE translation using
+# the iterative_request_router. When the
+# primary OpenAI backend returns a retryable status, the request is retried
+# against the Anthropic fallback with full request and response translation.
+# The client continues to speak OpenAI Chat Completions.
+#
+# The primary step preserves OpenAI Chat Completions bytes and selects the
+# typed IRR streaming transport when the client requests `stream: true`. The
+# fallback step composes the trusted provider profile pipeline:
+#
+#   1. openai_chat_completions_streaming_selector selects typed IRR streaming
+#      from the client request before the fallback translates it
+#   2. model_to_header promotes the client model so intelligent_route can
+#      resolve the candidate (the IRR resets per-step request state, so the
+#      header must be set inside the step that consumes it)
+#   3. intelligent_route binds the Anthropic candidate from a versioned
+#      overlay (api format, path, target model, credential reference)
+#   4. openai_chat_completions_to_anthropic_stream converts successful
+#      Anthropic SSE responses incrementally to OpenAI Chat Completions SSE
+#   5. openai_chat_completions_to_anthropic rewrites the request path and
+#      body to Anthropic Messages, and converts non-streaming responses back
+#      to OpenAI Chat Completions
+#   6. credential_inject injects the selected Anthropic API key
+#   7. load_balancer selects the fallback endpoint
+#
+# Each IRR step starts from the original client request, so the fallback
+# step re-translates from the canonical Chat Completions body rather than
+# from anything the primary step sent upstream.
+#
+# The routing overlay is a checked-in synthetic fixture. Replace it with a
+# production Grid overlay and real credential references for deployments.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy --features full -- -c examples/configs/inference/fallback-with-provider-translation.yaml
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [inference-failover]
+
+filter_chains:
+  - name: inference-failover
+    filters:
+      - filter: iterative_request_router
+        initial_step: primary
+        steps:
+          - name: primary
+            filters:
+              # Select typed IRR streaming for a client stream: true request.
+              - filter: openai_chat_completions_streaming_selector
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: openai-backend
+              - filter: credential_injection
+                clusters:
+                  - name: openai-backend
+                    header: Authorization
+                    value: "openai-key"
+                    header_prefix: "Bearer "
+                    strip_client_credential: true
+              - filter: load_balancer
+                clusters:
+                  - name: openai-backend
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - status: [429, 502, 503, 504]
+                next: anthropic-fallback
+              - default: true
+                done: true
+
+          - name: anthropic-fallback
+            filters:
+              # The fallback replays the original request, so it independently
+              # selects typed IRR streaming for stream: true.
+              - filter: openai_chat_completions_streaming_selector
+              # The IRR resets per-step request state, so the model header
+              # must be promoted inside this step for intelligent_route.
+              - filter: model_to_header
+                header: X-Model
+              - filter: intelligent_route
+                overlay_file: tests/integration/fixtures/inference/routing/openai-to-anthropic.json
+                model_header: X-Model
+                clusters: [anthropic-backend]
+                reload: {enabled: false}
+              - filter: openai_chat_completions_to_anthropic_stream
+                max_partial_event_bytes: 1048576
+                max_tool_blocks: 256
+              - filter: openai_chat_completions_to_anthropic
+                api_translation_enabled: true
+                max_body_bytes: 1048576
+              - filter: credential_inject
+                credentials:
+                  - name: anthropic-fixture-secret
+                    namespace: grid-fixture
+                    key: api-key
+                    strategy: apikey
+                    header: x-api-key
+                    # Synthetic fixture token only; use env_var or file in deployments.
+                    value: anthropic-fixture-key
+              - filter: load_balancer
+                clusters:
+                  - name: anthropic-backend
+                    endpoints:
+                      - "127.0.0.1:3002"
+            on_result:
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

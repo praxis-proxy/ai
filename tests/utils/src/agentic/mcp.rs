@@ -86,6 +86,10 @@ pub struct McpMockConfig {
     /// default 405 makes the transport treat the server as not supporting SSE and
     /// skip it. Enable this to exercise the GET-common-stream path end-to-end.
     pub serve_get_stream: bool,
+
+    /// When `Some`, attach this value as `structuredContent` to successful
+    /// `tools/call` results.
+    pub structured_content: Option<Value>,
 }
 
 impl Default for McpMockConfig {
@@ -100,6 +104,7 @@ impl Default for McpMockConfig {
             sse_tool_results: false,
             oversized_sse_bytes: None,
             serve_get_stream: false,
+            structured_content: None,
         }
     }
 }
@@ -535,9 +540,15 @@ fn handle_tools_call(stream: &mut TcpStream, config: &McpMockConfig, id: &Option
     } else if config.failing_tools.iter().any(|t| t == &name) {
         write_failing_tool_result(stream, id, &name);
     } else if config.sse_tool_results {
-        write_known_tool_result_sse(stream, id, &name, config.oversized_sse_bytes);
+        write_known_tool_result_sse(
+            stream,
+            id,
+            &name,
+            config.oversized_sse_bytes,
+            config.structured_content.as_ref(),
+        );
     } else {
-        write_known_tool_result(stream, id, &name);
+        write_known_tool_result(stream, id, &name, config.structured_content.as_ref());
     }
 }
 
@@ -678,8 +689,8 @@ fn record_request(state: &Mutex<Vec<McpRecordedRequest>>, record: McpRecordedReq
 }
 
 /// Successful `tools/call` content result.
-fn write_known_tool_result(stream: &mut TcpStream, id: &Option<Value>, name: &str) {
-    let result = json!({
+fn write_known_tool_result(stream: &mut TcpStream, id: &Option<Value>, name: &str, structured: Option<&Value>) {
+    let mut result = json!({
         "jsonrpc": "2.0",
         "id": id,
         "result": {
@@ -690,6 +701,9 @@ fn write_known_tool_result(stream: &mut TcpStream, id: &Option<Value>, name: &st
             "isError": false,
         }
     });
+    if let Some(structured) = structured {
+        result["result"]["structuredContent"] = structured.clone();
+    }
 
     let body = result.to_string();
     write_response(
@@ -702,7 +716,13 @@ fn write_known_tool_result(stream: &mut TcpStream, id: &Option<Value>, name: &st
 }
 
 /// Successful `tools/call` content result emitted as SSE.
-fn write_known_tool_result_sse(stream: &mut TcpStream, id: &Option<Value>, name: &str, oversized_bytes: Option<usize>) {
+fn write_known_tool_result_sse(
+    stream: &mut TcpStream,
+    id: &Option<Value>,
+    name: &str,
+    oversized_bytes: Option<usize>,
+    structured: Option<&Value>,
+) {
     let mut result = json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -711,6 +731,9 @@ fn write_known_tool_result_sse(stream: &mut TcpStream, id: &Option<Value>, name:
             "isError": false,
         }
     });
+    if let Some(structured) = structured {
+        result["result"]["structuredContent"] = structured.clone();
+    }
 
     // Pad the result if oversized_bytes is set to trigger transport's wire ceiling
     if let Some(n) = oversized_bytes {

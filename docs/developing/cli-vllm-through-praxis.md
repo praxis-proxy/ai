@@ -20,6 +20,10 @@ Anthropic-compatible API. For Codex, Praxis keeps `/v1/responses` end to end
 and lowers only client-owned tool types that vLLM does not understand. Use a
 translated path for a backend that only exposes OpenAI Chat Completions.
 
+To run these clients inside NVIDIA OpenShell sandboxes while Praxis and vLLM
+stay on the host, follow this guide for vLLM and Praxis, then
+[Run your Code Harness in OpenShell through Praxis and vLLM](openshell-cli-vllm-through-praxis.md).
+
 ## 1. Start vLLM
 
 ### On-demand GPU endpoint
@@ -168,8 +172,11 @@ supports their respective endpoints.
 ### Serving all four clients from one gateway
 
 One proxy process can serve all four CLIs over their native paths at once.
-There is no example config for this, because it is the two native examples
-above placed in one file: the Claude Code, OpenCode, and pi chain from
+It is the two native examples above placed in one file:
+[`openshell/sandboxed-coding-clients.yaml`](../../examples/configs/openshell/sandboxed-coding-clients.yaml)
+is that file, with both listeners on `0.0.0.0` for sandboxed clients; change
+them to `127.0.0.1` to serve clients on the same host. It contains the Claude
+Code, OpenCode, and pi chain from
 `anthropic/messages-native-vllm.yaml` and the Codex chain from
 `openai/responses/client-tool-compat.yaml`, behind two listeners, pointed at
 the same vLLM server and sharing one `GATEWAY_AUTH_PASSWORD`.
@@ -340,11 +347,14 @@ to the copied config:
 2. Change the local vLLM endpoint from `127.0.0.1:8000` to
    `host.docker.internal:8000`, and pass
    `--add-host=host.docker.internal:host-gateway` on the command line.
-3. Add `allow_private_upstreams: true` beside the existing
-   `allow_private_endpoints: true`. The existing option covers literal private
-   endpoints written in the config; the new one is needed because that
-   hostname *resolves* to a private address, and without it the request fails
-   with `upstream hostname resolved to private/reserved IP address`.
+3. Add `host.docker.internal` to `trusted_private_endpoints` on both
+   `load_balancer` clusters (`vllm-backend` and `vllm-responses-backend`). The
+   existing `allow_private_endpoints` covers literal private endpoints written
+   in the config; the new entry is needed because that hostname *resolves* to a
+   private address. Without it, the request fails with
+   `upstream hostname resolved to private/reserved IP address`. Prefer this
+   scoped entry over `insecure_options.allow_private_upstreams`, which relaxes
+   the check for every upstream.
 
 ```console
 docker run -d --rm --name praxis-vllm \
@@ -357,7 +367,8 @@ docker run -d --rm --name praxis-vllm \
 
 With Podman, both commands work unchanged. Podman also resolves
 `host.containers.internal` on its own, so the published-port config can use
-that name and drop `--add-host`.
+that name and drop `--add-host` — and use the same name in
+`trusted_private_endpoints`.
 
 The on-demand GPU endpoint needs no backend-specific container handling: the
 tunnel hostname is public, so the `endpoints` and `tls.sni` edits above are the
@@ -1186,3 +1197,29 @@ kill "$PRAXIS_PID"
 - Claude startup probes may call `/v1/messages/count_tokens`. Native vLLM
   supports it; the translated Chat path can return 404 and Claude degrades
   gracefully.
+
+## Pinned client versions
+
+The integration tests pin one version of each client and one vLLM image. Each
+client's manifest under `tests/integration/fixtures/*/pin.toml` is the source
+of truth for that client; the vLLM image is pinned in the OpenCode 1.x and
+Claude Code manifests. `cargo xtask check-pins` (part of `make lint`) fails if
+any harness constant, workflow, checksum fixture, or image reference disagrees
+with them.
+
+To move every pin to its latest upstream release within each manifest's
+`major_series`:
+
+```console
+cargo xtask bump-pins --dry-run   # report available bumps, write nothing
+cargo xtask bump-pins             # or: --pin opencode --pin vllm ...
+```
+
+It rewrites every mechanical site, swaps the checksum fixtures, and validates
+the result before writing. It never changes behavioral pins: tool lists,
+exit-code semantics, version-conditioned test expectations, replay recordings,
+and "verified against" claims in this guide. Its report lists those as a
+re-validation checklist, together with every line that still names the old
+version. The weekly `Bump Pins` workflow runs it and opens a draft pull request
+with that checklist; the GPU acceptance lanes (`vllm-full-suite` label) gate it
+before review.

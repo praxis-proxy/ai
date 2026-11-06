@@ -15,6 +15,9 @@ translation — the only routes whose outbound wire headers differ between
 SDK v1 (`anthropic-version: 2023-06-01`, `x-api-key`) and SDK v2
 (`anthropic-version: 2026-10-21`, `Authorization: Bearer`).
 
+Native request guardrails are also checked through `nemo-guardrails.yaml`,
+using recording NeMo and model backends for both SDK lanes.
+
 The third translation direction (OpenAI -> Anthropic Messages) is driven
 by the OpenAI SDK as the client, so it does not vary on this axis; its
 backend wire headers are asserted in
@@ -42,7 +45,7 @@ from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-from anthropic import Anthropic, BadRequestError
+from anthropic import APIStatusError, Anthropic, BadRequestError
 
 from conftest import find_binary as _find_binary
 from conftest import free_port as _free_port
@@ -160,6 +163,9 @@ def _chat_sse(text: str = "hello") -> bytes:
 NATIVE_STATE = _RecordingState(_anthropic_message([{"type": "text", "text": "hello"}]),
                                "application/json")
 TRANSLATED_STATE = _RecordingState(_chat_completion(content="hello"), "application/json")
+NEMO_STATE = _RecordingState(
+    json.dumps({"status": "passed", "content": "Hello"}).encode(), "application/json"
+)
 
 
 class _RecordingHandler(BaseHTTPRequestHandler):
@@ -190,10 +196,15 @@ class _TranslatedHandler(_RecordingHandler):
     state = TRANSLATED_STATE
 
 
+class _NemoHandler(_RecordingHandler):
+    state = NEMO_STATE
+
+
 @pytest.fixture(autouse=True)
 def _reset_recording_states():
     NATIVE_STATE.reset()
     TRANSLATED_STATE.reset()
+    NEMO_STATE.reset()
 
 
 def _retarget_example(config_path: str, replacements: list[tuple[str, str]]) -> str:
@@ -293,6 +304,29 @@ def translated_client():
         )
 
 
+@pytest.fixture()
+def native_guardrails_client():
+    """Exercise the checked-in request guardrails example with recording providers."""
+    with ExitStack() as stack:
+        backend, backend_thread = _start_backend(NATIVE_STATE, _NativeHandler)
+        stack.callback(_stop_backend, backend, backend_thread)
+        nemo, nemo_thread = _start_backend(NEMO_STATE, _NemoHandler)
+        stack.callback(_stop_backend, nemo, nemo_thread)
+        port = _free_port()
+        config_path = _retarget_example("examples/configs/nemo-guardrails.yaml", [
+            ("0.0.0.0:8080", f"127.0.0.1:{port}"),
+            ("127.0.0.1:3000", f"127.0.0.1:{backend.server_address[1]}"),
+            ("127.0.0.1:3001", f"127.0.0.1:{nemo.server_address[1]}"),
+        ])
+        stack.callback(os.unlink, config_path)
+        proc = _start_proxy(config_path, port)
+        stack.callback(_stop_proxy, proc)
+        yield stack.enter_context(Anthropic(
+            base_url=f"http://127.0.0.1:{port}", api_key="test-key",
+            max_retries=0, timeout=10.0,
+        ))
+
+
 def _native_expected_headers(lane: str) -> dict[str, str]:
     """Wire headers each SDK lane must send on the native route."""
     if lane == "2.x":
@@ -302,6 +336,64 @@ def _native_expected_headers(lane: str) -> dict[str, str]:
 
 def _native_forbidden_headers(lane: str) -> list[str]:
     return ["x-api-key"] if lane == "2.x" else ["authorization"]
+
+
+class TestNativeGuardrails:
+    """Native Messages must be screened before forwarding through either SDK lane."""
+
+    @pytest.mark.parametrize("content", ["Hello", [{"type": "text", "text": "Hello"}]],
+                             ids=["string-content", "text-blocks"])
+    def test_canonical_checks_preserve_native_input(self, native_guardrails_client, anthropic_sdk_info, content):
+        body = {
+            "model": MODEL, "max_tokens": 64,
+            "system": [{"type": "text", "text": "Follow policy."}],
+            "messages": [{"role": "user", "content": content}],
+        }
+        response = native_guardrails_client.messages.create(**body)
+        assert response.content[0].text == "hello", "the native response must parse through the SDK"
+        assert len(NEMO_STATE.requests) == 1, "the SDK request must actually be screened"
+        check_path, check_headers, check = NEMO_STATE.requests[0]
+        assert check_path == "/v1/checks", "guardrails must use the NeMo checks endpoint"
+        assert check["messages"] == [
+            {"role": "system", "content": "Follow policy."},
+            {"role": "user", "content": "Hello"},
+        ], "NeMo must receive canonical system and user text"
+        assert check["guardrails"] == {"rail_types": ["input"], "config_ids": ["your-config"]}, (
+            "the example must retain its guardrail configuration and input phase"
+        )
+        assert "authorization" not in check_headers and "x-api-key" not in check_headers, (
+            "caller credentials must not be projected onto NeMo"
+        )
+        assert len(NATIVE_STATE.requests) == 1, "a passed verdict must forward exactly once"
+        path, headers, forwarded = NATIVE_STATE.requests[0]
+        assert path == "/v1/messages", "the native Messages route must be preserved"
+        assert forwarded == body, "guardrails must preserve all original Anthropic fields"
+        _, lane = anthropic_sdk_info
+        for name, expected in _native_expected_headers(lane).items():
+            assert headers.get(name) == expected, f"guardrails must preserve SDK {lane} header {name}"
+
+    @pytest.mark.parametrize("verdict, expected_status", [("blocked", 403), ("modified", 502)])
+    def test_unsafe_verdicts_prevent_model_calls(self, native_guardrails_client, verdict, expected_status):
+        NEMO_STATE.script(200, "application/json", {
+            "status": verdict, "content": "masked", "rail": "pii",
+        })
+        with pytest.raises(APIStatusError) as error:
+            native_guardrails_client.messages.create(
+                model=MODEL, max_tokens=64, system="Follow policy.",
+                messages=[{"role": "user", "content": "Contact alice@example.com"}],
+            )
+        assert error.value.status_code == expected_status, "the SDK must observe the guardrail rejection"
+        assert len(NEMO_STATE.requests) == 1, "the rejection must follow a real provider call"
+        assert not NATIVE_STATE.requests, "blocked or modified native input must never reach the model"
+
+    def test_unchanged_modification_keeps_native_body(self, native_guardrails_client):
+        NEMO_STATE.script(200, "application/json", {"status": "modified", "content": "Hello"})
+        body = {"model": MODEL, "max_tokens": 64, "messages": [{"role": "user", "content": "Hello"}]}
+        response = native_guardrails_client.messages.create(**body)
+        assert response.content[0].text == "hello", "an unchanged modification must pass through the SDK"
+        assert len(NEMO_STATE.requests) == 1, "unchanged input must still be evaluated"
+        assert len(NATIVE_STATE.requests) == 1, "an unchanged verdict must reach the model once"
+        assert NATIVE_STATE.requests[0][2] == body, "a no-op modification must preserve the native request"
 
 
 class TestNativePassthrough:

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use http::{HeaderValue, StatusCode};
 use praxis_filter::{FilterAction, Response, SelectedUpstreamBodyOutcome};
@@ -39,13 +40,16 @@ fn converts_legacy_request_direction_and_binds_target_model() {
     assert_eq!(translated["messages"][2]["content"][0]["tool_use_id"], "call-1");
     assert_eq!(translated["tools"][0]["input_schema"]["type"], "object");
     assert_eq!(translated["tool_choice"], json!({"type":"tool","name":"weather"}));
-    assert_eq!(profile.client_model, "client-model");
+    assert_eq!(
+        profile.client_model, "client-model",
+        "the profile must preserve the client-visible model"
+    );
     assert!(profile.stream);
     assert!(profile.include_usage);
 }
 
 #[test]
-fn rejects_unmapped_fields_and_content_instead_of_dropping_them() {
+fn rejects_unmapped_fields_but_preserves_supported_image_content() {
     let unsupported =
         br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"frequency_penalty":0.3}"#;
     assert!(
@@ -53,29 +57,260 @@ fn rejects_unmapped_fields_and_content_instead_of_dropping_them() {
             .unwrap_err()
             .contains("frequency_penalty")
     );
-    let image = br#"{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.invalid/x.png"}}]}],"max_tokens":8}"#;
-    assert!(
-        translate_request(image, "provider-model")
-            .unwrap_err()
-            .contains("image_url")
-    );
 }
 
 #[test]
-fn rejects_conflicting_token_limits_and_invalid_tool_arguments() {
-    let conflict =
-        br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"max_completion_tokens":9}"#;
-    assert!(
-        translate_request(conflict, "provider-model")
-            .unwrap_err()
-            .contains("disagree")
-    );
+fn invalid_tool_arguments_still_fail() {
     let invalid = br#"{"model":"m","messages":[{"role":"assistant","tool_calls":[{"id":"call","type":"function","function":{"name":"f","arguments":"[]"}}]}],"max_tokens":8}"#;
     assert!(
         translate_request(invalid, "provider-model")
             .unwrap_err()
             .contains("JSON object")
     );
+}
+
+#[test]
+fn defaults_missing_max_tokens_and_preserves_alias_precedence() {
+    let base = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]"#;
+    let defaulted = format!("{base}}}");
+    let (bytes, _) = translate_request(defaulted.as_bytes(), "provider-model").unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["max_tokens"],
+        4096,
+        "omitting both token aliases must use the compatibility default"
+    );
+
+    for (field, expected) in [("max_tokens", 12), ("max_completion_tokens", 13)] {
+        let input = format!("{base},\"{field}\":{expected}}}");
+        let (bytes, _) = translate_request(input.as_bytes(), "provider-model").unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["max_tokens"],
+            expected,
+            "an explicit {field} must override the compatibility default"
+        );
+    }
+    let equal = format!("{base},\"max_tokens\":14,\"max_completion_tokens\":14}}");
+    let (bytes, _) = translate_request(equal.as_bytes(), "provider-model").unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["max_tokens"],
+        14,
+        "equal token aliases must preserve their explicit value"
+    );
+    let conflict = format!("{base},\"max_tokens\":15,\"max_completion_tokens\":16}}");
+    let (bytes, _) = translate_request(conflict.as_bytes(), "provider-model").unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["max_tokens"],
+        16,
+        "max_completion_tokens must take precedence over max_tokens"
+    );
+}
+
+#[test]
+fn rejects_invalid_token_values() {
+    for (field, value) in [
+        ("max_tokens", "0"),
+        ("max_tokens", "-1"),
+        ("max_tokens", "1.5"),
+        ("max_tokens", "\"many\""),
+        ("max_tokens", "null"),
+        ("max_completion_tokens", "0"),
+        ("max_completion_tokens", "-1"),
+        ("max_completion_tokens", "1.5"),
+        ("max_completion_tokens", "\"many\""),
+        ("max_completion_tokens", "null"),
+    ] {
+        let input = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"{field}":{value}}}"#);
+        assert!(
+            translate_request(input.as_bytes(), "provider-model")
+                .unwrap_err()
+                .contains("positive integer"),
+            "{field} value {value} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn accepts_and_drops_only_the_legacy_ignored_options() {
+    for (field, value) in [
+        ("user", r#""customer-42""#),
+        ("n", "2"),
+        ("seed", "42"),
+        ("parallel_tool_calls", "true"),
+    ] {
+        let input = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"max_tokens":8,"{field}":{value}}}"#
+        );
+        let (bytes, _) = translate_request(input.as_bytes(), "provider-model").unwrap();
+        let output: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            output.get(field).is_none(),
+            "{field} must be intentionally omitted upstream"
+        );
+    }
+    let combined = br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"user":"u","n":3,"seed":-7,"parallel_tool_calls":false}"#;
+    let (bytes, _) = translate_request(combined, "provider-model").unwrap();
+    let output: Value = serde_json::from_slice(&bytes).unwrap();
+    for field in ["user", "n", "seed", "parallel_tool_calls"] {
+        assert!(
+            output.get(field).is_none(),
+            "the combined request must omit {field} upstream"
+        );
+    }
+}
+
+#[test]
+fn rejects_malformed_ignored_options() {
+    for (field, value) in [
+        ("user", "1"),
+        ("n", "0"),
+        ("n", "1.5"),
+        ("seed", "true"),
+        ("parallel_tool_calls", "1"),
+    ] {
+        let input = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"max_tokens":8,"{field}":{value}}}"#
+        );
+        assert!(
+            translate_request(input.as_bytes(), "provider-model").is_err(),
+            "invalid {field} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn translates_base64_and_remote_image_sources_in_content_order() {
+    let input = br#"{"model":"client-model","messages":[{"role":"user","content":[{"type":"text","text":"first"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC","detail":"high"}},{"type":"text","text":"last"},{"type":"image_url","image_url":{"url":"https://images.example.test/photo.png"}}]}]}"#;
+    let (bytes, profile) = translate_request(input, "provider-model").unwrap();
+    let output: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        output["model"], "provider-model",
+        "image requests must use the selected provider model"
+    );
+    assert_eq!(
+        profile.client_model, "client-model",
+        "the profile must preserve the client-visible model"
+    );
+    let content = output["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(
+        content.len(),
+        4,
+        "image conversion must retain every input content block"
+    );
+    assert_eq!(
+        content[0],
+        json!({"type":"text","text":"first"}),
+        "leading text must remain before the first image"
+    );
+    assert_eq!(
+        content[1],
+        json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}}),
+        "the inline image must preserve its encoding and declared media type"
+    );
+    assert_eq!(
+        content[2],
+        json!({"type":"text","text":"last"}),
+        "intervening text must remain between the images"
+    );
+    assert_eq!(
+        content[3],
+        json!({"type":"image","source":{"type":"url","url":"https://images.example.test/photo.png"}}),
+        "the remote image must remain an unchanged URL reference"
+    );
+}
+
+#[test]
+fn rejects_assistant_images_without_relabeling_or_dropping_them() {
+    for image in [
+        "https://images.example.test/photo.png",
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+    ] {
+        let input = json!({"model":"m","messages":[
+            {"role":"user","content":"Describe the image"},
+            {"role":"assistant","content":[
+                {"type":"text","text":"before"},
+                {"type":"image_url","image_url":{"url":image}},
+                {"type":"text","text":"after"}
+            ]}
+        ]});
+        assert!(
+            translate_request(input.to_string().as_bytes(), "provider-model")
+                .unwrap_err()
+                .contains("supported only in user messages"),
+            "assistant image must be rejected for source {image}"
+        );
+    }
+}
+
+#[test]
+fn rejects_invalid_preferred_token_alias_even_with_valid_legacy_alias() {
+    for invalid in [json!(0), json!(-1), json!(1.5), json!("many"), Value::Null] {
+        let input = json!({"model":"m","messages":[{"role":"user","content":"hi"}],
+            "max_tokens":8,"max_completion_tokens":invalid});
+        assert!(
+            translate_request(input.to_string().as_bytes(), "provider-model")
+                .unwrap_err()
+                .contains("positive integer"),
+            "invalid preferred alias must not fall back to max_tokens"
+        );
+    }
+}
+
+#[test]
+fn validates_base64_beyond_the_image_signature_and_preserves_encoded_data() {
+    let mut decoded = b"\x89PNG\r\n\x1a\n".to_vec();
+    decoded.resize(32 * 1024, 0);
+    let encoded = STANDARD.encode(&decoded);
+    let request = |payload: &str| {
+        json!({"model":"m","messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{payload}")}}
+        ]}]})
+        .to_string()
+    };
+    let (translated, _) = translate_request(request(&encoded).as_bytes(), "provider-model").unwrap();
+    let translated: Value = serde_json::from_slice(&translated).unwrap();
+    assert_eq!(
+        translated["messages"][0]["content"][0]["source"]["data"], encoded,
+        "incremental validation must forward the original encoding unchanged"
+    );
+    for invalid in [
+        format!("{encoded}%"),
+        format!("{encoded}AAAA"),
+        encoded.trim_end_matches('=').to_owned(),
+    ] {
+        assert!(
+            translate_request(request(&invalid).as_bytes(), "provider-model")
+                .unwrap_err()
+                .contains("invalid base64"),
+            "invalid trailing data or padding after a valid signature must be rejected"
+        );
+    }
+}
+
+#[test]
+fn rejects_malformed_or_unsupported_images() {
+    for (url, reason) in [
+        ("data:image/png;base64,%%%", "invalid base64"),
+        ("data:image/png;base64,aGVsbG8=", "does not match"),
+        ("data:image/svg+xml;base64,PHN2Zz4=", "media type"),
+        ("data:image/png,abc", "base64 encoding marker"),
+        ("http://images.example.test/a.png", "HTTPS URL"),
+        (
+            "https://user:password@images.example.test/a.png",
+            "embedded credentials",
+        ),
+        ("https://user@images.example.test/a.png", "embedded credentials"),
+        ("not a url", "valid HTTPS"),
+    ] {
+        let input = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"{url}"}}}}]}}]}}"#
+        );
+        assert!(
+            translate_request(input.as_bytes(), "provider-model")
+                .unwrap_err()
+                .contains(reason),
+            "{url} should fail with {reason}"
+        );
+    }
 }
 
 #[test]
@@ -340,7 +575,8 @@ async fn openai_candidate_rewrites_only_the_selected_target_model() {
 #[tokio::test]
 #[expect(clippy::panic, reason = "tests assert that unsupported requests are rejected")]
 async fn selected_request_body_limit_rejects_before_json_parsing() {
-    let config: serde_yaml::Value = serde_yaml::from_str("api_translation_enabled: true\nmax_body_bytes: 1").unwrap();
+    let config: serde_yaml::Value =
+        serde_yaml::from_str("api_translation_enabled: true\nmax_request_body_bytes: 1").unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&request);
@@ -363,6 +599,59 @@ async fn selected_request_body_limit_rejects_before_json_parsing() {
         String::from_utf8_lossy(rejection.body.as_deref().unwrap())
             .contains("size limit set by the platform administrator")
     );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::panic,
+    reason = "tests assert that request bodies at the limit pass and over-limit bodies fail"
+)]
+async fn split_request_limit_accepts_boundary_and_rejects_one_byte_over() {
+    let valid = br#"{"model":"client-model","messages":[{"role":"user","content":"hi"}],"max_tokens":20}"#;
+    let max_request_body_bytes = valid.len() + 2;
+    let yaml = format!(
+        "api_translation_enabled: true\nmax_request_body_bytes: {max_request_body_bytes}\nmax_response_body_bytes: 1"
+    );
+    let config: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
+
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    selected_profile_metadata(&mut ctx);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut at_limit = Vec::from(valid.as_slice());
+    at_limit.extend_from_slice(b"  ");
+    assert_eq!(at_limit.len(), max_request_body_bytes);
+    let mut body = Some(Bytes::from(at_limit));
+    let outcome = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SelectedUpstreamBodyOutcome::Continue));
+
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    selected_profile_metadata(&mut ctx);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut over_limit = Vec::from(valid.as_slice());
+    over_limit.extend_from_slice(b"   ");
+    assert_eq!(over_limit.len(), max_request_body_bytes + 1);
+    let mut body = Some(Bytes::from(over_limit));
+    let outcome = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+    let SelectedUpstreamBodyOutcome::Reject(rejection) = outcome else {
+        panic!("request one byte over the configured limit must be rejected");
+    };
+    assert_eq!(rejection.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(String::from_utf8_lossy(rejection.body.as_deref().unwrap()).contains("request_too_large"));
 }
 
 #[tokio::test]
@@ -418,7 +707,8 @@ async fn translates_json_response_split_across_streamed_chunks() {
     reason = "tests assert that over-limit provider responses are rejected"
 )]
 async fn rejects_json_response_that_exceeds_accumulation_limit() {
-    let config: serde_yaml::Value = serde_yaml::from_str("api_translation_enabled: true\nmax_body_bytes: 128").unwrap();
+    let config: serde_yaml::Value =
+        serde_yaml::from_str("api_translation_enabled: true\nmax_response_body_bytes: 128").unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut response = json_response();
@@ -456,6 +746,72 @@ async fn rejects_json_response_that_exceeds_accumulation_limit() {
             .contains("size limit set by the platform administrator")
     );
     assert!(ctx.get_filter_state::<super::BufferedJsonResponse>().is_none());
+}
+
+#[tokio::test]
+#[expect(
+    clippy::panic,
+    reason = "tests assert the response cap remains independent of the larger request cap"
+)]
+async fn split_response_limit_is_enforced_after_a_larger_request_limit_accepts() {
+    let upstream = anthropic_json_response();
+    let response_limit = upstream.len();
+    let yaml = format!(
+        "api_translation_enabled: true\nmax_request_body_bytes: 4096\nmax_response_body_bytes: {response_limit}"
+    );
+    let config: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
+
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut response = json_response();
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.current_filter_id = Some(7);
+    selected_profile_metadata(&mut ctx);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    translate_request_body(filter.as_ref(), &mut ctx).await;
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut body = Some(Bytes::copy_from_slice(upstream));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(serde_json::from_slice::<Value>(body.as_ref().unwrap()).is_ok());
+
+    let yaml = format!(
+        "api_translation_enabled: true\nmax_request_body_bytes: 4096\nmax_response_body_bytes: {}",
+        response_limit - 1
+    );
+    let config: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut response = json_response();
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.current_filter_id = Some(7);
+    selected_profile_metadata(&mut ctx);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    translate_request_body(filter.as_ref(), &mut ctx).await;
+    ctx.response_header = Some(&mut response);
+    assert!(matches!(
+        filter.on_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut body = Some(Bytes::copy_from_slice(upstream));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("response one byte over the configured response limit must be rejected");
+    };
+    assert_eq!(rejection.status, StatusCode::BAD_GATEWAY);
+    assert!(String::from_utf8_lossy(rejection.body.as_deref().unwrap()).contains("provider_response_too_large"));
 }
 
 #[tokio::test]
