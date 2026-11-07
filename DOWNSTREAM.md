@@ -51,3 +51,14 @@ For each of the six issues above, please confirm:
 The ET `main` branch is synchronized with upstream through the normal downstream
 workflow. Resolve sync conflicts in ET, run the required checks, and record the
 resulting sync commit here before building an EnMaaS image.
+
+## Temporary downstream backports
+
+- `apis/src/vertex/mod.rs` (Anthropic→Vertex `rawPredict`): the deployed
+  image still carries the pre-v0.8.0 module. It now strips `Accept-Encoding`
+  and WARNs when a response with an armed transform is encoded or when an SSE
+  chunk cannot be parsed (backport of the v0.8.0 `apis/src/vertex/anthropic`
+  behavior). Delete this module at the v0.8.0 sync. The interim
+  `headers.request_remove: accept-encoding` entries in the base and QoS
+  Praxis configs can be reverted once the rebuilt image is deployed (avoid a
+  permanent double-strip).

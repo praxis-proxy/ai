@@ -902,7 +902,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gzip_sse_chunk_is_not_forwarded_after_a_parse_failure() {
+    async fn unterminated_sse_chunk_is_not_forwarded_at_eos() {
         let filter = filter("project: demo");
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
@@ -921,13 +921,47 @@ mod tests {
         filter.on_response(&mut ctx).await.unwrap();
         assert_eq!(ctx.get_metadata(TRANSFORM_KEY), Some(TRANSFORM_SSE));
 
-        // gzip magic + opaque bytes: not a valid SSE frame.
+        // Unterminated bytes (no frame terminator) are buffered as a partial;
+        // at EOS the partial is dropped without reaching the client.
         let mut body = Some(Bytes::from_static(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03opaque"));
         filter.on_response_body(&mut ctx, &mut body, true).unwrap();
         let emitted = body.expect("the filter replaces the chunk with an empty body");
         assert!(
             emitted.is_empty(),
+            "an unterminated SSE chunk must not reach the client, got {emitted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_sse_frame_is_dropped_after_a_parse_failure() {
+        // The scratch limit is the only way to reach the parser's Err path
+        // (gzip bytes alone are buffered as a partial frame). Force it with a
+        // tiny max_body_bytes and a newline-free chunk larger than the limit.
+        let filter = filter("project: demo\nmax_body_bytes: 64");
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        ctx.set_metadata(OPERATION_KEY, "messages");
+        ctx.set_metadata(MODEL_KEY, "vertex/claude-sonnet-4-5");
+
+        let mut response = make_response();
+        response
+            .headers
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        ctx.response_header = Some(&mut response);
+        ctx.current_filter_id = Some(0);
+        filter.on_response(&mut ctx).await.unwrap();
+        assert_eq!(ctx.get_metadata(TRANSFORM_KEY), Some(TRANSFORM_SSE));
+
+        let mut body = Some(Bytes::from(vec![b'x'; 128]));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        let emitted = body.expect("the filter replaces the failing chunk with an empty body");
+        assert!(
+            emitted.is_empty(),
             "an unparseable SSE chunk must not reach the client, got {emitted:?}"
+        );
+        assert!(
+            ctx.remove_filter_state::<SseFrameParser>().is_some(),
+            "the parser must be reinserted so the rest of the stream can recover"
         );
     }
 }
