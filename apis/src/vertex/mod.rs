@@ -53,7 +53,7 @@ use http::{HeaderName, HeaderValue};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
-use tracing::debug;
+use tracing::{debug, trace, warn};
 
 use self::config::{VertexConfig, build_config};
 use crate::{
@@ -194,7 +194,11 @@ impl HttpFilter for VertexFilter {
         true
     }
 
-    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // The response-side transform parses and rewrites the body (JSON or
+        // SSE), so a compressed upstream body would be opaque to the parser.
+        // A compliant backend returns plaintext when the header is absent.
+        ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         Ok(FilterAction::Continue)
     }
 
@@ -268,6 +272,7 @@ impl HttpFilter for VertexFilter {
 
         let transform = response_transform(ctx);
         ctx.set_metadata(TRANSFORM_KEY, transform);
+        warn_if_encoded(ctx);
         if transform == TRANSFORM_ERROR {
             let status = ctx
                 .response_header
@@ -347,18 +352,43 @@ fn response_transform(ctx: &HttpFilterContext<'_>) -> &'static str {
     }
 }
 
+/// Warn when the upstream response carries a content coding while a response
+/// transform (which parses the body) is armed. The request-side strip should
+/// make this unreachable; the warning makes any regression visible.
+fn warn_if_encoded(ctx: &HttpFilterContext<'_>) {
+    let encoding = ctx.response_header.as_ref().and_then(|resp| {
+        resp.headers
+            .get(http::header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("identity"))
+    });
+    if let Some(encoding) = encoding {
+        warn!(
+            encoding,
+            "vertex: upstream response is encoded while a response transform is armed; expected plaintext (is Accept-Encoding stripped?)"
+        );
+    }
+}
+
 /// Patch an SSE chunk: parse complete frames, restore the model in
 /// `message_start` only, and re-emit. Partial frames stay in the
 /// per-request parser across chunk boundaries.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the in-flight SSE parser state transition together"
+)]
 fn patch_sse_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, end_of_stream: bool) {
     let Some(bytes) = body.as_ref() else {
         if end_of_stream {
+            trace!("vertex: no SSE body at end of stream; emitting an empty chunk");
             *body = Some(Bytes::new());
         }
         return;
     };
 
     let Some(mut parser) = ctx.remove_filter_state::<SseFrameParser>() else {
+        warn!("vertex: SSE parser state missing; forwarding the chunk without a model rewrite");
         return;
     };
 
@@ -368,12 +398,15 @@ fn patch_sse_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, en
             // A malformed or oversized frame must not kill the stream or
             // emit split duplicates; drop the chunk and let the stream
             // finish (matches the azure translation filter's behavior).
-            debug!(%error, "vertex: SSE frame parse failed; dropping chunk to keep the stream alive");
+            warn!(%error, "vertex: SSE frame parse failed; dropping chunk to keep the stream alive");
             ctx.insert_filter_state(parser);
             *body = Some(Bytes::new());
             return;
         },
     };
+    if frames.is_empty() && !end_of_stream {
+        trace!("vertex: SSE chunk contains no complete frame; buffering");
+    }
 
     if !end_of_stream {
         ctx.insert_filter_state(parser);
@@ -390,6 +423,7 @@ fn patch_sse_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, en
 /// preserving the HTTP status.
 fn translate_error_body(ctx: &HttpFilterContext<'_>, body: &mut Option<Bytes>) {
     let Some(bytes) = body.as_ref().filter(|b| !b.is_empty()) else {
+        trace!("vertex: empty error body; forwarding unchanged");
         return;
     };
     let status = ctx
@@ -404,18 +438,23 @@ fn translate_error_body(ctx: &HttpFilterContext<'_>, body: &mut Option<Bytes>) {
             "vertex: translated Google error envelope to Anthropic shape"
         );
         *body = Some(Bytes::from(translated));
+    } else {
+        trace!("vertex: body is not a Google error envelope; forwarding unchanged");
     }
 }
 
 /// Restore the user-facing model id in a buffered JSON response.
 fn restore_response_model(ctx: &HttpFilterContext<'_>, body: &mut Option<Bytes>) {
     let (Some(bytes), Some(user_model)) = (body.as_ref().filter(|b| !b.is_empty()), ctx.get_metadata(MODEL_KEY)) else {
+        trace!("vertex: empty response body or missing model; forwarding unchanged");
         return;
     };
 
     if let Some(restored) = response::restore_model(bytes, user_model) {
         debug!("vertex: restored user-facing model id in response");
         *body = Some(Bytes::from(restored));
+    } else {
+        trace!("vertex: response is not JSON or has no model to restore; forwarding unchanged");
     }
 }
 
@@ -617,7 +656,11 @@ mod tests {
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
             .unwrap();
-        assert!(ctx.request_headers_to_remove.is_empty());
+        assert!(
+            ctx.request_headers_to_remove.iter().all(|name| name != ANTHROPIC_BETA),
+            "the kept beta flag must not be removed: {:?}",
+            ctx.request_headers_to_remove
+        );
         let beta_header = ctx
             .request_headers_to_set
             .iter()
@@ -639,7 +682,11 @@ mod tests {
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await
             .unwrap();
-        assert_eq!(ctx.request_headers_to_remove.len(), 1);
+        assert!(
+            ctx.request_headers_to_remove.contains(&ANTHROPIC_BETA),
+            "an unallowed beta flag must be removed: {:?}",
+            ctx.request_headers_to_remove
+        );
         assert!(
             ctx.request_headers_to_set
                 .iter()
@@ -838,5 +885,49 @@ mod tests {
         let emitted = String::from_utf8(body.unwrap().to_vec()).unwrap();
         assert!(emitted.contains("\"model\":\"claude-sonnet-4-5\""), "{emitted}");
         assert!(!emitted.contains("20250929"), "{emitted}");
+    }
+
+    #[tokio::test]
+    async fn on_request_strips_accept_encoding() {
+        let filter = filter("project: demo");
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            ctx.request_headers_to_remove.contains(&header::ACCEPT_ENCODING),
+            "Accept-Encoding must be stripped so the Vertex response transform sees plaintext"
+        );
+    }
+
+    #[tokio::test]
+    async fn gzip_sse_chunk_is_not_forwarded_after_a_parse_failure() {
+        let filter = filter("project: demo");
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        ctx.set_metadata(OPERATION_KEY, "messages");
+        ctx.set_metadata(MODEL_KEY, "vertex/claude-sonnet-4-5");
+
+        let mut response = make_response();
+        response
+            .headers
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        response
+            .headers
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        ctx.response_header = Some(&mut response);
+        ctx.current_filter_id = Some(0);
+        filter.on_response(&mut ctx).await.unwrap();
+        assert_eq!(ctx.get_metadata(TRANSFORM_KEY), Some(TRANSFORM_SSE));
+
+        // gzip magic + opaque bytes: not a valid SSE frame.
+        let mut body = Some(Bytes::from_static(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03opaque"));
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+        let emitted = body.expect("the filter replaces the chunk with an empty body");
+        assert!(
+            emitted.is_empty(),
+            "an unparseable SSE chunk must not reach the client, got {emitted:?}"
+        );
     }
 }
