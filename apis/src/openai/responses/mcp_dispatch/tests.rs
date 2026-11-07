@@ -424,7 +424,7 @@ fn filter_request_body_mode() {
         matches!(
             filter.request_body_mode(),
             praxis_filter::BodyMode::StreamBuffer {
-                max_bytes: Some(praxis_filter::body::MAX_JSON_BODY_BYTES)
+                max_bytes: Some(crate::json_body::MAX_JSON_BODY_BYTES)
             }
         ),
         "should buffer up to the absolute ceiling; body_limits governs the raw cap"

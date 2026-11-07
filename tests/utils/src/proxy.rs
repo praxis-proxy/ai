@@ -164,8 +164,14 @@ fn resolve_listener_pipeline(
         .map(|(name, filters)| (name.as_str(), filters.as_slice()))
         .collect();
 
-    let mut pipeline =
-        FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options).unwrap();
+    let mut pipeline = FilterPipeline::build_with_chains(
+        &mut entries,
+        registry,
+        &chains,
+        &config.insecure_options,
+        &config.clusters,
+    )
+    .unwrap();
     #[cfg(feature = "openai-responses")]
     let request_body_limit = praxis_ai::agentic_request_body_cap(config.body_limits.max_request_bytes, budget_policy);
     #[cfg(not(feature = "openai-responses"))]

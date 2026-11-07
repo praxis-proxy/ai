@@ -212,7 +212,7 @@ runtime:
         )
         .unwrap();
         let chains: HashMap<&str, &[FilterEntry]> = HashMap::new();
-        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
+        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[])
             .expect("file-search factory should build against the shared client");
     }
 

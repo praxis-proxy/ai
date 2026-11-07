@@ -222,8 +222,13 @@ fn build_listener_pipelines(
         let request_body_limit = agentic_request_body_cap(config.body_limits.max_request_bytes, budget_policy);
         #[cfg(not(feature = "openai-responses"))]
         let request_body_limit = config.body_limits.max_request_bytes;
-        let mut pipeline =
-            FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &config.insecure_options)?;
+        let mut pipeline = FilterPipeline::build_with_chains(
+            &mut entries,
+            &registry,
+            &chains,
+            &config.insecure_options,
+            &config.clusters,
+        )?;
         configure_pipeline(
             &mut pipeline,
             config,
@@ -1700,7 +1705,7 @@ filter_chains:
     /// KV store registry with one test store.
     fn make_kv_registry() -> praxis_core::kv::KvStoreRegistry {
         let registry = praxis_core::kv::KvStoreRegistry::new();
-        registry.get_or_create("test");
+        registry.get_or_create_memory("test");
         registry
     }
 
