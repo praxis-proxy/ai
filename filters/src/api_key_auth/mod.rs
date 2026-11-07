@@ -52,6 +52,9 @@ struct CachedIdentity {
     /// Extracted subscription.
     subscription: String,
 
+    /// Stable API-key ID returned by the validation service.
+    key_id: Option<String>,
+
     /// When this entry was cached.
     cached_at: Instant,
 }
@@ -77,6 +80,10 @@ struct ValidationResponse {
     /// Subscription name.
     #[serde(default)]
     subscription: String,
+
+    /// Stable API-key ID returned by the validation service.
+    #[serde(rename = "keyId", default)]
+    key_id: Option<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -198,6 +205,7 @@ impl ApiKeyAuthFilter {
             username: result.username,
             group: result.groups.join(","),
             subscription: result.subscription,
+            key_id: result.key_id.filter(|value| !value.trim().is_empty()),
             cached_at: Instant::now(),
         })
     }
@@ -247,6 +255,9 @@ impl HttpFilter for ApiKeyAuthFilter {
         ctx.set_metadata("x-tenant-group", identity.group);
         if !identity.subscription.is_empty() {
             ctx.set_metadata("x-tenant-subscription", identity.subscription);
+        }
+        if let Some(key_id) = identity.key_id {
+            ctx.set_metadata("api_key.id", key_id);
         }
 
         Ok(FilterAction::Continue)

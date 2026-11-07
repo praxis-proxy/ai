@@ -61,7 +61,8 @@ async fn valid_key_passes_and_writes_metadata() {
             "valid": true,
             "username": "yossi",
             "groups": ["ai-eng"],
-            "subscription": "enterprise"
+            "subscription": "enterprise",
+            "keyId": "6e3c3851-eab5-4c10-babc-a0366a063caf"
         })))
         .mount(&server)
         .await;
@@ -93,6 +94,38 @@ async fn valid_key_passes_and_writes_metadata() {
         Some(&"enterprise".to_owned()),
         "subscription should be in metadata"
     );
+    assert_eq!(
+        ctx.filter_metadata.get("api_key.id"),
+        Some(&"6e3c3851-eab5-4c10-babc-a0366a063caf".to_owned()),
+        "keyId should be in metadata"
+    );
+}
+
+#[tokio::test]
+async fn valid_response_without_key_id_does_not_publish_one() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/validate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "valid": true,
+            "username": "no-key-id",
+            "groups": []
+        })))
+        .mount(&server)
+        .await;
+
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str(&format!(r#"validate_url: "{}/validate""#, server.uri())).unwrap();
+    let filter = super::ApiKeyAuthFilter::from_config(&yaml).unwrap();
+
+    let mut req = make_request(Method::POST, "/v1/messages");
+    req.headers
+        .insert("x-api-key", HeaderValue::from_static("sk-oai-no-key-id"));
+    let mut ctx = make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.filter_metadata.get("api_key.id"), None);
 }
 
 #[tokio::test]
@@ -181,7 +214,8 @@ async fn cache_hit_skips_callout() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "valid": true,
             "username": "cached-user",
-            "groups": ["team"]
+            "groups": ["team"],
+            "keyId": "cached-key-id"
         })))
         .expect(1) // exactly one callout, not two
         .mount(&server)
@@ -211,6 +245,11 @@ async fn cache_hit_skips_callout() {
         ctx2.filter_metadata.get("x-tenant-username"),
         Some(&"cached-user".to_owned()),
         "cached username should be in metadata"
+    );
+    assert_eq!(
+        ctx2.filter_metadata.get("api_key.id"),
+        Some(&"cached-key-id".to_owned()),
+        "cached keyId should be in metadata"
     );
     // wiremock's expect(1) verifies only one callout was made.
 }

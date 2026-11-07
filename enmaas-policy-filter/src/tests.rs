@@ -69,6 +69,7 @@ fn defaults_are_stable() {
     assert_eq!(config.metering_feature_key, "inference-tokens");
     assert!(matches!(config.credential_mode, crate::config::CredentialMode::Off));
     assert_eq!(config.qos_clusters, vec!["cb-glm".to_owned()]);
+    assert_eq!(config.key_id_clusters, vec!["cb-glm".to_owned()]);
 }
 
 use std::{
@@ -450,6 +451,154 @@ async fn strips_client_headers_before_forwarding() {
     assert!(removed.contains(&"authorization"));
     assert!(removed.contains(&"accept-encoding"));
     assert!(removed.contains(&"x-api-key"));
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn forwards_validated_key_id_only_for_cb_glm() {
+    let (policy_url, _captured, handle) =
+        mock_policy(r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"main","qosSubject":"subject-1"}"#);
+    let filter = build_filter(&policy_url);
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.cluster = Some(Arc::from("cb-glm"));
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+    ctx.set_metadata("api_key.id", "key-uuid-1");
+    ctx.request_headers_to_remove.clear();
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.request_headers_to_remove
+            .contains(&HeaderName::from_static("x-enmaas-key-id"))
+    );
+    assert!(
+        ctx.extra_request_headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-enmaas-key-id") && value == "key-uuid-1")
+    );
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn does_not_forward_key_id_to_external_cluster_but_strips_spoof() {
+    let (policy_url, _captured, handle) =
+        mock_policy(r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"main","qosSubject":"subject-1"}"#);
+    let filter = build_filter(&policy_url);
+    let mut request = make_request(Method::POST, "/v1/chat/completions");
+    request
+        .headers
+        .insert("x-enmaas-key-id", HeaderValue::from_static("spoofed"));
+    let mut ctx = make_filter_context(&request);
+    ctx.cluster = Some(Arc::from("openai"));
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+    ctx.set_metadata("api_key.id", "key-uuid-1");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        !ctx.extra_request_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-enmaas-key-id"))
+    );
+    assert!(
+        ctx.request_headers_to_remove
+            .contains(&HeaderName::from_static("x-enmaas-key-id"))
+    );
+    let effective = praxis_ai_apis::callout_headers::effective_request_callout_headers(
+        &ctx,
+        std::borrow::Cow::Borrowed(&ctx.request.headers),
+    );
+    assert!(effective.get("x-enmaas-key-id").is_none());
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn stripped_key_id_is_replaced_with_validated_value() {
+    let (policy_url, _captured, handle) =
+        mock_policy(r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"main","qosSubject":"subject-1"}"#);
+    let filter = build_filter(&policy_url);
+    let mut request = make_request(Method::POST, "/v1/chat/completions");
+    request
+        .headers
+        .insert("x-enmaas-key-id", HeaderValue::from_static("spoofed"));
+    let mut ctx = make_filter_context(&request);
+    ctx.cluster = Some(Arc::from("cb-glm"));
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+    ctx.set_metadata("api_key.id", "validated-key-id");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.request_headers_to_remove
+            .contains(&HeaderName::from_static("x-enmaas-key-id"))
+    );
+    assert!(
+        ctx.extra_request_headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-enmaas-key-id") && value == "validated-key-id")
+    );
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn final_effective_headers_contain_one_validated_key_id() {
+    let (policy_url, _captured, handle) =
+        mock_policy(r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"main","qosSubject":"subject-1"}"#);
+    let filter = build_filter(&policy_url);
+    let mut request = make_request(Method::POST, "/v1/chat/completions");
+    request
+        .headers
+        .insert("x-enmaas-key-id", HeaderValue::from_static("spoofed"));
+    let mut ctx = make_filter_context(&request);
+    ctx.cluster = Some(Arc::from("cb-glm"));
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+    ctx.set_metadata("api_key.id", "validated-key-id");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    let effective = praxis_ai_apis::callout_headers::effective_request_callout_headers(
+        &ctx,
+        std::borrow::Cow::Borrowed(&ctx.request.headers),
+    );
+    let values: Vec<&str> = effective
+        .get_all("x-enmaas-key-id")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    assert_eq!(values, vec!["validated-key-id"]);
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn missing_key_id_strips_spoofed_header_without_injecting() {
+    let (policy_url, _captured, handle) =
+        mock_policy(r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"main","qosSubject":"subject-1"}"#);
+    let filter = build_filter(&policy_url);
+    let mut request = make_request(Method::POST, "/v1/chat/completions");
+    request
+        .headers
+        .insert("x-enmaas-key-id", HeaderValue::from_static("spoofed"));
+    let mut ctx = make_filter_context(&request);
+    ctx.cluster = Some(Arc::from("cb-glm"));
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.request_headers_to_remove
+            .contains(&HeaderName::from_static("x-enmaas-key-id"))
+    );
+    assert!(
+        !ctx.extra_request_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-enmaas-key-id"))
+    );
     handle.join().expect("mock policy thread");
 }
 

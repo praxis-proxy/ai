@@ -168,6 +168,9 @@ pub(crate) struct EnmaasPolicyConfig {
     #[serde(default = "default_key_clusters")]
     pub key_clusters: Vec<String>,
 
+    #[serde(default = "default_key_id_clusters")]
+    pub key_id_clusters: Vec<String>,
+
     #[serde(default = "default_qos_clusters")]
     pub qos_clusters: Vec<String>,
 
@@ -258,6 +261,9 @@ pub(crate) fn validate_config(cfg: &EnmaasPolicyConfig) -> Result<(), FilterErro
     }
     if cfg.qos_clusters.is_empty() || cfg.qos_clusters.iter().any(|value| value.trim().is_empty()) {
         return Err("enmaas_policy: qos_clusters must contain at least one non-empty name".into());
+    }
+    if cfg.key_id_clusters.is_empty() || cfg.key_id_clusters.iter().any(|value| value.trim().is_empty()) {
+        return Err("enmaas_policy: key_id_clusters must contain at least one non-empty name".into());
     }
     if cfg.header_prefix.chars().any(char::is_control) {
         return Err("enmaas_policy: header_prefix must not contain control characters".into());
@@ -407,6 +413,10 @@ fn default_max_keys() -> usize {
 }
 
 fn default_key_clusters() -> Vec<String> {
+    vec!["cb-glm".to_owned()]
+}
+
+fn default_key_id_clusters() -> Vec<String> {
     vec!["cb-glm".to_owned()]
 }
 

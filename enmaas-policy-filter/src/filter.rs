@@ -57,6 +57,8 @@ const STATUS_MODEL_DENIED: u16 = 403;
 const STATUS_POLICY_UNAVAILABLE: u16 = 503;
 const STATUS_RATE_LIMITED: u16 = 429;
 const FAIL_OPEN_CACHE_TTL_SECONDS: u64 = 1;
+const API_KEY_ID_METADATA: &str = "api_key.id";
+const KEY_ID_HEADER: &str = "x-enmaas-key-id";
 
 /// Remove client credentials and request encoding before forwarding upstream.
 ///
@@ -85,6 +87,7 @@ pub(crate) struct EnmaasPolicyFilter {
     response_class_header: Option<HeaderName>,
     credential_header: HeaderName,
     key_clusters: Vec<String>,
+    key_id_clusters: Vec<String>,
     qos_clusters: Vec<String>,
     keys: KeyRing,
     events: EventReporter,
@@ -134,6 +137,7 @@ impl EnmaasPolicyFilter {
 
         Ok(Box::new(Self {
             key_clusters: config.key_clusters.clone(),
+            key_id_clusters: config.key_id_clusters.clone(),
             qos_clusters: config.qos_clusters.clone(),
             config,
             address_policy,
@@ -185,6 +189,34 @@ impl EnmaasPolicyFilter {
         ctx.cluster
             .as_deref()
             .is_some_and(|cluster| self.qos_clusters.iter().any(|candidate| candidate == cluster))
+    }
+
+    fn applies_to_key_id_cluster(&self, ctx: &HttpFilterContext<'_>) -> bool {
+        ctx.cluster
+            .as_deref()
+            .is_some_and(|cluster| self.key_id_clusters.iter().any(|candidate| candidate == cluster))
+    }
+
+    /// Forward the validated API-key ID only on cb-glm routes, stripping any
+    /// client-supplied copy on every route.
+    fn project_key_id(&self, ctx: &mut HttpFilterContext<'_>) {
+        let header = HeaderName::from_static(KEY_ID_HEADER);
+        if !ctx.request_headers_to_remove.contains(&header) {
+            ctx.request_headers_to_remove.push(header);
+        }
+        if !self.applies_to_key_id_cluster(ctx) {
+            return;
+        }
+        let Some(key_id) = ctx.get_metadata(API_KEY_ID_METADATA).filter(|value| !value.is_empty()) else {
+            return;
+        };
+        let key_id = key_id.to_owned();
+        if HeaderValue::from_str(&key_id).is_err() {
+            return;
+        }
+        ctx.extra_request_headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case(KEY_ID_HEADER));
+        ctx.extra_request_headers.push((Cow::Borrowed(KEY_ID_HEADER), key_id));
     }
 
     async fn cached(&self, key: &str) -> Option<PolicyDecision> {
@@ -435,6 +467,7 @@ impl HttpFilter for EnmaasPolicyFilter {
         }
 
         strip_client_headers(ctx);
+        self.project_key_id(ctx);
 
         let username = ctx
             .get_metadata(&self.config.username_metadata)
