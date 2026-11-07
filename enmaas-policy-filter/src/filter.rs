@@ -56,6 +56,25 @@ const STATUS_BUDGET_EXHAUSTED: u16 = 429;
 const STATUS_MODEL_DENIED: u16 = 403;
 const STATUS_POLICY_UNAVAILABLE: u16 = 503;
 const STATUS_RATE_LIMITED: u16 = 429;
+const FAIL_OPEN_CACHE_TTL_SECONDS: u64 = 1;
+
+/// Remove client credentials and request encoding before forwarding upstream.
+///
+/// The provider credential is injected later, and `token_count` needs an
+/// uncompressed response to parse usage from streaming requests. This filter
+/// is intended for fully proxied inference pipelines; do not install it on
+/// BYOK/pass-through routes where client credentials must reach the upstream.
+fn strip_client_headers(ctx: &mut HttpFilterContext<'_>) {
+    for name in [
+        AUTHORIZATION,
+        http::header::ACCEPT_ENCODING,
+        HeaderName::from_static("x-api-key"),
+    ] {
+        if !ctx.request_headers_to_remove.contains(&name) {
+            ctx.request_headers_to_remove.push(name);
+        }
+    }
+}
 
 pub(crate) struct EnmaasPolicyFilter {
     config: EnmaasPolicyConfig,
@@ -185,6 +204,12 @@ impl EnmaasPolicyFilter {
     }
 
     async fn store(&self, key: String, decision: PolicyDecision) {
+        let default_ttl = self.config.decision_cache_ttl_seconds;
+        let ttl = decision.cache_ttl_seconds.unwrap_or(default_ttl).max(1);
+        self.store_with_ttl(key, decision, ttl).await;
+    }
+
+    async fn store_with_ttl(&self, key: String, decision: PolicyDecision, ttl_seconds: u64) {
         if self.config.decision_cache_ttl_seconds == 0 {
             return;
         }
@@ -192,13 +217,11 @@ impl EnmaasPolicyFilter {
         if cache.len() >= self.config.decision_cache_max_entries {
             cache.clear();
         }
-        let default_ttl = self.config.decision_cache_ttl_seconds;
-        let ttl = decision.cache_ttl_seconds.unwrap_or(default_ttl).max(1);
         cache.insert(
             key,
             CachedDecision {
                 decision,
-                expires_at: Instant::now() + Duration::from_secs(ttl),
+                expires_at: Instant::now() + Duration::from_secs(ttl_seconds.max(1)),
             },
         );
     }
@@ -372,6 +395,9 @@ impl EnmaasPolicyFilter {
         if self.config.credential_mode == CredentialMode::Off || !self.applies_to_key_cluster(ctx) {
             return None;
         }
+        // Shadow mode deliberately injects the default/current key so the
+        // upstream credential behavior stays unchanged while selection is
+        // measured. Only the metric label distinguishes it from active mode.
         let (alias, shadow) = match self.config.credential_mode {
             CredentialMode::Off => return None,
             CredentialMode::Shadow => (Some("main"), true),
@@ -407,6 +433,8 @@ impl HttpFilter for EnmaasPolicyFilter {
         if !self.config.enabled {
             return Ok(FilterAction::Continue);
         }
+
+        strip_client_headers(ctx);
 
         let username = ctx
             .get_metadata(&self.config.username_metadata)
@@ -461,6 +489,8 @@ impl HttpFilter for EnmaasPolicyFilter {
                     warn!(%error, "enmaas_policy: metering callout failed");
                     if self.config.fail_open {
                         let decision = PolicyDecision::fail_open(&self.config.default_class, &username);
+                        self.store_with_ttl(cache_key, decision.clone(), FAIL_OPEN_CACHE_TTL_SECONDS)
+                            .await;
                         self.apply_decision(ctx, &decision, &username, false)
                     } else {
                         reject_unavailable("metering service unavailable")

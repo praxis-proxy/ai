@@ -11,7 +11,7 @@ use http::{HeaderName, HeaderValue};
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
-const DEFAULT_TIMEOUT_SECONDS: u64 = 1;
+const DEFAULT_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_DECISION_CACHE_TTL_SECONDS: u64 = 5;
 const DEFAULT_DECISION_CACHE_MAX_ENTRIES: usize = 10_000;
 const DEFAULT_USERNAME_METADATA: &str = "x-tenant-username";

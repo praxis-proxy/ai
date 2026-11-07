@@ -64,7 +64,7 @@ fn defaults_are_stable() {
     assert!(matches!(config.qos_enforcement, crate::config::QosEnforcement::Soft));
     assert_eq!(config.username_metadata, "x-tenant-username");
     assert_eq!(config.model_metadata, "model_to_provider.client_model");
-    assert_eq!(config.timeout_seconds, 1);
+    assert_eq!(config.timeout_seconds, 5);
     assert_eq!(config.response_class_header, "x-enmaas-qos-class");
     assert_eq!(config.metering_feature_key, "inference-tokens");
     assert!(matches!(config.credential_mode, crate::config::CredentialMode::Off));
@@ -205,6 +205,35 @@ fn mock_metering(status: &'static str, body: &'static str) -> (String, thread::J
         stream.write_all(response.as_bytes()).expect("write metering response");
     });
     (format!("http://{address}"), handle)
+}
+
+fn mock_metering_counted() -> (String, Arc<Mutex<usize>>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind counted metering");
+    let address = listener.local_addr().expect("counted metering address");
+    let calls = Arc::new(Mutex::new(0_usize));
+    let calls_for_thread = Arc::clone(&calls);
+    let handle = thread::spawn(move || {
+        listener.set_nonblocking(true).expect("nonblocking listener");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    *calls_for_thread.lock().expect("call count") += 1;
+                    let mut buffer = [0_u8; 4096];
+                    let _ = stream.read(&mut buffer).expect("read metering request");
+                    let response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 13\r\nConnection: close\r\n\r\nupstream down";
+                    if stream.write_all(response.as_bytes()).is_err() {
+                        break;
+                    }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::park_timeout(std::time::Duration::from_millis(5));
+                },
+                Err(_) => break,
+            }
+        }
+    });
+    (format!("http://{address}"), calls, handle)
 }
 
 fn build_filter(policy_url: &str) -> Box<dyn HttpFilter> {
@@ -390,6 +419,122 @@ async fn local_bucket_rejects_after_burst() {
         FilterAction::Reject(rejection) => assert_eq!(rejection.status, 429),
         other => panic!("expected local bucket rejection, got {other:?}"),
     }
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn strips_client_headers_before_forwarding() {
+    let (policy_url, _captured, handle) =
+        mock_policy(r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"main","qosSubject":"subject-1"}"#);
+    let filter = build_filter(&policy_url);
+    let mut request = make_request(Method::POST, "/v1/chat/completions");
+    request.headers.insert(
+        http::header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer client-token"),
+    );
+    request.headers.insert(
+        http::header::ACCEPT_ENCODING,
+        HeaderValue::from_static("gzip, deflate, br"),
+    );
+    request
+        .headers
+        .insert("x-api-key", HeaderValue::from_static("client-api-key"));
+    let mut ctx = make_filter_context(&request);
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+
+    let removed: Vec<&str> = ctx.request_headers_to_remove.iter().map(HeaderName::as_str).collect();
+    assert!(removed.contains(&"authorization"));
+    assert!(removed.contains(&"accept-encoding"));
+    assert!(removed.contains(&"x-api-key"));
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn fail_open_without_identity_still_strips_client_headers() {
+    let filter = build_filter("http://127.0.0.1:1");
+    let mut request = make_request(Method::POST, "/v1/chat/completions");
+    request.headers.insert(
+        http::header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer client-token"),
+    );
+    request.headers.insert(
+        http::header::ACCEPT_ENCODING,
+        HeaderValue::from_static("gzip, deflate, br"),
+    );
+    let mut ctx = make_filter_context(&request);
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(ctx.request_headers_to_remove.contains(&http::header::AUTHORIZATION));
+    assert!(ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING));
+}
+
+#[tokio::test]
+async fn spoofed_x_api_key_is_stripped_before_class_key_injection() {
+    let key_file = tempfile::NamedTempFile::new().expect("temp key file");
+    std::fs::write(key_file.path(), r#"{"main":[{"id":"main-0","key":"secret-main"}]}"#).expect("write key file");
+    let (policy_url, _captured, handle) = mock_policy(
+        r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"main","qosSubject":"subject-1","qosKeyAlias":"main"}"#,
+    );
+    let extra = format!(
+        "credential_mode: active\ncredential_header: x-api-key\nkey_file: {}\n",
+        key_file.path().display()
+    );
+    let filter = build_filter_with(&policy_url, &extra);
+    let mut request = make_request(Method::POST, "/v1/chat/completions");
+    request
+        .headers
+        .insert("x-api-key", HeaderValue::from_static("spoofed-client-key"));
+    let mut ctx = make_filter_context(&request);
+    ctx.cluster = Some(Arc::from("cb-glm"));
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.request_headers_to_remove
+            .contains(&HeaderName::from_static("x-api-key"))
+    );
+    assert!(
+        ctx.extra_request_headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-api-key") && value == "Bearer secret-main")
+    );
+    handle.join().expect("mock policy thread");
+}
+
+#[tokio::test]
+async fn active_key_is_added_after_client_credential_strip() {
+    let key_file = tempfile::NamedTempFile::new().expect("temp key file");
+    std::fs::write(key_file.path(), r#"{"main":[{"id":"main-0","key":"secret-main"}]}"#).expect("write key file");
+    let (policy_url, _captured, handle) = mock_policy(
+        r#"{"hasAccess":true,"modelAllowed":true,"qosClass":"main","qosSubject":"subject-1","qosKeyAlias":"main"}"#,
+    );
+    let extra = format!("credential_mode: active\nkey_file: {}\n", key_file.path().display());
+    let filter = build_filter_with(&policy_url, &extra);
+    let mut request = make_request(Method::POST, "/v1/chat/completions");
+    request.headers.insert(
+        http::header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer client-token"),
+    );
+    let mut ctx = make_filter_context(&request);
+    ctx.cluster = Some(Arc::from("cb-glm"));
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(ctx.request_headers_to_remove.contains(&http::header::AUTHORIZATION));
+    assert!(
+        ctx.extra_request_headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("authorization") && value == "Bearer secret-main")
+    );
     handle.join().expect("mock policy thread");
 }
 
@@ -591,6 +736,29 @@ async fn metering_5xx_fails_open() {
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(ctx.get_metadata("qos.class"), Some("main"));
     handle.join().expect("mock metering thread");
+}
+
+#[tokio::test]
+async fn fail_open_decision_is_short_cached() {
+    let (url, calls, handle) = mock_metering_counted();
+    let filter = build_filter(&url);
+    let request = make_request(Method::POST, "/v1/chat/completions");
+
+    for _ in 0..2 {
+        let mut ctx = make_filter_context(&request);
+        ctx.set_metadata("x-tenant-username", "alice");
+        ctx.set_metadata("model_to_provider.client_model", "model-a");
+        let action = filter.on_request(&mut ctx).await.expect("policy request");
+        assert!(matches!(action, FilterAction::Continue));
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        *calls.lock().expect("call count"),
+        1,
+        "fail-open decision should suppress the second callout"
+    );
+    handle.join().expect("counted metering thread");
 }
 
 #[tokio::test]
