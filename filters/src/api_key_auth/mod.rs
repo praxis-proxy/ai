@@ -251,14 +251,7 @@ impl HttpFilter for ApiKeyAuthFilter {
         }
 
         // 5. Write identity to filter_metadata.
-        ctx.set_metadata("x-tenant-username", identity.username);
-        ctx.set_metadata("x-tenant-group", identity.group);
-        if !identity.subscription.is_empty() {
-            ctx.set_metadata("x-tenant-subscription", identity.subscription);
-        }
-        if let Some(key_id) = identity.key_id {
-            ctx.set_metadata("api_key.id", key_id);
-        }
+        set_identity_metadata(ctx, identity);
 
         Ok(FilterAction::Continue)
     }
@@ -267,6 +260,18 @@ impl HttpFilter for ApiKeyAuthFilter {
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+/// Copy the validated identity into filter metadata for downstream filters.
+fn set_identity_metadata(ctx: &mut HttpFilterContext<'_>, identity: CachedIdentity) {
+    ctx.set_metadata("x-tenant-username", identity.username);
+    ctx.set_metadata("x-tenant-group", identity.group);
+    if !identity.subscription.is_empty() {
+        ctx.set_metadata("x-tenant-subscription", identity.subscription);
+    }
+    if let Some(key_id) = identity.key_id {
+        ctx.set_metadata("api_key.id", key_id);
+    }
+}
 
 /// Reject with 401 Unauthorized.
 fn reject_unauthorized(message: &'static str) -> FilterAction {
