@@ -180,6 +180,12 @@ for how these are authored and regenerated.
 | [web-search-scoped-credentials.yaml](configs/openai/responses/web-search-scoped-credentials.yaml) | A scoped-credentials variant of web-search-chat-completions.yaml |
 | [web-search.yaml](configs/openai/responses/web-search.yaml) | Demonstrates the `openai_web_search_dispatch` filter configuration |
 
+### OpenShell
+
+| File | Description |
+| ------ | ------------- |
+| [sandboxed-coding-clients.yaml](configs/openshell/sandboxed-coding-clients.yaml) | One host-side gateway for Codex, Claude Code, OpenCode, and pi running inside NVIDIA OpenShell sandboxes, each over its native wire API, with Codex client-tool compatibility applied to its tool payloads |
+
 ### Payload Processing
 
 | File | Description |

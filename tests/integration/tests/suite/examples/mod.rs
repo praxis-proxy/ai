@@ -152,6 +152,9 @@ mod openai_state_ownership;
 #[cfg(feature = "store-sqlite")]
 mod openai_stream_events;
 mod openai_tool_parse;
+#[cfg(feature = "openai-agentic-loop")]
+#[cfg(feature = "store-sqlite")]
+mod openshell_sandboxed_coding_clients;
 mod project_state_owner_headers;
 mod prompt_enrichment;
 mod provider_route;

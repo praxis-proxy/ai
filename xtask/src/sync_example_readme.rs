@@ -18,7 +18,7 @@ use clap::Parser;
 /// Title overrides for category directories whose display name cannot be
 /// derived by simple title-casing. All other directories are converted
 /// automatically (e.g. `"traffic-management"` → `"Traffic Management"`).
-const TITLE_OVERRIDES: &[(&str, &str)] = &[("_root", "General"), ("openai", "OpenAI")];
+const TITLE_OVERRIDES: &[(&str, &str)] = &[("_root", "General"), ("openai", "OpenAI"), ("openshell", "OpenShell")];
 
 /// Comment-line prefixes that begin a non-description block. Paragraphs
 /// whose first line starts with any of these are skipped during description

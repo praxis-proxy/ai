@@ -269,7 +269,7 @@ request limits, transport caps, and operational capacity controls still apply.
 | Tool execution | [`openai_file_search_dispatch`] | Charge search fanout, raw and parsed results, model context, public output, and citations. |
 | Tool execution | [`openai_web_search_dispatch`] | Limit provider response bytes from remaining headroom and charge results and both model-facing and public output. |
 | Translation | [`openai_responses_to_chat_completions`] | Charge translated Chat requests and responses, including streaming converter frames and snapshots. |
-| Completion | [`openai_conversations`] | Reserve the completed turn and bound transactional conversation-cache rebuild before append-back. |
+| Completion | [`openai_conversations`] | Reserve the completed turn and bound the transactional item append, including a one-time legacy-cache copy when needed. |
 | Completion | [`openai_responses_store`] | Bound buffered output, require the ledger before input capture, and skip success persistence after budget failure. |
 | Compatibility | [`anthropic_web_search`] | Treat the shared provider's new retained-limit outcome as a failed tool result; Anthropic requests do not use this ledger. |
 

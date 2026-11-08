@@ -2477,9 +2477,10 @@ async fn sqlite_delete_item_and_sync(
     Ok(true)
 }
 
-/// Clear the retired cache in the mutation transaction, including after the last
-/// item is deleted so old cached rows cannot reappear. The affected-row check
-/// preserves rollback when the parent disappears before mutation.
+/// Clear a stale array in the mutation transaction, including after the last
+/// item is deleted so old cached rows cannot reappear. The caller checked the
+/// parent under `BEGIN IMMEDIATE`; skip the write when the cache is already
+/// empty or holds the preserved legacy prefix.
 async fn sqlite_invalidate_messages(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     conv_table: &str,
@@ -2487,10 +2488,11 @@ async fn sqlite_invalidate_messages(
     conversation_id: &str,
 ) -> Result<(), StoreError> {
     let update_sql = format!(
-        "UPDATE {conv_table} SET messages = CASE WHEN substr(messages, 1, 19) = '{{\"legacy_messages\":' THEN messages ELSE '[]' END \
-         WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?"
+        "UPDATE {conv_table} SET messages = '[]' \
+         WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ? \
+         AND (messages IS NULL OR (messages <> '[]' AND substr(messages, 1, 19) <> '{{\"legacy_messages\":'))"
     );
-    let updated = sqlx::query(AssertSqlSafe(update_sql.as_str()))
+    sqlx::query(AssertSqlSafe(update_sql.as_str()))
         .bind(conversation_id)
         .bind(owner.tenant_id())
         .bind(owner.issuer())
@@ -2498,12 +2500,6 @@ async fn sqlite_invalidate_messages(
         .execute(&mut **tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
-
-    if updated.rows_affected() == 0 {
-        return Err(StoreError::Database(format!(
-            "conversation disappeared during message sync: {conversation_id}"
-        )));
-    }
 
     Ok(())
 }
@@ -2825,6 +2821,62 @@ mod tests {
     use std::sync::{Arc, Mutex, Weak};
 
     use super::*;
+
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "one cache-state matrix observes row updates")]
+    async fn invalidation_updates_only_stale_or_null_caches() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let owner = StateOwner::from_trusted_parts("tenant", "issuer", "subject").unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "CREATE TEMP TABLE nullable_conversations AS SELECT 'c' AS conversation_id, \
+             'tenant' AS tenant_id, 'issuer' AS owner_issuer, 'subject' AS owner_subject, \
+             CAST(NULL AS TEXT) AS messages",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        for (cache, expected, writes) in [
+            (None, "[]", 1),
+            (Some("[]"), "[]", 0),
+            (Some("{\"legacy_messages\":[]}"), "{\"legacy_messages\":[]}", 0),
+            (Some("[1]"), "[]", 1),
+        ] {
+            sqlx::query(
+                "UPDATE nullable_conversations SET messages = ? \
+                 WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            )
+            .bind(cache)
+            .bind("c")
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlite_invalidate_messages(&mut tx, "nullable_conversations", &owner, "c")
+                .await
+                .unwrap();
+            let changed: i64 = sqlx::query_scalar("SELECT changes()")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            assert_eq!(changed, writes, "cache: {cache:?}");
+            let messages: Option<String> = sqlx::query_scalar(
+                "SELECT messages FROM nullable_conversations \
+                 WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            )
+            .bind("c")
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            assert_eq!(messages.as_deref(), Some(expected));
+        }
+    }
 
     #[tokio::test]
     async fn history_read_cancellation_releases_partial_progress() {
