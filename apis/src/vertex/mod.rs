@@ -375,8 +375,9 @@ fn warn_if_encoded(ctx: &HttpFilterContext<'_>) {
 /// `message_start` only, and re-emit. Partial frames stay in the
 /// per-request parser across chunk boundaries.
 #[expect(
+    clippy::cognitive_complexity,
     clippy::too_many_lines,
-    reason = "keeps the in-flight SSE parser state transition together"
+    reason = "keeps the in-flight SSE parser state transition together; tracing macros inflate clippy complexity (rust-lang/rust-clippy#14417)"
 )]
 fn patch_sse_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, end_of_stream: bool) {
     let Some(bytes) = body.as_ref() else {
