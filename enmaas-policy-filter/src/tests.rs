@@ -911,6 +911,30 @@ async fn fail_open_decision_is_short_cached() {
 }
 
 #[tokio::test]
+async fn active_key_is_injected_when_metering_fails_open() {
+    let key_file = tempfile::NamedTempFile::new().expect("temp key file");
+    std::fs::write(key_file.path(), r#"{"main":[{"id":"main-0","key":"secret-main"}]}"#).expect("write key file");
+    let (url, handle) = mock_metering("503 Service Unavailable", "upstream down");
+    let extra = format!("credential_mode: active\nkey_file: {}\n", key_file.path().display());
+    let filter = build_filter_with(&url, &extra);
+    let request = make_request(Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&request);
+    ctx.cluster = Some(Arc::from("cb-glm"));
+    ctx.set_metadata("x-tenant-username", "alice");
+    ctx.set_metadata("model_to_provider.client_model", "model-a");
+
+    let action = filter.on_request(&mut ctx).await.expect("policy request");
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.extra_request_headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("authorization") && value == "Bearer secret-main"),
+        "fail-open must still inject the main/current provider key"
+    );
+    handle.join().expect("mock metering thread");
+}
+
+#[tokio::test]
 async fn metering_malformed_json_fails_open() {
     let (url, handle) = mock_metering("200 OK", "not-json");
     let filter = build_filter(&url);
