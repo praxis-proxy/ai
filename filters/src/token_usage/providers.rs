@@ -102,13 +102,27 @@ fn chat_completions_usage(usage: ChatCompletionsUsage) -> Option<TokenUsage> {
     let reasoning = usage
         .completion_tokens_details
         .and_then(|details| details.reasoning_tokens);
-    // Gemini's OpenAI-compatible streaming usage sometimes omits
-    // `completion_tokens` while still reporting `total_tokens`.
-    let completion_tokens = usage.completion_tokens.or_else(|| {
-        usage
-            .total_tokens
-            .map(|total| total.saturating_sub(usage.prompt_tokens))
-    })?;
+    let candidates = usage.completion_tokens.unwrap_or(0);
+    let reasoning_count = reasoning.unwrap_or(0);
+    let completion_tokens = match (usage.completion_tokens, usage.total_tokens) {
+        // Gemini-style separate thinking: candidates + thinking == total - prompt.
+        (Some(candidates), Some(total))
+            if reasoning_count > 0
+                && total
+                    == usage
+                        .prompt_tokens
+                        .saturating_add(candidates)
+                        .saturating_add(reasoning_count) =>
+        {
+            candidates.saturating_add(reasoning_count)
+        },
+        // When completion is absent, total - prompt already includes all output.
+        (None, Some(total)) => total.saturating_sub(usage.prompt_tokens),
+        _ => candidates,
+    };
+    if usage.completion_tokens.is_none() && usage.total_tokens.is_none() {
+        return None;
+    }
     Some(
         TokenUsage::new(usage.prompt_tokens, completion_tokens, usage.total_tokens)
             .with_cache(cache_read, cache_write)
@@ -502,6 +516,59 @@ mod tests {
         assert_eq!(usage.output_tokens(), 13);
         assert_eq!(usage.total_tokens(), 15);
         assert_eq!(usage.reasoning_tokens(), Some(13));
+    }
+
+    #[test]
+    fn openai_nonstream_reasoning_is_folded_into_completion() {
+        // Gemini non-streaming: completion excludes separately reported thinking.
+        let json = br#"{"usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 14, "completion_tokens_details": {"reasoning_tokens": 11}}}"#;
+        let usage = parse_openai(json).expect("usage should parse");
+        assert_eq!(usage.input_tokens(), 2);
+        assert_eq!(usage.output_tokens(), 12);
+        assert_eq!(usage.total_tokens(), 14);
+        assert_eq!(usage.reasoning_tokens(), Some(11));
+    }
+
+    #[test]
+    fn openai_missing_completion_uses_total_minus_prompt_without_reasoning() {
+        let json = br#"{"usage": {"prompt_tokens": 10, "total_tokens": 40}}"#;
+        let usage = parse_openai(json).expect("usage should parse");
+        assert_eq!(usage.input_tokens(), 10);
+        assert_eq!(usage.output_tokens(), 30);
+        assert_eq!(usage.total_tokens(), 40);
+    }
+
+    #[test]
+    fn openai_missing_completion_uses_total_even_when_reasoning_is_present() {
+        let json = br#"{"usage": {"prompt_tokens": 2, "total_tokens": 15, "completion_tokens_details": {"reasoning_tokens": 5}}}"#;
+        let usage = parse_openai(json).expect("usage should parse");
+        assert_eq!(usage.output_tokens(), 13);
+        assert_eq!(usage.reasoning_tokens(), Some(5));
+    }
+
+    #[test]
+    fn openai_mismatched_total_with_reasoning_does_not_double_count() {
+        let json = br#"{"usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 36, "completion_tokens_details": {"reasoning_tokens": 5}}}"#;
+        let usage = parse_openai(json).expect("usage should parse");
+        assert_eq!(usage.output_tokens(), 20);
+    }
+
+    #[test]
+    fn openai_total_less_than_completion_with_reasoning_does_not_fold() {
+        let json = br#"{"usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 15, "completion_tokens_details": {"reasoning_tokens": 5}}}"#;
+        let usage = parse_openai(json).expect("usage should parse");
+        assert_eq!(usage.output_tokens(), 20);
+    }
+
+    #[test]
+    fn openai_reasoning_is_not_double_counted_when_inclusive() {
+        // OpenAI/Azure: reasoning is already inside completion_tokens.
+        let json = br#"{"usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30, "completion_tokens_details": {"reasoning_tokens": 5}}}"#;
+        let usage = parse_openai(json).expect("usage should parse");
+        assert_eq!(usage.input_tokens(), 10);
+        assert_eq!(usage.output_tokens(), 20);
+        assert_eq!(usage.total_tokens(), 30);
+        assert_eq!(usage.reasoning_tokens(), Some(5));
     }
 
     #[test]
