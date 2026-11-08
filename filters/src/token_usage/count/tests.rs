@@ -439,6 +439,17 @@ async fn sse_openai_final_usage_event() {
 }
 
 #[tokio::test]
+async fn sse_openai_streaming_usage_without_completion_tokens_derives_output() {
+    let events = b"data: {\"usage\":{\"prompt_tokens\":2,\"total_tokens\":15,\"completion_tokens_details\":{\"reasoning_tokens\":13}}}\n\n";
+
+    let (input, output, total) = run_sse_extraction(ProviderKind::OpenAi, events).await;
+
+    assert_eq!(input.as_deref(), Some("2"), "Gemini streaming input tokens");
+    assert_eq!(output.as_deref(), Some("13"), "derived completion tokens");
+    assert_eq!(total.as_deref(), Some("15"), "Gemini streaming total tokens");
+}
+
+#[tokio::test]
 async fn sse_openai_responses_final_usage_event() {
     let events = concat!(
         "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",

@@ -37,8 +37,9 @@ struct ChatCompletionsUsage {
     /// Tokens in the prompt.
     prompt_tokens: u64,
 
-    /// Tokens in the completion.
-    completion_tokens: u64,
+    /// Tokens in the completion. Some OpenAI-compatible streaming providers
+    /// omit this while still reporting the total.
+    completion_tokens: Option<u64>,
 
     /// Total tokens (optional, can be calculated).
     total_tokens: Option<u64>,
@@ -82,17 +83,17 @@ pub(super) fn parse_openai(body: &[u8]) -> Option<TokenUsage> {
     let envelope: OpenAiEnvelope = serde_json::from_slice(body).ok()?;
 
     if let Some(usage) = envelope.usage {
-        return Some(match usage {
+        return match usage {
             OpenAiTopLevelUsage::ChatCompletions(usage) => chat_completions_usage(usage),
-            OpenAiTopLevelUsage::Responses(usage) => responses_api_usage(usage),
-        });
+            OpenAiTopLevelUsage::Responses(usage) => Some(responses_api_usage(usage)),
+        };
     }
 
     envelope.response?.usage.map(responses_api_usage)
 }
 
 /// Converts a Chat Completions usage object.
-fn chat_completions_usage(usage: ChatCompletionsUsage) -> TokenUsage {
+fn chat_completions_usage(usage: ChatCompletionsUsage) -> Option<TokenUsage> {
     // `prompt_tokens` already includes cached reads and writes, so both counts
     // are recorded as breakdowns of the prompt rather than added to it.
     let (cache_read, cache_write) = usage.prompt_tokens_details.map_or((None, None), |details| {
@@ -101,9 +102,18 @@ fn chat_completions_usage(usage: ChatCompletionsUsage) -> TokenUsage {
     let reasoning = usage
         .completion_tokens_details
         .and_then(|details| details.reasoning_tokens);
-    TokenUsage::new(usage.prompt_tokens, usage.completion_tokens, usage.total_tokens)
-        .with_cache(cache_read, cache_write)
-        .with_reasoning(reasoning)
+    // Gemini's OpenAI-compatible streaming usage sometimes omits
+    // `completion_tokens` while still reporting `total_tokens`.
+    let completion_tokens = usage.completion_tokens.or_else(|| {
+        usage
+            .total_tokens
+            .map(|total| total.saturating_sub(usage.prompt_tokens))
+    })?;
+    Some(
+        TokenUsage::new(usage.prompt_tokens, completion_tokens, usage.total_tokens)
+            .with_cache(cache_read, cache_write)
+            .with_reasoning(reasoning),
+    )
 }
 
 /// Converts a Responses API usage object, keeping cache breakdowns out of the
@@ -475,12 +485,41 @@ mod tests {
 
     #[test]
     fn openai_usage_missing_required_field_returns_none() {
-        // prompt_tokens present but completion_tokens absent
+        // prompt_tokens present but completion_tokens and total_tokens absent
         let json = br#"{"usage": {"prompt_tokens": 10}}"#;
         assert!(
             parse_openai(json).is_none(),
-            "usage with missing required field should return None"
+            "usage with no completion or total should return None"
         );
+    }
+
+    #[test]
+    fn openai_streaming_usage_derives_completion_from_total() {
+        // Gemini's OpenAI-compatible streaming chunk omits completion_tokens.
+        let json = br#"{"usage": {"prompt_tokens": 2, "total_tokens": 15, "completion_tokens_details": {"reasoning_tokens": 13}}}"#;
+        let usage = parse_openai(json).expect("streaming usage should parse");
+        assert_eq!(usage.input_tokens(), 2);
+        assert_eq!(usage.output_tokens(), 13);
+        assert_eq!(usage.total_tokens(), 15);
+        assert_eq!(usage.reasoning_tokens(), Some(13));
+    }
+
+    #[test]
+    fn openai_streaming_usage_equal_total_derives_zero_completion() {
+        let json = br#"{"usage": {"prompt_tokens": 10, "total_tokens": 10}}"#;
+        let usage = parse_openai(json).expect("usage should parse");
+        assert_eq!(usage.input_tokens(), 10);
+        assert_eq!(usage.output_tokens(), 0);
+        assert_eq!(usage.total_tokens(), 10);
+    }
+
+    #[test]
+    fn openai_streaming_usage_total_less_than_prompt_derives_zero_completion() {
+        let json = br#"{"usage": {"prompt_tokens": 10, "total_tokens": 5}}"#;
+        let usage = parse_openai(json).expect("usage should parse");
+        assert_eq!(usage.input_tokens(), 10);
+        assert_eq!(usage.output_tokens(), 0);
+        assert_eq!(usage.total_tokens(), 5);
     }
 
     #[test]
