@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 
+use praxis_core::config::Config;
 use praxis_test_utils::{
     CapturedRequest, StatefulCapturingBackend, StatefulCapturingGuard, free_port, http_send, parse_body, parse_status,
     start_proxy,
@@ -52,7 +53,7 @@ fn capturing_chat_backend() -> StatefulCapturingGuard {
 }
 
 /// Build the example config for a proxy port and a capturing backend.
-fn translate_config(proxy_port: u16, backend: &StatefulCapturingGuard) -> praxis_core::config::Config {
+fn translate_config(proxy_port: u16, backend: &StatefulCapturingGuard) -> Config {
     load_example_config(CONFIG, proxy_port, HashMap::from([("127.0.0.1:8000", backend.port())]))
 }
 
@@ -191,7 +192,9 @@ fn both_sdk_credential_forms_stop_at_the_translator_on_one_chain() {
 
     let raw = post_message(
         &proxy,
-        &format!("x-api-key: {CLIENT_SECRET}\r\nAuthorization: Bearer {CLIENT_SECRET}\r\n"),
+        &format!(
+            "x-api-key: {CLIENT_SECRET}\r\nAuthorization: Bearer {CLIENT_SECRET}\r\nanthropic-version: 2026-10-21\r\n"
+        ),
     );
 
     assert_eq!(parse_status(&raw), 200, "translated request should return 200: {raw}");
@@ -203,7 +206,7 @@ fn both_sdk_credential_forms_stop_at_the_translator_on_one_chain() {
         forwarded.headers
     );
     let names = captured_header_names(&forwarded);
-    for forbidden in ["authorization", "x-api-key"] {
+    for forbidden in ["authorization", "x-api-key", "anthropic-version"] {
         assert!(
             !names.contains(&forbidden.to_owned()),
             "the backend must not receive a {forbidden} header: {names:?}"
