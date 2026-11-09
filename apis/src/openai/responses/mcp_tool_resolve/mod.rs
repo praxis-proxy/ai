@@ -66,7 +66,7 @@ use bytes::Bytes;
 use praxis_core::config::InsecureOptions;
 use praxis_filter::{
     BodyAccess, BodyMode, BoundUpstreamBodyOutcome, ChainBindingContext, FilterAction, FilterError, FilterPipeline,
-    HttpFilter, HttpFilterContext, TerminalResponse, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    HttpFilter, HttpFilterContext, TerminalResponse, parse_filter_config,
 };
 use tracing::debug;
 
@@ -86,7 +86,7 @@ use crate::{
     callout_headers::effective_body_callout_headers,
     callout_identity::{McpCalloutIdentity, stage_mcp_callout_identity},
     classifier::is_responses_create,
-    json_body::{SerializedJson, serialize_json_body, serialized_len},
+    json_body::{MAX_JSON_BODY_BYTES, SerializedJson, serialize_json_body, serialized_len},
     mcp_client,
 };
 

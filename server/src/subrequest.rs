@@ -61,7 +61,11 @@ pub fn create_subrequest_client(config: &Config) -> SubRequestClient {
                 half_open_timeout: Duration::from_secs(cb.half_open_timeout_secs),
             }),
     });
-    let response_ceiling = config.body_limits.max_response_bytes.unwrap_or(usize::MAX);
+    let response_ceiling = config
+        .body_limits
+        .max_response_bytes
+        .unwrap_or(usize::MAX)
+        .min(config.body_limits.max_buffer_bytes.get());
     SubRequestClient::with_max_response_bytes(connector, response_ceiling)
 }
 
@@ -140,6 +144,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn client_response_ceiling_respects_max_buffer_bytes() {
+        for (buffer_cap, response_cap, expected) in [
+            (4096, Some(8192), 4096),
+            (8192, Some(4096), 4096),
+            (4096, None, 4096),
+            (134_217_728, None, 134_217_728),
+        ] {
+            let mut config = minimal_config("");
+            config.body_limits.max_buffer_bytes = buffer_cap.try_into().unwrap();
+            config.body_limits.max_response_bytes = response_cap;
+            let client = create_subrequest_client(&config);
+            assert_eq!(
+                client.max_response_bytes(),
+                expected,
+                "buffered callouts must respect both response and buffering caps"
+            );
+        }
+    }
+
+    #[test]
     fn absent_circuit_breaker_leaves_isolation_disabled() {
         let client = create_subrequest_client(&minimal_config(""));
         let debug = format!("{client:?}");
@@ -212,7 +236,7 @@ runtime:
         )
         .unwrap();
         let chains: HashMap<&str, &[FilterEntry]> = HashMap::new();
-        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
+        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[])
             .expect("file-search factory should build against the shared client");
     }
 

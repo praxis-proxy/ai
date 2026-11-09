@@ -33,13 +33,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, BoundUpstreamBodyOutcome, EmptyFilterConfig, FilterAction, FilterError, HttpFilter,
-    HttpFilterContext, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    HttpFilterContext, parse_filter_config,
 };
 use tracing::{debug, trace};
 
 use self::parser::{ParsedTools, parse_tools};
 use super::bound_body_outcome;
-use crate::{classifier::is_responses_create, promotion::is_promotable_value};
+use crate::{classifier::is_responses_create, json_body::MAX_JSON_BODY_BYTES, promotion::is_promotable_value};
 
 // -----------------------------------------------------------------------------
 // ToolParseFilter
