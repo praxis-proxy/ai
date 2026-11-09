@@ -5311,7 +5311,7 @@ class TestResponsesToChatCompletionsVLLM:
         """The SDK request's provider controls survive the checked-in pipeline."""
         client, forwarded = reasoning_capture_client
 
-        response = client.responses.create(
+        raw_response = client.responses.with_raw_response.create(
             model=CHAT_TRANSLATION_MODEL,
             input=[
                 {
@@ -5337,8 +5337,9 @@ class TestResponsesToChatCompletionsVLLM:
             },
         )
 
+        assert "access_programs" in json.loads(raw_response.text)
+        response = raw_response.parse()
         assert response.status == "completed"
-        assert "access_programs" in response.model_fields_set
         assert response.access_programs is None
         assert (
             response.safety_identifier == "tenant-user"
