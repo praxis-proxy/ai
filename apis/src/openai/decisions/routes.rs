@@ -9,8 +9,11 @@
 //!
 //! Praxis proxies the Decisions contract rather than owning it, so these
 //! operations declare their runtime request-body shape without an
-//! `OwnedOperationContract`. Operation IDs are the official ones from the pinned
-//! OpenAI specification, reproduced verbatim including upstream's casing.
+//! `OwnedOperationContract`. Operation IDs follow the official Decisions API
+//! naming, reproduced verbatim including upstream's casing. The pinned
+//! `docs/conformance/specs/openai-openapi.yaml` does not yet describe
+//! `/v1/decisions`, so this registry has no spec drift check; add one
+//! (`registry_check::compare`) once a pinned revision covers the path.
 
 use std::ops::Deref;
 

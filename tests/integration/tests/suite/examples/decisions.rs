@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    free_port, http_send, json_post, load_example_config, parse_body, parse_status, start_backend_with_shutdown,
-    start_proxy,
+    StatefulCapturingBackend, free_port, http_send, json_post, load_example_config, parse_body, parse_status,
+    start_backend_with_shutdown, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -63,19 +63,43 @@ fn decisions_example_routes_a_create_decision_request() {
 
 #[test]
 fn decisions_example_passes_the_body_through_unmodified() {
-    let h = start();
-
     // The proxy does not own the Decisions contract: an unusual but
     // well-formed body must reach the backend unchanged rather than be
-    // rejected or rewritten locally.
+    // rejected or rewritten locally. A capturing backend observes what
+    // actually arrived, so a dropped or rewritten body fails the test.
+    let decisions = StatefulCapturingBackend::new(vec![(200, "decisions-backend".to_owned())]).start_with_shutdown();
+    let default = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+    let config = load_example_config(
+        "openai/decisions.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3001", decisions.port()), ("127.0.0.1:3002", default.port())]),
+    );
+    let proxy = start_proxy(&config);
+
     let body = r#"{"model":"gpt-6-luna","input":"x","questions":[{"type":"score","name":"s","instructions":"?","levels":[{"label":"a","description":"a"},{"label":"b","description":"b"}]}]}"#;
-    let raw = http_send(h.proxy.addr(), &json_post("/v1/decisions?foo=1", body));
+    let raw = http_send(proxy.addr(), &json_post("/v1/decisions?foo=1", body));
 
     assert_eq!(parse_status(&raw), 200, "query string should not affect routing");
     assert_eq!(
         parse_body(&raw),
         "decisions-backend",
         "the request should still reach the decisions cluster"
+    );
+
+    let requests = decisions.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the decisions backend should see exactly one request"
+    );
+    assert_eq!(
+        requests[0].uri, "/v1/decisions?foo=1",
+        "the forwarded URI should keep path and query"
+    );
+    assert_eq!(
+        requests[0].body, body,
+        "the forwarded body must be byte-for-byte unchanged"
     );
 }
 
