@@ -634,10 +634,12 @@ fn is_sse_response_body(resp_body: &str) -> bool {
 }
 
 /// Read a full HTTP request (headers + body) from a TCP stream.
+/// Without `Content-Length`, stop once the headers arrive; this helper does not
+/// decode chunked request bodies.
 fn read_full_request(stream: &mut TcpStream) -> String {
     let mut data = Vec::new();
     let mut buf = [0_u8; 8192];
-    let mut expected_len = None;
+    let mut expected_total_len = None;
 
     loop {
         match stream.read(&mut buf) {
@@ -646,14 +648,14 @@ fn read_full_request(stream: &mut TcpStream) -> String {
         }
         // Revalidating UTF-8 over the growing body on every read makes large
         // request fixtures quadratic and can exceed the client's timeout.
-        if expected_len.is_none()
+        if expected_total_len.is_none()
             && let Some(header_end) = data.windows(4).position(|bytes| bytes == b"\r\n\r\n")
         {
             let headers = String::from_utf8_lossy(&data[..header_end]);
             let content_length = super::specialized::parse_content_length(&headers);
-            expected_len = Some(header_end.saturating_add(4).saturating_add(content_length));
+            expected_total_len = Some(header_end.saturating_add(4).saturating_add(content_length));
         }
-        if expected_len.is_some_and(|len| data.len() >= len) {
+        if expected_total_len.is_some_and(|len| data.len() >= len) {
             break;
         }
     }
