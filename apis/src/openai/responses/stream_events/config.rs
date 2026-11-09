@@ -5,10 +5,10 @@
 
 use std::time::Duration;
 
-use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
+use praxis_filter::FilterError;
 use serde::Deserialize;
 
-use crate::openai::sse::SseParserConfig;
+use crate::{json_body::MAX_JSON_BODY_BYTES, openai::sse::SseParserConfig};
 
 /// Configuration for the `openai_stream_events` filter.
 ///

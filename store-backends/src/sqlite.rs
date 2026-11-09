@@ -29,6 +29,13 @@ use super::{
 };
 
 // -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// SQLite's extended primary-key constraint code, distinct from unique indexes.
+const SQLITE_CONSTRAINT_PRIMARYKEY: &str = "1555";
+
+// -----------------------------------------------------------------------------
 // SqliteResponseStore
 // -----------------------------------------------------------------------------
 
@@ -2436,7 +2443,18 @@ async fn sqlite_create_items_and_sync(
             .bind(position)
             .execute(&mut **tx)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|error| {
+                // This table's primary key is the owner-scoped item ID. Position
+                // conflicts use a separate unique index and remain database errors.
+                if error
+                    .as_database_error()
+                    .is_some_and(|database| database.code().as_deref() == Some(SQLITE_CONSTRAINT_PRIMARYKEY))
+                {
+                    StoreError::InvalidInput(format!("conversation item '{}' already exists", item.item_id))
+                } else {
+                    StoreError::Database(error.to_string())
+                }
+            })?;
     }
 
     sqlite_invalidate_messages(tx, conv_table, owner, conversation_id).await

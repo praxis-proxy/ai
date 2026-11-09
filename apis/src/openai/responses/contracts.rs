@@ -58,6 +58,9 @@ pub(super) struct ResponseResource {
     #[schema(example = "response")]
     pub(super) object: String,
 
+    /// Access programs reported by the provider, if any.
+    pub(super) access_programs: Option<Value>,
+
     /// Generation status.
     #[schema(example = "completed")]
     pub(super) status: String,
@@ -160,6 +163,7 @@ mod tests {
         let res = ResponseResource {
             id: "resp_1".to_owned(),
             object: "response".to_owned(),
+            access_programs: None,
             status: "completed".to_owned(),
             created_at: 1_700_000_000,
             completed_at: Some(1_700_000_005),

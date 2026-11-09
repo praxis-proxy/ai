@@ -8,11 +8,11 @@ use bytes::Bytes;
 use http::Method;
 use praxis_filter::{
     BodyAccess, BodyMode, EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    SubRequestResponseMode, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    SubRequestResponseMode, parse_filter_config,
 };
 use serde::Deserialize;
 
-use crate::operation::normalize_path;
+use crate::{json_body::MAX_JSON_BODY_BYTES, operation::normalize_path};
 
 /// Registered filter identifier.
 const FILTER_NAME: &str = "openai_chat_completions_streaming_selector";

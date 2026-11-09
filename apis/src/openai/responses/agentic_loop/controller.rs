@@ -10,8 +10,7 @@ use bytes::Bytes;
 use http::header::{CONTENT_TYPE, HeaderValue};
 use praxis_filter::{
     BodyAccess, BodyMode, ClientResponseHeadersCommitted, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    IterationState, Rejection, SubRequestResponseMode, TrustedHeaderMutation, body::MAX_JSON_BODY_BYTES,
-    parse_filter_config,
+    IterationState, Rejection, SubRequestResponseMode, TrustedHeaderMutation, parse_filter_config,
 };
 use serde_json::{Value, json};
 use tracing::{debug, trace};
@@ -44,6 +43,7 @@ use super::{
 use crate::{
     classifier::is_responses_create,
     http_hop::{connection_nominates_header, is_hop_by_hop},
+    json_body::MAX_JSON_BODY_BYTES,
 };
 // -----------------------------------------------------------------------------
 // Constants
