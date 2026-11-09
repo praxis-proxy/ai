@@ -3244,3 +3244,93 @@ def test_ttl_purges_conversation_after_expiration(ttl_proxy_client):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"] + sys.argv[1:]))
+
+
+@pytest.fixture(scope="module")
+def rate_limited_conversation_clients(request):
+    with tempfile.TemporaryDirectory() as db_dir:
+        port, control_port, readiness_port = _free_port(), _free_port(), _free_port()
+        path = _write_config(port, os.path.join(db_dir, "rate_limited.db"))
+        with open(path) as config_file:
+            config = json.load(config_file)
+        control_chain = json.loads(json.dumps(config["filter_chains"][0]))
+        control_chain["name"] = "control"
+        config["filter_chains"][0]["filters"][-1]["rate_limit"] = {
+            "mode": "global", "rate": getattr(request, "param", 0.000001), "burst": 1,
+        }
+        config["filter_chains"].append(control_chain)
+        config["listeners"].append({
+            "name": "control", "address": f"127.0.0.1:{control_port}",
+            "filter_chains": ["control"],
+        })
+        with open(path, "w") as config_file:
+            json.dump(config, config_file)
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", path], stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, text=True, env=_proxy_env(readiness_port),
+        )
+        clients = [OpenAI(api_key="not-needed", base_url=f"http://127.0.0.1:{p}/v1",
+                          default_headers={OWNER_HEADER: _owner_assertion("alice")},
+                          max_retries=0, timeout=10.0) for p in (port, control_port)]
+        try:
+            _wait_for_proxy(port, proc)
+            _wait_for_store_ready(readiness_port, proc)
+            limited, control = clients
+            conversation = limited.conversations.create(metadata={"original": "yes"}, items=[{
+                "type": "message", "role": "user", "content": "keep this item",
+            }])
+            item = control.conversations.items.list(conversation.id).data[0]
+            yield limited, control, conversation.id, item.id
+        finally:
+            for client in clients:
+                client.close()
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(path)
+
+
+@pytest.mark.parametrize("operation", [
+    "create", "retrieve", "update", "delete", "create_items", "list_items", "retrieve_item", "delete_item",
+])
+def test_conversations_rate_limit_contract(rate_limited_conversation_clients, operation):
+    limited, control, conversation_id, item_id = rate_limited_conversation_clients
+    actions = {
+        "create": lambda: limited.conversations.create(),
+        "retrieve": lambda: limited.conversations.retrieve(conversation_id),
+        "update": lambda: limited.conversations.update(conversation_id, metadata={"changed": "yes"}),
+        "delete": lambda: limited.conversations.delete(conversation_id),
+        "create_items": lambda: limited.conversations.items.create(conversation_id, items=[{
+            "type": "message", "role": "user", "content": "should not be added",
+        }]),
+        "list_items": lambda: limited.conversations.items.list(conversation_id),
+        "retrieve_item": lambda: limited.conversations.items.retrieve(item_id, conversation_id=conversation_id),
+        "delete_item": lambda: limited.conversations.items.delete(item_id, conversation_id=conversation_id),
+    }
+    with pytest.raises(openai.RateLimitError) as raised:
+        actions[operation]()
+    response = raised.value.response
+    assert response.status_code == 429
+    assert response.headers["content-type"].startswith("application/json")
+    assert int(response.headers["retry-after"]) >= 1
+    error = response.json()["error"]
+    assert error["type"] == "rate_limit_error"
+    assert error["code"] == "rate_limit_exceeded"
+    assert error["param"] is None
+    assert isinstance(error["message"], str) and error["message"]
+    assert control.conversations.retrieve(conversation_id).metadata == {"original": "yes"}
+    assert [item.id for item in control.conversations.items.list(conversation_id).data] == [item_id]
+
+
+@pytest.mark.parametrize("rate_limited_conversation_clients", [1], indirect=True)
+def test_conversations_rate_limit_recovers_after_retry_delay(rate_limited_conversation_clients):
+    limited, _, conversation_id, _ = rate_limited_conversation_clients
+    with pytest.raises(openai.RateLimitError) as raised:
+        limited.conversations.retrieve(conversation_id)
+    retry_after = int(raised.value.response.headers["retry-after"])
+    assert retry_after == 1
+    time.sleep(retry_after + 0.05)
+    assert limited.conversations.retrieve(conversation_id).id == conversation_id

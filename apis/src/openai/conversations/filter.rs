@@ -52,9 +52,19 @@ use crate::{
 ///
 /// All matched requests are served from the owner-scoped store and never
 /// forwarded upstream. Unmatched paths pass through as `Continue`. The filter
-/// keeps only request-scoped state: it resolves the store from the per-request
+/// resolves the store from the per-request
 /// registry the serving runtime provisions, and takes an owner-bound handle.
 /// `ai_operation` must precede this filter in the same chain.
+/// Optional `rate_limit` admission reuses the core request limiter and formats
+/// its 429 rejection as OpenAI JSON. One budget covers all local operations;
+/// `mode: global` shares it across callers and `mode: per_ip` uses the TCP peer
+/// address, not the authenticated owner or forwarded headers. `rate` is requests
+/// per second and `burst` is bucket capacity. The block is disabled when absent.
+/// Admission runs after trusted owner resolution and before store access; failed
+/// CRUD requests consume capacity too. A pipeline rebuild creates fresh buckets.
+/// Core per-IP state bounds and eviction apply. Shadow mode records decisions
+/// without rejecting. Successful local responses do not gain rate-limit headers.
+///
 /// For a managed `POST /v1/responses` with `conversation`, completed JSON and
 /// SSE responses append the request input and final output items to the local
 /// Conversation. Streaming append-back reads the canonical terminal response
@@ -75,8 +85,16 @@ use crate::{
 ///   conversations_table: conversations
 ///   items_table: conversation_items
 ///   allow_private_database_url: true
+///   rate_limit:
+///     mode: global
+///     rate: 100
+///     burst: 200
 /// ```
-pub struct OpenaiConversationsFilter;
+#[derive(Default)]
+pub struct OpenaiConversationsFilter {
+    /// Core admission policy, scoped to this pipeline instance's Conversations operations.
+    rate_limit: Option<Box<dyn HttpFilter>>,
+}
 
 /// Per-request state used when another filter forces request-body pre-read
 /// before this filter's header hook has run.
@@ -155,7 +173,38 @@ impl OpenaiConversationsFilter {
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: ConversationsConfig = parse_filter_config("openai_conversations", config)?;
         validate_config(&cfg)?;
-        Ok(Box::new(Self))
+        let rate_limit = cfg
+            .rate_limit
+            .as_ref()
+            .map(praxis_filter::builtins::RateLimitFilter::from_config)
+            .transpose()?;
+        Ok(Box::new(Self { rate_limit }))
+    }
+
+    /// Run nested core admission while preserving Conversations pre-read state.
+    async fn admit_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if let Err(action) = require_state_owner(ctx) {
+            return Ok(action);
+        }
+        if let Some(limiter) = &self.rate_limit {
+            // The nested core filter can publish shadow bookkeeping under the
+            // same invocation ID. Move aside our pre-read state across that call.
+            let request_state = ctx.remove_filter_state::<ConversationRequestState>();
+            let action = limiter.on_request(ctx).await;
+            if let Some(state) = request_state {
+                ctx.insert_filter_state(state);
+            }
+            match action? {
+                FilterAction::Reject(rejection) if rejection.status == 429 => {
+                    Self::discard_request_state(ctx);
+                    return Ok(FilterAction::Reject(super::rate_limit::format_rejection(rejection)?));
+                },
+                FilterAction::Continue => {},
+                action => return Ok(action),
+            }
+        }
+
+        Ok(FilterAction::Continue)
     }
 
     /// Resolve the owner-scoped store, or the fail-closed action to return.
@@ -441,6 +490,11 @@ impl HttpFilter for OpenaiConversationsFilter {
             }
             return Ok(FilterAction::Continue);
         };
+
+        let action = self.admit_request(ctx).await?;
+        if !matches!(action, FilterAction::Continue) {
+            return Ok(action);
+        }
 
         // The classifier publishes registry body metadata. Pair it with the
         // typed operation so corrupt or manually fabricated extension state

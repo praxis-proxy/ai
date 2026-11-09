@@ -624,6 +624,36 @@ fn list_items_with_invalid_query_on_nonexistent_conversation_returns_400() {
     assert_eq!(body["error"]["type"], "invalid_request_error");
 }
 
+#[test]
+fn configured_rate_limit_returns_openai_error() {
+    let proxy_port = free_port();
+    let yaml = std::fs::read_to_string(example_config_path("openai/conversations/conversations.yaml")).unwrap();
+    let patched = patch_yaml(
+        &yaml
+            .replace("sqlite://conversations.db?mode=rwc", "sqlite::memory:")
+            .replace("rate: 100", "rate: 0.000001")
+            .replace("burst: 200", "burst: 1"),
+        proxy_port,
+        &HashMap::new(),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).unwrap();
+    let proxy = start_proxy(&config);
+    let id = create_conversation(&proxy, "{}");
+    for method in ["GET", "DELETE"] {
+        let raw = http_send(
+            proxy.addr(),
+            &format!("{method} /v1/conversations/{id} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+        );
+        assert_eq!(parse_status(&raw), 429, "{raw}");
+        assert!(raw.to_ascii_lowercase().contains("content-type: application/json"));
+        assert!(raw.to_ascii_lowercase().contains("retry-after:"));
+        let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+        assert!(body["error"]["param"].is_null());
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Test Helpers
 // -----------------------------------------------------------------------------

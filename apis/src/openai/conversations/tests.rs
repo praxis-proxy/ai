@@ -45,7 +45,7 @@ fn make_owned_filter_context(req: &Request) -> HttpFilterContext<'_> {
 
 /// Build the stateless conversations filter under test.
 fn build_test_filter() -> OpenaiConversationsFilter {
-    OpenaiConversationsFilter
+    OpenaiConversationsFilter::default()
 }
 
 /// Publish the same generic extension as `ai_operation`.
@@ -4868,7 +4868,7 @@ fn harness() -> TestHarness {
 
 /// A harness over a caller-supplied backend (e.g. a fault-injecting double).
 fn harness_with(store: Arc<dyn PersistedStateBackend>) -> TestHarness {
-    (Box::new(OpenaiConversationsFilter), store)
+    (Box::new(OpenaiConversationsFilter::default()), store)
 }
 
 /// A harness over a real SQLite backend, for tests that assert the SQL backend's
@@ -4889,7 +4889,7 @@ async fn sqlite_harness() -> TestHarness {
         .await
         .expect("sqlite store should build"),
     );
-    (Box::new(OpenaiConversationsFilter), store)
+    (Box::new(OpenaiConversationsFilter::default()), store)
 }
 
 /// Build a request context with the shared store registered under the
@@ -6054,4 +6054,172 @@ async fn create_conversation_response_field_order_matches_openai() {
     let resp = rejection_body(&rejection);
     let keys: Vec<&String> = resp.as_object().unwrap().keys().collect();
     assert_eq!(keys, &["id", "object", "created_at", "metadata"]);
+}
+
+#[tokio::test]
+async fn conformance_conversations_rate_limit_rejects_every_operation_before_store_access() {
+    #[derive(serde::Deserialize)]
+    struct Reference {
+        components: Components,
+    }
+    #[derive(serde::Deserialize)]
+    struct Components {
+        schemas: ErrorSchemas,
+    }
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct ErrorSchemas {
+        error: Value,
+        error_response: Value,
+        misalignment_error_details_resource: Value,
+        #[serde(rename = "_MisalignmentSteer")]
+        misalignment_steer: Value,
+        #[serde(rename = "_MisalignmentErrorType")]
+        misalignment_error_type: Value,
+    }
+    let pinned: Reference =
+        serde_yaml::from_str(include_str!("../../../../docs/conformance/specs/openai-openapi.yaml")).unwrap();
+    let reference = serde_json::json!({"$ref": "#/components/schemas/ErrorResponse", "components": {"schemas": pinned.components.schemas}});
+    let validator = jsonschema::validator_for(&reference).unwrap();
+    for operation in operation_specs() {
+        let config = serde_yaml::from_str(
+            "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nrate_limit: {mode: global, rate: 0.000001, burst: 1}",
+        )
+        .unwrap();
+        let filter = OpenaiConversationsFilter::from_config(&config).unwrap();
+        let path = operation
+            .runtime_path()
+            .replace("{conversation_id}", "conv_test")
+            .replace("{item_id}", "msg_test");
+        let req = make_request(
+            Method::from_bytes(operation.method().as_str().as_bytes()).unwrap(),
+            &path,
+        );
+        let mut ctx = make_owned_filter_context(&req);
+        drop(filter.on_request(&mut ctx).await.unwrap());
+        let mut ctx = make_owned_filter_context(&req);
+        let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
+            panic!("expected rate limit rejection");
+        };
+        assert_eq!(rejection.status, 429, "{path}");
+        assert!(
+            rejection
+                .headers
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case("content-type") && v == "application/json")
+        );
+        let retry = rejection
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("retry-after"))
+            .unwrap();
+        assert!(retry.1.parse::<u64>().unwrap() >= 1);
+        let body = rejection_body(&rejection);
+        validator.validate(&body).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert!(body["error"].get("code").is_some());
+        assert!(body["error"].get("param").is_some());
+    }
+    println!("PRAXIS_CONFORMANCE_OK conversations rate_limit_response_contract");
+}
+
+fn rate_limited_filter(policy: &str) -> Box<dyn HttpFilter> {
+    let yaml = format!("backend: sqlite\ndatabase_url: 'sqlite::memory:'\nrate_limit: {policy}");
+    OpenaiConversationsFilter::from_config(&serde_yaml::from_str(&yaml).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn rate_limit_budgets_are_scoped_to_client_ip_and_pipeline_instance() {
+    let policy = "{mode: per_ip, rate: 0.000001, burst: 1}";
+    let filter = rate_limited_filter(policy);
+    let req = make_request(Method::GET, "/v1/conversations/conv_missing");
+    for (ip, expected) in [("192.0.2.1", 500), ("192.0.2.1", 429), ("192.0.2.2", 500)] {
+        let mut ctx = make_owned_filter_context(&req);
+        ctx.client_addr = Some(ip.parse().unwrap());
+        let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
+            panic!("expected local rejection");
+        };
+        assert_eq!(rejection.status, expected);
+    }
+    let rebuilt = rate_limited_filter(policy);
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.client_addr = Some("192.0.2.1".parse().unwrap());
+    assert!(matches!(rebuilt.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(r) if r.status == 500));
+}
+
+#[tokio::test]
+async fn unrelated_routes_and_missing_owners_do_not_consume_conversation_capacity() {
+    let filter = rate_limited_filter("{mode: global, rate: 0.000001, burst: 1}");
+    let unrelated = make_request(Method::GET, "/v1/models");
+    let mut ctx = make_owned_filter_context(&unrelated);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let req = make_request(Method::GET, "/v1/conversations/conv_missing");
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.remove::<crate::state_owner::StateOwner>();
+    assert!(matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(r) if r.status == 401));
+    let mut ctx = make_owned_filter_context(&req);
+    assert!(matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(r) if r.status == 500));
+    let mut ctx = make_owned_filter_context(&req);
+    assert!(matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(r) if r.status == 429));
+}
+
+#[tokio::test]
+async fn rate_limit_admission_charges_preread_body_only_once() {
+    let filter = rate_limited_filter("{mode: global, rate: 0.000001, burst: 2}");
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(InMemoryStore::new());
+    for expected in [200, 200, 429] {
+        let req = make_request(Method::POST, "/v1/conversations");
+        let mut ctx = conv_ctx(&store, &req);
+        ctx.current_filter_id = Some(0);
+        let mut body = Some(Bytes::from_static(b"{}"));
+        drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+        let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
+            panic!("expected local response");
+        };
+        assert_eq!(rejection.status, expected);
+    }
+}
+
+#[test]
+fn rate_limit_config_reuses_core_validation_and_stays_out_of_store_config() {
+    for policy in [
+        "{mode: global, rate: 0, burst: 1}",
+        "{mode: global, rate: 1, burst: 0}",
+        "{mode: owner, rate: 1, burst: 1}",
+        "{mode: global, rate: 1, burst: 1, unknown: true}",
+    ] {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nrate_limit: {policy}"
+        ))
+        .unwrap();
+        assert!(OpenaiConversationsFilter::from_config(&yaml).is_err());
+    }
+    let yaml = serde_yaml::from_str(
+        "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nrate_limit: {mode: global, rate: 1, burst: 1}",
+    )
+    .unwrap();
+    let (_, store) = super::store_ref_config(&yaml).unwrap();
+    assert!(store.get("rate_limit").is_none());
+}
+
+
+#[tokio::test]
+async fn shadow_rate_limit_preserves_preread_requests_after_exhaustion() {
+    let filter = rate_limited_filter("{mode: global, rate: 0.000001, burst: 1, shadow: true}");
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(InMemoryStore::new());
+    for _ in 0..3 {
+        let req = make_request(Method::POST, "/v1/conversations");
+        let mut ctx = conv_ctx(&store, &req);
+        ctx.current_filter_id = Some(0);
+        let mut body = Some(Bytes::from_static(b"{\"metadata\":{\"preserved\":\"yes\"}}"));
+        drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+        let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
+            panic!("expected local success");
+        };
+        assert_eq!(rejection.status, 200);
+        assert_eq!(rejection_body(&rejection)["metadata"]["preserved"], "yes");
+    }
 }
