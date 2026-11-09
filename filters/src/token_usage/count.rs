@@ -171,6 +171,12 @@ impl ProviderKind {
     /// `/v1/messages/count_tokens` deliberately matches nothing: its
     /// count is a tokenizer estimate for a request that never ran, and
     /// metering it would double-count against the real call.
+    ///
+    /// The AWS streaming endpoints (`/converse-stream`,
+    /// `/invoke-with-response-stream`) also match nothing: their bodies
+    /// are AWS `EventStream` frames, which none of the body parsers can
+    /// read, so selecting a parser for them would meter nothing while
+    /// pretending to be metered.
     fn for_path(path: &str) -> Option<Self> {
         if path.ends_with("/responses") || path.ends_with("/chat/completions") || path.ends_with("/completions") {
             // Azure exposes OpenAI paths (`/openai/deployments/...`) with
@@ -180,9 +186,9 @@ impl ProviderKind {
             Some(Self::Anthropic)
         } else if path.ends_with(":generateContent") || path.ends_with(":streamGenerateContent") {
             Some(Self::Google)
-        } else if path.ends_with("/converse") || path.ends_with("/converse-stream") {
+        } else if path.ends_with("/converse") {
             Some(Self::Bedrock)
-        } else if path.ends_with("/invoke") || path.ends_with("/invoke-with-response-stream") {
+        } else if path.ends_with("/invoke") {
             Some(Self::BedrockInvokeModel)
         } else {
             None

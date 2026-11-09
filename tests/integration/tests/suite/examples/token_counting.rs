@@ -19,6 +19,7 @@
 //! | `missing_usage_fields_*` | openai | Praxis-Token-* headers absent |
 //! | `example_config_*` | openai | 200 OK + body unchanged |
 //! | `example_config_token_metrics_carry_promoted_model_label` | openai | `praxis_ai_*` metrics labeled with the `model_to_header`-promoted body model (never `unknown` or a raw client `X-Model`) |
+//! | `auto_*_meters_usage` | auto (token-counting-auto.yaml) | `praxis_ai_prompt_tokens_total` / `praxis_ai_output_tokens_total` emitted with the dialect's exact counts, per dialect incl. Anthropic SSE |
 //!
 //! ## Why extracted counts aren't asserted here
 //!
@@ -355,90 +356,53 @@ fn example_config_token_counting_openai() {
 // Automatic provider selection (`provider: auto`)
 // -----------------------------------------------------------------------------
 //
-// A mixed-dialect listener: one chain with `provider: auto` serves every
-// dialect below on the same base URL, and each request meters with the
-// parser its endpoint implies.
+// These run the token-counting-auto.yaml example: one chain with
+// `provider: auto` serving every dialect on the same base URL. Each test
+// asserts the praxis_ai_* usage metrics actually emitted for its dialect —
+// passthrough alone would still pass if parser selection were broken.
+//
+// Every test sends a unique body model, so the counter series it asserts is
+// touched only by its own request even though the in-process metrics
+// recorder is shared across tests.
 
 #[test]
-fn auto_anthropic_non_streaming_body_passes_through() {
-    let backend = Backend::fixed(ANTHROPIC_JSON)
-        .header("content-type", "application/json")
-        .start_with_shutdown();
-    let proxy_port = free_port();
-    let config = token_count_config(proxy_port, backend.port(), "auto");
-    let proxy = start_proxy(&config);
-
-    let raw = http_send(proxy.addr(), &json_post("/v1/messages", "{}"));
-    assert_eq!(parse_status(&raw), 200);
-    assert_eq!(parse_body(&raw), ANTHROPIC_JSON, "body should pass through unchanged");
-}
-
-#[test]
-fn auto_openai_responses_non_streaming_body_passes_through() {
-    let backend = Backend::fixed(OPENAI_JSON)
-        .header("content-type", "application/json")
-        .start_with_shutdown();
-    let proxy_port = free_port();
-    let config = token_count_config(proxy_port, backend.port(), "auto");
-    let proxy = start_proxy(&config);
-
-    let raw = http_send(proxy.addr(), &json_post("/v1/responses", "{}"));
-    assert_eq!(parse_status(&raw), 200);
-    assert_eq!(parse_body(&raw), OPENAI_JSON, "body should pass through unchanged");
-}
-
-#[test]
-fn auto_google_non_streaming_body_passes_through() {
-    let backend = Backend::fixed(GOOGLE_JSON)
-        .header("content-type", "application/json")
-        .start_with_shutdown();
-    let proxy_port = free_port();
-    let config = token_count_config(proxy_port, backend.port(), "auto");
-    let proxy = start_proxy(&config);
-
-    let raw = http_send(
-        proxy.addr(),
-        &json_post("/v1beta/models/gemini-pro:generateContent", "{}"),
+fn auto_anthropic_non_streaming_meters_usage() {
+    auto_dialect_meters_usage(
+        "/v1/messages",
+        ANTHROPIC_JSON,
+        "application/json",
+        "auto-anthropic",
     );
-    assert_eq!(parse_status(&raw), 200);
-    assert_eq!(parse_body(&raw), GOOGLE_JSON, "body should pass through unchanged");
 }
 
 #[test]
-fn auto_bedrock_converse_non_streaming_body_passes_through() {
-    let backend = Backend::fixed(BEDROCK_CONVERSE_JSON)
-        .header("content-type", "application/json")
-        .start_with_shutdown();
-    let proxy_port = free_port();
-    let config = token_count_config(proxy_port, backend.port(), "auto");
-    let proxy = start_proxy(&config);
+fn auto_openai_responses_non_streaming_meters_usage() {
+    auto_dialect_meters_usage("/v1/responses", OPENAI_JSON, "application/json", "auto-openai");
+}
 
-    let raw = http_send(proxy.addr(), &json_post("/model/anthropic.claude-3/converse", "{}"));
-    assert_eq!(parse_status(&raw), 200);
-    assert_eq!(
-        parse_body(&raw),
+#[test]
+fn auto_google_non_streaming_meters_usage() {
+    auto_dialect_meters_usage(
+        "/v1beta/models/gemini-pro:generateContent",
+        GOOGLE_JSON,
+        "application/json",
+        "auto-google",
+    );
+}
+
+#[test]
+fn auto_bedrock_converse_non_streaming_meters_usage() {
+    auto_dialect_meters_usage(
+        "/model/anthropic.claude-3/converse",
         BEDROCK_CONVERSE_JSON,
-        "body should pass through unchanged"
+        "application/json",
+        "auto-bedrock",
     );
 }
 
 #[test]
-fn auto_anthropic_streaming_body_passes_through() {
-    let backend = Backend::fixed(ANTHROPIC_SSE)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .start_with_shutdown();
-    let proxy_port = free_port();
-    let config = token_count_config(proxy_port, backend.port(), "auto");
-    let proxy = start_proxy(&config);
-
-    let raw = http_send(proxy.addr(), &json_post("/v1/messages", r#"{"stream":true}"#));
-    assert_eq!(parse_status(&raw), 200);
-    assert_eq!(
-        parse_body(&raw),
-        ANTHROPIC_SSE,
-        "SSE body should pass through unchanged"
-    );
+fn auto_anthropic_streaming_meters_usage() {
+    auto_dialect_meters_usage("/v1/messages", ANTHROPIC_SSE, "text/event-stream", "auto-sse");
 }
 
 /// An unmeterable path under `provider: auto` must pass through and stay
@@ -460,6 +424,72 @@ fn auto_unmeterable_path_passes_through_unmetered() {
         parse_header(&raw, "praxis-token-input").is_none(),
         "praxis-token-input must be absent on an unmeterable path"
     );
+}
+
+// -----------------------------------------------------------------------------
+// Auto-dialect helpers
+// -----------------------------------------------------------------------------
+
+/// Send `body` to `path` through the token-counting-auto example with the
+/// request's model set to `model`, then assert the example's /metrics
+/// endpoint reports the body's usage counts under that model label.
+fn auto_dialect_meters_usage(path: &str, body: &str, content_type: &str, model: &str) {
+    let mut backend = Backend::fixed(body).header("content-type", content_type);
+    if content_type.contains("event-stream") {
+        backend = backend.header("cache-control", "no-cache");
+    }
+    let backend = backend.start_with_shutdown();
+    let (proxy_port, admin_port) = (free_port(), free_port());
+    let config = load_example_config(
+        "token-counting-auto.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:9901", admin_port)]),
+    );
+    let proxy = start_proxy(&config);
+
+    let request = if content_type.contains("event-stream") {
+        format!(r#"{{"model":"{model}","stream":true}}"#)
+    } else {
+        format!(r#"{{"model":"{model}"}}"#)
+    };
+    let raw = http_send(proxy.addr(), &json_post(path, &request));
+    assert_eq!(parse_status(&raw), 200, "the {model} request should pass through");
+    assert_eq!(parse_body(&raw), body, "body should pass through unchanged");
+
+    // Every dialect fixture above reports the same counts: 10 in, 20 out.
+    let admin = format!("127.0.0.1:{admin_port}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, metrics) = http_get(&admin, "/metrics", None);
+        let input = counter_value(&metrics, "praxis_ai_prompt_tokens_total", model);
+        let output = counter_value(&metrics, "praxis_ai_output_tokens_total", model);
+        if let (Some(input), Some(output)) = (input, output) {
+            assert_eq!(
+                (input, output),
+                (10, 20),
+                "auto must meter {model} from its dialect's usage format:\n{metrics}"
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "usage for model {model} never appeared in /metrics:\n{metrics}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Read a labeled `praxis_ai_*` counter from a /metrics scrape, if present.
+fn counter_value(metrics: &str, name: &str, model: &str) -> Option<u64> {
+    metrics
+        .lines()
+        .find(|l| {
+            l.starts_with(name)
+                && l.contains(&format!(r#"model="{model}""#))
+                && l.contains(r#"cluster="backend""#)
+        })
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
 }
 
 // -----------------------------------------------------------------------------

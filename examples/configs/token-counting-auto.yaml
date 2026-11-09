@@ -1,0 +1,70 @@
+# Automatic Token Counting
+#
+# The `auto` provider variant of token-counting.yaml: one chain serves
+# several AI API dialects behind a single base URL and picks the usage
+# parser per request from the endpoint path.
+#
+# Path-to-parser mapping:
+#   /v1/responses, /v1/chat/completions, /v1/completions -> OpenAI
+#     (Azure's /openai/deployments/... paths share the OpenAI schema)
+#   /v1/messages                                         -> Anthropic
+#   ...:generateContent, ...:streamGenerateContent       -> Google
+#   .../converse                                         -> Bedrock
+#   .../invoke                                           -> Bedrock InvokeModel
+#
+# Paths with no usage format (health checks, /v1/models,
+# /v1/messages/count_tokens) are skipped and stay unmetered. The AWS
+# streaming endpoints (/converse-stream, /invoke-with-response-stream)
+# are also skipped: their bodies are AWS EventStream frames, which no
+# parser can read.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/token-counting-auto.yaml
+#   curl http://localhost:8080/v1/chat/completions -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+#   curl http://localhost:8080/v1/messages -d '{"model":"claude-3","messages":[{"role":"user","content":"hi"}]}'
+#
+# Counts land in filter_metadata (token.input/output/total) and in the
+# praxis_ai_* metrics exposed on the admin metrics listener below.
+
+# The health and metrics endpoints (/healthy, /ready, /metrics) bind here;
+# scrape the praxis_ai_* token metrics (labeled by model and cluster) from
+# /metrics.
+admin:
+  metrics_address: "127.0.0.1:9901"
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      # A single catch-all route: the dialect is inferred per request by
+      # token_count, not by routing, which is exactly the mixed-dialect
+      # frontend auto exists for.
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      # model_to_header promotes the request body's "model" field to the
+      # X-Model request header and publishes it as model_to_header.model
+      # metadata, so the praxis_ai_* token metrics emitted by token_count
+      # carry a real model label instead of "unknown".
+      - filter: model_to_header
+
+      - filter: token_usage_headers
+
+      - filter: token_count
+        provider: auto
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

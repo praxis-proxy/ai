@@ -1870,12 +1870,7 @@ fn for_path_resolves_each_dialect() {
         Some(Google)
     );
     assert_eq!(ProviderKind::for_path("/model/converse"), Some(Bedrock));
-    assert_eq!(ProviderKind::for_path("/model/converse-stream"), Some(Bedrock));
     assert_eq!(ProviderKind::for_path("/model/invoke"), Some(BedrockInvokeModel));
-    assert_eq!(
-        ProviderKind::for_path("/model/invoke-with-response-stream"),
-        Some(BedrockInvokeModel)
-    );
 }
 
 #[test]
@@ -1885,6 +1880,11 @@ fn for_path_rejects_unmeterable_paths() {
         "/v1/models",
         "/v1/messages/count_tokens",
         "/v1/embeddings",
+        // AWS streaming bodies are EventStream frames, not a format any
+        // parser reads; mapping them would meter nothing while looking
+        // metered.
+        "/model/converse-stream",
+        "/model/invoke-with-response-stream",
         "/",
     ] {
         assert!(
