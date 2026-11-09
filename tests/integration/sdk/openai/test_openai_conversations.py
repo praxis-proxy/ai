@@ -1799,6 +1799,43 @@ class TestOpenAIConversations:
             )
         assert exc_info.value.status_code == 400, "duplicate item id must be rejected with 400"
 
+    def test_owner_wide_item_id_conflict_is_rejected_atomically(
+        self, openai_client, other_owner_client
+    ):
+        shared = {
+            "id": "item_owner_wide_conflict",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "original"}],
+        }
+        first = openai_client.conversations.create(items=[shared])
+        second = openai_client.conversations.create()
+        before = openai_client.conversations.items.list(first.id).model_dump()
+        preceding = {**shared, "id": "item_before_owner_wide_conflict"}
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.create(items=[preceding, shared])
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.body["type"] == "invalid_request_error"
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.items.create(
+                second.id, items=[preceding, shared]
+            )
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.body["type"] == "invalid_request_error"
+        assert openai_client.conversations.items.list(first.id).model_dump() == before
+        assert openai_client.conversations.items.list(second.id).data == []
+
+        created = openai_client.conversations.items.create(
+            second.id, items=[preceding]
+        )
+        assert [item.id for item in created.data] == [preceding["id"]]
+        other = other_owner_client.conversations.create(items=[shared])
+        assert [
+            item.id for item in other_owner_client.conversations.items.list(other.id).data
+        ] == [shared["id"]]
+
     @pytest.mark.parametrize(
         "query",
         ["limit=101", "limit=-1", "order=sideways", "after="],
