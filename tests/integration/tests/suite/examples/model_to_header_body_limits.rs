@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    StatefulCapturingBackend, free_port, http_send, load_example_config, parse_status, start_proxy,
-    start_stateful_backend,
+    StatefulCapturingBackend, free_port, http_send, load_example_config, parse_body, parse_header, parse_status,
+    start_proxy, start_stateful_backend,
 };
 
 /// The example opts into 32 MiB request and buffer limits.
@@ -65,6 +65,7 @@ fn model_inspection_enforces_both_bounds_for_fixed_and_chunked_requests() {
             let body = model_body(1025);
             let raw = http_send(proxy.addr(), &request(&body, chunked));
             assert_eq!(parse_status(&raw), 413, "one byte beyond the effective bound: {raw}");
+            assert_body_limit_error(&raw);
             assert_eq!(llama.requests().len(), 1, "oversize bodies must not reach the upstream");
             assert!(granite.requests().is_empty(), "spoofed routing must remain ineffective");
         }
@@ -88,8 +89,23 @@ fn raising_only_buffer_cap_preserves_default_request_limit() {
         413,
         "the default 10 MiB transfer cap still applies: {raw}"
     );
+    assert_body_limit_error(&raw);
     assert!(granite.requests().is_empty());
     assert!(llama.requests().is_empty());
+}
+
+/// Pin the shared error contract for declared-length and streamed rejections.
+fn assert_body_limit_error(raw: &str) {
+    assert_eq!(
+        parse_header(raw, "content-type").as_deref(),
+        Some("application/json"),
+        "body-limit errors must advertise JSON: {raw}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&parse_body(raw)).unwrap(),
+        serde_json::json!({"error": "request body too large"}),
+        "body-limit errors must preserve the shared JSON contract"
+    );
 }
 
 /// Load the actual example with isolated listeners and upstreams.
