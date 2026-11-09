@@ -37,6 +37,7 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, ClassVar
+from unittest.mock import Mock
 from urllib.parse import urlparse
 
 import httpx
@@ -12017,8 +12018,8 @@ def native_guardrails_client(tmp_path, request):
     config = config.replace("0.0.0.0:8080", f"127.0.0.1:{port}")
     config = config.replace("127.0.0.1:3001", f"127.0.0.1:{servers[0].server_port}")
     config = config.replace("127.0.0.1:3000", f"127.0.0.1:{servers[1].server_port}")
-    config_path = tmp_path / "guardrails.yaml"
-    config_path.write_text(config)
+    config_path = _persist_config(config)
+    request.addfinalizer(lambda: os.unlink(config_path))
     log_path = tmp_path / "praxis.log"
     with log_path.open("w") as log_file:
         proc = subprocess.Popen(
@@ -12042,6 +12043,34 @@ def native_guardrails_client(tmp_path, request):
             if not started or request.session.testsfailed > 0:
                 log_file.flush()
                 print(f"\n=== Native guardrails Praxis logs ===\n{log_path.read_text()}", file=sys.stderr)
+
+
+@qualification_profile("supporting")
+@pytest.mark.parametrize("uid", [0, 1000], ids=["root", "non-root"])
+def test_native_guardrails_fixture_inherits_root_override(tmp_path, monkeypatch, request, uid):
+    """Check the actual fixture's launch config without needing a root process."""
+    monkeypatch.setattr(os, "geteuid", lambda: uid)
+    monkeypatch.setattr(sys.modules[__name__], "_find_binary", lambda: "praxis-ai")
+    monkeypatch.setattr(sys.modules[__name__], "_wait_for_proxy", lambda *args: None)
+    configs = []
+
+    def launch_proxy(argv, **kwargs):
+        config_path = Path(argv[2])
+        configs.append(config_path)
+        config = config_path.read_text()
+        if uid == 0:
+            assert config.count("allow_root: true") == 1, config
+        else:
+            assert "allow_root:" not in config, config
+        return Mock()
+
+    monkeypatch.setattr(subprocess, "Popen", launch_proxy)
+    fixture = native_guardrails_client.__wrapped__(tmp_path, request)
+    try:
+        next(fixture)
+    finally:
+        fixture.close()
+    assert len(configs) == 1
 
 
 @pytest.mark.parametrize(
