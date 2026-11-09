@@ -11,6 +11,8 @@ The promoted value is also published to `model_to_header.model` metadata for dow
 
 Promotion is deferred until end-of-stream so a later body-writing filter (for example `llmisvc_model_provider_resolver`) can observe the pending header in the same `StreamBuffer` pre-read pass.
 
+Body inspection inherits the pipeline's `body_limits.max_buffer_bytes` and `body_limits.max_request_bytes`; the smaller bound applies. To accept requests above the default 10 MiB request limit, raise `max_request_bytes` and ensure `max_buffer_bytes` is at least as large (its default is 64 MiB). These bounds govern the shared pipeline buffer even when another filter declares a smaller buffer. Filters can still enforce separate validation limits while processing the body.
+
 ## Configuration
 
 | Field | Type | Required | Description |

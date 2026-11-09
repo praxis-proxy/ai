@@ -54,6 +54,14 @@ fn default_header() -> String {
 /// (for example `llmisvc_model_provider_resolver`) can observe the pending
 /// header in the same `StreamBuffer` pre-read pass.
 ///
+/// Body inspection inherits the pipeline's `body_limits.max_buffer_bytes`
+/// and `body_limits.max_request_bytes`; the smaller bound applies. To accept
+/// requests above the default 10 MiB request limit, raise `max_request_bytes`
+/// and ensure `max_buffer_bytes` is at least as large (its default is 64 MiB).
+/// These bounds govern the shared pipeline buffer even when another filter
+/// declares a smaller buffer. Filters can still enforce separate validation
+/// limits while processing the body.
+///
 /// # YAML configuration
 ///
 /// ```yaml
@@ -142,7 +150,9 @@ impl HttpFilter for ModelToHeaderFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
-        self.inner.request_body_mode()
+        // The inner JSON extractor's 10 MiB default would silently prevent
+        // operators from raising the pipeline's configured inspection bound.
+        BodyMode::StreamBuffer { max_bytes: None }
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -261,14 +271,33 @@ mod tests {
             BodyAccess::ReadOnly,
             "body access should delegate to inner"
         );
-        assert!(
-            matches!(
-                filter.request_body_mode(),
-                BodyMode::StreamBuffer {
-                    max_bytes: Some(limit)
-                } if limit > 0
-            ),
-            "body mode should be StreamBuffer with a default size limit"
+        assert_eq!(
+            filter.request_body_mode(),
+            BodyMode::StreamBuffer { max_bytes: None },
+            "inspection should inherit the configured pipeline limits"
+        );
+    }
+
+    #[test]
+    fn inherited_bounds_govern_the_shared_buffer_with_other_filters() {
+        let mut entries = serde_yaml::from_str::<Vec<praxis_core::config::FilterEntry>>(
+            "
+- filter: model_to_header
+- filter: prompt_enrich
+  max_body_bytes: 1024
+  prepend: [{role: system, content: hello}]
+",
+        )
+        .unwrap();
+        let mut pipeline = praxis_filter::FilterPipeline::build(&mut entries, &crate::build_ai_registry()).unwrap();
+        let limits = serde_yaml::from_str("max_request_bytes: 33554432\nmax_buffer_bytes: 33554432").unwrap();
+        pipeline.configure_body_limits(&limits, false).unwrap();
+        assert_eq!(
+            pipeline.body_capabilities().request_body_mode,
+            BodyMode::StreamBuffer {
+                max_bytes: Some(33_554_432)
+            },
+            "filter mode declarations request shared capacity; listener bounds are the hard limits"
         );
     }
 

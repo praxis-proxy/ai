@@ -77,6 +77,7 @@ mod llmd_ext_proc;
 mod llmisvc_model_provider_resolver;
 mod mcp_broker;
 mod model_to_header;
+mod model_to_header_body_limits;
 mod model_to_header_trust_existing;
 mod model_to_provider;
 #[cfg(all(feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
