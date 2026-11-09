@@ -1692,8 +1692,8 @@ mod tests {
         let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
         assert!(error.contains("`cache_control`"), "{error}");
         assert!(
-            error.contains("prompt_caching"),
-            "must point at the lossy opt-in: {error}"
+            error.contains("not supported by this endpoint"),
+            "must tell the client what to do: {error}"
         );
 
         body["system"] = json!([{"type": "text", "text": "Be brief", "citations": [{"cited_text": "x"}]}]);
