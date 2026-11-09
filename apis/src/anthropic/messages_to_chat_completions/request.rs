@@ -614,12 +614,21 @@ fn take_movable_system_content(message: Value, seen_non_system: bool) -> Result<
 /// array are joined by [`hoist_system`]'s single-newline block join. The fold
 /// must not change how an existing block array is joined, so it inherits
 /// that join instead of re-separating pre-existing blocks.
+///
+/// A group that contributes neither text nor a `cache_control` marker — the
+/// empty directive forms, or an empty existing system — is dropped, so
+/// removing the message leaves no stray join separator behind.
 fn merge_mid_conversation_system(body: &mut Map<String, Value>, moved: Vec<SystemParts>) -> Result<(), String> {
     let existing = body.remove("system").filter(|value| !value.is_null());
     let (mut groups, existing_is_blocks) = existing_system_groups(existing)?;
     // One group per source: the existing top-level system, then each moved
     // message in encounter order.
     groups.extend(moved);
+    // An empty directive (`content: []` or `""`) is an empty group; dropping
+    // it keeps its removal from leaving a separator artifact. A group with a
+    // surviving `cache_control` marker is always kept so the marker still
+    // fails closed in validation.
+    groups.retain(|group| group.iter().any(|(text, marker)| !text.is_empty() || marker.is_some()));
 
     let carries_marker = groups
         .iter()
@@ -3316,6 +3325,54 @@ mod tests {
             assert_eq!(messages.len(), 2, "the message must not survive: {messages:?}");
             assert_eq!(messages[0], json!({"role": "user", "content": "Hi"}));
         }
+    }
+
+    #[test]
+    fn mid_conversation_system_empty_directives_leave_no_separator() {
+        // A removed directive must not leave a join separator behind: the
+        // surviving system text is exactly what existed plus what real
+        // messages contributed.
+        let body = json!({
+            "model": "m",
+            "system": "Be brief",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": []},
+                {"role": "system", "content": ""},
+                {"role": "user", "content": "Reply with exactly: OK"}
+            ]
+        });
+        let (translated, degraded) = degrade(body, MIDSYS).unwrap();
+        assert!(degraded.mid_conversation_system);
+        let messages = translated["messages"].as_array().unwrap();
+        assert_eq!(
+            messages[0],
+            json!({"role": "system", "content": "Be brief"}),
+            "no trailing blank lines: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_empty_directive_before_real_leaves_no_separator() {
+        // An empty directive before a real moved message (no top-level
+        // system) must not prefix the folded text with separators.
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": ""},
+                {"role": "system", "content": "Real"},
+                {"role": "user", "content": "Reply with exactly: OK"}
+            ]
+        });
+        let (translated, degraded) = degrade(body, MIDSYS).unwrap();
+        assert!(degraded.mid_conversation_system);
+        let messages = translated["messages"].as_array().unwrap();
+        assert_eq!(
+            messages[0],
+            json!({"role": "system", "content": "Real"}),
+            "no leading blank lines: {messages:?}"
+        );
     }
 
     #[test]

@@ -245,7 +245,7 @@ surfaces:
           message must be at the beginning"); a leading system message is
           never moved. The fold loses the original system message positions,
           which is why the cell is lossy.
-        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:792-795; apis/src/anthropic/messages_to_chat_completions/request.rs:532-692
+        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:801-804; apis/src/anthropic/messages_to_chat_completions/request.rs:532-701
       multimodal-image:
         status: translated
         note: >-
