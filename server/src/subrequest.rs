@@ -66,6 +66,8 @@ pub fn create_subrequest_client(config: &Config) -> SubRequestClient {
 }
 
 /// Buffered callout responses must satisfy both the transfer and memory bounds.
+/// `max_response_bytes: null` removes the transfer limit, but buffered responses
+/// remain bounded by `body_limits.max_buffer_bytes`.
 pub(crate) fn buffered_response_limit(config: &Config) -> usize {
     config
         .body_limits
