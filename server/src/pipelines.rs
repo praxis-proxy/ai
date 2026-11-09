@@ -1247,6 +1247,76 @@ insecure_options:
     }
 
     #[test]
+    fn model_inspection_inherits_configured_body_limits() {
+        for (limits, insecure, expected, buffer_cap) in [
+            ("", "", 10_485_760, 67_108_864),
+            ("max_request_bytes: 33554432", "", 33_554_432, 67_108_864),
+            ("max_buffer_bytes: 134217728", "", 10_485_760, 134_217_728),
+            ("max_request_bytes: 134217728", "", 67_108_864, 67_108_864),
+            (
+                "max_request_bytes: 134217728, max_buffer_bytes: 134217728",
+                "",
+                134_217_728,
+                134_217_728,
+            ),
+            ("max_request_bytes: 2048, max_buffer_bytes: 1024", "", 1024, 1024),
+            ("max_request_bytes: 1024, max_buffer_bytes: 2048", "", 1024, 2048),
+            (
+                "max_request_bytes: null, max_buffer_bytes: 2048",
+                "allow_unbounded_body: true",
+                2048,
+                2048,
+            ),
+        ] {
+            let config = Config::from_yaml(&format!(
+                r#"
+body_limits: {{ {limits} }}
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: model_to_header
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints: ["127.0.0.1:8001"]
+insecure_options:
+  allow_private_endpoints: true
+  {insecure}
+"#
+            ))
+            .unwrap();
+            let client = test_client();
+            let registry = crate::build_full_registry(&client);
+            let pipelines = resolve_pipelines(
+                &config,
+                &registry,
+                &empty_health_registry(),
+                &empty_kv_stores(),
+                &empty_inflight_registry(),
+                &client,
+            )
+            .unwrap();
+            let pipeline = pipelines.get("web").unwrap().load();
+            assert_eq!(pipeline.buffer_cap(), buffer_cap, "buffer cap for {limits}");
+            assert_eq!(
+                pipeline.body_capabilities().request_body_mode,
+                praxis_filter::BodyMode::StreamBuffer {
+                    max_bytes: Some(expected)
+                },
+                "effective inspection limit for {limits}"
+            );
+        }
+    }
+
+    #[test]
     fn resolve_pipelines_applies_max_buffer_bytes() {
         for cap in [4096, 134_217_728] {
             let mut config = valid_config();
