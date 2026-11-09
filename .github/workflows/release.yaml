@@ -486,6 +486,31 @@ jobs:
             --existing-notes "$RUNNER_TEMP/release-qualification/base-notes.md" \
             --output-dir "$RUNNER_TEMP/release-qualification"
           cat "$RUNNER_TEMP/release-qualification/release-qualification.md" >> "$GITHUB_STEP_SUMMARY"
+
+          # Best-effort previous release for a status diff. A missing asset is
+          # not an error; the report simply has no comparison section.
+          prev_dir="$RUNNER_TEMP/support-previous"
+          mkdir -p "$prev_dir"
+          prev_tag=$(gh api "repos/$GH_REPO/releases?per_page=30" \
+            --jq '[.[] | select(.draft == false and .tag_name != env.TAG)] | first | .tag_name // empty' \
+            2>/dev/null || true)
+          if [ -n "${prev_tag:-}" ]; then
+            gh release download "$prev_tag" --repo "$GH_REPO" \
+              --pattern support-report.json --dir "$prev_dir" 2>/dev/null || true
+          fi
+          prev_args=()
+          if [ -f "$prev_dir/support-report.json" ]; then
+            prev_args=(--previous "$prev_dir/support-report.json")
+          fi
+          python3 .github/scripts/support_report.py generate \
+            --tag "$TAG" --sha "$sha" \
+            --qualification "$RUNNER_TEMP/release-qualification/qualification.json" \
+            --release-qualification "$RUNNER_TEMP/release-qualification/release-qualification.json" \
+            "${prev_args[@]}" \
+            --existing-notes "$RUNNER_TEMP/release-qualification/release-notes.md" \
+            --output-dir "$RUNNER_TEMP/release-qualification"
+          cat "$RUNNER_TEMP/release-qualification/support-report.md" >> "$GITHUB_STEP_SUMMARY"
+
           if [ "$existing" = true ]; then
             gh release edit "$TAG" --repo "$GH_REPO" \
               --prerelease="$PRERELEASE" \
@@ -499,6 +524,8 @@ jobs:
             "$RUNNER_TEMP/release-qualification/qualification.json" \
             "$RUNNER_TEMP/release-qualification/release-qualification.json" \
             "$RUNNER_TEMP/release-qualification/release-qualification.md" \
+            "$RUNNER_TEMP/release-qualification/support-report.json" \
+            "$RUNNER_TEMP/release-qualification/support-report.md" \
             --repo "$GH_REPO" --clobber
           gh release view "$TAG" --repo "$GH_REPO" --json body,assets \
             > "$RUNNER_TEMP/release-qualification/published.json"
@@ -511,6 +538,10 @@ jobs:
                   or body.count("<!-- praxis:native-vllm-qualification:end -->") != 1 \
                   or body.count("<!-- praxis:release-ci-qualification:start -->") != 1 \
                   or body.count("<!-- praxis:release-ci-qualification:end -->") != 1 \
-                  or not {"qualification.json", "release-qualification.json", "release-qualification.md"} <= names:
+                  or body.count("<!-- praxis:support-report:start -->") != 1 \
+                  or body.count("<!-- praxis:support-report:end -->") != 1 \
+                  or not {"qualification.json", "release-qualification.json",
+                          "release-qualification.md", "support-report.json",
+                          "support-report.md"} <= names:
               raise SystemExit("release is missing its unique qualification sections or report assets")
           PY

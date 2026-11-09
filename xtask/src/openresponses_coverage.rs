@@ -3,7 +3,8 @@
 
 //! `cargo xtask openresponses-coverage` computes the `OpenResponses` translation
 //! conformance coverage from the triage manifest and regenerates (or verifies)
-//! `docs/conformance/openresponses-translation.md`.
+//! `docs/conformance/openresponses-translation.md` and its machine-readable
+//! sidecar `docs/conformance/openresponses-coverage.json`.
 //!
 //! Coverage is `supported / (supported + unsupported)` — the fraction of
 //! in-scope suite templates the `openai_responses_to_chat_completions` filter passes.
@@ -13,7 +14,11 @@
 //! to `supported` and bumps the number, so the report is a ratchet that tracks
 //! implementation quality rather than a static all-pass claim.
 
-use std::{fmt::Write as _, fs, path::PathBuf};
+use std::{
+    fmt::Write as _,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use clap::Parser;
 use serde::Deserialize;
@@ -35,6 +40,11 @@ const MANIFEST_REL: &str = "tests/conformance/openresponses/manifest.yaml";
 
 /// Generated report, relative to the workspace root.
 const DOC_REL: &str = "docs/conformance/openresponses-translation.md";
+
+/// Generated machine-readable sidecar, relative to the workspace root.
+///
+/// The release support report reads this instead of parsing YAML.
+const JSON_REL: &str = "docs/conformance/openresponses-coverage.json";
 
 // -----------------------------------------------------------------------------
 // Manifest
@@ -84,20 +94,21 @@ pub(crate) fn run(args: &Args) {
     let raw = fs::read_to_string(&manifest_path).expect("failed to read OpenResponses triage manifest");
     let manifest: Manifest = serde_yaml::from_str(&raw).expect("failed to parse OpenResponses triage manifest");
 
-    let content = render_doc(&manifest);
+    emit(args, &root, &doc_path, DOC_REL, &render_doc(&manifest));
+    emit(args, &root, &root.join(JSON_REL), JSON_REL, &render_json(&manifest));
+}
 
+/// Write one generated file, or fail when its committed copy drifted.
+fn emit(args: &Args, root: &Path, path: &Path, rel: &str, content: &str) {
     if args.fix {
-        fs::write(&doc_path, &content).unwrap();
-        println!("wrote {}", doc_path.strip_prefix(&root).unwrap_or(&doc_path).display());
+        fs::write(path, content).unwrap();
+        println!("wrote {}", path.strip_prefix(root).unwrap_or(path).display());
+    } else if fs::read_to_string(path).unwrap_or_default() == content {
+        println!("{rel} is up to date");
     } else {
-        let current = fs::read_to_string(&doc_path).unwrap_or_default();
-        if current == content {
-            println!("{DOC_REL} is up to date");
-        } else {
-            eprintln!("{DOC_REL} is stale");
-            eprintln!("\nrun: cargo xtask openresponses-coverage --fix");
-            std::process::exit(1);
-        }
+        eprintln!("{rel} is stale");
+        eprintln!("\nrun: cargo xtask openresponses-coverage --fix");
+        std::process::exit(1);
     }
 }
 
@@ -158,6 +169,35 @@ fn ids(entries: &[Entry]) -> String {
 // -----------------------------------------------------------------------------
 // Rendering
 // -----------------------------------------------------------------------------
+
+/// Render the machine-readable sidecar consumed by the release support report.
+fn render_json(m: &Manifest) -> String {
+    let cov = coverage(m);
+    let ids = |entries: &[Entry]| entries.iter().map(|entry| entry.id.clone()).collect::<Vec<_>>();
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "source": MANIFEST_REL,
+        "suite": {
+            "commit": m.suite.commit,
+            "bun": m.suite.bun,
+            "zod": m.suite.zod,
+        },
+        "coverage": {
+            "supported": cov.supported,
+            "unsupported": cov.unsupported,
+            "inapplicable": cov.inapplicable,
+            "in_scope": cov.in_scope(),
+            "total": cov.total(),
+            "percent": cov.percent(),
+        },
+        "supported": ids(&m.supported),
+        "unsupported": ids(&m.unsupported),
+        "inapplicable": ids(&m.inapplicable),
+    });
+    let mut rendered = serde_json::to_string_pretty(&document).expect("manifest is serializable");
+    rendered.push('\n');
+    rendered
+}
 
 /// Render the full `openresponses-translation.md` document.
 #[expect(clippy::too_many_lines, reason = "straight-line Markdown document template")]
