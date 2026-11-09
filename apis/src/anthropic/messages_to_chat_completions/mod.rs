@@ -133,7 +133,11 @@ const DEGRADED_FEATURES_HEADER: &str = "x-degraded-features";
 /// content shapes remain subject to strict validation and can be rejected
 /// with a 400.
 /// Features absent from the allowlist, malformed markers, and other
-/// `context_management` edits are still rejected with a 400.
+/// `context_management` edits are still rejected with a 400 — except that
+/// without `mid_conversation_system` the translator does not reject
+/// in-array `system` messages itself: it preserves them in their original
+/// positions (Chat Completions represents them directly) and the backend
+/// decides whether to accept that ordering.
 ///
 /// # YAML
 ///

@@ -9,8 +9,10 @@
 # caching (`cache_control` markers), extended thinking (`thinking`), and
 # mid-conversation `system` messages (the environment block it sends after the
 # first user turn) — are stripped or folded and reported instead of rejected.
-# Without that allowlist such requests fail closed with a 400 (the strict
-# default of `messages-to-openai.yaml`). The client speaks the Anthropic
+# Without that allowlist, unsupported thinking and cache markers fail closed
+# with a 400 at the proxy (the strict default of `messages-to-openai.yaml`),
+# and mid-conversation `system` messages are passed through in position for
+# the backend to accept or reject. The client speaks the Anthropic
 # wire format; Praxis rewrites both the request and the response, and vLLM
 # only sees Chat Completions.
 #
@@ -86,9 +88,11 @@ filter_chains:
         # described below and reports the loss (one WARN log per request, the
         # praxis_anthropic_messages_to_chat_completions_degraded_total counter,
         # and an x-degraded-features response header) instead of rejecting an
-        # unmodified Claude Code client with a 400. Remove an entry to make
-        # that feature fail closed again; malformed markers and every feature
-        # not listed here are still rejected.
+        # unmodified Claude Code client with a 400. Malformed markers and
+        # every feature not listed here are still rejected. Removing
+        # prompt_caching or extended_thinking fails their markers closed at
+        # the proxy again; removing mid_conversation_system instead keeps the
+        # message in position, and the backend decides, as described below.
         #   - prompt_caching:    drop `cache_control` markers. Prompt and tool
         #     content are preserved; explicit cache breakpoints are not honored,
         #     so cost and latency may differ.

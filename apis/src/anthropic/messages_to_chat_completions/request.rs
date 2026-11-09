@@ -3343,7 +3343,10 @@ mod tests {
             ]
         });
         let (translated, degraded) = degrade(body, MIDSYS).unwrap();
-        assert!(degraded.mid_conversation_system);
+        assert!(
+            degraded.mid_conversation_system,
+            "the empty directives were folded: {translated}"
+        );
         let messages = translated["messages"].as_array().unwrap();
         assert_eq!(
             messages[0],
@@ -3366,7 +3369,10 @@ mod tests {
             ]
         });
         let (translated, degraded) = degrade(body, MIDSYS).unwrap();
-        assert!(degraded.mid_conversation_system);
+        assert!(
+            degraded.mid_conversation_system,
+            "the empty directive before the real message was folded: {translated}"
+        );
         let messages = translated["messages"].as_array().unwrap();
         assert_eq!(
             messages[0],
