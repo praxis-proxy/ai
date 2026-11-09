@@ -7,7 +7,7 @@ name: Coding Conventions
 on:
   pull_request_target:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
@@ -32,7 +32,7 @@ jobs:
           app-id: ${{ secrets.PRAXIS_BOT_APP_ID }}
           private-key: ${{ secrets.PRAXIS_BOT_APP_PRIVATE_KEY }}
 
-      - name: Check for description
+      - name: Check for why, what, and how
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -44,17 +44,58 @@ jobs:
             exit 0
           fi
 
-          word_count=$(echo "$PR_BODY" | wc -w)
-          if [ "$word_count" -lt 2 ]; then
-            marker="<!-- praxis:pr-description-check -->"
+          missing=$(python3 - <<'PY'
+          import os
+          import re
+
+          body = os.environ.get("PR_BODY", "")
+          headings = {
+              "why": re.compile(r"^#{1,6}\s+why\b", re.IGNORECASE),
+              "what": re.compile(r"^#{1,6}\s+what\b", re.IGNORECASE),
+              "how": re.compile(r"^#{1,6}\s+how\b", re.IGNORECASE),
+          }
+          sections = {}
+          current = None
+          for line in body.splitlines():
+              match = next((name for name, pattern in headings.items() if pattern.match(line.strip())), None)
+              if match:
+                  current = match
+                  sections.setdefault(current, [])
+              elif line.lstrip().startswith("#") and re.match(r"^#{1,6}\s", line.strip()):
+                  current = None
+              elif current:
+                  sections[current].append(line)
+
+          missing = []
+          for name in headings:
+              content = "\n".join(sections.get(name, []))
+              content = re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL).strip()
+              if not content:
+                  missing.append(name)
+          print(" ".join(missing))
+          PY
+          )
+
+          if [ -n "$missing" ]; then
+            marker="<!-- praxis:pr-description-check-v2 -->"
+            details=""
+            for section in $missing; do
+              details="${details}\n- ${section^}: add a short explanation under the section heading."
+            done
             already=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
               --jq "[.[] | select(.body | contains(\"${marker}\"))] | length")
             if [ "$already" -eq 0 ]; then
               gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" \
                 --body "${marker}
-          Please add a description to this PR explaining what it does and why. See our [coding conventions](https://github.com/praxis-proxy/conventions/blob/main/docs/conventions.md)."
+                This PR needs a description with non-empty **Why**, **What**, and **How** sections. Explain why the change is needed, what problem it fixes, and how the change addresses it. For a new filter parameter, justify why it is needed and what behavior it controls.${details}
+
+                See [CONTRIBUTING.md](https://github.com/praxis-proxy/praxis-ai/blob/main/CONTRIBUTING.md#pull-request-gates)."
             fi
+            echo "PR description is missing content for: $missing"
+            exit 1
           fi
+
+          echo "PR description contains non-empty Why, What, and How sections."
 
   # ----------------------------------------------------------------------------
   # Dependency Version Check

@@ -48,7 +48,13 @@ go through the [proposal process].
 CI enforces reviewability on every PR:
 
 - A maximum added lines count of production code (tests, docs, examples excluded)
-- A real description of what and why - `Signed-off-by`
+- A description with non-empty **Why**, **What**, and **How** sections. Explain
+  why the change is needed, what problem it fixes, and how the implementation
+  addresses it. The Praxis bot check fails when any section is missing or empty.
+  PRs that add a filter parameter must also justify why the parameter is
+  needed, what behavior it controls, and why existing configuration is
+  insufficient.
+- A `Signed-off-by`
   trailer on every commit (`git commit -s`)
 - Cryptographically signed commits (GPG or SSH)
 - Human authorship: commits authored or signed-off by tools are rejected
