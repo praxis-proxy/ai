@@ -360,7 +360,61 @@ fn non_object_reasoning_block_is_rejected_before_forwarding() {
 }
 
 #[test]
-fn reasoning_summary_request_is_rejected_before_forwarding() {
+fn reasoning_summary_auto_is_best_effort_and_forwarded_without_the_summary() {
+    let chat_response = serde_json::json!({
+        "id": "chatcmpl_auto",
+        "object": "chat.completion",
+        "model": "deepseek-r1",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "4",
+                "reasoning": "2 plus 2 is 4.",
+                "reasoning_content": null
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18}
+    });
+    let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let (config, _db) = load_test_config(
+        "reasoning_summary_auto_best_effort",
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "deepseek-r1",
+        "input": "What is 2+2?",
+        "reasoning": {"summary": "auto"},
+        "stream": false,
+        "store": false
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "\"auto\" is a best-effort request and must not be rejected: {raw}"
+    );
+
+    let forwarded: Vec<_> = backend.requests().into_iter().filter(|r| r.method == "POST").collect();
+    assert_eq!(
+        forwarded.len(),
+        1,
+        "the best-effort request must reach the backend exactly once"
+    );
+    assert!(
+        !forwarded[0].body.contains("\"summary\""),
+        "a dialect without safe-summary support must drop the summary field: {}",
+        forwarded[0].body
+    );
+}
+
+#[test]
+fn reasoning_summary_explicit_request_is_rejected_before_forwarding() {
     let backend = StatefulCapturingBackend::new(vec![(
         200,
         serde_json::json!({
@@ -375,7 +429,7 @@ fn reasoning_summary_request_is_rejected_before_forwarding() {
     .start_with_shutdown();
     let proxy_port = free_port();
     let (config, _db) = load_test_config(
-        "reasoning_summary_rejected",
+        "reasoning_summary_explicit_rejected",
         proxy_port,
         &HashMap::from([("127.0.0.1:3001", backend.port())]),
     );
@@ -383,7 +437,7 @@ fn reasoning_summary_request_is_rejected_before_forwarding() {
     let request = serde_json::json!({
         "model": "deepseek-r1",
         "input": "What is 2+2?",
-        "reasoning": {"summary": "auto"},
+        "reasoning": {"summary": "concise"},
         "stream": false,
         "store": false
     });
@@ -395,7 +449,7 @@ fn reasoning_summary_request_is_rejected_before_forwarding() {
     assert_eq!(response["error"]["code"], "invalid_request_error");
     assert!(
         backend.requests().is_empty(),
-        "a summary request must not reach a dialect without a safe-summary contract"
+        "an explicit summary request must not reach a dialect without a safe-summary contract"
     );
 }
 

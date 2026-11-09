@@ -4759,18 +4759,47 @@ class TestResponsesReasoningVLLM:
         assert stored.output[0].model_dump() == final.output[0].model_dump()
 
     @pytest.mark.parametrize("streaming", [False, True])
-    def test_reasoning_summary_request_is_rejected(self, reasoning_client, streaming):
-        """vLLM has no safe-summary contract, so a summary request is a 400."""
+    def test_reasoning_summary_auto_is_best_effort(self, reasoning_client, streaming):
+        """`auto` asks for a summary if one is cheap; vLLM answers without one.
+
+        Codex 0.166.0 sends `reasoning.summary: "auto"` on every request, so
+        rejecting it broke a real client rather than surfacing a capability gap.
+        The request must reach the backend and come back with no summary items.
+        """
+        response = reasoning_client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="What is 2+2? Think briefly, then answer.",
+            reasoning={"summary": "auto"},
+            temperature=0,
+            stream=streaming,
+            store=False,
+            max_output_tokens=1024,
+        )
+        if streaming:
+            terminals = [event for event in response if event.type == "response.completed"]
+            assert terminals, "a best-effort summary request must complete rather than fail closed"
+            output = terminals[-1].response.output
+        else:
+            assert response.status == "completed", response.status
+            output = response.output
+        for item in output:
+            if item.type == "reasoning":
+                assert item.summary == [], "a best-effort summary must stay empty"
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    @pytest.mark.parametrize("summary", ["concise", "detailed"])
+    def test_explicit_reasoning_summary_request_is_rejected(self, reasoning_client, streaming, summary):
+        """vLLM has no safe-summary contract, so an explicit request is a 400."""
         with pytest.raises(BadRequestError) as exc_info:
             reasoning_client.responses.create(
                 model=CHAT_TRANSLATION_MODEL,
                 input="What is 2+2?",
-                reasoning={"summary": "auto"},
+                reasoning={"summary": summary},
                 stream=streaming,
                 store=False,
                 max_output_tokens=64,
             )
-        assert exc_info.value.status_code == 400, "reasoning summary request must return 400"
+        assert exc_info.value.status_code == 400, "explicit reasoning summary request must return 400"
 
     def test_non_object_reasoning_is_rejected(self, reasoning_client):
         """A proxy-owned `reasoning` field that is neither object nor null is a 400."""

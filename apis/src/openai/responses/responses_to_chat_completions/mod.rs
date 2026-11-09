@@ -137,8 +137,10 @@ struct ChatStreamOutputHandoff(usize);
 /// `message.reasoning_content` alias) and emits it as a reasoning item whose
 /// `content` is `reasoning_text`. Raw reasoning is never placed in the item
 /// summary, which is reserved for safe summaries. No current dialect can
-/// generate a safe summary, so a client that requests `reasoning.summary` (or
-/// the deprecated `reasoning.generate_summary`) is rejected. Streaming responses
+/// generate a safe summary, so `reasoning.summary: "auto"` (and the deprecated
+/// `reasoning.generate_summary`) is treated as best effort and satisfied by
+/// emitting no summary items, while an explicit value such as `"concise"` or
+/// `"detailed"` is rejected, so the capability gap stays loud. Streaming responses
 /// translate `delta.reasoning` (or `delta.reasoning_content`) incrementally into
 /// `response.reasoning_text.delta` events under the same byte limit. On continuation,
 /// raw reasoning is replayed into the following assistant turn's `reasoning` field,
