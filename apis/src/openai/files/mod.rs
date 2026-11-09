@@ -3,4 +3,6 @@
 
 //! OpenAI Files API family.
 
+#[cfg(feature = "openai-files")]
+pub(crate) mod contracts;
 pub(crate) mod routes;

@@ -8,7 +8,17 @@
 
 #![expect(
     clippy::allow_attributes,
-    reason = "parameter contracts used when conversations feature is enabled"
+    reason = "parameter contracts used when the conversations or files feature is enabled"
+)]
+#![cfg_attr(
+    all(
+        not(test),
+        not(any(feature = "openai-conversations", feature = "openai-responses-openapi"))
+    ),
+    expect(
+        dead_code,
+        reason = "no generator consumes the Files contract until local handlers land"
+    )
 )]
 
 use std::borrow::{Borrow, Cow};
@@ -81,9 +91,59 @@ macro_rules! schema_binding {
 
 pub(crate) use schema_binding;
 
+/// Declare a required string path parameter.
+#[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
+macro_rules! path_parameter {
+    ($name:literal, $description:literal) => {
+        $crate::openai::operation::ParameterSpec::new(
+            $name,
+            $crate::openai::operation::ParameterLocation::Path,
+            true,
+            $description,
+            <String as utoipa::PartialSchema>::schema,
+        )
+    };
+}
+
+#[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
+pub(crate) use path_parameter;
+
+/// Declare an optional typed query parameter.
+///
+/// The `$schema:ty` form derives the schema from a type's `PartialSchema`
+/// impl. The `schema_fn = $path` form takes an explicit schema constructor for
+/// parameters whose emitted contract must match the official reference exactly.
+#[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
+macro_rules! query_parameter {
+    ($name:literal, $schema:ty, $description:literal) => {
+        $crate::openai::operation::ParameterSpec::new(
+            $name,
+            $crate::openai::operation::ParameterLocation::Query,
+            false,
+            $description,
+            <$schema as utoipa::PartialSchema>::schema,
+        )
+    };
+    ($name:literal,schema_fn = $schema_fn:path, $description:literal) => {
+        $crate::openai::operation::ParameterSpec::new(
+            $name,
+            $crate::openai::operation::ParameterLocation::Query,
+            false,
+            $description,
+            $schema_fn,
+        )
+    };
+}
+
+#[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
+pub(crate) use query_parameter;
+
 /// Location of one operation parameter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code, reason = "parameter contracts used when conversations feature is enabled")]
+#[allow(
+    dead_code,
+    reason = "parameter contracts used when the conversations or files feature is enabled"
+)]
 pub(crate) enum ParameterLocation {
     /// Parameter embedded in the request path.
     Path,
@@ -93,7 +153,10 @@ pub(crate) enum ParameterLocation {
 
 /// `OpenAPI` metadata for one operation parameter.
 #[derive(Clone, Copy)]
-#[allow(dead_code, reason = "parameter contracts used when conversations feature is enabled")]
+#[allow(
+    dead_code,
+    reason = "parameter contracts used when the conversations or files feature is enabled"
+)]
 pub(crate) struct ParameterSpec {
     /// Parameter name.
     pub(crate) name: &'static str,
@@ -107,7 +170,10 @@ pub(crate) struct ParameterSpec {
     schema: fn() -> RefOr<Schema>,
 }
 
-#[allow(dead_code, reason = "parameter contracts used when conversations feature is enabled")]
+#[allow(
+    dead_code,
+    reason = "parameter contracts used when the conversations or files feature is enabled"
+)]
 impl ParameterSpec {
     /// Declare one parameter backed by a concrete Rust schema type.
     pub(crate) const fn new(

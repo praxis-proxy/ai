@@ -89,6 +89,7 @@ in [#1717](https://github.com/praxis-proxy/ai/issues/1717).
 | `openai-file-resolve-filter` | `openai_file_resolve` | none beyond `openai-responses`; uses the shared subrequest client |
 | `store-postgres`, `store-postgres-cert-auth`, `store-sqlite`, `store-all` | `openai_responses_store`, `openai_responses_rehydrate`, and the SQL backends | `sqlx` (PostgreSQL adds native TLS through the system OpenSSL; the certificate-only profile omits password authentication) |
 | `openai-conversations` | `openai_conversations` | `jsonschema`, `utoipa`, a store backend |
+| `openai-files` | none yet (Files wire contracts and owned operation metadata) | `utoipa`; activates `experimental` |
 | `openai-compact` | `openai_responses_compact` | `tiktoken-rs`, a store backend |
 | `openai-mcp-tools` | `openai_mcp_tool_resolve`, `openai_mcp_dispatch`, `openai_mcp_streaming_selector` | `rmcp`, a store backend |
 | `openai-all` | every OpenAI group above, without choosing a store backend | |

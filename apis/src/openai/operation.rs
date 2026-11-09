@@ -7,16 +7,34 @@
 //! `ai_operation` classifier can identify requests. The `OpenAPI` contract
 //! half lives in the `openapi` submodule and depends on `utoipa`.
 
-#[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
+#[cfg(any(
+    feature = "openai-conversations",
+    feature = "openai-files",
+    feature = "openai-responses-openapi"
+))]
 mod openapi;
 
-#[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
+#[cfg(any(
+    feature = "openai-conversations",
+    feature = "openai-files",
+    feature = "openai-responses-openapi"
+))]
+#[cfg_attr(
+    all(
+        not(test),
+        not(any(feature = "openai-conversations", feature = "openai-responses-openapi"))
+    ),
+    expect(
+        unused_imports,
+        reason = "no generator consumes the Files contract until local handlers land"
+    )
+)]
 pub(crate) use openapi::{
     MediaTypeSpec, OwnedOperationContract, RequestBodySpec, ResponseSpec, SchemaBinding, implementation_openapi,
     schema_binding,
 };
-#[cfg(feature = "openai-conversations")]
-pub(crate) use openapi::{ParameterLocation, ParameterSpec, ResponseHeaderSpec};
+#[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
+pub(crate) use openapi::{ParameterLocation, ParameterSpec, ResponseHeaderSpec, path_parameter, query_parameter};
 
 use crate::operation::{
     ApplicationProtocol, HandlingMode, HttpMethod, OperationEntry, OperationSpec, RequestBody, Transport,
@@ -37,7 +55,11 @@ pub struct OpenAiOperationSpec {
     /// Path as it appears in the OpenAI spec, without `/v1`.
     pub spec_path: &'static str,
     /// Contract generated into the implementation `OpenAPI` document.
-    #[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
+    #[cfg(any(
+        feature = "openai-conversations",
+        feature = "openai-files",
+        feature = "openai-responses-openapi"
+    ))]
     pub(crate) owned_contract: Option<OwnedOperationContract>,
 }
 
@@ -95,7 +117,11 @@ impl OpenAiOperationSpec {
     }
 
     /// Return the locally owned `OpenAPI` contract, when applicable.
-    #[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
+    #[cfg(any(
+        feature = "openai-conversations",
+        feature = "openai-files",
+        feature = "openai-responses-openapi"
+    ))]
     pub(crate) const fn owned_contract(&self) -> Option<OwnedOperationContract> {
         self.owned_contract
     }
