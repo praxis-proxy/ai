@@ -464,10 +464,6 @@ jobs:
           PRERELEASE: ${{ needs.validate.outputs.prerelease }}
         run: |
           set -euo pipefail
-          prerelease_flags=()
-          if [ "$PRERELEASE" = "true" ]; then
-            prerelease_flags=(--prerelease)
-          fi
           sha=$(git rev-parse 'HEAD^{commit}')
           mkdir -p "$RUNNER_TEMP/release-qualification"
           python3 .github/scripts/vllm_qualification.py release-evidence \
@@ -492,11 +488,11 @@ jobs:
           cat "$RUNNER_TEMP/release-qualification/release-qualification.md" >> "$GITHUB_STEP_SUMMARY"
           if [ "$existing" = true ]; then
             gh release edit "$TAG" --repo "$GH_REPO" \
-              "${prerelease_flags[@]}" \
+              --prerelease="$PRERELEASE" \
               --notes-file "$RUNNER_TEMP/release-qualification/release-notes.md"
           else
             gh release create "$TAG" --repo "$GH_REPO" \
-              "${prerelease_flags[@]}" \
+              --prerelease="$PRERELEASE" \
               --notes-file "$RUNNER_TEMP/release-qualification/release-notes.md"
           fi
           gh release upload "$TAG" \

@@ -18,11 +18,19 @@ def prerelease(version):
 
 class ReleasePrereleaseTest(unittest.TestCase):
     def test_pre_1_0_versions_are_prereleases(self):
+        """Every 0.x release is pre-1.0 and therefore a pre-release."""
         for version in ("0.0.1", "0.1.0", "0.10.0", "v0.10.0"):
             with self.subTest(version=version):
                 self.assertEqual(prerelease(version), "true")
 
+    def test_pre_release_suffixes_are_prereleases(self):
+        """SemVer suffix releases are pre-releases even from 1.0 onward."""
+        for version in ("1.0.0-rc.1", "2.0.0-beta.2", "v1.0.0-alpha"):
+            with self.subTest(version=version):
+                self.assertEqual(prerelease(version), "true")
+
     def test_1_0_and_later_are_stable(self):
+        """Stable releases from 1.0.0 onward are published normally."""
         for version in ("1.0.0", "1.2.3", "2.0.0", "10.0.0", "v1.0.0"):
             with self.subTest(version=version):
                 self.assertEqual(prerelease(version), "false")
