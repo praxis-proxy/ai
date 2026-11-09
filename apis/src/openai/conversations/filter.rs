@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
-    body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
+    body::{BodyAccess, BodyMode},
     parse_filter_config,
 };
 use serde::Deserialize;
@@ -28,6 +28,7 @@ use super::{
 };
 use crate::{
     is_event_stream_content_type,
+    json_body::MAX_JSON_BODY_BYTES,
     openai::responses::{
         AgenticBudgetPolicy,
         agentic_loop::budget::input_charge,

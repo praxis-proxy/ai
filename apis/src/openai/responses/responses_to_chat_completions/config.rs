@@ -3,11 +3,14 @@
 
 //! Configuration for Responses-to-Chat translation.
 
-use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
+use praxis_filter::FilterError;
 use serde::Deserialize;
 
 use super::stream::StreamLimits;
-use crate::openai::{responses::body_limits::validate_size_limit, translation::reasoning::ReasoningOptions};
+use crate::{
+    json_body::MAX_JSON_BODY_BYTES,
+    openai::{responses::body_limits::validate_size_limit, translation::reasoning::ReasoningOptions},
+};
 
 /// Default SSE reassembly buffer ceiling in bytes.
 const DEFAULT_MAX_SSE_BUFFER_BYTES: usize = 1 << 20;

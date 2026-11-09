@@ -1,7 +1,7 @@
 # OpenAI Conformance
 
 This directory tracks Praxis AI conformance against selected OpenAI API
-surfaces. The current scope is Conversations only.
+surfaces. The current scope is Conversations and Responses.
 
 This directory also vendors the upstream Anthropic Messages API OpenAPI
 document at `specs/anthropic-spec.json`. It is read by the automated PR review
@@ -21,9 +21,9 @@ Conformance compares two independent truths:
   `specs/openai-openapi.yaml`, with its immutable commit and SHA-256 recorded
   in `specs/openai-openapi-source.json`. Every area is projected semantically
   from this one source during the conformance run.
-- Praxis behavior is declared by the Conversations operation registry. Each
-  operation has one route, handling mode, and, when Praxis owns the payload,
-  request and response contract bindings.
+- Praxis behavior is declared by the Conversations and Responses operation
+  registries. Each operation has one route, handling mode, and, when Praxis
+  owns the payload, request and response contract bindings.
 
 The registry generates runtime matching, capability claims, and the local
 implementation OpenAPI document. The report is derived output; editing it
@@ -244,9 +244,9 @@ active.
 
 OpenAI Conversations responses were checked against `api.openai.com` on
 2026-07-27. Omitted and explicitly null create metadata returned `{}`, while a
-populated string map round-tripped unchanged. Praxis therefore retains its
-string-map response schema and records the 12 missing upstream metadata
-constraints as explicit exceptions.
+populated string map round-tripped unchanged. The refreshed upstream spec now
+defines the string-map response schema. Four exceptions remain for Praxis's
+metadata-key constraint, which that response schema omits.
 
 The same probe covered the update request body. An absent body returned `400
 missing_required_parameter` and null metadata returned `400 invalid_type`, so

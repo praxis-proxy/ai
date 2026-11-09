@@ -1876,14 +1876,17 @@ struct ResponseResourceParts<'a> {
 }
 
 /// Build a full `Responses` resource snapshot.
+///
+/// Access programs are null because the managed Chat translator has no
+/// access-program admission policy.
 fn response_resource(
     context: &ResponseContext<'_>,
     parts: ResponseResourceParts<'_>,
 ) -> Result<Value, TranslationError> {
-    let status = parts.status;
     let mut resource = json!({
         "id": context.response_id,
         "object": "response",
+        "access_programs": Value::Null,
         "created_at": context.created_at,
         "status": parts.status,
         "error": Value::Null,
@@ -1912,7 +1915,7 @@ fn response_resource(
         "background": false,
         "service_tier": parts.service_tier
     });
-    insert_request_resource_fields(&mut resource, context, status);
+    insert_request_resource_fields(&mut resource, context, parts.status);
     Ok(resource)
 }
 

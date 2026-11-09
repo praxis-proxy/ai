@@ -55,7 +55,7 @@ use bytes::Bytes;
 use praxis_filter::{
     BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     StreamingResponseBody, StreamingTerminalResponse,
-    body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
+    body::{BodyAccess, BodyMode},
     parse_filter_config,
     sse::{SseDecoder, SseLimits, SseRecord},
 };
@@ -69,6 +69,7 @@ use super::{
 use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
+    json_body::MAX_JSON_BODY_BYTES,
     openai::include::{IncludeFields, decode_query_component_strict, parse_include},
     service::responses::{
         InputItemPage, ListParams, MAX_PAGE_LIMIT, Order, StoredOutputPlan, build_record, list_input_items,

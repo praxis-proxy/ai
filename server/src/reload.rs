@@ -68,7 +68,11 @@ pub(crate) fn reload_pipelines(
 
     let health_registry = build_health_registry(&new_config.clusters);
 
-    let new_ceiling = new_config.body_limits.max_response_bytes.unwrap_or(usize::MAX);
+    let new_ceiling = new_config
+        .body_limits
+        .max_response_bytes
+        .unwrap_or(usize::MAX)
+        .min(new_config.body_limits.max_buffer_bytes.get());
     let updated_client = praxis_core::subrequest::SubRequestClient::with_max_response_bytes(
         subrequest_client.connector().clone(),
         new_ceiling,
@@ -527,6 +531,46 @@ mod tests {
         assert!(result.is_ok(), "valid reload should succeed");
         let new_ptr = Arc::as_ptr(&live.get("web").unwrap().load());
         assert_ne!(old_ptr, new_ptr, "pipeline pointer should change after reload");
+    }
+
+    #[test]
+    fn reload_updates_max_buffer_bytes_and_subrequest_ceiling() {
+        let (live, mut old_config, registry, shutdown) = setup_live_pipelines();
+        for (buffer_cap, response_cap, expected) in [
+            (4096, Some(8192), 4096),
+            (134_217_728, None, 134_217_728),
+            (8192, Some(4096), 4096),
+        ] {
+            let mut new_config = valid_config();
+            new_config.body_limits.max_buffer_bytes = buffer_cap.try_into().unwrap();
+            new_config.body_limits.max_response_bytes = response_cap;
+            new_config.insecure_options.allow_unbounded_body = response_cap.is_none();
+            reload_pipelines(
+                &new_config,
+                &old_config,
+                &registry,
+                &live,
+                &shutdown,
+                &empty_kv_stores(),
+                &empty_inflight_registry(),
+                &test_client(),
+                &crate::StoreReloadHandle::default(),
+                &crate::SharedHealthRegistry::default(),
+            )
+            .unwrap();
+            let pipeline = live.get("web").unwrap().load();
+            assert_eq!(
+                pipeline.buffer_cap(),
+                buffer_cap,
+                "reload must update the buffering cap"
+            );
+            assert_eq!(
+                pipeline.subrequest_client().unwrap().max_response_bytes(),
+                expected,
+                "reloaded callouts must respect both response and buffering caps"
+            );
+            old_config = new_config;
+        }
     }
 
     #[test]

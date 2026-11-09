@@ -60,7 +60,7 @@ use futures::{FutureExt as _, future::join_all};
 use praxis_core::config::InsecureOptions;
 use praxis_filter::{
     BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
-    HttpFilterContext, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    HttpFilterContext, Rejection, parse_filter_config,
 };
 use tracing::{debug, warn};
 
@@ -96,7 +96,7 @@ use super::{
 use crate::{
     callout_headers::effective_body_callout_headers,
     callout_identity::{McpCalloutIdentity, stage_mcp_callout_identity},
-    json_body::serialized_len,
+    json_body::{MAX_JSON_BODY_BYTES, serialized_len},
     mcp_client,
     state_owner::StateOwner,
     store::{OwnerScopedResponseStore, PendingApprovalRecord, ResponseStoreRegistry},

@@ -82,6 +82,7 @@ fn echo_listener(address: &str) -> Listener {
         cluster: None,
         downstream_keepalive_timeout_ms: None,
         downstream_read_timeout_ms: None,
+        forward_proxy: None,
         filter_chains: vec!["echo".into()],
         max_connections: None,
         name: "echo".into(),

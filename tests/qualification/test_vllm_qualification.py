@@ -72,6 +72,21 @@ class QualificationTest(unittest.TestCase):
         self.assertEqual(plugin.profile_for_item(item("openai_client", "chat_streaming_client")), "unclassified")
         self.assertEqual(plugin.profile_for_item(item(override="supporting")), "supporting")
 
+    def test_nightly_regression_fixture_profiles(self):
+        profiles = {
+            "admission_client": "native",
+            "mcp_approval_floor_client": "native",
+            "code_interpreter_capture_client": "supporting",
+            "witness_backend_tool_client": "supporting",
+            "backend_error_client": "supporting",
+            "ttft_proxy": "supporting",
+            "native_guardrails_client": "supporting",
+        }
+        for fixture, expected in profiles.items():
+            with self.subTest(fixture=fixture):
+                item = SimpleNamespace(fixturenames=[fixture], obj=SimpleNamespace())
+                self.assertEqual(plugin.profile_for_item(item), expected)
+
     def test_mixed_profiles_do_not_turn_skipped_native_into_passed_qualification(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)

@@ -30,6 +30,10 @@ use serde::Serialize;
 use serde_json::Value;
 use tracing::debug;
 
+/// Cap for JSON bodies these filters buffer, size, or accumulate. Praxis 0.8.0 raised its own
+/// `MAX_JSON_BODY_BYTES` to the addressable maximum and leaves the cap to `body_limits`; praxis-ai keeps 64 MiB.
+pub const MAX_JSON_BODY_BYTES: usize = praxis_core::config::DEFAULT_MAX_BUFFER_BYTES;
+
 /// Serialize `value` for a later body replacement.
 ///
 /// Returns the serialized form without touching the buffered body, so callers can inspect the length (or
