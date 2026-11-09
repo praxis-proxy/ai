@@ -5338,6 +5338,8 @@ class TestResponsesToChatCompletionsVLLM:
         )
 
         assert response.status == "completed"
+        assert "access_programs" in response.model_fields_set
+        assert response.access_programs is None
         assert (
             response.safety_identifier == "tenant-user"
         ), "safety_identifier echoed back"
