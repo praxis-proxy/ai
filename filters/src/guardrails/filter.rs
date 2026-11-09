@@ -10,8 +10,10 @@ use bytes::Bytes;
 #[cfg(feature = "openai-responses")]
 use praxis_ai_apis::openai::{local_tool_guardrail_messages, record_local_tool_guardrail_failure};
 use praxis_ai_apis::{
-    guardrail_messages::{GuardrailMessageDirection, extract_guardrail_messages},
-    json_body::{MAX_JSON_BODY_BYTES, replace_json_body},
+    guardrail_messages::{
+        GuardrailMessageDirection, GuardrailTextLocations, extract_with_locations, redact_native_body,
+    },
+    json_body::{MAX_JSON_BODY_BYTES, replace_json_body, serialize_json_body},
     openai::{ChatCompletionsOperation, chat_completions_operation_specs},
     operation::Transport,
     operation_classifier::AiOperationMatch,
@@ -46,6 +48,8 @@ const STREAMING_RESPONSE_GUARDRAIL_ERROR: &str =
 pub(super) enum ResponseScreening {
     /// The request carried a body, so a 2xx response is model output.
     Screen,
+    /// The request asks for structured model output.
+    ScreenStructured,
     /// The response is not model output and is forwarded unevaluated.
     Skip,
 }
@@ -103,23 +107,27 @@ pub(super) enum ResponseScreening {
 ///
 /// Request checks retain the conversation prefix through each user turn.
 /// Response checks send each extracted assistant output separately, retaining
-/// its original index when combining verdicts and applying Chat redaction.
+/// its original index when combining verdicts and applying redaction.
 /// A `modified` verdict whose content exactly equals the checked string is
 /// treated as passed because no rewrite is needed. Blocked verdicts and
 /// actual text changes keep their normal enforcement.
 ///
-/// Redaction rewriting currently supports Chat Completions wire bodies only.
-/// A provider `modified` verdict on a Chat request rewrites each targeted user
-/// message and forwards the masked body. A `modified` verdict that changes text
-/// for any other protocol is explicitly rejected before attempting a Chat
-/// rewrite. A request rewrite that cannot be applied is also rejected with HTTP 502
-/// so the original text is not sent upstream. On a Chat response, each targeted
-/// choice is rebuilt from `index`, `finish_reason`, and a message containing
-/// only `role` and the masked `content`. A choice whose message has array
-/// `content`, `tool_calls`, or `function_call` cannot be redacted; as with
-/// other supported response protocols, the client receives the original HTTP
-/// 200 with an `evaluation_failed` error document. `on_response` drops
-/// `Content-Length` so core reframes the buffered body at its natural size.
+/// Redaction supports native Chat Completions, Responses, and Anthropic
+/// Messages text. For Responses and Anthropic, a user or assistant message
+/// must contain a string or a single text block. A changed multi-block message
+/// is rejected instead of guessing how to distribute the replacement. Native
+/// output annotations, log probabilities, citations, and Anthropic refusal
+/// explanations associated with rewritten content are cleared. When a Responses
+/// output is rewritten, annotations and log probabilities on unmodified blocks,
+/// including empty-text siblings, must be absent, null, or empty arrays;
+/// otherwise the entire response is replaced with an `evaluation_failed` error.
+/// All-passed and unchanged-modified responses retain their metadata. Metadata
+/// is not screened by `NeMo`. Unknown fields on a rewritten message fail closed.
+/// Structured text output cannot be safely rewritten. Responses refusals can
+/// still be rewritten when every replacement targets a refusal block. Responses
+/// function-call responses cannot be safely rewritten. A request rewrite failure returns HTTP 502. A response
+/// rewrite failure replaces the body with an `evaluation_failed` document at
+/// the original response status. Response framing uses the new body length.
 ///
 /// When `phase.response` is enabled, Chat Completions requests with
 /// `"stream": true` are rejected with HTTP 422 until incremental SSE
@@ -303,12 +311,13 @@ impl AiGuardrailsFilter {
         messages: Vec<serde_json::Value>,
         phase: GuardPhase,
         runtime: &GuardCalloutRuntime<'_>,
+        native_text: bool,
     ) -> Result<GuardResult, FilterError> {
         #[cfg(test)]
         if let Some(verdict) = &self.scripted_verdict {
             return Ok(verdict.clone());
         }
-        self.provider.evaluate(messages, phase, runtime).await
+        self.provider.evaluate(messages, phase, runtime, native_text).await
     }
 
     /// Evaluate the local result suffix and leave terminal response ownership
@@ -320,7 +329,7 @@ impl AiGuardrailsFilter {
         messages: Vec<serde_json::Value>,
     ) -> Result<FilterAction, FilterError> {
         let runtime = self.callout_runtime(ctx);
-        match self.evaluate(messages, GuardPhase::Request, &runtime).await {
+        match self.evaluate(messages, GuardPhase::Request, &runtime, false).await {
             Ok(result) => record_local_tool_verdict(ctx, result),
             Err(error) => {
                 tracing::error!(%error, phase = "tool_results", "ai_guardrails: evaluation failed");
@@ -437,6 +446,13 @@ impl HttpFilter for AiGuardrailsFilter {
             ctx.insert_filter_state(ResponseScreening::Screen);
         }
 
+        // Local tool-result checks can return early, so record the response
+        // format before evaluating that path. Chat redaction does not use it.
+        if self.phase.response && !supports_chat_redaction(ctx) && body.as_ref().is_some_and(requests_structured_output)
+        {
+            ctx.insert_filter_state(ResponseScreening::ScreenStructured);
+        }
+
         #[cfg(feature = "openai-responses")]
         if self.phase.tool_results {
             match local_tool_guardrail_messages(&ctx.extensions, DEFAULT_MAX_BODY_BYTES) {
@@ -490,11 +506,13 @@ impl HttpFilter for AiGuardrailsFilter {
             .ok_or_else(|| -> FilterError {
                 "ai_guardrails: request extraction requires an ai_operation match".into()
             })?;
-        let messages = extract_guardrail_messages(operation, GuardrailMessageDirection::Request, bytes)
+        let (messages, locations) = extract_with_locations(operation, GuardrailMessageDirection::Request, bytes)
             .map_err(|error| -> FilterError { format!("ai_guardrails: {error}").into() })?;
         let runtime = self.callout_runtime(ctx);
-        let result = self.evaluate(messages, GuardPhase::Request, &runtime).await?;
-        record_verdict(ctx, body, result, GuardPhase::Request)
+        let result = self
+            .evaluate(messages, GuardPhase::Request, &runtime, !supports_chat_redaction(ctx))
+            .await?;
+        record_verdict(ctx, body, result, GuardPhase::Request, &locations)
     }
 
     fn response_body_access(&self) -> BodyAccess {
@@ -550,19 +568,27 @@ impl HttpFilter for AiGuardrailsFilter {
                 "ai_guardrails: response extraction requires an ai_operation match".into()
             })
             .and_then(|operation| {
-                extract_guardrail_messages(operation, GuardrailMessageDirection::Response, bytes)
+                extract_with_locations(operation, GuardrailMessageDirection::Response, bytes)
                     .map_err(|error| -> FilterError { format!("ai_guardrails: {error}").into() })
             })
-            .and_then(|messages| {
+            .and_then(|(messages, locations)| {
                 let handle = tokio::runtime::Handle::current();
                 let runtime = self.callout_runtime(ctx);
                 // `on_response_body` is sync (Pingora constraint); use `block_in_place`
                 // to bridge into async. See #51 for the plan to make this truly async.
-                tokio::task::block_in_place(|| handle.block_on(self.evaluate(messages, GuardPhase::Response, &runtime)))
+                tokio::task::block_in_place(|| {
+                    handle.block_on(self.evaluate(
+                        messages,
+                        GuardPhase::Response,
+                        &runtime,
+                        !supports_chat_redaction(ctx),
+                    ))
+                })
+                .map(|result| (result, locations))
             });
 
         match evaluation {
-            Ok(result) => record_verdict(ctx, body, result, GuardPhase::Response),
+            Ok((result, locations)) => record_verdict(ctx, body, result, GuardPhase::Response, &locations),
             Err(e) => {
                 tracing::error!(error = %e, "ai_guardrails: response-phase evaluation failed");
                 replace_body_with_error(
@@ -664,6 +690,7 @@ fn record_verdict(
     body: &mut Option<Bytes>,
     result: GuardResult,
     phase: GuardPhase,
+    locations: &GuardrailTextLocations,
 ) -> Result<FilterAction, FilterError> {
     let verdict = result.status_label();
     let phase_label = phase.label();
@@ -677,10 +704,57 @@ fn record_verdict(
         GuardResult::Block { reason } => Ok(enforce_block(body, reason, phase, verdict)),
         GuardResult::Redact { replacements, reason } => {
             tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict");
-            if !supports_chat_redaction(ctx) {
-                return Ok(reject_unsupported_redaction(body, phase));
+            if supports_chat_redaction(ctx) {
+                return Ok(apply_redaction(body, replacements, phase));
             }
-            Ok(apply_redaction(body, replacements, phase))
+            Ok(apply_native_redaction(ctx, body, replacements, phase, locations))
+        },
+    }
+}
+
+/// Apply a native rewrite or enforce a failure before the original is released.
+#[expect(
+    clippy::too_many_lines,
+    reason = "validates and commits one native guardrail verdict"
+)]
+fn apply_native_redaction(
+    ctx: &HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    replacements: Vec<MessageRedaction>,
+    phase: GuardPhase,
+    locations: &GuardrailTextLocations,
+) -> FilterAction {
+    if phase == GuardPhase::Response
+        && ctx.get_filter_state::<ResponseScreening>() == Some(&ResponseScreening::ScreenStructured)
+        && replacements
+            .iter()
+            .any(|replacement| !locations.is_refusal(replacement.index))
+    {
+        return reject_native_redaction(body, phase);
+    }
+    let rewritten = body.as_ref().ok_or("missing body").and_then(|bytes| {
+        redact_native_body(
+            bytes,
+            locations,
+            replacements.into_iter().map(|r| (r.index, r.modified_text)),
+        )
+    });
+    match rewritten {
+        Ok(value) => match serialize_json_body(&value) {
+            Ok(serialized) if serialized.len() <= DEFAULT_MAX_BODY_BYTES => {
+                if phase == GuardPhase::Request {
+                    serialized.commit(body, "ai_guardrails", "content");
+                } else {
+                    // Bytes shares the serialized allocation with the response body.
+                    *body = Some(serialized.as_bytes().clone());
+                }
+                FilterAction::Continue
+            },
+            _ => reject_native_redaction(body, phase),
+        },
+        Err(error) => {
+            tracing::error!(phase = phase.label(), %error, "ai_guardrails: native rewrite failed");
+            reject_native_redaction(body, phase)
         },
     }
 }
@@ -698,8 +772,8 @@ fn supports_chat_redaction(ctx: &HttpFilterContext<'_>) -> bool {
 }
 
 /// Reject unsupported rewrites explicitly so a fail-open policy cannot forward the original text.
-fn reject_unsupported_redaction(body: &mut Option<Bytes>, phase: GuardPhase) -> FilterAction {
-    let message = "Guardrail redaction failed: rewriting is supported only for Chat Completions";
+fn reject_native_redaction(body: &mut Option<Bytes>, phase: GuardPhase) -> FilterAction {
+    let message = "Guardrail redaction failed: native text cannot be safely rewritten";
     match phase {
         GuardPhase::Request => FilterAction::Reject(Rejection::status(502).with_body(message)),
         GuardPhase::Response => {
@@ -1015,6 +1089,18 @@ struct GuardrailsRequest {
     stream: Option<serde_json::Value>,
 }
 
+/// Detect native structured output formats before any tool-result early return.
+fn requests_structured_output(body: &Bytes) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|json| {
+            ["/text/format/type", "/output_config/format/type", "/output_format/type"]
+                .iter()
+                .filter_map(|path| json.pointer(path).and_then(serde_json::Value::as_str))
+                .any(|kind| kind == "json_schema" || kind == "json_object")
+        })
+}
+
 /// Whether the stream field requests a streamed response.
 fn stream_requested(stream: Option<&serde_json::Value>) -> bool {
     stream.and_then(serde_json::Value::as_bool).unwrap_or(false)
@@ -1052,7 +1138,10 @@ fn request_body_parse_error(error: &serde_json::Error) -> FilterError {
 /// Bodyless requests such as `GET /v1/models` cannot carry a prompt, and error
 /// statuses carry upstream diagnostics rather than a completion.
 fn response_is_model_output(ctx: &HttpFilterContext<'_>) -> bool {
-    let request_had_body = ctx.get_filter_state::<ResponseScreening>() == Some(&ResponseScreening::Screen);
+    let request_had_body = matches!(
+        ctx.get_filter_state::<ResponseScreening>(),
+        Some(ResponseScreening::Screen | ResponseScreening::ScreenStructured)
+    );
     let success = ctx
         .response_header
         .as_ref()

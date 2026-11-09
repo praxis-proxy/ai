@@ -183,6 +183,140 @@ fn isolated_output_nemo() -> praxis_test_utils::StatefulCapturingGuard {
     })
 }
 
+/// Match per-output modified/passed verdicts in a deterministic NeMo test double.
+fn redacting_output_nemo() -> praxis_test_utils::StatefulCapturingGuard {
+    start_body_aware_backend(|body| {
+        let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+        let messages = payload.get("messages").and_then(serde_json::Value::as_array).unwrap();
+        assert_eq!(messages.len(), 1, "response outputs must be screened independently");
+        let text = messages
+            .first()
+            .and_then(|message| message.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        let status = if text.contains("secret") { "modified" } else { "passed" };
+        (
+            200,
+            serde_json::json!({"status":status,"content":text.replace("secret", "masked")}).to_string(),
+        )
+    })
+}
+
+/// Unscreened sibling metadata rejects the whole rewrite, even with fail-open configured.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "checks passed and empty siblings through the HTTP pipeline"
+)]
+fn response_guardrails_redaction_rejects_unscreened_sibling_metadata() {
+    for text in ["safe", ""] {
+        for (field, metadata) in [
+            (
+                "annotations",
+                serde_json::json!([{"type":"url_citation","title":"secret","url":"https://example.test","start_index":0,"end_index":0}]),
+            ),
+            (
+                "logprobs",
+                serde_json::json!([{"token":"secret","bytes":[115,101,99,114,101,116],"logprob":-0.1,"top_logprobs":[]}]),
+            ),
+        ] {
+            let mut sibling = serde_json::json!({"type":"output_text","text":text});
+            sibling[field] = metadata;
+            let upstream = serde_json::json!({"output":[
+                {"type":"message","role":"assistant","content":[sibling]},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"secret"}]}
+            ]})
+            .to_string();
+            let backend = json_backend(&upstream);
+            let nemo = redacting_output_nemo();
+            let mut config = load_response_config(free_port(), backend.port(), nemo.port());
+            for entry in config.filter_chains.iter_mut().flat_map(|chain| &mut chain.filters) {
+                if entry.filter_type == "ai_guardrails" {
+                    entry.failure_mode = praxis_core::config::FailureMode::Open;
+                }
+            }
+            let proxy = start_proxy(&config);
+            let (status, body) = http_post(proxy.addr(), "/v1/responses", r#"{"model":"test","input":"hello"}"#);
+            assert_eq!(status, 200, "response headers are already committed");
+            let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                error.pointer("/error/code").and_then(serde_json::Value::as_str),
+                Some("evaluation_failed"),
+                "unscreened sibling metadata must reject the complete rewrite"
+            );
+            assert!(
+                !body.contains("secret") && !body.contains("masked"),
+                "no original or partial rewrite may escape"
+            );
+            assert_eq!(
+                nemo.requests().len(),
+                if text.is_empty() { 1 } else { 2 },
+                "only nonempty output text is checked"
+            );
+        }
+    }
+}
+
+/// Metadata is preserved if no actual text change occurs, including unchanged modified verdicts.
+#[test]
+fn response_guardrails_noop_preserves_unscreened_sibling_metadata() {
+    let upstream = serde_json::json!({"output":[
+        {"type":"message","role":"assistant","content":[{"type":"output_text","text":"safe"}]},
+        {"type":"message","role":"assistant","content":[{"type":"output_text","text":"","annotations":[{"title":"secret"}],"logprobs":[{"token":"secret"}]}]}
+    ]}).to_string();
+    for verdict in [
+        r#"{"status":"passed","content":"safe"}"#,
+        r#"{"status":"modified","content":"safe"}"#,
+    ] {
+        let backend = json_backend(&upstream);
+        let nemo = nemo_mock(verdict);
+        let config = load_response_config(free_port(), backend.port(), nemo.port());
+        let proxy = start_proxy(&config);
+        let (status, body) = http_post(proxy.addr(), "/v1/responses", r#"{"model":"test","input":"hello"}"#);
+        assert_eq!(status, 200, "unchanged output must retain its status");
+        assert_eq!(
+            body, upstream,
+            "no rewrite means no sibling metadata rejection or removal"
+        );
+    }
+}
+
+/// Rewritten metadata is cleared while safe siblings with empty metadata survive.
+#[test]
+fn response_guardrails_redaction_allows_empty_or_rewritten_sibling_metadata() {
+    for all_modified in [false, true] {
+        let second = if all_modified { "second secret" } else { "safe" };
+        let metadata = if all_modified {
+            serde_json::json!([{"token":"secret"}])
+        } else {
+            serde_json::json!([])
+        };
+        let upstream = serde_json::json!({"id":"preserved", "output":[
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"secret","annotations":[{"title":"secret"}]}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":second,"logprobs":metadata}]}
+        ]});
+        let backend = json_backend(&upstream.to_string());
+        let nemo = redacting_output_nemo();
+        let config = load_response_config(free_port(), backend.port(), nemo.port());
+        let proxy = start_proxy(&config);
+        let (status, body) = http_post(proxy.addr(), "/v1/responses", r#"{"model":"test","input":"hello"}"#);
+        assert_eq!(status, 200, "safe native redaction must succeed");
+        let mut expected = upstream;
+        *expected.pointer_mut("/output/0/content/0/text").unwrap() = serde_json::json!("masked");
+        *expected.pointer_mut("/output/0/content/0/annotations").unwrap() = serde_json::json!([]);
+        if all_modified {
+            *expected.pointer_mut("/output/1/content/0/text").unwrap() = serde_json::json!("second masked");
+            *expected.pointer_mut("/output/1/content/0/logprobs").unwrap() = serde_json::json!([]);
+        }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            expected,
+            "rewritten blocks must lose text metadata while safe siblings retain their metadata"
+        );
+        assert_eq!(nemo.requests().len(), 2, "both assistant outputs must be evaluated");
+    }
+}
+
 /// Both safe and harmful later outputs must receive their own NeMo check.
 #[test]
 fn response_guardrails_isolates_each_output_and_honors_later_blocks() {
@@ -247,19 +381,24 @@ fn response_guardrails_extracts_anthropic_messages_output() {
     );
 }
 
-/// Unsupported response rewrites replace the entire body, even when it also contains Chat-shaped data.
+/// Multi-block response rewrites replace the body, even with Chat-shaped data.
 #[test]
-fn response_guardrails_rejects_non_chat_redaction() {
+fn response_guardrails_rejects_multiblock_redaction() {
     for (path, input, upstream) in [
         (
             "/v1/responses",
             r#"{"model":"test","input":"Hello"}"#,
-            r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"secret output"}]}],"choices":[{"index":0,"message":{"role":"assistant","content":"decoy"}}]}"#,
+            r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"secret "},{"type":"output_text","text":"output"}]}],"choices":[{"index":0,"message":{"role":"assistant","content":"decoy"}}]}"#,
         ),
         (
             "/v1/messages",
             r#"{"model":"test","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}"#,
-            r#"{"role":"assistant","content":[{"type":"text","text":"secret output"}],"choices":[{"index":0,"message":{"role":"assistant","content":"decoy"}}]}"#,
+            r#"{"id":"msg_test","type":"message","role":"assistant","model":"test","content":[{"type":"text","text":"secret ","citations":null},{"type":"text","text":"output","citations":null}],"stop_reason":"end_turn","stop_sequence":null,"stop_details":null,"container":null,"usage":{"input_tokens":5,"output_tokens":5,"cache_creation":null,"cache_creation_input_tokens":null,"cache_read_input_tokens":null,"inference_geo":null,"output_tokens_details":null,"server_tool_use":null,"service_tier":null}}"#,
+        ),
+        (
+            "/v1/messages",
+            r#"{"model":"test","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}"#,
+            r#"{"role":"assistant","content":[{"type":"text","text":"secret "},{"type":"text","text":"output"}],"choices":[{"index":0,"message":{"role":"assistant","content":"decoy"}}]}"#,
         ),
     ] {
         let backend = json_backend(upstream);
@@ -282,10 +421,18 @@ fn response_guardrails_rejects_non_chat_redaction() {
             !body.contains("secret"),
             "original {path} output must not reach the client"
         );
+        let requests = nemo.requests();
         assert_eq!(
-            nemo.requests().len(),
+            requests.len(),
             1,
             "the native response must reach NeMo before rejecting its rewrite"
+        );
+        let request: serde_json::Value =
+            serde_json::from_str(&requests.first().expect("one NeMo request").body).expect("NeMo request is JSON");
+        assert_eq!(
+            request.get("messages"),
+            Some(&serde_json::json!([{"role":"assistant","content":"secret output"}])),
+            "NeMo must evaluate the combined text from both response blocks"
         );
     }
 }
@@ -586,4 +733,91 @@ fn response_guardrails_non_streaming_reaches_model() {
         backend.requests().iter().any(|r| r.method == "POST"),
         "the upstream model should be invoked (POST forwarded) for a non-streaming request"
     );
+}
+
+/// A native response reaches the client with NeMo's replacement applied.
+#[test]
+fn response_guardrails_redacts_native_outputs() {
+    for (path, request, upstream, target) in [
+        (
+            "/v1/responses",
+            r#"{"model":"test","input":"hello"}"#,
+            r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"secret","annotations":[]}]}]}"#,
+            "/output/0/content/0/text",
+        ),
+        (
+            "/v1/messages",
+            r#"{"model":"test","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}"#,
+            r#"{"role":"assistant","content":[{"type":"text","text":"secret"}]}"#,
+            "/content/0/text",
+        ),
+    ] {
+        let backend = json_backend(upstream);
+        let nemo = nemo_mock(r#"{"status":"modified","content":"masked"}"#);
+        let config = load_response_config(free_port(), backend.port(), nemo.port());
+        let proxy = start_proxy(&config);
+        let (status, body) = http_post(proxy.addr(), path, request);
+        assert_eq!(status, 200, "{body}");
+        let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            response.pointer(target).and_then(serde_json::Value::as_str),
+            Some("masked"),
+            "the native output must contain the masked text"
+        );
+        assert!(
+            !body.contains("secret"),
+            "the original output text must not reach the client"
+        );
+    }
+}
+
+/// Manual validation with a local NeMo server whose output rail masks PII.
+#[test]
+#[ignore = "requires a local NeMo service with output masking on port 18001"]
+fn live_nemo_redacts_native_outputs() {
+    for (path, request, upstream, target) in [
+        (
+            "/v1/responses",
+            r#"{"model":"test","input":"hello"}"#,
+            r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Contact alice@example.com","annotations":[]}]}]}"#,
+            "/output/0/content/0/text",
+        ),
+        (
+            "/v1/messages",
+            r#"{"model":"test","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}"#,
+            r#"{"role":"assistant","content":[{"type":"text","text":"Contact alice@example.com"}]}"#,
+            "/content/0/text",
+        ),
+    ] {
+        let backend = json_backend(upstream);
+        let mut config = load_response_config(free_port(), backend.port(), 18001);
+        let guard = config
+            .filter_chains
+            .iter_mut()
+            .flat_map(|chain| &mut chain.filters)
+            .find(|filter| filter.filter_type == "ai_guardrails")
+            .unwrap();
+        guard
+            .config
+            .as_mapping_mut()
+            .unwrap()
+            .get_mut(serde_yaml::Value::from("provider"))
+            .unwrap()
+            .as_mapping_mut()
+            .unwrap()
+            .remove(serde_yaml::Value::from("guardrails"));
+        let proxy = start_proxy(&config);
+        let (status, body) = http_post(proxy.addr(), path, request);
+        assert_eq!(status, 200, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let text = json.pointer(target).and_then(serde_json::Value::as_str).unwrap();
+        assert!(
+            text.contains("<EMAIL_ADDRESS>"),
+            "the real NeMo replacement must reach the client"
+        );
+        assert!(
+            !text.contains("alice@example.com"),
+            "the original email must not reach the client"
+        );
+    }
 }
