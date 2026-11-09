@@ -9,6 +9,11 @@ All workspace crates inherit this version.
 
 [semver]: https://semver.org/
 
+Releases before `1.0.0` are marked as **pre-release** on GitHub. The API may
+still change until the first stable major release, and GitHub's "Latest"
+release must not advertise a pre-1.0 build as stable. Releases from `1.0.0`
+onward are published as stable.
+
 ## Distribution
 
 The supported release artifact is the Praxis AI container image on GHCR.

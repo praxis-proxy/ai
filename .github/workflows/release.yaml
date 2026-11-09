@@ -37,6 +37,7 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -54,6 +55,10 @@ jobs:
             exit 1
           fi
           echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+          # Pre-1.0 builds are pre-releases: the API can still change, and the
+          # repository's "Latest" release must not advertise one as stable.
+          prerelease=$(bash .github/scripts/release-prerelease.sh "$TAG_VERSION")
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
   # ----------------------------------------------------------------------------
   # Run the full test suite
@@ -456,8 +461,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
         run: |
           set -euo pipefail
+          prerelease_flags=()
+          if [ "$PRERELEASE" = "true" ]; then
+            prerelease_flags=(--prerelease)
+          fi
           sha=$(git rev-parse 'HEAD^{commit}')
           mkdir -p "$RUNNER_TEMP/release-qualification"
           python3 .github/scripts/vllm_qualification.py release-evidence \
@@ -482,9 +492,11 @@ jobs:
           cat "$RUNNER_TEMP/release-qualification/release-qualification.md" >> "$GITHUB_STEP_SUMMARY"
           if [ "$existing" = true ]; then
             gh release edit "$TAG" --repo "$GH_REPO" \
+              "${prerelease_flags[@]}" \
               --notes-file "$RUNNER_TEMP/release-qualification/release-notes.md"
           else
             gh release create "$TAG" --repo "$GH_REPO" \
+              "${prerelease_flags[@]}" \
               --notes-file "$RUNNER_TEMP/release-qualification/release-notes.md"
           fi
           gh release upload "$TAG" \
