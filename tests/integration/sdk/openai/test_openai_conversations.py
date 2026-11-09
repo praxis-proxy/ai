@@ -1815,17 +1815,17 @@ class TestOpenAIConversations:
 
         with pytest.raises(BadRequestError) as exc_info:
             openai_client.conversations.create(items=[preceding, shared])
-        assert exc_info.value.status_code == 400
-        assert exc_info.value.body["type"] == "invalid_request_error"
+        assert exc_info.value.status_code == 400, "an owner-wide item ID conflict on create must return 400"
+        assert exc_info.value.body["type"] == "invalid_request_error", "create conflicts must use the invalid_request_error envelope"
 
         with pytest.raises(BadRequestError) as exc_info:
             openai_client.conversations.items.create(
                 second.id, items=[preceding, shared]
             )
-        assert exc_info.value.status_code == 400
-        assert exc_info.value.body["type"] == "invalid_request_error"
-        assert openai_client.conversations.items.list(first.id).model_dump() == before
-        assert openai_client.conversations.items.list(second.id).data == []
+        assert exc_info.value.status_code == 400, "an owner-wide item ID conflict on append must return 400"
+        assert exc_info.value.body["type"] == "invalid_request_error", "append conflicts must use the invalid_request_error envelope"
+        assert openai_client.conversations.items.list(first.id).model_dump() == before, "the source conversation must be unchanged"
+        assert openai_client.conversations.items.list(second.id).data == [], "the failed batch must not persist its preceding item"
 
         created = openai_client.conversations.items.create(
             second.id, items=[preceding]
