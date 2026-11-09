@@ -452,7 +452,8 @@ class TestRequestFieldHandling:
 
         assert excinfo.value.status_code == 400
         assert "cache_control" in str(excinfo.value)
-        assert "prompt_caching" in str(excinfo.value)
+        assert "not supported by this endpoint" in str(excinfo.value)
+        assert "Remove the caching markers" in str(excinfo.value)
         assert RecordingBackend.bodies == []
 
     def test_deferred_tool_placeholder_is_accepted(self, anthropic_client):

@@ -743,7 +743,9 @@ fn text_block_rejection(block: &Value) -> Option<String> {
     }
     if !null_or_absent(block, "cache_control") {
         return Some(
-            "`cache_control` cannot be translated (enable `allow_lossy_features: prompt_caching` to strip it)"
+            "Prompt caching (`cache_control`) is not supported by this endpoint. Remove the caching \
+             markers from your request, or contact your platform administrator if your client adds \
+             them automatically."
                 .to_owned(),
         );
     }
