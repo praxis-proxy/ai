@@ -53,9 +53,10 @@ For the experimental Responses/certificate-authenticated store profile, use
 or pass the same list as `--build-arg CARGO_FEATURES=...` to `Containerfile.fips`.
 The agentic loop additionally requires `openai-agentic-loop`.
 
-The certificate-only store currently pins SQLx to commit `6736b97d` from a
-temporary fork. That commit makes migrations, PostgreSQL password
-authentication, and advisory-lock string hashing independently optional.
+The certificate-only store currently pins SQLx to commit `637e7025` from a
+temporary fork. It preserves independently optional migrations, PostgreSQL
+password authentication, and advisory-lock string hashing, and includes the
+upstream compatibility fix for patched `libsqlite3-sys` 0.39 releases.
 The pin can return to an upstream release after [transact-rs/sqlx#4417],
 [transact-rs/sqlx#4420], and [transact-rs/sqlx#4421] land and are released.
 

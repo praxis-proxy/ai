@@ -2639,9 +2639,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.37.0"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -4933,9 +4933,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "3.8.0"
+version = "3.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8be15815186873ea063bf005011d16c356804973489e40c39116ae3a2878d1f"
+checksum = "d24a7e92f4bcaa36b97fa93c4fa7ca8f3e669eced949345b3462dba333c7f909"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -4954,6 +4954,7 @@ dependencies = [
  "schemars 1.2.3",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "sse-stream",
  "thiserror",
  "tokio",
@@ -4966,9 +4967,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "3.8.0"
+version = "3.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b0748e054a5f5598b3213cf72099ae6b2745ba4d996c59ccf455150a7dbb839"
+checksum = "b3140f24a766f80f9ec1607bde85680959a69b83d46fa9ce87dadab7e67ab029"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -5638,7 +5639,7 @@ checksum = "0134f9043ed38b087ac4f7d4af44c79e2c9e5094421fe3164f435ce585953b10"
 [[package]]
 name = "sqlx"
 version = "0.9.0"
-source = "git+https://github.com/praxis-proxy/sqlx.git?rev=18f9f82a33a935a8aaa3502aa6d01890c294ec99#18f9f82a33a935a8aaa3502aa6d01890c294ec99"
+source = "git+https://github.com/praxis-proxy/sqlx.git?rev=637e7025b1276ad3c08cc36e666b97fcfea4914c#637e7025b1276ad3c08cc36e666b97fcfea4914c"
 dependencies = [
  "sqlx-core",
  "sqlx-macros",
@@ -5649,7 +5650,7 @@ dependencies = [
 [[package]]
 name = "sqlx-core"
 version = "0.9.0"
-source = "git+https://github.com/praxis-proxy/sqlx.git?rev=18f9f82a33a935a8aaa3502aa6d01890c294ec99#18f9f82a33a935a8aaa3502aa6d01890c294ec99"
+source = "git+https://github.com/praxis-proxy/sqlx.git?rev=637e7025b1276ad3c08cc36e666b97fcfea4914c#637e7025b1276ad3c08cc36e666b97fcfea4914c"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5681,7 +5682,7 @@ dependencies = [
 [[package]]
 name = "sqlx-macros"
 version = "0.9.0"
-source = "git+https://github.com/praxis-proxy/sqlx.git?rev=18f9f82a33a935a8aaa3502aa6d01890c294ec99#18f9f82a33a935a8aaa3502aa6d01890c294ec99"
+source = "git+https://github.com/praxis-proxy/sqlx.git?rev=637e7025b1276ad3c08cc36e666b97fcfea4914c#637e7025b1276ad3c08cc36e666b97fcfea4914c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5693,7 +5694,7 @@ dependencies = [
 [[package]]
 name = "sqlx-macros-core"
 version = "0.9.0"
-source = "git+https://github.com/praxis-proxy/sqlx.git?rev=18f9f82a33a935a8aaa3502aa6d01890c294ec99#18f9f82a33a935a8aaa3502aa6d01890c294ec99"
+source = "git+https://github.com/praxis-proxy/sqlx.git?rev=637e7025b1276ad3c08cc36e666b97fcfea4914c#637e7025b1276ad3c08cc36e666b97fcfea4914c"
 dependencies = [
  "cfg-if",
  "dotenvy",
@@ -5716,7 +5717,7 @@ dependencies = [
 [[package]]
 name = "sqlx-postgres"
 version = "0.9.0"
-source = "git+https://github.com/praxis-proxy/sqlx.git?rev=18f9f82a33a935a8aaa3502aa6d01890c294ec99#18f9f82a33a935a8aaa3502aa6d01890c294ec99"
+source = "git+https://github.com/praxis-proxy/sqlx.git?rev=637e7025b1276ad3c08cc36e666b97fcfea4914c#637e7025b1276ad3c08cc36e666b97fcfea4914c"
 dependencies = [
  "atoi",
  "base64 0.22.1",
@@ -5748,7 +5749,7 @@ dependencies = [
 [[package]]
 name = "sqlx-sqlite"
 version = "0.9.0"
-source = "git+https://github.com/praxis-proxy/sqlx.git?rev=18f9f82a33a935a8aaa3502aa6d01890c294ec99#18f9f82a33a935a8aaa3502aa6d01890c294ec99"
+source = "git+https://github.com/praxis-proxy/sqlx.git?rev=637e7025b1276ad3c08cc36e666b97fcfea4914c#637e7025b1276ad3c08cc36e666b97fcfea4914c"
 dependencies = [
  "atoi",
  "flume",
