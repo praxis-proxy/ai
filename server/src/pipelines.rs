@@ -271,7 +271,7 @@ fn validate_shared_token_quota_pipeline(
     chains: &HashMap<&str, &[FilterEntry]>,
     listener_name: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if shared_quota_limiter_exists_in_branch(entries, chains, &mut HashSet::new()) {
+    if branch_contains(entries, chains, &mut HashSet::new(), &is_shared_quota_limiter) {
         return Err(format!(
             "listener '{listener_name}': token_rate_limit with use_token_quota must be top-level, not branch-conditional"
         )
@@ -304,13 +304,15 @@ fn validate_shared_token_quota_pipeline(
         )
         .into());
     }
-    if !policy.conditions.is_empty()
+    if policy.failure_mode != FailureMode::Closed
+        || counter.failure_mode != FailureMode::Closed
+        || !policy.conditions.is_empty()
         || !policy.response_conditions.is_empty()
         || !counter.conditions.is_empty()
         || !counter.response_conditions.is_empty()
     {
         return Err(format!(
-            "listener '{listener_name}': policy and token_count must be unconditional when token_rate_limit uses shared quota"
+            "listener '{listener_name}': policy and token_count must be unconditional and fail-closed when token_rate_limit uses shared quota"
         )
         .into());
     }
@@ -323,12 +325,18 @@ fn validate_shared_token_quota_pipeline(
     Ok(())
 }
 
-/// Detect a shared-quota limiter nested in any reachable inline or named branch.
+/// Whether an entry is a shared-quota limiter.
 #[cfg(feature = "token-rate-limit-filter")]
-fn shared_quota_limiter_exists_in_branch(
+fn is_shared_quota_limiter(entry: &FilterEntry) -> bool {
+    entry.filter_type == "token_rate_limit" && config_bool(entry, "use_token_quota")
+}
+
+/// Detect a matching entry nested in any reachable inline or named branch.
+fn branch_contains(
     entries: &[FilterEntry],
     chains: &HashMap<&str, &[FilterEntry]>,
     visited: &mut HashSet<String>,
+    matches: &impl Fn(&FilterEntry) -> bool,
 ) -> bool {
     entries.iter().any(|entry| {
         entry.branch_chains.as_ref().is_some_and(|branches| {
@@ -344,9 +352,7 @@ fn shared_quota_limiter_exists_in_branch(
                             }
                         },
                     };
-                    nested.iter().any(|filter| {
-                        filter.filter_type == "token_rate_limit" && config_bool(filter, "use_token_quota")
-                    }) || shared_quota_limiter_exists_in_branch(nested, chains, visited)
+                    nested.iter().any(matches) || branch_contains(nested, chains, visited, matches)
                 })
             })
         })
@@ -749,7 +755,9 @@ fn validate_provider_boundary(
     entries: &[FilterEntry],
     chains: &HashMap<&str, &[FilterEntry]>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if provider_consumer_exists_in_branch(entries, chains, &mut HashSet::new()) {
+    if branch_contains(entries, chains, &mut HashSet::new(), &|entry| {
+        entry.filter_type == "provider_route"
+    }) {
         return Err(format!(
             "listener '{}': provider_route must be top-level, not branch-conditional",
             listener.name
@@ -829,34 +837,6 @@ fn required_peer_identity_trust<'a>(
         .into());
     }
     Ok(peer)
-}
-
-/// Detect provider consumers nested in any reachable inline or named branch.
-fn provider_consumer_exists_in_branch(
-    entries: &[FilterEntry],
-    chains: &HashMap<&str, &[FilterEntry]>,
-    visited: &mut HashSet<String>,
-) -> bool {
-    entries.iter().any(|entry| {
-        entry.branch_chains.as_ref().is_some_and(|branches| {
-            branches.iter().any(|branch| {
-                branch.chains.iter().any(|chain| {
-                    let nested = match chain {
-                        ChainRef::Inline { filters, .. } => filters.as_slice(),
-                        ChainRef::Named(name) => {
-                            if visited.insert(name.clone()) {
-                                chains.get(name.as_str()).copied().unwrap_or_default()
-                            } else {
-                                &[]
-                            }
-                        },
-                    };
-                    nested.iter().any(|filter| filter.filter_type == "provider_route")
-                        || provider_consumer_exists_in_branch(nested, chains, visited)
-                })
-            })
-        })
-    })
 }
 
 /// Require a security-boundary filter to execute unconditionally and fail closed.
@@ -979,6 +959,16 @@ mod tests {
 - filter: token_count
 ",
                 "policy must use body_access: read_only",
+            ),
+            (
+                "
+- filter: token_rate_limit
+  use_token_quota: true
+- filter: policy
+  failure_mode: open
+- filter: token_count
+",
+                "unconditional and fail-closed",
             ),
             (
                 "

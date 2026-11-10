@@ -10,6 +10,13 @@ runs the configured quota plugin on `cmf.llm_output`. The plugin partitions
 cache and reasoning tokens, applies its weights, rounds up, and returns a
 typed result for `token_rate_limit` and `external_metering`.
 
+`token_count` supports `openai`, `anthropic`, `google`, `bedrock`,
+`bedrock_invoke_model`, and `azure` response usage. Quota policy routing has a
+separate request-side requirement: `policy` must see and admit a usable
+top-level `model` in the JSON request body. A model present only in the URL is
+not admitted for this purpose. Missing models fail closed by default through
+the policy filter's `llm.require_model` behavior.
+
 Configure the PPE plugin in the policy document:
 
 ```yaml
@@ -63,6 +70,7 @@ Response hooks run in reverse, producing
 and streamed responses without buffering or exposing response content to the
 quota plugin. Shared quota currently requires the policy's default
 `body_access: read_only`; `read_write` response buffering does not yet publish
-the quota result to the limiter. The PPE result includes `value`, `formula_id`,
-`unit`, `status`, and the exact normalized `usage` and routing `context` used
-for audit.
+the quota result to the limiter. A metadata-only denial is recorded in PPE
+output for the host consumer, but cannot stop a response whose content has
+already been released. The PPE result includes `value`, `formula_id`, `unit`,
+`status`, and the exact normalized `usage` and routing `context` used for audit.
