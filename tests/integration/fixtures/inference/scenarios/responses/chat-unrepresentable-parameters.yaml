@@ -7,6 +7,7 @@ upstream_authority: 127.0.0.1:3001
 features:
   - responses.chat.unrepresentable_parameters
   - responses.chat.invalid_tools
+  - responses.chat.access_programs
 turns:
   - name: truncation
     request:
@@ -71,6 +72,50 @@ turns:
             - 42
           store: false
           stream: false
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ""
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: access-programs
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Hello
+          store: false
+          stream: false
+          access_programs: {}
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ""
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: access-programs-cyber
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Hello
+          store: false
+          stream: false
+          access_programs: {cyber: daybreak_blue}
     expect:
       client_status: 400
       client_body_kind: json
