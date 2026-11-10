@@ -61,5 +61,8 @@ The proxy chain must be declared in this request order:
 Response hooks run in reverse, producing
 `token_count -> policy/PPE -> consumers`. Metadata-only policy works for JSON
 and streamed responses without buffering or exposing response content to the
-quota plugin. The PPE result includes `value`, `formula_id`, `unit`, `status`,
-and the exact normalized `usage` and routing `context` used for audit.
+quota plugin. Shared quota currently requires the policy's default
+`body_access: read_only`; `read_write` response buffering does not yet publish
+the quota result to the limiter. The PPE result includes `value`, `formula_id`,
+`unit`, `status`, and the exact normalized `usage` and routing `context` used
+for audit.

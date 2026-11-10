@@ -298,6 +298,12 @@ fn validate_shared_token_quota_pipeline(
     let (Some(policy), Some(counter)) = (entries.get(*policy_index), entries.get(*count_index)) else {
         return Err(format!("listener '{listener_name}': internal shared quota filter index is invalid").into());
     };
+    if config_str(policy, "body_access").is_some_and(|mode| mode != "read_only") {
+        return Err(format!(
+            "listener '{listener_name}': policy must use body_access: read_only when token_rate_limit uses shared quota"
+        )
+        .into());
+    }
     if !policy.conditions.is_empty()
         || !policy.response_conditions.is_empty()
         || !counter.conditions.is_empty()
@@ -366,6 +372,16 @@ fn config_bool(entry: &FilterEntry, field: &str) -> bool {
         .and_then(|mapping| mapping.get(serde_yaml::Value::String(field.to_owned())))
         .and_then(serde_yaml::Value::as_bool)
         .unwrap_or(false)
+}
+
+/// Read one string from a filter's flattened configuration mapping.
+#[cfg(feature = "token-rate-limit-filter")]
+fn config_str<'a>(entry: &'a FilterEntry, field: &str) -> Option<&'a str> {
+    entry
+        .config
+        .as_mapping()
+        .and_then(|mapping| mapping.get(serde_yaml::Value::String(field.to_owned())))
+        .and_then(serde_yaml::Value::as_str)
 }
 
 /// Clone `registry` and hand it the proxy's shared sub-request `connector` as
@@ -929,6 +945,7 @@ mod tests {
 - filter: token_rate_limit
   use_token_quota: true
 - filter: policy
+  body_access: read_only
 - filter: token_count
 ",
         )
@@ -952,6 +969,16 @@ mod tests {
 - filter: token_count
 ",
                 "token_rate_limit -> policy -> token_count",
+            ),
+            (
+                "
+- filter: token_rate_limit
+  use_token_quota: true
+- filter: policy
+  body_access: read_write
+- filter: token_count
+",
+                "policy must use body_access: read_only",
             ),
             (
                 "
