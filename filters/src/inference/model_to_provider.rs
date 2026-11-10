@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_ai_apis::{MODEL_PROVIDER_CLIENT_MODEL_METADATA, json_body::replace_json_body};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::DEFAULT_JSON_BODY_MAX_BYTES,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     builtins::http::payload_processing::config_validation::validate_max_body_bytes, parse_filter_config,
 };
 use serde::Deserialize;
@@ -56,9 +56,10 @@ struct ModelToProviderConfig {
     /// Existing load-balancer cluster selected when no model/path mapping matches.
     #[serde(default)]
     fallback_upstream: Option<String>,
-    /// Maximum JSON request body buffered to inspect the model field.
-    #[serde(default = "default_max_body_bytes")]
-    max_body_bytes: usize,
+    /// Optional hard request-body processing limit in bytes. Omit to inherit pipeline
+    /// `max_request_bytes` and `max_buffer_bytes`; oversize bodies return HTTP 413 before parsing.
+    #[serde(default)]
+    max_body_bytes: Option<usize>,
 }
 
 /// One public-model to upstream mapping.
@@ -112,6 +113,17 @@ struct ModelProviderMapping {
 /// client unless a provider response adapter reads the client-facing ID back
 /// from the `model_to_provider.client_model` metadata key.
 ///
+/// Request buffering inherits the pipeline's `max_request_bytes` and
+/// `max_buffer_bytes`. Optional `max_body_bytes` is a hard processing limit:
+/// bodies larger than it return HTTP 413 before parsing, independently of
+/// other filters' buffer declarations. The limit applies to the body received
+/// by this filter, before its own rewriting or enrichment.
+///
+/// Omitting the limit removes the former implicit 10 MiB filter cap; pipeline
+/// limits still apply. Existing positive values remain valid and are now
+/// enforced even when another filter requests a larger shared buffer. Zero
+/// remains invalid; YAML `null` behaves like omission.
+///
 /// # YAML configuration
 ///
 /// ```yaml
@@ -129,8 +141,8 @@ pub struct ModelToProviderFilter {
     paths: HashSet<String>,
     /// Optional cluster for requests that match no mapping.
     fallback_upstream: Option<Arc<str>>,
-    /// Maximum buffered request body size.
-    max_body_bytes: usize,
+    /// Optional hard request-body processing limit, independent of shared buffering.
+    max_body_bytes: Option<usize>,
 }
 
 /// Per-filter selection staged during body pre-read for the request phase.
@@ -160,7 +172,9 @@ impl ModelToProviderFilter {
         if config.models.is_empty() || config.models.len() > MAX_MODEL_MAPPINGS {
             return Err(format!("model_to_provider: models must contain 1-{MAX_MODEL_MAPPINGS} mappings").into());
         }
-        validate_max_body_bytes("model_to_provider", config.max_body_bytes)?;
+        if let Some(limit) = config.max_body_bytes {
+            validate_max_body_bytes("model_to_provider", limit)?;
+        }
         if let Some(upstream) = &config.fallback_upstream {
             validate_mapping_value("fallback_upstream", upstream)?;
         }
@@ -234,11 +248,6 @@ fn validate_mapping_paths(model: &str, paths: Vec<String>) -> Result<Vec<String>
     Ok(validated)
 }
 
-/// Default request body limit shared with JSON body filters.
-fn default_max_body_bytes() -> usize {
-    DEFAULT_JSON_BODY_MAX_BYTES
-}
-
 /// Validate a public model, cluster name, or provider target model.
 fn validate_mapping_value(field: &str, value: &str) -> Result<(), FilterError> {
     if value.trim().is_empty() || value.len() > MAX_MAPPING_VALUE_LEN || value.chars().any(char::is_control) {
@@ -277,9 +286,7 @@ impl HttpFilter for ModelToProviderFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
-        BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_body_bytes),
-        }
+        BodyMode::StreamBuffer { max_bytes: None }
     }
 
     fn needs_request_context(&self) -> bool {
@@ -315,6 +322,13 @@ impl HttpFilter for ModelToProviderFilter {
         }
         ctx.remove_filter_state::<ResolvedUpstream>();
         ctx.filter_metadata.remove(MODEL_PROVIDER_CLIENT_MODEL_METADATA);
+
+        if self
+            .max_body_bytes
+            .is_some_and(|limit| body.as_ref().is_some_and(|raw| raw.len() > limit))
+        {
+            return Ok(FilterAction::Reject(Rejection::status(413)));
+        }
 
         let path = ctx.request.uri.path();
         if !self.paths.contains(path) {
