@@ -185,6 +185,37 @@ class SupportReportTest(unittest.TestCase):
             self.assertEqual(report["live_validation"]["status"], "provenance mismatch")
             self.assertIn("No live claims are made", markdown)
             self.assertNotIn("codex_native", markdown)
+            # The other checkout's provenance must not be attributed to this release.
+            self.assertEqual(report["provenance"]["gateway"], {})
+            self.assertEqual(report["provenance"]["backend"], {})
+            self.assertEqual(report["provenance"]["model"], {})
+            self.assertEqual(report["provenance"]["configuration"], {})
+            self.assertNotIn("0.8.0", json.dumps(report["provenance"]))
+            self.assertNotIn("d" * 64, json.dumps(report["provenance"]))
+            provenance = markdown.split("### Provenance", 1)[1].split("###", 1)[0]
+            self.assertNotIn("0.8.0", provenance)
+            self.assertNotIn("d" * 64, provenance)
+            self.assertIn("| Praxis core | unavailable |", provenance)
+            self.assertEqual(report["evidence"], "partial")
+
+    def test_unrun_ci_workflows_do_not_complete_the_evidence(self):
+        for status in ("not_run", "unavailable"):
+            with tempfile.TemporaryDirectory() as directory:
+                evidence = release_qualification()
+                evidence["workflows"][0]["status"] = status
+                write_fixtures(directory,
+                               qualification_value=qualification(),
+                               release_qualification_value=evidence)
+                report, markdown = generate(arguments(
+                    directory,
+                    qualification=str(Path(directory) / "qualification.json"),
+                    release_qualification=str(Path(directory) / "release-qualification.json")))
+
+                self.assertEqual(report["live_validation"]["status"], "passed")
+                self.assertEqual(len(report["ci_evidence"]["workflows"]), 1)
+                self.assertEqual(report["evidence"], "partial")
+                self.assertIn(status, markdown)
+                self.assertEqual(support.verify(report, markdown, TAG, SHA), [])
 
     def test_zero_counts_render_as_zero(self):
         with tempfile.TemporaryDirectory() as directory:

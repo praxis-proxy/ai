@@ -340,6 +340,10 @@ def build(args):
 
     translation = translation_section(matrix)
     live = live_validation(qualification, args.sha)
+    # A qualification report from another checkout describes that checkout, not
+    # this release. Keep its values out of release provenance by default so a
+    # mismatched run cannot supply a Praxis version or binary hash here.
+    trusted = {} if live.get("status") == "provenance mismatch" else live
     report = {
         "schema_version": VERSION,
         "profile": PROFILE,
@@ -351,10 +355,10 @@ def build(args):
         },
         "scope": {"includes": INCLUDES, "excludes": EXCLUDES},
         "provenance": {
-            "gateway": live.get("gateway") or {},
-            "backend": live.get("backend") or {},
-            "model": live.get("model") or {},
-            "configuration": live.get("configuration") or {},
+            "gateway": trusted.get("gateway") or {},
+            "backend": trusted.get("backend") or {},
+            "model": trusted.get("model") or {},
+            "configuration": trusted.get("configuration") or {},
             "harness_pins": harness_pins(root),
         },
         "native_surfaces": matrix.get("native_surfaces") or [],
@@ -365,10 +369,15 @@ def build(args):
     }
     report["known_gaps"] = known_gaps(translation, live)
     report["previous"] = previous_diff(previous, report)
+    # A nonempty workflow list is not evidence by itself: releases routinely
+    # record workflows that never ran or could not be queried at this commit.
+    # Only a real CI status — success, failure, incomplete, skipped, cancelled —
+    # makes the exact-commit evidence complete.
     report["evidence"] = "complete" if (
         report["live_validation"].get("status") in
         {"passed", "failed", "incomplete", "needs_review", "skipped", "unexecuted"}
-        and report["ci_evidence"].get("workflows")
+        and any(workflow.get("status") not in (None, "not_run", "unavailable")
+                for workflow in report["ci_evidence"].get("workflows") or [])
     ) else "partial"
     return report
 
