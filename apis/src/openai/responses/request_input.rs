@@ -128,8 +128,7 @@ pub(crate) fn input_echo_value(state: &ResponsesState) -> Option<Value> {
 }
 
 #[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, reason = "tests")]
+#[expect(clippy::unwrap_used, reason = "test fixtures must serialize successfully")]
 mod tests {
     use serde_json::json;
 
@@ -237,7 +236,11 @@ mod tests {
 
     #[test]
     fn null_input_round_trips_as_null() {
-        assert_eq!(current_input(json!({"model": "m", "input": null})), Some(json!(null)));
+        assert_eq!(
+            current_input(json!({"model": "m", "input": null})),
+            Some(json!(null)),
+            "explicit null input must stay null"
+        );
     }
 
     #[test]
@@ -253,16 +256,44 @@ mod tests {
     fn unsupported_scalar_input_stays_in_parameters() {
         // A number cannot be normalized; it is retained in the parameters and
         // emitted once so existing validators still reject it (#1618).
-        assert_eq!(current_input(json!({"model": "m", "input": 42})), Some(json!(42)));
+        assert_eq!(
+            current_input(json!({"model": "m", "input": 42})),
+            Some(json!(42)),
+            "unsupported scalar input must remain available to validation"
+        );
     }
 
     #[test]
     fn classify_maps_each_shape() {
-        assert_eq!(InputForm::classify(None), InputForm::Missing);
-        assert_eq!(InputForm::classify(Some(&json!(null))), InputForm::Null);
-        assert_eq!(InputForm::classify(Some(&json!("s"))), InputForm::String);
-        assert_eq!(InputForm::classify(Some(&json!({}))), InputForm::Object);
-        assert_eq!(InputForm::classify(Some(&json!([]))), InputForm::Array);
-        assert_eq!(InputForm::classify(Some(&json!(42))), InputForm::Missing);
+        assert_eq!(
+            InputForm::classify(None),
+            InputForm::Missing,
+            "input shape must retain its serialization form"
+        );
+        assert_eq!(
+            InputForm::classify(Some(&json!(null))),
+            InputForm::Null,
+            "input shape must retain its serialization form"
+        );
+        assert_eq!(
+            InputForm::classify(Some(&json!("s"))),
+            InputForm::String,
+            "input shape must retain its serialization form"
+        );
+        assert_eq!(
+            InputForm::classify(Some(&json!({}))),
+            InputForm::Object,
+            "input shape must retain its serialization form"
+        );
+        assert_eq!(
+            InputForm::classify(Some(&json!([]))),
+            InputForm::Array,
+            "input shape must retain its serialization form"
+        );
+        assert_eq!(
+            InputForm::classify(Some(&json!(42))),
+            InputForm::Missing,
+            "input shape must retain its serialization form"
+        );
     }
 }

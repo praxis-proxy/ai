@@ -779,11 +779,7 @@ fn continuation_state_fits(
         };
         used = used.saturating_add(size);
     }
-    for values in [
-        &state.accumulated_output,
-        &state.previous_tools,
-        &state.tools,
-    ] {
+    for values in [&state.accumulated_output, &state.previous_tools, &state.tools] {
         let Some(size) = bounded_json_size(values, max_bytes.saturating_sub(used)).ok().flatten() else {
             return false;
         };

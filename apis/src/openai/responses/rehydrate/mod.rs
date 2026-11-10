@@ -1395,6 +1395,10 @@ impl StateSource {
 
 /// Build the rehydrated state, reusing the managed owner's decoded state when it
 /// exists and otherwise building one from the parsed body (#1618).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "thread the live request body alongside context and stored response data"
+)]
 fn resolve_rehydrated_state(
     ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
@@ -1424,12 +1428,7 @@ fn resolve_rehydrated_state(
                 return Err(reject_server_error("request pipeline state is unavailable"));
             };
             if apply_stored_configuration(&mut existing.request_body, &stored) {
-                match serde_json::to_vec(&super::request_input::CurrentRequestBody::new(&existing)) {
-                    Ok(bytes) => *body = Some(Bytes::from(bytes)),
-                    Err(error) => {
-                        warn!(error = %error, "rehydrate: failed to publish merged configuration to request body")
-                    },
-                }
+                publish_current_request(body, &existing);
             }
             Ok(rehydrate_existing_state(
                 existing,
@@ -1441,11 +1440,21 @@ fn resolve_rehydrated_state(
     }
 }
 
+/// Publish merged configuration without retaining another decoded input copy.
+fn publish_current_request(body: &mut Option<Bytes>, state: &ResponsesState) {
+    match serde_json::to_vec(&super::request_input::CurrentRequestBody::new(state)) {
+        Ok(bytes) => *body = Some(Bytes::from(bytes)),
+        Err(error) => {
+            warn!(error = %error, "rehydrate: failed to publish merged configuration to request body");
+        },
+    }
+}
+
 /// Merge stored history into the managed owner's already-decoded state (#1618).
 ///
 /// Mirrors [`build_state`]'s post-decode steps: the owner already materialized the
 /// current input, so only the stored history, tools, and usage are layered on.
-fn rehydrate_existing_state(
+pub(super) fn rehydrate_existing_state(
     mut state: ResponsesState,
     stored: Vec<Value>,
     previous_tools: Vec<Value>,

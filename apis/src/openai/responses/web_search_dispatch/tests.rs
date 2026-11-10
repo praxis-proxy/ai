@@ -3404,3 +3404,28 @@ fn bound_streamed_search_action_is_noop_without_dispatcher_bound() {
         "without the dispatcher in the chain the stream filter leaves the item as-is"
     );
 }
+
+#[test]
+fn search_bridge_shares_payloads_and_detaches_on_mutation() {
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"input": "hello"}));
+    let start = state.messages.len();
+    append_search_bridge(
+        &mut state,
+        [
+            serde_json::json!({"type": "function_call", "call_id": "bridge"}),
+            serde_json::json!({"type": "function_call_output", "call_id": "bridge", "output": "results"}),
+        ],
+    );
+    for index in start..start + 2 {
+        assert!(
+            state.messages.shares_item_with(index, &state.persisted_messages, index),
+            "bridge histories must share immutable payloads"
+        );
+    }
+    state.messages.get_mut(start + 1).unwrap()["output"] = serde_json::json!("edited");
+    assert_eq!(
+        state.persisted_messages[start + 1]["output"],
+        "results",
+        "working edits must not change persisted results"
+    );
+}

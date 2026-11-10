@@ -1571,8 +1571,15 @@ fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge:
 fn append_search_bridge(state: &mut ResponsesState, bridge: [Value; 2]) {
     let result_start = state.messages.len();
     if state.captures_persistence_history() {
-        state.messages.extend(bridge.iter().cloned());
-        state.extend_persisted_messages(bridge);
+        // Both histories retain the same immutable payloads; later mutation
+        // detaches only the changed item through MessageHistory's copy-on-write.
+        for item in bridge {
+            let item = Arc::new(item);
+            state.messages.push_shared(Arc::clone(&item));
+            if let Some(persisted) = state.persisted_messages_mut() {
+                persisted.push_shared(item);
+            }
+        }
     } else {
         state.messages.extend(bridge);
     }

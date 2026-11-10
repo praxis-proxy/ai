@@ -1518,13 +1518,6 @@ impl ResponsesState {
         }
     }
 
-    /// Append persistence-only items when durable history capture is enabled.
-    pub(crate) fn extend_persisted_messages(&mut self, items: impl IntoIterator<Item = serde_json::Value>) {
-        if self.persistence_history_enabled {
-            self.persisted_messages.extend(items);
-        }
-    }
-
     /// Prepend stored history when this request will produce a durable record.
     #[cfg(feature = "store")]
     pub(crate) fn prepend_persisted_messages(&mut self, history: MessageHistory) {

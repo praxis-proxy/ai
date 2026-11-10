@@ -1366,14 +1366,14 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
                     state.tool_search_calls.push(assignment);
                 }
-                state.accumulated_output.push(item.clone());
                 state.persist_collected_output(absolute_index, &item);
+                state.accumulated_output.push(item);
             },
             Some("tool_search_call") if is_completed_output_item(&item) => {
                 // Client-executed searches stay client-visible and stored, but
                 // must not queue server-side connector discovery.
-                state.accumulated_output.push(item.clone());
                 state.persist_collected_output(absolute_index, &item);
+                state.accumulated_output.push(item);
             },
             _ => {
                 state.accumulated_output.push(item);

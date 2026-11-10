@@ -80,9 +80,19 @@ fn print_allocation_comparison(fixture: &Fixture) {
     let current_stored = fixture.stored.clone();
     let current = measure(|| responses_state_benchmark::current(current_body, current_stored));
 
+    let reuse_body = fixture.body.clone();
+    let reuse_stored = fixture.stored.clone();
+    let reuse = measure(|| responses_state_benchmark::managed_reuse(reuse_body, reuse_stored));
+
     println!(
-        "{} allocations: legacy={} bytes/{} allocs, current={} bytes/{} allocs",
-        fixture.name, legacy.bytes_total, legacy.count_total, current.bytes_total, current.count_total
+        "{} allocations: legacy={} bytes/{} allocs, current={} bytes/{} allocs, managed_reuse={} bytes/{} allocs",
+        fixture.name,
+        legacy.bytes_total,
+        legacy.count_total,
+        current.bytes_total,
+        current.count_total,
+        reuse.bytes_total,
+        reuse.count_total
     );
 }
 
@@ -111,6 +121,15 @@ fn benchmark_responses_state(c: &mut Criterion) {
                 || (fixture.body.clone(), fixture.stored.clone()),
                 |(body, stored)| {
                     responses_state_benchmark::current(black_box(body), black_box(stored));
+                },
+                BatchSize::SmallInput,
+            );
+        });
+        group.bench_function(BenchmarkId::new("managed_reuse", fixture.name), |bencher| {
+            bencher.iter_batched(
+                || (fixture.body.clone(), fixture.stored.clone()),
+                |(body, stored)| {
+                    responses_state_benchmark::managed_reuse(black_box(body), black_box(stored));
                 },
                 BatchSize::SmallInput,
             );

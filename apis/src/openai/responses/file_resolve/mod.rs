@@ -727,7 +727,12 @@ async fn sync_state_with_budget(
     // Resolve the history tails from the locally owned resolved body before it is
     // stored as request parameters; the resolved input is not retained in
     // `request_body` (the params-only invariant, #1618).
-    if let Some(resolved_input) = resolved_body.get("input").and_then(serde_json::Value::as_array) {
+    let resolved_input = match resolved_body.get("input") {
+        Some(serde_json::Value::Array(items)) => Some(items.as_slice()),
+        Some(item @ serde_json::Value::Object(_)) => Some(std::slice::from_ref(item)),
+        _ => None,
+    };
+    if let Some(resolved_input) = resolved_input {
         sync_message_history(&mut state.messages, input_len, Some(resolved_input), resolver, budget).await?;
         if let Some(persisted_messages) = state.persisted_messages_mut() {
             sync_persisted_history(persisted_messages, input_len, Some(resolved_input), resolver, budget).await?;

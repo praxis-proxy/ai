@@ -2020,3 +2020,136 @@ fn display_omits_file_url_path_and_query() {
     let displayed = format!("{source}");
     assert_eq!(displayed, "https://storage.example.com");
 }
+
+
+#[tokio::test]
+async fn sync_state_leaves_original_input_untouched_object_input() {
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+
+    let mut request_body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file-abc"}]
+        }]
+    });
+    request_body["input"] = request_body["input"][0].take();
+    let mut state = ResponsesState::from_request_body(request_body);
+    state
+        .messages
+        .insert(0, json!({"role": "user", "content": "replay history"}));
+    state
+        .persisted_messages
+        .insert(0, json!({"role": "user", "content": "replay history"}));
+    ctx.extensions.insert(state);
+
+    let mut resolved_body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_data": "SGVsbG8="}]
+        }]
+    });
+    resolved_body["input"] = resolved_body["input"][0].take();
+    sync_state(&mut ctx, resolved_body, &make_client(), OnMissing::Continue)
+        .await
+        .unwrap();
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let part = &state.input[0]["content"][0];
+    assert_eq!(
+        part["file_id"], "file-abc",
+        "state.input should keep the original client file_id"
+    );
+    assert!(
+        part.get("file_data").is_none(),
+        "state.input should not receive resolved file_data"
+    );
+    assert_eq!(
+        state.messages[1]["content"][0]["file_data"], "SGVsbG8=",
+        "the rewritten tail should still reach messages"
+    );
+}
+
+#[tokio::test]
+async fn object_input_file_url_resolved_to_data_uri() {
+    use crate::{
+        callout_policy::OnMissing,
+        openai::responses::file_resolve::{
+            resolve::resolve_input,
+            resolve_url::{FileUrlResolver, NormalizedOrigin},
+        },
+    };
+
+    // Start TCP stub serving file content
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let stub_url = format!("http://{address}/file.txt");
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut request = [0_u8; 4096];
+                let mut stream = stream;
+                let _read = stream.read(&mut request).unwrap();
+                let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nHello World";
+                stream.write_all(response).unwrap();
+            });
+        }
+    });
+
+    // Build request body with input_file containing file_url
+    let mut body = json!({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_file",
+                "file_url": stub_url.clone()
+            }]
+        }]
+    });
+
+    // Create FilesApiClient
+    let client = make_client_for_url_with_max("http://unused:9999", 64 * 1024 * 1024);
+
+    // Create FileUrlResolver with allowed private origins (localhost)
+    let localhost_origin = NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap();
+    let resolver = FileUrlResolver {
+        allowed_private_origins: vec![localhost_origin],
+        client: crate::subrequest::isolated_client(4),
+    };
+
+    body["input"] = body["input"][0].take();
+
+    // Call resolve_input with url_resolver
+    let count = resolve_input(
+        &mut body,
+        &client,
+        OnMissing::Reject,
+        &http::HeaderMap::new(),
+        Some(&resolver),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(count, 1, "should resolve one file_url reference");
+
+    // Assert file_url removed and file_data is data URI
+    let part = &body["input"]["content"][0];
+    assert!(part.get("file_url").is_none(), "file_url should be removed");
+    let file_data = part["file_data"].as_str().unwrap();
+    assert!(
+        file_data.starts_with("data:text/plain;base64,"),
+        "file_data should be a data URI"
+    );
+    let base64_part = file_data.strip_prefix("data:text/plain;base64,").unwrap();
+    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_part).unwrap();
+    assert_eq!(decoded, b"Hello World", "data URI should contain the file content");
+}

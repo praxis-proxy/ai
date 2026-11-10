@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::{
     history::MessageHistory,
-    rehydrate::{build_state, replay_messages_from_stored},
+    rehydrate::{build_state, rehydrate_existing_state, replay_messages_from_stored},
     request_input::{InputForm, input_echo_value},
     state::{ResponsesState, normalize_input_owned},
 };
@@ -48,6 +48,14 @@ pub fn legacy(body: Value, stored: Vec<Value>, raw_body: &[u8]) -> Result<(), se
 /// Run current managed rehydration and reconstruct the input for store capture.
 pub fn current(body: Value, stored: Vec<Value>) {
     let state = build_state(body, stored, vec![], None);
+    let store_input = input_echo_value(&state);
+    black_box((state, store_input));
+}
+
+/// Run managed-owner initialization followed by reuse during rehydration and store capture.
+pub fn managed_reuse(body: Value, stored: Vec<Value>) {
+    let state = ResponsesState::from_managed_request_body(body);
+    let state = rehydrate_existing_state(state, stored, vec![], None);
     let store_input = input_echo_value(&state);
     black_box((state, store_input));
 }

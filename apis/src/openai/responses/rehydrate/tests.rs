@@ -80,6 +80,8 @@ fn compare_rehydrated_capture_allocations(body: Value) -> (u64, u64, u64, u64) {
     let current_body = body;
     let legacy_stored = stored.clone();
     let current_stored = stored;
+    let reuse_body = current_body.clone();
+    let reuse_stored = current_stored.clone();
     let legacy_raw = raw;
 
     let legacy = allocation_counter::measure(|| {
@@ -89,6 +91,21 @@ fn compare_rehydrated_capture_allocations(body: Value) -> (u64, u64, u64, u64) {
     let current = allocation_counter::measure(|| {
         super::super::rehydrate_benchmark::current(current_body, current_stored);
     });
+    let reuse = allocation_counter::measure(|| {
+        super::super::rehydrate_benchmark::managed_reuse(reuse_body, reuse_stored);
+    });
+    assert!(
+        reuse.bytes_total < legacy.bytes_total,
+        "managed reuse must reduce allocated bytes: legacy={}, reuse={}",
+        legacy.bytes_total,
+        reuse.bytes_total
+    );
+    assert!(
+        reuse.count_total < legacy.count_total,
+        "managed reuse must reduce allocation count: legacy={}, reuse={}",
+        legacy.count_total,
+        reuse.count_total
+    );
     (
         legacy.bytes_total,
         legacy.count_total,

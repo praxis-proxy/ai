@@ -3475,3 +3475,44 @@ def test_conversations_rate_limit_recovers_after_retry_delay(rate_limited_conver
     assert retry_after == 1, "a one-request-per-second bucket must advertise a one-second retry"
     time.sleep(retry_after + 0.05)
     assert limited.conversations.retrieve(conversation_id).id == conversation_id, "admission must recover after Retry-After"
+
+
+@pytest.fixture(params=[False, True], ids=["native", "translated"])
+def conversation_backend_doc_extract(request, tmp_path):
+    """Both inference lanes with document extraction after rehydration."""
+    yield from _run_conversation_proxy(
+        tmp_path, request.param, [{"filter": "openai_doc_extract", "allow_pre_security_callout": True}]
+    )
+
+
+def test_object_input_document_extraction_preserves_original_snapshot(
+    conversation_backend_doc_extract,
+):
+    """Object input is extracted for inference while original input is persisted."""
+    import base64
+
+    client, captured, _, translated = conversation_backend_doc_extract
+    conversation = client.conversations.create()
+    original = {
+        "role": "user",
+        "content": [{
+            "type": "input_file",
+            "filename": "notes.txt",
+            "file_data": "data:text/plain;base64," + base64.b64encode(b"document content").decode(),
+        }],
+    }
+    response = client.responses.create(
+        model="test-model",
+        conversation=conversation.id,
+        extra_body={"input": original},
+    )
+    assert response.status == "completed", "object document input must complete"
+    _, forwarded = captured[-1]
+    messages = forwarded["messages" if translated else "input"]
+    assert "document content" in json.dumps(messages), "backend must receive extracted text"
+    assert "file_data" not in json.dumps(messages), "backend must not receive the original file"
+    page = client.conversations.items.list(conversation.id, order="asc")
+    users = [item.model_dump() for item in page.data if getattr(item, "role", None) == "user"]
+    assert original["content"][0]["file_data"] in json.dumps(users), (
+        "the original file input must survive extraction in the client snapshot"
+    )

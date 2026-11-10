@@ -396,10 +396,11 @@ fn reject_retained_document_budget() -> FilterAction {
 
 /// Walk the current request input and extract text-safe `input_file` parts.
 fn extract_current_input(parsed: &mut serde_json::Value, budget: &mut ExtractionBudget) -> Result<usize, ExtractError> {
-    let Some(items) = parsed.get_mut("input").and_then(serde_json::Value::as_array_mut) else {
-        return Ok(0);
-    };
-    extract_items(items, budget)
+    match parsed.get_mut("input") {
+        Some(serde_json::Value::Array(items)) => extract_items(items, budget),
+        Some(item @ serde_json::Value::Object(_)) => extract_items(std::slice::from_mut(item), budget),
+        _ => Ok(0),
+    }
 }
 
 /// Walk items and extract text-safe `input_file` content parts.
@@ -471,7 +472,12 @@ fn sync_state_after_rewrite(
     // Resolve the history tails from the locally owned resolved body before it is
     // stored as request parameters; the resolved input is not retained in
     // `request_body` (the params-only invariant, #1618).
-    if let Some(resolved_input) = resolved_body.get("input").and_then(serde_json::Value::as_array) {
+    let resolved_input = match resolved_body.get("input") {
+        Some(serde_json::Value::Array(items)) => Some(items.as_slice()),
+        Some(item @ serde_json::Value::Object(_)) => Some(std::slice::from_ref(item)),
+        _ => None,
+    };
+    if let Some(resolved_input) = resolved_input {
         sync_message_history(&mut state.messages, input_len, Some(resolved_input), budget)?;
         if let Some(persisted_messages) = state.persisted_messages_mut() {
             sync_persisted_history(persisted_messages, input_len, Some(resolved_input), budget)?;

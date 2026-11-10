@@ -1322,6 +1322,7 @@ mod tests {
                 vec!["openai_chat_completions_to_anthropic_messages"],
                 vec!["openai_responses_to_chat_completions"],
                 vec!["openai_responses_to_chat_completions"],
+                vec!["responses_native_passthrough"],
             ]
         );
         assert_eq!(
@@ -1423,11 +1424,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 92, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 71, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 76, "manifest recording inventory count");
+        assert_eq!(report.features_total, 93, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 72, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 77, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1497,6 +1499,7 @@ mod tests {
                 "responses/native-continuation",
                 "responses/native-continuation-stream",
                 "responses/native-tool-call",
+                "responses/object-document-input",
                 "responses/responses-to-chat-completions-reasoning-agentic",
                 "vertex/anthropic-wire-translation",
                 "vertex/bounded-stream-limits",
@@ -1504,7 +1507,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 92, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 93, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1929,6 +1932,10 @@ mod tests {
                         "responses/chat-unrepresentable-parameters".to_owned(),
                     ]
                 ),
+                (
+                    &"responses.request.object_document_input".to_owned(),
+                    &vec!["responses/object-document-input".to_owned()]
+                ),
             ]
         );
         for feature in &manifest.features[0..2] {
@@ -2099,7 +2106,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)],
         );
-        for feature in &manifest.features[62..92] {
+        for feature in &manifest.features[62..93] {
             assert_eq!(
                 feature
                     .providers
