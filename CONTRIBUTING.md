@@ -52,7 +52,8 @@ CI enforces reviewability on every PR:
   completes the issue or `Refs #123` when the issue remains open.
 - A description with non-empty **Why**, **What**, and **How** sections. Explain
   why the change is needed, what problem it fixes, and how the implementation
-  addresses it. The Praxis bot check fails when any section is missing or empty.
+  addresses it. The Praxis bot check fails when a section is missing or empty,
+  or when the PR has no issue reference.
   PRs that add a filter parameter must also justify why the parameter is
   needed, what behavior it controls, and why existing configuration is
   insufficient.
