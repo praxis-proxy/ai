@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 VERSION = 3
 PROFILE = "responses-gateway-live-vllm-gpu"
@@ -85,7 +85,7 @@ def model_revision(runtime, model):
         "commits={v for v in values if re.fullmatch('[0-9a-f]{40}',v)}; "
         "print(next(iter(commits)) if len(commits)==1 and len(values)==1 else '')"
     )
-    return command(runtime, "exec", "vllm", "python", "-c", code, model) or None
+    return command(runtime, "exec", "vllm", "python3", "-c", code, model) or None
 
 
 def suite(name, path, profile=None):
@@ -203,7 +203,8 @@ def capture(args):
                     "build_profile": "cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres (debug)",
                     "praxis_version": locked_version("praxis-proxy"),
                     "praxis_filter_version": locked_version("praxis-proxy-filter")},
-        "backend": {"mode": "real-vllm-gpu", "version": command(runtime, "exec", "vllm", "python", "-c", "import vllm; print(vllm.__version__)"),
+        # The runtime image provides python3, not an unversioned python alias.
+        "backend": {"mode": "real-vllm-gpu", "version": command(runtime, "exec", "vllm", "python3", "-c", "import vllm; print(vllm.__version__)"),
                     "image_tag": image, "local_image_id": image_id,
                     "registry_digest": registry_digest,
                     "image_source": "registry" if registry_digest else "local-build",
@@ -358,12 +359,20 @@ def render(report, detailed=False):
     status = report.get("status", "unavailable")
     lines = [START, "### vLLM Responses gateway qualification", ""]
     if status == "unavailable":
-        lines.append("vLLM Responses gateway qualification: unavailable for this release commit. No usable exact-commit GPU qualification report was found.")
+        lines.append("vLLM Responses gateway qualification: unavailable for this release commit. No usable recent ancestor GPU nightly qualification report was found.")
         lines += ["", f"Reason: {report.get('reason', 'GPU evidence unavailable')}."]
     elif status == "not_requested":
         lines.append("vLLM Responses gateway qualification: GPU testing was not requested.")
     else:
         lines.append(f"vLLM Responses gateway qualification: **{status.replace('_', ' ')}**. {report.get('reason', '')}")
+    context = report.get("release_context", {})
+    if context:
+        lines += ["", f"Release commit: `{context['release_sha']}`."]
+        if context.get("tested_at"):
+            lines.append(f"Latest successful GPU nightly: {context['tested_at']}. This evidence describes the tested checkout below; changes since that checkout have not been GPU validated by this run.")
+        for run in context.get("newer_runs", []):
+            outcome = run.get("reason") or run.get("conclusion") or run["status"]
+            lines.append(f"Newer GPU nightly: [{run['run_id']}]({run.get('url')}) at {run['created_at']}: {outcome}.")
     gateway, backend, model = (report.get(key, {}) for key in ("gateway", "backend", "model"))
     if status not in ("unavailable", "not_requested"):
         # Whether the backend image was pulled from the registry or built on the
@@ -506,54 +515,93 @@ def gh_json(endpoint):
         return None
 
 
+GPU_REQUIRED_JOBS = (
+    "Start ephemeral EC2 GPU runner",
+    "Run complete live vLLM Responses suite (GPU)",
+    "Claude Code and Anthropic SDK acceptance on real vLLM (GPU)",
+    "Codex acceptance on real vLLM (GPU)",
+    "OpenCode acceptance on real vLLM (GPU)",
+    "pi acceptance on real vLLM (GPU)",
+    "Stop ephemeral EC2 GPU runner",
+    "Summarize vLLM Responses gateway GPU qualification",
+)
+
+
 def release_evidence(args):
-    sha = args.sha
-    repo = args.repo
-    runs = []
+    # Keep the original tested SHA throughout the report. Ancestor evidence
+    # describes a previous nightly, never an exact-release qualification.
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+    report = unavailable(args.sha, "no successful ancestor GPU nightly within 48 hours")
+    newer = []
     page = 1
+    destination = Path(args.output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
     while True:
-        runs_data = gh_json(f"repos/{repo}/actions/workflows/vllm-integration.yaml/runs?head_sha={sha}&status=completed&per_page=100&page={page}")
-        if not isinstance(runs_data, dict):
+        data = gh_json(
+            f"repos/{args.repo}/actions/workflows/vllm-integration.yaml/runs"
+            f"?branch=main&event=schedule&per_page=100&page={page}")
+        if not isinstance(data, dict) or not isinstance(data.get("workflow_runs"), list):
+            report = unavailable(args.sha, "nightly workflow lookup failed")
             break
-        batch = runs_data.get("workflow_runs", [])
-        runs.extend(batch)
-        if len(batch) < 100:
+        runs = sorted(data["workflow_runs"], key=lambda run: run["created_at"], reverse=True)
+        stop = False
+        for run in runs:
+            started = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+            if started < cutoff:
+                stop = True
+                break
+            comparison = gh_json(f"repos/{args.repo}/compare/{run['head_sha']}...{args.sha}")
+            if not isinstance(comparison, dict):
+                report = unavailable(args.sha, "nightly ancestry lookup failed")
+                stop = True
+                break
+            if comparison.get("status") not in ("ahead", "identical"):
+                continue
+            observation = {"run_id": run["id"], "url": run.get("html_url"),
+                           "created_at": run["created_at"], "sha": run["head_sha"],
+                           "status": run["status"], "conclusion": run.get("conclusion")}
+            if run["status"] != "completed" or run.get("conclusion") != "success":
+                newer.append(observation)
+                continue
+            jobs = gh_json(f"repos/{args.repo}/actions/runs/{run['id']}/jobs?per_page=100&filter=latest")
+            if not isinstance(jobs, dict) or jobs.get("total_count", 0) > 100:
+                report = unavailable(args.sha, "nightly jobs lookup failed or incomplete")
+                stop = True
+                break
+            outcomes = {job["name"]: job.get("conclusion") for job in jobs.get("jobs", [])}
+            if any(outcomes.get(name) != "success" for name in GPU_REQUIRED_JOBS):
+                observation["reason"] = "required GPU jobs did not all succeed"
+                newer.append(observation)
+                continue
+            download_dir = destination / "download" / str(run["id"])
+            try:
+                downloaded = subprocess.run(
+                    ["gh", "run", "download", str(run["id"]), "--repo", args.repo,
+                     "--name", ARTIFACT, "--dir", str(download_dir)],
+                    capture_output=True, text=True, check=False, timeout=120)
+            except (OSError, subprocess.TimeoutExpired):
+                downloaded = None
+            raw = read_json(download_dir / "qualification.json") if downloaded and downloaded.returncode == 0 else None
+            problem = verify(raw, run, run["head_sha"])
+            if problem or raw.get("status") != "passed":
+                observation["reason"] = problem or raw.get("reason") or "qualification did not pass"
+                newer.append(observation)
+                continue
+            report = raw
+            report["release_context"] = {
+                "release_sha": args.sha, "tested_at": run["created_at"],
+                "selection": "latest successful ancestor GPU nightly within 48 hours",
+                "newer_runs": newer,
+            }
+            stop = True
+            break
+        if stop or len(runs) < 100:
             break
         page += 1
-    if not isinstance(runs_data, dict):
-        report = unavailable(sha, "workflow run lookup failed")
-    else:
-        jobs_by_id = {}
-        for run in runs:
-            data = gh_json(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100&filter=latest")
-            if not isinstance(data, dict):
-                report = unavailable(sha, f"jobs lookup failed for run {run['id']}")
-                break
-            jobs_by_id[run["id"]] = data.get("jobs", [])
-        else:
-            chosen = choose_run(runs, jobs_by_id)
-            if chosen is None:
-                report = unavailable(sha, "no completed Responses GPU attempt for this commit")
-            else:
-                run_id = chosen["id"]
-                url = chosen.get("html_url")
-                destination = Path(args.output_dir)
-                destination.mkdir(parents=True, exist_ok=True)
-                try:
-                    downloaded = subprocess.run(["gh", "run", "download", str(run_id), "--repo", repo,
-                                                 "--name", ARTIFACT, "--dir", str(destination / "download")],
-                                                capture_output=True, text=True, check=False, timeout=120)
-                except (OSError, subprocess.TimeoutExpired):
-                    downloaded = None
-                if downloaded is None or downloaded.returncode != 0:
-                    report = unavailable(sha, "report artifact missing, expired, or download failed", url)
-                else:
-                    raw = read_json(destination / "download" / "qualification.json")
-                    problem = verify(raw, chosen, sha)
-                    report = unavailable(sha, problem, url) if problem else raw
-    output = Path(args.output_dir)
-    write_json(output / "qualification.json", report)
-    (output / "qualification-section.md").write_text(render(report), encoding="utf-8")
+    if "release_context" not in report:
+        report["release_context"] = {"release_sha": args.sha, "newer_runs": newer}
+    write_json(destination / "qualification.json", report)
+    (destination / "qualification-section.md").write_text(render(report), encoding="utf-8")
 
 
 def main():
