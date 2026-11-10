@@ -88,6 +88,10 @@ pub fn store_ref_config(filter_config: &serde_yaml::Value) -> Result<(String, Va
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConversationsConfig {
     /// Optional request admission using the core `rate_limit` configuration.
+    /// A mapping with required `mode` (`global` or `per_ip`), `rate` (positive
+    /// requests per second), and `burst` (integer capacity, at least `rate`).
+    /// Optional `ipv6_prefix_len` (1 to 128, default 128) groups IPv6 peers;
+    /// `shadow` (boolean, default false) observes without rejecting.
     /// Global or per-IP budgets cover all eight local operations together.
     #[serde(default)]
     pub rate_limit: Option<serde_yaml::Value>,

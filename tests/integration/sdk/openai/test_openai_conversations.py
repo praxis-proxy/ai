@@ -3299,7 +3299,7 @@ def rate_limited_conversation_clients(request):
 def test_conversations_rate_limit_contract(rate_limited_conversation_clients, operation):
     limited, control, conversation_id, item_id = rate_limited_conversation_clients
     actions = {
-        "create": lambda: limited.conversations.create(),
+        "create": limited.conversations.create,
         "retrieve": lambda: limited.conversations.retrieve(conversation_id),
         "update": lambda: limited.conversations.update(conversation_id, metadata={"changed": "yes"}),
         "delete": lambda: limited.conversations.delete(conversation_id),
@@ -3313,24 +3313,30 @@ def test_conversations_rate_limit_contract(rate_limited_conversation_clients, op
     with pytest.raises(openai.RateLimitError) as raised:
         actions[operation]()
     response = raised.value.response
-    assert response.status_code == 429
-    assert response.headers["content-type"].startswith("application/json")
-    assert int(response.headers["retry-after"]) >= 1
+    assert response.status_code == 429, f"{operation}: exhausted admission must return 429"
+    assert response.headers["content-type"].startswith("application/json"), f"{operation}: errors must be JSON"
+    assert int(response.headers["retry-after"]) >= 1, f"{operation}: Retry-After must be positive seconds"
     error = response.json()["error"]
-    assert error["type"] == "rate_limit_error"
-    assert error["code"] == "rate_limit_exceeded"
-    assert error["param"] is None
-    assert isinstance(error["message"], str) and error["message"]
-    assert control.conversations.retrieve(conversation_id).metadata == {"original": "yes"}
-    assert [item.id for item in control.conversations.items.list(conversation_id).data] == [item_id]
+    assert error["type"] == "rate_limit_error", f"{operation}: expected admission error category"
+    assert error["code"] == "rate_limit_exceeded", f"{operation}: expected admission error code"
+    assert error["param"] is None, f"{operation}: admission is independent of a request parameter"
+    assert isinstance(error["message"], str), f"{operation}: error message must be a string"
+    assert error["message"], f"{operation}: error message must be nonempty"
+    assert control.conversations.retrieve(conversation_id).metadata == {"original": "yes"}, f"{operation}: denied requests must preserve metadata"
+    assert [item.id for item in control.conversations.items.list(conversation_id).data] == [item_id], f"{operation}: denied requests must preserve items"
 
 
 @pytest.mark.parametrize("rate_limited_conversation_clients", [1], indirect=True)
 def test_conversations_rate_limit_recovers_after_retry_delay(rate_limited_conversation_clients):
     limited, _, conversation_id, _ = rate_limited_conversation_clients
-    with pytest.raises(openai.RateLimitError) as raised:
-        limited.conversations.retrieve(conversation_id)
-    retry_after = int(raised.value.response.headers["retry-after"])
-    assert retry_after == 1
+    for _ in range(10):
+        try:
+            limited.conversations.retrieve(conversation_id)
+        except openai.RateLimitError as error:
+            retry_after = int(error.response.headers["retry-after"])
+            break
+    else:
+        pytest.fail("could not establish exhaustion before testing recovery")
+    assert retry_after == 1, "a one-request-per-second bucket must advertise a one-second retry"
     time.sleep(retry_after + 0.05)
-    assert limited.conversations.retrieve(conversation_id).id == conversation_id
+    assert limited.conversations.retrieve(conversation_id).id == conversation_id, "admission must recover after Retry-After"

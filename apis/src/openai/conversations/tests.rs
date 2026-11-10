@@ -6098,6 +6098,10 @@ async fn conformance_conversations_rate_limit_rejects_every_operation_before_sto
         let mut ctx = make_owned_filter_context(&req);
         drop(filter.on_request(&mut ctx).await.unwrap());
         let mut ctx = make_owned_filter_context(&req);
+        assert!(
+            ctx.extensions.get::<ResponseStoreRegistry>().is_none(),
+            "{path}: rejection must be proven without an installed store"
+        );
         let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
             panic!("expected rate limit rejection");
         };
@@ -6106,19 +6110,32 @@ async fn conformance_conversations_rate_limit_rejects_every_operation_before_sto
             rejection
                 .headers
                 .iter()
-                .any(|(n, v)| n.eq_ignore_ascii_case("content-type") && v == "application/json")
+                .any(|(n, v)| n.eq_ignore_ascii_case("content-type") && v == "application/json"),
+            "{path}: admission errors must declare JSON"
         );
         let retry = rejection
             .headers
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case("retry-after"))
             .unwrap();
-        assert!(retry.1.parse::<u64>().unwrap() >= 1);
+        assert!(
+            retry.1.parse::<u64>().unwrap() >= 1,
+            "{path}: Retry-After must be positive integer seconds"
+        );
         let body = rejection_body(&rejection);
         validator.validate(&body).unwrap();
-        assert_eq!(body["error"]["type"], "rate_limit_error");
-        assert!(body["error"].get("code").is_some());
-        assert!(body["error"].get("param").is_some());
+        assert_eq!(
+            body["error"]["type"], "rate_limit_error",
+            "{path}: admission error category"
+        );
+        assert!(
+            body["error"].get("code").is_some(),
+            "{path}: code is required even when null"
+        );
+        assert!(
+            body["error"].get("param").is_some(),
+            "{path}: param is required even when null"
+        );
     }
     println!("PRAXIS_CONFORMANCE_OK conversations rate_limit_response_contract");
 }
@@ -6139,12 +6156,18 @@ async fn rate_limit_budgets_are_scoped_to_client_ip_and_pipeline_instance() {
         let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
             panic!("expected local rejection");
         };
-        assert_eq!(rejection.status, expected);
+        assert_eq!(
+            rejection.status, expected,
+            "unexpected admission status for client {ip}"
+        );
     }
     let rebuilt = rate_limited_filter(policy);
     let mut ctx = make_owned_filter_context(&req);
     ctx.client_addr = Some("192.0.2.1".parse().unwrap());
-    assert!(matches!(rebuilt.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(r) if r.status == 500));
+    assert!(
+        matches!(rebuilt.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(r) if r.status == 500),
+        "a fresh or admitted request must reach store resolution"
+    );
 }
 
 #[tokio::test]
@@ -6152,18 +6175,27 @@ async fn unrelated_routes_and_missing_owners_do_not_consume_conversation_capacit
     let filter = rate_limited_filter("{mode: global, rate: 0.000001, burst: 1}");
     let unrelated = make_request(Method::GET, "/v1/models");
     let mut ctx = make_owned_filter_context(&unrelated);
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
+        "unrelated routes must bypass Conversations admission"
+    );
     let req = make_request(Method::GET, "/v1/conversations/conv_missing");
     let mut ctx = make_owned_filter_context(&req);
     ctx.extensions.remove::<crate::state_owner::StateOwner>();
-    assert!(matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(r) if r.status == 401));
+    assert!(
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(r) if r.status == 401),
+        "missing owner must fail before consuming capacity"
+    );
     let mut ctx = make_owned_filter_context(&req);
-    assert!(matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(r) if r.status == 500));
+    assert!(
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(r) if r.status == 500),
+        "a fresh or admitted request must reach store resolution"
+    );
     let mut ctx = make_owned_filter_context(&req);
-    assert!(matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(r) if r.status == 429));
+    assert!(
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(r) if r.status == 429),
+        "the next authenticated request must exhaust capacity"
+    );
 }
 
 #[tokio::test]
@@ -6179,7 +6211,10 @@ async fn rate_limit_admission_charges_preread_body_only_once() {
         let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
             panic!("expected local response");
         };
-        assert_eq!(rejection.status, expected);
+        assert_eq!(
+            rejection.status, expected,
+            "pre-read body must consume exactly one admission token"
+        );
     }
 }
 
@@ -6195,14 +6230,20 @@ fn rate_limit_config_reuses_core_validation_and_stays_out_of_store_config() {
             "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nrate_limit: {policy}"
         ))
         .unwrap();
-        assert!(OpenaiConversationsFilter::from_config(&yaml).is_err());
+        assert!(
+            OpenaiConversationsFilter::from_config(&yaml).is_err(),
+            "core must reject invalid policy {policy}"
+        );
     }
     let yaml = serde_yaml::from_str(
         "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nrate_limit: {mode: global, rate: 1, burst: 1}",
     )
     .unwrap();
     let (_, store) = super::store_ref_config(&yaml).unwrap();
-    assert!(store.get("rate_limit").is_none());
+    assert!(
+        store.get("rate_limit").is_none(),
+        "admission policy must stay out of backend configuration"
+    );
 }
 
 
@@ -6219,7 +6260,11 @@ async fn shadow_rate_limit_preserves_preread_requests_after_exhaustion() {
         let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
             panic!("expected local success");
         };
-        assert_eq!(rejection.status, 200);
-        assert_eq!(rejection_body(&rejection)["metadata"]["preserved"], "yes");
+        assert_eq!(rejection.status, 200, "shadow exhaustion must permit the request");
+        assert_eq!(
+            rejection_body(&rejection)["metadata"]["preserved"],
+            "yes",
+            "shadow bookkeeping must preserve pre-read body data"
+        );
     }
 }

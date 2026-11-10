@@ -62,6 +62,9 @@ use crate::{
 /// per second and `burst` is bucket capacity. The block is disabled when absent.
 /// Admission runs after trusted owner resolution and before store access; failed
 /// CRUD requests consume capacity too. A pipeline rebuild creates fresh buckets.
+/// Request-body pre-read can run before admission, so this policy does not
+/// bound body-buffering memory or ingress bandwidth. Configure connection and
+/// request-body size limits separately when those costs need to be constrained.
 /// Core per-IP state bounds and eviction apply. Shadow mode records decisions
 /// without rejecting. Successful local responses do not gain rate-limit headers.
 ///

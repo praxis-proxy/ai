@@ -627,16 +627,42 @@ fn list_items_with_invalid_query_on_nonexistent_conversation_returns_400() {
 #[test]
 fn configured_rate_limit_returns_openai_error() {
     let proxy_port = free_port();
+    let control_port = free_port();
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("conversations.db").display()
+    );
     let yaml = std::fs::read_to_string(example_config_path("openai/conversations/conversations.yaml")).unwrap();
+    for expected in ["sqlite://conversations.db?mode=rwc", "rate: 100", "burst: 200"] {
+        assert!(
+            yaml.contains(expected),
+            "example configuration changed: missing {expected}"
+        );
+    }
     let patched = patch_yaml(
         &yaml
-            .replace("sqlite://conversations.db?mode=rwc", "sqlite::memory:")
+            .replace("sqlite://conversations.db?mode=rwc", &database_url)
             .replace("rate: 100", "rate: 0.000001")
             .replace("burst: 200", "burst: 1"),
         proxy_port,
         &HashMap::new(),
     );
-    let config = praxis_core::config::Config::from_yaml(&patched).unwrap();
+    let mut config = praxis_core::config::Config::from_yaml(&patched).unwrap();
+    let mut control_chain = config.filter_chains[0].clone();
+    control_chain.name = "control".to_owned();
+    let conversations = control_chain
+        .filters
+        .iter_mut()
+        .find(|entry| entry.filter_type == "openai_conversations")
+        .unwrap();
+    conversations.config.as_mapping_mut().unwrap().remove("rate_limit");
+    let mut control_listener = config.listeners[0].clone();
+    control_listener.name = "control".to_owned();
+    control_listener.address = format!("127.0.0.1:{control_port}");
+    control_listener.filter_chains = vec![control_chain.name.clone()];
+    config.filter_chains.push(control_chain);
+    config.listeners.push(control_listener);
     let proxy = start_proxy(&config);
     let id = create_conversation(&proxy, "{}");
     for method in ["GET", "DELETE"] {
@@ -645,13 +671,42 @@ fn configured_rate_limit_returns_openai_error() {
             &format!("{method} /v1/conversations/{id} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
         );
         assert_eq!(parse_status(&raw), 429, "{raw}");
-        assert!(raw.to_ascii_lowercase().contains("content-type: application/json"));
-        assert!(raw.to_ascii_lowercase().contains("retry-after:"));
+        assert!(
+            raw.to_ascii_lowercase().contains("content-type: application/json"),
+            "{method}: denial must declare JSON"
+        );
+        assert!(
+            raw.to_ascii_lowercase().contains("retry-after:"),
+            "{method}: denial must provide a retry delay"
+        );
         let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
-        assert_eq!(body["error"]["type"], "rate_limit_error");
-        assert_eq!(body["error"]["code"], "rate_limit_exceeded");
-        assert!(body["error"]["param"].is_null());
+        assert_eq!(
+            body["error"]["type"], "rate_limit_error",
+            "{method}: admission error category"
+        );
+        assert_eq!(
+            body["error"]["code"], "rate_limit_exceeded",
+            "{method}: admission error code"
+        );
+        assert!(
+            body["error"]["param"].is_null(),
+            "{method}: admission is independent of request parameters"
+        );
     }
+    let raw = http_send(
+        &format!("127.0.0.1:{control_port}"),
+        &format!("GET /v1/conversations/{id} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "denied DELETE must preserve the conversation: {raw}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        body["id"], id,
+        "the control listener must observe the original conversation"
+    );
 }
 
 // -----------------------------------------------------------------------------
