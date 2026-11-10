@@ -23,7 +23,12 @@
 # loads `fixtures/openai/responses/websocket-codex-<version>.json`, a
 # recording of this version's wire protocol, so a bump must recapture it
 # rather than rename it.
-version = "0.166.0"
+version = "0.167.0"
+# 0.167.0 shipped as rust-v0.167.0 on 2026-11-06 and is not a prerelease. It
+# is pinned by hand because the weekly automated bump cannot open its pull
+# request yet: `Generate token` fails without Workflows: write on the bot app
+# installation, so the job discards a valid bump (see the tracked issue for
+# that permission gap). Drop this note once the scheduled bump works again.
 # Target triple of the pinned release archive.
 platform = "x86_64-unknown-linux-musl"
 # How CI obtains the executable.
@@ -36,4 +41,4 @@ release_tag_prefix = "rust-v"
 archive = "codex-x86_64-unknown-linux-musl.tar.gz"
 # Exact `codex --version` output. Observed: the product prefix is `codex-cli`,
 # not `codex`.
-version_output = "codex-cli 0.166.0"
+version_output = "codex-cli 0.167.0"

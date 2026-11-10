@@ -1336,7 +1336,7 @@ jobs:
     env:
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
-      CODEX_VERSION: "0.166.0"
+      CODEX_VERSION: "0.167.0"
       CODEX_VLLM_MODEL: qwen3-8b
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

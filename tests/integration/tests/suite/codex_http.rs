@@ -112,7 +112,7 @@ const TOOL_ITEM_TYPES: &[&str] = &["command_execution", "file_change", "mcp_tool
 // Compaction acceptance constants
 // -----------------------------------------------------------------------------
 //
-// Pinned Codex (verified 0.144.1 through 0.166.0) against a provider named
+// Pinned Codex (verified 0.144.1 through 0.167.0) against a provider named
 // `praxis` does not qualify for remote compaction (`supports_remote_compaction()` is false unless the provider is
 // `openai`/Azure), and the `token_budget` window-reset feature ships disabled by
 // default. Auto-compaction therefore takes the local inline path
@@ -2539,7 +2539,7 @@ fn live_apply_patch_codex_jsonl_requires_a_completed_result_file_change() {
 
 /// Validate the compaction run's JSONL.
 ///
-/// Pinned Codex (verified 0.144.1 through 0.166.0) emits exactly one
+/// Pinned Codex (verified 0.144.1 through 0.167.0) emits exactly one
 /// `turn.completed` for the whole submitted prompt (covering every tool
 /// round), so accepted-turn growth is
 /// proven by counting correlated successful `command_execution` items, not
@@ -2578,7 +2578,7 @@ fn chapter_labels(command: &str) -> Vec<&str> {
 }
 
 /// Unwraps a single `<shell> -c/-lc '<inner>'` layer and returns the command
-/// Codex actually executed. Pinned Codex (verified 0.144.1 through 0.166.0)
+/// Codex actually executed. Pinned Codex (verified 0.144.1 through 0.167.0)
 /// records shell-wrapped invocations such as `/bin/bash -lc './verify.sh'`;
 /// the unit fixtures use the
 /// bare form. Only one quoting layer is stripped, which is all Codex adds.
