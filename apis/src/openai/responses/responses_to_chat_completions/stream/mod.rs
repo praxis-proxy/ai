@@ -1973,6 +1973,7 @@ fn minimal_failed_resource(context: &ResponseContext<'_>, message: &str) -> Valu
     json!({
         "id": context.response_id,
         "object": "response",
+        "access_programs": Value::Null,
         "created_at": context.created_at,
         "completed_at": Value::Null,
         "status": "failed",

@@ -31,6 +31,7 @@ provider API integrations on top of [Praxis](https://github.com/praxis-proxy/pra
 
 - [Development setup](developing/getting-started.md)
 - [Run your Code Harness through Praxis and vLLM](developing/cli-vllm-through-praxis.md)
+- [Run your Code Harness in OpenShell through Praxis and vLLM](developing/openshell-cli-vllm-through-praxis.md)
 - [Nightly GPU test suite](developing/gpu-nightly-suite.md)
 - [Adding filters](developing/adding-filters.md)
 - [Flow visualizers](developing/flow-visualizers.md)

@@ -36,7 +36,9 @@ backends and applies policy.
 - **Code harness support.** Run Codex through OpenAI Responses, Claude Code
   through Anthropic Messages, and OpenCode and pi through Chat Completions. The
   [coding client guide](docs/developing/cli-vllm-through-praxis.md) shows each
-  client reaching native vLLM endpoints or Chat Completions through translation.
+  client reaching native vLLM endpoints or Chat Completions through translation,
+  and the [OpenShell guide](docs/developing/openshell-cli-vllm-through-praxis.md)
+  runs the same clients inside NVIDIA OpenShell sandboxes.
 - **Manage OpenAI response state.** Persist and rehydrate Responses history,
   serve Conversations endpoints locally, and use PostgreSQL or SQLite for
   storage. Fully supports both OpenAI Python SDK 2.x and 3.x client versions. See the [response store guide](docs/architecture/response-store.md)
@@ -172,7 +174,12 @@ Feel free to join our [discussion forums] to ask questions or share ideas.
 
 Or please join us in our Slack channel on [CNCF Slack]: [#praxis] channel
 
+Check the [CNCF Praxis Calendar] to see our community calls and other online
+meetups.
+
 [discussion forums]:https://github.com/praxis-proxy/praxis/discussions
+[#praxis]:https://cloud-native.slack.com/archives/C0BK0RSP5RC
+[CNCF Praxis Calendar]:https://app.lfx.dev/projects/praxis/calendar
 
 ## License
 

@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
-    SelectedUpstreamBodyOutcome, SubRequestResponseMode, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    SelectedUpstreamBodyOutcome, SubRequestResponseMode, parse_filter_config,
 };
 use tracing::{debug, trace, warn};
 
@@ -48,6 +48,7 @@ use super::{
 };
 use crate::{
     classifier::is_responses_create,
+    json_body::MAX_JSON_BODY_BYTES,
     openai::translation::{
         chat_completions::{ResponseContext, chat_response_to_response_resource, responses_state_to_chat_request},
         reasoning::{ReasoningOptions, validate_requested_reasoning},

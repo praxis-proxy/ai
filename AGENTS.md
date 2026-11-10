@@ -155,6 +155,15 @@ truthful provider, model, and provenance metadata.
 
 ## Adding a Filter
 
+Before creating a filter, inspect existing filters in `apis/src/` and
+`filters/src/` for overlapping responsibilities, including filters that
+already parse the same protocol or derive related routing facts. Prefer
+extending the filter that owns that behavior and reusing its parsed data.
+For example, derive modality in existing API protocol filters rather than
+adding a separate filter that buffers and parses the same request body.
+Create a new filter only when it has a distinct responsibility; explain
+which existing filters were considered and why extending them is unsuitable.
+
 1. Create module under `filters/src/` or `apis/src/`
 2. Implement `HttpFilter` from `praxis-filter`
 3. Register in `praxis_ai_filters::register_ai_filters`
@@ -164,6 +173,7 @@ truthful provider, model, and provenance metadata.
 
 ## Key Patterns
 
+- **Filter callouts**: use `FilteredSubrequestExecutor` for every outbound call made by a filter. It runs the configured outbound filter chain around the HTTP exchange, including credential injection and other outbound policies. `SubRequestClient::execute_url()` performs the HTTP exchange without running a configured filter pipeline.
 - **Classify → route → branch**: classifier filters
   promote facts to internal headers
   (`x-praxis-ai-*`) and the router matches those

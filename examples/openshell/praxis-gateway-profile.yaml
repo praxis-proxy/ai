@@ -1,0 +1,70 @@
+# OpenShell provider profile for a host-side Praxis gateway.
+#
+# This is an OpenShell provider profile, not a Praxis config. It pairs with
+# `examples/configs/openshell/sandboxed-coding-clients.yaml` and lets coding
+# harnesses inside an OpenShell sandbox reach that gateway, and nothing else
+# this profile grants. See
+# `docs/developing/openshell-cli-vllm-through-praxis.md`.
+#
+#   openshell profile lint   -f examples/openshell/praxis-gateway-profile.yaml
+#   openshell profile import -f examples/openshell/praxis-gateway-profile.yaml
+#   openshell provider create --name praxis --type praxis-gateway \
+#     --credential GATEWAY_AUTH_PASSWORD
+#
+# Credential scope:  GATEWAY_AUTH_PASSWORD, the Praxis `basic_auth` password.
+#                    The sandbox sees an `openshell:resolve:env:...`
+#                    placeholder. The harness sends
+#                    `Authorization: Basic base64("gateway:<placeholder>")`, and
+#                    the OpenShell proxy decodes it, substitutes the real
+#                    password, and re-encodes it, only toward the endpoints
+#                    below. The vLLM key stays in the Praxis process.
+# Endpoint access:   the two gateway listeners on the sandbox host, reached
+#                    through `host.openshell.internal`. Substitution needs
+#                    L7 inspection, so both are `protocol: rest`.
+# Binaries:          trim to what your image installs. The defaults match
+#                    `examples/openshell/Containerfile.harnesses` (npm global
+#                    installs on the official Node image) and the upstream
+#                    OpenCode image. Resolve real paths inside the sandbox with
+#                    `readlink -f "$(command -v <harness>)"`.
+
+id: praxis-gateway
+display_name: Praxis gateway
+description: Host-side Praxis AI gateway in front of vLLM
+category: inference
+inference_capable: true
+credentials:
+  - name: gateway_password
+    description: Praxis basic_auth password for username `gateway`
+    env_vars: [GATEWAY_AUTH_PASSWORD]
+    required: true
+    auth_style: basic
+discovery:
+  credentials: [gateway_password]
+endpoints:
+  # Claude Code (/v1/messages), OpenCode and pi (/v1/chat/completions).
+  - host: host.openshell.internal
+    port: 8080
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: POST, path: "/v1/messages" }
+      - allow: { method: POST, path: "/v1/messages/count_tokens" }
+      - allow: { method: POST, path: "/v1/chat/completions" }
+      - allow: { method: GET, path: "/v1/models" }
+  # Codex (/v1/responses).
+  - host: host.openshell.internal
+    port: 8081
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: POST, path: "/v1/responses" }
+      - allow: { method: GET, path: "/v1/models" }
+binaries:
+  # Node itself runs pi and the npm launcher scripts.
+  - /usr/local/bin/node
+  # Native binaries that npm packages ship and exec (Claude Code, Codex, OpenCode).
+  - /usr/local/lib/node_modules/**
+  # Upstream OpenCode image layout.
+  - /usr/local/bin/opencode
+  # Smoke tests from the guide.
+  - /usr/bin/curl

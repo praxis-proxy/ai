@@ -58,6 +58,10 @@ pub(super) struct ResponseResource {
     #[schema(example = "response")]
     pub(super) object: String,
 
+    /// Access programs reported by the provider, if any.
+    #[schema(required = true, nullable = true)]
+    pub(super) access_programs: Option<Value>,
+
     /// Generation status.
     #[schema(example = "completed")]
     pub(super) status: String,
@@ -137,8 +141,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn access_programs_contract_is_required_and_nullable() -> Result<(), Box<dyn std::error::Error>> {
+        let schema = serde_json::to_value(<ResponseResource as utoipa::PartialSchema>::schema())?;
+        assert!(
+            schema
+                .get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|required| required.contains(&serde_json::json!("access_programs")))
+        );
+        let property = schema
+            .get("properties")
+            .and_then(|properties| properties.get("access_programs"));
+        // OpenAPI 3.1 represents serde_json::Value as an unconstrained schema,
+        // which accepts every JSON type, including null.
+        assert_eq!(
+            property,
+            Some(&serde_json::json!({
+                "description": "Access programs reported by the provider, if any."
+            }))
+        );
+        Ok(())
+    }
+
+    #[test]
     #[expect(clippy::too_many_lines, reason = "straight-line struct instantiation test")]
-    fn contract_types_can_be_instantiated() {
+    fn contract_types_can_be_instantiated() -> Result<(), Box<dyn std::error::Error>> {
         let req = CreateResponseRequest {
             model: Some("gpt-4o".to_owned()),
             input: Some(serde_json::json!("Hello")),
@@ -160,6 +187,7 @@ mod tests {
         let res = ResponseResource {
             id: "resp_1".to_owned(),
             object: "response".to_owned(),
+            access_programs: None,
             status: "completed".to_owned(),
             created_at: 1_700_000_000,
             completed_at: Some(1_700_000_005),
@@ -185,6 +213,8 @@ mod tests {
             background: Some(false),
             service_tier: Some(serde_json::json!("default")),
         };
+        let serialized = serde_json::to_value(&res)?;
+        assert_eq!(serialized.get("access_programs"), Some(&Value::Null));
         assert_eq!(res.id, "resp_1");
         assert_eq!(res.object, "response");
         assert_eq!(res.status, "completed");
@@ -195,5 +225,6 @@ mod tests {
         assert_eq!(res.temperature, Some(1.0));
         assert_eq!(res.top_p, Some(1.0));
         assert_eq!(res.background, Some(false));
+        Ok(())
     }
 }

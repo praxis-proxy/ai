@@ -882,3 +882,13 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.access_programs
+    scopes:
+      - openai_responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-basic-nonstream
+      - responses/chat-unrepresentable-parameters
+    providers:
+      synthetic:
+        status: synthetic_only

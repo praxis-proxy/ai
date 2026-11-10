@@ -306,13 +306,17 @@ fn zero_max_body_bytes_rejected() {
 
 #[test]
 fn oversized_max_body_bytes_rejected() {
-    let config = serde_yaml::from_str::<serde_yaml::Value>("max_body_bytes: 67108865").unwrap();
+    let config = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+        "max_body_bytes: {}",
+        praxis_filter::body::MAX_JSON_BODY_BYTES + 1
+    ))
+    .unwrap();
 
     let result = StreamUsageInjectFilter::from_config(&config);
 
     assert!(
         result.is_err(),
-        "max_body_bytes above the 64 MiB ceiling should be rejected at config time"
+        "max_body_bytes above the ceiling should be rejected at config time"
     );
 }
 

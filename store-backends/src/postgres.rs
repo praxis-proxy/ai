@@ -216,7 +216,8 @@ impl PostgresResponseStore {
         let insert_sql = format!(
             "INSERT INTO {items_table} \
              (item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (tenant_id, owner_issuer, owner_subject, item_id) DO NOTHING"
         );
         for (i, item) in items.iter().enumerate() {
             let offset = i64::try_from(i).unwrap_or(i64::MAX);
@@ -224,7 +225,7 @@ impl PostgresResponseStore {
             let item_data =
                 serde_json::to_string(&item.item_data).map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-            sqlx::query(AssertSqlSafe(insert_sql.as_str()))
+            let result = sqlx::query(AssertSqlSafe(insert_sql.as_str()))
                 .bind(&item.item_id)
                 .bind(owner.tenant_id())
                 .bind(owner.issuer())
@@ -236,6 +237,12 @@ impl PostgresResponseStore {
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| self.db_err(&e))?;
+            if result.rows_affected() == 0 {
+                return Err(StoreError::InvalidInput(format!(
+                    "conversation item '{}' already exists",
+                    item.item_id
+                )));
+            }
         }
 
         pg_invalidate_messages(tx, conv_table, owner, conversation_id).await
@@ -2640,9 +2647,9 @@ fn pg_prepare_legacy_prefix(json: &str) -> Result<Option<String>, StoreError> {
     Ok(None)
 }
 
-/// Clear the retired array cache, preserving the canonical internal prefix
-/// written at first append. Its exact leading key avoids JSON casts on malformed
-/// retired caches. The affected-row check preserves rollback if the parent vanished.
+/// Clear a stale array while preserving the canonical internal prefix written
+/// at first append. The caller holds the owner-scoped parent row lock, so an
+/// unchanged empty cache or prefix needs no conversation-row update.
 async fn pg_invalidate_messages(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     conv_table: &str,
@@ -2650,10 +2657,11 @@ async fn pg_invalidate_messages(
     conversation_id: &str,
 ) -> Result<(), StoreError> {
     let update_sql = format!(
-        "UPDATE {conv_table} SET messages = CASE WHEN left(messages, 19) = '{{\"legacy_messages\":' THEN messages ELSE '[]' END \
-         WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4"
+        "UPDATE {conv_table} SET messages = '[]' \
+         WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
+         AND (messages IS NULL OR (messages <> '[]' AND left(messages, 19) <> '{{\"legacy_messages\":'))"
     );
-    let updated = sqlx::query(AssertSqlSafe(update_sql.as_str()))
+    sqlx::query(AssertSqlSafe(update_sql.as_str()))
         .bind(conversation_id)
         .bind(owner.tenant_id())
         .bind(owner.issuer())
@@ -2661,12 +2669,6 @@ async fn pg_invalidate_messages(
         .execute(&mut **tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
-
-    if updated.rows_affected() == 0 {
-        return Err(StoreError::Database(format!(
-            "conversation disappeared during message sync: {conversation_id}"
-        )));
-    }
 
     Ok(())
 }
@@ -2990,6 +2992,72 @@ mod tests {
     use std::sync::{Arc, Mutex, Weak};
 
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    #[expect(clippy::too_many_lines, reason = "one cache-state matrix observes row updates")]
+    async fn invalidation_updates_only_stale_or_null_caches() {
+        let url = std::env::var("DATABASE_URL").expect("disposable test database");
+        let pool = PgPoolOptions::new().connect(&url).await.unwrap();
+        let owner = StateOwner::from_trusted_parts("tenant", "issuer", "subject").unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "CREATE TEMP TABLE nullable_conversations AS SELECT 'c'::text AS conversation_id, \
+             'tenant'::text AS tenant_id, 'issuer'::text AS owner_issuer, 'subject'::text AS owner_subject, \
+             NULL::text AS messages",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        for (cache, expected, writes) in [
+            (None, "[]", 1),
+            (Some("[]"), "[]", 0),
+            (Some("{\"legacy_messages\":[]}"), "{\"legacy_messages\":[]}", 0),
+            (Some("[1]"), "[]", 1),
+        ] {
+            sqlx::query(
+                "UPDATE nullable_conversations SET messages = $1 \
+                 WHERE conversation_id = $2 AND tenant_id = $3 AND owner_issuer = $4 AND owner_subject = $5",
+            )
+            .bind(cache)
+            .bind("c")
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            let updates_before: i64 = sqlx::query_scalar(
+                "SELECT pg_stat_get_xact_tuples_updated('pg_temp.nullable_conversations'::regclass)",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            pg_invalidate_messages(&mut tx, "nullable_conversations", &owner, "c")
+                .await
+                .unwrap();
+            let updates_after: i64 = sqlx::query_scalar(
+                "SELECT pg_stat_get_xact_tuples_updated('pg_temp.nullable_conversations'::regclass)",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            assert_eq!(updates_after - updates_before, writes, "cache: {cache:?}");
+            let messages: Option<String> = sqlx::query_scalar(
+                "SELECT messages FROM nullable_conversations \
+                 WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4",
+            )
+            .bind("c")
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            assert_eq!(messages.as_deref(), Some(expected));
+        }
+    }
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]

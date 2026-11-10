@@ -6,14 +6,17 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use http::Method;
-use praxis_filter::{BodyAccess, BodyMode, FilterAction, HttpFilter as _, body::MAX_JSON_BODY_BYTES};
+use praxis_filter::{BodyAccess, BodyMode, FilterAction, HttpFilter as _};
 
 use super::{
     config::{DocExtractConfig, OnUnsupported, is_text_safe_mime},
     extract::{ExtractError, ExtractionBudget, extract_input_file, parse_data_uri},
     *,
 };
-use crate::test_utils::{make_filter_context, make_request};
+use crate::{
+    json_body::MAX_JSON_BODY_BYTES,
+    test_utils::{make_filter_context, make_request},
+};
 
 fn install_document_budget(ctx: &mut HttpFilterContext<'_>, body: &serde_json::Value, limit: usize) {
     let raw = serde_json::to_vec(body).unwrap();

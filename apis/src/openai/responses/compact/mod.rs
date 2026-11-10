@@ -51,7 +51,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -70,6 +70,7 @@ use super::{
 };
 use crate::{
     callout_policy::OnFailure,
+    json_body::MAX_JSON_BODY_BYTES,
     state_owner::{StateOwner, require_state_owner},
     store::{OwnerScopedResponseStore, ResponseRecord, ResponseStoreRegistry, StoreError},
     subrequest::{self, SubRequest, SubRequestClient},
