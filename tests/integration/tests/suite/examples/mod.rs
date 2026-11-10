@@ -41,6 +41,7 @@ mod file_search_chat_completions;
 mod file_search_dispatch;
 #[cfg(feature = "openai-agentic-loop")]
 mod file_search_streaming;
+mod filter_body_processing_limits;
 #[cfg(feature = "openai-responses")]
 mod format_routing;
 #[cfg(all(
