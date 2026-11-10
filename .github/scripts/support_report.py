@@ -195,6 +195,14 @@ def live_validation(qualification, sha):
                 "reason": "No qualification report was produced for this release commit."}
     gateway = qualification.get("gateway") or {}
     tested = gateway.get("checkout_sha")
+    status = qualification.get("status")
+    if sha and not tested and status not in ("unavailable", "not_requested"):
+        # A run that could not record its checkout cannot be attributed to this
+        # release, so it is not live evidence even when its status looks usable.
+        return {"status": "provenance mismatch",
+                "reason": "Qualification checkout SHA unavailable for release commit %s" % sha,
+                "workflow": qualification.get("workflow"),
+                "gateway": gateway}
     if tested and sha and tested != sha:
         return {"status": "provenance mismatch",
                 "reason": "Qualification tested checkout %s, not release commit %s" % (tested, sha),

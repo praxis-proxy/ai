@@ -39,10 +39,12 @@ Before tagging a release:
 - [ ] Inspect the latest successful GPU nightly within 48 hours and any newer
       failures; release publishing reuses ancestor evidence and records its
       tested SHA separately from the release SHA
-- [ ] If native GPU qualification is desired, dispatch the existing vLLM
-      workflow on the final release commit/tag and inspect its report. The
-      release support report renders live validation as `not validated`
-      without it
+- [ ] If native GPU qualification is desired, dispatch the **vLLM
+      Integration** workflow at the final release commit or tag with
+      `run_live_vllm` enabled; it defaults to false and skips the complete
+      live suite. The release reuses a verified run at that exact commit for
+      live validation and renders `not validated` without one, while the CI
+      qualification section keeps reporting ancestor nightly evidence
 
 ## Tagging a Release
 
@@ -156,8 +158,10 @@ committed conformance reports and this release's exact-commit evidence:
   OpenAI percentage states its non-beta, non-deprecated scope and the number of
   operations that scope excludes.
 - Live qualification status with client acceptance suite status, reasons, and
-  per-scenario results, when a GPU run exists for the release commit. A client
-  suite that failed before producing its scenario artifact is still listed.
+  per-scenario results, when a verified GPU run exists at the release commit.
+  A client suite that failed before producing its scenario artifact is still
+  listed. The report never substitutes the ancestor nightly the CI
+  qualification section uses for the release commit.
 - Exact-commit CI workflow outcomes.
 - Translation cell status changes since the release published before this one,
   when that release's `support-report.json` is available.
@@ -168,8 +172,9 @@ model gateway, API server, per-field API support, and live hosted-provider
 validation are named as out of scope in the report itself. Missing live
 evidence renders as `not validated` rather than being omitted. The report also
 refuses evidence collected at another commit: a qualification report for a
-different checkout, or CI evidence recording a different release SHA, renders
-as `provenance mismatch` and copies no results.
+different checkout or one that cannot name its checkout, or CI evidence
+recording a different release SHA, renders as `provenance mismatch` and copies
+no results.
 
 Generation reads `docs/conformance/translation-matrix.json` and
 `docs/conformance/openresponses-coverage.json`, which

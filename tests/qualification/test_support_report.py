@@ -272,6 +272,40 @@ class SupportReportTest(unittest.TestCase):
             self.assertNotIn("codex_native", markdown)
             self.assertIn("claude_native_edits", markdown)
 
+    def test_qualification_without_a_checkout_sha_is_a_provenance_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            value = qualification()
+            value["status"] = "incomplete"
+            value["reason"] = "actual checkout SHA unavailable"
+            value["gateway"]["checkout_sha"] = None
+            write_fixtures(directory, qualification_value=value)
+            report, markdown = generate(arguments(
+                directory, qualification=str(Path(directory) / "qualification.json")))
+
+            self.assertEqual(report["live_validation"]["status"], "provenance mismatch")
+            self.assertIn("Qualification checkout SHA unavailable for release commit", markdown)
+            self.assertIn("No live claims are made", markdown)
+            self.assertNotIn("codex_native", markdown)
+            self.assertEqual(report["provenance"]["gateway"], {})
+            self.assertEqual(report["evidence"], "partial")
+
+    def test_unavailable_and_not_requested_statuses_are_preserved(self):
+        for status in ("unavailable", "not_requested"):
+            with tempfile.TemporaryDirectory() as directory:
+                value = {"schema_version": 3, "profile": "responses-gateway-live-vllm-gpu",
+                         "requested": False, "status": status, "reason": "no run",
+                         "gateway": {"checkout_sha": None}, "workflow": {"url": None},
+                         "backend": {}, "model": {}, "configuration": {},
+                         "suites": {}, "limitations": []}
+                write_fixtures(directory, qualification_value=value)
+                report, markdown = generate(arguments(
+                    directory, qualification=str(Path(directory) / "qualification.json")))
+
+                self.assertEqual(report["live_validation"]["status"], status)
+                self.assertEqual(report["evidence"], "partial")
+                self.assertIn("No live claims are made", markdown)
+                self.assertEqual(support.verify(report, markdown, TAG, SHA), [])
+
     def test_conformance_percentage_carries_its_scope(self):
         with tempfile.TemporaryDirectory() as directory:
             write_fixtures(directory)

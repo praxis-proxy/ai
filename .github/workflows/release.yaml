@@ -470,6 +470,14 @@ jobs:
             --repo "$GH_REPO" --sha "$sha" \
             --output-dir "$RUNNER_TEMP/release-qualification"
 
+          # The qualification section reports ancestor nightly evidence. The
+          # support report only claims live validation for the release commit
+          # itself, which requires a vLLM Integration run dispatched at that
+          # commit. A missing run leaves the live section "not validated".
+          exact_dir="$RUNNER_TEMP/support-exact"
+          python3 .github/scripts/vllm_qualification.py exact-evidence \
+            --repo "$GH_REPO" --sha "$sha" --output-dir "$exact_dir" || true
+
           if gh release view "$TAG" --repo "$GH_REPO" --json body \
             --jq .body > "$RUNNER_TEMP/release-qualification/base-notes.md" 2>/dev/null; then
             existing=true
@@ -513,7 +521,7 @@ jobs:
           fi
           python3 .github/scripts/support_report.py generate \
             --tag "$TAG" --sha "$sha" \
-            --qualification "$RUNNER_TEMP/release-qualification/qualification.json" \
+            --qualification "$exact_dir/qualification.json" \
             --release-qualification "$RUNNER_TEMP/release-qualification/release-qualification.json" \
             "${prev_args[@]}" \
             --existing-notes "$RUNNER_TEMP/release-qualification/release-notes.md" \
