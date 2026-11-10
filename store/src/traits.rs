@@ -473,6 +473,23 @@ pub trait ConversationItemStore: Send + Sync {
     /// would replace a preserved legacy prefix.
     async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError>;
 
+    /// Insert a new conversation and its initial items in one commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without writing rows on collision or persistence failure.
+    /// Backends must opt in rather than falling back to partially committed writes.
+    async fn create_conversation_with_items(
+        &self,
+        _record: &ConversationRecord,
+        _items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement atomic conversation creation".to_owned(),
+        ))
+    }
+
+
     /// Update only the legacy message cache for a conversation.
     ///
     /// Returns `true` if a record was updated, `false` if no matching

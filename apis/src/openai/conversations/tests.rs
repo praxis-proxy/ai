@@ -5005,6 +5005,16 @@ struct FailingItemStore {
     reason = "test double still uses the former tenant-oriented names"
 )]
 impl ConversationItemStore for FailingItemStore {
+    async fn create_conversation_with_items(
+        &self,
+        record: &ConversationRecord,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        self.upsert_conversation(record).await?;
+        self.create_items_and_sync_messages(&record.owner, &record.conversation_id, items)
+            .await
+    }
+
     async fn conversation_history(
         &self,
         _owner: &crate::StateOwner,
@@ -5307,6 +5317,14 @@ impl AppendDuringUpdateStore {
     reason = "test double still uses the former tenant-oriented names"
 )]
 impl ConversationItemStore for AppendDuringUpdateStore {
+    async fn create_conversation_with_items(
+        &self,
+        record: &ConversationRecord,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        self.inner.create_conversation_with_items(record, items).await
+    }
+
     async fn conversation_history(
         &self,
         owner: &crate::StateOwner,
@@ -6055,8 +6073,7 @@ async fn create_conversation_response_field_order_matches_openai() {
     assert_eq!(keys, &["id", "object", "created_at", "metadata"]);
 }
 
-#[tokio::test]
-async fn conformance_conversations_rate_limit_rejects_every_operation_before_store_access() {
+fn pinned_error_validator() -> jsonschema::Validator {
     #[derive(serde::Deserialize)]
     struct Reference {
         components: Components,
@@ -6079,7 +6096,12 @@ async fn conformance_conversations_rate_limit_rejects_every_operation_before_sto
     let pinned: Reference =
         serde_yaml::from_str(include_str!("../../../../docs/conformance/specs/openai-openapi.yaml")).unwrap();
     let reference = serde_json::json!({"$ref": "#/components/schemas/ErrorResponse", "components": {"schemas": pinned.components.schemas}});
-    let validator = jsonschema::validator_for(&reference).unwrap();
+    jsonschema::validator_for(&reference).unwrap()
+}
+
+#[tokio::test]
+async fn conformance_conversations_rate_limit_rejects_every_operation_before_store_access() {
+    let validator = pinned_error_validator();
     for operation in operation_specs() {
         let config = serde_yaml::from_str(
             "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nrate_limit: {mode: global, rate: 0.000001, burst: 1}",
@@ -6266,4 +6288,242 @@ async fn shadow_rate_limit_preserves_preread_requests_after_exhaustion() {
             "shadow bookkeeping must preserve pre-read body data"
         );
     }
+}
+
+
+/// Drive the real request/body dispatch, including bodyless routes.
+async fn run_contract_request(
+    filter: &dyn HttpFilter,
+    store: Option<&Arc<dyn PersistedStateBackend>>,
+    req: &Request,
+    body: &'static [u8],
+    owner: crate::StateOwner,
+) -> praxis_filter::Rejection {
+    let mut ctx = store.map_or_else(|| make_owned_filter_context(req), |store| conv_ctx(store, req));
+    ctx.extensions.insert(owner);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let action = if matches!(action, FilterAction::Continue) {
+        let mut body = Some(Bytes::from_static(body));
+        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap()
+    } else {
+        action
+    };
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected local response for {}", req.uri);
+    };
+    rejection
+}
+
+fn assert_error_contract(validator: &jsonschema::Validator, rejection: &praxis_filter::Rejection, status: u16) {
+    assert_eq!(rejection.status, status);
+    assert!(
+        rejection
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("content-type") && value == "application/json")
+    );
+    assert!(
+        !rejection
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("retry-after")),
+        "only admission errors advertise a retry delay"
+    );
+    let body = rejection_body(rejection);
+    validator.validate(&body).unwrap();
+    assert_eq!(
+        body["error"]["type"],
+        if status == 500 {
+            "server_error"
+        } else {
+            "invalid_request_error"
+        }
+    );
+    assert!(
+        !body.to_string().contains("SELECT"),
+        "backend details must stay private"
+    );
+}
+
+#[tokio::test]
+async fn conformance_conversations_declared_errors_match_pinned_contract_and_preserve_owners() {
+    #[derive(serde::Deserialize)]
+    struct Reference {
+        paths: BTreeMap<String, BTreeMap<String, Value>>,
+    }
+    let pinned: Reference =
+        serde_yaml::from_str(include_str!("../../../../docs/conformance/specs/openai-openapi.yaml")).unwrap();
+    let validator = pinned_error_validator();
+    let generated: Value = serde_json::from_str(&super::implementation_openapi_json().unwrap()).unwrap();
+    let (filter, store) = sqlite_harness().await;
+    let owner = crate::test_utils::test_owner("default");
+    let foreign = crate::test_utils::test_owner("other");
+    let id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({"keep": "original"})).await;
+    let mut item = race_item("item_private");
+    item.owner = owner.clone();
+    item.conversation_id.clone_from(&id);
+    store
+        .create_items_and_sync_messages(&owner, &id, &[item])
+        .await
+        .unwrap();
+    let original_history = store.conversation_history(&owner, &id).await.unwrap();
+    let mut checked = 0;
+    for operation in operation_specs() {
+        let method = operation.method().as_str().to_lowercase();
+        let responses = &pinned.paths[operation.spec_path][&method]["responses"];
+        let generated_responses = &generated["paths"][operation.spec_path][&method]["responses"];
+        assert_eq!(
+            responses
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+            generated_responses.as_object().unwrap().keys().collect()
+        );
+        for status in responses
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|status| matches!(status.as_str(), "400" | "404" | "500"))
+        {
+            let status = status.parse::<u16>().unwrap();
+            let mut path = operation
+                .runtime_path()
+                .replace("{conversation_id}", &id)
+                .replace("{item_id}", "item_private");
+            let mut body = br#"{"metadata":{},"items":[]}"#.as_slice();
+            if status == 400 {
+                match operation.operation {
+                    ConversationOperation::CreateConversation
+                    | ConversationOperation::UpdateConversation
+                    | ConversationOperation::CreateConversationItems => body = b"{",
+                    ConversationOperation::ListConversationItems => path.push_str("?limit=-1"),
+                    ConversationOperation::DeleteConversationItem => path = path.replace("item_private", "%FF"),
+                    _ => panic!("unexpected declared 400"),
+                }
+            }
+            let rejection = run_contract_request(
+                filter.as_ref(),
+                (status != 500).then_some(&store),
+                &make_request(
+                    Method::from_bytes(operation.method().as_str().as_bytes()).unwrap(),
+                    &path,
+                ),
+                body,
+                if status == 404 { foreign.clone() } else { owner.clone() },
+            )
+            .await;
+            assert_error_contract(&validator, &rejection, status);
+            if status == 404 {
+                // A missing resource and one owned by another caller must be indistinguishable.
+                let absent_path = path.replace(&id, "conv_absent");
+                let absent = run_contract_request(
+                    filter.as_ref(),
+                    Some(&store),
+                    &make_request(
+                        Method::from_bytes(operation.method().as_str().as_bytes()).unwrap(),
+                        &absent_path,
+                    ),
+                    body,
+                    foreign.clone(),
+                )
+                .await;
+                assert_error_contract(&validator, &absent, 404);
+                assert_eq!(
+                    rejection_body(&rejection)["error"]["type"],
+                    rejection_body(&absent)["error"]["type"]
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 16, "every pinned non-admission error must be exercised");
+    let unchanged = ConversationItemStore::get_conversation(store.as_ref(), &owner, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.metadata, serde_json::json!({"keep": "original"}));
+    assert_eq!(store.conversation_history(&owner, &id).await.unwrap(), original_history);
+    println!("PRAXIS_CONFORMANCE_OK conversations error_response_contract");
+}
+
+
+#[tokio::test]
+async fn conformance_conversations_storage_errors_roll_back_mutations() {
+    let validator = pinned_error_validator();
+    for (method, path, body, event, table) in [
+        (
+            Method::POST,
+            "/v1/conversations",
+            br#"{"items":[{"type":"message","role":"user","content":"rollback"}]}"#.as_slice(),
+            "INSERT",
+            "items",
+        ),
+        (
+            Method::POST,
+            "/v1/conversations/CONVERSATION",
+            br#"{"metadata":{"changed":"yes"}}"#,
+            "UPDATE",
+            "conversations",
+        ),
+        (
+            Method::POST,
+            "/v1/conversations/CONVERSATION/items",
+            br#"{"items":[{"type":"message","role":"user","content":"rollback"}]}"#,
+            "INSERT",
+            "items",
+        ),
+        (
+            Method::DELETE,
+            "/v1/conversations/CONVERSATION/items/item_private",
+            b"",
+            "DELETE",
+            "items",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", directory.path().join("atomic.db").display());
+        let store: Arc<dyn PersistedStateBackend> = Arc::new(
+            SqliteResponseStore::new(&url, "responses", "conversations", Some("items"), None, None)
+                .await
+                .unwrap(),
+        );
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        let filter = OpenaiConversationsFilter::default();
+        let owner = crate::test_utils::test_owner("default");
+        let id = create_test_conversation(&filter, &store, serde_json::json!({"keep":"original"})).await;
+        let mut item = race_item("item_private");
+        item.owner = owner.clone();
+        item.conversation_id.clone_from(&id);
+        store
+            .create_items_and_sync_messages(&owner, &id, &[item])
+            .await
+            .unwrap();
+        let original_history = store.conversation_history(&owner, &id).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TRIGGER fail_mutation AFTER {event} ON {table} BEGIN SELECT RAISE(ABORT, 'injected private database failure'); END")))
+            .execute(&pool).await.unwrap();
+        let rejection = run_contract_request(
+            &filter,
+            Some(&store),
+            &make_request(method, &path.replace("CONVERSATION", &id)),
+            body,
+            owner.clone(),
+        )
+        .await;
+        assert_error_contract(&validator, &rejection, 500);
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM conversations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "a rejected create leaves no parent");
+        assert_eq!(store.conversation_history(&owner, &id).await.unwrap(), original_history);
+        let record = ConversationItemStore::get_conversation(store.as_ref(), &owner, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.metadata, serde_json::json!({"keep":"original"}));
+        assert!(!rejection_body(&rejection).to_string().contains("injected private"));
+        pool.close().await;
+    }
+    println!("PRAXIS_CONFORMANCE_OK conversations storage_error_rollback");
 }

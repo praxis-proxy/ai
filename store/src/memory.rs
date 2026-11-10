@@ -721,6 +721,35 @@ impl ResponseStore for InMemoryStore {
 
 #[async_trait]
 impl ConversationItemStore for InMemoryStore {
+    async fn create_conversation_with_items(
+        &self,
+        record: &ConversationRecord,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock()?;
+        if inner.conversation_ids.contains_key(&record.conversation_id) {
+            return Err(StoreError::Database("conversation id collision".to_owned()));
+        }
+        if items
+            .iter()
+            .any(|item| item.owner != record.owner || item.conversation_id != record.conversation_id)
+        {
+            return Err(StoreError::InvalidInput("initial item scope mismatch".to_owned()));
+        }
+        reject_duplicate_item_ids(&inner, items)?;
+        let key = (record.owner.clone(), record.conversation_id.clone());
+        // The store retains these records after the caller's borrowed batch ends.
+        inner
+            .conversation_ids
+            .insert(record.conversation_id.clone(), record.owner.clone());
+        inner.conversations.insert(key.clone(), record.clone());
+        for item in items {
+            inner.item_ids.insert((item.owner.clone(), item.item_id.clone()));
+        }
+        inner.items.insert(key, items.to_vec());
+        Ok(())
+    }
+
     async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError> {
         let mut inner = self.lock()?;
         if let Some(existing_owner) = inner.conversation_ids.get(&record.conversation_id)

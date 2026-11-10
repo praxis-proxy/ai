@@ -309,6 +309,23 @@ impl OwnerScopedStore {
         self.store.upsert_conversation(record).await
     }
 
+    /// Atomically create a conversation and items within this owner's scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an owner mismatch or the backend persistence error.
+    pub async fn create_conversation_with_items(
+        &self,
+        record: &ConversationRecord,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        self.require_matching_owner(&record.owner)?;
+        for item in items {
+            self.require_matching_owner(&item.owner)?;
+        }
+        self.store.create_conversation_with_items(record, items).await
+    }
+
     /// Update only this owner's conversation message cache.
     ///
     /// # Errors

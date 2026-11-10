@@ -1412,6 +1412,55 @@ impl ResponseStore for SqliteResponseStore {
 )]
 #[async_trait]
 impl ConversationItemStore for SqliteResponseStore {
+    async fn create_conversation_with_items(
+        &self,
+        record: &ConversationRecord,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        require_matching_item_scope(&record.owner, &record.conversation_id, items)?;
+        let metadata = serde_json::to_string(&record.metadata).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let messages = serde_json::to_string(&record.messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let sql = format!(
+            "INSERT INTO {} (conversation_id, tenant_id, owner_issuer, owner_subject, created_at, metadata, messages) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            self.tables.conversations
+        );
+        sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(&record.conversation_id)
+            .bind(record.owner.tenant_id())
+            .bind(record.owner.issuer())
+            .bind(record.owner.subject())
+            .bind(record.created_at)
+            .bind(&metadata)
+            .bind(&messages)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if !items.is_empty() {
+            let items_table = self
+                .tables
+                .items
+                .as_deref()
+                .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
+            sqlite_create_items_and_sync(
+                &mut tx,
+                items_table,
+                &self.tables.conversations,
+                &record.owner,
+                &record.conversation_id,
+                items,
+                None,
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError> {
         self.upsert_conversation_record(record).await
     }
