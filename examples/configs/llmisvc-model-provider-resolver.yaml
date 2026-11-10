@@ -20,6 +20,11 @@
 # Upstream body model becomes `granite-3.1-8b` while `X-Model`
 # remains `publishers/rhoai/models/granite-3.1-8b`.
 
+# Request buffering inherits body_limits.max_request_bytes and max_buffer_bytes.
+# Set max_body_bytes on the transforming filter to enforce a smaller processing
+# limit (HTTP 413 before parsing), even when another filter requests more buffer.
+# Omitted max_body_bytes has no implicit 10 MiB filter cap.
+
 listeners:
   - name: llmisvc-gateway
     address: "0.0.0.0:8080" # dev value; binds all interfaces

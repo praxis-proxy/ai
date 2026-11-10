@@ -216,7 +216,8 @@ impl PostgresResponseStore {
         let insert_sql = format!(
             "INSERT INTO {items_table} \
              (item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (tenant_id, owner_issuer, owner_subject, item_id) DO NOTHING"
         );
         for (i, item) in items.iter().enumerate() {
             let offset = i64::try_from(i).unwrap_or(i64::MAX);
@@ -224,7 +225,7 @@ impl PostgresResponseStore {
             let item_data =
                 serde_json::to_string(&item.item_data).map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-            sqlx::query(AssertSqlSafe(insert_sql.as_str()))
+            let result = sqlx::query(AssertSqlSafe(insert_sql.as_str()))
                 .bind(&item.item_id)
                 .bind(owner.tenant_id())
                 .bind(owner.issuer())
@@ -236,6 +237,12 @@ impl PostgresResponseStore {
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| self.db_err(&e))?;
+            if result.rows_affected() == 0 {
+                return Err(StoreError::InvalidInput(format!(
+                    "conversation item '{}' already exists",
+                    item.item_id
+                )));
+            }
         }
 
         pg_invalidate_messages(tx, conv_table, owner, conversation_id).await

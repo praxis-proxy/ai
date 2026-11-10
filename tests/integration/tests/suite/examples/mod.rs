@@ -42,6 +42,7 @@ mod file_search_chat_completions;
 mod file_search_dispatch;
 #[cfg(feature = "openai-agentic-loop")]
 mod file_search_streaming;
+mod filter_body_processing_limits;
 #[cfg(feature = "openai-responses")]
 mod format_routing;
 #[cfg(all(
@@ -78,6 +79,7 @@ mod llmd_ext_proc;
 mod llmisvc_model_provider_resolver;
 mod mcp_broker;
 mod model_to_header;
+mod model_to_header_body_limits;
 mod model_to_header_trust_existing;
 mod model_to_provider;
 #[cfg(all(feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
@@ -153,6 +155,9 @@ mod openai_state_ownership;
 #[cfg(feature = "store-sqlite")]
 mod openai_stream_events;
 mod openai_tool_parse;
+#[cfg(feature = "openai-agentic-loop")]
+#[cfg(feature = "store-sqlite")]
+mod openshell_sandboxed_coding_clients;
 mod project_state_owner_headers;
 mod prompt_enrichment;
 mod provider_route;

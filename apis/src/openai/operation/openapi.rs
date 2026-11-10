@@ -157,11 +157,24 @@ pub(crate) struct RequestBodySpec {
     pub(crate) content: &'static [MediaTypeSpec],
 }
 
+/// One response header described by an owned contract.
+#[derive(Clone, Copy)]
+pub(crate) struct ResponseHeaderSpec {
+    /// Wire header name.
+    pub(crate) name: &'static str,
+    /// Human-readable header semantics.
+    pub(crate) description: &'static str,
+    /// Header value schema.
+    pub(crate) schema: fn() -> RefOr<Schema>,
+}
+
 /// One response contract owned by an operation.
 #[derive(Clone, Copy)]
 pub(crate) struct ResponseSpec {
     /// HTTP response status code.
     pub(crate) status: &'static str,
+    /// Optional response headers.
+    pub(crate) headers: &'static [ResponseHeaderSpec],
     /// Human-readable response description.
     pub(crate) description: &'static str,
     /// Response media representations. Empty for bodyless responses.
@@ -249,16 +262,30 @@ fn register_schema(components: &mut Components, binding: SchemaBinding) {
     components.schemas.insert(binding.name().into_owned(), binding.schema());
 }
 
+/// Assemble one response separately to bound temporary schema-builder stack usage.
+fn build_response(response: ResponseSpec) -> utoipa::openapi::response::Response {
+    let mut builder = ResponseBuilder::new().description(response.description);
+    for media in response.content {
+        builder = builder.content(media.content_type, schema_content(media.schema));
+    }
+    for header in response.headers {
+        builder = builder.header(
+            header.name,
+            utoipa::openapi::header::HeaderBuilder::new()
+                .description(Some(header.description))
+                .schema(Some((header.schema)()))
+                .build(),
+        );
+    }
+    builder.build()
+}
+
 /// Build one `OpenAPI` operation from its registry metadata.
 fn build_operation(spec: &OpenAiOperationSpec, contract: OwnedOperationContract, tag: &str) -> Operation {
     let mut operation = OperationBuilder::new().operation_id(Some(spec.operation_id())).tag(tag);
 
     for response in contract.responses {
-        let mut builder = ResponseBuilder::new().description(response.description);
-        for media in response.content {
-            builder = builder.content(media.content_type, schema_content(media.schema));
-        }
-        operation = operation.response(response.status, builder.build());
+        operation = operation.response(response.status, build_response(*response));
     }
 
     if !contract.parameters.is_empty() {
@@ -350,11 +377,13 @@ mod tests {
             responses: &[
                 ResponseSpec {
                     status: "200",
+                    headers: &[],
                     description: "OK",
                     content: &[MediaTypeSpec::new("application/json", schema_binding!(FileResource))],
                 },
                 ResponseSpec {
                     status: "204",
+                    headers: &[],
                     description: "No content",
                     content: &[],
                 },

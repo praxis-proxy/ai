@@ -1799,6 +1799,43 @@ class TestOpenAIConversations:
             )
         assert exc_info.value.status_code == 400, "duplicate item id must be rejected with 400"
 
+    def test_owner_wide_item_id_conflict_is_rejected_atomically(
+        self, openai_client, other_owner_client
+    ):
+        shared = {
+            "id": "item_owner_wide_conflict",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "original"}],
+        }
+        first = openai_client.conversations.create(items=[shared])
+        second = openai_client.conversations.create()
+        before = openai_client.conversations.items.list(first.id).model_dump()
+        preceding = {**shared, "id": "item_before_owner_wide_conflict"}
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.create(items=[preceding, shared])
+        assert exc_info.value.status_code == 400, "an owner-wide item ID conflict on create must return 400"
+        assert exc_info.value.body["type"] == "invalid_request_error", "create conflicts must use the invalid_request_error envelope"
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.items.create(
+                second.id, items=[preceding, shared]
+            )
+        assert exc_info.value.status_code == 400, "an owner-wide item ID conflict on append must return 400"
+        assert exc_info.value.body["type"] == "invalid_request_error", "append conflicts must use the invalid_request_error envelope"
+        assert openai_client.conversations.items.list(first.id).model_dump() == before, "the source conversation must be unchanged"
+        assert openai_client.conversations.items.list(second.id).data == [], "the failed batch must not persist its preceding item"
+
+        created = openai_client.conversations.items.create(
+            second.id, items=[preceding]
+        )
+        assert [item.id for item in created.data] == [preceding["id"]]
+        other = other_owner_client.conversations.create(items=[shared])
+        assert [
+            item.id for item in other_owner_client.conversations.items.list(other.id).data
+        ] == [shared["id"]]
+
     @pytest.mark.parametrize(
         "query",
         ["limit=101", "limit=-1", "order=sideways", "after="],
@@ -3207,3 +3244,99 @@ def test_ttl_purges_conversation_after_expiration(ttl_proxy_client):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"] + sys.argv[1:]))
+
+
+@pytest.fixture(scope="module")
+def rate_limited_conversation_clients(request):
+    with tempfile.TemporaryDirectory() as db_dir:
+        port, control_port, readiness_port = _free_port(), _free_port(), _free_port()
+        path = _write_config(port, os.path.join(db_dir, "rate_limited.db"))
+        with open(path) as config_file:
+            config = json.load(config_file)
+        control_chain = json.loads(json.dumps(config["filter_chains"][0]))
+        control_chain["name"] = "control"
+        config["filter_chains"][0]["filters"][-1]["rate_limit"] = {
+            "mode": "global", "rate": getattr(request, "param", 0.000001), "burst": 1,
+        }
+        config["filter_chains"].append(control_chain)
+        config["listeners"].append({
+            "name": "control", "address": f"127.0.0.1:{control_port}",
+            "filter_chains": ["control"],
+        })
+        with open(path, "w") as config_file:
+            json.dump(config, config_file)
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", path], stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, text=True, env=_proxy_env(readiness_port),
+        )
+        clients = [OpenAI(api_key="not-needed", base_url=f"http://127.0.0.1:{p}/v1",
+                          default_headers={OWNER_HEADER: _owner_assertion("alice")},
+                          max_retries=0, timeout=10.0) for p in (port, control_port)]
+        try:
+            _wait_for_proxy(port, proc)
+            _wait_for_store_ready(readiness_port, proc)
+            limited, control = clients
+            conversation = limited.conversations.create(metadata={"original": "yes"}, items=[{
+                "type": "message", "role": "user", "content": "keep this item",
+            }])
+            item = control.conversations.items.list(conversation.id).data[0]
+            yield limited, control, conversation.id, item.id
+        finally:
+            for client in clients:
+                client.close()
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(path)
+
+
+@pytest.mark.parametrize("operation", [
+    "create", "retrieve", "update", "delete", "create_items", "list_items", "retrieve_item", "delete_item",
+])
+def test_conversations_rate_limit_contract(rate_limited_conversation_clients, operation):
+    limited, control, conversation_id, item_id = rate_limited_conversation_clients
+    actions = {
+        "create": limited.conversations.create,
+        "retrieve": lambda: limited.conversations.retrieve(conversation_id),
+        "update": lambda: limited.conversations.update(conversation_id, metadata={"changed": "yes"}),
+        "delete": lambda: limited.conversations.delete(conversation_id),
+        "create_items": lambda: limited.conversations.items.create(conversation_id, items=[{
+            "type": "message", "role": "user", "content": "should not be added",
+        }]),
+        "list_items": lambda: limited.conversations.items.list(conversation_id),
+        "retrieve_item": lambda: limited.conversations.items.retrieve(item_id, conversation_id=conversation_id),
+        "delete_item": lambda: limited.conversations.items.delete(item_id, conversation_id=conversation_id),
+    }
+    with pytest.raises(openai.RateLimitError) as raised:
+        actions[operation]()
+    response = raised.value.response
+    assert response.status_code == 429, f"{operation}: exhausted admission must return 429"
+    assert response.headers["content-type"].startswith("application/json"), f"{operation}: errors must be JSON"
+    assert int(response.headers["retry-after"]) >= 1, f"{operation}: Retry-After must be positive seconds"
+    error = response.json()["error"]
+    assert error["type"] == "rate_limit_error", f"{operation}: expected admission error category"
+    assert error["code"] == "rate_limit_exceeded", f"{operation}: expected admission error code"
+    assert error["param"] is None, f"{operation}: admission is independent of a request parameter"
+    assert isinstance(error["message"], str), f"{operation}: error message must be a string"
+    assert error["message"], f"{operation}: error message must be nonempty"
+    assert control.conversations.retrieve(conversation_id).metadata == {"original": "yes"}, f"{operation}: denied requests must preserve metadata"
+    assert [item.id for item in control.conversations.items.list(conversation_id).data] == [item_id], f"{operation}: denied requests must preserve items"
+
+
+@pytest.mark.parametrize("rate_limited_conversation_clients", [1], indirect=True)
+def test_conversations_rate_limit_recovers_after_retry_delay(rate_limited_conversation_clients):
+    limited, _, conversation_id, _ = rate_limited_conversation_clients
+    for _ in range(10):
+        try:
+            limited.conversations.retrieve(conversation_id)
+        except openai.RateLimitError as error:
+            retry_after = int(error.response.headers["retry-after"])
+            break
+    else:
+        pytest.fail("could not establish exhaustion before testing recovery")
+    assert retry_after == 1, "a one-request-per-second bucket must advertise a one-second retry"
+    time.sleep(retry_after + 0.05)
+    assert limited.conversations.retrieve(conversation_id).id == conversation_id, "admission must recover after Retry-After"

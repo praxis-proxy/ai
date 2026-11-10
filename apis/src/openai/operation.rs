@@ -16,7 +16,7 @@ pub(crate) use openapi::{
     schema_binding,
 };
 #[cfg(feature = "openai-conversations")]
-pub(crate) use openapi::{ParameterLocation, ParameterSpec};
+pub(crate) use openapi::{ParameterLocation, ParameterSpec, ResponseHeaderSpec};
 
 use crate::operation::{
     ApplicationProtocol, HandlingMode, HttpMethod, OperationEntry, OperationSpec, RequestBody, Transport,

@@ -910,13 +910,17 @@ fn from_config_rejects_zero_max_scratch_bytes() {
 
 #[test]
 fn from_config_rejects_max_body_bytes_above_ceiling() {
-    let config: serde_yaml::Value = serde_yaml::from_str("provider: openai\nmax_body_bytes: 67108865").unwrap();
+    let config: serde_yaml::Value = serde_yaml::from_str(&format!(
+        "provider: openai\nmax_body_bytes: {}",
+        praxis_filter::body::MAX_JSON_BODY_BYTES + 1
+    ))
+    .unwrap();
     match TokenCountFilter::from_config(&config) {
         Err(err) => assert!(
             err.to_string().contains("exceeds maximum"),
-            "should reject max_body_bytes above 64 MiB: {err}"
+            "should reject max_body_bytes above the ceiling: {err}"
         ),
-        Ok(_) => panic!("should reject max_body_bytes above 64 MiB"),
+        Ok(_) => panic!("should reject max_body_bytes above the ceiling"),
     }
 }
 

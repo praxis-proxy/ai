@@ -40,7 +40,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use praxis_filter::{
     BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
+    body::{BodyAccess, BodyMode},
     parse_filter_config,
 };
 use serde::Deserialize;
@@ -60,7 +60,7 @@ use super::{
 };
 use crate::{
     is_event_stream_content_type,
-    json_body::replace_json_body,
+    json_body::{MAX_JSON_BODY_BYTES, replace_json_body},
     state_owner::{StateOwner, require_state_owner},
     store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry, StoreError},
 };
