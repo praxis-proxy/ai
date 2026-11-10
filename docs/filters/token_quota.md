@@ -63,12 +63,23 @@ The proxy chain must be declared in this request order:
   body_access: read_only
 - filter: token_count
   provider: openai
+  max_body_bytes: 1048576       # optional; default JSON capture limit (1 MiB)
 ```
 
 Response hooks run in reverse, producing
 `token_count -> policy/PPE -> consumers`. Metadata-only policy works for JSON
-and streamed responses without buffering or exposing response content to the
-quota plugin. Shared quota currently requires the policy's default
+and streamed responses without exposing response content to the quota plugin.
+`token_count` processes SSE incrementally, but buffers non-streaming JSON up to
+`max_body_bytes` (1 MiB by default). A larger JSON response produces
+`usage_overflow`, and the limiter retains its reservation estimate instead of
+charging actual usage.
+
+OpenAI Chat Completions streaming requests must set
+`stream_options: {"include_usage": true}` (or use `stream_usage_inject`) so the
+final stream event includes usage. Without that option, the quota result is
+`missing_usage`, and the limiter likewise retains its reservation estimate.
+
+Shared quota currently requires the policy's default
 `body_access: read_only`; `read_write` response buffering does not yet publish
 the quota result to the limiter. A metadata-only denial is recorded in PPE
 output for the host consumer, but cannot stop a response whose content has
