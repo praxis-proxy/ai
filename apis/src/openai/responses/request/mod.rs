@@ -108,8 +108,6 @@ impl OpenaiResponsesRequestFilter {
     ///
     /// Returns [`FilterError`] when configuration is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        // `max_input_nodes` is a `NonZeroUsize`, so a `0` fails at config-parse time
-        // above rather than needing a runtime check here.
         let cfg: ResponsesRequestConfig = parse_filter_config(FILTER_NAME, config)?;
         let shared = build_config(FILTER_NAME, cfg.shared)?;
         Ok(Box::new(Self {
@@ -151,24 +149,6 @@ impl OpenaiResponsesRequestFilter {
         if let Some(reason) = state_skip_reason(&classified, &self.config, operation) {
             trace!(reason, "leaving Responses state uninitialized");
             return FilterAction::Release;
-        }
-
-        // Structural-complexity guard (#1618): bound the memory initialization will
-        // materialize (normalized input, shared histories, persistence capture)
-        // before any of that expansion runs. Fires for every managed create — the
-        // optional agentic retained-payload budget below is absent on chains without
-        // an agentic-loop filter. Publish the resolved limit so the alternate
-        // initialization paths (rehydrate, MCP state creation) enforce the same bound.
-        ctx.set_metadata(
-            super::complexity::MAX_INPUT_NODES_METADATA,
-            self.config.max_input_nodes.to_string(),
-        );
-        if let Some(reason) = super::complexity::rejects(&parsed, self.config.max_input_nodes.get()) {
-            return FilterAction::Reject(responses_error_rejection(
-                413,
-                "invalid_request_error",
-                reason.message(),
-            ));
         }
 
         // A budgeted create carries its retained-payload accounting into state; any

@@ -33,8 +33,6 @@ mod body_limits;
 #[cfg(feature = "openai-compact")]
 pub(crate) mod compact;
 #[cfg(feature = "openai-responses")]
-pub(crate) mod complexity;
-#[cfg(feature = "openai-responses")]
 mod config;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod content_parts;

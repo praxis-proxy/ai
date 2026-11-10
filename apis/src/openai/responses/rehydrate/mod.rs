@@ -1408,22 +1408,16 @@ fn resolve_rehydrated_state(
     previous_usage: Option<Value>,
 ) -> Result<ResponsesState, FilterAction> {
     match source {
-        StateSource::Parsed(parsed_body) => {
-            // Re-guard structural complexity before reconstructing state so this
-            // alternate initialization path cannot bypass the managed-create bound (#1618).
-            super::complexity::enforce(ctx, &parsed_body)?;
-            Ok(merge_configuration_and_build_state(
-                body,
-                parsed_body,
-                stored,
-                previous_tools,
-                previous_usage,
-            ))
-        },
+        StateSource::Parsed(parsed_body) => Ok(merge_configuration_and_build_state(
+            body,
+            parsed_body,
+            stored,
+            previous_tools,
+            previous_usage,
+        )),
         StateSource::Reuse => {
-            // The managed owner already enforced the structural bound at
-            // finish_managed_request, so reuse its decoded state and merge history
-            // into it instead of re-parsing and rebuilding (#1618).
+            // Merge stored history into the managed owner's decoded state
+            // instead of re-parsing and rebuilding it (#1618).
             let Some(mut existing) = ctx.extensions.remove::<ResponsesState>() else {
                 return Err(reject_server_error("request pipeline state is unavailable"));
             };
