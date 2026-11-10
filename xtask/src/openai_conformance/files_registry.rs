@@ -23,6 +23,10 @@ use super::{
 };
 
 /// Compare pinned, runtime, and generated Files operations.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Compares pinned, runtime, and generated operation identities."
+)]
 pub(super) fn check() -> Result<String, String> {
     let reference = load_reference_source(OPENAI_REFERENCE_SPEC, Some(OPENAI_REFERENCE_MANIFEST))?;
     let mut pinned = OperationIds::new();

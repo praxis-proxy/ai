@@ -519,9 +519,7 @@ fn file_status_schema() -> Object {
 /// The derive would emit `format: int64, minimum: 0` for a `u64`, which the
 /// pinned schema does not declare.
 fn file_bytes_schema() -> Object {
-    ObjectBuilder::new()
-        .schema_type(Type::Integer)
-        .build()
+    ObjectBuilder::new().schema_type(Type::Integer).build()
 }
 
 /// Fixed `"file"` discriminator schema.
