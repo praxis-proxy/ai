@@ -5,4 +5,9 @@
 
 #[cfg(feature = "openai-files")]
 pub(crate) mod contracts;
+#[cfg(feature = "openai-files")]
+mod openapi;
 pub(crate) mod routes;
+
+#[cfg(feature = "openai-files")]
+pub use openapi::implementation_openapi_json;

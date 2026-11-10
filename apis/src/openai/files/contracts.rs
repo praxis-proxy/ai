@@ -27,7 +27,7 @@ use serde_json::Value;
 use utoipa::{
     ToSchema,
     openapi::{
-        RefOr,
+        Deprecated, RefOr,
         schema::{Object, ObjectBuilder, Schema, Type},
     },
 };
@@ -243,18 +243,18 @@ pub(crate) struct OpenAiFile {
     created_at: i64,
     /// Expiration timestamp in seconds since the Unix epoch.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(format = "unixtime")]
+    #[schema(format = "unixtime", nullable = false)]
     expires_at: Option<i64>,
     /// Original file name.
     filename: String,
     /// Declared purpose.
     purpose: FilePurpose,
     /// Deprecated processing status; still required by the pinned contract.
-    #[schema(deprecated)]
+    #[schema(schema_with = file_status_schema)]
     status: FileStatus,
     /// Deprecated status detail.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(deprecated)]
+    #[schema(deprecated, nullable = false)]
     status_details: Option<String>,
 }
 
@@ -425,6 +425,7 @@ impl FileExpirationAfter {
 /// Multipart body of `createFile`. Schema only: the form is parsed
 /// incrementally rather than deserialized.
 #[derive(ToSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CreateFileRequest {
     /// The file to upload.
     #[schema(value_type = String, format = Binary)]
@@ -432,6 +433,7 @@ pub(crate) struct CreateFileRequest {
     /// Intended purpose.
     purpose: UploadPurpose,
     /// Optional expiration policy.
+    #[schema(nullable = false)]
     expires_after: Option<FileExpirationAfter>,
 }
 
@@ -481,6 +483,26 @@ pub(crate) fn list_files_limit_schema() -> RefOr<Schema> {
             .default(Some(Value::from(MAX_LIST_LIMIT)))
             .build(),
     ))
+}
+
+/// Emit the `listFiles` `order` query schema: `asc` or `desc`, default `desc`.
+pub(crate) fn list_files_order_schema() -> RefOr<Schema> {
+    RefOr::T(Schema::Object(
+        ObjectBuilder::new()
+            .schema_type(Type::String)
+            .enum_values(Some(["asc", "desc"]))
+            .default(Some(Value::from("desc")))
+            .build(),
+    ))
+}
+
+/// Inline deprecated `status` schema; a `$ref` would drop `deprecated`.
+fn file_status_schema() -> Object {
+    ObjectBuilder::new()
+        .schema_type(Type::String)
+        .enum_values(Some(["uploaded", "processed", "error"]))
+        .deprecated(Some(Deprecated::True))
+        .build()
 }
 
 /// Fixed `"file"` discriminator schema.

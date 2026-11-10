@@ -38,6 +38,8 @@ pub use conversations::{
 };
 #[cfg(feature = "openai-conversations")]
 pub use conversations::{OpenaiConversationsFilter, implementation_openapi_json as conversations_openapi_json};
+#[cfg(feature = "openai-files")]
+pub use files::implementation_openapi_json as files_openapi_json;
 pub use files::routes::{FilesOperation, FilesOperationSpec, operation_specs as files_operation_specs};
 pub use operation::OpenAiOperationSpec;
 #[cfg(feature = "openai-responses")]

@@ -52,6 +52,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::openai::operation::collect_component_references;
 
     #[test]
     fn generated_operations_come_from_owned_registry_entries() {
@@ -72,7 +73,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         let expected = operation_specs()
             .iter()
-            .filter(|spec| spec.owned_contract().is_some() && spec.owns_contract())
+            .filter(|spec| spec.owned_contract().is_some())
             .map(|spec| (spec.method().as_str(), spec.spec_path))
             .collect::<BTreeSet<_>>();
 
@@ -297,26 +298,5 @@ mod tests {
             Some(&Value::Bool(true)),
             "live OpenAI behavior requires an update request body"
         );
-    }
-
-    fn collect_component_references<'a>(value: &'a Value, references: &mut Vec<&'a str>) {
-        match value {
-            Value::Object(object) => {
-                if let Some(reference) = object.get("$ref").and_then(Value::as_str)
-                    && reference.starts_with("#/components/schemas/")
-                {
-                    references.push(reference);
-                }
-                for value in object.values() {
-                    collect_component_references(value, references);
-                }
-            },
-            Value::Array(values) => {
-                for value in values {
-                    collect_component_references(value, references);
-                }
-            },
-            _ => {},
-        }
     }
 }

@@ -10,19 +10,10 @@
     clippy::allow_attributes,
     reason = "parameter contracts used when the conversations or files feature is enabled"
 )]
-#![cfg_attr(
-    all(
-        not(test),
-        not(any(feature = "openai-conversations", feature = "openai-responses-openapi"))
-    ),
-    expect(
-        dead_code,
-        reason = "no generator consumes the Files contract until local handlers land"
-    )
-)]
-
 use std::borrow::{Borrow, Cow};
 
+#[cfg(test)]
+use serde_json::Value as JsonValue;
 use utoipa::openapi::{
     Components, Content, Info, OpenApi, Paths, Ref, RefOr, Required, Tag,
     path::{HttpMethod as OpenApiHttpMethod, Operation, OperationBuilder, Parameter, ParameterBuilder, ParameterIn},
@@ -276,6 +267,9 @@ const fn openapi_method(method: HttpMethod) -> OpenApiHttpMethod {
 }
 
 /// Generate an implementation `OpenAPI` document from runtime operation specs.
+///
+/// Emits every operation that declares an owned contract, regardless of its
+/// handling mode; specs without a contract are skipped.
 pub(crate) fn implementation_openapi<I>(title: &str, version: &str, tag: &str, specs: I) -> OpenApi
 where
     I: IntoIterator,
@@ -290,9 +284,6 @@ where
         let Some(contract) = spec.owned_contract() else {
             continue;
         };
-        if !spec.owns_contract() {
-            continue;
-        }
 
         register_contract_schemas(&mut components, contract);
         openapi.paths.add_path_operation(
@@ -393,11 +384,34 @@ const fn required(value: bool) -> Required {
     if value { Required::True } else { Required::False }
 }
 
+/// Collect every `#/components/schemas/...` reference in a JSON document.
+#[cfg(test)]
+#[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
+pub(crate) fn collect_component_references<'a>(value: &'a JsonValue, references: &mut Vec<&'a str>) {
+    match value {
+        JsonValue::Object(object) => {
+            if let Some(reference) = object.get("$ref").and_then(JsonValue::as_str)
+                && reference.starts_with("#/components/schemas/")
+            {
+                references.push(reference);
+            }
+            for value in object.values() {
+                collect_component_references(value, references);
+            }
+        },
+        JsonValue::Array(values) => {
+            for value in values {
+                collect_component_references(value, references);
+            }
+        },
+        _ => {},
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use serde_json::Value as JsonValue;
     use utoipa::ToSchema;
 
     use super::*;
@@ -536,5 +550,29 @@ mod tests {
                 .is_some()
         );
         assert!(value.pointer("/paths/~1files/post/responses/204/content").is_none());
+    }
+
+    #[test]
+    fn passthrough_operation_with_a_contract_is_emitted() {
+        let mut passthrough = FILE_OPERATION;
+        passthrough.runtime.mode = HandlingMode::Passthrough;
+        assert!(!passthrough.owns_contract());
+
+        let document = implementation_openapi("Files test", "0.1.0", "Files", std::iter::once(&passthrough));
+        let value = serde_json::to_value(document).unwrap();
+
+        assert_eq!(
+            value.pointer("/paths/~1files/post/operationId"),
+            Some(&JsonValue::from("createFile"))
+        );
+    }
+
+    #[test]
+    fn operation_without_a_contract_is_skipped_in_any_mode() {
+        let mut local = PROXIED_UPLOAD;
+        local.runtime.mode = HandlingMode::Local;
+        let document = implementation_openapi("Files test", "0.1.0", "Files", [&PROXIED_UPLOAD, &PROXIED_GET, &local]);
+
+        assert!(document.paths.paths.is_empty());
     }
 }

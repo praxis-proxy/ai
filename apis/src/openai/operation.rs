@@ -14,21 +14,13 @@
 ))]
 mod openapi;
 
+#[cfg(all(test, any(feature = "openai-conversations", feature = "openai-files")))]
+pub(crate) use openapi::collect_component_references;
 #[cfg(any(
     feature = "openai-conversations",
     feature = "openai-files",
     feature = "openai-responses-openapi"
 ))]
-#[cfg_attr(
-    all(
-        not(test),
-        not(any(feature = "openai-conversations", feature = "openai-responses-openapi"))
-    ),
-    expect(
-        unused_imports,
-        reason = "no generator consumes the Files contract until local handlers land"
-    )
-)]
 pub(crate) use openapi::{
     MediaTypeSpec, OwnedOperationContract, RequestBodySpec, ResponseSpec, SchemaBinding, implementation_openapi,
     schema_binding,
@@ -108,9 +100,10 @@ impl OpenAiOperationSpec {
 
     /// Whether Praxis owns this operation's externally visible contract.
     ///
-    /// Contract ownership is `OpenAPI` generation policy rather than runtime
-    /// identity, so it lives on the OpenAI wrapper beside the contract it
-    /// governs rather than on the shared handling mode.
+    /// True for `Transform` and `Local` operations. It describes ownership
+    /// only: `OpenAPI` generation is gated on a declared
+    /// `owned_contract`, not on this flag. It lives on
+    /// the OpenAI wrapper rather than on the shared handling mode.
     #[must_use]
     pub const fn owns_contract(&self) -> bool {
         matches!(self.runtime.mode, HandlingMode::Transform | HandlingMode::Local)

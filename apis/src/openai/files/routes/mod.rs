@@ -21,8 +21,8 @@ use std::ops::Deref;
 
 #[cfg(feature = "openai-files")]
 use super::contracts::{
-    CreateFileRequest, DeleteFileResponse, FileContent, ListFilesResponse, ListOrder, OpenAiFile,
-    list_files_limit_schema,
+    CreateFileRequest, DeleteFileResponse, FileContent, ListFilesResponse, OpenAiFile, list_files_limit_schema,
+    list_files_order_schema,
 };
 #[cfg(feature = "openai-files")]
 use crate::openai::operation::{
@@ -225,7 +225,7 @@ files_operations! {
                 ),
                 query_parameter!(
                     "order",
-                    ListOrder,
+                    schema_fn = list_files_order_schema,
                     "Sort order by the `created_at` timestamp of the objects. `asc` for ascending order and `desc` for descending order."
                 ),
                 query_parameter!(
@@ -382,10 +382,7 @@ mod tests {
 
     #[cfg(feature = "openai-files")]
     mod contract {
-        use serde_json::Value;
-
         use super::*;
-        use crate::openai::operation::implementation_openapi;
 
         #[test]
         fn every_spec_declares_a_contract_but_passthrough_does_not_own_it() {
@@ -397,12 +394,6 @@ mod tests {
                 );
                 assert!(!spec.owns_contract(), "{} is passthrough", spec.operation_id());
             }
-            let document =
-                implementation_openapi("Files", "0.1.0", "Files", OPERATION_SPECS.iter().map(|s| s.definition));
-            assert!(
-                document.paths.paths.is_empty(),
-                "passthrough operations generate no paths"
-            );
         }
 
         #[test]
@@ -419,65 +410,6 @@ mod tests {
                     assert_eq!(spec.request_body().is_required(), request.required);
                 }
             }
-        }
-
-        #[test]
-        #[expect(clippy::too_many_lines, reason = "one assertion sweep over the generated document")]
-        fn generation_covers_every_operation_when_local() {
-            let local = OPERATION_SPECS.iter().map(|spec| {
-                let mut definition = spec.definition;
-                definition.runtime.mode = HandlingMode::Local;
-                definition
-            });
-            let value: Value = serde_json::to_value(implementation_openapi("Files", "0.1.0", "Files", local)).unwrap();
-
-            for (path, method, id) in [
-                ("~1files", "get", "listFiles"),
-                ("~1files", "post", "createFile"),
-                ("~1files~1{file_id}", "get", "retrieveFile"),
-                ("~1files~1{file_id}", "delete", "deleteFile"),
-                ("~1files~1{file_id}~1content", "get", "downloadFile"),
-            ] {
-                assert_eq!(
-                    value.pointer(&format!("/paths/{path}/{method}/operationId")),
-                    Some(&Value::from(id)),
-                    "{method} {path}"
-                );
-            }
-
-            assert_eq!(
-                value.pointer("/paths/~1files/post/requestBody/content/multipart~1form-data/schema/$ref"),
-                Some(&Value::from("#/components/schemas/CreateFileRequest"))
-            );
-            assert!(
-                value
-                    .pointer("/paths/~1files~1{file_id}~1content/get/responses/200/content/application~1octet-stream")
-                    .is_some()
-            );
-            for component in [
-                "OpenAIFile",
-                "ListFilesResponse",
-                "DeleteFileResponse",
-                "CreateFileRequest",
-                "FileExpirationAfter",
-            ] {
-                assert!(
-                    value.pointer(&format!("/components/schemas/{component}")).is_some(),
-                    "missing component {component}"
-                );
-            }
-
-            let file_id = value.pointer("/paths/~1files~1{file_id}/get/parameters/0").unwrap();
-            assert_eq!(file_id["name"], "file_id");
-            assert_eq!(file_id["in"], "path");
-            let names: Vec<_> = value
-                .pointer("/paths/~1files/get/parameters")
-                .and_then(Value::as_array)
-                .unwrap()
-                .iter()
-                .map(|parameter| parameter["name"].as_str().unwrap())
-                .collect();
-            assert_eq!(names, ["purpose", "limit", "order", "after"]);
         }
     }
 }
