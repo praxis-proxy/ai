@@ -30,8 +30,9 @@ Before tagging a release:
 - [ ] Pull request labels produce useful generated release notes
 - [ ] Inspect CI runs for the final release commit; the release report records
       missing, skipped, failed, and unfinished evidence as well as successes
-- [ ] If native GPU qualification is desired, dispatch the existing vLLM
-      workflow on the final release commit/tag and inspect its report
+- [ ] Inspect the latest successful GPU nightly within 48 hours and any newer
+      failures; release publishing reuses ancestor evidence and records its
+      tested SHA separately from the release SHA
 
 ## Tagging a Release
 
@@ -128,7 +129,7 @@ evidence. Missing or unverifiable GPU evidence is stated as unavailable, with
 its reason and instructions to collect it; it does not block the release.
 The additional CI inventory is informational and does not change existing
 release gates. See [native vLLM qualification](developing/vllm-qualification.md)
-for the GPU schema, selection policy, and final-tag dispatch procedure.
+for the GPU schema and recent ancestor nightly selection policy.
 
 [gh-releases]: https://github.com/praxis-proxy/ai/releases
 

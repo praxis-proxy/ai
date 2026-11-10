@@ -135,7 +135,7 @@ class ReleaseQualificationTest(unittest.TestCase):
         self.assertIn("existing change", twice)
         self.assertIn("| Tests | Rust unit tests and lint | success | 1 skipped, 1 success |", section)
         self.assertIn("no completed Responses GPU attempt", section)
-        self.assertIn("run_live_vllm=true", section)
+        self.assertIn("successful ancestor nightly within 48 hours", section)
         self.assertIn("Optional provider test: skipped", release.render(report, detailed=True))
         self.assertEqual(section, Path(__file__).with_name("release-ci-notes.fixture.md").read_text())
 

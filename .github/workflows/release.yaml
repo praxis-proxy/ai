@@ -451,7 +451,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Generate and verify exact-commit qualification evidence
+      - name: Generate CI evidence and verify recent GPU nightly qualification
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
