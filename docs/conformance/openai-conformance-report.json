@@ -1023,6 +1023,10 @@
         "command": "cargo test -p praxis-ai-apis --no-default-features --features openai-conversations,store-all --lib conformance_conversations_ -- --show-output",
         "checks": [
           {
+            "kind": "rate_limit_response_contract",
+            "evidence": "openai::conversations::tests::conformance_conversations_rate_limit_rejects_every_operation_before_store_access"
+          },
+          {
             "kind": "route_dispatch",
             "evidence": "openai::conversations::tests::conformance_conversations_routes_match_runtime_registry"
           },
