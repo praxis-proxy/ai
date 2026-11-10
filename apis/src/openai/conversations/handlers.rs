@@ -465,26 +465,17 @@ pub(super) async fn handle_delete_item(
         Err(action) => return action,
     };
     let item_id = item_id.as_ref();
-    let record = match store.get_conversation(conversation_id).await {
-        Ok(Some(record)) => record,
-        Ok(None) => {
-            debug!(conversation_id, item_id, "conversation not found for item delete");
-            return Ok(FilterAction::Reject(not_found_response(
-                &conversation_not_found_message(conversation_id),
-            )?));
-        },
-        Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
-    };
-
-    match store.delete_item_and_sync_messages(conversation_id, item_id).await {
-        Ok(true) => {
+    match store.delete_item_and_get_conversation(conversation_id, item_id).await {
+        Ok(Some(record)) => {
             debug!(conversation_id, item_id, "conversation item deleted");
-            // Keep the pre-mutation metadata snapshot so a post-commit read
-            // failure cannot turn a committed deletion into an error response.
-            let body = conversation_response(record);
+            let body = ConversationResource::new(
+                record.conversation_id,
+                record.created_at,
+                Metadata::from_value(record.metadata),
+            );
             Ok(FilterAction::Reject(json_response(200, &body)?))
         },
-        Ok(false) => {
+        Ok(None) => {
             debug!(conversation_id, item_id, "conversation item not found for delete");
             Ok(FilterAction::Reject(not_found_response(&item_not_found_message(
                 item_id,

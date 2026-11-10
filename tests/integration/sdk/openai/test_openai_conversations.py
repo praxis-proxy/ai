@@ -2299,6 +2299,10 @@ class TestOpenAIConversations:
             ],
         )
 
+        conversation = openai_client.conversations.update(
+            conversation.id, metadata={"topic": "committed-before-delete"},
+        )
+
         updated = openai_client.conversations.items.delete(
             "item_delete_once",
             conversation_id=conversation.id,

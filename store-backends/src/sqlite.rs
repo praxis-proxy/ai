@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use futures::TryStreamExt as _;
 use percent_encoding::percent_decode_str;
-use praxis_ai_store::StateOwner;
+use praxis_ai_store::{ConversationSnapshot, StateOwner};
 use sqlx::{
     AssertSqlSafe, Row as _, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
@@ -1861,6 +1861,18 @@ impl ConversationItemStore for SqliteResponseStore {
         conversation_id: &str,
         item_id: &str,
     ) -> Result<bool, StoreError> {
+        Ok(self
+            .delete_item_and_get_conversation(owner, conversation_id, item_id)
+            .await?
+            .is_some())
+    }
+
+    async fn delete_item_and_get_conversation(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<Option<ConversationSnapshot>, StoreError> {
         let items_table = self
             .tables
             .items
@@ -1874,12 +1886,35 @@ impl ConversationItemStore for SqliteResponseStore {
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        sqlite_require_conversation(&mut tx, conv_table, owner, conversation_id).await?;
+        let sql = format!(
+            "SELECT conversation_id, created_at, metadata FROM {conv_table} WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?"
+        );
+        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(conversation_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?
+            .ok_or(StoreError::NotFound)?;
+        let metadata: String = row
+            .try_get("metadata")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let snapshot = ConversationSnapshot {
+            conversation_id: row
+                .try_get("conversation_id")
+                .map_err(|e| StoreError::Database(e.to_string()))?,
+            created_at: row
+                .try_get("created_at")
+                .map_err(|e| StoreError::Database(e.to_string()))?,
+            metadata: serde_json::from_str(&metadata).map_err(|e| StoreError::Serialization(e.to_string()))?,
+        };
         let deleted =
             sqlite_delete_item_and_sync(&mut tx, items_table, conv_table, owner, conversation_id, item_id).await?;
 
         tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
-        Ok(deleted)
+        Ok(deleted.then_some(snapshot))
     }
 }
 

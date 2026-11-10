@@ -20,8 +20,8 @@ use crate::{
     owner::StateOwner,
     traits::{PersistedStateBackend, ResponseStore},
     types::{
-        BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-        ResponseCasOutcome, ResponseEventRecord, ResponseRecord, StoreError,
+        BudgetedRecord, ConversationItemRecord, ConversationRecord, ConversationSnapshot, EventLogStatus,
+        PendingApprovalRecord, ResponseCasOutcome, ResponseEventRecord, ResponseRecord, StoreError,
     },
 };
 
@@ -525,6 +525,21 @@ impl OwnerScopedStore {
         }
         self.store
             .create_items_and_sync_messages_bounded(&self.owner, conversation_id, items, max_append_charge_bytes)
+            .await
+    }
+
+    /// Delete an item and return the conversation snapshot under the same lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend mutation fails.
+    pub async fn delete_item_and_get_conversation(
+        &self,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<Option<ConversationSnapshot>, StoreError> {
+        self.store
+            .delete_item_and_get_conversation(&self.owner, conversation_id, item_id)
             .await
     }
 

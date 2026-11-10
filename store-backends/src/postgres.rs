@@ -7,7 +7,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use futures::TryStreamExt as _;
-use praxis_ai_store::StateOwner;
+use praxis_ai_store::{ConversationSnapshot, StateOwner};
 use sqlx::{
     AssertSqlSafe, Row as _,
     postgres::{PgConnectOptions, PgPoolOptions, PgRow, PgSslMode},
@@ -2063,6 +2063,18 @@ impl ConversationItemStore for PostgresResponseStore {
         conversation_id: &str,
         item_id: &str,
     ) -> Result<bool, StoreError> {
+        Ok(self
+            .delete_item_and_get_conversation(owner, conversation_id, item_id)
+            .await?
+            .is_some())
+    }
+
+    async fn delete_item_and_get_conversation(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<Option<ConversationSnapshot>, StoreError> {
         self.delete_item_and_sync_messages_inner(owner, conversation_id, item_id)
             .await
     }
@@ -2585,7 +2597,7 @@ impl PostgresResponseStore {
         owner: &StateOwner,
         conversation_id: &str,
         item_id: &str,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<Option<ConversationSnapshot>, StoreError> {
         let items_table = self
             .tables
             .items
@@ -2596,7 +2608,7 @@ impl PostgresResponseStore {
         let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
 
         let lock_sql = format!(
-            "SELECT 1 FROM {conv_table} \
+            "SELECT conversation_id, created_at, metadata FROM {conv_table} \
              WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
              FOR UPDATE"
         );
@@ -2608,9 +2620,13 @@ impl PostgresResponseStore {
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| self.db_err(&e))?;
-        if locked.is_none() {
-            return Err(StoreError::NotFound);
-        }
+        let row = locked.ok_or(StoreError::NotFound)?;
+        let metadata: String = row.try_get("metadata").map_err(|e| self.db_err(&e))?;
+        let snapshot = ConversationSnapshot {
+            conversation_id: row.try_get("conversation_id").map_err(|e| self.db_err(&e))?,
+            created_at: row.try_get("created_at").map_err(|e| self.db_err(&e))?,
+            metadata: serde_json::from_str(&metadata).map_err(|e| StoreError::Serialization(e.to_string()))?,
+        };
 
         let delete_sql = format!(
             "DELETE FROM {items_table} \
@@ -2629,13 +2645,13 @@ impl PostgresResponseStore {
 
         if result.rows_affected() == 0 {
             tx.commit().await.map_err(|e| self.db_err(&e))?;
-            return Ok(false);
+            return Ok(None);
         }
 
         pg_invalidate_messages(&mut tx, conv_table, owner, conversation_id).await?;
 
         tx.commit().await.map_err(|e| self.db_err(&e))?;
-        Ok(true)
+        Ok(Some(snapshot))
     }
 }
 

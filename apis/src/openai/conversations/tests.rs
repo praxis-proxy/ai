@@ -4606,6 +4606,56 @@ async fn forwarding_adapter_reads_legacy_prefix_and_item_rows() {
 }
 
 #[tokio::test]
+async fn delete_item_returns_metadata_committed_before_its_lock() {
+    let inner = Arc::new(
+        SqliteResponseStore::new(
+            "sqlite::memory:",
+            "test_responses",
+            "test_conversations",
+            Some("test_items"),
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    inner
+        .create_conversation_with_items(
+            &ConversationRecord {
+                conversation_id: "conv_race".to_owned(),
+                owner: crate::test_utils::test_owner(DEFAULT_TENANT_ID),
+                created_at: 1000,
+                metadata: serde_json::json!({"topic": "stale"}),
+                messages: serde_json::json!([]),
+            },
+            &[race_item("item_a")],
+        )
+        .await
+        .unwrap();
+    let (filter, store) = harness_with(Arc::new(AppendDuringUpdateStore::new(
+        Arc::clone(&inner),
+        race_item("item_b"),
+    )));
+    let req = make_request(Method::DELETE, "/v1/conversations/conv_race/items/item_a");
+    let mut ctx = conv_ctx(&store, &req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected local response")
+    };
+    assert_eq!(rejection.status, 200);
+    let body = rejection_body(&rejection);
+    assert_eq!(body["metadata"]["topic"], "committed-before-delete");
+    assert_eq!(body["created_at"], 1000);
+    assert!(
+        inner
+            .get_conversation_item(&crate::test_utils::test_owner(DEFAULT_TENANT_ID), "conv_race", "item_a")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn update_conversation_metadata_does_not_clobber_concurrent_append() {
     // #1144: metadata writes must not overwrite a concurrent item append.
     let inner = Arc::new(
@@ -5168,6 +5218,18 @@ impl ConversationItemStore for FailingItemStore {
         Ok(0)
     }
 
+    async fn delete_item_and_get_conversation(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<praxis_ai_store::ConversationSnapshot>, StoreError> {
+        if !self.conversation_exists || matches!(self.append_failure, AppendFailure::ConversationDeleted) {
+            return Err(StoreError::NotFound);
+        }
+        Ok(None)
+    }
+
     async fn delete_item_and_sync_messages(
         &self,
         _tenant_id: &crate::StateOwner,
@@ -5290,7 +5352,8 @@ impl ResponseStore for FailingItemStore {
 /// On the first `get_conversation` call — the read the update handler performs
 /// before writing metadata — it returns the pre-append conversation snapshot and
 /// then commits a concurrent item append that rebuilds the denormalized
-/// `messages` cache. Every other operation delegates to a real SQLite store that
+/// `messages` cache. Item deletion commits a metadata update before acquiring
+/// the mutation lock. Other operations delegate to the real SQLite store that
 /// the test also holds, so it can assert the final persisted state.
 struct AppendDuringUpdateStore {
     /// Ensures the concurrent append fires exactly once.
@@ -5467,12 +5530,32 @@ impl ConversationItemStore for AppendDuringUpdateStore {
 
     async fn delete_item_and_sync_messages(
         &self,
-        tenant_id: &crate::StateOwner,
+        owner: &crate::StateOwner,
         conversation_id: &str,
         item_id: &str,
     ) -> Result<bool, StoreError> {
+        Ok(self
+            .delete_item_and_get_conversation(owner, conversation_id, item_id)
+            .await?
+            .is_some())
+    }
+
+    async fn delete_item_and_get_conversation(
+        &self,
+        owner: &crate::StateOwner,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<Option<praxis_ai_store::ConversationSnapshot>, StoreError> {
+        // A metadata writer commits immediately before the delete takes its lock.
         self.inner
-            .delete_item_and_sync_messages(tenant_id, conversation_id, item_id)
+            .update_conversation_metadata(
+                owner,
+                conversation_id,
+                &serde_json::json!({"topic": "committed-before-delete"}),
+            )
+            .await?;
+        self.inner
+            .delete_item_and_get_conversation(owner, conversation_id, item_id)
             .await
     }
 }
