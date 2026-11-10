@@ -1834,6 +1834,41 @@ mod tests {
             "a named tool block must not be reported as end_turn when upstream uses stop"
         );
     }
+
+    #[test]
+    fn message_delta_prefers_matched_stop_sequence_over_tool_use() {
+        let (filter, mut ctx) = make_filter_and_context();
+        ctx.set_metadata(
+            crate::anthropic::messages_to_chat_completions::STOP_SEQUENCES_KEY,
+            r#"[","]"#,
+        );
+
+        let tool_start = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},\"index\":0}]}\n\n";
+        let mut body1 = Some(Bytes::from(tool_start));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let finish = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\",\"stop_reason\":\",\"}]}\n\n";
+        let mut body2 = Some(Bytes::from(finish));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let mut done = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut done, false).unwrap());
+
+        let out = String::from_utf8(done.unwrap().to_vec()).unwrap();
+        let event = event_data(&out, "message_delta");
+        let delta = event.get("delta").unwrap();
+        assert_eq!(
+            delta.get("stop_reason").and_then(Value::as_str),
+            Some("stop_sequence"),
+            "a matched client stop must take precedence over tool_use"
+        );
+        assert_eq!(
+            delta.get("stop_sequence").and_then(Value::as_str),
+            Some(","),
+            "the matched client stop sequence must be reported"
+        );
+    }
+
     const INVALID_TOOL_CALL_CASES: [(&str, &str, &str); 5] = [
         (
             "missing id",

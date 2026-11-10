@@ -252,6 +252,7 @@ class RecordingBackend(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _send_named_tool_stop_stream(self):
+        """Return a named tool call followed by a stop finish reason."""
         chunks = [
             {
                 "delta": {
@@ -702,6 +703,12 @@ class TestStreamingResponseValidation:
                 model=MODEL,
                 max_tokens=64,
                 messages=[{"role": "user", "content": "Use the weather tool"}],
+                tools=[{
+                    "name": "get_weather",
+                    "description": "Get the weather for a city.",
+                    "input_schema": {"type": "object", "properties": {}},
+                }],
+                tool_choice={"type": "tool", "name": "get_weather"},
             ) as stream:
                 events = list(stream)
         finally:
@@ -713,10 +720,19 @@ class TestStreamingResponseValidation:
             if event.type == "content_block_start"
             and event.content_block.type == "tool_use"
         )
-        assert tool_use.name == "get_weather"
+        assert tool_use.name == "get_weather", "the named tool must be preserved in the response"
+        [upstream] = RecordingBackend.bodies
+        assert upstream["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "get_weather"},
+        }, "the named Anthropic tool choice must be translated to Chat Completions"
         message_delta = next(event for event in events if event.type == "message_delta")
-        assert message_delta.delta.stop_reason == "tool_use"
-        assert any(event.type == "message_stop" for event in events)
+        assert message_delta.delta.stop_reason == "tool_use", (
+            "a tool call with an upstream stop finish reason must report tool_use"
+        )
+        assert any(event.type == "message_stop" for event in events), (
+            "a completed streaming response must emit message_stop"
+        )
 
     def test_invalid_tool_id_aborts_incomplete_stream(self, anthropic_client):
         RecordingBackend.bodies.clear()
