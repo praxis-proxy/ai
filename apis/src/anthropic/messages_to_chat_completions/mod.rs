@@ -78,6 +78,13 @@ struct StreamingErrorBuffer {
 /// report it back truthfully as `stop_reason: stop_sequence`.
 pub(crate) const STOP_SEQUENCES_KEY: &str = "anthropic_messages_to_chat_completions.stop_sequences";
 
+/// Request-scoped client stop sequences used by both translation phases.
+///
+/// This is stored in typed extensions rather than bounded routing metadata:
+/// Anthropic does not impose the metadata value limit on stop sequences.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ClientStopSequences(pub(crate) Vec<String>);
+
 /// Metadata key carrying the comma-separated degraded-feature labels from the
 /// request-body phase to the response-header phase.
 const DEGRADED_FEATURES_KEY: &str = "anthropic_messages_to_chat_completions.degraded_features";
@@ -449,8 +456,9 @@ fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, value: Option<&serd
     if let Some(stop_sequences) = value
         .get("stop_sequences")
         .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+        && let Ok(stop_sequences) = serde_json::from_value::<Vec<String>>(stop_sequences.clone())
     {
-        ctx.set_metadata(STOP_SEQUENCES_KEY, stop_sequences.to_string());
+        ctx.extensions.insert(ClientStopSequences(stop_sequences));
     }
 }
 
@@ -460,6 +468,10 @@ fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, value: Option<&serd
 /// rejects on its own; treating it as empty keeps the response at
 /// `end_turn` rather than failing the translation.
 pub(crate) fn client_stop_sequences(ctx: &HttpFilterContext<'_>) -> Vec<String> {
+    if let Some(stop_sequences) = ctx.extensions.get::<ClientStopSequences>() {
+        return stop_sequences.0.clone();
+    }
+
     ctx.filter_metadata
         .get(STOP_SEQUENCES_KEY)
         .and_then(|value| serde_json::from_str(value).ok())
@@ -1096,10 +1108,24 @@ mod tests {
         extract_request_metadata(&mut ctx, value.as_ref());
 
         assert_eq!(
-            ctx.filter_metadata.get(STOP_SEQUENCES_KEY).unwrap(),
-            r#"[",","END"]"#,
+            client_stop_sequences(&ctx),
+            vec![",".to_owned(), "END".to_owned()],
             "client stop sequences are retained for the response phase"
         );
+        assert!(!ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY));
+    }
+
+    #[test]
+    fn extract_request_metadata_retains_stop_sequences_longer_than_metadata_limit() {
+        let sequence = "s".repeat(253);
+        let value = serde_json::json!({"model": "gpt-4", "stop_sequences": [sequence]});
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+
+        extract_request_metadata(&mut ctx, Some(&value));
+
+        assert_eq!(client_stop_sequences(&ctx), vec![sequence]);
+        assert!(!ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY));
     }
 
     #[test]
