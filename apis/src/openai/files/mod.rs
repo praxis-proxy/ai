@@ -11,3 +11,15 @@ pub(crate) mod routes;
 
 #[cfg(feature = "openai-files")]
 pub use openapi::implementation_openapi_json;
+
+#[cfg(test)]
+#[cfg(feature = "openai-files")]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::print_stdout,
+    reason = "tests"
+)]
+mod tests;

@@ -14,6 +14,19 @@
 ))]
 mod openapi;
 
+/// Shared conformance test helpers.
+#[cfg(test)]
+#[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::too_many_lines,
+    reason = "tests"
+)]
+pub(crate) mod conformance;
+
 #[cfg(all(test, any(feature = "openai-conversations", feature = "openai-files")))]
 pub(crate) use openapi::collect_component_references;
 #[cfg(any(
@@ -107,6 +120,33 @@ impl OpenAiOperationSpec {
     #[must_use]
     pub const fn owns_contract(&self) -> bool {
         matches!(self.runtime.mode, HandlingMode::Transform | HandlingMode::Local)
+    }
+
+    /// Whether the operation declares an `OpenAPI` contract.
+    ///
+    /// Generation and conformance comparison are gated on this, not on
+    /// [`Self::owns_contract`]: a passthrough operation may still declare the
+    /// contract it will own once local handlers land. Always `false` when no
+    /// `OpenAPI` feature is compiled.
+    #[must_use]
+    pub const fn declares_contract(&self) -> bool {
+        #[cfg(any(
+            feature = "openai-conversations",
+            feature = "openai-files",
+            feature = "openai-responses-openapi"
+        ))]
+        {
+            self.owned_contract.is_some()
+        }
+        #[cfg(not(any(
+            feature = "openai-conversations",
+            feature = "openai-files",
+            feature = "openai-responses-openapi"
+        )))]
+        {
+            let _ = self;
+            false
+        }
     }
 
     /// Return the locally owned `OpenAPI` contract, when applicable.

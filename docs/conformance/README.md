@@ -99,8 +99,19 @@ Every operation has one proxy-boundary mode:
 - `transform`: map between input and output contracts owned by Praxis.
 - `local`: terminate the request and produce the response in Praxis.
 
-Only `transform` and `local` operations enter owned-contract OpenAPI
-comparison. All eight current Conversations operations are `local`.
+Operations with an owned mode (`transform` or `local`) or a declared
+contract enter owned-contract OpenAPI comparison. The generator emits every
+operation that declares a contract, so the comparison covers exactly what is
+generated. All eight current Conversations operations are `local`.
+
+The five Files operations are `passthrough` but declare their contracts, so
+oasdiff compares them against the pinned Files projection. Contract exceptions
+record where the generated contract deliberately deviates: the download
+returns `application/octet-stream` rather than the pinned `application/json`,
+`evals` is added to `OpenAIFile.purpose`, and the generated `OpenAIFile` states
+`type: object` explicitly. `cargo xtask check-files-registry` additionally
+compares pinned, runtime, and generated operation identity three ways and runs
+in `make lint`.
 
 ### Rate-limit response ownership
 
@@ -245,7 +256,7 @@ excluded from comparison), and keeps three independent dimensions:
 
 1. `capability_coverage` groups selected operations by handling mode and shows
    missing or stale support claims.
-2. `owned_contract_conformance` compares `local` and `transform` contracts
+2. `owned_contract_conformance` compares owned-mode and declared contracts
    with pinned `oasdiff`. Operation drift and inherited area drift, such as
    global authentication, are reported separately.
 3. `runtime_verification` records the focused commands, exact test evidence,

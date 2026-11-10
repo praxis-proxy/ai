@@ -51,34 +51,6 @@ mod tests {
     }
 
     #[test]
-    fn generated_operations_match_the_registry() {
-        let document = document();
-        let mut generated = BTreeSet::new();
-        for (path, item) in document["paths"].as_object().unwrap() {
-            for (method, operation) in item.as_object().unwrap() {
-                generated.insert((
-                    method.to_uppercase(),
-                    path.clone(),
-                    operation["operationId"].as_str().unwrap().to_owned(),
-                ));
-            }
-        }
-        let expected = operation_specs()
-            .iter()
-            .map(|spec| {
-                (
-                    spec.method().as_str().to_owned(),
-                    spec.spec_path.to_owned(),
-                    spec.operation_id().to_owned(),
-                )
-            })
-            .collect::<BTreeSet<_>>();
-
-        assert_eq!(generated.len(), 5);
-        assert_eq!(generated, expected);
-    }
-
-    #[test]
     fn every_component_reference_resolves() {
         let document = document();
         let mut references = Vec::new();
@@ -140,8 +112,7 @@ mod tests {
         }
         let limit = &parameters[1]["schema"];
         assert_eq!(limit["type"], "integer");
-        assert_eq!(limit["minimum"], 1);
-        assert_eq!(limit["maximum"], 10_000);
+        assert!(limit.get("minimum").is_none() && limit.get("maximum").is_none());
         assert_eq!(limit["default"], 10_000);
         let order = &parameters[2]["schema"];
         assert_eq!(strings(&order["enum"]), BTreeSet::from(["asc", "desc"]));

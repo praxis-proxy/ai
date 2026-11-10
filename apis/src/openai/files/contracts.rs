@@ -236,7 +236,7 @@ pub(crate) struct OpenAiFile {
     #[schema(schema_with = file_object_schema)]
     object: FileObject,
     /// Size in bytes.
-    #[schema(format = Int64, minimum = 0)]
+    #[schema(schema_with = file_bytes_schema)]
     bytes: u64,
     /// Creation timestamp in seconds since the Unix epoch.
     #[schema(format = "unixtime")]
@@ -285,6 +285,14 @@ impl OpenAiFile {
     #[must_use]
     pub(crate) const fn with_expires_at(mut self, expires_at: i64) -> Self {
         self.expires_at = Some(expires_at);
+        self
+    }
+
+    /// Set the deprecated status detail.
+    #[must_use]
+    #[cfg_attr(not(test), expect(dead_code, reason = "no handler sets it yet"))]
+    pub(crate) fn with_status_details(mut self, details: impl Into<String>) -> Self {
+        self.status_details = Some(details.into());
         self
     }
 
@@ -473,13 +481,14 @@ fn deserialize_limit<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Optio
     Ok(limit)
 }
 
-/// Emit the `listFiles` `limit` query schema: integer, 1..=10000, default 10000.
+/// Emit the `listFiles` `limit` query schema: integer, default 10000.
+///
+/// The 1..=10000 range is enforced at runtime and stated in the parameter
+/// description; the pinned schema carries no `minimum`/`maximum`.
 pub(crate) fn list_files_limit_schema() -> RefOr<Schema> {
     RefOr::T(Schema::Object(
         ObjectBuilder::new()
             .schema_type(Type::Integer)
-            .minimum(Some(MIN_LIST_LIMIT))
-            .maximum(Some(MAX_LIST_LIMIT))
             .default(Some(Value::from(MAX_LIST_LIMIT)))
             .build(),
     ))
@@ -502,6 +511,17 @@ fn file_status_schema() -> Object {
         .schema_type(Type::String)
         .enum_values(Some(["uploaded", "processed", "error"]))
         .deprecated(Some(Deprecated::True))
+        .build()
+}
+
+/// Plain `integer` schema for `bytes`.
+///
+/// The derive would emit `format: int64, minimum: 0` for a `u64`, which the
+/// pinned schema does not declare.
+fn file_bytes_schema() -> Object {
+    ObjectBuilder::new()
+        .schema_type(Type::Integer)
+        .description(Some("The size of the file, in bytes."))
         .build()
 }
 

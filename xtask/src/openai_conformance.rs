@@ -267,10 +267,10 @@ fn run_inner(args: &Args) -> Result<CoverageReport, String> {
         args.include_beta,
     );
 
-    let owned_operations = report.owned_operations();
+    let contract_operations = report.contract_operations();
     report.oasdiff = Some(run_scoped_oasdiff(
         args.implementation_spec.as_deref(),
-        &owned_operations,
+        &contract_operations,
         &areas,
         &reference_projections,
     )?);
