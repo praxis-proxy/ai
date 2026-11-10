@@ -11,6 +11,7 @@
 //! response synthesis echoes the client's input back onto the Responses resource
 //! via [`input_echo_value`].
 
+#[cfg(any(test, feature = "store"))]
 use serde::ser::SerializeMap as _;
 use serde_json::Value;
 
@@ -54,14 +55,15 @@ impl InputForm {
 /// Serializes the current request: parameters plus the current input in its
 /// original form. Borrows state and never reconstructs an owned body.
 ///
-/// Only MCP tool discovery re-serializes the current request, so this view is
-/// gated on `openai-mcp-tools`; [`input_echo_value`] serves the always-present
-/// response-synthesis echo.
+/// Stored configuration publication and MCP tool discovery use this view;
+/// both require `store`. Tests also exercise the input-shape projection directly.
+#[cfg(any(test, feature = "store"))]
 pub(crate) struct CurrentRequestBody<'a> {
     /// Request state to project.
     state: &'a ResponsesState,
 }
 
+#[cfg(any(test, feature = "store"))]
 impl<'a> CurrentRequestBody<'a> {
     /// Borrow `state` for current-request serialization.
     #[must_use]
@@ -70,6 +72,7 @@ impl<'a> CurrentRequestBody<'a> {
     }
 }
 
+#[cfg(any(test, feature = "store"))]
 impl serde::Serialize for CurrentRequestBody<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let Some(object) = self.state.request_body.as_object() else {
