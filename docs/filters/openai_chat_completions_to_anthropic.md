@@ -11,7 +11,7 @@ The trusted profile is emitted by `intelligent_route`, never inferred from a req
 
 For Anthropic candidates, non-streaming JSON response chunks are retained in bounded request-local state until they can be translated. The separate SSE filter converts event chunks incrementally, and OpenAI-compatible response chunks remain unchanged.
 
-Anthropic translation runs only when the filter's `api_translation_enabled` setting is true, as derived from the tenant's API translation permission.
+Installing this filter enables translation for selected Anthropic providers.
 
 `api_version` selects the backend contract independently of caller headers. It defaults to `2023-06-01`. Supported sampling fields are preserved under either version; the backend owns version-specific parameter validation. Unknown versions fail configuration parsing. OpenAI-compatible candidates and native Messages passthrough are unaffected.
 
@@ -21,7 +21,6 @@ The compatibility contract defaults an omitted token limit to 4096 and ignores `
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `api_translation_enabled` | bool | no | Permission from trusted application configuration. Anthropic requests fail closed when this is false (the default). |
 | `api_version` | string | no | Operator-selected Anthropic contract: `2023-06-01` (default) or `2026-10-21`. Independent of caller headers; sampling validation remains the responsibility of the backend. |
 | `max_body_bytes` | integer | no | Compatibility setting for the former shared request/response limit. A direction-specific limit takes precedence when set. |
 | `max_request_body_bytes` | integer | no | Maximum complete translated Chat Completions request body. |

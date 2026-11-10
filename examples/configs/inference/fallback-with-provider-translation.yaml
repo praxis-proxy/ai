@@ -91,7 +91,6 @@ filter_chains:
                 max_partial_event_bytes: 1048576
                 max_tool_blocks: 256
               - filter: openai_chat_completions_to_anthropic
-                api_translation_enabled: true
                 max_body_bytes: 1048576
               - filter: credential_inject
                 credentials:
