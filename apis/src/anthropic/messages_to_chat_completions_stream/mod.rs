@@ -2093,6 +2093,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn many_tool_blocks_keep_all_terminal_stops() {
+        let (filter, mut ctx) = make_filter_and_context();
+        let tool_calls = (0..64)
+            .map(|index| {
+                serde_json::json!({
+                    "index": index,
+                    "id": format!("call_{index}"),
+                    "function": {"name": "tool", "arguments": "{}"}
+                })
+            })
+            .collect::<Vec<_>>();
+        let chunk = serde_json::json!({
+            "id": "c1",
+            "model": "gpt-4",
+            "choices": [{"delta": {"tool_calls": tool_calls}, "index": 0}]
+        });
+        let mut body = Some(Bytes::from(format!("data: {chunk}\n\n")));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let first_output = String::from_utf8(body.take().unwrap().to_vec()).unwrap();
+        assert_eq!(first_output.matches("event: content_block_start").count(), 64);
+        let state = ctx.get_filter_state::<StreamState>().unwrap();
+        assert_eq!(state.tools.len(), 64);
+        assert_eq!(open_tool_blocks(state).len(), 64);
+
+        let mut done = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut done, false).unwrap());
+        let out = String::from_utf8(done.unwrap().to_vec()).unwrap();
+        assert_eq!(out.matches("event: content_block_stop").count(), 64);
+    }
+
+    #[test]
+    fn tool_block_state_isolated_between_filter_instances() {
+        let (_, mut ctx) = make_filter_and_context();
+
+        ctx.current_filter_id = Some(0);
+        let state = ctx.get_filter_state_mut::<StreamState>().unwrap();
+        set_tool_block_index(state, "first", 0);
+        set_tool_block_open(state, "first", true);
+        state.tool_count = 1;
+
+        ctx.current_filter_id = Some(1);
+        ctx.insert_filter_state(StreamState::default());
+        let state = ctx.get_filter_state_mut::<StreamState>().unwrap();
+        assert_eq!(get_tool_block_count(state), 0);
+        assert!(open_tool_blocks(state).is_empty());
+        set_tool_block_index(state, "second", 0);
+        set_tool_block_open(state, "second", true);
+        state.tool_count = 1;
+
+        ctx.current_filter_id = Some(0);
+        let state = ctx.get_filter_state::<StreamState>().unwrap();
+        assert_eq!(get_tool_block_count(state), 1);
+        assert_eq!(open_tool_blocks(state), vec![(0, "first".to_owned())]);
+        ctx.current_filter_id = Some(1);
+        let state = ctx.get_filter_state::<StreamState>().unwrap();
+        assert_eq!(get_tool_block_count(state), 1);
+        assert_eq!(open_tool_blocks(state), vec![(0, "second".to_owned())]);
+    }
+
     const INVALID_TOOL_CALL_CASES: [(&str, &str, &str); 5] = [
         (
             "missing id",
