@@ -25,15 +25,17 @@ use super::{
 /// Compare pinned, runtime, and generated Files operations.
 pub(super) fn check() -> Result<String, String> {
     let reference = load_reference_source(OPENAI_REFERENCE_SPEC, Some(OPENAI_REFERENCE_MANIFEST))?;
-    let pinned: OperationIds = reference
-        .document
-        .scoped_operations(FILES_SCOPE)?
-        .into_iter()
-        .filter_map(|operation| {
-            let id = operation.operation_id?;
-            Some(((operation.key.method, operation.key.path), id))
-        })
-        .collect();
+    let mut pinned = OperationIds::new();
+    let mut missing_ids = Vec::new();
+    for operation in reference.document.scoped_operations(FILES_SCOPE)? {
+        let key = (operation.key.method, operation.key.path);
+        match operation.operation_id {
+            Some(id) => {
+                pinned.insert(key, id);
+            },
+            None => missing_ids.push(format!("pinned operation {} {} has no operationId", key.0, key.1)),
+        }
+    }
     let runtime: OperationIds = praxis_ai_apis::openai::files_operation_specs()
         .iter()
         .map(|spec| {
@@ -45,7 +47,8 @@ pub(super) fn check() -> Result<String, String> {
         .collect();
     let generated = generated_operations()?;
 
-    let failures = compare_three_way(&pinned, &runtime, &generated);
+    let mut failures = missing_ids;
+    failures.extend(compare_three_way(&pinned, &runtime, &generated));
     if failures.is_empty() {
         Ok(format!(
             "files registry, generated document, and pinned specification agree: {} operations checked",

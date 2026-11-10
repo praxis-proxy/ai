@@ -12,8 +12,8 @@
 //! Each operation declares its owned contract (parameters, request body, and
 //! response) once, and the runtime request-body shape is derived from that same
 //! declaration so the two cannot diverge. Entries stay `Passthrough` until local
-//! handlers land, so the generated implementation document stays empty until
-//! the handling mode switches to `Local`. Operation IDs are the official ones
+//! handlers land; generation and conformance comparison follow the declared
+//! contract, not the handling mode. Operation IDs are the official ones
 //! from the pinned OpenAI specification, reproduced verbatim including
 //! upstream's casing.
 

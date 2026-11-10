@@ -521,7 +521,6 @@ fn file_status_schema() -> Object {
 fn file_bytes_schema() -> Object {
     ObjectBuilder::new()
         .schema_type(Type::Integer)
-        .description(Some("The size of the file, in bytes."))
         .build()
 }
 

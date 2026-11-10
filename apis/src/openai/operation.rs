@@ -16,7 +16,14 @@ mod openapi;
 
 /// Shared conformance test helpers.
 #[cfg(test)]
-#[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
+#[cfg(any(
+    all(
+        feature = "openai-conversations",
+        feature = "_store-postgres",
+        feature = "store-sqlite"
+    ),
+    feature = "openai-files"
+))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
     clippy::unwrap_used,

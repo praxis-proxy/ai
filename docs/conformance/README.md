@@ -122,13 +122,10 @@ operation that declares a contract, so the comparison covers exactly what is
 generated. All eight current Conversations operations are `local`.
 
 The five Files operations are `passthrough` but declare their contracts, so
-oasdiff compares them against the pinned Files projection. Contract exceptions
-record where the generated contract deliberately deviates: the download
-returns `application/octet-stream` rather than the pinned `application/json`,
-`evals` is added to `OpenAIFile.purpose`, and the generated `OpenAIFile` states
-`type: object` explicitly. `cargo xtask check-files-registry` additionally
-compares pinned, runtime, and generated operation identity three ways and runs
-in `make lint`.
+oasdiff compares them against the pinned Files projection. See
+[Files contract](#files-contract) for the recorded deviations.
+`cargo xtask check-files-registry` additionally compares pinned, runtime, and
+generated operation identity three ways and runs in `make lint`.
 
 ### Files contract
 
@@ -149,7 +146,7 @@ in `make lint`.
   same rule as [Rate-limit response ownership](#rate-limit-response-ownership).
 - **Authentication.** Deployment-owned, as for Conversations. The Files scope
   uses `without_inherited_security()` so the pinned global bearer requirement
-  is not compared against a filter that does not authenticate; see
+  is not compared against the passthrough routes, which do not authenticate; see
   [Authentication ownership](#authentication-ownership).
 
 ### Rate-limit response ownership
