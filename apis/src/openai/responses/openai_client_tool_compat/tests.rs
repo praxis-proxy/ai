@@ -5,11 +5,11 @@
 
 use std::collections::HashSet;
 
-use praxis_filter::body::MAX_JSON_BODY_BYTES;
 use serde_json::{Value, json};
 
 use super::*;
 use crate::{
+    json_body::MAX_JSON_BODY_BYTES,
     openai::responses::agentic_loop::budget::SimpleBudget,
     test_utils::{make_filter_context, make_request},
 };

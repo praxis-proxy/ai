@@ -74,7 +74,7 @@ use bytes::Bytes;
 use praxis_core::config::ChainRef;
 use praxis_filter::{
     BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, FilterError, FilterPipeline, HttpFilter,
-    HttpFilterContext, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    HttpFilterContext, Rejection, parse_filter_config,
 };
 use tracing::{debug, trace, warn};
 
@@ -96,7 +96,7 @@ use crate::{
     callout_identity::{CalloutContextMissing, CalloutIdentity, credential_authority, stage_callout_identity},
     callout_policy::{MISSING_CALLOUT_CONTEXT, OnMissing},
     classifier::is_responses_create,
-    json_body::serialize_json_body,
+    json_body::{MAX_JSON_BODY_BYTES, serialize_json_body},
     openai::api_client::{ApiClient, ApiClientConfig, DownstreamRuntime, OutboundExecution},
     subrequest::SubRequestClient,
 };

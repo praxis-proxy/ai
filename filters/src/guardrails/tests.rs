@@ -664,7 +664,7 @@ phase:
     assert_eq!(
         filter.request_body_mode(),
         praxis_filter::body::BodyMode::StreamBuffer {
-            max_bytes: Some(praxis_filter::body::MAX_JSON_BODY_BYTES)
+            max_bytes: Some(praxis_ai_apis::json_body::MAX_JSON_BODY_BYTES)
         },
         "response-only guardrails should use the absolute JSON body limit"
     );

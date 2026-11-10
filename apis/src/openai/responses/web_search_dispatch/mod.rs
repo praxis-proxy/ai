@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
-    HttpFilterContext, IterationState, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    HttpFilterContext, IterationState, Rejection, parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -55,6 +55,7 @@ use super::{
 use crate::{
     callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity},
     callout_policy::MISSING_CALLOUT_CONTEXT,
+    json_body::MAX_JSON_BODY_BYTES,
     web_search::{
         CalloutContext, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome,
         SearchQueryValidation, SearchResult, build_config, config::MAX_CALLS_PER_ROUND, format_search_results,

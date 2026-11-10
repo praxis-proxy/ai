@@ -54,7 +54,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    Rejection, parse_filter_config,
 };
 use tracing::{debug, trace, warn};
 
@@ -75,7 +75,10 @@ use super::{
     responses_proxy::serialized_outbound_body_len,
     state::ResponsesState,
 };
-use crate::{classifier::is_responses_create, json_body::serialize_json_body};
+use crate::{
+    classifier::is_responses_create,
+    json_body::{MAX_JSON_BODY_BYTES, serialize_json_body},
+};
 
 /// Converts `input_file` content parts to `input_text` for backends
 /// that do not support `input_file` natively (e.g. vLLM, llm-d).

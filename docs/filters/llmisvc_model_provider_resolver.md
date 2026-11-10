@@ -13,12 +13,16 @@ If the header is absent/empty, or the body has no `"model"` field, this filter i
 
 Does **not** resolve `ExternalModel` / `ExternalProvider` CRDs, perform weighted provider selection, rewrite `Host`, or inject credentials.
 
+Request buffering inherits the pipeline's `max_request_bytes` and `max_buffer_bytes`. Optional `max_body_bytes` is a hard processing limit: bodies larger than it return HTTP 413 before parsing, independently of other filters' buffer declarations. The limit applies to the body received by this filter, before its own rewriting or enrichment.
+
+Omitting the limit removes the former implicit 10 MiB filter cap; pipeline limits still apply. Existing positive values remain valid and are now enforced even when another filter requests a larger shared buffer. Zero remains invalid; YAML `null` behaves like omission.
+
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `header` | string | no | Request header that carries the publisher ID for `KServe` routing. Defaults to `X-Model` (same as `model_to_header`). |
-| `max_body_bytes` | integer | no | Maximum request body size to buffer before parsing. |
+| `max_body_bytes` | integer | no | Optional hard request-body processing limit in bytes. Omit to inherit pipeline `max_request_bytes` and `max_buffer_bytes`; oversize bodies return HTTP 413 before parsing. |
 
 ## Example
 

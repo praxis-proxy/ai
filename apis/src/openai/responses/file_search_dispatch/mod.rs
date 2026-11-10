@@ -33,7 +33,7 @@ use bytes::Bytes;
 use http::HeaderMap;
 use praxis_filter::{
     BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
-    HttpFilterContext, IterationState, SubrequestRuntime, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    HttpFilterContext, IterationState, SubrequestRuntime, parse_filter_config,
 };
 use serde_json::Value;
 use tracing::warn;
@@ -51,6 +51,7 @@ use crate::{
     callout_identity::{CalloutContextMissing, stage_callout_identity},
     callout_policy::{MISSING_CALLOUT_CONTEXT, OnFailure},
     http_hop::connection_nominates_header,
+    json_body::MAX_JSON_BODY_BYTES,
     openai::{
         responses::{
             bounded_json_size,

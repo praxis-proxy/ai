@@ -11,7 +11,7 @@ use std::{
 #[cfg(feature = "openai-responses")]
 use praxis_ai_apis::openai::AgenticBudgetPolicy;
 use praxis_core::config::{
-    ChainRef, Config, ExpandedFilterChains, FailureMode, FilterEntry, InsecureOptions, Listener,
+    BodyLimitsConfig, ChainRef, Config, ExpandedFilterChains, FailureMode, FilterEntry, InsecureOptions, Listener,
 };
 use praxis_filter::{FilterPipeline, FilterRegistry};
 use praxis_protocol::ListenerPipelines;
@@ -224,8 +224,13 @@ fn build_listener_pipelines(
         let request_body_limit = config.body_limits.max_request_bytes;
         #[cfg(feature = "token-rate-limit-filter")]
         validate_shared_token_quota_pipeline(&entries, &chains, &listener.name)?;
-        let mut pipeline =
-            FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &config.insecure_options)?;
+        let mut pipeline = FilterPipeline::build_with_chains(
+            &mut entries,
+            &registry,
+            &chains,
+            &config.insecure_options,
+            &config.clusters,
+        )?;
         configure_pipeline(
             &mut pipeline,
             config,
@@ -687,11 +692,12 @@ fn configure_pipeline(
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
     request_body_limit: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    pipeline.apply_body_limits(
-        request_body_limit,
-        config.body_limits.max_response_bytes,
-        config.insecure_options.allow_unbounded_body,
-    )?;
+    let limits = BodyLimitsConfig {
+        max_buffer_bytes: config.body_limits.max_buffer_bytes,
+        max_request_bytes: request_body_limit,
+        max_response_bytes: config.body_limits.max_response_bytes,
+    };
+    pipeline.configure_body_limits(&limits, config.insecure_options.allow_unbounded_body)?;
     if !health_registry.is_empty() {
         pipeline.set_health_registry(Arc::clone(health_registry));
     }
@@ -1139,6 +1145,30 @@ mod tests {
         assert_eq!(agentic_request_body_cap(None, Some(policy)), Some(128));
         assert_eq!(agentic_request_body_cap(Some(64), Some(policy)), Some(64));
         assert_eq!(agentic_request_body_cap(Some(10_485_760), None), Some(10_485_760));
+
+        let mut config = valid_config();
+        config.body_limits.max_buffer_bytes = 4096.try_into().unwrap();
+        let mut pipeline = FilterPipeline::build(&mut [], &FilterRegistry::with_builtins()).unwrap();
+        configure_pipeline(
+            &mut pipeline,
+            &config,
+            &empty_health_registry(),
+            &empty_kv_stores(),
+            &empty_inflight_registry(),
+            &test_client(),
+            agentic_request_body_cap(config.body_limits.max_request_bytes, Some(policy)),
+        )
+        .unwrap();
+        assert_eq!(
+            pipeline.request_body_ceiling(),
+            Some(128),
+            "the agentic request cap must survive wiring"
+        );
+        assert_eq!(
+            pipeline.buffer_cap(),
+            4096,
+            "the independent buffering cap must also survive wiring"
+        );
     }
 
     #[test]
@@ -1432,6 +1462,111 @@ insecure_options:
             praxis_filter::BodyMode::SizeLimit { max_bytes: 2048 },
             "default Stream should become SizeLimit for enforcement"
         );
+    }
+
+    #[test]
+    fn model_inspection_inherits_configured_body_limits() {
+        for (limits, insecure, expected, buffer_cap) in [
+            ("", "", 10_485_760, 67_108_864),
+            ("max_request_bytes: 33554432", "", 33_554_432, 67_108_864),
+            ("max_buffer_bytes: 134217728", "", 10_485_760, 134_217_728),
+            ("max_request_bytes: 134217728", "", 67_108_864, 67_108_864),
+            (
+                "max_request_bytes: 134217728, max_buffer_bytes: 134217728",
+                "",
+                134_217_728,
+                134_217_728,
+            ),
+            ("max_request_bytes: 2048, max_buffer_bytes: 1024", "", 1024, 1024),
+            ("max_request_bytes: 1024, max_buffer_bytes: 2048", "", 1024, 2048),
+            (
+                "max_request_bytes: null, max_buffer_bytes: 2048",
+                "allow_unbounded_body: true",
+                2048,
+                2048,
+            ),
+        ] {
+            let config = Config::from_yaml(&format!(
+                r#"
+body_limits: {{ {limits} }}
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: model_to_header
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints: ["127.0.0.1:8001"]
+insecure_options:
+  allow_private_endpoints: true
+  {insecure}
+"#
+            ))
+            .unwrap();
+            let client = test_client();
+            let registry = crate::build_full_registry(&client);
+            let pipelines = resolve_pipelines(
+                &config,
+                &registry,
+                &empty_health_registry(),
+                &empty_kv_stores(),
+                &empty_inflight_registry(),
+                &client,
+            )
+            .unwrap();
+            let pipeline = pipelines.get("web").unwrap().load();
+            assert_eq!(pipeline.buffer_cap(), buffer_cap, "buffer cap for {limits}");
+            assert_eq!(
+                pipeline.body_capabilities().request_body_mode,
+                praxis_filter::BodyMode::StreamBuffer {
+                    max_bytes: Some(expected)
+                },
+                "effective inspection limit for {limits}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_pipelines_applies_max_buffer_bytes() {
+        for cap in [4096, 134_217_728] {
+            let mut config = valid_config();
+            config.body_limits.max_buffer_bytes = cap.try_into().unwrap();
+            config.body_limits.max_request_bytes = Some(268_435_456);
+            config.body_limits.max_response_bytes = Some(268_435_456);
+            config.filter_chains[0].filters.insert(
+                0,
+                serde_yaml::from_str(
+                    "filter: json_body\nmax_body_bytes: 268435456\nrequest_remove: [/secret]\nresponse_remove: [/secret]",
+                )
+                .unwrap(),
+            );
+            let pipelines = resolve_pipelines(
+                &config,
+                &FilterRegistry::with_builtins(),
+                &empty_health_registry(),
+                &empty_kv_stores(),
+                &empty_inflight_registry(),
+                &test_client(),
+            )
+            .unwrap();
+            let pipeline = pipelines.get("web").unwrap().load();
+            assert_eq!(
+                pipeline.buffer_cap(),
+                cap,
+                "configured buffering cap must reach the pipeline"
+            );
+            let expected = praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(cap) };
+            assert_eq!(pipeline.body_capabilities().request_body_mode, expected);
+            assert_eq!(pipeline.body_capabilities().response_body_mode, expected);
+        }
     }
 
     #[cfg(all(feature = "openai-file-resolve-filter", feature = "openai-mcp-tools"))]
@@ -1918,7 +2053,7 @@ filter_chains:
     /// KV store registry with one test store.
     fn make_kv_registry() -> praxis_core::kv::KvStoreRegistry {
         let registry = praxis_core::kv::KvStoreRegistry::new();
-        registry.get_or_create("test");
+        registry.get_or_create_memory("test");
         registry
     }
 

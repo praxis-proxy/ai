@@ -18,7 +18,7 @@ use std::{
 use arc_swap::ArcSwap;
 use pingora_core::server::{RunArgs, ShutdownSignal, ShutdownSignalWatch};
 use praxis_core::{
-    config::{Config, ExpandedFilterChains, Listener},
+    config::{BodyLimitsConfig, Config, ExpandedFilterChains, Listener},
     server::RuntimeOptions,
 };
 use praxis_filter::{FilterFactory, FilterPipeline, FilterRegistry, HttpFilter};
@@ -164,18 +164,25 @@ fn resolve_listener_pipeline(
         .map(|(name, filters)| (name.as_str(), filters.as_slice()))
         .collect();
 
-    let mut pipeline =
-        FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options).unwrap();
+    let mut pipeline = FilterPipeline::build_with_chains(
+        &mut entries,
+        registry,
+        &chains,
+        &config.insecure_options,
+        &config.clusters,
+    )
+    .unwrap();
     #[cfg(feature = "openai-responses")]
     let request_body_limit = praxis_ai::agentic_request_body_cap(config.body_limits.max_request_bytes, budget_policy);
     #[cfg(not(feature = "openai-responses"))]
     let request_body_limit = config.body_limits.max_request_bytes;
+    let limits = BodyLimitsConfig {
+        max_buffer_bytes: config.body_limits.max_buffer_bytes,
+        max_request_bytes: request_body_limit,
+        max_response_bytes: config.body_limits.max_response_bytes,
+    };
     pipeline
-        .apply_body_limits(
-            request_body_limit,
-            config.body_limits.max_response_bytes,
-            config.insecure_options.allow_unbounded_body,
-        )
+        .configure_body_limits(&limits, config.insecure_options.allow_unbounded_body)
         .unwrap();
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     pipeline.set_subrequest_client(client.clone());
@@ -900,6 +907,29 @@ mod tests {
 
     use super::{ProxyGuard, ProxyShutdownError, simple_proxy_yaml, start_proxy};
     use crate::{free_port_guard, http_get};
+
+    #[test]
+    fn max_buffer_bytes_rejects_oversized_buffered_requests() {
+        let proxy_port = free_port_guard().release();
+        let backend = crate::Backend::fixed("ok").start_with_shutdown();
+        let mut config =
+            Config::from_yaml(&simple_proxy_yaml(proxy_port, backend.port())).expect("test config should parse");
+        config.body_limits.max_buffer_bytes = 64.try_into().expect("buffer cap should be valid");
+        config.filter_chains[0].filters.insert(
+            0,
+            serde_yaml::from_str("filter: json_body\nrequest_remove: [/secret]")
+                .expect("buffering filter should parse"),
+        );
+        let _proxy = start_proxy(&config);
+        let address = format!("127.0.0.1:{proxy_port}");
+        assert_eq!(crate::http_post(&address, "/", r#"{"secret":"small"}"#).0, 200);
+        let oversized = format!(r#"{{"secret":"{}"}}"#, "x".repeat(128));
+        assert_eq!(
+            crate::http_post(&address, "/", &oversized).0,
+            413,
+            "the buffering cap must reject bodies below the larger transfer ceiling"
+        );
+    }
 
     #[test]
     fn metrics_listener_records_counters_without_admin_api() {

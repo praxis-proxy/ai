@@ -813,7 +813,7 @@ provider:
             .unwrap_or_else(|error| panic!("guardrails entry should parse: {error}")),
         ];
         let chains = HashMap::new();
-        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
+        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[])
             .expect("omitting outbound_chain should build an empty pass-through chain");
     }
 
@@ -840,7 +840,7 @@ provider:
             .expect("the controller's insecure_options must be fields Praxis accepts");
         let mut entries: Vec<FilterEntry> =
             serde_yaml::from_value(config["filter_chains"][0]["filters"].clone()).unwrap();
-        FilterPipeline::build_with_chains(&mut entries, &build_ai_registry(), &HashMap::new(), &insecure)
+        FilterPipeline::build_with_chains(&mut entries, &build_ai_registry(), &HashMap::new(), &insecure, &[])
             .expect("the controller-compiled NeMo callout must build");
     }
 
@@ -861,7 +861,8 @@ provider:
             .unwrap_or_else(|error| panic!("guardrails entry should parse: {error}")),
         ];
         let chains = HashMap::new();
-        let result = FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default());
+        let result =
+            FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[]);
         assert!(
             result.is_err(),
             "production registry must reject an unbuildable outbound_chain"
@@ -886,9 +887,14 @@ provider:
     fn guardrails_ordering_errors(prefix: &str, allow_open_security: bool) -> Vec<String> {
         let registry = build_ai_registry();
         let mut entries = vec![guardrails_entry(prefix)];
-        let pipeline =
-            FilterPipeline::build_with_chains(&mut entries, &registry, &HashMap::new(), &InsecureOptions::default())
-                .expect("ai_guardrails should build");
+        let pipeline = FilterPipeline::build_with_chains(
+            &mut entries,
+            &registry,
+            &HashMap::new(),
+            &InsecureOptions::default(),
+            &[],
+        )
+        .expect("ai_guardrails should build");
         pipeline.ordering_errors(&entries, allow_open_security, &SkipPipelineChecks::default())
     }
 
@@ -1008,6 +1014,7 @@ provider:
                 &registry,
                 &HashMap::new(),
                 &InsecureOptions::default(),
+                &[],
             );
             let Err(error) = result else {
                 panic!("an unavailable filter must fail pipeline construction");
@@ -1063,7 +1070,8 @@ outbound_chain:
 ",
         )];
         let chains = HashMap::new();
-        let result = FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default());
+        let result =
+            FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[]);
         assert!(
             result.is_err(),
             "an outbound chain referencing an unknown filter must fail the pipeline build"
@@ -1092,7 +1100,7 @@ allow_pre_security_callout: true
 ",
         )];
         let chains = HashMap::new();
-        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
+        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[])
             .expect("an omitted outbound_chain must default to an empty inline chain and bind");
     }
 
@@ -1115,7 +1123,8 @@ outbound_chain:
 ",
         )];
         let chains = HashMap::new();
-        let result = FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default());
+        let result =
+            FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[]);
         assert!(
             result.is_err(),
             "an outbound chain referencing an unknown filter must fail the pipeline build"
@@ -1143,7 +1152,7 @@ outbound_chain:
 ",
         )];
         let chains = HashMap::new();
-        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
+        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[])
             .expect("a resolvable outbound chain must build");
     }
 
@@ -1187,7 +1196,7 @@ outbound_chain:
         .expect("named outbound chain should parse");
         let chains = HashMap::from([("vector-store-outbound", chain_entries.as_slice())]);
 
-        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
+        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[])
             .expect("named outbound chain should resolve inside the IRR step");
     }
 }
