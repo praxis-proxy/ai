@@ -3314,7 +3314,8 @@ fn commit_deferred_listings(
     }
 
     let retained = if let Some(slot) = budget {
-        let mut charge = request_body
+        let mut charge = state
+            .request_body
             .get("tools")
             .map(discovery_value_charge)
             .transpose()?

@@ -7,10 +7,7 @@ use bytes::{Bytes, BytesMut};
 use praxis_filter::{FilterAction, FilterEntry, FilterPipeline, SelectedUpstreamBodyOutcome};
 use serde_json::json;
 
-use super::{
-    super::{request_input::{InputForm, input_echo_value}, state::normalize_input_owned},
-    *,
-};
+use super::*;
 use crate::{
     openai::sse::{SseFrame, SseFrameParser},
     store::{
@@ -2232,51 +2229,57 @@ async fn configuration_update_applies_to_native_and_translated_conversation_requ
 
 #[tokio::test]
 async fn configuration_update_publishes_merged_default_to_live_request_body() {
-    for request_reasoning in [
-        None,
-        Some(json!({})),
-        Some(json!({"effort": null})),
-        Some(json!({"effort": "low"})),
-    ] {
-        let stored = json!([
-            {"type": "configuration_update", "id": "cnfu_1", "reasoning": {"effort": "medium"}},
-            {"type": "message", "id": "msg_1", "role": "user", "content": "hello"},
-            {"type": "configuration_update", "id": "cnfu_2", "reasoning": {"effort": "high"}},
-        ]);
-        let registry = setup_registry(MockStore::with_conversation("conv_config", stored));
-        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-        let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-        ctx.extensions.insert(registry);
-        ctx.set_metadata("openai_responses_request.format", "openai_responses");
-        let mut request = json!({"model": "gpt-4.1", "input": "continue", "conversation": "conv_config"});
-        if let Some(reasoning) = &request_reasoning {
-            request["reasoning"] = reasoning.clone();
+    for reuse_state in [false, true] {
+        for request_reasoning in [
+            None,
+            Some(json!({})),
+            Some(json!({"effort": null})),
+            Some(json!({"effort": "low"})),
+        ] {
+            let stored = json!([
+                {"type": "configuration_update", "id": "cnfu_1", "reasoning": {"effort": "medium"}},
+                {"type": "message", "id": "msg_1", "role": "user", "content": "hello"},
+                {"type": "configuration_update", "id": "cnfu_2", "reasoning": {"effort": "high"}},
+            ]);
+            let registry = setup_registry(MockStore::with_conversation("conv_config", stored));
+            let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+            let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+            ctx.extensions.insert(registry);
+            ctx.set_metadata("openai_responses_request.format", "openai_responses");
+            let mut request = json!({"model": "gpt-4.1", "input": "continue", "conversation": "conv_config"});
+            if let Some(reasoning) = &request_reasoning {
+                request["reasoning"] = reasoning.clone();
+            }
+            let mut body = Some(Bytes::from(serde_json::to_vec(&request).unwrap()));
+            if reuse_state {
+                ctx.extensions
+                    .insert(ResponsesState::from_managed_request_body(request));
+            }
+            let action = default_filter()
+                .on_request_body(&mut ctx, &mut body, true)
+                .await
+                .unwrap();
+            assert!(
+                matches!(action, FilterAction::Release),
+                "rehydration must release: request_reasoning={request_reasoning:?}"
+            );
+            let live: Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+            // An effort the request carried (including an explicit null) wins; a
+            // vacant or absent effort inherits the latest stored default.
+            let expected_effort = match &request_reasoning {
+                Some(reasoning) => reasoning.get("effort").cloned().unwrap_or_else(|| json!("high")),
+                None => json!("high"),
+            };
+            assert_eq!(
+                live["reasoning"]["effort"], expected_effort,
+                "the merged default must be published to the live body later filters see: request_reasoning={request_reasoning:?}"
+            );
+            assert_eq!(live["model"], "gpt-4.1", "unrelated members must be preserved in place");
+            assert_eq!(
+                live["conversation"], "conv_config",
+                "the selector stays for the selected rebuild to remove"
+            );
         }
-        let mut body = Some(Bytes::from(serde_json::to_vec(&request).unwrap()));
-        let action = default_filter()
-            .on_request_body(&mut ctx, &mut body, true)
-            .await
-            .unwrap();
-        assert!(
-            matches!(action, FilterAction::Release),
-            "rehydration must release: request_reasoning={request_reasoning:?}"
-        );
-        let live: Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
-        // An effort the request carried (including an explicit null) wins; a
-        // vacant or absent effort inherits the latest stored default.
-        let expected_effort = match &request_reasoning {
-            Some(reasoning) => reasoning.get("effort").cloned().unwrap_or_else(|| json!("high")),
-            None => json!("high"),
-        };
-        assert_eq!(
-            live["reasoning"]["effort"], expected_effort,
-            "the merged default must be published to the live body later filters see: request_reasoning={request_reasoning:?}"
-        );
-        assert_eq!(live["model"], "gpt-4.1", "unrelated members must be preserved in place");
-        assert_eq!(
-            live["conversation"], "conv_config",
-            "the selector stays for the selected rebuild to remove"
-        );
     }
 }
 

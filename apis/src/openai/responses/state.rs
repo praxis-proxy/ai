@@ -27,7 +27,9 @@ use praxis_filter::FilterAction;
 use super::mcp_classify::ApprovalFloor;
 #[cfg(any(test, feature = "openai-agentic-loop"))]
 use super::{bounded_json_size, error::responses_error_rejection, file_search_dispatch::citations::annotate_response};
-use super::{history::MessageHistory, openai_client_tool_compat::custom_input::CustomInputFormat, request_input::InputForm};
+use super::{
+    history::MessageHistory, openai_client_tool_compat::custom_input::CustomInputFormat, request_input::InputForm,
+};
 #[cfg(any(test, feature = "openai-agentic-loop"))]
 use crate::json_body::MAX_JSON_BODY_BYTES;
 

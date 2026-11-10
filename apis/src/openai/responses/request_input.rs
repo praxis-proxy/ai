@@ -7,11 +7,10 @@
 //! is decoded only once. [`InputForm`] records the input's original JSON shape so
 //! callers can reproduce the client's form (including the string shorthand)
 //! without retaining a second decoded copy: MCP tool discovery re-serializes the
-//! current request via `CurrentRequestBody` (gated on `openai-mcp-tools`), and
+//! current request via `CurrentRequestBody`, and
 //! response synthesis echoes the client's input back onto the Responses resource
 //! via [`input_echo_value`].
 
-#[cfg(feature = "openai-mcp-tools")]
 use serde::ser::SerializeMap as _;
 use serde_json::Value;
 
@@ -58,13 +57,11 @@ impl InputForm {
 /// Only MCP tool discovery re-serializes the current request, so this view is
 /// gated on `openai-mcp-tools`; [`input_echo_value`] serves the always-present
 /// response-synthesis echo.
-#[cfg(feature = "openai-mcp-tools")]
 pub(crate) struct CurrentRequestBody<'a> {
     /// Request state to project.
     state: &'a ResponsesState,
 }
 
-#[cfg(feature = "openai-mcp-tools")]
 impl<'a> CurrentRequestBody<'a> {
     /// Borrow `state` for current-request serialization.
     #[must_use]
@@ -73,7 +70,6 @@ impl<'a> CurrentRequestBody<'a> {
     }
 }
 
-#[cfg(feature = "openai-mcp-tools")]
 impl serde::Serialize for CurrentRequestBody<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let Some(object) = self.state.request_body.as_object() else {
@@ -140,7 +136,6 @@ mod tests {
     use super::*;
 
     /// Serialize the current-request view of `body` and return its `input` member.
-    #[cfg(feature = "openai-mcp-tools")]
     fn current_input(body: Value) -> Option<Value> {
         let state = ResponsesState::from_request_body(body);
         let serialized = serde_json::to_value(CurrentRequestBody::new(&state)).unwrap();
@@ -211,7 +206,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "openai-mcp-tools")]
     #[test]
     fn string_input_round_trips_as_shorthand() {
         assert_eq!(
@@ -221,7 +215,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "openai-mcp-tools")]
     #[test]
     fn object_input_round_trips_as_single_object() {
         let object = json!({"type": "message", "role": "user", "content": "hi"});
@@ -232,7 +225,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "openai-mcp-tools")]
     #[test]
     fn array_input_round_trips_as_array() {
         let array = json!([{"type": "message", "role": "user", "content": "a"}]);
@@ -243,13 +235,11 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "openai-mcp-tools")]
     #[test]
     fn null_input_round_trips_as_null() {
         assert_eq!(current_input(json!({"model": "m", "input": null})), Some(json!(null)));
     }
 
-    #[cfg(feature = "openai-mcp-tools")]
     #[test]
     fn missing_input_is_omitted() {
         assert_eq!(
@@ -259,7 +249,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "openai-mcp-tools")]
     #[test]
     fn unsupported_scalar_input_stays_in_parameters() {
         // A number cannot be normalized; it is retained in the parameters and

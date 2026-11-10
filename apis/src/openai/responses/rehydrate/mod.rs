@@ -162,12 +162,18 @@ impl RehydrateFilter {
             .map(|state| state.history_rehydrated)
         {
             Some(true) => return Ok(FilterAction::Release),
-            Some(false) => return self.rehydrate_reusing_state(ctx).await,
+            Some(false) => return self.rehydrate_reusing_state(ctx, body).await,
             None => {},
         }
         match parse_body_and_extract_id(bytes) {
-            Ok((body, Some(id))) => self.rehydrate_from_response(ctx, StateSource::Parsed(body), id).await,
-            Ok((body, None)) => self.rehydrate_from_conversation(ctx, StateSource::Parsed(body)).await,
+            Ok((parsed_body, Some(id))) => {
+                self.rehydrate_from_response(ctx, body, StateSource::Parsed(parsed_body), id)
+                    .await
+            },
+            Ok((parsed_body, None)) => {
+                self.rehydrate_from_conversation(ctx, body, StateSource::Parsed(parsed_body))
+                    .await
+            },
             Err(action) => Ok(action),
         }
     }
@@ -175,7 +181,11 @@ impl RehydrateFilter {
     /// Rehydrate by reusing the existing [`ResponsesState`] instead of re-parsing
     /// the request body (#1618). Selectors are re-read from the retained
     /// parameters, preserving the same validation as [`parse_body_and_extract_id`].
-    async fn rehydrate_reusing_state(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    async fn rehydrate_reusing_state(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<FilterAction, FilterError> {
         let prev_id = {
             let Some(state) = ctx.extensions.get::<ResponsesState>() else {
                 return Ok(reject_server_error("request pipeline state is unavailable"));
@@ -187,8 +197,8 @@ impl RehydrateFilter {
             }
         };
         match prev_id {
-            Some(id) => self.rehydrate_from_response(ctx, StateSource::Reuse, id).await,
-            None => self.rehydrate_from_conversation(ctx, StateSource::Reuse).await,
+            Some(id) => self.rehydrate_from_response(ctx, body, StateSource::Reuse, id).await,
+            None => self.rehydrate_from_conversation(ctx, body, StateSource::Reuse).await,
         }
     }
 
@@ -196,6 +206,7 @@ impl RehydrateFilter {
     async fn rehydrate_from_response(
         &self,
         ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
         source: StateSource,
         prev_id: String,
     ) -> Result<FilterAction, FilterError> {
@@ -217,7 +228,7 @@ impl RehydrateFilter {
         bind_previous_tools_to_owner(&mut previous_tools, &owner);
         let previous_usage = record.response_object.get("usage").filter(|u| !u.is_null()).cloned();
         let stored = stored_messages_for_response(record);
-        let state = match resolve_rehydrated_state(ctx, source, stored, previous_tools, previous_usage) {
+        let state = match resolve_rehydrated_state(ctx, body, source, stored, previous_tools, previous_usage) {
             Ok(state) => state,
             Err(action) => return Ok(action),
         };
@@ -232,6 +243,7 @@ impl RehydrateFilter {
     async fn rehydrate_from_conversation(
         &self,
         ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
         source: StateSource,
     ) -> Result<FilterAction, FilterError> {
         let conv_id = match source.conversation_id(ctx) {
@@ -250,7 +262,7 @@ impl RehydrateFilter {
             return Ok(action);
         }
         let stored = stored_messages_for_conversation(record);
-        let state = match resolve_rehydrated_state(ctx, source, stored, vec![], None) {
+        let state = match resolve_rehydrated_state(ctx, body, source, stored, vec![], None) {
             Ok(state) => state,
             Err(action) => return Ok(action),
         };
@@ -1385,6 +1397,7 @@ impl StateSource {
 /// exists and otherwise building one from the parsed body (#1618).
 fn resolve_rehydrated_state(
     ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
     source: StateSource,
     stored: Vec<Value>,
     previous_tools: Vec<Value>,
@@ -1395,15 +1408,29 @@ fn resolve_rehydrated_state(
             // Re-guard structural complexity before reconstructing state so this
             // alternate initialization path cannot bypass the managed-create bound (#1618).
             super::complexity::enforce(ctx, &parsed_body)?;
-            Ok(build_state(parsed_body, stored, previous_tools, previous_usage))
+            Ok(merge_configuration_and_build_state(
+                body,
+                parsed_body,
+                stored,
+                previous_tools,
+                previous_usage,
+            ))
         },
         StateSource::Reuse => {
             // The managed owner already enforced the structural bound at
             // finish_managed_request, so reuse its decoded state and merge history
             // into it instead of re-parsing and rebuilding (#1618).
-            let Some(existing) = ctx.extensions.remove::<ResponsesState>() else {
+            let Some(mut existing) = ctx.extensions.remove::<ResponsesState>() else {
                 return Err(reject_server_error("request pipeline state is unavailable"));
             };
+            if apply_stored_configuration(&mut existing.request_body, &stored) {
+                match serde_json::to_vec(&super::request_input::CurrentRequestBody::new(&existing)) {
+                    Ok(bytes) => *body = Some(Bytes::from(bytes)),
+                    Err(error) => {
+                        warn!(error = %error, "rehydrate: failed to publish merged configuration to request body")
+                    },
+                }
+            }
             Ok(rehydrate_existing_state(
                 existing,
                 stored,
@@ -1418,8 +1445,6 @@ fn resolve_rehydrated_state(
 ///
 /// Mirrors [`build_state`]'s post-decode steps: the owner already materialized the
 /// current input, so only the stored history, tools, and usage are layered on.
-/// `request_reasoning` is left as the owner recorded it from the original request,
-/// exactly as `build_state` captures it before applying stored configuration.
 fn rehydrate_existing_state(
     mut state: ResponsesState,
     stored: Vec<Value>,

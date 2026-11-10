@@ -164,7 +164,7 @@ impl OpenaiResponsesRequestFilter {
             self.config.max_input_nodes.to_string(),
         );
         if let Some(reason) = super::complexity::rejects(&parsed, self.config.max_input_nodes.get()) {
-            return FilterAction::Reject(super::error::responses_error_rejection(
+            return FilterAction::Reject(responses_error_rejection(
                 413,
                 "invalid_request_error",
                 reason.message(),
