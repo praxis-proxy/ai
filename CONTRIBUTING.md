@@ -48,12 +48,17 @@ go through the [proposal process].
 CI enforces reviewability on every PR:
 
 - A maximum added lines count of production code (tests, docs, examples excluded)
+- A link to the issue the PR addresses, using `Closes #123` when the PR
+  completes the issue or `Refs #123` when the issue remains open.
 - A description with non-empty **Why**, **What**, and **How** sections. Explain
   why the change is needed, what problem it fixes, and how the implementation
   addresses it. The Praxis bot check fails when any section is missing or empty.
   PRs that add a filter parameter must also justify why the parameter is
   needed, what behavior it controls, and why existing configuration is
   insufficient.
+- Maintainer review starts only after all required CI checks pass. A maintainer
+  assignment signals that review has started; contributors should wait for CI
+  to be green before requesting or expecting that assignment.
 - A `Signed-off-by`
   trailer on every commit (`git commit -s`)
 - Cryptographically signed commits (GPG or SSH)

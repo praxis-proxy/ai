@@ -15,7 +15,8 @@
 
 ## Related issue
 
-<!-- Contributors must be assigned to the issue before opening a PR. -->
+<!-- Every PR must link the issue it addresses. Use "Closes #123" if this PR
+     completes the issue, or "Refs #123" if the issue remains open. -->
 
 Closes #
 

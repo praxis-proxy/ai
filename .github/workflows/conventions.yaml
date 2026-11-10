@@ -54,6 +54,10 @@ jobs:
               "what": re.compile(r"^#{1,6}\s+what\b", re.IGNORECASE),
               "how": re.compile(r"^#{1,6}\s+how\b", re.IGNORECASE),
           }
+          issue_reference = re.compile(
+              r"^\s*(?:closes?|fix(?:es|ed)?|resolves?|refs?|related to|part of)\s+#\d+\b",
+              re.IGNORECASE,
+          )
           sections = {}
           current = None
           for line in body.splitlines():
@@ -72,30 +76,36 @@ jobs:
               content = re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL).strip()
               if not content:
                   missing.append(name)
+          if not any(issue_reference.search(line) for line in body.splitlines()):
+              missing.append("issue")
           print(" ".join(missing))
           PY
           )
 
           if [ -n "$missing" ]; then
-            marker="<!-- praxis:pr-description-check-v2 -->"
+            marker="<!-- praxis:pr-description-check-v3 -->"
             details=""
             for section in $missing; do
-              details="${details}\n- ${section^}: add a short explanation under the section heading."
+              if [ "$section" = "issue" ]; then
+                details="${details}\n- Related issue: add Closes #123 or Refs #123 for the issue this PR addresses."
+              else
+                details="${details}\n- ${section^}: add a short explanation under the section heading."
+              fi
             done
             already=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
               --jq "[.[] | select(.body | contains(\"${marker}\"))] | length")
             if [ "$already" -eq 0 ]; then
               gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" \
                 --body "${marker}
-                This PR needs a description with non-empty **Why**, **What**, and **How** sections. Explain why the change is needed, what problem it fixes, and how the change addresses it. For a new filter parameter, justify why it is needed and what behavior it controls.${details}
+                This PR needs non-empty **Why**, **What**, and **How** sections plus a linked issue reference. Explain why the change is needed, what problem it fixes, and how the change addresses it. For a new filter parameter, justify why it is needed and what behavior it controls.${details}
 
                 See [CONTRIBUTING.md](https://github.com/praxis-proxy/praxis-ai/blob/main/CONTRIBUTING.md#pull-request-gates)."
             fi
-            echo "PR description is missing content for: $missing"
+            echo "PR description or issue reference is missing: $missing"
             exit 1
           fi
 
-          echo "PR description contains non-empty Why, What, and How sections."
+          echo "PR description contains non-empty Why, What, and How sections and links an issue."
 
   # ----------------------------------------------------------------------------
   # Dependency Version Check
