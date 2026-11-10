@@ -124,6 +124,7 @@ macro_rules! operation_contract {
                 request: request_binding!($request),
                 responses: &[ResponseSpec {
                     status: "200",
+                    headers: &[],
                     description: "OK",
                     content: &[response_binding!($response)],
                 }],
