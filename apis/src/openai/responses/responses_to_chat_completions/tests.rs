@@ -2668,3 +2668,37 @@ fn translated_late_reasoning_tracks_each_round_in_request_state() {
         [1..=2, 4..=5]
     );
 }
+
+#[tokio::test]
+async fn access_programs_is_rejected_before_chat_translation() {
+    for selection in [
+        json!({}),
+        json!({"cyber": "standard"}),
+        json!({"cyber": "daybreak_blue"}),
+        json!({"cyber": "daybreak_red"}),
+        json!(null),
+    ] {
+        let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut context = crate::test_utils::make_filter_context(&request);
+        context.set_metadata("openai_responses_request.format", "openai_responses");
+        let request_body = json!({"model": "m", "input": "hello", "access_programs": selection});
+        let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
+        context
+            .extensions
+            .insert(ResponsesState::from_request_body(request_body));
+        let action = filter
+            .on_selected_upstream_request_body(&mut context, &mut body)
+            .await
+            .unwrap();
+        let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
+            panic!("expected access_programs rejection");
+        };
+        assert_eq!(rejection.status, 400);
+        let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert_eq!(error["error"]["code"], "invalid_request_error");
+        assert!(error["error"]["message"].as_str().unwrap().contains("access_programs"));
+        assert!(context.get_metadata(ARMED_KEY).is_none());
+    }
+}

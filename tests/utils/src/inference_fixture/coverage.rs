@@ -1321,6 +1321,7 @@ mod tests {
                 vec!["responses_native_passthrough"],
                 vec!["openai_chat_completions_to_anthropic_messages"],
                 vec!["openai_responses_to_chat_completions"],
+                vec!["openai_responses_to_chat_completions"],
             ]
         );
         assert_eq!(
@@ -1421,9 +1422,10 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 91, "manifest feature inventory count");
+        assert_eq!(report.features_total, 92, "manifest feature inventory count");
         assert_eq!(report.scenarios_total, 71, "manifest scenario inventory count");
         assert_eq!(report.recordings_total, 76, "manifest recording inventory count");
         assert_eq!(
@@ -1502,7 +1504,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 91, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 92, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1920,6 +1922,13 @@ mod tests {
                     &"responses.chat.tools.orphan_output_projection".to_owned(),
                     &vec!["responses/chat-orphan-tool-output".to_owned()]
                 ),
+                (
+                    &"responses.chat.access_programs".to_owned(),
+                    &vec![
+                        "responses/chat-basic-nonstream".to_owned(),
+                        "responses/chat-unrepresentable-parameters".to_owned(),
+                    ]
+                ),
             ]
         );
         for feature in &manifest.features[0..2] {
@@ -2090,7 +2099,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)],
         );
-        for feature in &manifest.features[62..91] {
+        for feature in &manifest.features[62..92] {
             assert_eq!(
                 feature
                     .providers
@@ -2390,6 +2399,7 @@ mod tests {
                 "responses.chat.continuation",
                 "responses.chat.auto_tool_choice_without_tools",
                 "responses.chat.shared_controls",
+                "responses.chat.access_programs",
             ]
         );
         assert_eq!(responses_chat.turns.len(), 2);

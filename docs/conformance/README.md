@@ -108,19 +108,25 @@ The pinned OpenAI reference declares a `429` response on all eight
 Conversations operations. Its `TooManyRequests` contract includes an optional
 integer `Retry-After` header (minimum 1) and an `ErrorResponse` JSON body.
 
-The local Conversations handlers do not produce `429` responses. Their registry
-therefore does not declare that response. A deployment rate limiter can reject
-traffic before the handler, but that does not establish the upstream response
-contract for the locally owned operation. In particular, the token rate limiter
-returns a bodyless rejection, while `OpenAiErrorFormatter` formats fatal proxy
-errors, not arbitrary filter rejections.
+The Conversations filter owns an optional `rate_limit` admission path that
+reuses the core request limiter. It runs after classification and trusted owner
+resolution, before store access, and covers all eight local operations. Its
+adapter adds the OpenAI JSON error envelope while preserving the core limiter's
+`Retry-After` and rate-limit headers. The operation registry declares the shared
+429 body and optional retry header from runtime contract types.
 
-The eight missing `429` responses remain actionable response drift. Do not copy
-the upstream error schema into the implementation document without a runtime
-path that produces it, or exclude the status from comparison. Closing this gap
-requires a runtime-owned rate-limit response path and focused tests of its JSON
-body and optional retry header before changing the registry and regenerating
-this report.
+`mode: global` shares a budget across callers of that filter instance;
+`mode: per_ip` groups requests by their TCP peer address, independently of the
+Conversations store's owner isolation. The core configuration controls refill,
+burst, IPv6 grouping, and shadow mode. Omitting the block disables admission.
+Buckets are local to the pipeline instance and reset when it is rebuilt. This is
+request admission, not a distributed or owner-specific quota guarantee.
+
+The focused conformance suite requires a runtime rejection test for every
+operation, validated against the pinned error schema. SDK tests exercise all
+eight HTTP paths and verify that rejected mutations preserve existing state.
+The default example demonstrates admission and has a functional rejection test.
+The fatal proxy error formatter remains a separate response path.
 
 ### Authentication ownership
 

@@ -1174,6 +1174,7 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
             return
         if request_body and (
             request_body.get("prompt") is not None
+            or "access_programs" in request_body
             or any(tool.get("type") == "code_interpreter" for tool in (request_body.get("tools") or []))
         ):
             self._send_provider_owned_response(request_body)
@@ -4247,6 +4248,19 @@ class TestOpenAIResponsesVLLM:
             "type": "invalid_request_error",
         }, "error envelope must report background mode is unsupported"
 
+    @pytest.mark.parametrize("selection", [{}, {"cyber": "daybreak_blue"}])
+    def test_access_programs_native_passthrough(self, witness_backend_client, selection):
+        client, forwarded = witness_backend_client
+        response = client.responses.create(
+            model="gpt-5",
+            input="SDK access programs passthrough",
+            store=False,
+            extra_body={"access_programs": selection},
+        )
+        assert response.status == "completed"
+        assert len(forwarded) == 1
+        assert forwarded[0]["access_programs"] == selection
+
     def test_openai_bound_background_create_and_stream(self, witness_backend_client):
         """The stock full-flow pipeline preserves OpenAI-owned background creates."""
         client, forwarded = witness_backend_client
@@ -5401,6 +5415,35 @@ class TestResponsesToChatCompletionsVLLM:
     # pipeline, not native Responses passthrough, so it measures the contract
     # owned by the translation filter.
 
+    @pytest.mark.parametrize(
+        "selection",
+        [
+            {},
+            {"cyber": "standard"},
+            {"cyber": "daybreak_blue"},
+            {"cyber": "daybreak_red"},
+            None,
+        ],
+    )
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_access_programs_is_rejected_before_chat_backend(
+        self, reasoning_capture_client, selection, stream
+    ):
+        client, forwarded = reasoning_capture_client
+        with pytest.raises(BadRequestError) as exc_info:
+            client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input="hello",
+                store=False,
+                stream=stream,
+                extra_body={"access_programs": selection},
+            )
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.body["type"] == "invalid_request_error"
+        assert exc_info.value.body["code"] == "invalid_request_error"
+        assert "access_programs" in exc_info.value.body["message"]
+        assert not forwarded
+
     def test_shared_controls_reach_chat_backend(self, reasoning_capture_client):
         """The SDK request's provider controls survive the checked-in pipeline."""
         client, forwarded = reasoning_capture_client
@@ -5431,7 +5474,7 @@ class TestResponsesToChatCompletionsVLLM:
             },
         )
 
-        assert "access_programs" in json.loads(raw_response.text)
+        assert json.loads(raw_response.text).get("access_programs", "missing") is None
         response = raw_response.parse()
         assert response.status == "completed"
         assert response.access_programs is None
