@@ -1,7 +1,7 @@
 # OpenAI Conformance
 
 This directory tracks Praxis AI conformance against selected OpenAI API
-surfaces. The current scope is Conversations and Responses.
+surfaces. The current scopes are Conversations, Responses and Files.
 
 This directory also vendors the upstream Anthropic Messages API OpenAPI
 document at `specs/anthropic-spec.json`. It is read by the automated PR review
@@ -28,6 +28,17 @@ Conformance compares two independent truths:
 The registry generates runtime matching, capability claims, and the local
 implementation OpenAPI document. The report is derived output; editing it
 does not add support.
+
+Files is a Praxis-owned contract on top of the same pin. The source chain is:
+
+1. the pinned full spec, projected to the `/files` scope;
+2. the `files_operations!` registry, which owns operation identity and the
+   declared contract of each operation;
+3. the DTOs in `files/contracts.rs`, which the registry references;
+4. the generated `files_openapi_json()` document.
+
+There is no trimmed or hand-maintained copy of the Files spec. Everything
+downstream of the pin is generated or derived from the registry.
 
 ## How It Fits Together
 
@@ -74,6 +85,12 @@ than declaring behavior Praxis does not implement.
   response types shared by runtime behavior and generated schemas.
 - `apis/src/openai/conversations/openapi.rs` builds the implementation OpenAPI
   document from the registry.
+- `apis/src/openai/files/routes/` (`mod.rs`), `contracts.rs`, `openapi.rs`, and
+  `tests.rs` play the same roles for Files: the `files_operations!` registry,
+  the wire DTOs, the generated implementation document, and the
+  `conformance_files_` runtime checks.
+- `xtask/src/openai_conformance/files_registry.rs` implements
+  `cargo xtask check-files-registry`.
 - `apis/src/openai/operation.rs` provides handling modes and reusable
   parameter, media-type, request, response, and OpenAPI generation metadata.
 - `apis/src/openai/conversations/filter.rs` and `handlers.rs` execute the
@@ -112,6 +129,28 @@ returns `application/octet-stream` rather than the pinned `application/json`,
 `type: object` explicitly. `cargo xtask check-files-registry` additionally
 compares pinned, runtime, and generated operation identity three ways and runs
 in `make lint`.
+
+### Files contract
+
+- **Handling mode versus contract.** All five Files operations are
+  `passthrough`: Praxis forwards them without mutation. Each still declares a
+  contract, and generation and oasdiff comparison follow the declared contract,
+  not the handling mode.
+- **Schema deviations from the pin.** These are recorded as
+  `FILES_CONTRACT_EXCEPTIONS` in `xtask/src/openai_conformance/area.rs`:
+  `evals` is added to `OpenAIFile.purpose` (it is an accepted upload purpose);
+  the generated `OpenAIFile` states `type: object` explicitly; and the download
+  returns `application/octet-stream` instead of the pinned `application/json`.
+- **Serialization choices within the pinned schema** (not exceptions):
+  `status` is always present (`processed`); `expires_at` and `status_details`
+  are omitted when absent; an empty list has `first_id` and `last_id` set to
+  `""`.
+- **Error responses.** None are declared until a handler produces them, by the
+  same rule as [Rate-limit response ownership](#rate-limit-response-ownership).
+- **Authentication.** Deployment-owned, as for Conversations. The Files scope
+  uses `without_inherited_security()` so the pinned global bearer requirement
+  is not compared against a filter that does not authenticate; see
+  [Authentication ownership](#authentication-ownership).
 
 ### Rate-limit response ownership
 
@@ -212,6 +251,21 @@ cargo xtask openai-conversation-item-contracts --check
 When Conversations is selected, conformance generation performs the check
 before comparing schemas, so the runtime validator and generated implementation
 document cannot silently drift from the pinned item union.
+
+Check Files operation identity three ways (pinned specification, runtime
+registry, generated document):
+
+```console
+cargo xtask check-files-registry
+```
+
+It compares `(method, path, operationId)` and fails if any source disagrees.
+Schemas are left to oasdiff. `make lint` runs it. The Files report area also
+runs the `conformance_files_` tests, which cover route dispatch, success
+payloads against the generated response schemas, and a sensitivity check that
+the schema validation rejects an invalid payload. Each test prints a
+`PRAXIS_CONFORMANCE_OK files <check>` sentinel that the report requires as
+evidence.
 
 ## Reference Refresh
 
@@ -319,6 +373,10 @@ Follow-up fixes remove their fingerprints from the report without needing the
 label. When no failures remain, the strict gate passes and no acknowledgement
 step runs.
 
+For Files, `make lint` additionally fails when `check-files-registry` finds
+operation drift, and the report run fails when a `conformance_files_` test or
+its sentinel is missing.
+
 ## Change Workflow
 
 When OpenAI-compatible behavior changes:
@@ -330,6 +388,23 @@ When OpenAI-compatible behavior changes:
 5. Regenerate `openai-conformance-report.json`.
 6. Commit code, the generated report, and reference artifacts only when the
    upstream pin was intentionally changed.
+
+### Changing the Files contract
+
+1. Edit the registry entry in `files/routes/mod.rs` and/or the DTOs in
+   `files/contracts.rs`.
+2. Run `cargo xtask check-files-registry`.
+3. Run the `conformance_files_` tests.
+4. Regenerate `openai-conformance-report.json`. Oasdiff drift must be fixed or
+   carry an evidence-backed contract exception.
+
+### Refreshing the upstream pin for Files
+
+1. Run `cargo xtask openai-conformance-reference --revision <sha>`.
+2. Run `cargo xtask check-files-registry`; it flags operation drift.
+3. Regenerate the report; oasdiff shows Files schema drift.
+4. Update the DTOs, and update or remove any exception that the stale-exception
+   rule flags (generation fails when a declared fingerprint no longer appears).
 
 Future API areas should add one data-driven path selector, operation registry
 adapter, generated owned-contract document, and focused runtime suite. They
