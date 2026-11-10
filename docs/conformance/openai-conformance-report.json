@@ -428,8 +428,7 @@
               "has_other_drift": false,
               "request_details": [],
               "response_details": [
-                "responses.deleted",
-                "responses.429.content.application/json.schema.properties.error.properties.misalignment.properties.deleted"
+                "responses.deleted"
               ],
               "other_details": []
             },
@@ -444,8 +443,7 @@
               "has_other_drift": false,
               "request_details": [],
               "response_details": [
-                "responses.deleted",
-                "responses.429.content.application/json.schema.properties.error.properties.misalignment.properties.deleted"
+                "responses.deleted"
               ],
               "other_details": []
             },
@@ -460,8 +458,7 @@
               "has_other_drift": false,
               "request_details": [],
               "response_details": [
-                "responses.deleted",
-                "responses.429.content.application/json.schema.properties.error.properties.misalignment.properties.deleted"
+                "responses.deleted"
               ],
               "other_details": []
             },
@@ -476,8 +473,7 @@
               "has_other_drift": false,
               "request_details": [],
               "response_details": [
-                "responses.deleted",
-                "responses.429.content.application/json.schema.properties.error.properties.misalignment.properties.deleted"
+                "responses.deleted"
               ],
               "other_details": []
             },
@@ -492,8 +488,7 @@
               "has_other_drift": false,
               "request_details": [],
               "response_details": [
-                "responses.deleted",
-                "responses.429.content.application/json.schema.properties.error.properties.misalignment.properties.deleted"
+                "responses.deleted"
               ],
               "other_details": []
             },
@@ -508,8 +503,7 @@
               "has_other_drift": false,
               "request_details": [],
               "response_details": [
-                "responses.deleted",
-                "responses.429.content.application/json.schema.properties.error.properties.misalignment.properties.deleted"
+                "responses.deleted"
               ],
               "other_details": []
             },
@@ -524,8 +518,7 @@
               "has_other_drift": false,
               "request_details": [],
               "response_details": [
-                "responses.deleted",
-                "responses.429.content.application/json.schema.properties.error.properties.misalignment.properties.deleted"
+                "responses.deleted"
               ],
               "other_details": []
             },
@@ -540,8 +533,7 @@
               "has_other_drift": false,
               "request_details": [],
               "response_details": [
-                "responses.deleted",
-                "responses.429.content.application/json.schema.properties.error.properties.misalignment.properties.deleted"
+                "responses.deleted"
               ],
               "other_details": []
             }
@@ -874,8 +866,7 @@
               "kind": "response_schema",
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
-                "responses.deleted",
-                "responses.429.content.application/json.schema.properties.error.properties.misalignment.properties.deleted"
+                "responses.deleted"
               ]
             }
           ]
@@ -892,8 +883,7 @@
               "kind": "response_schema",
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
-                "responses.deleted",
-                "responses.429.content.application/json.schema.properties.error.properties.misalignment.properties.deleted"
+                "responses.deleted"
               ]
             }
           ]
@@ -910,8 +900,7 @@
               "kind": "response_schema",
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
-                "responses.deleted",
-                "responses.429.content.application/json.schema.properties.error.properties.misalignment.properties.deleted"
+                "responses.deleted"
               ]
             }
           ]
@@ -928,8 +917,7 @@
               "kind": "response_schema",
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
-                "responses.deleted",
-                "responses.429.content.application/json.schema.properties.error.properties.misalignment.properties.deleted"
+                "responses.deleted"
               ]
             }
           ]
@@ -946,8 +934,7 @@
               "kind": "response_schema",
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
-                "responses.deleted",
-                "responses.429.content.application/json.schema.properties.error.properties.misalignment.properties.deleted"
+                "responses.deleted"
               ]
             }
           ]
@@ -964,8 +951,7 @@
               "kind": "response_schema",
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
-                "responses.deleted",
-                "responses.429.content.application/json.schema.properties.error.properties.misalignment.properties.deleted"
+                "responses.deleted"
               ]
             }
           ]
@@ -982,8 +968,7 @@
               "kind": "response_schema",
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
-                "responses.deleted",
-                "responses.429.content.application/json.schema.properties.error.properties.misalignment.properties.deleted"
+                "responses.deleted"
               ]
             }
           ]
@@ -1000,8 +985,7 @@
               "kind": "response_schema",
               "summary": "Align the response body schema with the OpenAI spec.",
               "detail_paths": [
-                "responses.deleted",
-                "responses.429.content.application/json.schema.properties.error.properties.misalignment.properties.deleted"
+                "responses.deleted"
               ]
             }
           ]
