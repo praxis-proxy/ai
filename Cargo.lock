@@ -4476,13 +4476,15 @@ dependencies = [
 
 [[package]]
 name = "quixotic-plecostomus-error"
-version = "0.11.1"
-source = "git+https://github.com/praxis-proxy/pingora?rev=4fde8bb89a96c54ee19134d66d91f03e81f67f0a#4fde8bb89a96c54ee19134d66d91f03e81f67f0a"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a76f53bd72ce9a7e1ce66ecd1196bdca3ce602f7963e7e5da6d2b7069465b10"
 
 [[package]]
 name = "quixotic-plecostomus-header-serde"
-version = "0.11.1"
-source = "git+https://github.com/praxis-proxy/pingora?rev=4fde8bb89a96c54ee19134d66d91f03e81f67f0a#4fde8bb89a96c54ee19134d66d91f03e81f67f0a"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6169b0102aff5e460cbfb342b047c7b534c2dcfbc62520e42a628d1cf3f26e4"
 dependencies = [
  "bytes",
  "http",
@@ -4496,8 +4498,9 @@ dependencies = [
 
 [[package]]
 name = "quixotic-plecostomus-http"
-version = "0.11.1"
-source = "git+https://github.com/praxis-proxy/pingora?rev=4fde8bb89a96c54ee19134d66d91f03e81f67f0a#4fde8bb89a96c54ee19134d66d91f03e81f67f0a"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8b706dc57349a6a5e56e585568402a8f1556af06eb6ab3f40603d3037afffed"
 dependencies = [
  "bytes",
  "http",
