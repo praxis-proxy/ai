@@ -15,7 +15,7 @@ Request fields the translation does not map are forwarded untouched for the back
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `allow_lossy_features` | (`extended_thinking` \| `prompt_caching`)[] | no | Anthropic features the operator allows the translator to degrade. Empty by default, which keeps the strict reject behavior for every feature. Unknown names fail config loading (`deny_unknown_fields` plus the validated `LossyFeature` enum), so a typo cannot silently widen what the translator will drop. |
+| `allow_lossy_features` | (`extended_thinking` \| `prompt_caching` \| `mid_conversation_system`)[] | no | Anthropic features the operator allows the translator to degrade. Empty by default, which keeps the strict reject behavior for every feature. Unknown names fail config loading (`deny_unknown_fields` plus the validated `LossyFeature` enum), so a typo cannot silently widen what the translator will drop. |
 | `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer` mode. |
 
 ## Examples
