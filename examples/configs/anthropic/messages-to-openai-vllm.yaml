@@ -102,9 +102,10 @@ filter_chains:
         #   - mid_conversation_system: fold `system` messages that appear after
         #     the first non-system turn (Claude Code's environment block) into
         #     the single leading system message. Chat Completions permits them
-        #     anywhere, but vLLM chat templates reject a system message that
-        #     follows a non-system one ("System message must be at the
-        #     beginning"), so this backend needs the fold.
+        #     anywhere; whether a backend rejects one depends on its chat
+        #     template (some vLLM-hosted templates fail with "System message
+        #     must be at the beginning", others render it in place), so the
+        #     fold keeps the translated request independent of that tolerance.
         allow_lossy_features:
           - prompt_caching
           - extended_thinking

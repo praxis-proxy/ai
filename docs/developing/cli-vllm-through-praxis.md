@@ -569,13 +569,22 @@ sends and reports the loss (a `WARN` log, the
 `praxis_anthropic_messages_to_chat_completions_degraded_total` counter, and an
 `x-degraded-features` response header) instead of rejecting the request.
 Claude Code also sends a `system` message after its first user turn (the
-environment block); real OpenAI accepts that shape, but vLLM chat templates
-reject it ("System message must be at the beginning"), so the same allowlist
-entry folds it into the leading system message.
+environment block); real OpenAI accepts that shape. Whether a Chat Completions
+backend rejects it depends on the model's chat template: some vLLM-hosted
+templates fail with "System message must be at the beginning" when a system
+message follows a non-system one, while others — including this guide's default
+Qwen3-8B template — render it in place. The same allowlist entry folds it into
+the leading system message, so the translated request no longer depends on the
+template's tolerance for that ordering.
 
 To see the strict behavior instead — a 400 when a thinking or prompt-caching
-marker appears — use the `messages-to-openai.yaml` route (empty allowlist) and
-disable both of those features in Claude Code:
+marker appears — remove the `allow_lossy_features` block from the
+`anthropic_messages_to_chat_completions` filter in your copy of
+`messages-to-openai-vllm.yaml` and disable both of those features in Claude
+Code. Stay on this route rather than switching to the plain
+`messages-to-openai.yaml` example: that example injects no backend credential,
+so against the keyed vLLM server above it fails with a 401 before any strict
+rejection:
 
 ```console
 export CLAUDE_CODE_DISABLE_THINKING=1
@@ -584,8 +593,9 @@ export DISABLE_PROMPT_CACHING=1
 
 Claude Code cannot disable the mid-conversation `system` message — it always
 sends the environment block — and the strict route passes it through in its
-original position, so it is the vLLM chat template that rejects the request
-(the reason the translated route folds it).
+original position, so whether the request survives is up to the model's chat
+template: some reject it there ("System message must be at the beginning"),
+while this guide's default Qwen3-8B template renders it in place.
 
 Claude Code does not know the served model's real window, so it sends the
 default `max_tokens` for the Anthropic model name it believes it is calling —

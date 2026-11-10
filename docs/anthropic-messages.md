@@ -101,9 +101,9 @@ and the response, so vLLM only ever sees OpenAI Chat Completions.
 
 Chat Completions cannot represent the Anthropic-only features an unmodified
 Claude Code client always sends — prompt caching (`cache_control` markers) and
-extended thinking (`thinking`) — and backends with strict chat templates
-(vLLM-hosted models) additionally reject the mid-conversation `system`
-message Claude Code sends after its first user turn. The example enables
+extended thinking (`thinking`) — and backends whose chat templates reject a
+mid-conversation `system` message (some vLLM-hosted models) additionally
+refuse the one Claude Code sends after its first user turn. The example enables
 **operator-approved degradation** on the translation filter so those requests
 succeed instead of failing closed with a 400:
 
@@ -125,8 +125,9 @@ translated response carries no thinking blocks; `mid_conversation_system`
 folds each eligible text-only `system` message with exactly `role` and
 `content` fields that appears after the first non-system turn into
 the single leading system message (real OpenAI accepts mid-array `system`
-messages, but vLLM chat templates answer "System message must be at the
-beginning"). Remove an entry to make that
+messages; whether a vLLM-hosted backend accepts one depends on the model's
+chat template — some answer "System message must be at the beginning", others
+render it in place). Remove an entry to make that
 feature fail closed again. Malformed markers, other `context_management` edits,
 and every feature not listed are still rejected with a 400. Leaving the
 allowlist empty (the default of [`messages-to-openai.yaml`](../examples/configs/anthropic/messages-to-openai.yaml))
