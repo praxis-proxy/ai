@@ -34,6 +34,8 @@ mod openapi;
 )]
 pub(crate) mod conformance;
 
+#[cfg(feature = "openai-conversations")]
+pub(crate) use openapi::ResponseHeaderSpec;
 #[cfg(all(test, any(feature = "openai-conversations", feature = "openai-files")))]
 pub(crate) use openapi::collect_component_references;
 #[cfg(any(
@@ -46,7 +48,7 @@ pub(crate) use openapi::{
     schema_binding,
 };
 #[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
-pub(crate) use openapi::{ParameterLocation, ParameterSpec, ResponseHeaderSpec, path_parameter, query_parameter};
+pub(crate) use openapi::{ParameterLocation, ParameterSpec, path_parameter, query_parameter};
 
 use crate::operation::{
     ApplicationProtocol, HandlingMode, HttpMethod, OperationEntry, OperationSpec, RequestBody, Transport,

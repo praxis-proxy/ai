@@ -135,9 +135,8 @@ generated operation identity three ways and runs in `make lint`.
   not the handling mode.
 - **Schema deviations from the pin.** These are recorded as
   `FILES_CONTRACT_EXCEPTIONS` in `xtask/src/openai_conformance/area.rs`:
-  `evals` is added to `OpenAIFile.purpose` (it is an accepted upload purpose);
-  the generated `OpenAIFile` states `type: object` explicitly; and the download
-  returns `application/octet-stream` instead of the pinned `application/json`.
+  `evals` is added to `OpenAIFile.purpose` (it is an accepted upload purpose),
+  and the generated `OpenAIFile` states `type: object` explicitly.
 - **Serialization choices within the pinned schema** (not exceptions):
   `status` is always present (`processed`); `expires_at` and `status_details`
   are omitted when absent; an empty list has `first_id` and `last_id` set to

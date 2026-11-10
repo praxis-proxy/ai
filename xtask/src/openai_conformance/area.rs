@@ -112,9 +112,9 @@ const FILES_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
 
 /// Evidence-backed discrepancies for Files operations.
 ///
-/// Three kinds, each on every operation returning `OpenAIFile` that oasdiff
-/// reports: `evals` added to `OpenAIFile.purpose`, an explicit `type: object`
-/// the pinned schema leaves implicit, and the download media type.
+/// Two kinds, each on every operation returning `OpenAIFile` that oasdiff
+/// reports: `evals` added to `OpenAIFile.purpose`, and an explicit
+/// `type: object` the pinned schema leaves implicit.
 const FILES_CONTRACT_EXCEPTIONS: &[ContractException] = &[
     files_purpose_exception(
         "GET",
@@ -146,8 +146,6 @@ const FILES_CONTRACT_EXCEPTIONS: &[ContractException] = &[
         "/files",
         "responses.200.content.application/json.schema.type.added",
     ),
-    files_download_exception("responses.200.content.added"),
-    files_download_exception("responses.200.content.deleted"),
 ];
 
 /// Declare one `OpenAIFile.purpose` exception.
@@ -175,18 +173,6 @@ const fn files_object_type_exception(
         detail,
         rationale: "the generated OpenAIFile schema states `type: object`, which the pinned schema leaves implicit; its properties already make it an object",
         evidence: "praxis-ai-apis/openai/files/contracts.rs: OpenAiFile derived schema",
-    }
-}
-
-/// Declare one `downloadFile` media-type exception.
-const fn files_download_exception(detail: &'static str) -> ContractException {
-    ContractException {
-        kind: super::model::ContractDriftKind::Response,
-        method: Some("GET"),
-        path: Some("/files/{file_id}/content"),
-        detail,
-        rationale: "the download returns raw file bytes as application/octet-stream, while the pinned spec declares application/json",
-        evidence: "praxis-ai-apis/openai/files/routes/mod.rs: downloadFile binary response; FileContent schema",
     }
 }
 

@@ -8,8 +8,9 @@
 //! compare like with like. Deliberate deviations from the pinned reference:
 //!
 //! - `OpenAIFile.purpose` accepts `evals`, so an upload round-trips.
-//! - `downloadFile` declares `application/octet-stream` rather than upstream's `application/json` string, because
-//!   Praxis streams the stored bytes.
+//!
+//! `downloadFile` already declares `application/octet-stream` upstream, so it
+//! needs no exception.
 
 #![expect(
     clippy::large_stack_frames,
@@ -28,7 +29,7 @@ use utoipa::{
     ToSchema,
     openapi::{
         Deprecated, RefOr,
-        schema::{Object, ObjectBuilder, Schema, Type},
+        schema::{Object, ObjectBuilder, Schema, SchemaType, Type},
     },
 };
 
@@ -514,12 +515,16 @@ fn file_status_schema() -> Object {
         .build()
 }
 
-/// Plain `integer` schema for `bytes`.
+/// Nullable `integer` schema for `bytes`.
 ///
 /// The derive would emit `format: int64, minimum: 0` for a `u64`, which the
-/// pinned schema does not declare.
+/// pinned schema does not declare. The pinned type is `["integer", "null"]`
+/// (the size can be unavailable for an in-progress upload); Praxis always
+/// reports a size, which satisfies the wider declared type.
 fn file_bytes_schema() -> Object {
-    ObjectBuilder::new().schema_type(Type::Integer).build()
+    ObjectBuilder::new()
+        .schema_type(SchemaType::from_iter([Type::Integer, Type::Null]))
+        .build()
 }
 
 /// Fixed `"file"` discriminator schema.
