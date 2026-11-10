@@ -152,20 +152,24 @@ committed conformance reports and this release's exact-commit evidence:
   reference config, and pinned client versions.
 - Native API surfaces and the translation support matrix, including every
   known gap and its blocker.
-- OpenAI operation conformance and OpenResponses translation coverage.
-- Live qualification status with per-scenario client acceptance results, when
-  a GPU run exists for the release commit.
+- OpenAI operation conformance and OpenResponses translation coverage. The
+  OpenAI percentage states its non-beta, non-deprecated scope and the number of
+  operations that scope excludes.
+- Live qualification status with client acceptance suite status, reasons, and
+  per-scenario results, when a GPU run exists for the release commit. A client
+  suite that failed before producing its scenario artifact is still listed.
 - Exact-commit CI workflow outcomes.
-- Translation cell status changes since the previous release, when its
-  `support-report.json` is available.
+- Translation cell status changes since the release published before this one,
+  when that release's `support-report.json` is available.
 
 The report is intentionally narrower than a product support matrix. It covers
 the Praxis AI gateway and the vLLM backend the qualification suite uses; the
 model gateway, API server, per-field API support, and live hosted-provider
 validation are named as out of scope in the report itself. Missing live
-evidence renders as `not validated` rather than being omitted, and a
-qualification report for a different checkout renders as `provenance mismatch`
-with no live claims.
+evidence renders as `not validated` rather than being omitted. The report also
+refuses evidence collected at another commit: a qualification report for a
+different checkout, or CI evidence recording a different release SHA, renders
+as `provenance mismatch` and copies no results.
 
 Generation reads `docs/conformance/translation-matrix.json` and
 `docs/conformance/openresponses-coverage.json`, which

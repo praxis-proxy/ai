@@ -230,6 +230,26 @@ def live_suite_rows(live):
     return rows
 
 
+def harness_suite_rows(live):
+    """One row per client acceptance suite, including suites without cases.
+
+    A client job that fails before writing its scenario artifact records the
+    failure with an empty case list. Those suites carry no scenario rows, so
+    they need their own status line or the failure disappears from the report.
+    """
+    rows = []
+    suites = live.get("suites") or {}
+    for name, client in HARNESS_SUITES:
+        suite = suites.get(name)
+        if not isinstance(suite, dict):
+            continue
+        rows.append({"client": client, "suite": name,
+                     "status": suite.get("status"),
+                     "reason": suite.get("reason"),
+                     "scenarios": len(suite.get("cases") or [])})
+    return rows
+
+
 def harness_rows(live):
     rows = []
     suites = live.get("suites") or {}
@@ -244,10 +264,30 @@ def harness_rows(live):
 
 
 def ci_evidence(release_qualification, sha):
+    """Exact-commit CI evidence, refused when it describes another commit.
+
+    The workflow evidence is only meaningful for the commit it was collected
+    at, so a report for a different SHA is downgraded and its workflow rows are
+    dropped rather than presented as evidence for this release.
+    """
     if not isinstance(release_qualification, dict):
         return {"status": "unavailable",
                 "reason": "No exact-commit CI evidence was produced for this release.",
-                "workflows": []}
+                "release_sha": None, "selection": None,
+                "limitations": [], "workflows": []}
+    recorded = release_qualification.get("release_sha")
+    if not recorded or (sha and recorded != sha):
+        return {
+            "status": "provenance mismatch" if recorded else "unavailable",
+            "reason": ("Exact-commit CI evidence has no recorded release SHA."
+                       if not recorded else
+                       "Exact-commit CI evidence describes %s, not release commit %s"
+                       % (recorded, sha)),
+            "release_sha": recorded,
+            "selection": release_qualification.get("selection"),
+            "limitations": release_qualification.get("limitations") or [],
+            "workflows": [],
+        }
     workflows = []
     for workflow in release_qualification.get("workflows") or []:
         run = workflow.get("run") or {}
@@ -471,6 +511,31 @@ def render_translation(report, lines):
     lines.append("")
 
 
+def openai_scope(openai):
+    """Describe what the OpenAI coverage percentage counts and leaves out.
+
+    The percentage is only meaningful next to its scope: beta and deprecated
+    operations fall outside both the numerator and the denominator.
+    """
+    scope = openai.get("scope") or {}
+    ignored = (openai.get("capability_coverage") or {}).get("ignored") or {}
+    areas = " and ".join(scope.get("areas") or []) or "tracked"
+    qualifiers = []
+    if scope.get("include_beta") is False:
+        qualifiers.append("non-beta")
+    if scope.get("include_deprecated") is False:
+        qualifiers.append("non-deprecated")
+    surface = (" " + ", ".join(qualifiers)) if qualifiers else ""
+    excluded = []
+    for key in ("beta", "deprecated"):
+        if scope.get("include_" + key) is False and ignored.get(key):
+            excluded.append("%s %s operations" % (ignored.get(key), key))
+    if not excluded:
+        return "The count covers%s %s operations." % (surface, areas)
+    return "The count covers%s %s operations and excludes %s." % (
+        surface, areas, " and ".join(excluded))
+
+
 def render_conformance(report, lines):
     conformance = report.get("conformance") or {}
     lines += ["### Contract conformance", ""]
@@ -485,13 +550,17 @@ def render_conformance(report, lines):
             verification.get("all_passed"), "unknown")
         lines += [
             "**OpenAI operations.** %s/%s operations covered (%s%%); "
-            "runtime verification %s." % (
+            "runtime verification %s. %s" % (
                 coverage.get("covered_operations_count", "?"),
                 coverage.get("total_operations", "?"),
                 coverage.get("coverage_percent", "?"),
-                passed),
+                passed,
+                openai_scope(openai)),
             "",
         ]
+        caveat = one_line((report.get("translation") or {}).get("caveat"))
+        if caveat:
+            lines += [caveat, ""]
         rows = [(area.get("area"), area.get("total"), area.get("covered"),
                  area.get("coverage_percent")) for area in coverage.get("by_area") or []]
         if rows:
@@ -540,6 +609,15 @@ def render_live(report, lines):
                         for row in suite_rows])
         lines.append("")
 
+    client_suites = harness_suite_rows(live)
+    if client_suites:
+        lines.append("Client acceptance suites:")
+        lines.append("")
+        lines += table(("Client", "Status", "Scenarios", "Reason"),
+                       [(row["client"], row["status"], row["scenarios"], row["reason"])
+                        for row in client_suites])
+        lines.append("")
+
     harness = harness_rows(live)
     if harness:
         lines.append("Client acceptance scenarios:")
@@ -566,6 +644,9 @@ def render_ci(report, lines):
     workflows = evidence.get("workflows") or []
     if not workflows:
         lines += ["No exact-commit CI evidence was recorded for this release.", ""]
+        reason = one_line(evidence.get("reason")).rstrip(".")
+        if reason:
+            lines += ["Reason: %s." % reason, ""]
         return
     rows = []
     for workflow in workflows:

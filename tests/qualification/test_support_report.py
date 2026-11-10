@@ -46,10 +46,12 @@ def matrix(cell_status="translated"):
 
 def openai():
     return {
-        "scope": {"areas": ["Responses"]},
+        "scope": {"areas": ["Conversations", "Responses"],
+                  "include_deprecated": False, "include_beta": False},
         "reference": {"upstream": {"revision": "b" * 40}},
         "capability_coverage": {"total_operations": 7, "covered_operations_count": 7,
                                 "coverage_percent": 100.0,
+                                "ignored": {"deprecated": 0, "beta": 7},
                                 "by_area": [{"area": "Responses", "total": 7,
                                              "covered": 7, "coverage_percent": 100.0}]},
         "runtime_verification": {"all_passed": True},
@@ -216,6 +218,68 @@ class SupportReportTest(unittest.TestCase):
                 self.assertEqual(report["evidence"], "partial")
                 self.assertIn(status, markdown)
                 self.assertEqual(support.verify(report, markdown, TAG, SHA), [])
+
+    def test_ci_evidence_for_another_commit_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = release_qualification()
+            evidence["release_sha"] = "b" * 40
+            write_fixtures(directory, qualification_value=qualification(),
+                           release_qualification_value=evidence)
+            report, markdown = generate(arguments(
+                directory,
+                qualification=str(Path(directory) / "qualification.json"),
+                release_qualification=str(Path(directory) / "release-qualification.json")))
+
+            self.assertEqual(report["ci_evidence"]["status"], "provenance mismatch")
+            self.assertEqual(report["ci_evidence"]["workflows"], [])
+            self.assertEqual(report["evidence"], "partial")
+            self.assertIn("not release commit", markdown)
+            self.assertNotIn("| Tests |", markdown)
+            self.assertEqual(support.verify(report, markdown, TAG, SHA), [])
+
+    def test_ci_evidence_without_a_release_sha_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = release_qualification()
+            del evidence["release_sha"]
+            write_fixtures(directory, qualification_value=qualification(),
+                           release_qualification_value=evidence)
+            report, markdown = generate(arguments(
+                directory,
+                qualification=str(Path(directory) / "qualification.json"),
+                release_qualification=str(Path(directory) / "release-qualification.json")))
+
+            self.assertEqual(report["ci_evidence"]["status"], "unavailable")
+            self.assertEqual(report["ci_evidence"]["workflows"], [])
+            self.assertEqual(report["evidence"], "partial")
+            self.assertIn("no recorded release SHA", markdown)
+            self.assertEqual(support.verify(report, markdown, TAG, SHA), [])
+
+    def test_failed_client_suite_is_rendered_without_scenarios(self):
+        with tempfile.TemporaryDirectory() as directory:
+            value = qualification()
+            value["suites"]["codex_acceptance"] = {
+                "status": "failure",
+                "reason": "Codex CLI job failed before writing its scenario artifact",
+                "cases": []}
+            write_fixtures(directory, qualification_value=value)
+            report, markdown = generate(arguments(
+                directory, qualification=str(Path(directory) / "qualification.json")))
+
+            self.assertEqual(report["live_validation"]["status"], "passed")
+            self.assertIn("Client acceptance suites:", markdown)
+            self.assertIn("| Codex | failure | 0 | Codex CLI job failed before writing "
+                          "its scenario artifact |", markdown)
+            self.assertNotIn("codex_native", markdown)
+            self.assertIn("claude_native_edits", markdown)
+
+    def test_conformance_percentage_carries_its_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            write_fixtures(directory)
+            _, markdown = generate(arguments(directory))
+
+            self.assertIn("The count covers non-beta, non-deprecated Conversations and "
+                          "Responses operations and excludes 7 beta operations.", markdown)
+            self.assertIn("Qualified number, not the bare percentage.", markdown)
 
     def test_zero_counts_render_as_zero(self):
         with tempfile.TemporaryDirectory() as directory:

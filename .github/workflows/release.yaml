@@ -487,12 +487,21 @@ jobs:
             --output-dir "$RUNNER_TEMP/release-qualification"
           cat "$RUNNER_TEMP/release-qualification/release-qualification.md" >> "$GITHUB_STEP_SUMMARY"
 
-          # Best-effort previous release for a status diff. A missing asset is
-          # not an error; the report simply has no comparison section.
+          # Best-effort previous release for a status diff. A rerun of an older
+          # tag compares against the release published before it, not the newest
+          # release overall, so it cannot present regressions backwards. A
+          # missing asset is not an error; the report has no comparison section.
           prev_dir="$RUNNER_TEMP/support-previous"
           mkdir -p "$prev_dir"
-          prev_tag=$(gh api "repos/$GH_REPO/releases?per_page=30" \
-            --jq '[.[] | select(.draft == false and .tag_name != env.TAG)] | first | .tag_name // empty' \
+          if [ "$existing" = true ]; then
+            released_at=$(gh release view "$TAG" --repo "$GH_REPO" \
+              --json createdAt --jq .createdAt)
+          else
+            released_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          fi
+          prev_tag=$(gh api "repos/$GH_REPO/releases?per_page=100" \
+            --jq "[.[] | select(.draft == false and .created_at < \"$released_at\")]
+                  | max_by(.created_at) | .tag_name // empty" \
             2>/dev/null || true)
           if [ -n "${prev_tag:-}" ]; then
             gh release download "$prev_tag" --repo "$GH_REPO" \
