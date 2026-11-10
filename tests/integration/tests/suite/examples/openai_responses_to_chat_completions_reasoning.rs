@@ -400,6 +400,21 @@ fn reasoning_summary_auto_is_best_effort_and_forwarded_without_the_summary() {
         "\"auto\" is a best-effort request and must not be rejected: {raw}"
     );
 
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("client response should be JSON");
+    assert_eq!(
+        response["reasoning"]["summary"], "auto",
+        "the response must echo the requested summary"
+    );
+    assert_eq!(
+        response["output"][0]["type"], "reasoning",
+        "the promoted reasoning item must lead the output"
+    );
+    assert_eq!(
+        response["output"][0]["summary"],
+        serde_json::json!([]),
+        "raw reasoning must never be exposed as a summary"
+    );
+
     let forwarded: Vec<_> = backend.requests().into_iter().filter(|r| r.method == "POST").collect();
     assert_eq!(
         forwarded.len(),

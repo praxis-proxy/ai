@@ -4937,10 +4937,13 @@ class TestResponsesReasoningVLLM:
                 event for event in response if event.type == "response.completed"
             ]
             assert terminals, "a best-effort summary request must complete rather than fail closed"
-            output = terminals[-1].response.output
+            resource = terminals[-1].response
         else:
             assert response.status in ("completed", "incomplete"), response.status
-            output = response.output
+            resource = response
+        output = resource.output
+
+        assert resource.reasoning.summary == "auto", resource.reasoning
 
         seen = forwarded[before:]
         assert len(seen) == 1, seen
