@@ -59,6 +59,7 @@ pub(super) struct ResponseResource {
     pub(super) object: String,
 
     /// Access programs reported by the provider, if any.
+    #[schema(required = true, nullable = true)]
     pub(super) access_programs: Option<Value>,
 
     /// Generation status.
@@ -140,6 +141,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn access_programs_contract_is_required_and_nullable() {
+        let schema = serde_json::to_value(<ResponseResource as utoipa::PartialSchema>::schema()).unwrap();
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("access_programs"))
+        );
+        let property = &schema["properties"]["access_programs"];
+        // OpenAPI 3.1 represents serde_json::Value as an unconstrained schema,
+        // which accepts every JSON type, including null.
+        assert_eq!(
+            property,
+            &serde_json::json!({
+                "description": "Access programs reported by the provider, if any."
+            })
+        );
+    }
+
+    #[test]
     #[expect(clippy::too_many_lines, reason = "straight-line struct instantiation test")]
     fn contract_types_can_be_instantiated() {
         let req = CreateResponseRequest {
@@ -189,6 +210,8 @@ mod tests {
             background: Some(false),
             service_tier: Some(serde_json::json!("default")),
         };
+        let serialized = serde_json::to_value(&res).unwrap();
+        assert_eq!(serialized.get("access_programs"), Some(&Value::Null));
         assert_eq!(res.id, "resp_1");
         assert_eq!(res.object, "response");
         assert_eq!(res.status, "completed");

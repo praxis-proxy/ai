@@ -505,6 +505,15 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
 /// reported back as the default.
 #[expect(clippy::too_many_lines, reason = "sequential validation of request parameters")]
 fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), TranslationError> {
+    // Access program selection cannot be honored by the Chat backend. Keep
+    // this check at translation so native Responses passthrough is unaffected.
+    if let Some(access_programs) = obj.get("access_programs") {
+        return Err(TranslationError::UnrepresentableRequestParameter {
+            parameter: "access_programs",
+            value: json_type_name(access_programs),
+            supported: "omitting `access_programs`",
+        });
+    }
     validate_moderation_parameter(obj)?;
     if obj
         .get("tools")
