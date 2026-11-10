@@ -35,10 +35,11 @@ jobs:
       - name: Check for why, what, and how
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          labels=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels -q '.labels[].name')
+          labels=$(gh pr view "$PR_NUMBER" --repo "$GH_REPO" --json labels -q '.labels[].name')
           if echo "$labels" | grep -q '^skip/pr-conventions$'; then
             echo "skip/pr-conventions label present — skipping description check"
             exit 0
@@ -48,7 +49,29 @@ jobs:
           import os
           import re
 
-          body = os.environ.get("PR_BODY", "")
+          body = re.sub(r"<!--.*?-->", "", os.environ.get("PR_BODY", ""), flags=re.DOTALL)
+          visible_lines = []
+          fence_char = None
+          fence_length = 0
+          for line in body.splitlines():
+              fence = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+              if fence_char is None:
+                  if fence:
+                      fence_char = fence.group(1)[0]
+                      fence_length = len(fence.group(1))
+                      continue
+              else:
+                  if (
+                      fence
+                      and fence.group(1)[0] == fence_char
+                      and len(fence.group(1)) >= fence_length
+                      and re.fullmatch(r" {0,3}(?:`{3,}|~{3,})\s*", line)
+                  ):
+                      fence_char = None
+                      fence_length = 0
+                  continue
+              visible_lines.append(line)
+
           headings = {
               "why": re.compile(r"^#{1,6}\s+why\b", re.IGNORECASE),
               "what": re.compile(r"^#{1,6}\s+what\b", re.IGNORECASE),
@@ -60,23 +83,32 @@ jobs:
           )
           sections = {}
           current = None
-          for line in body.splitlines():
+          current_level = None
+          for line in visible_lines:
+              heading = re.match(r"^(#{1,6})\s+(.*)$", line.strip())
+              if not heading:
+                  if current:
+                      sections[current].append(line)
+                  continue
+
+              level = len(heading.group(1))
+              title = heading.group(2)
               match = next((name for name, pattern in headings.items() if pattern.match(line.strip())), None)
               if match:
                   current = match
+                  current_level = level
                   sections.setdefault(current, [])
-              elif line.lstrip().startswith("#") and re.match(r"^#{1,6}\s", line.strip()):
+              elif current and level <= current_level:
                   current = None
-              elif current:
-                  sections[current].append(line)
+                  current_level = None
 
           missing = []
           for name in headings:
               content = "\n".join(sections.get(name, []))
-              content = re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL).strip()
+              content = content.strip()
               if not content:
                   missing.append(name)
-          if not any(issue_reference.search(line) for line in body.splitlines()):
+          if not any(issue_reference.search(line) for line in visible_lines):
               missing.append("issue")
           print(" ".join(missing))
           PY
@@ -87,19 +119,19 @@ jobs:
             details=""
             for section in $missing; do
               if [ "$section" = "issue" ]; then
-                details="${details}\n- Related issue: add Closes #123 or Refs #123 for the issue this PR addresses."
+                details="${details}"$'\n- Related issue: add Closes #123 or Refs #123 for the issue this PR addresses.'
               else
-                details="${details}\n- ${section^}: add a short explanation under the section heading."
+                details="${details}"$'\n- '"${section^}"': add a short explanation under the section heading.'
               fi
             done
-            already=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            already=$(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
               --jq "[.[] | select(.body | contains(\"${marker}\"))] | length")
             if [ "$already" -eq 0 ]; then
-              gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" \
+              gh pr comment "$PR_NUMBER" --repo "$GH_REPO" \
                 --body "${marker}
                 This PR needs non-empty **Why**, **What**, and **How** sections plus a linked issue reference. Explain why the change is needed, what problem it fixes, and how the change addresses it. For a new filter parameter, justify why it is needed and what behavior it controls.${details}
 
-                See [CONTRIBUTING.md](https://github.com/praxis-proxy/praxis-ai/blob/main/CONTRIBUTING.md#pull-request-gates)."
+                See [CONTRIBUTING.md](https://github.com/${GH_REPO}/blob/main/CONTRIBUTING.md#pull-request-gates)."
             fi
             echo "PR description or issue reference is missing: $missing"
             exit 1
