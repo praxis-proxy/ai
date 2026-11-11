@@ -952,12 +952,15 @@ class BraveSearchHandler(BaseHTTPRequestHandler):
     request_count = 0
     response_code = 200
     successful_requests_remaining: ClassVar[int | None] = None
+    #: Results served after the canned result, e.g. off-domain URLs.
+    extra_results: ClassVar[list[dict[str, str]]] = []
 
     @classmethod
     def reset(cls):
         cls.request_count = 0
         cls.response_code = 200
         cls.successful_requests_remaining = None
+        cls.extra_results = []
         cls.request_paths.clear()
 
     request_paths: ClassVar[list[str]] = []
@@ -986,7 +989,8 @@ class BraveSearchHandler(BaseHTTPRequestHandler):
                             "title": "Mock Search Result",
                             "url": "https://example.com/mock",
                             "description": "A mock search result for testing",
-                        }
+                        },
+                        *BraveSearchHandler.extra_results,
                     ]
                 }
             }
@@ -3352,6 +3356,70 @@ class TestOpenAIResponsesVLLM:
             ]
         finally:
             client.conversations.delete(conversation.id)
+
+    def test_hosted_web_search_enforces_allowed_domains(self, witness_tool_client):
+        """Native hosted search drops provider results outside ``allowed_domains`` (#1768).
+
+        The Brave mock returns one result inside and one outside the allow-list.
+        Only the allowed result may reach the model re-entry or the public
+        ``action.sources``; the provider cannot be trusted to apply the filter.
+        """
+        client, forwarded = witness_tool_client
+        BraveSearchHandler.reset()
+        BraveSearchHandler.extra_results = [
+            {
+                "title": "Outside Domain Result",
+                "url": "https://outside.example/result",
+                "description": "A result outside the allowed domains",
+            }
+        ]
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-tool-stream",
+                input="DOMAIN-FILTER-1768",
+                tools=[{"type": "web_search", "filters": {"allowed_domains": ["example.com"]}}],
+                include=["web_search_call.action.sources"],
+                max_tool_calls=1,
+                store=False,
+                extra_headers={"x-user-brave-key": "controlled-test-only"},
+            )
+            assert response.status == "completed"
+            assert [item.type for item in response.output] == ["web_search_call", "message"]
+            assert BraveSearchHandler.request_count == 1
+            sources = response.output[0].model_dump()["action"]["sources"]
+            assert [source["url"] for source in sources] == ["https://example.com/mock"], (
+                "only allowed-domain results may be public sources"
+            )
+            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
+            reentry = json.dumps(forwarded[1]["input"])
+            assert "Mock Search Result" in reentry
+            assert "outside.example" not in reentry, (
+                "an off-domain result must not reach the model"
+            )
+        finally:
+            BraveSearchHandler.reset()
+
+    def test_hosted_web_search_rejects_unenforceable_filters(self, witness_tool_client):
+        """Unenforceable web-search ``filters`` fail closed before any round (#1768)."""
+        client, forwarded = witness_tool_client
+        BraveSearchHandler.reset()
+        cases = [
+            ({"blocked_domains": ["example.com"]}, "unsupported_parameter"),
+            ({"allowed_domains": ["example.com/path"]}, "invalid_value"),
+        ]
+        for filters, code in cases:
+            with pytest.raises(BadRequestError) as exc_info:
+                client.responses.create(
+                    model="sdk-conversation-tool-stream",
+                    input="DOMAIN-FILTER-REJECT-1768",
+                    tools=[{"type": "web_search", "filters": filters}],
+                    store=False,
+                    extra_headers={"x-user-brave-key": "controlled-test-only"},
+                )
+            assert exc_info.value.status_code == 400
+            assert exc_info.value.body["code"] == code
+        assert BraveSearchHandler.request_count == 0, "preflight must precede any callout"
+        assert forwarded == [], "preflight must precede any inference round"
 
     @qualification_profile("supporting")
     @pytest.mark.parametrize("replay_limited", [False, True], ids=["default", "replay-limit"])
