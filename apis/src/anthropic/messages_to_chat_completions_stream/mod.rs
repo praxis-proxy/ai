@@ -1807,6 +1807,7 @@ mod tests {
         );
     }
 
+    /// A streamed named tool call maps an upstream `stop` to `tool_use`.
     #[test]
     fn message_delta_reports_tool_use_when_named_tool_stream_finishes_with_stop() {
         let (filter, mut ctx) = make_filter_and_context();
@@ -1835,6 +1836,7 @@ mod tests {
         );
     }
 
+    /// A matched client stop sequence takes precedence over an open tool block.
     #[test]
     fn message_delta_prefers_matched_stop_sequence_over_tool_use() {
         let (filter, mut ctx) = make_filter_and_context();

@@ -696,6 +696,7 @@ class TestStreamingResponseValidation:
     def test_named_tool_with_stop_finish_reason_reports_tool_use(
         self, anthropic_client
     ):
+        """Preserve named-tool semantics when the upstream terminates with stop."""
         RecordingBackend.bodies.clear()
         RecordingBackend.untranslatable_stream_once = "tool_use_stop"
         try:
