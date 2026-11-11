@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "scenario_id": "openai_legacy/anthropic-version-sampling",
   "protocol": "openai_chat_completions",
   "provenance": {
     "kind": "synthetic",
@@ -14,7 +15,6 @@
       "msg_json": "msg_recorded_0002"
     }
   },
-  "scenario_id": "openai_legacy/anthropic-version-sampling",
   "turns": [
     {
       "name": "defaults-forwarded",
@@ -185,9 +185,9 @@
             "kind": "json",
             "value": {
               "error": {
-                "type": "invalid_request_error",
                 "code": 400,
-                "message": "fixture backend rejected sampling"
+                "message": "fixture backend rejected sampling",
+                "type": "invalid_request_error"
               }
             }
           }
@@ -237,11 +237,11 @@
           "body": {
             "kind": "json",
             "value": {
-              "type": "error",
               "error": {
-                "type": "invalid_request_error",
-                "message": "fixture backend rejected sampling"
-              }
+                "message": "fixture backend rejected sampling",
+                "type": "invalid_request_error"
+              },
+              "type": "error"
             }
           }
         }
