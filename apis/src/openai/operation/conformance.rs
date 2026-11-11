@@ -84,76 +84,14 @@ pub(crate) fn generated_response_schemas(spec: &Value, content_type: &str) -> BT
 }
 
 pub(crate) fn assert_matches_schema(spec: &Value, path: &str, schema: &Value, value: &Value) {
+    // The recursive matcher above already covers enum membership, types,
+    // items, required properties, and additionalProperties, including
+    // nullable values; a second hand-rolled walk would only re-validate
+    // the same constraints (and diverge on nullability).
     assert!(
         schema_matches_value(spec, schema, value),
         "{path} does not match generated schema: {value}"
     );
-    let schema = resolve_schema_ref(spec, schema);
-
-    if let Some(enum_values) = schema.get("enum").and_then(Value::as_array) {
-        assert!(
-            enum_values.contains(value),
-            "{path} should be one of {enum_values:?}, got {value}"
-        );
-    }
-
-    if let Some(schema_type) = schema.get("type").and_then(Value::as_str) {
-        assert_schema_type(path, schema_type, value);
-    } else if schema.get("properties").is_some() || schema.get("required").is_some() {
-        assert_schema_type(path, "object", value);
-    }
-
-    if let Some(items_schema) = schema.get("items") {
-        for (idx, item) in value
-            .as_array()
-            .unwrap_or_else(|| panic!("{path} should be an array"))
-            .iter()
-            .enumerate()
-        {
-            assert_matches_schema(spec, &format!("{path}[{idx}]"), items_schema, item);
-        }
-    }
-
-    let Some(obj) = value.as_object() else {
-        return;
-    };
-
-    if let Some(required) = schema.get("required").and_then(Value::as_array) {
-        for required_name in required {
-            let required_name = required_name.as_str().unwrap();
-            assert!(
-                obj.contains_key(required_name),
-                "{path} missing required property {required_name}"
-            );
-        }
-    }
-
-    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-        for (property_name, property_schema) in properties {
-            if let Some(property_value) = obj.get(property_name) {
-                assert_matches_schema(
-                    spec,
-                    &format!("{path}.{property_name}"),
-                    property_schema,
-                    property_value,
-                );
-            }
-        }
-    }
-
-    if let Some(additional_schema) = schema.get("additionalProperties").filter(|schema| schema.is_object()) {
-        let properties = schema.get("properties").and_then(Value::as_object);
-        for (property_name, property_value) in obj {
-            if properties.is_none_or(|properties| !properties.contains_key(property_name)) {
-                assert_matches_schema(
-                    spec,
-                    &format!("{path}.{property_name}"),
-                    additional_schema,
-                    property_value,
-                );
-            }
-        }
-    }
 }
 
 pub(crate) fn schema_matches_value(spec: &Value, schema: &Value, value: &Value) -> bool {
@@ -264,11 +202,6 @@ pub(crate) fn resolve_schema_ref<'a>(spec: &'a Value, schema: &'a Value) -> &'a 
     let pointer = ref_path.strip_prefix('#').unwrap_or(ref_path);
     spec.pointer(pointer)
         .unwrap_or_else(|| panic!("missing generated schema ref {ref_path}"))
-}
-
-pub(crate) fn assert_schema_type(path: &str, schema_type: &str, value: &Value) {
-    let matches = value_has_type(value, schema_type);
-    assert!(matches, "{path} should be {schema_type}, got {value}");
 }
 
 pub(crate) fn value_has_type(value: &Value, schema_type: &str) -> bool {

@@ -155,8 +155,8 @@ const fn files_purpose_exception(method: &'static str, path: &'static str, detai
         method: Some(method),
         path: Some(path),
         detail,
-        rationale: "`evals` is an accepted upload purpose, so stored files can carry it, while the pinned OpenAIFile.purpose enum omits it",
-        evidence: "praxis-ai-apis/openai/files/contracts.rs: FilePurpose::Evals and UploadPurpose::Evals (CreateFileRequest.purpose)",
+        rationale: "the pinned CreateFileRequest.purpose enum accepts evals as an upload purpose, so a round-tripped file can report it, while the pinned OpenAIFile.purpose enum omits it",
+        evidence: "docs/conformance/specs/openai-openapi.yaml: CreateFileRequest.purpose enum includes evals; OpenAIFile.purpose enum omits it",
     }
 }
 

@@ -895,8 +895,8 @@
               "operation": "GET /files"
             },
             "detail": "responses.200.content.application/json.schema.properties.data.items.properties.purpose.enum.added",
-            "rationale": "`evals` is an accepted upload purpose, so stored files can carry it, while the pinned OpenAIFile.purpose enum omits it",
-            "evidence": "praxis-ai-apis/openai/files/contracts.rs: FilePurpose::Evals and UploadPurpose::Evals (CreateFileRequest.purpose)"
+            "rationale": "the pinned CreateFileRequest.purpose enum accepts evals as an upload purpose, so a round-tripped file can report it, while the pinned OpenAIFile.purpose enum omits it",
+            "evidence": "docs/conformance/specs/openai-openapi.yaml: CreateFileRequest.purpose enum includes evals; OpenAIFile.purpose enum omits it"
           },
           {
             "kind": "response",
@@ -906,8 +906,8 @@
               "operation": "GET /files/{file_id}"
             },
             "detail": "responses.200.content.application/json.schema.properties.purpose.enum.added",
-            "rationale": "`evals` is an accepted upload purpose, so stored files can carry it, while the pinned OpenAIFile.purpose enum omits it",
-            "evidence": "praxis-ai-apis/openai/files/contracts.rs: FilePurpose::Evals and UploadPurpose::Evals (CreateFileRequest.purpose)"
+            "rationale": "the pinned CreateFileRequest.purpose enum accepts evals as an upload purpose, so a round-tripped file can report it, while the pinned OpenAIFile.purpose enum omits it",
+            "evidence": "docs/conformance/specs/openai-openapi.yaml: CreateFileRequest.purpose enum includes evals; OpenAIFile.purpose enum omits it"
           },
           {
             "kind": "response",
@@ -917,8 +917,8 @@
               "operation": "POST /files"
             },
             "detail": "responses.200.content.application/json.schema.properties.purpose.enum.added",
-            "rationale": "`evals` is an accepted upload purpose, so stored files can carry it, while the pinned OpenAIFile.purpose enum omits it",
-            "evidence": "praxis-ai-apis/openai/files/contracts.rs: FilePurpose::Evals and UploadPurpose::Evals (CreateFileRequest.purpose)"
+            "rationale": "the pinned CreateFileRequest.purpose enum accepts evals as an upload purpose, so a round-tripped file can report it, while the pinned OpenAIFile.purpose enum omits it",
+            "evidence": "docs/conformance/specs/openai-openapi.yaml: CreateFileRequest.purpose enum includes evals; OpenAIFile.purpose enum omits it"
           },
           {
             "kind": "response",

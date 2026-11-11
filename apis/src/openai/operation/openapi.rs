@@ -6,10 +6,6 @@
 //! Split from the runtime operation metadata so builds that only classify
 //! operations do not compile `utoipa`.
 
-#![expect(
-    clippy::allow_attributes,
-    reason = "parameter contracts used when the conversations or files feature is enabled"
-)]
 use std::borrow::{Borrow, Cow};
 
 #[cfg(test)]
@@ -131,9 +127,12 @@ pub(crate) use query_parameter;
 
 /// Location of one operation parameter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(
-    dead_code,
-    reason = "parameter contracts used when the conversations or files feature is enabled"
+#[cfg_attr(
+    not(any(feature = "openai-conversations", feature = "openai-files")),
+    expect(
+        dead_code,
+        reason = "parameter contracts used when the conversations or files feature is enabled"
+    )
 )]
 pub(crate) enum ParameterLocation {
     /// Parameter embedded in the request path.
@@ -143,11 +142,11 @@ pub(crate) enum ParameterLocation {
 }
 
 /// `OpenAPI` metadata for one operation parameter.
+///
+/// Unlike the enum and constructor below, the struct itself stays live in every
+/// feature combination: [`build_parameter`](Self::schema) consumes it whenever
+/// an owned contract is generated.
 #[derive(Clone, Copy)]
-#[allow(
-    dead_code,
-    reason = "parameter contracts used when the conversations or files feature is enabled"
-)]
 pub(crate) struct ParameterSpec {
     /// Parameter name.
     pub(crate) name: &'static str,
@@ -161,9 +160,12 @@ pub(crate) struct ParameterSpec {
     schema: fn() -> RefOr<Schema>,
 }
 
-#[allow(
-    dead_code,
-    reason = "parameter contracts used when the conversations or files feature is enabled"
+#[cfg_attr(
+    not(any(feature = "openai-conversations", feature = "openai-files")),
+    expect(
+        dead_code,
+        reason = "parameter contracts used when the conversations or files feature is enabled"
+    )
 )]
 impl ParameterSpec {
     /// Declare one parameter backed by a concrete Rust schema type.
