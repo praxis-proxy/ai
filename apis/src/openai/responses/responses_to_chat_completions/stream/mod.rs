@@ -41,13 +41,16 @@ use self::{
     framing::{Framing, FramingError},
     reasoning::ReasoningState,
 };
-use crate::openai::translation::{
-    chat_completions::{
-        ResponseContext, chat_response_to_response_resource, context_has_web_search,
-        function_call_output_item_from_parts, in_progress_response_resource_with_service_tier, message_output_item,
-        output_text_item, refusal_item, web_search_call_output_item_from_parts,
+use crate::openai::{
+    responses::state::ResponsesState,
+    translation::{
+        chat_completions::{
+            ResponseContext, chat_response_to_response_resource, context_has_web_search,
+            function_call_output_item_from_parts, in_progress_response_resource_with_service_tier, message_output_item,
+            output_text_item, refusal_item, web_search_call_output_item_from_parts,
+        },
+        reasoning::{ReasoningOptions, reasoning_item_id},
     },
-    reasoning::{ReasoningOptions, reasoning_item_id},
 };
 
 /// Resource limits governing one streaming translation.
@@ -325,6 +328,15 @@ impl ToolCallState {
     }
 }
 
+/// Client input echo for lifecycle resources, reconstructed at most once per
+/// stream (`input` was moved out of `request_body` at init, #1618).
+enum EchoedInput {
+    /// Not reconstructed yet.
+    Pending,
+    /// Reconstructed; `None` when the request carried no `input`.
+    Ready(Option<Value>),
+}
+
 /// Incremental Chat Completions to Responses SSE converter.
 pub(super) struct StreamConverter {
     /// Stable Responses resource id.
@@ -378,10 +390,15 @@ pub(super) struct StreamConverter {
     /// Late reasoning position from a successful terminal, consumed once by the
     /// filter to preserve this completion's association in stored replay.
     replay_reasoning_index: Option<usize>,
+    /// Client input echoed onto lifecycle resources, reconstructed once from the
+    /// state snapshot (`input` was moved out of `request_body` at init, #1618) and
+    /// reused across callbacks so heartbeats never rebuild it.
+    echoed_input: EchoedInput,
 }
 
 impl StreamConverter {
     /// Create a converter for a streaming response.
+    #[expect(clippy::too_many_lines, reason = "initializes every converter field")]
     pub(super) fn new(
         response_id: String,
         created_at: u64,
@@ -417,6 +434,17 @@ impl StreamConverter {
             budget_output_allowance: 0,
             frames_processed: 0,
             replay_reasoning_index: None,
+            echoed_input: EchoedInput::Pending,
+        }
+    }
+
+    /// Reconstruct the client input echo once per stream from the state snapshot.
+    ///
+    /// `input` was moved out of `request_body` at init (#1618); lifecycle resources
+    /// echo it back. Caching here keeps heartbeat callbacks from rebuilding it.
+    pub(super) fn ensure_echoed_input(&mut self, state: &ResponsesState) {
+        if matches!(self.echoed_input, EchoedInput::Pending) {
+            self.echoed_input = EchoedInput::Ready(crate::openai::responses::request_input::input_echo_value(state));
         }
     }
 
@@ -1379,13 +1407,18 @@ impl StreamConverter {
             )?;
         }
         let content_items = self.build_message_content_items();
-        let context = self.response_context(inputs, None);
         let output_index = self.message.as_ref().expect("present").output_index;
+        // Build the item (which borrows the echoed input via the context) before
+        // mutating `self.emit`, so the context's `&self` borrow is released first.
+        let item = {
+            let context = self.response_context(inputs, None);
+            message_output_item(&context, status, content_items)
+        };
         emit_event(
             &mut self.emit,
             &self.limits,
             true,
-            events::output_item_done(output_index, &message_output_item(&context, status, content_items)),
+            events::output_item_done(output_index, &item),
             out,
         )?;
         self.message.as_mut().expect("present").closed = true;
@@ -1481,9 +1514,11 @@ impl StreamConverter {
     /// Emit the terminal `response.completed` or `response.incomplete` event.
     fn emit_terminal(&mut self, inputs: &SnapshotInputs<'_>, out: &mut Vec<u8>) -> Result<(), ConvertError> {
         let finish = self.finish_reason.clone().unwrap_or_default();
-        let context = self.response_context(inputs, Some(inputs.now));
         let mut synthetic = self.synthetic_completion(&finish);
+        // Finish mutating `self` (reasoning move) before taking the context's `&self`
+        // borrow, which the echoed input now ties to `self` (#1618).
         self.move_reasoning_to_completion(&mut synthetic)?;
+        let context = self.response_context(inputs, Some(inputs.now));
         let mut resource = chat_response_to_response_resource(&synthetic, &context).map_err(|error| {
             tracing::trace!(%error, "accumulated stream state could not form a valid terminal response");
             ConvertError::InvalidTerminalResource
@@ -1595,14 +1630,20 @@ impl StreamConverter {
             Err(other) => return Err(other),
         }
         // A failed response has no completion moment, so no completed_at timestamp.
-        let context = self.response_context(inputs, None);
         // The synthetic completion only supplies the request-echoed envelope
         // (id, model, usage); mark_failed drops its output because the failed
         // terminal never streamed completion events for the accumulated items.
         let synthetic = self.synthetic_completion("stop");
-        let mut resource = chat_response_to_response_resource(&synthetic, &context)
-            .or_else(|_| in_progress_response_resource_with_service_tier(&context, self.service_tier.as_ref()))
-            .unwrap_or_else(|_| minimal_failed_resource(&context, message));
+        // Build every resource that borrows the context — which now ties the echoed
+        // input to `&self` (#1618) — before mutating `self.emit` below.
+        let (mut resource, minimal) = {
+            let context = self.response_context(inputs, None);
+            let resource = chat_response_to_response_resource(&synthetic, &context)
+                .or_else(|_| in_progress_response_resource_with_service_tier(&context, self.service_tier.as_ref()))
+                .unwrap_or_else(|_| minimal_failed_resource(&context, message));
+            let minimal = minimal_failed_resource(&context, message);
+            (resource, minimal)
+        };
         mark_failed(&mut resource, message);
         // The partial snapshot can be arbitrarily large — this failure may itself
         // be the byte-limit trip, and the snapshot echoes request-controlled
@@ -1611,7 +1652,7 @@ impl StreamConverter {
         // constant-bounded failed resource that echoes no request data, so the
         // terminal never re-serializes the oversized content the ceiling bounds.
         if serialized_json_len(&resource)? > self.limits.max_body_bytes {
-            resource = minimal_failed_resource(&context, message);
+            resource = minimal.clone();
         }
         // Emit the failed terminal. Even after the byte-ceiling fallback the frame
         // can exceed the (tighter) per-frame ceiling — the response-size ceiling
@@ -1628,7 +1669,6 @@ impl StreamConverter {
         ) {
             Ok(()) => {},
             Err(ConvertError::FrameSizeLimit) => {
-                let minimal = minimal_failed_resource(&context, message);
                 emit_event(
                     &mut self.emit,
                     &self.limits,
@@ -1828,7 +1868,7 @@ impl StreamConverter {
     }
 
     /// Build a response context borrowing the request body.
-    fn response_context<'a>(&self, inputs: &SnapshotInputs<'a>, completed_at: Option<u64>) -> ResponseContext<'a> {
+    fn response_context<'a>(&'a self, inputs: &SnapshotInputs<'a>, completed_at: Option<u64>) -> ResponseContext<'a> {
         let mut context =
             ResponseContext::from_responses_request(inputs.request_body, self.response_id.clone(), self.created_at)
                 .with_reasoning_options(self.reasoning_options);
@@ -1838,6 +1878,12 @@ impl StreamConverter {
         context.tools = inputs.tools;
         if let Some(original_tool_choice) = inputs.original_tool_choice {
             context.tool_choice = Some(original_tool_choice);
+        }
+        // `input` was moved out of `request_body` at init (#1618); echo the copy the
+        // converter reconstructed once (falls back to the request body in tests that
+        // do not strip it).
+        if let EchoedInput::Ready(Some(input)) = &self.echoed_input {
+            context.input = Some(input);
         }
         match completed_at {
             Some(timestamp) => context.with_completed_at(timestamp),

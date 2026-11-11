@@ -117,6 +117,7 @@ The manifest declares **94 features** across **11 scopes**, linked to **72 scena
 | `openai_chat_completions_to_anthropic_messages` | `external_model.anthropic.request.legacy_sampling` | `synthetic_only` | `openai_legacy/anthropic-json-sse-error` | `synthetic`: `synthetic_only` |
 | `openai_chat_completions_to_anthropic_messages` | `external_model.anthropic.request.version_sampling` | `synthetic_only` | `openai_legacy/anthropic-version-sampling` | `synthetic`: `synthetic_only` |
 | `openai_responses_to_chat_completions` | `responses.chat.access_programs` | `synthetic_only` | `responses/chat-basic-nonstream`<br>`responses/chat-unrepresentable-parameters` | `synthetic`: `synthetic_only` |
+| `responses_native_passthrough` | `responses.request.object_document_input` | `synthetic_only` | `responses/object-document-input` | `synthetic`: `synthetic_only` |
 <!-- END GENERATED INFERENCE COVERAGE -->
 
 ## Layout

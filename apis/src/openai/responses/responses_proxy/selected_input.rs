@@ -74,7 +74,8 @@ fn reconcile_shorthand<'a>(
     canonical: Vec<Cow<'a, Value>>,
     native: bool,
 ) -> Result<Vec<Cow<'a, Value>>, FilterError> {
-    if let [Value::Object(message)] = state.input.as_slice()
+    if state.input.len() == 1
+        && let Some(Value::Object(message)) = state.input.get(0)
         && message.len() == 3
         && message.get("type").and_then(Value::as_str) == Some("message")
         && message.get("role").and_then(Value::as_str) == Some("user")

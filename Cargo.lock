@@ -3583,6 +3583,7 @@ dependencies = [
 name = "praxis-ai-benchmarks"
 version = "0.10.0"
 dependencies = [
+ "allocation-counter",
  "criterion",
  "praxis-ai-apis",
  "serde_json",
