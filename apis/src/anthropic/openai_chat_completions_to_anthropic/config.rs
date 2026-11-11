@@ -24,8 +24,8 @@ pub(crate) struct OpenaiChatCompletionsToAnthropicConfig {
     #[serde(default)]
     pub(crate) api_translation_enabled: bool,
     /// Operator-selected Anthropic contract: `2023-06-01` (default) or
-    /// `2026-10-21`. Independent of caller headers; the new version rejects
-    /// sampling controls before dispatch.
+    /// `2026-10-21`. Independent of caller headers; sampling validation
+    /// remains the responsibility of the backend.
     #[serde(default)]
     pub(crate) api_version: AnthropicApiVersion,
     /// Compatibility setting for the former shared request/response limit.
@@ -41,10 +41,10 @@ pub(crate) struct OpenaiChatCompletionsToAnthropicConfig {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(try_from = "String")]
 pub(crate) enum AnthropicApiVersion {
-    /// Preserve the existing sampling-compatible contract.
+    /// Anthropic Messages API version 2023-06-01.
     #[default]
     V20230601,
-    /// Reject sampling controls before dispatch.
+    /// Anthropic Messages API version 2026-10-21.
     V20261021,
 }
 

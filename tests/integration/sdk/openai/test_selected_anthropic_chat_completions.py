@@ -512,57 +512,56 @@ def test_disabled_translation_names_platform_administrator(translation_disabled_
 
 @pytest.mark.parametrize("field,value", [
     ("temperature", 0), ("temperature", 1), ("temperature", 0.5),
-    ("top_p", 1), ("top_p", 0.9), ("top_k", 40),
-    ("temperature", None), ("top_p", None), ("top_k", None),
+    ("top_p", 1), ("top_p", 0.9),
 ])
 @pytest.mark.parametrize("stream", [False, True])
-def test_version_specific_sampling_before_dispatch(client: OpenAI, api_version, field, value, stream) -> None:
-    legacy_supported = api_version == "2023-06-01" and field != "top_k" and value is not None
-    if legacy_supported:
-        if stream:
-            STATE.script(200, "text/event-stream", _anthropic_events())
-        else:
-            STATE.script(200, "application/json", _message(
-                [{"type": "text", "text": "hello"}], {"input_tokens": 1, "output_tokens": 1},
-            ))
-        response = client.chat.completions.create(
-            model=MODEL, messages=[{"role": "user", "content": "hi"}],
-            max_tokens=16, stream=stream, extra_body={field: value},
-        )
-        if stream:
-            assert list(response), "legacy sampling must support streaming"
-        else:
-            assert response.choices[0].message.content == "hello"
-        assert STATE.requests[-1][2][field] == value, "legacy sampling must not change"
-        return
+def test_sampling_reaches_upstream_unchanged(client: OpenAI, api_version, field, value, stream) -> None:
+    """Both configured versions forward defaults and non-defaults unchanged."""
+    if stream:
+        STATE.script(200, "text/event-stream", _anthropic_events())
+    else:
+        STATE.script(200, "application/json", _message(
+            [{"type": "text", "text": "hello"}], {"input_tokens": 1, "output_tokens": 1},
+        ))
+    response = client.chat.completions.create(
+        model=MODEL, messages=[{"role": "user", "content": "hi"}],
+        max_tokens=16, stream=stream, extra_body={field: value},
+    )
+    if stream:
+        assert list(response), "streaming sampling requests must reach the backend"
+    else:
+        assert response.choices[0].message.content == "hello"
+    assert STATE.requests[-1][2][field] == value, "sampling must not change"
+    assert STATE.requests[-1][1]["anthropic-version"] == api_version
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_sampling_rejection_comes_from_upstream(client: OpenAI, api_version, stream) -> None:
+    """The backend owns sampling validation; its error reaches the OpenAI client."""
+    STATE.script(400, "application/json", {
+        "type": "error", "error": {"type": "invalid_request_error", "message": "fixture backend rejected sampling"},
+    })
     with pytest.raises(APIStatusError) as exc:
         client.chat.completions.create(
             model=MODEL, messages=[{"role": "user", "content": "hi"}],
-            max_tokens=16, stream=stream, extra_body={field: value},
+            max_tokens=16, stream=stream, extra_body={"temperature": 0.5, "top_p": 0.9},
         )
-    assert exc.value.status_code == 400, "unsupported sampling must be a client error"
-    assert field in exc.value.response.json()["error"]["message"], "error must identify the unsupported field"
-    if api_version == "2026-10-21" and field != "top_k":
-        assert "2026-10-21" in exc.value.response.json()["error"]["message"], "error must identify the version"
-    assert STATE.requests == [], "rejected sampling must never reach the backend"
+    assert exc.value.status_code == 400
+    assert exc.value.response.json()["error"] == {
+        "code": 400, "type": "invalid_request_error", "message": "fixture backend rejected sampling",
+    }
+    assert len(STATE.requests) == 1, "sampling must reach the backend before rejection"
+    _, headers, body = STATE.requests[0]
+    assert headers["anthropic-version"] == api_version
+    assert body["temperature"] == 0.5 and body["top_p"] == 0.9
 
 
 @pytest.mark.parametrize("caller_version", [None, "caller-version"])
 def test_protocol_default_cannot_override_translation(protocol_client, caller_version):
-    """Wire version and pre-dispatch validation must use the same contract."""
+    """The translator selects the wire version without changing sampling."""
     sdk, version = protocol_client
     headers = {} if caller_version is None else {"anthropic-version": caller_version}
-    if version == "2026-10-21":
-        with pytest.raises(APIStatusError) as exc:
-            sdk.chat.completions.create(
-                model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16,
-                extra_headers=headers, extra_body={"temperature": 0.5},
-            )
-        assert exc.value.status_code == 400
-        assert STATE.requests == [], "new-version sampling must be rejected before dispatch"
-        sampling = {}
-    else:
-        sampling = {"temperature": 0.5}
+    sampling = {"temperature": 0.5}
     STATE.script(200, "application/json", _message(
         [{"type": "text", "text": "hello"}], {"input_tokens": 1, "output_tokens": 1},
     ))
@@ -573,7 +572,7 @@ def test_protocol_default_cannot_override_translation(protocol_client, caller_ve
     _path, wire_headers, body = STATE.requests[-1]
     assert wire_headers["anthropic-version"] == version, "translator must own the wire contract"
     if sampling:
-        assert body["temperature"] == 0.5, "legacy sampling must survive a conflicting native default"
+        assert body["temperature"] == 0.5, "sampling must survive a conflicting native default"
 
 
 if __name__ == "__main__":

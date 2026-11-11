@@ -1,128 +1,60 @@
 version: 1
 id: openai_legacy/anthropic-version-sampling
-description: Operator-selected Anthropic API version overrides a conflicting native protocol default, rejects sampling before dispatch, and accepts requests without sampling.
+description: Configured Anthropic version overrides a native default while sampling
+  reaches upstream unchanged and backend errors reach the client.
 protocol: openai_chat_completions
 example_config: openai-selected-provider-version-fixture.yaml
 upstream_authority: 127.0.0.1:8001
 features:
-  - external_model.anthropic.request.version_sampling
+- external_model.anthropic.request.version_sampling
 turns:
-  - name: without-sampling
-    request:
-      method: POST
-      path: /v1/chat/completions
-      headers:
-        content-type:
-          - application/json
-      body:
-        kind: json
-        value:
-          max_tokens: 16
-          messages:
-            - content: Say hello.
-              role: user
-          model: ${MODEL}
-          stream: false
-    expect:
-      client_status: 200
-      client_body_kind: json
-      upstream_path: /v1/messages
-      upstream_body_kind: json
-      client_sse_events: []
-      upstream_sse_events: []
-  - name: temperature-rejected
-    request:
-      method: POST
-      path: /v1/chat/completions
-      headers:
-        content-type:
-          - application/json
-      body:
-        kind: json
-        value:
-          max_tokens: 16
-          messages:
-            - content: Say hello.
-              role: user
-          model: ${MODEL}
-          stream: false
-          temperature: 1
-    expect:
-      client_status: 400
-      client_body_kind: json
-      upstream_path: ''
-      upstream_body_kind: empty
-      client_sse_events: []
-      upstream_sse_events: []
-  - name: top_p-rejected
-    request:
-      method: POST
-      path: /v1/chat/completions
-      headers:
-        content-type:
-          - application/json
-      body:
-        kind: json
-        value:
-          max_tokens: 16
-          messages:
-            - content: Say hello.
-              role: user
-          model: ${MODEL}
-          stream: false
-          top_p: 0.9
-    expect:
-      client_status: 400
-      client_body_kind: json
-      upstream_path: ''
-      upstream_body_kind: empty
-      client_sse_events: []
-      upstream_sse_events: []
-  - name: top_k-rejected
-    request:
-      method: POST
-      path: /v1/chat/completions
-      headers:
-        content-type:
-          - application/json
-      body:
-        kind: json
-        value:
-          max_tokens: 16
-          messages:
-            - content: Say hello.
-              role: user
-          model: ${MODEL}
-          stream: false
-          top_k: 40
-    expect:
-      client_status: 400
-      client_body_kind: json
-      upstream_path: ''
-      upstream_body_kind: empty
-      client_sse_events: []
-      upstream_sse_events: []
-  - name: temperature-null
-    request:
-      method: POST
-      path: /v1/chat/completions
-      headers:
-        content-type:
-          - application/json
-      body:
-        kind: json
-        value:
-          max_tokens: 16
-          messages:
-            - content: Say hello.
-              role: user
-          model: ${MODEL}
-          stream: false
-          temperature: null
-    expect:
-      client_status: 400
-      client_body_kind: json
-      upstream_path: ''
-      upstream_body_kind: empty
-      client_sse_events: []
-      upstream_sse_events: []
+- name: defaults-forwarded
+  request:
+    method: POST
+    path: /v1/chat/completions
+    headers:
+      content-type:
+      - application/json
+    body:
+      kind: json
+      value:
+        max_tokens: 16
+        messages:
+        - content: Say hello.
+          role: user
+        model: ${MODEL}
+        stream: false
+        temperature: 1
+        top_p: 1
+  expect:
+    client_status: 200
+    client_body_kind: json
+    upstream_path: /v1/messages
+    upstream_body_kind: json
+    client_sse_events: []
+    upstream_sse_events: []
+- name: upstream-sampling-error
+  request:
+    method: POST
+    path: /v1/chat/completions
+    headers:
+      content-type:
+      - application/json
+    body:
+      kind: json
+      value:
+        max_tokens: 16
+        messages:
+        - content: Say hello.
+          role: user
+        model: ${MODEL}
+        stream: false
+        temperature: 0.5
+        top_p: 0.9
+  expect:
+    client_status: 400
+    client_body_kind: json
+    upstream_path: /v1/messages
+    upstream_body_kind: json
+    client_sse_events: []
+    upstream_sse_events: []

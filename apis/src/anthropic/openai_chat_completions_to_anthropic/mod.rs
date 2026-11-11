@@ -120,9 +120,8 @@ struct BufferedJsonResponse {
 /// ```
 ///
 /// `api_version` selects the backend contract independently of caller headers.
-/// It defaults to `2023-06-01`, which preserves numeric `temperature` and
-/// `top_p`. Selecting `2026-10-21` rejects any `temperature`, `top_p`, or
-/// `top_k` field with HTTP 400 before dispatch, including defaults and nulls.
+/// It defaults to `2023-06-01`. Supported sampling fields are preserved under
+/// either version; the backend owns version-specific parameter validation.
 /// Unknown versions fail configuration parsing. OpenAI-compatible candidates
 /// and native Messages passthrough are unaffected.
 ///
@@ -341,17 +340,16 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
             }
             return Ok(SelectedUpstreamBodyOutcome::Continue);
         }
-        let (translated, request) =
-            match request::translate_request(bytes, &profile.target_model, self.config.api_version) {
-                Ok(result) => result,
-                Err(error) => {
-                    return Ok(SelectedUpstreamBodyOutcome::Reject(Self::openai_error_rejection(
-                        400,
-                        "invalid_request_error",
-                        &error,
-                    )));
-                },
-            };
+        let (translated, request) = match request::translate_request(bytes, &profile.target_model) {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(SelectedUpstreamBodyOutcome::Reject(Self::openai_error_rejection(
+                    400,
+                    "invalid_request_error",
+                    &error,
+                )));
+            },
+        };
         ctx.set_metadata(REQUEST_STREAM, request.stream.to_string());
         ctx.set_metadata(CLIENT_MODEL, request.client_model);
         ctx.set_metadata(INCLUDE_USAGE, request.include_usage.to_string());

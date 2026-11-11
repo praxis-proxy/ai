@@ -316,9 +316,10 @@ fields even when they contain defaults.
 
 For Chat Completions clients translated to Anthropic Messages, the operator
 selects `openai_chat_completions_to_anthropic.api_version`. Its default is
-`2023-06-01`; selecting `2026-10-21` rejects sampling controls before sending
-the request upstream, including explicit default values and nulls. This
-translator setting wins over a co-configured native protocol default in either
+`2023-06-01`. Under either supported version, supported sampling values reach
+the backend unchanged; the backend owns version-specific validation and any
+rejection is returned through the existing error translation. The translator
+setting wins over a co-configured native protocol default in either
 filter order. It applies to the whole translator configuration, not individual
 routing-overlay providers. Compatible Messages-to-Chat Completions and native vLLM
 routes retain their sampling support. See the

@@ -1428,11 +1428,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
         assert_eq!(report.features_total, 95, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 72, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 77, "manifest recording inventory count");
+        assert_eq!(report.scenarios_total, 73, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 78, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![

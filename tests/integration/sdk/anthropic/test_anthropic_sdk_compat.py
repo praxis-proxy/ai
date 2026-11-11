@@ -626,22 +626,23 @@ class TestTranslatedToChatCompletions:
         assert translated_history[-1]["tool_call_id"] == tool_use.id
 
     @pytest.mark.parametrize("version", ["2023-06-01", "2026-10-21"])
-    def test_sampling_parameters_are_translated(self, translated_client, version):
+    @pytest.mark.parametrize("temperature,top_p", [(1, 1), (0.5, 0.9)])
+    def test_sampling_parameters_are_translated(self, translated_client, version, temperature, top_p):
         # Sampling parameters are no longer typed SDK fields; they travel as
         # request-body fields via extra_body on both lanes.
         translated_client.messages.create(
             model=MODEL,
             max_tokens=64,
             stop_sequences=["\n"],
-            extra_body={"temperature": 0.5, "top_p": 0.9, "top_k": 40},
+            extra_body={"temperature": temperature, "top_p": top_p, "top_k": 40},
             extra_headers={"anthropic-version": version},
             messages=[{"role": "user", "content": "Hi"}],
         )
 
         _path, headers, body = TRANSLATED_STATE.requests[-1]
         assert "anthropic-version" not in headers, "caller version must not reach a Chat Completions backend"
-        assert body["temperature"] == 0.5
-        assert body["top_p"] == 0.9
+        assert body["temperature"] == temperature
+        assert body["top_p"] == top_p
         assert body["stop"] == ["\n"], "stop_sequences must become the Chat Completions stop"
         assert body["top_k"] == 40, "top_k must be forwarded as an unmapped field"
 

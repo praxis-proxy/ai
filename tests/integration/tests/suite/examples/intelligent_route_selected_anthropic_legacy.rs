@@ -220,8 +220,11 @@ fn selected_anthropic_sse_is_converted_incrementally_to_openai_sse() {
 }
 
 #[test]
-fn selected_anthropic_version_example_rejects_sampling_before_dispatch() {
-    let backend = StatefulCapturingBackend::new(vec![(200, ANTHROPIC_JSON.to_owned())]).start_with_shutdown();
+fn selected_anthropic_version_example_preserves_sampling_and_backend_errors() {
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, ANTHROPIC_JSON.to_owned()),
+        (400, r#"{"type":"error","error":{"type":"invalid_request_error","message":"fixture backend rejected sampling"}}"#.to_owned()),
+    ]).start_with_shutdown();
     let example = example_config_path("openai-selected-provider-version-fixture.yaml");
     let overlay = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/inference/routing/openai-to-anthropic.json");
     let yaml = std::fs::read_to_string(&example)
@@ -234,68 +237,56 @@ fn selected_anthropic_version_example_rejects_sampling_before_dispatch() {
         );
     let config = Config::from_yaml(&yaml).expect("version-aware example must parse");
     let proxy = start_proxy(&config);
-    let mut body = json!({
-        "model":"fixture-openai-model", "messages":[{"role":"user","content":"hi"}], "max_tokens":16
-    });
-    for field in ["temperature", "top_p", "top_k"] {
-        for stream in [false, true] {
-            body[field] = json!(1);
-            body["stream"] = json!(stream);
-            let encoded = serde_json::to_string(&body).expect("serialize rejected request");
-            let request = format!(
-                "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{encoded}",
-                encoded.len()
-            );
-            let response = http_send(proxy.addr(), &request);
-            assert_eq!(
-                parse_status(&response),
-                400,
-                "new contract must reject {field}: {response}"
-            );
+    for (status, temperature, top_p) in [(200, 1.0, 1.0), (400, 0.5, 0.9)] {
+        let body = json!({
+            "model":"fixture-openai-model", "messages":[{"role":"user","content":"hi"}],
+            "max_tokens":16, "temperature":temperature, "top_p":top_p, "stream":false
+        });
+        let encoded = serde_json::to_string(&body).expect("serialize sampling request");
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAnthropic-Version: 2023-06-01\r\nConnection: close\r\n\r\n{encoded}",
+            encoded.len()
+        );
+        let response = http_send(proxy.addr(), &request);
+        assert_eq!(
+            parse_status(&response),
+            status,
+            "backend status must reach client: {response}"
+        );
+        let requests = backend.requests();
+        let upstream = requests
+            .iter()
+            .rev()
+            .find(|request| request.method == "POST")
+            .expect("sampling reaches upstream");
+        let upstream_body: Value = serde_json::from_str(&upstream.body).expect("upstream Messages JSON");
+        assert_eq!(
+            upstream_body["temperature"], temperature,
+            "temperature must be preserved"
+        );
+        assert_eq!(upstream_body["top_p"], top_p, "top_p must be preserved");
+        assert!(
+            upstream
+                .headers
+                .to_ascii_lowercase()
+                .contains("anthropic-version: 2026-10-21"),
+            "configured version must override caller and native default"
+        );
+        if status == 400 {
             let error: Value = serde_json::from_str(&parse_body(&response)).expect("OpenAI error JSON");
-            let message = error["error"]["message"].as_str().expect("error message");
-            assert!(message.contains(field), "error must name unsupported field: {message}");
-            if field == "top_k" {
-                assert!(
-                    message.contains("cannot be preserved"),
-                    "top_k is a bridge limitation: {message}"
-                );
-            } else {
-                assert!(
-                    message.contains("2026-10-21"),
-                    "error must name selected version: {message}"
-                );
-                assert!(
-                    message.contains("platform administrator"),
-                    "version configuration is administrator-owned: {message}"
-                );
-            }
-            body.as_object_mut().expect("request object").remove(field);
+            assert_eq!(error["error"]["message"], "fixture backend rejected sampling");
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+            assert_eq!(error["error"]["code"], 400);
         }
     }
-    assert!(
-        backend.requests().iter().all(|request| request.method != "POST"),
-        "rejected requests must make no upstream inference calls"
-    );
-    body["stream"] = json!(false);
-    let encoded = serde_json::to_string(&body).expect("serialize accepted request");
-    let request = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAnthropic-Version: 2023-06-01\r\nConnection: close\r\n\r\n{encoded}",
-        encoded.len()
-    );
-    let response = http_send(proxy.addr(), &request);
     assert_eq!(
-        parse_status(&response),
-        200,
-        "omitted sampling must succeed: {response}"
-    );
-    let upstream = post_request(&backend.requests());
-    assert!(
-        upstream
-            .headers
-            .to_ascii_lowercase()
-            .contains("anthropic-version: 2026-10-21"),
-        "configured version must override the caller header"
+        backend
+            .requests()
+            .iter()
+            .filter(|request| request.method == "POST")
+            .count(),
+        2,
+        "both sampling requests must reach upstream"
     );
 }
 

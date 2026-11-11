@@ -28,16 +28,16 @@ individual provider entries in the routing overlay. Use separate configured
 routes for Anthropic-compatible backends requiring different API versions.
 OpenAI-compatible provider selections are unaffected by this setting.
 
-Under `2023-06-01`, numeric `temperature` and `top_p` values are forwarded
-unchanged. The existing rejection of `top_k` on this Chat Completions bridge
-remains in place. Under `2026-10-21`, the presence of `temperature`, `top_p`,
-or `top_k` causes HTTP 400 before dispatch, including default values and
-`null`. This is deliberately strict: even clients that automatically send
-`temperature: 1` or `top_p: 1` must omit those fields for the new contract.
-Version-specific errors identify the field and API version; `top_k` instead
-reports that the bridge cannot preserve it, under either version. No sampling
-field is silently removed. Omit unsupported fields or ask the platform
-administrator to configure a contract supported by the selected backend.
+Under either version, supported numeric `temperature` and `top_p` values
+are forwarded unchanged, including explicit defaults and non-default values.
+The translator selects the wire version; the backend owns version-specific
+sampling validation. Praxis does not drop supported sampling fields or reject
+them based on the configured API version. An upstream rejection is returned
+through the existing OpenAI-compatible error translation.
+
+Existing structural validation is unchanged: this bridge still rejects
+`top_k` and unsupported field types. Selecting a different API version does
+not expand the supported field set.
 
 Native Messages passthrough has a different contract:
 `anthropic_messages_protocol` preserves caller-supplied `anthropic-version`
@@ -50,7 +50,7 @@ provider restrictions to those backends.
 
 The controlled example
 [`openai-selected-provider-version-fixture.yaml`](../../examples/configs/openai-selected-provider-version-fixture.yaml)
-and inference replay cover new-version success and rejection before dispatch.
+and inference replay cover new-version sampling preservation and upstream error propagation.
 They use synthetic backend responses, not live Anthropic evidence.
 
 ## Request contract
