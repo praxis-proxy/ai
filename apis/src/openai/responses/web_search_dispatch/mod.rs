@@ -1226,29 +1226,14 @@ fn web_search_context_size_from_state(state: &ResponsesState) -> Option<&str> {
     })
 }
 
-/// Recover the first web-search tool's `user_location` object from request state.
-///
-/// The canonical state preserves the full `user_location` the client sent; the
-/// dispatcher and preflight read it from here after IRR resets step-local
-/// metadata.
-fn web_search_user_location_from_state(state: &ResponsesState) -> Option<&Value> {
-    state.tools.iter().find_map(|tool| {
-        let tool_type = tool.get("type").and_then(Value::as_str)?;
-        if is_web_search_tool_type(tool_type) {
-            tool.get("user_location")
-        } else {
-            None
-        }
-    })
-}
-
 /// Every web-search tool's `user_location` object from request state, in
 /// declaration order.
 ///
 /// A request may declare more than one web-search tool, so the round-0 preflight
-/// inspects them all rather than only the first — an unsupported field or a
-/// conflicting country on a later tool must not slip past
-/// [`web_search_user_location_from_state`]'s first-match lookup.
+/// and outbound country pick inspect them all rather than only the first — an
+/// unsupported field or a conflicting country on a later tool must not slip
+/// past, and an earlier unset location must not hide a later country
+/// (issues #1548 / #1769).
 fn web_search_user_locations_from_state(state: &ResponsesState) -> impl Iterator<Item = &Value> {
     state.tools.iter().filter_map(|tool| {
         let tool_type = tool.get("type").and_then(Value::as_str)?;
@@ -1258,16 +1243,21 @@ fn web_search_user_locations_from_state(state: &ResponsesState) -> impl Iterator
     })
 }
 
-/// Extract the supported ISO `country` code from the request's `user_location`.
+/// Extract the supported ISO `country` code to forward from web-search tools.
 ///
 /// Only `country` is forwarded to providers (issue #1548); the round-0 preflight
-/// already rejected any unsupported field, so a value returned here is known to
-/// be provider-supported. A null or empty `country` is a canonical "unset".
+/// already rejected any unsupported field and any *conflicting* countries, so a
+/// value returned here is known to be provider-supported. Walk every web-search
+/// tool the same way preflight does: a null `user_location`, a missing/null/
+/// empty `country`, or a non-object location is unset and must not hide a later
+/// tool's real country (issue #1769).
 fn web_search_country_from_state(state: &ResponsesState) -> Option<&str> {
-    web_search_user_location_from_state(state)?
-        .get("country")
-        .and_then(Value::as_str)
-        .filter(|country| !country.is_empty())
+    web_search_user_locations_from_state(state).find_map(|user_location| {
+        user_location
+            .get("country")
+            .and_then(Value::as_str)
+            .filter(|country| !country.is_empty())
+    })
 }
 
 /// Parse a hosted search action while preserving legacy compatibility. A valid,
