@@ -730,13 +730,14 @@ mod tests {
 
     #[test]
     fn rejects_max_body_bytes_above_ceiling() {
-        let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 67108865").unwrap();
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            "max_body_bytes: {}",
+            praxis_filter::body::MAX_JSON_BODY_BYTES + 1
+        ))
+        .unwrap();
         let result = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml);
 
-        assert!(
-            result.is_err(),
-            "max_body_bytes above 64 MiB ceiling should be rejected"
-        );
+        assert!(result.is_err(), "max_body_bytes above the ceiling should be rejected");
     }
 
     #[tokio::test]

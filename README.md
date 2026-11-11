@@ -174,7 +174,12 @@ Feel free to join our [discussion forums] to ask questions or share ideas.
 
 Or please join us in our Slack channel on [CNCF Slack]: [#praxis] channel
 
+Check the [CNCF Praxis Calendar] to see our community calls and other online
+meetups.
+
 [discussion forums]:https://github.com/praxis-proxy/praxis/discussions
+[#praxis]:https://cloud-native.slack.com/archives/C0BK0RSP5RC
+[CNCF Praxis Calendar]:https://app.lfx.dev/projects/praxis/calendar
 
 ## License
 

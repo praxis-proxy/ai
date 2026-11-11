@@ -3,11 +3,11 @@
 
 //! Configuration for the `openai_client_tool_compat` filter.
 
-use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
+use praxis_filter::FilterError;
 use serde::Deserialize;
 
 use super::custom_input::CustomInputPatternEncoding;
-use crate::openai::responses::body_limits::validate_size_limit;
+use crate::{json_body::MAX_JSON_BODY_BYTES, openai::responses::body_limits::validate_size_limit};
 
 // -----------------------------------------------------------------------------
 // Constants

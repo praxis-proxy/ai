@@ -6,11 +6,11 @@
 use std::collections::HashSet;
 
 use praxis_core::config::ChainRef;
-use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
+use praxis_filter::FilterError;
 use serde::Deserialize;
 use url::Url;
 
-use crate::openai::responses::body_limits::validate_size_limit;
+use crate::{json_body::MAX_JSON_BODY_BYTES, openai::responses::body_limits::validate_size_limit};
 
 // -----------------------------------------------------------------------------
 // Constants

@@ -6,21 +6,24 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use http::Method;
-use praxis_filter::{BodyAccess, BodyMode, FilterAction, HttpFilter as _, body::MAX_JSON_BODY_BYTES};
+use praxis_filter::{BodyAccess, BodyMode, FilterAction, HttpFilter as _};
 
 use super::{
     config::{DocExtractConfig, OnUnsupported, is_text_safe_mime},
     extract::{ExtractError, ExtractionBudget, extract_input_file, parse_data_uri},
     *,
 };
-use crate::test_utils::{make_filter_context, make_request};
+use crate::{
+    json_body::MAX_JSON_BODY_BYTES,
+    test_utils::{make_filter_context, make_request},
+};
 
 fn install_document_budget(ctx: &mut HttpFilterContext<'_>, body: &serde_json::Value, limit: usize) {
     let raw = serde_json::to_vec(body).unwrap();
     let policy =
         AgenticBudgetPolicy::from_config(&serde_yaml::from_str(&format!("max_retained_bytes: {limit}")).unwrap())
             .unwrap();
-    let mut state = ResponsesState::from_request_body(body.clone());
+    let mut state = ResponsesState::from_managed_request_body(body.clone());
     state.simple_budget = Some(SimpleBudget::new_with_store(limit, input_charge(&raw).unwrap(), false).unwrap());
     ctx.extensions.insert(policy);
     ctx.extensions.insert(state);
@@ -92,6 +95,36 @@ async fn budgeted_document_extract_reserves_rewritten_owners() {
     assert!(
         state.simple_budget.unwrap().remaining_bytes().unwrap() < initial,
         "rewritten document owners must consume request headroom"
+    );
+}
+
+#[tokio::test]
+async fn store_false_budgeted_document_extract_skips_absent_persistence_history() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    set_responses_metadata(&mut ctx);
+    let mut body_json = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_file", "filename": "notes.txt", "file_data": text_file_data("hello")}
+        ]}
+    ]));
+    body_json["store"] = serde_json::Value::Bool(false);
+    install_document_budget(&mut ctx, &body_json, 1_048_576);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "document extraction must not require a persistence-only history when store is false"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(!state.captures_persistence_history());
+    assert!(state.persisted_messages.is_empty());
+    assert_eq!(state.messages[0]["content"][0]["type"], "input_text");
+    assert_eq!(
+        state.input[0]["content"][0]["type"], "input_file",
+        "the original input snapshot remains available"
     );
 }
 
@@ -876,10 +909,9 @@ async fn sync_state_updates_responses_state() {
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
 
-    let state_input = state.request_body.get("input").and_then(|v| v.as_array()).unwrap();
-    assert_eq!(
-        state_input[0]["content"][0]["type"], "input_text",
-        "state.request_body should have extracted input_text"
+    assert!(
+        state.request_body.get("input").is_none(),
+        "extracted input is synced into histories, not duplicated in request_body (#1618)"
     );
 
     assert_eq!(
@@ -1578,4 +1610,77 @@ async fn rejects_when_state_body_exceeds_max_rewritten_body_bytes() {
         },
         _ => panic!("expected rejection when state body (with large history) exceeds max_rewritten_body_bytes"),
     }
+}
+
+
+#[test]
+fn sync_state_leaves_original_input_untouched_object_input() {
+    use super::super::state::ResponsesState;
+
+    let req = Box::leak(Box::new(make_request(Method::POST, "/v1/responses")));
+    let mut ctx = make_filter_context(req);
+
+    let mut body_json = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_file", "filename": "notes.txt", "file_data": text_file_data("state content")}
+        ]}
+    ]));
+    body_json["input"] = body_json["input"][0].take();
+    ctx.extensions.insert(ResponsesState::from_request_body(body_json));
+
+    // `sync_state` syncs an already-extracted body; it does not extract.
+    let mut extracted = responses_body(&serde_json::json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "extracted state content"}
+        ]}
+    ]));
+    extracted["input"] = extracted["input"][0].take();
+    sync_state(&mut ctx, extracted, &make_filter().config).unwrap();
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let part = &state.input[0]["content"][0];
+    assert_eq!(
+        part["type"], "input_file",
+        "state.input should keep the original input_file part"
+    );
+    assert_eq!(
+        part["file_data"],
+        text_file_data("state content"),
+        "state.input should keep the original client file_data"
+    );
+    assert_eq!(
+        state.messages[0]["content"][0]["type"], "input_text",
+        "the extracted tail should still reach messages"
+    );
+}
+
+#[tokio::test]
+async fn object_input_extracts_and_synchronizes_both_histories() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    set_responses_metadata(&mut ctx);
+    let original = serde_json::json!({"model": "m", "input": {
+        "role": "user", "content": [{"type": "input_file", "filename": "notes.txt", "file_data": text_file_data("hello")}]
+    }});
+    ctx.extensions
+        .insert(ResponsesState::from_request_body(original.clone()));
+    let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
+    let action = make_filter().on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "object input must be extracted"
+    );
+    let rewritten: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert!(rewritten["input"].is_object(), "wire input must preserve object form");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    for history in [&state.messages, &state.persisted_messages] {
+        assert_eq!(
+            history[0]["content"][0]["type"], "input_text",
+            "both histories must use extracted content"
+        );
+    }
+    assert_eq!(
+        state.input[0], original["input"],
+        "the client snapshot must stay unchanged"
+    );
 }

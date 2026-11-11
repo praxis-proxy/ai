@@ -4,16 +4,14 @@
 //! Configuration for protocol-neutral web-search providers.
 
 use praxis_core::config::ChainRef;
-use praxis_filter::{
-    FilterError, body::MAX_JSON_BODY_BYTES,
-    builtins::http::payload_processing::config_validation::validate_max_body_bytes,
-};
+use praxis_filter::{FilterError, builtins::http::payload_processing::config_validation::validate_max_body_bytes};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use crate::{
     callout_policy,
     credential_source::{self, CredentialSource, DiagnosticContext, SecretHandle, WatchHandle},
+    json_body::MAX_JSON_BODY_BYTES,
 };
 
 /// Default callout timeout (10 seconds — search APIs can be slow).
@@ -811,7 +809,7 @@ mod tests {
     #[test]
     fn build_config_rejects_oversized_max_body_bytes() {
         let mut cfg = base_config();
-        cfg.max_body_bytes = Some(999_999_999_999);
+        cfg.max_body_bytes = Some(praxis_filter::body::MAX_JSON_BODY_BYTES + 1);
         assert!(
             build_config("openai_web_search_dispatch", &cfg).is_err(),
             "max_body_bytes above limit should be rejected"

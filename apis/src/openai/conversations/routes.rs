@@ -25,8 +25,8 @@ use super::contracts::{
 use crate::openai::{
     include::IncludeField,
     operation::{
-        MediaTypeSpec, OwnedOperationContract, ParameterLocation, ParameterSpec, RequestBodySpec, ResponseSpec,
-        schema_binding,
+        MediaTypeSpec, OwnedOperationContract, ParameterLocation, ParameterSpec, RequestBodySpec, ResponseHeaderSpec,
+        ResponseSpec, schema_binding,
     },
 };
 #[cfg(feature = "openai-conversations")]
@@ -116,8 +116,18 @@ macro_rules! operation_contract {
                 request: request_binding!($request),
                 responses: &[ResponseSpec {
                     status: "200",
+                    headers: &[],
                     description: "OK",
                     content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($response))],
+                }, ResponseSpec {
+                    status: "429",
+                    description: "Rate limit exceeded",
+                    headers: &[ResponseHeaderSpec {
+                        name: "Retry-After",
+                        description: "Minimum integer seconds to wait before retrying, when a delay can be computed.",
+                        schema: super::rate_limit::retry_after_schema,
+                    }],
+                    content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!(super::rate_limit::ErrorResponse))],
                 }],
             })
         }

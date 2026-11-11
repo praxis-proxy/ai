@@ -109,41 +109,32 @@ workflow invokes `.github/scripts/vllm_qualification.py capture` after both
 test steps and `finish` on a hosted runner. The script's focused tests run with
 `python3 -m unittest discover -s tests/qualification`.
 
-## Release selection and pre-release run
+## Release selection from recent nightlies
 
 For a release tag, the workflow peels annotated tags with
-`git rev-parse 'HEAD^{commit}'`. It queries completed `vllm-integration.yaml`
-runs for that exact commit and selects the newest run ID whose latest attempt
-actually scheduled the Responses GPU suite, or whose GPU provisioning failed.
-Skipped non-GPU runs are ignored. It does not fall back to an older green GPU
-run when the selected run's report is missing, expired, or invalid. It verifies
-the workflow run SHA, report checkout SHA, schema version, Responses profile, run
-ID, and attempt. A mismatch produces an explicit unavailable status report and
-release-note section. GPU evidence is informational; it does not block release
-publication. Failure to generate or publish the mandatory section and asset
-does fail the release job.
+`git rev-parse 'HEAD^{commit}'`. It reuses the latest successful scheduled
+GPU nightly on `main` started within the preceding 48 hours, provided its tested
+commit is an ancestor of the release commit (or the same commit). Release
+publication does not launch or wait for a new GPU run.
 
-The version bump often creates a commit different from a prior tested `main`
-commit, and labeled PRs can test a merge commit. To qualify the final commit,
-dispatch the existing workflow on `main` **after the final version-bump commit
-has merged**, confirm the run's checkout SHA is the SHA you will tag, and wait
-for its report before pushing the tag:
+All required GPU acceptance, startup, teardown, and summary jobs must succeed,
+and the downloaded qualification report must be complete and passing. The
+report is verified against its original run ID, attempt, and tested SHA.
+Unavailable or invalid reports are not accepted as successful qualification.
+The search can reuse an earlier successful nightly, but reports every newer
+eligible failed, incomplete, or unfinished nightly alongside it.
 
-```console
-git rev-parse origin/main
-gh workflow run vllm-integration.yaml --ref main -f run_live_vllm=true
-gh run list --workflow vllm-integration.yaml --limit 10
-gh run download RUN_ID --name vllm-qualification --dir /tmp/vllm-qualification
-```
+The published report preserves the tested checkout SHA, date, versions, and
+Actions link, and separately identifies the release SHA. Changes after the
+tested checkout are not claimed to have passed GPU validation. If no acceptable
+recent ancestor nightly exists, GPU evidence is unavailable; release publication
+continues with that explicit status. CI evidence remains scoped to the exact
+release commit.
 
-If the tag is already pushed, dispatch with `--ref v0.4.2`, wait for the hosted
-summary, then manually rerun the Release workflow on that tag. Replace
-`v0.4.2` and `RUN_ID` with the actual tag and run. The release job uses generated
-changelog text, inserts
-marked CI and GPU qualification sections, attaches all three reports, and
-verifies their presence. Reruns replace the sections and assets; repository
-release immutability settings may reject an update, which is surfaced as a
-workflow error.
+The release job inserts marked CI and GPU qualification sections, attaches all
+three reports, and verifies their presence. Rerun Release on the tag to refresh
+this publication-time snapshot. Repository release immutability settings may
+reject an update, which is surfaced as a workflow error.
 
 A synthetic, reviewable notes fixture lives in
 `tests/qualification/release-notes.fixture.md`. It demonstrates the rendered

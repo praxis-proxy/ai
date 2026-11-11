@@ -10,26 +10,26 @@
   },
   "reference": {
     "source": "docs/conformance/specs/openai-openapi.yaml",
-    "source_sha256": "9430b00d75b4cd96b70edb1aed7127f9d58e183e8b1011552d169ba57904e840",
+    "source_sha256": "f8245fc4bb4f5081b232f24528910393cd4bb5e0453931a68278b498cae2c58a",
     "upstream": {
       "repository": "https://github.com/openai/openai-openapi",
-      "revision": "cf79040afd73deda323d2cc869199d4f463bd7ad",
+      "revision": "8d845994d29ca6ded7719b1dbb7ff24a7a0f1feb",
       "path": "openapi.yaml",
-      "source_sha256": "9430b00d75b4cd96b70edb1aed7127f9d58e183e8b1011552d169ba57904e840"
+      "source_sha256": "f8245fc4bb4f5081b232f24528910393cd4bb5e0453931a68278b498cae2c58a"
     }
   },
   "area_projections": [
     {
       "area_id": "conversations",
       "area": "Conversations",
-      "projection_sha256": "9c92cf1d3c63e7f0f2786317ed1b3318d9464b8722b3ab3c2340d260e8765e77",
+      "projection_sha256": "400d3d385453183be5fae78169819672d763aaae2ae8c7f20db0dc56887633fe",
       "operations": 8,
       "inherited_security": "deployment"
     },
     {
       "area_id": "responses",
       "area": "Responses",
-      "projection_sha256": "71d66fe9e0e899c7385325795b233def83762fed6365962e407ab723f481738a",
+      "projection_sha256": "2da4413ec49e555fb5dc015e13906d92b1016255ca6105bcce2a005fcd10caa8",
       "operations": 14,
       "inherited_security": "deployment"
     }
@@ -324,7 +324,7 @@
           "path": "/responses/compact",
           "operation": "POST /responses/compact",
           "area": "Responses",
-          "tag": "untagged",
+          "tag": "Responses",
           "operation_id": "Compactconversation",
           "deprecated": false,
           "beta": false
@@ -344,7 +344,7 @@
           "path": "/responses/input_tokens",
           "operation": "POST /responses/input_tokens",
           "area": "Responses",
-          "tag": "untagged",
+          "tag": "Responses",
           "operation_id": "Getinputtokencounts",
           "deprecated": false,
           "beta": false
@@ -551,53 +551,9 @@
               "path": "/conversations",
               "operation": "POST /conversations"
             },
-            "detail": "responses.200.content.application/json.schema.properties.metadata.type.added",
-            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
-            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
-          },
-          {
-            "kind": "response",
-            "operation": {
-              "method": "POST",
-              "path": "/conversations",
-              "operation": "POST /conversations"
-            },
-            "detail": "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
-            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
-            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
-          },
-          {
-            "kind": "response",
-            "operation": {
-              "method": "POST",
-              "path": "/conversations",
-              "operation": "POST /conversations"
-            },
             "detail": "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded",
-            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
-            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
-          },
-          {
-            "kind": "response",
-            "operation": {
-              "method": "GET",
-              "path": "/conversations/{conversation_id}",
-              "operation": "GET /conversations/{conversation_id}"
-            },
-            "detail": "responses.200.content.application/json.schema.properties.metadata.type.added",
-            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
-            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
-          },
-          {
-            "kind": "response",
-            "operation": {
-              "method": "GET",
-              "path": "/conversations/{conversation_id}",
-              "operation": "GET /conversations/{conversation_id}"
-            },
-            "detail": "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
-            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
-            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
+            "rationale": "Praxis constrains response metadata keys, while the upstream response map omits the key constraint",
+            "evidence": "api.openai.com probe on 2026-07-27: populated metadata round-tripped as a string map; OpenAI metadata limits remain documented in the request schema"
           },
           {
             "kind": "response",
@@ -607,30 +563,8 @@
               "operation": "GET /conversations/{conversation_id}"
             },
             "detail": "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded",
-            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
-            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
-          },
-          {
-            "kind": "response",
-            "operation": {
-              "method": "POST",
-              "path": "/conversations/{conversation_id}",
-              "operation": "POST /conversations/{conversation_id}"
-            },
-            "detail": "responses.200.content.application/json.schema.properties.metadata.type.added",
-            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
-            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
-          },
-          {
-            "kind": "response",
-            "operation": {
-              "method": "POST",
-              "path": "/conversations/{conversation_id}",
-              "operation": "POST /conversations/{conversation_id}"
-            },
-            "detail": "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
-            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
-            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
+            "rationale": "Praxis constrains response metadata keys, while the upstream response map omits the key constraint",
+            "evidence": "api.openai.com probe on 2026-07-27: populated metadata round-tripped as a string map; OpenAI metadata limits remain documented in the request schema"
           },
           {
             "kind": "response",
@@ -640,30 +574,8 @@
               "operation": "POST /conversations/{conversation_id}"
             },
             "detail": "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded",
-            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
-            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
-          },
-          {
-            "kind": "response",
-            "operation": {
-              "method": "DELETE",
-              "path": "/conversations/{conversation_id}/items/{item_id}",
-              "operation": "DELETE /conversations/{conversation_id}/items/{item_id}"
-            },
-            "detail": "responses.200.content.application/json.schema.properties.metadata.type.added",
-            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
-            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
-          },
-          {
-            "kind": "response",
-            "operation": {
-              "method": "DELETE",
-              "path": "/conversations/{conversation_id}/items/{item_id}",
-              "operation": "DELETE /conversations/{conversation_id}/items/{item_id}"
-            },
-            "detail": "responses.200.content.application/json.schema.properties.metadata.additionalProperties.schemaAdded",
-            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
-            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
+            "rationale": "Praxis constrains response metadata keys, while the upstream response map omits the key constraint",
+            "evidence": "api.openai.com probe on 2026-07-27: populated metadata round-tripped as a string map; OpenAI metadata limits remain documented in the request schema"
           },
           {
             "kind": "response",
@@ -673,8 +585,8 @@
               "operation": "DELETE /conversations/{conversation_id}/items/{item_id}"
             },
             "detail": "responses.200.content.application/json.schema.properties.metadata.propertyNames.schemaAdded",
-            "rationale": "OpenAI returns metadata as a string map, while the upstream response property has no schema",
-            "evidence": "api.openai.com probe on 2026-07-27: omitted and null metadata returned {}, populated metadata returned the supplied string map"
+            "rationale": "Praxis constrains response metadata keys, while the upstream response map omits the key constraint",
+            "evidence": "api.openai.com probe on 2026-07-27: populated metadata round-tripped as a string map; OpenAI metadata limits remain documented in the request schema"
           },
           {
             "kind": "request",
@@ -1110,6 +1022,10 @@
         "status": "passed",
         "command": "cargo test -p praxis-ai-apis --no-default-features --features openai-conversations,store-all --lib conformance_conversations_ -- --show-output",
         "checks": [
+          {
+            "kind": "rate_limit_response_contract",
+            "evidence": "openai::conversations::tests::conformance_conversations_rate_limit_rejects_every_operation_before_store_access"
+          },
           {
             "kind": "route_dispatch",
             "evidence": "openai::conversations::tests::conformance_conversations_routes_match_runtime_registry"
