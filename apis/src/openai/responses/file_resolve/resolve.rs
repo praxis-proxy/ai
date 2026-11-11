@@ -840,8 +840,10 @@ pub(crate) async fn resolve_input_with_budget(
     url_resolver: Option<&FileUrlResolver>,
     budget: &mut ResolutionBudget,
 ) -> Result<usize, ResolveError> {
-    let Some(serde_json::Value::Array(input)) = body.get_mut("input") else {
-        return Ok(0);
+    let input = match body.get_mut("input") {
+        Some(serde_json::Value::Array(items)) => items.as_mut_slice(),
+        Some(item @ serde_json::Value::Object(_)) => std::slice::from_mut(item),
+        _ => return Ok(0),
     };
 
     resolve_items(input, client, on_missing, request_headers, url_resolver, budget).await

@@ -1,0 +1,34 @@
+version: 1
+id: responses/object-document-input
+description: Controlled object-form document input is extracted while preserving its object shape.
+protocol: openai_responses
+example_config: openai/responses/doc-extract-inline.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.request.object_document_input
+turns:
+  - name: object-document
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type: [application/json]
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input:
+            role: user
+            content:
+              - type: input_file
+                filename: notes.txt
+                file_data: data:text/plain;base64,aGVsbG8=
+          store: false
+          stream: false
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/responses
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

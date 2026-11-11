@@ -137,15 +137,14 @@ filter_chains:
             cluster: "chat-completions-backend"
 
       # Inject the backend's own credential after routing selects the cluster.
-      # `strip_client_credential` (default true) removes any client-supplied
-      # `Authorization` before injection.
+      # `basic_auth` removes the caller's `Authorization` before the backend
+      # token is added, so only the backend credential reaches the backend.
       - filter: credential_injection
         clusters:
           - name: chat-completions-backend
             header: Authorization
             env_var: VLLM_API_KEY
             header_prefix: "Bearer "
-            strip_client_credential: true
 
       - filter: load_balancer
         clusters:
