@@ -873,3 +873,12 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.request.object_document_input
+    scopes:
+      - responses_native_passthrough
+    status: synthetic_only
+    scenarios:
+      - responses/object-document-input
+    providers:
+      synthetic:
+        status: synthetic_only

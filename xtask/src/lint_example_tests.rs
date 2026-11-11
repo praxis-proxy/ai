@@ -23,7 +23,6 @@ const SKIP: &[&str] = &[
     // Fixture-only config backing the `messages/degrade-features` inference
     // fixture; exercised through the replay harness, not a `.rs` example test.
     "anthropic/messages-to-openai-degrade-fixture.yaml",
-    "anthropic/messages-to-openai.yaml",
     "anthropic/request-validate.yaml",
     "credential-injection.yaml",
     "json-rpc-routing.yaml",
