@@ -118,7 +118,14 @@ async fn budgeted_create_preserves_provider_owned_parameters() {
         matches!(action, FilterAction::Release),
         "provider parameters must reach the backend"
     );
-    assert_eq!(ctx.extensions.get::<ResponsesState>().unwrap().request_body, original);
+    // `input` is moved out of request_body into state.input (#1618); every other
+    // provider parameter is preserved in the parameter object.
+    let mut expected_params = original.clone();
+    expected_params.as_object_mut().unwrap().remove("input");
+    assert_eq!(
+        ctx.extensions.get::<ResponsesState>().unwrap().request_body,
+        expected_params
+    );
 }
 
 #[tokio::test]
@@ -178,7 +185,11 @@ async fn budgeted_create_admits_stream_tools_and_typed_input() {
         let action = filter.on_request_body(&mut ctx, &mut bytes, true).await.unwrap();
         assert!(matches!(action, FilterAction::Release), "{body}");
         let state = ctx.extensions.get::<ResponsesState>().unwrap();
-        assert_eq!(state.request_body, body);
+        // `input` is moved out of request_body into state.input (#1618); the
+        // parameter object retains everything else.
+        let mut expected_params = body.clone();
+        expected_params.as_object_mut().unwrap().remove("input");
+        assert_eq!(state.request_body, expected_params, "{body}");
         assert!(state.simple_budget.is_some());
     }
 }
@@ -258,6 +269,172 @@ fn assert_prompt_template_rejection(action: FilterAction) {
                 "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)"
             ),
             "prompt template rejection must explain the provider-binding requirement"
+        );
+    }
+}
+
+/// Assert that Code Interpreter is rejected with the gateway's OpenAI error envelope.
+fn assert_unsupported_tool_rejection(action: FilterAction) {
+    assert!(
+        matches!(&action, FilterAction::Reject(_)),
+        "unsupported Responses tools must be rejected before upstream contact"
+    );
+    let FilterAction::Reject(rejection) = action else {
+        unreachable!("the assertion above requires a rejection");
+    };
+    assert_eq!(
+        rejection.status, 400,
+        "unsupported tool rejection must be a client error"
+    );
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        body.pointer("/error/type").and_then(serde_json::Value::as_str),
+        Some("invalid_request_error"),
+        "unsupported tool rejection must use the OpenAI invalid-request error type"
+    );
+    assert_eq!(
+        body.pointer("/error/code").and_then(serde_json::Value::as_str),
+        Some("invalid_request_error"),
+        "unsupported tool rejection must use the same error code as Chat Completions translation"
+    );
+    assert_eq!(
+        body.pointer("/error/message").and_then(serde_json::Value::as_str),
+        Some("The code_interpreter tool is not supported by this gateway."),
+        "unsupported tool rejection must identify the tool the gateway cannot execute"
+    );
+}
+
+/// Build a Code Interpreter request in either stream mode.
+fn code_interpreter_body(model: &str, stream: bool) -> Bytes {
+    Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": model,
+            "input": "Compute 1 + 1.",
+            "stream": stream,
+            "tools": [{"type": "code_interpreter", "container": {"type": "auto"}}]
+        }))
+        .unwrap(),
+    )
+}
+
+/// The managed owner must reject unsupported tools with either a fresh or cached parse.
+#[tokio::test]
+async fn code_interpreter_is_rejected_only_by_the_managed_owner() {
+    for pre_routing in [false, true] {
+        for stream in [false, true] {
+            let request = create_request();
+            let mut ctx = classified_context(&request).await;
+            let original = code_interpreter_body("gpt-4.1", stream);
+            let mut body = Some(original.clone());
+
+            if pre_routing {
+                let facts = filter("initialize_state: false");
+                let action = facts.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+                assert!(
+                    matches!(action, FilterAction::Release),
+                    "the facts-only pass must leave tool policy to the selected provider"
+                );
+            }
+
+            let managed = default_filter();
+            let action = managed.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+            assert_unsupported_tool_rejection(action);
+            assert_eq!(
+                body.as_deref(),
+                Some(original.as_ref()),
+                "rejecting an unsupported tool must leave the request body unchanged"
+            );
+            assert!(
+                ctx.extensions.get::<ResponsesState>().is_none(),
+                "unsupported tools must be rejected before managed response state is initialized"
+            );
+        }
+    }
+}
+
+/// A facts-only chain must preserve provider-owned tools, even across repeated classification.
+#[tokio::test]
+async fn code_interpreter_is_preserved_by_facts_only_passes() {
+    let facts = filter("initialize_state: false");
+    for stream in [false, true] {
+        let request = create_request();
+        let mut ctx = classified_context(&request).await;
+        let original = code_interpreter_body("gpt-5", stream);
+        let mut body = Some(original.clone());
+
+        for _ in 0..2 {
+            let action = facts.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+            assert!(
+                matches!(action, FilterAction::Release),
+                "facts-only passes must preserve Code Interpreter for the selected provider"
+            );
+            assert_eq!(
+                body.as_deref(),
+                Some(original.as_ref()),
+                "facts-only passes must forward provider-owned tool declarations unchanged"
+            );
+            assert_eq!(
+                ctx.get_metadata("openai_responses_request.model"),
+                Some("gpt-5"),
+                "Code Interpreter must not suppress the facts needed to route to OpenAI"
+            );
+            assert!(
+                ctx.extensions.get::<ResponsesState>().is_none(),
+                "facts-only passes must not initialize managed state"
+            );
+        }
+    }
+}
+
+/// Token counting accepts tools without executing them, so Code Interpreter declarations pass through.
+#[tokio::test]
+async fn code_interpreter_is_preserved_for_input_token_counting() {
+    let request = make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = classified_context(&request).await;
+    let original = code_interpreter_body("gpt-4.1", false);
+    let mut body = Some(original.clone());
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "token counting must allow Code Interpreter declarations"
+    );
+    assert_eq!(
+        body.as_deref(),
+        Some(original.as_ref()),
+        "the complete token-count request must pass through unchanged"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "token counting does not initialize response creation state"
+    );
+}
+
+/// The hosted-tool restriction must preserve client-owned function tools in either role.
+#[tokio::test]
+async fn supported_function_tool_is_not_rejected_by_managed_tool_policy() {
+    for initialize_state in [true, false] {
+        let request_filter = if initialize_state {
+            default_filter()
+        } else {
+            filter("initialize_state: false")
+        };
+        let request = create_request();
+        let mut ctx = classified_context(&request).await;
+        let mut body = Some(Bytes::from_static(
+            br#"{"model":"gpt-4.1","input":"Call nothing.","tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}],"tool_choice":"none"}"#,
+        ));
+
+        let action = request_filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(
+            matches!(action, FilterAction::Release),
+            "the unsupported-tool policy must accept client function tools in both filter roles"
         );
     }
 }
@@ -1321,9 +1498,13 @@ async fn the_managed_pass_reuses_the_pre_routing_parse() {
         .get::<ResponsesState>()
         .expect("the managed pass initializes state from the cached parse");
     assert_eq!(
-        state.request_body.pointer("/input").and_then(serde_json::Value::as_str),
+        state
+            .input
+            .get(0)
+            .and_then(|item| item.get("content"))
+            .and_then(serde_json::Value::as_str),
         Some("deserialize once"),
-        "state must come from the cached parse"
+        "state must come from the cached parse (input is moved out of request_body, #1618)"
     );
 }
 

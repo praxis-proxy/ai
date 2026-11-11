@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
-    HttpFilterContext, IterationState, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    HttpFilterContext, IterationState, Rejection, parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -55,6 +55,7 @@ use super::{
 use crate::{
     callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity},
     callout_policy::MISSING_CALLOUT_CONTEXT,
+    json_body::MAX_JSON_BODY_BYTES,
     web_search::{
         CalloutContext, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome,
         SearchQueryValidation, SearchResult, build_config, config::MAX_CALLS_PER_ROUND, format_search_results,
@@ -1232,8 +1233,7 @@ fn web_search_context_size_from_state(state: &ResponsesState) -> Option<&str> {
 /// A request may declare more than one web-search tool, so the round-0 preflight
 /// and outbound country pick inspect them all rather than only the first — an
 /// unsupported field or a conflicting country on a later tool must not slip
-/// past, and an earlier unset location must not hide a later country
-/// (issues #1548 / #1769).
+/// past, and an earlier unset location must not hide a later country.
 fn web_search_user_locations_from_state(state: &ResponsesState) -> impl Iterator<Item = &Value> {
     state.tools.iter().filter_map(|tool| {
         let tool_type = tool.get("type").and_then(Value::as_str)?;
@@ -1245,12 +1245,12 @@ fn web_search_user_locations_from_state(state: &ResponsesState) -> impl Iterator
 
 /// Extract the supported ISO `country` code to forward from web-search tools.
 ///
-/// Only `country` is forwarded to providers (issue #1548); the round-0 preflight
-/// already rejected any unsupported field and any *conflicting* countries, so a
-/// value returned here is known to be provider-supported. Walk every web-search
-/// tool the same way preflight does: a null `user_location`, a missing/null/
-/// empty `country`, or a non-object location is unset and must not hide a later
-/// tool's real country (issue #1769).
+/// Only `country` is forwarded to providers; the round-0 preflight already
+/// rejected any unsupported field and any *conflicting* countries, so a value
+/// returned here is known to be provider-supported. Walk every web-search tool
+/// the same way preflight does: a null `user_location`, a missing/null/empty
+/// `country`, or a non-object location is unset and must not hide a later
+/// tool's real country.
 fn web_search_country_from_state(state: &ResponsesState) -> Option<&str> {
     web_search_user_locations_from_state(state).find_map(|user_location| {
         user_location
@@ -1520,10 +1520,9 @@ fn include_action_sources(ctx: &HttpFilterContext<'_>) -> bool {
 /// into state.
 ///
 /// `bridge` is the backend-valid `function_call`/`function_call_output` pair.
-/// The per-element clone is required: `messages` and `persisted_messages` are
-/// distinct owners of the bridge messages. The public `output_item` is upserted
-/// so the placeholder accumulated during the response phase is replaced in
-/// place, never duplicated.
+/// When durable history is enabled, the per-element clone keeps the working and
+/// persisted histories independent. The public `output_item` is upserted so the
+/// placeholder accumulated during the response phase is replaced in place.
 fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge: [Value; 2], ids: &SearchCallIds<'_>) {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         let round_start = state
@@ -1542,10 +1541,7 @@ fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge:
             });
             return;
         }
-        let result_start = state.messages.len();
-        state.messages.extend(bridge.iter().cloned());
-        state.persisted_messages.extend(bridge);
-        state.mark_local_tool_results_from(result_start);
+        append_search_bridge(state, bridge);
         // Record execution provenance keyed on the item id `stream_events` reads:
         // this replaces the model's placeholder with an executed result, so only
         // now may the search's lifecycle be synthesized. A placeholder copied into
@@ -1557,6 +1553,26 @@ fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge:
             *slot = output_item;
         }
     }
+}
+
+/// Append backend bridge items to working history and, when enabled, its
+/// persistence mirror. Moving the pair is sufficient for store:false requests.
+fn append_search_bridge(state: &mut ResponsesState, bridge: [Value; 2]) {
+    let result_start = state.messages.len();
+    if state.captures_persistence_history() {
+        // Both histories retain the same immutable payloads; later mutation
+        // detaches only the changed item through MessageHistory's copy-on-write.
+        for item in bridge {
+            let item = Arc::new(item);
+            state.messages.push_shared(Arc::clone(&item));
+            if let Some(persisted) = state.persisted_messages_mut() {
+                persisted.push_shared(item);
+            }
+        }
+    } else {
+        state.messages.extend(bridge);
+    }
+    state.mark_local_tool_results_from(result_start);
 }
 
 /// Owned provider rows kept locally while a multi-query call is in flight.

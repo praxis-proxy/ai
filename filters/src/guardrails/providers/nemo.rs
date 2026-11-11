@@ -260,15 +260,15 @@ impl NemoProvider {
             return Ok(GuardResult::Pass);
         }
         ensure_check_limit(indices.len(), self.max_message_checks)?;
-        self.evaluate_prefixes(messages, indices, phase, runtime).await
+        self.evaluate_messages(messages, indices, phase, runtime).await
     }
 
-    /// Evaluate each target prefix concurrently to completion before deciding the result.
+    /// Evaluate each target message concurrently to completion before deciding the result.
     ///
     /// All started checks are allowed to finish so the outbound circuit breaker
     /// observes their real outcomes. This avoids recording intentionally dropped
     /// sibling requests as transport failures.
-    async fn evaluate_prefixes(
+    async fn evaluate_messages(
         &self,
         messages: Vec<serde_json::Value>,
         indices: Vec<usize>,
@@ -283,7 +283,7 @@ impl NemoProvider {
             let Some(end) = pending_indices.next() else {
                 break;
             };
-            checks.push(self.check_prefix(&messages, end, phase, runtime));
+            checks.push(self.check_target_message(&messages, end, phase, runtime));
         }
 
         let mut results = Vec::with_capacity(checks.len());
@@ -293,7 +293,7 @@ impl NemoProvider {
             collect_prefix_result(completed, &mut results, &mut block_reason, &mut first_error);
             if schedule_pending && pending_indices.len() > 0 {
                 match next_prefix_before_deadline(&mut pending_indices, runtime.deadline, &mut first_error) {
-                    NextPrefix::Index(end) => checks.push(self.check_prefix(&messages, end, phase, runtime)),
+                    NextPrefix::Index(end) => checks.push(self.check_target_message(&messages, end, phase, runtime)),
                     NextPrefix::Done | NextPrefix::DeadlineElapsed => schedule_pending = false,
                 }
             }
@@ -308,8 +308,8 @@ impl NemoProvider {
         Ok(combine_slice_results(results))
     }
 
-    /// Start one prefix check while retaining its target message index.
-    async fn check_prefix(
+    /// Retain request history, isolate response outputs, and preserve the original index.
+    async fn check_target_message(
         &self,
         messages: &[serde_json::Value],
         end: usize,
@@ -317,12 +317,17 @@ impl NemoProvider {
         runtime: &GuardCalloutRuntime<'_>,
     ) -> Result<(usize, NemoVerdict), FilterError> {
         ensure_deadline_remaining(runtime.deadline)?;
-        let prefix = messages
-            .get(..=end)
+        let target = messages
+            .get(end)
             .ok_or_else(|| -> FilterError { "ai_guardrails (nemo): invalid message index".into() })?;
-        self.check_messages(prefix, phase, runtime)
-            .await
-            .map(|result| (end, result))
+        let context = match phase {
+            GuardPhase::Request => messages
+                .get(..=end)
+                .ok_or_else(|| -> FilterError { "ai_guardrails (nemo): invalid message index".into() })?,
+            GuardPhase::Response => std::slice::from_ref(target),
+        };
+        let verdict = self.check_messages(context, phase, runtime).await?;
+        Ok((end, normalize_unchanged_modification(verdict, target)))
     }
 
     /// POST one message slice to `/v1/checks` through the outbound chain.
@@ -685,8 +690,10 @@ fn merge_redact(pending: Option<GuardResult>, extra: GuardResult) -> GuardResult
 ///
 /// `/v1/checks` evaluates only the last message of a slice. Request phase
 /// issues one call per user turn, each carrying the conversation prefix up to
-/// that turn. Response `choices` are alternative completions, not turns, so
-/// only `choices[0].message` is checked and redacted.
+/// that turn. Response extraction can produce several assistant outputs, so
+/// output phase checks each assistant message in isolation. Distinct outputs
+/// are not conversation history; sending them together can make `NeMo` return
+/// an empty modification instead of screening the target output.
 fn target_message_indices(messages: &[serde_json::Value], phase: GuardPhase) -> Vec<usize> {
     match phase {
         GuardPhase::Request => messages
@@ -695,10 +702,12 @@ fn target_message_indices(messages: &[serde_json::Value], phase: GuardPhase) -> 
             .filter(|(_, message)| message_role(message) == Some("user"))
             .map(|(index, _)| index)
             .collect(),
-        GuardPhase::Response => match messages.first() {
-            Some(message) if message_role(message) == Some("assistant") => vec![0],
-            _ => Vec::new(),
-        },
+        GuardPhase::Response => messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message_role(message) == Some("assistant"))
+            .map(|(index, _)| index)
+            .collect(),
     }
 }
 
@@ -826,6 +835,20 @@ enum NemoVerdict {
         /// Human-readable redaction reason from the provider.
         reason: String,
     },
+}
+
+/// Some `NeMo` builds report `modified` for unchanged conversation text.
+/// An exact string match needs no rewrite. Changed text, including an empty
+/// full redaction, and blocked verdicts keep their normal handling.
+fn normalize_unchanged_modification(verdict: NemoVerdict, target: &serde_json::Value) -> NemoVerdict {
+    match &verdict {
+        NemoVerdict::Modified { content, .. }
+            if target.get("content").and_then(serde_json::Value::as_str) == Some(content.as_str()) =>
+        {
+            NemoVerdict::Pass
+        },
+        _ => verdict,
+    }
 }
 
 /// Map a deserialized [`NemoResponse`] to a [`NemoVerdict`].
@@ -995,7 +1018,7 @@ guardrails:
     }
 
     #[test]
-    fn target_message_indices_response_checks_only_first_choice() {
+    fn target_message_indices_response_collects_every_assistant_output() {
         let messages = vec![
             serde_json::json!({"role": "assistant", "content": "a"}),
             serde_json::json!({"role": "assistant", "content": "b"}),
@@ -1003,21 +1026,21 @@ guardrails:
 
         assert_eq!(
             target_message_indices(&messages, GuardPhase::Response),
-            vec![0],
-            "response phase should check only the first choice"
+            vec![0, 1],
+            "response phase should check every assistant output"
         );
     }
 
     #[test]
-    fn target_message_indices_response_skips_when_first_choice_is_not_assistant() {
+    fn target_message_indices_response_collects_later_assistant_output() {
         let messages = vec![
             serde_json::json!({"role": "user", "content": "echo"}),
             serde_json::json!({"role": "assistant", "content": "later"}),
         ];
 
         assert!(
-            target_message_indices(&messages, GuardPhase::Response).is_empty(),
-            "response phase should skip when the first choice is not an assistant message"
+            target_message_indices(&messages, GuardPhase::Response) == vec![1],
+            "response phase should screen a later assistant output"
         );
     }
 
@@ -1180,6 +1203,74 @@ guardrails:
                 reason: "pii".to_string(),
             },
             "modified status should return the masked content and rail name"
+        );
+    }
+
+    #[test]
+    fn unchanged_modification_passes_only_for_identical_string_content() {
+        let target = serde_json::json!({"content": "safe text"});
+        let verdict = NemoVerdict::Modified {
+            content: "safe text".to_owned(),
+            reason: "modified".to_owned(),
+        };
+        assert_eq!(
+            normalize_unchanged_modification(verdict, &target),
+            NemoVerdict::Pass,
+            "an identical replacement needs no body rewrite"
+        );
+    }
+
+    #[test]
+    fn changed_and_empty_replacements_remain_modified() {
+        let target = serde_json::json!({"content": "safe text"});
+        for content in ["", "masked", " safe text", "safe text ", "SAFE TEXT"] {
+            let verdict = NemoVerdict::Modified {
+                content: content.to_owned(),
+                reason: "pii".to_owned(),
+            };
+            assert!(
+                matches!(
+                    normalize_unchanged_modification(verdict, &target),
+                    NemoVerdict::Modified { .. }
+                ),
+                "a changed replacement must retain redaction handling: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn modifications_without_string_targets_are_not_suppressed() {
+        for target in [
+            serde_json::json!({}),
+            serde_json::json!({"content": null}),
+            serde_json::json!({"content": [{"type":"text","text":"safe text"}]}),
+        ] {
+            let verdict = NemoVerdict::Modified {
+                content: "safe text".to_owned(),
+                reason: "pii".to_owned(),
+            };
+            assert!(
+                matches!(
+                    normalize_unchanged_modification(verdict, &target),
+                    NemoVerdict::Modified { .. }
+                ),
+                "only a verified string equality can suppress a rewrite"
+            );
+        }
+    }
+
+    #[test]
+    fn unchanged_blocked_content_still_blocks() {
+        let target = serde_json::json!({"content": "blocked text"});
+        let verdict = NemoVerdict::Block {
+            reason: "toxicity".to_owned(),
+        };
+        assert!(
+            matches!(
+                normalize_unchanged_modification(verdict, &target),
+                NemoVerdict::Block { .. }
+            ),
+            "unchanged text must never override a blocked verdict"
         );
     }
 

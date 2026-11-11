@@ -136,7 +136,7 @@ def collect(repo, sha, gpu, release_run=None, attempt=None):
         "selection": "Newest eligible run per workflow for the exact release commit; latest attempt only. The current release run is pinned when supplied. No older green fallback.",
         "limitations": [
             "CI records workflow head SHA and job/step outcomes, not individual test counts or complete API conformance.",
-            "PR runs are excluded because their checkout can be a synthetic merge; no evidence is borrowed from other commits.",
+            "CI PR runs are excluded because their checkout can be a synthetic merge; CI evidence is scoped to the release commit. GPU evidence may describe a recent ancestor nightly, explicitly identified separately.",
             "Missing runs may reflect path filters or optional triggers; no execution is inferred.",
             "This is a publication-time snapshot; queued or running jobs may finish later. Rerun Release to refresh it.",
             "GPU qualification identifies its tested checkout and binary separately from CI and the published container.",
@@ -170,7 +170,7 @@ def render(report, detailed=False):
     gpu = report["gpu"]
     if gpu.get("status") in ("unavailable", "not_requested"):
         lines += ["", f"GPU evidence: **{gpu['status']}**. {cell(gpu.get('reason', 'No GPU report'))}.",
-                  "To collect GPU evidence, dispatch `vllm-integration.yaml` with `run_live_vllm=true` on this release tag, wait for its summary, then rerun Release on the same tag."]
+                  "GPU evidence requires a complete successful ancestor nightly within 48 hours. Rerun Release to refresh this snapshot after the nightly completes."]
     if detailed:
         lines += ["", "#### CI job and step outcomes"]
         for entry in report["workflows"]:

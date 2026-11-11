@@ -137,7 +137,7 @@ fn service_account_token_rotation_is_observed_without_reload() {
 
     let (status, _) = http_post(
         proxy.addr(),
-        "/v1/checks",
+        "/v1/chat/completions",
         r#"{"model":"test","messages":[{"role":"user","content":"first"}]}"#,
     );
     assert_eq!(status, 200);
@@ -187,7 +187,7 @@ fn service_account_token_data_symlink_swap_is_observed() {
 
     let (status, _) = http_post(
         proxy.addr(),
-        "/v1/checks",
+        "/v1/chat/completions",
         r#"{"model":"test","messages":[{"role":"user","content":"first"}]}"#,
     );
     assert_eq!(status, 200);
@@ -265,7 +265,7 @@ fn poll_for_bearer(addr: &str, nemo: &StatefulCapturingGuard, token: &str, timeo
     loop {
         let (status, body) = http_post(
             addr,
-            "/v1/checks",
+            "/v1/chat/completions",
             r#"{"model":"test","messages":[{"role":"user","content":"after-rotation"}]}"#,
         );
         assert_eq!(

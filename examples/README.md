@@ -141,6 +141,7 @@ for how these are authored and regenerated.
 | [client-tool-compat.yaml](configs/openai/responses/client-tool-compat.yaml) | Lets a rich Codex-style Responses client talk to a function-only Responses backend (for example vLLM at POST /v1/responses) without routing through /v1/chat/completions and without executing client-owned tools in Praxis |
 | [codex-http-chat-translation.yaml](configs/openai/responses/codex-http-chat-translation.yaml) | Release-acceptance configuration for GitHub issue #870. A Codex client speaks the OpenAI Responses API over HTTP while Praxis selects a Chat Completions-only provider, translates both request and streaming response, rewrites the provider path, and replaces the client credential |
 | [compact.yaml](configs/openai/responses/compact.yaml) | Demonstrates compaction after rehydrate, file resolve, and document extract so rewritten current-turn content survives history replacement |
+| [doc-extract-inline.yaml](configs/openai/responses/doc-extract-inline.yaml) | Converts inline text-safe input_file data to input_text, including a single object-form input |
 | [doc-extract.yaml](configs/openai/responses/doc-extract.yaml) | Converts `input_file` content parts to `input_text` for inference backends that do not natively support `input_file` (e.g. vLLM, llm-d) |
 | [file-resolve.yaml](configs/openai/responses/file-resolve.yaml) | Resolves `file_id` and `file_url` references in Responses API input by fetching file metadata and content, then inlining base64 content as `file_data` or `image_url` before forwarding |
 | [file-search-chat-completions-fixture.yaml](configs/openai/responses/file-search-chat-completions-fixture.yaml) | Single-upstream fixture configuration for recording the private Chat Completions function representation of a Responses file_search tool |
@@ -178,6 +179,12 @@ for how these are authored and regenerated.
 | [web-search-file-key.yaml](configs/openai/responses/web-search-file-key.yaml) | A variant of web-search-chat-completions.yaml that sources the shared Brave provider key from a projected FILE instead of an environment variable |
 | [web-search-scoped-credentials.yaml](configs/openai/responses/web-search-scoped-credentials.yaml) | A scoped-credentials variant of web-search-chat-completions.yaml |
 | [web-search.yaml](configs/openai/responses/web-search.yaml) | Demonstrates the `openai_web_search_dispatch` filter configuration |
+
+### OpenShell
+
+| File | Description |
+| ------ | ------------- |
+| [sandboxed-coding-clients.yaml](configs/openshell/sandboxed-coding-clients.yaml) | One host-side gateway for Codex, Claude Code, OpenCode, and pi running inside NVIDIA OpenShell sandboxes, each over its native wire API, with Codex client-tool compatibility applied to its tool payloads |
 
 ### Payload Processing
 

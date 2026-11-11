@@ -13,11 +13,15 @@ At least one of `prepend` or `append` must be non-empty. JSON is re-serialized, 
 
 In chains that also use `json_body_field` or `model_to_header`, place `prompt_enrich` first.
 
+Request buffering inherits the pipeline's `max_request_bytes` and `max_buffer_bytes`. Optional `max_body_bytes` is a hard processing limit: bodies larger than it return HTTP 413 before parsing, independently of other filters' buffer declarations. The limit applies to the body received by this filter, before its own rewriting or enrichment.
+
+Omitting the limit removes the former implicit 10 MiB filter cap; pipeline limits still apply. Existing positive values remain valid and are now enforced even when another filter requests a larger shared buffer. Zero remains invalid; YAML `null` behaves like omission.
+
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `max_body_bytes` | integer | no | Maximum request body size to buffer before parsing. |
+| `max_body_bytes` | integer | no | Optional hard request-body processing limit in bytes. Omit to inherit pipeline `max_request_bytes` and `max_buffer_bytes`; oversize bodies return HTTP 413 before parsing. |
 | `on_invalid` | `continue` \| `reject` | no | Behavior when the body is not valid JSON or lacks a `messages` array. |
 | `prepend` | object[] | no | Messages to prepend at the beginning of the `messages` array. |
 | `prepend[].role` | `system` \| `user` | yes | Role for the injected message. |

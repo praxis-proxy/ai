@@ -8,7 +8,8 @@
 #   Request phase:
 #     passed   - request forwarded to the upstream unchanged
 #     blocked  - 403 returned to the client (triggered rail names in body)
-#     modified - each modified user message replaced with masked text, then forwarded
+#     modified - Chat Completions user messages rewritten with masked text;
+#                Responses and Anthropic requests rejected with HTTP 502
 #     provider HTTP error - 500 returned to the client
 #
 # Each user message triggers one /v1/checks call (cumulative slices).
@@ -43,6 +44,10 @@ listeners:
 filter_chains:
   - name: nemo-guardrails
     filters:
+      # Publishes the trusted operation identity used to select the request
+      # message extractor. It must run before ai_guardrails.
+      - filter: ai_operation
+
       - filter: ai_guardrails
         outbound_chain: nemo-outbound
         provider:

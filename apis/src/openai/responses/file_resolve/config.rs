@@ -4,13 +4,14 @@
 //! Configuration types for the `openai_file_resolve` filter.
 
 use praxis_core::config::ChainRef;
-use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
+use praxis_filter::FilterError;
 use serde::Deserialize;
 
 use super::resolve_url::NormalizedOrigin;
 use crate::{
     callout_identity::credential_authority,
     callout_policy::OnMissing,
+    json_body::MAX_JSON_BODY_BYTES,
     openai::{api_client, responses::body_limits::validate_size_limit},
 };
 

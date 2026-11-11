@@ -690,7 +690,7 @@ fn reserve_client_tool_lowering(state: &mut ResponsesState) -> bool {
 
 /// Bound copies of one already parsed source without serializing it into a buffer.
 fn retained_value_charge(value: &Value) -> Option<usize> {
-    let bytes = bounded_json_size(value, praxis_filter::body::MAX_JSON_BODY_BYTES)
+    let bytes = bounded_json_size(value, crate::json_body::MAX_JSON_BODY_BYTES)
         .ok()
         .flatten()?;
     bytes
@@ -719,7 +719,7 @@ fn namespace_fanout_charge(tool: &Value) -> Option<usize> {
     let members = tool.get("tools").and_then(Value::as_array).map_or(0, Vec::len);
     let header = bounded_json_size(
         &(tool.get("name"), tool.get("description")),
-        praxis_filter::body::MAX_JSON_BODY_BYTES,
+        crate::json_body::MAX_JSON_BODY_BYTES,
     )
     .ok()
     .flatten()?;
@@ -760,11 +760,11 @@ fn reserve_client_tool_restoration(state: &mut ResponsesState, bytes: &[u8]) -> 
         return true;
     }
     let charge = (|| {
-        let echo_bytes = bounded_json_size(&echo.tools, praxis_filter::body::MAX_JSON_BODY_BYTES)
+        let echo_bytes = bounded_json_size(&echo.tools, crate::json_body::MAX_JSON_BODY_BYTES)
             .ok()
             .flatten()?
             .checked_add(
-                bounded_json_size(&echo.tool_choice, praxis_filter::body::MAX_JSON_BODY_BYTES)
+                bounded_json_size(&echo.tool_choice, crate::json_body::MAX_JSON_BODY_BYTES)
                     .ok()
                     .flatten()?,
             )?;
@@ -774,7 +774,7 @@ fn reserve_client_tool_restoration(state: &mut ResponsesState, bytes: &[u8]) -> 
             .try_fold(0_usize, |longest, lowered| {
                 bounded_json_size(
                     &(&lowered.original_name, &lowered.namespace),
-                    praxis_filter::body::MAX_JSON_BODY_BYTES,
+                    crate::json_body::MAX_JSON_BODY_BYTES,
                 )
                 .ok()
                 .flatten()

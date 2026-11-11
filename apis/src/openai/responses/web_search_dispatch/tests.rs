@@ -2701,7 +2701,7 @@ async fn preflight_allows_web_search_tools_repeating_the_same_country() {
 #[test]
 fn country_pick_skips_earlier_null_user_location() {
     // An earlier `user_location: null` must not stop dispatch from taking a later
-    // tool's country (issue #1769). Preflight already accepts this shape.
+    // tool's country. Preflight already accepts this shape.
     let state = ResponsesState::from_request_body(serde_json::json!({
         "model": "gpt-4o",
         "input": "weather near me",
@@ -2716,7 +2716,7 @@ fn country_pick_skips_earlier_null_user_location() {
 #[test]
 fn country_pick_skips_earlier_null_country_member() {
     // `{type:approximate,country:null}` is unset for forwarding; a later FR must
-    // still become the outbound country (issue #1769).
+    // still become the outbound country.
     let state = ResponsesState::from_request_body(serde_json::json!({
         "model": "gpt-4o",
         "input": "weather near me",
@@ -3457,5 +3457,30 @@ fn bound_streamed_search_action_is_noop_without_dispatcher_bound() {
     assert_eq!(
         bounded, item,
         "without the dispatcher in the chain the stream filter leaves the item as-is"
+    );
+}
+
+#[test]
+fn search_bridge_shares_payloads_and_detaches_on_mutation() {
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"input": "hello"}));
+    let start = state.messages.len();
+    append_search_bridge(
+        &mut state,
+        [
+            serde_json::json!({"type": "function_call", "call_id": "bridge"}),
+            serde_json::json!({"type": "function_call_output", "call_id": "bridge", "output": "results"}),
+        ],
+    );
+    for index in start..start + 2 {
+        assert!(
+            state.messages.shares_item_with(index, &state.persisted_messages, index),
+            "bridge histories must share immutable payloads"
+        );
+    }
+    state.messages.get_mut(start + 1).unwrap()["output"] = serde_json::json!("edited");
+    assert_eq!(
+        state.persisted_messages[start + 1]["output"],
+        "results",
+        "working edits must not change persisted results"
     );
 }

@@ -52,8 +52,7 @@ use std::{borrow::Cow, collections::HashMap};
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
-    parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
 use tracing::{debug, trace, warn};
 
@@ -66,7 +65,7 @@ use super::agentic_loop::{
 use super::error::responses_error_rejection;
 use crate::{
     classifier::{is_chat_completions_create, is_responses_create},
-    json_body::replace_json_body,
+    json_body::{MAX_JSON_BODY_BYTES, replace_json_body},
     promotion::is_promotable_value,
 };
 

@@ -74,7 +74,7 @@ use bytes::Bytes;
 use praxis_core::config::ChainRef;
 use praxis_filter::{
     BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, FilterError, FilterPipeline, HttpFilter,
-    HttpFilterContext, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    HttpFilterContext, Rejection, parse_filter_config,
 };
 use tracing::{debug, trace, warn};
 
@@ -96,7 +96,7 @@ use crate::{
     callout_identity::{CalloutContextMissing, CalloutIdentity, credential_authority, stage_callout_identity},
     callout_policy::{MISSING_CALLOUT_CONTEXT, OnMissing},
     classifier::is_responses_create,
-    json_body::serialize_json_body,
+    json_body::{MAX_JSON_BODY_BYTES, serialize_json_body},
     openai::api_client::{ApiClient, ApiClientConfig, DownstreamRuntime, OutboundExecution},
     subrequest::SubRequestClient,
 };
@@ -452,7 +452,7 @@ impl HttpFilter for FileResolveFilter {
 fn budgeted_plain_input_without_references(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
         state.simple_budget.is_some()
-            && super::text_only_input(state.request_body.get("input"))
+            && super::text_only_messages(state.input.iter())
             && state.messages.iter().all(|item| !history_needs_file_resolution(item))
             && state
                 .persisted_messages
@@ -723,22 +723,24 @@ async fn sync_state_with_budget(
         return Ok(());
     };
 
-    state.request_body = resolved_body;
-
     let input_len = state.input.len();
-    let ResponsesState {
-        request_body,
-        messages,
-        persisted_messages,
-        ..
-    } = state;
-
-    let Some(resolved_input) = request_body.get("input").and_then(serde_json::Value::as_array) else {
-        return Ok(());
+    // Resolve the history tails from the locally owned resolved body before it is
+    // stored as request parameters; the resolved input is not retained in
+    // `request_body` (the params-only invariant, #1618).
+    let resolved_input = match resolved_body.get("input") {
+        Some(serde_json::Value::Array(items)) => Some(items.as_slice()),
+        Some(item @ serde_json::Value::Object(_)) => Some(std::slice::from_ref(item)),
+        _ => None,
     };
+    if let Some(resolved_input) = resolved_input {
+        sync_message_history(&mut state.messages, input_len, Some(resolved_input), resolver, budget).await?;
+        if let Some(persisted_messages) = state.persisted_messages_mut() {
+            sync_persisted_history(persisted_messages, input_len, Some(resolved_input), resolver, budget).await?;
+        }
+    }
 
-    sync_message_history(messages, input_len, Some(resolved_input), resolver, budget).await?;
-    sync_persisted_history(persisted_messages, input_len, Some(resolved_input), resolver, budget).await
+    state.set_request_params(resolved_body);
+    Ok(())
 }
 
 /// Test helper that creates an isolated request resolution budget.
@@ -777,7 +779,10 @@ async fn resolve_state_history(
 
     let input_len = state.input.len();
     sync_message_history(&mut state.messages, input_len, None, resolver, budget).await?;
-    sync_persisted_history(&mut state.persisted_messages, input_len, None, resolver, budget).await
+    if let Some(persisted_messages) = state.persisted_messages_mut() {
+        sync_persisted_history(persisted_messages, input_len, None, resolver, budget).await?;
+    }
+    Ok(())
 }
 
 /// Shared dependencies for resolving one state history vector.

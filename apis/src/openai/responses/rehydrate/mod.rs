@@ -40,7 +40,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use praxis_filter::{
     BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
+    body::{BodyAccess, BodyMode},
     parse_filter_config,
 };
 use serde::Deserialize;
@@ -60,7 +60,7 @@ use super::{
 };
 use crate::{
     is_event_stream_content_type,
-    json_body::replace_json_body,
+    json_body::{MAX_JSON_BODY_BYTES, replace_json_body},
     state_owner::{StateOwner, require_state_owner},
     store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry, StoreError},
 };
@@ -145,10 +145,60 @@ impl RehydrateFilter {
         let Some(bytes) = body.as_ref() else {
             return Ok(FilterAction::Release);
         };
+        // Reuse the state the managed owner already built from this body (#1618):
+        // its single parse and input materialization are authoritative, so
+        // rehydration merges stored history into it rather than re-parsing the
+        // body and rebuilding a second state. The selectors it validated remain in
+        // `request_body` (only `input` was stripped), so they are re-read there.
+        //
+        // If history was already restored (e.g. this filter sits inside an
+        // `iterative_request_router` step whose buffered request-body hook re-runs
+        // each iteration over the same carried-forward state), skip: merging the
+        // stored replay into an already-rehydrated state in place would duplicate
+        // the backend input and persisted history.
+        match ctx
+            .extensions
+            .get::<ResponsesState>()
+            .map(|state| state.history_rehydrated)
+        {
+            Some(true) => return Ok(FilterAction::Release),
+            Some(false) => return self.rehydrate_reusing_state(ctx, body).await,
+            None => {},
+        }
         match parse_body_and_extract_id(bytes) {
-            Ok((body_value, Some(id))) => self.rehydrate_from_response(ctx, body, body_value, id).await,
-            Ok((body_value, None)) => self.rehydrate_from_conversation(ctx, body, body_value).await,
+            Ok((parsed_body, Some(id))) => {
+                self.rehydrate_from_response(ctx, body, StateSource::Parsed(parsed_body), id)
+                    .await
+            },
+            Ok((parsed_body, None)) => {
+                self.rehydrate_from_conversation(ctx, body, StateSource::Parsed(parsed_body))
+                    .await
+            },
             Err(action) => Ok(action),
+        }
+    }
+
+    /// Rehydrate by reusing the existing [`ResponsesState`] instead of re-parsing
+    /// the request body (#1618). Selectors are re-read from the retained
+    /// parameters, preserving the same validation as [`parse_body_and_extract_id`].
+    async fn rehydrate_reusing_state(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<FilterAction, FilterError> {
+        let prev_id = {
+            let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+                return Ok(reject_server_error("request pipeline state is unavailable"));
+            };
+            match state.request_body.get("previous_response_id") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(id)) => Some(id.clone()),
+                Some(_) => return Ok(reject_invalid("previous_response_id must be a string")),
+            }
+        };
+        match prev_id {
+            Some(id) => self.rehydrate_from_response(ctx, body, StateSource::Reuse, id).await,
+            None => self.rehydrate_from_conversation(ctx, body, StateSource::Reuse).await,
         }
     }
 
@@ -157,7 +207,7 @@ impl RehydrateFilter {
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        parsed_body: Value,
+        source: StateSource,
         prev_id: String,
     ) -> Result<FilterAction, FilterError> {
         let owner = match require_state_owner(ctx) {
@@ -178,7 +228,10 @@ impl RehydrateFilter {
         bind_previous_tools_to_owner(&mut previous_tools, &owner);
         let previous_usage = record.response_object.get("usage").filter(|u| !u.is_null()).cloned();
         let stored = stored_messages_for_response(record);
-        let state = merge_configuration_and_build_state(body, parsed_body, stored, previous_tools, previous_usage);
+        let state = match resolve_rehydrated_state(ctx, body, source, stored, previous_tools, previous_usage) {
+            Ok(state) => state,
+            Err(action) => return Ok(action),
+        };
         install_rehydrated_state(ctx, state);
         debug!(previous_response_id = %prev_id, "previous response validated, state populated");
         ctx.set_metadata("responses.previous_response_id", prev_id);
@@ -191,9 +244,9 @@ impl RehydrateFilter {
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        parsed_body: Value,
+        source: StateSource,
     ) -> Result<FilterAction, FilterError> {
-        let conv_id = match resolve_conversation_id(&parsed_body) {
+        let conv_id = match source.conversation_id(ctx) {
             Ok(id) => id,
             Err(action) => return Ok(action),
         };
@@ -209,7 +262,10 @@ impl RehydrateFilter {
             return Ok(action);
         }
         let stored = stored_messages_for_conversation(record);
-        let state = merge_configuration_and_build_state(body, parsed_body, stored, vec![], None);
+        let state = match resolve_rehydrated_state(ctx, body, source, stored, vec![], None) {
+            Ok(state) => state,
+            Err(action) => return Ok(action),
+        };
         install_rehydrated_state(ctx, state);
         debug!(conversation_id = %conv_id, "conversation rehydrated, state populated");
         Ok(FilterAction::Release)
@@ -1309,8 +1365,112 @@ async fn fetch_conversation(
     })
 }
 
-/// Build [`ResponsesState`] by prepending stored messages before the current input.
-fn build_state(
+/// Where the rehydrated [`ResponsesState`] comes from.
+///
+/// A managed owner upstream already decoded the request into a `ResponsesState`;
+/// rehydration reuses it ([`StateSource::Reuse`]) rather than re-parsing. When no
+/// such state exists (a standalone rehydrate chain), the body is parsed once here
+/// ([`StateSource::Parsed`]).
+enum StateSource {
+    /// The request body parsed by this filter, used when no state exists yet.
+    Parsed(Value),
+    /// Reuse the [`ResponsesState`] a managed owner already built from this body.
+    Reuse,
+}
+
+impl StateSource {
+    /// Resolve the `conversation` selector from whichever body backs this source.
+    fn conversation_id(&self, ctx: &HttpFilterContext<'_>) -> Result<String, FilterAction> {
+        match self {
+            StateSource::Parsed(body) => resolve_conversation_id(body),
+            StateSource::Reuse => {
+                let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+                    return Err(reject_server_error("request pipeline state is unavailable"));
+                };
+                resolve_conversation_id(&state.request_body)
+            },
+        }
+    }
+}
+
+/// Build the rehydrated state, reusing the managed owner's decoded state when it
+/// exists and otherwise building one from the parsed body (#1618).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "thread the live request body alongside context and stored response data"
+)]
+fn resolve_rehydrated_state(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    source: StateSource,
+    stored: Vec<Value>,
+    previous_tools: Vec<Value>,
+    previous_usage: Option<Value>,
+) -> Result<ResponsesState, FilterAction> {
+    match source {
+        StateSource::Parsed(parsed_body) => Ok(merge_configuration_and_build_state(
+            body,
+            parsed_body,
+            stored,
+            previous_tools,
+            previous_usage,
+        )),
+        StateSource::Reuse => {
+            // Merge stored history into the managed owner's decoded state
+            // instead of re-parsing and rebuilding it (#1618).
+            let Some(mut existing) = ctx.extensions.remove::<ResponsesState>() else {
+                return Err(reject_server_error("request pipeline state is unavailable"));
+            };
+            if apply_stored_configuration(&mut existing.request_body, &stored) {
+                publish_current_request(body, &existing);
+            }
+            Ok(rehydrate_existing_state(
+                existing,
+                stored,
+                previous_tools,
+                previous_usage,
+            ))
+        },
+    }
+}
+
+/// Publish merged configuration without retaining another decoded input copy.
+fn publish_current_request(body: &mut Option<Bytes>, state: &ResponsesState) {
+    match serde_json::to_vec(&super::request_input::CurrentRequestBody::new(state)) {
+        Ok(bytes) => *body = Some(Bytes::from(bytes)),
+        Err(error) => {
+            warn!(error = %error, "rehydrate: failed to publish merged configuration to request body");
+        },
+    }
+}
+
+/// Merge stored history into the managed owner's already-decoded state (#1618).
+///
+/// Mirrors [`build_state`]'s post-decode steps: the owner already materialized the
+/// current input, so only the stored history, tools, and usage are layered on.
+pub(super) fn rehydrate_existing_state(
+    mut state: ResponsesState,
+    stored: Vec<Value>,
+    previous_tools: Vec<Value>,
+    previous_usage: Option<Value>,
+) -> ResponsesState {
+    apply_stored_configuration(&mut state.request_body, &stored);
+    let stored = MessageHistory::from(stored);
+    let replay = replay_messages_from_stored(&stored);
+    state.history_rehydrated = true;
+    state.messages.prepend_shared(replay);
+    state
+        .provider_compaction_ids
+        .extend(ResponsesState::provider_compaction_ids_from_messages(&stored));
+    state.prepend_persisted_messages(stored);
+    state.previous_tools = previous_tools;
+    state.previous_usage = previous_usage;
+    state
+}
+
+/// Build [`ResponsesState`] from a freshly parsed body, prepending stored messages
+/// before the current input. Used when no managed owner built state upstream.
+pub(super) fn build_state(
     parsed_body: Value,
     stored: Vec<Value>,
     previous_tools: Vec<Value>,
@@ -1318,13 +1478,13 @@ fn build_state(
 ) -> ResponsesState {
     let stored = MessageHistory::from(stored);
     let replay = replay_messages_from_stored(&stored);
-    let mut state = ResponsesState::from_request_body(parsed_body);
+    let mut state = ResponsesState::from_managed_request_body(parsed_body);
     state.history_rehydrated = true;
     state.messages.prepend_shared(replay);
     state
         .provider_compaction_ids
         .extend(ResponsesState::provider_compaction_ids_from_messages(&stored));
-    state.persisted_messages.prepend_shared(stored);
+    state.prepend_persisted_messages(stored);
     state.previous_tools = previous_tools;
     state.previous_usage = previous_usage;
     state
@@ -1413,7 +1573,7 @@ fn append_stored_output_items(messages: &mut Vec<Value>, output: Value) {
 }
 
 /// Return stored items that should be replayed as backend request input.
-fn replay_messages_from_stored(stored: &MessageHistory) -> MessageHistory {
+pub(super) fn replay_messages_from_stored(stored: &MessageHistory) -> MessageHistory {
     let mut replay = MessageHistory::default();
     for item in stored.shared_items() {
         let is_locally_marked = item.get(LOCAL_COMPACTION_MARKER).and_then(Value::as_bool) == Some(true);
