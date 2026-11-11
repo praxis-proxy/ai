@@ -17,8 +17,7 @@
 
 /// Incremental SSE parser state carried across response body chunks.
 ///
-/// Stored in `filter_metadata` via hex encoding between
-/// [`on_response_body`] calls.
+/// Kept in `filter_state` between [`on_response_body`] calls.
 ///
 /// [`on_response_body`]: praxis_filter::HttpFilter::on_response_body
 #[derive(Default)]
@@ -69,27 +68,6 @@ pub(crate) enum SkipPhase {
     LineHasContent,
 }
 
-impl SkipPhase {
-    /// Encode this phase for `filter_metadata` persistence.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::NotSkipping => "not_skipping",
-            Self::LineEmptySoFar => "line_empty",
-            Self::LineHasContent => "line_has_content",
-        }
-    }
-
-    /// Decode a persisted metadata value. Missing or unknown strings
-    /// map to [`Self::NotSkipping`] so a restart resumes buffering.
-    pub(crate) fn from_metadata_str(s: Option<&str>) -> Self {
-        match s {
-            Some("line_empty") => Self::LineEmptySoFar,
-            Some("line_has_content") => Self::LineHasContent,
-            _ => Self::NotSkipping,
-        }
-    }
-}
-
 /// Whether the last completed SSE action dispatched a payload or dropped
 /// an oversized event. Persisted across chunks so finalize can tell a
 /// recovered terminal usage event from a dropped one.
@@ -100,25 +78,6 @@ pub(crate) enum ScanTail {
     Payload,
     /// Last completed action discarded an oversized event.
     Dropped,
-}
-
-impl ScanTail {
-    /// Encode this tail for `filter_metadata` persistence.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Payload => "payload",
-            Self::Dropped => "dropped",
-        }
-    }
-
-    /// Decode a persisted metadata value. Missing or unknown strings
-    /// map to [`Self::Payload`].
-    pub(crate) fn from_metadata_str(s: Option<&str>) -> Self {
-        match s {
-            Some("dropped") => Self::Dropped,
-            _ => Self::Payload,
-        }
-    }
 }
 
 // -----------------------------------------------------------------------------
@@ -606,32 +565,6 @@ mod tests {
         assert!(
             state.tail != ScanTail::Dropped,
             "dispatching a later payload clears the dropped tail"
-        );
-    }
-
-    #[test]
-    fn skip_phase_round_trips_through_metadata_strings() {
-        assert_eq!(SkipPhase::NotSkipping.as_str(), "not_skipping");
-        assert_eq!(SkipPhase::LineEmptySoFar.as_str(), "line_empty");
-        assert_eq!(SkipPhase::LineHasContent.as_str(), "line_has_content");
-
-        assert_eq!(
-            SkipPhase::from_metadata_str(Some("not_skipping")),
-            SkipPhase::NotSkipping
-        );
-        assert_eq!(
-            SkipPhase::from_metadata_str(Some("line_empty")),
-            SkipPhase::LineEmptySoFar
-        );
-        assert_eq!(
-            SkipPhase::from_metadata_str(Some("line_has_content")),
-            SkipPhase::LineHasContent
-        );
-        assert_eq!(SkipPhase::from_metadata_str(None), SkipPhase::NotSkipping);
-        assert_eq!(
-            SkipPhase::from_metadata_str(Some("unknown")),
-            SkipPhase::NotSkipping,
-            "unknown values should resume normal buffering"
         );
     }
 
