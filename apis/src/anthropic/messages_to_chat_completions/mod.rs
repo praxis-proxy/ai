@@ -17,6 +17,8 @@ mod config;
 pub(crate) mod request;
 pub(crate) mod response;
 
+use std::borrow::Cow;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use metrics::counter;
@@ -414,7 +416,9 @@ fn transform_buffered_response(
             .map_or("", String::as_str);
         let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY);
         let stop_sequences = client_stop_sequences(ctx);
-        if let Some(finish_reason) = transform_non_streaming_body(body, request_model, request_id, &stop_sequences) {
+        if let Some(finish_reason) =
+            transform_non_streaming_body(body, request_model, request_id, stop_sequences.as_ref())
+        {
             ctx.set_metadata("openai.finish_reason", finish_reason);
             FilterAction::Continue
         } else {
@@ -467,15 +471,17 @@ fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, value: Option<&serd
 /// A list that is not all strings is invalid Anthropic input the backend
 /// rejects on its own; treating it as empty keeps the response at
 /// `end_turn` rather than failing the translation.
-pub(crate) fn client_stop_sequences(ctx: &HttpFilterContext<'_>) -> Vec<String> {
+pub(crate) fn client_stop_sequences<'a>(ctx: &'a HttpFilterContext<'_>) -> Cow<'a, [String]> {
     if let Some(stop_sequences) = ctx.extensions.get::<ClientStopSequences>() {
-        return stop_sequences.0.clone();
+        return Cow::Borrowed(&stop_sequences.0);
     }
 
-    ctx.filter_metadata
-        .get(STOP_SEQUENCES_KEY)
-        .and_then(|value| serde_json::from_str(value).ok())
-        .unwrap_or_default()
+    Cow::Owned(
+        ctx.filter_metadata
+            .get(STOP_SEQUENCES_KEY)
+            .and_then(|value| serde_json::from_str(value).ok())
+            .unwrap_or_default(),
+    )
 }
 
 /// Record degraded features as operator signals.
@@ -1112,12 +1118,13 @@ mod tests {
             vec![",".to_owned(), "END".to_owned()],
             "client stop sequences are retained for the response phase"
         );
+        assert!(matches!(client_stop_sequences(&ctx), Cow::Borrowed(_)));
         assert!(!ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY));
     }
 
     #[test]
     fn extract_request_metadata_retains_stop_sequences_longer_than_metadata_limit() {
-        let sequence = "s".repeat(253);
+        let sequence = "s".repeat(300);
         let value = serde_json::json!({"model": "gpt-4", "stop_sequences": [sequence]});
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);

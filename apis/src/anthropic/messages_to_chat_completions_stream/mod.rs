@@ -53,9 +53,6 @@ const TEXT_BLOCK_OPEN_KEY: &str = "anthropic_stream.text_block_open";
 /// Metadata key for the finish reason from the upstream provider.
 const FINISH_REASON_KEY: &str = "anthropic_stream.finish_reason";
 
-/// Metadata key for the client stop sequence the upstream reported as matched.
-const STOP_SEQUENCE_KEY: &str = "anthropic_stream.stop_sequence";
-
 /// Metadata key for accumulated output token count.
 const OUTPUT_TOKENS_KEY: &str = "anthropic_stream.output_tokens";
 
@@ -89,6 +86,13 @@ struct ToolBlockState {
     index: u32,
     /// Whether the block still needs a terminal stop event.
     open: bool,
+}
+
+/// Response data that may exceed the bounded routing metadata value size.
+#[derive(Default)]
+struct StreamResponseState {
+    /// Client stop sequence the upstream reported as matched.
+    stop_sequence: Option<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -612,7 +616,7 @@ fn transform_chunk(
         if let Some(matched) = choice.get("stop_reason").and_then(Value::as_str)
             && client_stop_sequences(ctx).iter().any(|sequence| sequence == matched)
         {
-            ctx.set_metadata(STOP_SEQUENCE_KEY, matched.to_owned());
+            set_matched_stop_sequence(ctx, matched);
         }
     }
 
@@ -995,7 +999,7 @@ fn emit_final_block_stop(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) 
 
 /// Emit the `message_delta` event with stop reason and usage.
 fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
-    let stop_sequence = ctx.filter_metadata.get(STOP_SEQUENCE_KEY);
+    let stop_sequence = matched_stop_sequence(ctx);
     let stop_reason = match ctx.filter_metadata.get(FINISH_REASON_KEY).map(String::as_str) {
         Some("stop") if stop_sequence.is_some() => "stop_sequence",
         Some(reason) => map_stop_reason(reason),
@@ -1018,6 +1022,22 @@ fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
             "usage": usage
         }),
     );
+}
+
+/// Retain a matched stop sequence outside size-bounded routing metadata.
+fn set_matched_stop_sequence(ctx: &mut HttpFilterContext<'_>, stop_sequence: &str) {
+    if ctx.get_filter_state::<StreamResponseState>().is_none() {
+        ctx.insert_filter_state(StreamResponseState::default());
+    }
+    if let Some(state) = ctx.get_filter_state_mut::<StreamResponseState>() {
+        state.stop_sequence = Some(stop_sequence.to_owned());
+    }
+}
+
+/// Return the matched stop sequence retained for this response.
+fn matched_stop_sequence<'a>(ctx: &'a HttpFilterContext<'_>) -> Option<&'a str> {
+    ctx.get_filter_state::<StreamResponseState>()
+        .and_then(|state| state.stop_sequence.as_deref())
 }
 
 /// Collect token counts from metadata and build the terminal delta usage.
@@ -1425,6 +1445,36 @@ mod tests {
             delta.get("stop_sequence").and_then(Value::as_str),
             Some(","),
             "matched value is reported"
+        );
+    }
+
+    #[test]
+    fn message_delta_preserves_long_matched_stop_sequence() {
+        let (filter, mut ctx) = make_filter_and_context();
+        let stop_sequence = "s".repeat(300);
+        ctx.extensions
+            .insert(crate::anthropic::messages_to_chat_completions::ClientStopSequences(
+                vec![stop_sequence.clone()],
+            ));
+        let chunk = serde_json::json!({
+            "id": "c1",
+            "model": "gpt-4",
+            "choices": [{
+                "delta": {"content": "partial"},
+                "index": 0,
+                "finish_reason": "stop",
+                "stop_reason": stop_sequence,
+            }],
+        });
+        let mut body = Some(Bytes::from(format!("data: {chunk}\n\ndata: [DONE]\n\n")));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+        let delta = event_data(&out, "message_delta").get("delta").unwrap().clone();
+        assert_eq!(delta.get("stop_reason").and_then(Value::as_str), Some("stop_sequence"));
+        assert_eq!(
+            delta.get("stop_sequence").and_then(Value::as_str),
+            Some(stop_sequence.as_str())
         );
     }
 
@@ -1910,7 +1960,6 @@ mod tests {
             assert_eq!(trailing_body, Some(Bytes::new()));
         }
     }
-
 
     #[test]
     fn interleaved_tool_call_argument_delta_uses_matching_tool_block_index() {
