@@ -87,7 +87,9 @@ jobs:
       always() &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    # A cold build took 18 minutes; CPU acceptance then passed in 3m39s,
+    # but the old 25-minute job cap cancelled post-job cache cleanup.
+    timeout-minutes: 35
     permissions:
       contents: read
     steps:
