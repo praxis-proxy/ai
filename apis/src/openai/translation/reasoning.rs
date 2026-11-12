@@ -182,7 +182,10 @@ fn summary_control<'a>(
 }
 
 /// Validate that a requested reasoning summary is compatible with the dialect.
-/// A summary request against a dialect without a safe-summary contract is rejected.
+/// `auto` is a best-effort request the translation satisfies by producing no
+/// summary items, so it is accepted on every dialect. An explicit summary
+/// value (`concise`, `detailed`, ...) against a dialect without a safe-summary
+/// contract is rejected so the capability gap stays loud.
 pub(crate) fn validate_requested_reasoning(
     request: &Map<String, Value>,
     options: &ReasoningOptions,
@@ -197,7 +200,10 @@ pub(crate) fn validate_requested_reasoning(
         },
     };
 
-    if requested_summary(reasoning)?.is_some() && !options.dialect.supports_safe_summary() {
+    if let Some(summary) = requested_summary(reasoning)?
+        && summary != "auto"
+        && !options.dialect.supports_safe_summary()
+    {
         return Err(TranslationError::UnsupportedReasoningSummary);
     }
 
@@ -334,7 +340,6 @@ fn reasoning_item(id: String, status: &str, text: &str) -> Value {
         }]
     })
 }
-
 
 #[cfg(test)]
 mod tests {

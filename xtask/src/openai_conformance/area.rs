@@ -24,6 +24,16 @@ pub(super) const RESPONSES_SCOPE: OperationScope =
 /// Runtime checks executed while generating the Conversations conformance report.
 const CONVERSATIONS_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
     RuntimeVerificationCheck {
+        kind: "storage_error_rollback",
+        evidence: "openai::conversations::tests::conformance_conversations_storage_errors_roll_back_mutations",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK conversations storage_error_rollback",
+    },
+    RuntimeVerificationCheck {
+        kind: "error_response_contract",
+        evidence: "openai::conversations::tests::conformance_conversations_declared_errors_match_pinned_contract_and_preserve_owners",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK conversations error_response_contract",
+    },
+    RuntimeVerificationCheck {
         kind: "rate_limit_response_contract",
         evidence: "openai::conversations::tests::conformance_conversations_rate_limit_rejects_every_operation_before_store_access",
         success_sentinel: "PRAXIS_CONFORMANCE_OK conversations rate_limit_response_contract",
