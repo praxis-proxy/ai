@@ -1649,6 +1649,36 @@ mod tests {
     }
 
     #[test]
+    fn message_delta_preserves_long_matched_stop_sequence() {
+        let (filter, mut ctx) = make_filter_and_context();
+        let stop_sequence = "s".repeat(300);
+        ctx.extensions
+            .insert(crate::anthropic::messages_to_chat_completions::ClientStopSequences(
+                vec![stop_sequence.clone()],
+            ));
+        let chunk = serde_json::json!({
+            "id": "c1",
+            "model": "gpt-4",
+            "choices": [{
+                "delta": {"content": "partial"},
+                "index": 0,
+                "finish_reason": "stop",
+                "stop_reason": stop_sequence,
+            }],
+        });
+        let mut body = Some(Bytes::from(format!("data: {chunk}\n\ndata: [DONE]\n\n")));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+        let delta = event_data(&out, "message_delta").get("delta").unwrap().clone();
+        assert_eq!(delta.get("stop_reason").and_then(Value::as_str), Some("stop_sequence"));
+        assert_eq!(
+            delta.get("stop_sequence").and_then(Value::as_str),
+            Some(stop_sequence.as_str())
+        );
+    }
+
+    #[test]
     fn message_delta_ignores_stop_reason_outside_client_sequences() {
         let (filter, mut ctx) = make_filter_and_context();
         ctx.set_metadata(
@@ -2208,7 +2238,6 @@ mod tests {
             assert_eq!(trailing_body, Some(Bytes::new()));
         }
     }
-
 
     #[test]
     fn interleaved_tool_call_argument_delta_uses_matching_tool_block_index() {

@@ -81,6 +81,7 @@ class RecordingBackend(BaseHTTPRequestHandler):
     send_tool_reply_once = False
     tool_call_arguments = "{}"
     many_tool_calls_stream_once = False
+    matched_stop_stream_once: str | None = None
     untranslatable_reply_once: str | None = None
     untranslatable_stream_once: str | None = None
     fragmented_stream_once = False
@@ -126,7 +127,11 @@ class RecordingBackend(BaseHTTPRequestHandler):
                 self.wfile.flush()
             return
         if body.get("stream"):
-            if RecordingBackend.untranslatable_stream_once:
+            if RecordingBackend.matched_stop_stream_once is not None:
+                stop_sequence = RecordingBackend.matched_stop_stream_once
+                RecordingBackend.matched_stop_stream_once = None
+                self._send_matched_stop_stream(stop_sequence)
+            elif RecordingBackend.untranslatable_stream_once:
                 kind = RecordingBackend.untranslatable_stream_once
                 RecordingBackend.untranslatable_stream_once = None
                 if kind == "tool_use_stop":
@@ -347,6 +352,28 @@ class RecordingBackend(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(wire.encode())))
         self.end_headers()
         self.wfile.write(wire.encode())
+        self.wfile.flush()
+
+    def _send_matched_stop_stream(self, stop_sequence: str):
+        """Send a terminal stream chunk reporting the supplied matched sequence."""
+        chunk = {
+            "id": "chatcmpl-stub",
+            "object": "chat.completion.chunk",
+            "created": 1_700_000_000,
+            "model": MODEL,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": "partial"},
+                "finish_reason": "stop",
+                "stop_reason": stop_sequence,
+            }],
+        }
+        wire = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode()
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(wire)))
+        self.end_headers()
+        self.wfile.write(wire)
         self.wfile.flush()
 
     def log_message(self, format, *args):
@@ -865,6 +892,25 @@ class TestStreamingResponseValidation:
             assert message.stop_reason == "end_turn"
         finally:
             RecordingBackend.fragmented_stream_once = False
+
+    def test_long_matched_stop_sequence_is_reported(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+        stop_sequence = "s" * 300
+        RecordingBackend.matched_stop_stream_once = stop_sequence
+
+        try:
+            with anthropic_client.messages.stream(
+                model=MODEL,
+                max_tokens=64,
+                stop_sequences=[stop_sequence],
+                messages=[{"role": "user", "content": "Stop after the marker"}],
+            ) as stream:
+                message = stream.get_final_message()
+        finally:
+            RecordingBackend.matched_stop_stream_once = None
+
+        assert message.stop_reason == "stop_sequence"
+        assert message.stop_sequence == stop_sequence
 
     def test_named_tool_with_stop_finish_reason_reports_tool_use(
         self, anthropic_client
