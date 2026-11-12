@@ -9,6 +9,9 @@ For base proxy capabilities such as TLS, HTTP/2, TCP, WebSocket, load
 balancing, rate limiting, compression, CORS, health checks, and credential
 injection, see the [Praxis core documentation][praxis].
 
+For client setup, provider authentication, and build choices, use
+[Client and provider paths](client-provider-paths.md).
+
 ## Inference routing and transformation
 
 - Classify requests by provider format, model, streaming mode, and tool
