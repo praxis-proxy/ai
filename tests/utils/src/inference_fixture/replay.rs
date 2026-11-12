@@ -25,7 +25,11 @@ use super::{
     http_server::ScriptedHttpServer,
     sanitize::sanitize_fixture_preserving_structure,
 };
-use crate::{ProxyGuard, example_config_path, free_port_guard, patch_yaml, start_proxy};
+use crate::{
+    ProxyGuard,
+    body_contract::{retained_json_order_mismatch, retained_tool_order_mismatch},
+    example_config_path, free_port_guard, patch_yaml, start_proxy,
+};
 
 /// Maximum time allowed for one backend capture to become observable.
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -169,6 +173,19 @@ impl ScenarioRunner {
                 let empty = uncontacted_upstream();
                 (empty.request, empty.response)
             };
+            // Normalization deliberately sorts object members. Check retained
+            // input before that pass so a reserialization regression cannot be
+            // erased by the fixture comparison's canonical representation.
+            if let (RecordedBody::Json { value: before }, RecordedBody::Json { value: after }) =
+                (&scenario.request.body, &upstream_request.body)
+                && let Some(position) =
+                    retained_json_order_mismatch(before, after).or_else(|| retained_tool_order_mismatch(before, after))
+            {
+                return Err(mismatch(
+                    &format!("turns[{turn_index}].upstream.request.{position}"),
+                    "retained JSON object member order changed",
+                ));
+            }
             let turn = WireTurn {
                 name: scenario.name,
                 client: RecordedExchange {
