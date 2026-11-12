@@ -122,12 +122,14 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// checks and post-response token usage reporting.
 ///
 /// Tenant identity is resolved from the highest-trust source available:
-/// verified `{prefix}*` metadata written by an authentication filter,
-/// then the `identity_header_guard` filter's namespaced
-/// `{namespace}.{prefix}*` metadata, then raw `{prefix}*` request
-/// headers. A higher tier always wins, so forged client headers can
-/// never override verified claims, and identity headers plus client
-/// credentials are always stripped before the request is forwarded.
+/// an `AuthenticatedIdentity` extension published by a policy/auth filter
+/// from a cryptographically verified token, then verified `{prefix}*`
+/// metadata written by an authentication filter, then the
+/// `identity_header_guard` filter's namespaced `{namespace}.{prefix}*`
+/// metadata, then raw `{prefix}*` request headers. A higher tier always
+/// wins, so forged client headers can never override verified claims, and
+/// identity headers plus client credentials are always stripped before the
+/// request is forwarded.
 /// Both event types carry `data.organization_id` and `data.cost_center`
 /// from `{prefix}organization-id` and `{prefix}cost-center`. When absent,
 /// those fields are empty strings rather than invented defaults.
@@ -137,6 +139,13 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// the client-facing model ID it recorded rather than the provider target.
 /// That filter buffers the request body, so its body pass completes before
 /// this filter's request hook runs the balance check.
+///
+/// For a complete setup where the Praxis Policy Engine (`policy` filter) verifies
+/// a JWT and this filter meters on the resulting tier-0 `AuthenticatedIdentity` —
+/// no `{prefix}*` header involved — see the end-to-end example below (a gateway
+/// config plus the PPE policy document it loads). A metered request then carries
+/// only `Authorization: Bearer <jwt>`, and usage is billed to the token's
+/// verified `identity_username_claim` within its `identity_group_claim`.
 ///
 /// # YAML
 ///
@@ -152,6 +161,104 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// identity_metadata_namespace: "identity"
 /// default_username: "anonymous"
 /// default_model: "unknown"
+/// ```
+///
+/// # End-to-end identity metering with the Praxis Policy Engine (YAML)
+///
+/// ```yaml
+/// # This end-to-end example is TWO files: the gateway config and the PPE policy
+/// # document it loads through `config_path`. Save each part under the filename in
+/// # its banner. The policy engine verifies a bearer JWT and publishes an
+/// # AuthenticatedIdentity; external_metering meters on it (tier 0), so no
+/// # x-tenant-* header is ever involved and a metered request carries only
+/// # `Authorization: Bearer <jwt>`.
+///
+/// # ===== gateway.yaml =====
+/// # Run from a praxis-ai checkout:  cargo run -p praxis-ai-proxy -- -c gateway.yaml
+/// listeners:
+///   - name: gateway
+///     address: "127.0.0.1:8080"
+///     filter_chains: [main]
+///
+/// filter_chains:
+///   - name: main
+///     filters:
+///       # Verify the JWT and publish the verified identity. Declared before
+///       # external_metering so the AuthenticatedIdentity exists when metering
+///       # resolves the tenant. This chain serves plain-HTTP inference (no MCP),
+///       # so the protocol-metadata gate is turned off.
+///       - filter: policy
+///         config_path: "policy.yaml"
+///         require_protocol_metadata: false
+///         # The issuer/JWKS callout is loopback in this local example; dev only.
+///         allow_private_idp: true
+///
+///       - filter: router
+///         routes:
+///           - path_prefix: "/"
+///             cluster: inference
+///
+///       # Balance check + usage reporting. Meter the verified `preferred_username`
+///       # claim as the tenant username (falling back to the verified subject id)
+///       # and the `organization` claim as the tenant group — tier 0, never a
+///       # forgeable x-tenant-* header. Declared before token_count so the
+///       # response hooks (which run in reverse) populate token.* first.
+///       - filter: external_metering
+///         metering_url: "http://127.0.0.1:9090"
+///         allow_private_endpoint: true
+///         feature_key: "inference-tokens"
+///         source: "ai-gateway"
+///         provider: "openai"
+///         fail_open: true
+///         identity_username_claim: "preferred_username"
+///         identity_group_claim: "organization"
+///
+///       - filter: token_count
+///         provider: openai
+///
+///       - filter: load_balancer
+///         clusters:
+///           - name: inference
+///             endpoints: ["127.0.0.1:3000"]
+///
+/// # Every upstream here is on loopback, so private endpoints must be opted in.
+/// insecure_options:
+///   allow_private_endpoints: true
+///
+/// ---
+///
+/// # ===== policy.yaml (loaded by the policy filter's config_path above) =====
+/// # One identity/jwt plugin verifies the bearer token against a trusted issuer
+/// # and publishes the AuthenticatedIdentity. `on_error: fail` makes a missing or
+/// # invalid token reject the request; `global.authentication` runs the plugin on
+/// # every route.
+/// #
+/// # `claim_mapper: standard` passes non-registered claims through to the
+/// # identity's custom claims, so external_metering can read `preferred_username`
+/// # and `organization`. A claim the standard mapper promotes to a typed field
+/// # (e.g. `groups` -> teams) would NOT appear as a custom claim, so pick a
+/// # passthrough claim such as `organization` for the tenant group.
+/// plugins:
+///   - name: jwt-user
+///     kind: identity/jwt
+///     hooks: [identity.resolve]
+///     mode: sequential
+///     on_error: fail
+///     config:
+///       header: Authorization        # the "Bearer " prefix is stripped automatically
+///       claim_mapper: standard
+///       trusted_issuers:
+///         - issuer: "https://idp.example.com"
+///           audiences: ["ai-gateway"]
+///           algorithms: ["HS256"]     # production: RS256 with a jwks_url decoding_key
+///           decoding_key:
+///             kind: secret
+///             secret: "REPLACE-WITH-A-RANDOM-SHARED-SECRET"
+///           leeway_seconds: 60
+///
+/// global:
+///   authentication:
+///     - jwt-user
 /// ```
 pub struct ExternalMeteringFilter {
     /// Connect-time policy for the metering endpoint. Rejects non-public
@@ -190,6 +297,14 @@ pub struct ExternalMeteringFilter {
     /// Metadata namespace the `identity_header_guard` filter writes
     /// captured headers under (tier 2 of identity resolution).
     identity_metadata_namespace: String,
+
+    /// Custom claim on a verified `AuthenticatedIdentity` (tier 0) to meter
+    /// as the username. `None` falls back to the verified subject id.
+    identity_username_claim: Option<String>,
+
+    /// Custom claim on a verified `AuthenticatedIdentity` (tier 0) to meter
+    /// as the tenant group. `None` takes no group from the verified identity.
+    identity_group_claim: Option<String>,
 
     /// Base URL of the external metering service.
     metering_url: String,
@@ -258,6 +373,8 @@ impl ExternalMeteringFilter {
             feature_key: cfg.feature_key,
             identity_header_prefix: cfg.identity_header_prefix.to_ascii_lowercase(),
             identity_metadata_namespace: cfg.identity_metadata_namespace,
+            identity_username_claim: cfg.identity_username_claim,
+            identity_group_claim: cfg.identity_group_claim,
             metering_url: cfg.metering_url,
             provider: cfg.provider,
             source: cfg.source,
@@ -417,7 +534,13 @@ impl HttpFilter for ExternalMeteringFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let mut state = capture_identity(ctx, &self.identity_header_prefix, &self.identity_metadata_namespace);
+        let mut state = capture_identity(
+            ctx,
+            &self.identity_header_prefix,
+            &self.identity_metadata_namespace,
+            self.identity_username_claim.as_deref(),
+            self.identity_group_claim.as_deref(),
+        );
         if state.model.is_empty()
             && let Some(model) = ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
         {
@@ -629,7 +752,13 @@ struct BalanceResponse {
 ///
 /// `prefix` must already be lowercase; [`ExternalMeteringFilter::build`]
 /// lowercases it once at construction.
-fn capture_identity(ctx: &mut HttpFilterContext<'_>, prefix: &str, identity_namespace: &str) -> MeteringState {
+fn capture_identity(
+    ctx: &mut HttpFilterContext<'_>,
+    prefix: &str,
+    identity_namespace: &str,
+    username_claim: Option<&str>,
+    group_claim: Option<&str>,
+) -> MeteringState {
     let user_agent = ctx
         .request
         .headers
@@ -638,7 +767,8 @@ fn capture_identity(ctx: &mut HttpFilterContext<'_>, prefix: &str, identity_name
         .unwrap_or_default()
         .to_owned();
 
-    let mut identity = crate::identity::resolve_tenant_identity(ctx, prefix, identity_namespace);
+    let mut identity =
+        crate::identity::resolve_tenant_identity(ctx, prefix, identity_namespace, username_claim, group_claim);
     strip_client_credentials(ctx);
 
     if identity.group.is_empty() {

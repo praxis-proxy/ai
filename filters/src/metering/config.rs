@@ -81,6 +81,19 @@ pub(super) struct ExternalMeteringConfig {
     #[serde(default = "default_identity_metadata_namespace")]
     pub identity_metadata_namespace: String,
 
+    /// Custom claim on a policy/auth filter's verified identity (tier 0) to
+    /// meter as the tenant username. When unset, the verified subject id is
+    /// used. Only consulted when an upstream filter (e.g. the `policy` engine)
+    /// published an `AuthenticatedIdentity` for the request.
+    #[serde(default)]
+    pub identity_username_claim: Option<String>,
+
+    /// Custom claim on a policy/auth filter's verified identity (tier 0) to
+    /// meter as the tenant group. When unset, no group is taken from the
+    /// verified identity.
+    #[serde(default)]
+    pub identity_group_claim: Option<String>,
+
     /// Fallback username when no identity header is present.
     /// If set, requests without `{prefix}username` are still metered
     /// under this name. If unset, metering is skipped entirely.
