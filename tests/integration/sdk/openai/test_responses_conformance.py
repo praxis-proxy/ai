@@ -33,7 +33,7 @@ MANIFEST_PATH = REPO_ROOT / "tests/conformance/openresponses/manifest.yaml"
 OVERLAY_PATH = REPO_ROOT / "tests/conformance/openresponses/package.json"
 
 SUITE_REPO = "https://github.com/openresponses/openresponses"
-SUITE_SHA = "92c12d96d7b61d6d15e2214daa5e9c6000ab6e1c"
+SUITE_SHA = "dce9ddb91921427c2ba06901c7dfaf0cc7056799"
 STREAMING_TEMPLATE_ID = "streaming-response"
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
@@ -80,6 +80,15 @@ def _ensure_suite() -> Path:
         subprocess.run(["git", "remote", "add", "origin", SUITE_REPO], cwd=suite_dir, check=True)
         subprocess.run(["git", "fetch", "-q", "--depth", "1", "origin", SUITE_SHA], cwd=suite_dir, check=True)
         subprocess.run(["git", "checkout", "-q", "FETCH_HEAD"], cwd=suite_dir, check=True)
+    actual_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=suite_dir, text=True
+    ).strip()
+    if actual_sha != SUITE_SHA:
+        raise RuntimeError(f"OpenResponses checkout is {actual_sha}, expected {SUITE_SHA}")
+    subprocess.run(
+        ["git", "diff", "--exit-code", "HEAD", "--", "src", "bin"],
+        cwd=suite_dir, check=True, capture_output=True,
+    )
     # Overlay a zod-only package.json so `bun install` skips the site tree.
     shutil.copyfile(OVERLAY_PATH, suite_dir / "package.json")
     lock = suite_dir / "bun.lock"
@@ -281,4 +290,4 @@ def test_openresponses_conformance_unsupported_stays_failing(praxis_proxy):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    sys.exit(pytest.main([__file__, "-v", *sys.argv[1:]]))

@@ -1,0 +1,20 @@
+# Native Responses backend owns generation, compaction and WebSocket state.
+# This profile proves forwarding compatibility, not Praxis-managed features.
+listeners:
+  - name: acceptance
+    address: "127.0.0.1:8080"
+    filter_chains: [acceptance]
+filter_chains:
+  - name: acceptance
+    filters:
+      - filter: ai_operation
+      - filter: router
+        routes:
+          - path_prefix: "/v1/responses"
+            cluster: responses-backend
+      - filter: load_balancer
+        clusters:
+          - name: responses-backend
+            endpoints: ["127.0.0.1:3001"]
+insecure_options:
+  allow_private_endpoints: true
