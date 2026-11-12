@@ -994,8 +994,14 @@ fn emit_final_block_stop(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) 
 /// Emit the `message_delta` event with stop reason and usage.
 fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
     let stop_sequence = ctx.filter_metadata.get(STOP_SEQUENCE_KEY);
+    let has_tool_use = ctx
+        .filter_metadata
+        .get(TOOL_BLOCK_COUNT_KEY)
+        .and_then(|count| count.parse::<usize>().ok())
+        .is_some_and(|count| count > 0);
     let stop_reason = match ctx.filter_metadata.get(FINISH_REASON_KEY).map(String::as_str) {
         Some("stop") if stop_sequence.is_some() => "stop_sequence",
+        Some("stop") if has_tool_use => "tool_use",
         Some(reason) => map_stop_reason(reason),
         None => "end_turn",
     };
@@ -1800,6 +1806,71 @@ mod tests {
             "tool arguments should stream as input_json_delta"
         );
     }
+
+    /// A streamed named tool call maps an upstream `stop` to `tool_use`.
+    #[test]
+    fn message_delta_reports_tool_use_when_named_tool_stream_finishes_with_stop() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let tool_start = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},\"index\":0}]}\n\n";
+        let mut body1 = Some(Bytes::from(tool_start));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let finish = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n";
+        let mut body2 = Some(Bytes::from(finish));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let mut done = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut done, false).unwrap());
+
+        let out = String::from_utf8(done.unwrap().to_vec()).unwrap();
+        let event = event_data(&out, "message_delta");
+        let stop_reason = event
+            .get("delta")
+            .and_then(|delta| delta.get("stop_reason"))
+            .and_then(Value::as_str);
+        assert_eq!(
+            stop_reason,
+            Some("tool_use"),
+            "a named tool block must not be reported as end_turn when upstream uses stop"
+        );
+    }
+
+    /// A matched client stop sequence takes precedence over an open tool block.
+    #[test]
+    fn message_delta_prefers_matched_stop_sequence_over_tool_use() {
+        let (filter, mut ctx) = make_filter_and_context();
+        ctx.set_metadata(
+            crate::anthropic::messages_to_chat_completions::STOP_SEQUENCES_KEY,
+            r#"[","]"#,
+        );
+
+        let tool_start = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},\"index\":0}]}\n\n";
+        let mut body1 = Some(Bytes::from(tool_start));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let finish = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\",\"stop_reason\":\",\"}]}\n\n";
+        let mut body2 = Some(Bytes::from(finish));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let mut done = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut done, false).unwrap());
+
+        let out = String::from_utf8(done.unwrap().to_vec()).unwrap();
+        let event = event_data(&out, "message_delta");
+        let delta = event.get("delta").unwrap();
+        assert_eq!(
+            delta.get("stop_reason").and_then(Value::as_str),
+            Some("stop_sequence"),
+            "a matched client stop must take precedence over tool_use"
+        );
+        assert_eq!(
+            delta.get("stop_sequence").and_then(Value::as_str),
+            Some(","),
+            "the matched client stop sequence must be reported"
+        );
+    }
+
     const INVALID_TOOL_CALL_CASES: [(&str, &str, &str); 5] = [
         (
             "missing id",

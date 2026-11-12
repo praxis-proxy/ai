@@ -85,6 +85,7 @@ class RecordingBackend(BaseHTTPRequestHandler):
     error_response_once = False
 
     def do_POST(self):
+        """Record a request and return the configured Chat Completions response."""
         length = int(self.headers.get("content-length", "0"))
         body = json.loads(self.rfile.read(length))
         RecordingBackend.bodies.append(body)
@@ -109,7 +110,10 @@ class RecordingBackend(BaseHTTPRequestHandler):
             if RecordingBackend.untranslatable_stream_once:
                 kind = RecordingBackend.untranslatable_stream_once
                 RecordingBackend.untranslatable_stream_once = None
-                self._send_untranslatable_stream(kind)
+                if kind == "tool_use_stop":
+                    self._send_named_tool_stop_stream()
+                else:
+                    self._send_untranslatable_stream(kind)
             else:
                 self._send_invalid_tool_id_stream()
             return
@@ -246,6 +250,42 @@ class RecordingBackend(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(wire)))
         self.end_headers()
         self.wfile.write(wire)
+        self.wfile.flush()
+
+    def _send_named_tool_stop_stream(self):
+        """Return a named tool call followed by a stop finish reason."""
+        chunks = [
+            {
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    }]
+                },
+                "finish_reason": None,
+            },
+            {"delta": {}, "finish_reason": "stop"},
+        ]
+        wire_chunks = []
+        for chunk in chunks:
+            payload = {
+                "id": "chatcmpl-stub",
+                "object": "chat.completion.chunk",
+                "created": 1_700_000_000,
+                "model": MODEL,
+                "choices": [{"index": 0, **chunk}],
+            }
+            wire_chunks.append(f"data: {json.dumps(payload)}\n\n")
+        wire = "".join(wire_chunks) + "data: [DONE]\n\n"
+        encoded = wire.encode()
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("content-length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
         self.wfile.flush()
 
     def log_message(self, format, *args):
@@ -654,6 +694,48 @@ class TestResponseValidation:
 
 
 class TestStreamingResponseValidation:
+    def test_named_tool_with_stop_finish_reason_reports_tool_use(
+        self, anthropic_client
+    ):
+        """Preserve named-tool semantics when the upstream terminates with stop."""
+        RecordingBackend.bodies.clear()
+        RecordingBackend.untranslatable_stream_once = "tool_use_stop"
+        try:
+            with anthropic_client.messages.stream(
+                model=MODEL,
+                max_tokens=64,
+                messages=[{"role": "user", "content": "Use the weather tool"}],
+                tools=[{
+                    "name": "get_weather",
+                    "description": "Get the weather for a city.",
+                    "input_schema": {"type": "object", "properties": {}},
+                }],
+                tool_choice={"type": "tool", "name": "get_weather"},
+            ) as stream:
+                events = list(stream)
+        finally:
+            RecordingBackend.untranslatable_stream_once = None
+
+        tool_use = next(
+            event.content_block
+            for event in events
+            if event.type == "content_block_start"
+            and event.content_block.type == "tool_use"
+        )
+        assert tool_use.name == "get_weather", "the named tool must be preserved in the response"
+        [upstream] = RecordingBackend.bodies
+        assert upstream["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "get_weather"},
+        }, "the named Anthropic tool choice must be translated to Chat Completions"
+        message_delta = next(event for event in events if event.type == "message_delta")
+        assert message_delta.delta.stop_reason == "tool_use", (
+            "a tool call with an upstream stop finish reason must report tool_use"
+        )
+        assert any(event.type == "message_stop" for event in events), (
+            "a completed streaming response must emit message_stop"
+        )
+
     def test_invalid_tool_id_aborts_incomplete_stream(self, anthropic_client):
         RecordingBackend.bodies.clear()
         events = []
