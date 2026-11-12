@@ -241,10 +241,20 @@ for transient capacity shortages. The build job still checks `nvidia-smi` before
 the multi-gigabyte build starts, and detects Docker or Podman to select
 `--gpus all` or `--device nvidia.com/gpu=all` accordingly.
 
-## Dependabot
+## Base image updates
 
-The `FROM` directive in `Containerfile` is monitored by Dependabot for
-weekly base image updates (see `.github/dependabot.yaml`). A base bump changes
-the Containerfile hash, so every consumer's provenance check stops matching the
-published images until `vllm-gpu-container.yaml` republishes them — consumers
-build from source in the meantime rather than serving a stale base.
+The `FROM` directive in `Containerfile` is one of the five sites that record the
+vLLM GPU image pin. `cargo xtask bump-pins` rewrites all five — this file, the
+two pin manifests under `tests/integration/fixtures/`, and the two workflow
+`VLLM_GPU_IMAGE` values — and `cargo xtask check-pins` (part of `make lint`)
+fails if any of them disagree, so a bump has to land as one change. The weekly
+`Bump Pins` workflow opens that change as a draft PR.
+
+Dependabot deliberately does not manage this file. It understands only the
+`FROM` line, so the PR it opens leaves the pin manifests and workflows stale and
+cannot pass `check-pins`.
+
+A base bump changes the Containerfile hash, so every consumer's provenance check
+stops matching the published images until `vllm-gpu-container.yaml` republishes
+them — consumers build from source in the meantime rather than serving a stale
+base.
