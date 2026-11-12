@@ -11,6 +11,8 @@ Request fields the translation does not map are forwarded untouched for the back
 
 `allow_lossy_features` opts specific Anthropic-only features into operator-approved degradation instead of that 400. A listed feature's wire markers are validated and then stripped so an unmodified client (for example Claude Code, which always sends `cache_control` and `thinking`) can still drive a Chat Completions backend. Each degradation is reported to the operator — one `WARN` log per request, a `praxis_anthropic_messages_to_chat_completions_degraded_total` counter per feature, and an `x-degraded-features` response header — because the request succeeds but the feature was silently dropped. `prompt_caching` removes `cache_control` markers (prompt and tool content are preserved, but explicit cache breakpoints are not honored, so cost and latency may differ); `extended_thinking` removes `thinking` and thinking-only `context_management` edits (the translated response carries no thinking blocks). Features absent from the allowlist, malformed markers, and other `context_management` edits are still rejected with a 400.
 
+Translation ends the Anthropic wire contract, so the filter removes `anthropic-version` and both Anthropic credential forms (`x-api-key` from SDK v1 and `authorization: Bearer` from SDK v2) before the request reaches the Chat Completions backend. Use `credential_injection` to add the backend's own token. The caller's API version does not change translation: `temperature`, `top_p`, and `top_k` are forwarded under either version, and `document` blocks and non-empty citations are rejected under either version.
+
 ## Configuration
 
 | Field | Type | Required | Description |

@@ -38,6 +38,21 @@
 #     Anthropic auth header) so a caller's Anthropic key never reaches vLLM.
 #   - `credential_injection` then injects the backend's own distinct Bearer
 #     token from `VLLM_API_KEY` toward the cluster.
+# The translation filter also removes `x-api-key` and `Authorization` on its
+# own, so neither Anthropic credential form can reach vLLM even without the
+# filters above.
+#
+# Anthropic SDK v2 sends its API key as `Authorization: Bearer` instead of
+# `x-api-key`. `basic_auth` accepts only `Basic`, so a v2 client that sends
+# just its Bearer key is rejected with a 401. Configure v2 clients to send the
+# gateway credential as the `Authorization` header (for example
+# `default_headers={"Authorization": "Basic ..."}`); the SDK then sends it in
+# place of its Bearer key.
+#
+# API version: the translator removes `anthropic-version`, so vLLM never sees
+# it. Requests from SDK v1 (`2023-06-01`) and SDK v2 (`2026-10-21`) are
+# translated identically: sampling fields are kept, while `document` blocks and
+# non-empty citations are rejected with a 400.
 #
 # The gateway password is resolved from `GATEWAY_AUTH_PASSWORD` at pipeline
 # build time; set it (and `VLLM_API_KEY`) in the proxy's environment.

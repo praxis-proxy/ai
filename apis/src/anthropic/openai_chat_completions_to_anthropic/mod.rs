@@ -123,7 +123,12 @@ struct BufferedJsonResponse {
 /// It defaults to `2023-06-01`. Supported sampling fields are preserved under
 /// either version; the backend owns version-specific parameter validation.
 /// Unknown versions fail configuration parsing. OpenAI-compatible candidates
-/// and native Messages passthrough are unaffected.
+/// and native Messages passthrough are unaffected. Translated requests carry
+/// only text, image, and tool blocks, so they never contain the assistant
+/// `document` blocks or user text citations that `2026-10-21` rejects.
+///
+/// Anthropic candidates have the caller's `authorization` and `x-api-key`
+/// removed; `credential_inject` installs the selected provider credential.
 ///
 /// The compatibility contract defaults an omitted token limit to 4096 and
 /// ignores `user`, `n`, `seed`,

@@ -47,6 +47,15 @@
 # Messages backend listens on 127.0.0.1:8000 and the Chat Completions backend on
 # 127.0.0.1:8001.
 #
+# API version and model credentials differ per path. The native path forwards
+# the caller's `anthropic-version` (`2023-06-01` from Anthropic SDK v1,
+# `2026-10-21` from SDK v2) and credential (`x-api-key` or
+# `Authorization: Bearer`) unchanged; `default_version` fills in only a missing
+# version. The Chat path removes `anthropic-version` and both credential forms,
+# then injects `VLLM_API_KEY`. Add a gateway-auth filter and credential removal
+# in front of the native backend for a deployment (see
+# `messages-native-vllm.yaml`).
+#
 # Run the deterministic native model mock:
 #   cargo run -p praxis-test-utils --example anthropic_messages_web_search_mock
 #
