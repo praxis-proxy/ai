@@ -14,6 +14,7 @@ mod anthropic_full_flow_agentic_chat;
 #[cfg(feature = "openai-responses")]
 mod anthropic_messages;
 mod anthropic_messages_native_vllm;
+mod anthropic_messages_to_openai;
 mod anthropic_messages_to_openai_vllm;
 mod anthropic_web_search_scoped_credentials;
 mod anthropic_web_search_tavily_scoped_credentials;
@@ -41,6 +42,7 @@ mod file_search_chat_completions;
 mod file_search_dispatch;
 #[cfg(feature = "openai-agentic-loop")]
 mod file_search_streaming;
+mod filter_body_processing_limits;
 #[cfg(feature = "openai-responses")]
 mod format_routing;
 #[cfg(all(
@@ -56,9 +58,11 @@ mod full_flow_agentic;
 mod gcp_adc;
 mod guardrails;
 mod guardrails_response;
+mod guardrails_service_account;
 mod identity_header_guard;
 #[cfg(feature = "openai-responses")]
 mod inference_fallback;
+mod inference_fallback_provider;
 #[cfg(feature = "inflight-tracker-filter")]
 mod inflight_tracking;
 mod intelligent_route_hardening;
@@ -77,6 +81,7 @@ mod mcp_broker;
 #[cfg(all(feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
 mod mcp_kuadrant_gateway;
 mod model_to_header;
+mod model_to_header_body_limits;
 mod model_to_header_trust_existing;
 mod model_to_provider;
 #[cfg(all(feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
@@ -152,6 +157,9 @@ mod openai_state_ownership;
 #[cfg(feature = "store-sqlite")]
 mod openai_stream_events;
 mod openai_tool_parse;
+#[cfg(feature = "openai-agentic-loop")]
+#[cfg(feature = "store-sqlite")]
+mod openshell_sandboxed_coding_clients;
 mod project_state_owner_headers;
 mod prompt_enrichment;
 mod provider_route;
@@ -180,6 +188,7 @@ mod token_rate_limit;
 #[cfg(feature = "token-rate-limit-filter")]
 mod token_rate_limit_sentinel;
 mod token_usage_headers;
+mod token_usage_metrics;
 mod vector_stores_routing;
 #[cfg(feature = "vertex-anthropic-filter")]
 mod vertex_anthropic;

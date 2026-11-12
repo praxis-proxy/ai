@@ -13,7 +13,21 @@ use std::{
 use tempfile::TempDir;
 
 /// Pinned version of the Claude Code CLI executable used for E2E acceptance tests.
-pub(crate) const CLAUDE_CODE_PINNED_VERSION: &str = "2.1.267";
+///
+/// Both lanes share it: the CPU lane installs this version from npm and the GPU
+/// lane downloads the native build the manifest names. Asserted as a substring
+/// of `claude --version`. Kept in sync with
+/// `tests/integration/fixtures/claude-code-cli/pin.toml` by
+/// `claude_code::pin_toml_version_matches_harness_const`.
+pub(crate) const CLAUDE_CODE_PINNED_VERSION: &str = "2.1.278";
+
+/// Pinned version of the Codex CLI executable used for E2E acceptance tests.
+///
+/// `codex --version` prints `codex-cli <version>`, so the version checks
+/// compare against that full line, not this bare value. Kept in sync with
+/// `tests/integration/fixtures/codex-cli/pin.toml` by
+/// `codex_pin::pin_toml_version_matches_harness_const`.
+pub(crate) const CODEX_PINNED_VERSION: &str = "0.144.1";
 
 /// Pinned version of the OpenCode CLI executable used for E2E acceptance tests.
 ///

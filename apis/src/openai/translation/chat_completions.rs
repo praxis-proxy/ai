@@ -370,6 +370,22 @@ pub(crate) fn responses_request_to_chat_request(
     translate_responses_request(request, RequestOverrides::default(), reasoning)
 }
 
+/// Map only Responses instructions and input to canonical conversation messages.
+///
+/// Standalone guardrail checks need this content even when unrelated request
+/// options cannot be represented by a Chat Completions backend. Callers must
+/// still validate that the mapped content is supported by their evaluator.
+pub(crate) fn responses_request_to_chat_messages(
+    request: &Value,
+    reasoning: &ReasoningOptions,
+) -> Result<Vec<Value>, TranslationError> {
+    let obj = request
+        .as_object()
+        .ok_or(TranslationError::ExpectedObject("Responses request"))?;
+    validate_input_container(obj.get("input"))?;
+    build_chat_messages(obj, None, reasoning)
+}
+
 /// Convert canonical Responses state into a Chat Completions request.
 pub(crate) fn responses_state_to_chat_request<'a>(
     request: &Value,
@@ -489,6 +505,15 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
 /// reported back as the default.
 #[expect(clippy::too_many_lines, reason = "sequential validation of request parameters")]
 fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), TranslationError> {
+    // Access program selection cannot be honored by the Chat backend. Keep
+    // this check at translation so native Responses passthrough is unaffected.
+    if let Some(access_programs) = obj.get("access_programs") {
+        return Err(TranslationError::UnrepresentableRequestParameter {
+            parameter: "access_programs",
+            value: json_type_name(access_programs),
+            supported: "omitting `access_programs`",
+        });
+    }
     validate_moderation_parameter(obj)?;
     if obj
         .get("tools")
@@ -1860,14 +1885,17 @@ struct ResponseResourceParts<'a> {
 }
 
 /// Build a full `Responses` resource snapshot.
+///
+/// Access programs are null because the managed Chat translator has no
+/// access-program admission policy.
 fn response_resource(
     context: &ResponseContext<'_>,
     parts: ResponseResourceParts<'_>,
 ) -> Result<Value, TranslationError> {
-    let status = parts.status;
     let mut resource = json!({
         "id": context.response_id,
         "object": "response",
+        "access_programs": Value::Null,
         "created_at": context.created_at,
         "status": parts.status,
         "error": Value::Null,
@@ -1896,7 +1924,7 @@ fn response_resource(
         "background": false,
         "service_tier": parts.service_tier
     });
-    insert_request_resource_fields(&mut resource, context, status);
+    insert_request_resource_fields(&mut resource, context, parts.status);
     Ok(resource)
 }
 

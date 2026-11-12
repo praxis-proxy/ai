@@ -63,6 +63,7 @@ for how these are authored and regenerated.
 | [model-to-header-trust-existing.yaml](configs/model-to-header-trust-existing.yaml) | Routes on a model header that a trusted hop in front of Praxis has already set, skipping the filter entirely when the header is present |
 | [model-to-provider.yaml](configs/model-to-provider.yaml) | Map a stable public model ID to an existing upstream cluster and target model |
 | [nemo-guardrails-response.yaml](configs/nemo-guardrails-response.yaml) | Evaluates upstream responses against a NeMo Guardrails service |
+| [nemo-guardrails-service-account.yaml](configs/nemo-guardrails-service-account.yaml) | Sends the pod's service account token on Praxis's calls to NeMo, so kube-rbac-proxy can decide whether Praxis is allowed to call |
 | [nemo-guardrails.yaml](configs/nemo-guardrails.yaml) | Evaluates incoming requests against a NeMo Guardrails service |
 | [openai-selected-provider-legacy-fixture.yaml](configs/openai-selected-provider-legacy-fixture.yaml) | Controlled inference-fixture replay for OpenAI Chat Completions to an Anthropic Messages provider |
 | [openai-selected-provider-legacy-translation.yaml](configs/openai-selected-provider-legacy-translation.yaml) | OpenAI Chat Completions clients reach the overlay-selected Anthropic Messages or OpenAI-compatible provider and receive translated Anthropic JSON/SSE or unchanged OpenAI-compatible responses. `intelligent_route` binds the trusted provider profile to each request before response and SSE processing |
@@ -83,6 +84,7 @@ for how these are authored and regenerated.
 | [token-rate-limit-soft-tiers.yaml](configs/token-rate-limit-soft-tiers.yaml) | Extends token-rate-limit.yaml with graduated enforcement tiers (proposal S1, ai#881) |
 | [token-rate-limit.yaml](configs/token-rate-limit.yaml) | Reserves an estimated token cost at admission time and reconciles that reservation against actual provider-reported usage once the response completes |
 | [token-usage-headers.yaml](configs/token-usage-headers.yaml) | Inject Praxis-Token-Input, Praxis-Token-Output, and Praxis-Token-Total headers into downstream responses when token counts are available in filter metadata |
+| [token-usage-metrics.yaml](configs/token-usage-metrics.yaml) | Opt-in, cardinality-bounded per-tenant token counters |
 
 ### Anthropic
 
@@ -117,6 +119,7 @@ for how these are authored and regenerated.
 
 | File | Description |
 | ------ | ------------- |
+| [fallback-with-provider-translation.yaml](configs/inference/fallback-with-provider-translation.yaml) | Demonstrates provider failover from an OpenAI-compatible backend to an Anthropic Messages provider with JSON and streaming SSE translation using the iterative_request_router |
 | [fallback-with-translation.yaml](configs/inference/fallback-with-translation.yaml) | Demonstrates provider failover with Responses-to-Chat Completions protocol translation using the iterative_request_router |
 
 ### OpenAI
@@ -138,6 +141,7 @@ for how these are authored and regenerated.
 | [client-tool-compat.yaml](configs/openai/responses/client-tool-compat.yaml) | Lets a rich Codex-style Responses client talk to a function-only Responses backend (for example vLLM at POST /v1/responses) without routing through /v1/chat/completions and without executing client-owned tools in Praxis |
 | [codex-http-chat-translation.yaml](configs/openai/responses/codex-http-chat-translation.yaml) | Release-acceptance configuration for GitHub issue #870. A Codex client speaks the OpenAI Responses API over HTTP while Praxis selects a Chat Completions-only provider, translates both request and streaming response, rewrites the provider path, and replaces the client credential |
 | [compact.yaml](configs/openai/responses/compact.yaml) | Demonstrates compaction after rehydrate, file resolve, and document extract so rewritten current-turn content survives history replacement |
+| [doc-extract-inline.yaml](configs/openai/responses/doc-extract-inline.yaml) | Converts inline text-safe input_file data to input_text, including a single object-form input |
 | [doc-extract.yaml](configs/openai/responses/doc-extract.yaml) | Converts `input_file` content parts to `input_text` for inference backends that do not natively support `input_file` (e.g. vLLM, llm-d) |
 | [file-resolve.yaml](configs/openai/responses/file-resolve.yaml) | Resolves `file_id` and `file_url` references in Responses API input by fetching file metadata and content, then inlining base64 content as `file_data` or `image_url` before forwarding |
 | [file-search-chat-completions-fixture.yaml](configs/openai/responses/file-search-chat-completions-fixture.yaml) | Single-upstream fixture configuration for recording the private Chat Completions function representation of a Responses file_search tool |
@@ -176,6 +180,12 @@ for how these are authored and regenerated.
 | [web-search-file-key.yaml](configs/openai/responses/web-search-file-key.yaml) | A variant of web-search-chat-completions.yaml that sources the shared Brave provider key from a projected FILE instead of an environment variable |
 | [web-search-scoped-credentials.yaml](configs/openai/responses/web-search-scoped-credentials.yaml) | A scoped-credentials variant of web-search-chat-completions.yaml |
 | [web-search.yaml](configs/openai/responses/web-search.yaml) | Demonstrates the `openai_web_search_dispatch` filter configuration |
+
+### OpenShell
+
+| File | Description |
+| ------ | ------------- |
+| [sandboxed-coding-clients.yaml](configs/openshell/sandboxed-coding-clients.yaml) | One host-side gateway for Codex, Claude Code, OpenCode, and pi running inside NVIDIA OpenShell sandboxes, each over its native wire API, with Codex client-tool compatibility applied to its tool payloads |
 
 ### Payload Processing
 

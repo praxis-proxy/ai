@@ -9,19 +9,29 @@ Calls an external AI guardrail provider to evaluate request and response bodies.
 
 Registered as a security filter. Pipeline validation rejects `failure_mode: open` unless `insecure_options.allow_open_security_filters` is set. `insecure_options.skip_pipeline_validation` also bypasses this check. With either option, a provider timeout or error can silently skip screening.
 
-Request `conditions:` are rejected for the same reason: a security filter must not be skipped for non-matching requests. Body hooks do not run inside a branch, so a router branch is not a substitute. A non-empty request body without a Chat Completions `messages` array fails the request with 500. Serve `/v1/responses` and `/v1/embeddings` from a listener that does not include this filter; put `ai_guardrails` only on a listener whose routes are Chat Completions.
+Request `conditions:` are rejected for the same reason: a security filter must not be skipped for non-matching requests. Body hooks do not run inside a branch, so a router branch is not a substitute. A guarded pipeline must run `ai_operation` before this filter. The operation match selects the protocol-specific extractor for request and response bodies; guardrails never classifies arbitrary JSON itself. A missing match, unsupported operation, or malformed body fails closed.
 
 Every provider callout runs through Praxis's filtered-subrequest executor. The optional `outbound_chain` adds destination-bound authentication, authorization, audit, and static service credentials; when omitted it defaults to an empty pass-through chain. Parent and child contexts stay isolated; user-scoped credential projection is handled separately in #880.
 
 Because this filter reads the request body before the header-phase security filters on the main chain run, operators should treat the pre-read body as untrusted input and configure an outbound chain whenever the provider requires destination-bound policy enforcement.
 
-**Wire format:** client request/response evaluation supports Chat Completions only (`messages` on requests, `choices[].message` on responses). `phase.tool_results` separately evaluates canonical local Responses tool results inside an IRR step. Other Responses content, Anthropic Messages, and MCP wire bodies are not supported yet (see ai#1043). For `phase.tool_results`, a provider `modified` verdict fails closed with `502 guardrail_error`; sanitized text is not forwarded because it cannot yet be safely mapped back to the canonical tool-result items. Only a `passed` verdict permits model re-entry.
+**Wire format:** client request/response evaluation dispatches from the authoritative `ai_operation` match. Chat Completions, selected OpenAI Responses operations, and selected Anthropic Messages text content are supported by the shared extractor. MCP requires its protocol filter to publish `mcp_jsonrpc` identity before it can be extracted (see ai#1043). `phase.tool_results` separately evaluates canonical local Responses tool results inside an IRR step. For `phase.tool_results`, a provider verdict that modifies text fails closed with `502 guardrail_error`; sanitized text is not forwarded because it cannot yet be safely mapped back to the canonical tool-result items. Only a `passed` verdict permits model re-entry.
 
-A provider `modified` verdict on the request rewrites each targeted user message and forwards the masked body. A request rewrite that cannot be applied is rejected with HTTP 502 so the original text is not sent upstream. On the response, each targeted choice is rebuilt from `index`, `finish_reason`, and a message containing only `role` and the masked `content`. A choice whose message has array `content`, `tool_calls`, or `function_call` cannot be redacted; the client receives the original HTTP 200 with an `evaluation_failed` error document. `on_response` drops `Content-Length` so core reframes the buffered body at its natural size.
+Visible reasoning is not yet supported by the text extractor. Responses output with non-empty reasoning `summary` or `content`, and Anthropic thinking blocks, replace the entire response with an `evaluation_failed` error document. Opaque Responses reasoning state with no visible text can accompany otherwise supported message output.
+
+Request checks retain the conversation prefix through each user turn. Response checks send each extracted assistant output separately, retaining its original index when combining verdicts and applying Chat redaction. A `modified` verdict whose content exactly equals the checked string is treated as passed because no rewrite is needed. Blocked verdicts and actual text changes keep their normal enforcement.
+
+Redaction rewriting currently supports Chat Completions wire bodies only. A provider `modified` verdict on a Chat request rewrites each targeted user message and forwards the masked body. A `modified` verdict that changes text for any other protocol is explicitly rejected before attempting a Chat rewrite. A request rewrite that cannot be applied is also rejected with HTTP 502 so the original text is not sent upstream. On a Chat response, each targeted choice is rebuilt from `index`, `finish_reason`, and a message containing only `role` and the masked `content`. A choice whose message has array `content`, `tool_calls`, or `function_call` cannot be redacted; as with other supported response protocols, the client receives the original HTTP 200 with an `evaluation_failed` error document. `on_response` drops `Content-Length` so core reframes the buffered body at its natural size.
 
 When `phase.response` is enabled, Chat Completions requests with `"stream": true` are rejected with HTTP 422 until incremental SSE response evaluation is supported (see #1108).
 
+The response phase screens only 2xx responses to requests that carried a body. Responses to bodyless requests (for example `GET /v1/models`) and non-2xx responses are forwarded unevaluated, with their original status and body, so upstream errors and management endpoints sharing the listener still reach the client.
+
 For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail configurations. When `provider.guardrails` is omitted, the request omits `config_ids` so the service can use its default configuration. Omit `provider.model` to leave the selected configuration's models unchanged; a non-empty value replaces or adds its main model.
+
+In production, set `provider.endpoint` to `https://`. Set `provider.tls.ca_file` to the PEM bundle that signed the `NeMo` server certificate. That bundle is this peer's trust store, and hostname verification stays enabled. Without it, the call uses the trust store loaded for the Praxis process.
+
+`provider.token_file` is optional. When set, Praxis reads that Kubernetes service account token at startup and sends it on the call to this `NeMo` address. The token is not on the request the outbound chain sees. Praxis adds `Authorization` after that chain runs, so a filter there cannot remove or replace it. An `http` endpoint is refused unless its host is loopback. A file that is missing, empty, or not a valid header value refuses to start. If the file later becomes unreadable, the `NeMo` call is refused and handled as a provider error: with the default `failure_mode: closed` the chat is rejected, and with `failure_mode: open` it is forwarded unscreened.
 
 ## Configuration
 
@@ -38,16 +48,22 @@ For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail configur
 ## Example
 
 ```yaml
-filter: ai_guardrails
-outbound_chain: nemo-outbound # optional
-provider:
-  type: nemo
-  endpoint: "http://nemo:8000/v1/checks"
-  guardrails:
-    config_ids: ["your-config"]
-  timeout_ms: 5000
-phase:
-  request: true
-  response: true
-  tool_results: false
+filters:
+  # Required: publishes the trusted protocol and operation identity.
+  - filter: ai_operation
+
+  - filter: ai_guardrails
+    outbound_chain: nemo-outbound # optional
+    provider:
+      type: nemo
+      endpoint: "https://nemo.default.svc:8443/v1/checks"
+      guardrails:
+        config_ids: ["your-config"]
+      tls:
+        ca_file: /var/run/secrets/nemo/ca.crt
+      timeout_ms: 5000
+    phase:
+      request: true
+      response: true
+      tool_results: false
 ```

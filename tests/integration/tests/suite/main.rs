@@ -44,6 +44,7 @@ mod claude_code;
 mod claude_code_vllm;
 #[cfg(all(feature = "openai-agentic-loop", feature = "store"))]
 mod codex_http;
+mod codex_pin;
 #[cfg(all(
     feature = "openai-agentic-loop",
     feature = "openai-compact",

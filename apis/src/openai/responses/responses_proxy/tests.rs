@@ -12,7 +12,7 @@ use praxis_filter::{
 };
 use serde_json::json;
 
-use super::super::state::{RequestReasoningPresence, ResponsesState};
+use super::super::state::ResponsesState;
 use crate::test_utils::{make_filter_context, make_request};
 
 // -----------------------------------------------------------------------------
@@ -388,23 +388,21 @@ async fn selected_rebuild_projects_state_owned_tools_and_tool_choice() {
 }
 
 #[tokio::test]
-async fn selected_rebuild_inherits_reasoning_effort_without_overwriting_live_settings() {
-    for (live_reasoning, expected) in [
-        (None, json!({"effort": "high"})),
-        (
-            Some(json!({"summary": "auto"})),
-            json!({"summary": "auto", "effort": "high"}),
-        ),
-        (
-            Some(json!({"effort": "low", "summary": "detailed"})),
-            json!({"effort": "low", "summary": "detailed"}),
-        ),
-        (Some(json!({"effort": null})), json!({"effort": null})),
-        (Some(json!(null)), json!(null)),
+async fn selected_rebuild_preserves_live_reasoning_without_injecting_state_defaults() {
+    for live_reasoning in [
+        None,
+        Some(json!({"summary": "auto"})),
+        Some(json!({"effort": "low", "summary": "detailed"})),
+        Some(json!({"effort": null})),
+        Some(json!(null)),
     ] {
         let filter = make_filter();
         let req = make_request(Method::POST, "/v1/responses");
         let mut ctx = make_filter_context(&req);
+        // State still carries the stored default the rehydrate filter already
+        // published into the live body; the rebuild must not re-apply it over
+        // whatever the live body now carries. The stored default reaches a
+        // request through rehydration, never through the rebuild.
         let mut state = ResponsesState::from_request_body(json!({
             "model": "before-filter",
             "input": "original",
@@ -412,9 +410,6 @@ async fn selected_rebuild_inherits_reasoning_effort_without_overwriting_live_set
             "reasoning": {"effort": "high", "summary": "old"}
         }));
         state.history_rehydrated = true;
-        // The request itself specified no reasoning; state carries the merged
-        // stored default, so an omitted live effort still inherits it.
-        state.request_reasoning = RequestReasoningPresence::Absent;
         ctx.extensions.insert(state);
         let mut live = json!({
             "model": "after-filter",
@@ -422,8 +417,8 @@ async fn selected_rebuild_inherits_reasoning_effort_without_overwriting_live_set
             "conversation": "conv_configuration",
             "metadata": {"changed": true}
         });
-        if let Some(reasoning) = live_reasoning {
-            live["reasoning"] = reasoning;
+        if let Some(reasoning) = &live_reasoning {
+            live["reasoning"] = reasoning.clone();
         }
         let mut body = Some(Bytes::from(serde_json::to_vec(&live).unwrap()));
         let action = filter
@@ -432,10 +427,16 @@ async fn selected_rebuild_inherits_reasoning_effort_without_overwriting_live_set
             .unwrap();
         assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
         let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-        assert_eq!(
-            rebuilt["reasoning"], expected,
-            "live effort wins; only omitted effort inherits"
-        );
+        match live_reasoning {
+            None => assert!(
+                rebuilt.get("reasoning").is_none(),
+                "absent live reasoning must stay absent; the stored default is published by rehydration, not the rebuild"
+            ),
+            Some(reasoning) => assert_eq!(
+                rebuilt["reasoning"], reasoning,
+                "live reasoning must survive byte-for-byte, including explicit nulls"
+            ),
+        }
         assert_eq!(rebuilt["model"], "after-filter", "later model edits must survive");
         assert_eq!(
             rebuilt["input"][0]["content"], "edited",
@@ -454,38 +455,33 @@ async fn selected_rebuild_inherits_reasoning_effort_without_overwriting_live_set
 
 #[tokio::test]
 async fn selected_rebuild_preserves_later_reasoning_member_removal() {
-    for request_reasoning in [
-        RequestReasoningPresence::OmittedEffort,
-        RequestReasoningPresence::ExplicitEffort,
-    ] {
-        let filter = make_filter();
-        let req = make_request(Method::POST, "/v1/responses");
-        let mut ctx = make_filter_context(&req);
-        let mut state = ResponsesState::from_request_body(json!({
-            "model": "gpt-4.1",
-            "input": "hello",
-            "conversation": "conv_configuration",
-            "reasoning": {"effort": "high"}
-        }));
-        state.history_rehydrated = true;
-        state.request_reasoning = request_reasoning;
-        ctx.extensions.insert(state);
-        // A later filter removed the reasoning member the request carried.
-        let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hello"}"#));
-        let action = filter
-            .on_selected_upstream_request_body(&mut ctx, &mut body)
-            .await
-            .unwrap();
-        assert!(
-            matches!(action, SelectedUpstreamBodyOutcome::Continue),
-            "removing the reasoning member must not reject the request"
-        );
-        let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-        assert!(
-            rebuilt.get("reasoning").is_none(),
-            "a later filter's removal of the reasoning member must stand: {request_reasoning:?}"
-        );
-    }
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "hello",
+        "conversation": "conv_configuration",
+        "reasoning": {"effort": "high"}
+    }));
+    state.history_rehydrated = true;
+    ctx.extensions.insert(state);
+    // A later filter removed the reasoning member the request carried (the
+    // rehydrate filter had already published the stored default into it).
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hello"}"#));
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "removing the reasoning member must not reject the request"
+    );
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert!(
+        rebuilt.get("reasoning").is_none(),
+        "a later filter's removal of the reasoning member must stand"
+    );
 }
 
 #[tokio::test]
@@ -502,7 +498,6 @@ async fn selected_rebuild_preserves_later_reasoning_effort_removal() {
         "reasoning": {"effort": "low", "summary": "detailed"}
     }));
     state.history_rehydrated = true;
-    state.request_reasoning = RequestReasoningPresence::ExplicitEffort;
     ctx.extensions.insert(state);
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1","input":"hello","reasoning":{"summary":"detailed"}}"#,

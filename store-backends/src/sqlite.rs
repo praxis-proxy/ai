@@ -15,7 +15,8 @@ use tracing::info;
 
 use super::{
     BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
-    PendingApprovalRecord, PoolConfig, ResponseEventRecord, ResponseRecord, ResponseStore, StoreError, SweepStats,
+    PendingApprovalRecord, PoolConfig, ResponseCasOutcome, ResponseEventRecord, ResponseRecord, ResponseStore,
+    StoreError, SweepStats,
     compression::{StoreCompressionConfig, decode, decode_bounded, decode_budgeted, decode_bytes, run_blocking},
     json_payload_charge, json_values_charge, json_values_fit,
     pool::apply_pool_config,
@@ -26,6 +27,13 @@ use super::{
         schema_version_table, sqlite_has_text_affinity, sqlite_key_column_folding,
     },
 };
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// SQLite's extended primary-key constraint code, distinct from unique indexes.
+const SQLITE_CONSTRAINT_PRIMARYKEY: &str = "1555";
 
 // -----------------------------------------------------------------------------
 // SqliteResponseStore
@@ -136,6 +144,22 @@ impl SqliteResponseStore {
     /// reload does not leak pools.
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+
+    /// Encode one response object into its stored form with the active codec.
+    async fn encode_object(&self, value: &serde_json::Value) -> Result<Vec<u8>, StoreError> {
+        let json = serde_json::to_vec(value).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let mut encoded = self.compression.encode_byte_values(&[&json]).await?.into_iter();
+        let Some(payload) = encoded.next() else {
+            return Err(StoreError::Serialization("compression returned no payload".to_owned()));
+        };
+        // With `algorithm: none` the codec hands back a borrow of `json`, so the
+        // buffer we already own is the stored form: move it rather than copying
+        // the whole object on every transition. zstd allocates its own frame.
+        Ok(match payload {
+            std::borrow::Cow::Borrowed(_) => json,
+            std::borrow::Cow::Owned(frame) => frame,
+        })
     }
 
     /// Insert or update a conversation row shared by both store traits.
@@ -551,6 +575,72 @@ impl ResponseStore for SqliteResponseStore {
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
         require_owner_preserving_write(result.rows_affected(), "response")
+    }
+
+    async fn compare_and_swap_response_object(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        expected_response_object: &serde_json::Value,
+        response_object: &serde_json::Value,
+    ) -> Result<ResponseCasOutcome, StoreError> {
+        // Encode before opening the transaction: compressing a large object is
+        // the slowest step here, and `BEGIN IMMEDIATE` would otherwise hold the
+        // write lock across it. The cost is a wasted encode when the comparison
+        // then fails, which is the rarer path.
+        let next = self.encode_object(response_object).await?;
+
+        // `BEGIN IMMEDIATE` takes the write lock up front so the read, the
+        // comparison and the update are one atomic step and cannot interleave
+        // with a competing claimant.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        let select = format!(
+            "SELECT response_object FROM {} \
+             WHERE id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            self.tables.responses
+        );
+        let row = sqlx::query(AssertSqlSafe(select.as_str()))
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        // Owner-scoped, so another principal's record is indistinguishable
+        // from a missing one. Dropping the transaction rolls it back.
+        let Some(row) = row else {
+            return Ok(ResponseCasOutcome::NotFound);
+        };
+        let stored_bytes: Vec<u8> = row
+            .try_get("response_object")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let stored = run_blocking(move || decode(&stored_bytes)).await?;
+        if &stored != expected_response_object {
+            return Ok(ResponseCasOutcome::Mismatch);
+        }
+
+        let update = format!(
+            "UPDATE {} SET response_object = ? \
+             WHERE id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            self.tables.responses
+        );
+        sqlx::query(AssertSqlSafe(update.as_str()))
+            .bind(&next)
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(ResponseCasOutcome::Applied)
     }
 
     async fn get_response(&self, owner: &StateOwner, id: &str) -> Result<Option<ResponseRecord>, StoreError> {
@@ -2353,7 +2443,18 @@ async fn sqlite_create_items_and_sync(
             .bind(position)
             .execute(&mut **tx)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|error| {
+                // This table's primary key is the owner-scoped item ID. Position
+                // conflicts use a separate unique index and remain database errors.
+                if error
+                    .as_database_error()
+                    .is_some_and(|database| database.code().as_deref() == Some(SQLITE_CONSTRAINT_PRIMARYKEY))
+                {
+                    StoreError::InvalidInput(format!("conversation item '{}' already exists", item.item_id))
+                } else {
+                    StoreError::Database(error.to_string())
+                }
+            })?;
     }
 
     sqlite_invalidate_messages(tx, conv_table, owner, conversation_id).await
@@ -2394,9 +2495,10 @@ async fn sqlite_delete_item_and_sync(
     Ok(true)
 }
 
-/// Clear the retired cache in the mutation transaction, including after the last
-/// item is deleted so old cached rows cannot reappear. The affected-row check
-/// preserves rollback when the parent disappears before mutation.
+/// Clear a stale array in the mutation transaction, including after the last
+/// item is deleted so old cached rows cannot reappear. The caller checked the
+/// parent under `BEGIN IMMEDIATE`; skip the write when the cache is already
+/// empty or holds the preserved legacy prefix.
 async fn sqlite_invalidate_messages(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     conv_table: &str,
@@ -2404,10 +2506,11 @@ async fn sqlite_invalidate_messages(
     conversation_id: &str,
 ) -> Result<(), StoreError> {
     let update_sql = format!(
-        "UPDATE {conv_table} SET messages = CASE WHEN substr(messages, 1, 19) = '{{\"legacy_messages\":' THEN messages ELSE '[]' END \
-         WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?"
+        "UPDATE {conv_table} SET messages = '[]' \
+         WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ? \
+         AND (messages IS NULL OR (messages <> '[]' AND substr(messages, 1, 19) <> '{{\"legacy_messages\":'))"
     );
-    let updated = sqlx::query(AssertSqlSafe(update_sql.as_str()))
+    sqlx::query(AssertSqlSafe(update_sql.as_str()))
         .bind(conversation_id)
         .bind(owner.tenant_id())
         .bind(owner.issuer())
@@ -2415,12 +2518,6 @@ async fn sqlite_invalidate_messages(
         .execute(&mut **tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
-
-    if updated.rows_affected() == 0 {
-        return Err(StoreError::Database(format!(
-            "conversation disappeared during message sync: {conversation_id}"
-        )));
-    }
 
     Ok(())
 }
@@ -2744,6 +2841,62 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "one cache-state matrix observes row updates")]
+    async fn invalidation_updates_only_stale_or_null_caches() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let owner = StateOwner::from_trusted_parts("tenant", "issuer", "subject").unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "CREATE TEMP TABLE nullable_conversations AS SELECT 'c' AS conversation_id, \
+             'tenant' AS tenant_id, 'issuer' AS owner_issuer, 'subject' AS owner_subject, \
+             CAST(NULL AS TEXT) AS messages",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        for (cache, expected, writes) in [
+            (None, "[]", 1),
+            (Some("[]"), "[]", 0),
+            (Some("{\"legacy_messages\":[]}"), "{\"legacy_messages\":[]}", 0),
+            (Some("[1]"), "[]", 1),
+        ] {
+            sqlx::query(
+                "UPDATE nullable_conversations SET messages = ? \
+                 WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            )
+            .bind(cache)
+            .bind("c")
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlite_invalidate_messages(&mut tx, "nullable_conversations", &owner, "c")
+                .await
+                .unwrap();
+            let changed: i64 = sqlx::query_scalar("SELECT changes()")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            assert_eq!(changed, writes, "cache: {cache:?}");
+            let messages: Option<String> = sqlx::query_scalar(
+                "SELECT messages FROM nullable_conversations \
+                 WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            )
+            .bind("c")
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            assert_eq!(messages.as_deref(), Some(expected));
+        }
+    }
+
+    #[tokio::test]
     async fn history_read_cancellation_releases_partial_progress() {
         tokio::time::timeout(std::time::Duration::from_secs(10), history_read_cleanup(true))
             .await
@@ -2820,7 +2973,6 @@ mod tests {
         assert!(store.delete_item_and_sync_messages(&owner, "c", "old").await.unwrap());
         assert_eq!(store.conversation_history(&owner, "c").await.unwrap(), Some(vec![]));
     }
-
 
     #[tokio::test]
     #[expect(

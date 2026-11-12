@@ -119,10 +119,9 @@ impl A2aFilter {
         let max_body_bytes = validated_config.max_body_bytes;
         let json_rpc_config = build_json_rpc_config(max_body_bytes);
 
-        let task_route_store = validated_config
-            .task_routing
-            .enabled
-            .then(|| Arc::new(LocalTaskRouteStore::new()));
+        let task_route_store = (validated_config.task_routing.enabled
+            && matches!(validated_config.task_routing.store, Some(config::TaskRouteStore::Local)))
+        .then(|| Arc::new(LocalTaskRouteStore::new()));
 
         Ok(Box::new(Self {
             config: validated_config,

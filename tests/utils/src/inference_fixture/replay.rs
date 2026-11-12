@@ -444,6 +444,8 @@ const REPLAY_CONTAINED_FILTERS: &[&str] = &[
     "openai_responses_proxy",
     "path_rewrite",
     "openai_responses_request",
+    // Inline document decoding has no network or filesystem access.
+    "openai_doc_extract",
     "openai_client_tool_compat",
     "state_owner",
     "openai_responses_store",
@@ -3046,6 +3048,9 @@ mod tests {
             "      - filter: openai_responses_request\n        initialize_state: false\n      - filter: openai_responses_request\n        on_invalid: reject\n      - filter: state_owner\n        mode: single_tenant\n        tenant_id: default\n      - filter: openai_responses_store\n      - filter: openai_responses_rehydrate\n      - filter: openai_stream_events\n      - filter: openai_responses_to_chat_completions\n      - filter: openai_chat_completions_to_azureai_chat_completions\n      - filter: openai_chat_completions_to_vertexai_gemini\n      - filter: path_rewrite\n      - filter: router\n      - filter: load_balancer\n",
         );
         validate_replay_filters(&safe_config).expect("known safe filters must remain replayable");
+        let inline_documents = Config::from_yaml(&replay_config_source("openai/responses/doc-extract-inline.yaml"))
+            .expect("inline document example must parse");
+        validate_replay_filters(&inline_documents).expect("inline document extraction must be replay-contained");
 
         for filters in [
             "      - filter: external_callout\n",

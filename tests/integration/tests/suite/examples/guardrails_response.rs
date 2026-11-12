@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, BackendGuard, StatefulCapturingBackend, free_port, http_post, start_backend_with_shutdown,
-    start_capturing_backend, start_proxy,
+    Backend, BackendGuard, StatefulCapturingBackend, free_port, http_get, http_post, start_backend_with_shutdown,
+    start_body_aware_backend, start_capturing_backend, start_proxy,
 };
 
 use super::load_example_config;
@@ -53,6 +53,14 @@ fn chat_backend(content: &str) -> BackendGuard {
         .start_with_shutdown()
 }
 
+/// Start a mock upstream that returns a protocol-native JSON response.
+fn json_backend(body: &str) -> BackendGuard {
+    Backend::status(200, body)
+        .header("Content-Type", "application/json")
+        .start_with_shutdown()
+}
+
+/// Load `nemo-guardrails-response.yaml` with its listener and NeMo ports patched.
 fn load_response_config(proxy_port: u16, backend_port: u16, nemo_port: u16) -> praxis_core::config::Config {
     load_example_config(
         "nemo-guardrails-response.yaml",
@@ -108,6 +116,215 @@ fn response_guardrails_pass_forwards_upstream_body() {
         Some("Hello! I'm doing well."),
         "upstream Chat Completion body should reach the client unchanged"
     );
+}
+
+/// A native Responses request preserves its operation identity through the
+/// example pipeline, so the output body is extracted and checked by NeMo.
+#[test]
+fn response_guardrails_extracts_openai_responses_output() {
+    let upstream = r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello from Responses"}]}]}"#;
+    let backend = json_backend(upstream);
+    let nemo = start_capturing_backend(r#"{"status":"passed","content":"Hello from Responses"}"#);
+    let proxy_port = free_port();
+    let config = load_response_config(proxy_port, backend.port(), nemo.port());
+    let proxy = start_proxy(&config);
+
+    let (status, body) = http_post(proxy.addr(), "/v1/responses", r#"{"model":"test","input":"Hello"}"#);
+
+    assert_eq!(status, 200, "Responses output should pass when NeMo passes it");
+    assert_eq!(
+        body, upstream,
+        "the native upstream response should reach the client unchanged"
+    );
+    let payload: serde_json::Value = serde_json::from_str(&nemo.body()).unwrap();
+    assert_eq!(
+        payload["messages"],
+        serde_json::json!([{"role":"assistant","content":"Hello from Responses"}]),
+        "the Responses output extractor must send assistant text to NeMo"
+    );
+}
+
+/// Build two independent response outputs in the selected native format.
+fn multiple_output_body(path: &str, second: &str) -> String {
+    if path == "/v1/chat/completions" {
+        serde_json::json!({"choices":[
+            {"index":0,"message":{"role":"assistant","content":"safe"},"finish_reason":"stop"},
+            {"index":1,"message":{"role":"assistant","content":second},"finish_reason":"stop"}
+        ]})
+        .to_string()
+    } else {
+        serde_json::json!({"output":[
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"safe"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":second}]}
+        ]})
+        .to_string()
+    }
+}
+
+/// Match output verdicts by payload, independently of concurrent arrival order.
+fn isolated_output_nemo() -> praxis_test_utils::StatefulCapturingGuard {
+    start_body_aware_backend(|body| {
+        let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+        let messages = payload
+            .get("messages")
+            .and_then(|messages| messages.as_array())
+            .unwrap();
+        assert_eq!(messages.len(), 1, "each response output must be screened in isolation");
+        let content = messages.first().and_then(|message| message.get("content")).unwrap();
+        let status = if content.as_str() == Some("harmful") {
+            "blocked"
+        } else {
+            "passed"
+        };
+        (
+            200,
+            serde_json::json!({"status":status,"content":content,"rail":"toxicity"}).to_string(),
+        )
+    })
+}
+
+/// Both safe and harmful later outputs must receive their own NeMo check.
+#[test]
+fn response_guardrails_isolates_each_output_and_honors_later_blocks() {
+    for (path, input) in [
+        (
+            "/v1/chat/completions",
+            r#"{"model":"test","messages":[{"role":"user","content":"Hello"}]}"#,
+        ),
+        ("/v1/responses", r#"{"model":"test","input":"Hello"}"#),
+    ] {
+        for second in ["second safe", "harmful"] {
+            let upstream = multiple_output_body(path, second);
+            let backend = json_backend(&upstream);
+            let nemo = isolated_output_nemo();
+            let config = load_response_config(free_port(), backend.port(), nemo.port());
+            let proxy = start_proxy(&config);
+            let (status, body) = http_post(proxy.addr(), path, input);
+            assert_eq!(status, 200, "response headers are already committed: {body}");
+            if second == "harmful" {
+                let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(
+                    error.pointer("/error/code").and_then(|value| value.as_str()),
+                    Some("content_blocked"),
+                    "a harmful later output must block the response"
+                );
+                assert!(!body.contains("harmful"), "blocked output must not reach the client");
+            } else {
+                assert_eq!(body, upstream, "every safe output must be forwarded unchanged");
+            }
+            assert_eq!(nemo.requests().len(), 2, "both assistant outputs must be evaluated");
+        }
+    }
+}
+
+/// A native Anthropic request preserves its operation identity through the
+/// example pipeline, so the output body is extracted and checked by NeMo.
+#[test]
+fn response_guardrails_extracts_anthropic_messages_output() {
+    let upstream = r#"{"role":"assistant","content":[{"type":"text","text":"Hello from Anthropic"}]}"#;
+    let backend = json_backend(upstream);
+    let nemo = start_capturing_backend(r#"{"status":"passed","content":"Hello from Anthropic"}"#);
+    let proxy_port = free_port();
+    let config = load_response_config(proxy_port, backend.port(), nemo.port());
+    let proxy = start_proxy(&config);
+
+    let (status, body) = http_post(
+        proxy.addr(),
+        "/v1/messages",
+        r#"{"model":"test","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}"#,
+    );
+
+    assert_eq!(status, 200, "Anthropic output should pass when NeMo passes it");
+    assert_eq!(
+        body, upstream,
+        "the native upstream response should reach the client unchanged"
+    );
+    let payload: serde_json::Value = serde_json::from_str(&nemo.body()).unwrap();
+    assert_eq!(
+        payload["messages"],
+        serde_json::json!([{"role":"assistant","content":"Hello from Anthropic"}]),
+        "the Anthropic output extractor must send assistant text to NeMo"
+    );
+}
+
+/// Unsupported response rewrites replace the entire body, even when it also contains Chat-shaped data.
+#[test]
+fn response_guardrails_rejects_non_chat_redaction() {
+    for (path, input, upstream) in [
+        (
+            "/v1/responses",
+            r#"{"model":"test","input":"Hello"}"#,
+            r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"secret output"}]}],"choices":[{"index":0,"message":{"role":"assistant","content":"decoy"}}]}"#,
+        ),
+        (
+            "/v1/messages",
+            r#"{"model":"test","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}"#,
+            r#"{"role":"assistant","content":[{"type":"text","text":"secret output"}],"choices":[{"index":0,"message":{"role":"assistant","content":"decoy"}}]}"#,
+        ),
+    ] {
+        let backend = json_backend(upstream);
+        let nemo = start_body_aware_backend(|_| {
+            (
+                200,
+                r#"{"status":"modified","content":"masked","rail":"pii"}"#.to_owned(),
+            )
+        });
+        let config = load_response_config(free_port(), backend.port(), nemo.port());
+        let proxy = start_proxy(&config);
+        let (status, body) = http_post(proxy.addr(), path, input);
+        assert_eq!(status, 200, "response headers are already committed: {body}");
+        let error: serde_json::Value = serde_json::from_str(&body).expect("replacement should be JSON");
+        assert_eq!(
+            error.pointer("/error/code").and_then(|code| code.as_str()),
+            Some("evaluation_failed")
+        );
+        assert!(
+            !body.contains("secret"),
+            "original {path} output must not reach the client"
+        );
+        assert_eq!(
+            nemo.requests().len(),
+            1,
+            "the native response must reach NeMo before rejecting its rewrite"
+        );
+    }
+}
+
+/// Visible reasoning cannot accompany an otherwise screenable answer until it has a screening policy.
+#[test]
+fn response_guardrails_rejects_visible_reasoning_without_calling_nemo() {
+    for (path, input, upstream) in [
+        (
+            "/v1/responses",
+            r#"{"model":"test","input":"Hello"}"#,
+            r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"safe"}]},{"type":"reasoning","summary":[{"type":"summary_text","text":"secret summary"}]}]}"#,
+        ),
+        (
+            "/v1/messages",
+            r#"{"model":"test","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}"#,
+            r#"{"role":"assistant","content":[{"type":"text","text":"safe"},{"type":"thinking","thinking":"secret reasoning","signature":"opaque"}]}"#,
+        ),
+    ] {
+        let backend = json_backend(upstream);
+        let nemo = start_body_aware_backend(|_| (200, r#"{"status":"passed","content":"safe"}"#.to_owned()));
+        let config = load_response_config(free_port(), backend.port(), nemo.port());
+        let proxy = start_proxy(&config);
+        let (status, body) = http_post(proxy.addr(), path, input);
+        assert_eq!(status, 200, "response headers are already committed: {body}");
+        let error: serde_json::Value = serde_json::from_str(&body).expect("replacement should be JSON");
+        assert_eq!(
+            error.pointer("/error/code").and_then(|code| code.as_str()),
+            Some("evaluation_failed")
+        );
+        assert!(
+            !body.contains("secret"),
+            "visible {path} reasoning must not reach the client"
+        );
+        assert!(
+            nemo.requests().is_empty(),
+            "an incomplete extraction must not be submitted to NeMo"
+        );
+    }
 }
 
 /// NeMo returns `"blocked"` for the upstream response - the body is replaced
@@ -257,6 +474,58 @@ fn response_guardrails_non_chat_body_replaces_body() {
     assert!(
         body.contains(r#""error""#),
         "body should be replaced with an error payload; got: {body}"
+    );
+}
+
+/// A bodyless request cannot carry a prompt, so its response is not model
+/// output: a model list on the same listener reaches the client unchanged and
+/// `NeMo` is never called.
+#[test]
+fn response_guardrails_bodyless_request_forwards_upstream_body() {
+    let models = r#"{"object":"list","data":[{"id":"test-model","object":"model"}]}"#;
+    let backend = Backend::status(200, models)
+        .header("Content-Type", "application/json")
+        .start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"blocked","content":"x"}"#.to_owned())])
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = load_response_config(proxy_port, backend.port(), nemo.port());
+    let proxy = start_proxy(&config);
+
+    let (status, body) = http_get(proxy.addr(), "/v1/models", None);
+
+    assert_eq!(status, 200);
+    assert_eq!(body, models, "a model list must reach the client unchanged");
+    assert!(
+        nemo.requests().iter().all(|r| r.method != "POST"),
+        "NeMo must not be called for a bodyless request"
+    );
+}
+
+/// An upstream error is a diagnostic, not a completion: its status and body
+/// reach the client unchanged and `NeMo` is never called.
+#[test]
+fn response_guardrails_upstream_error_is_forwarded() {
+    let backend = Backend::status(401, "Unauthorized")
+        .header("Content-Type", "text/plain")
+        .start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"blocked","content":"x"}"#.to_owned())])
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = load_response_config(proxy_port, backend.port(), nemo.port());
+    let proxy = start_proxy(&config);
+
+    let (status, body) = http_post(
+        proxy.addr(),
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"Hello"}]}"#,
+    );
+
+    assert_eq!(status, 401, "the upstream status must reach the client");
+    assert_eq!(body, "Unauthorized", "the upstream error body must reach the client");
+    assert!(
+        nemo.requests().iter().all(|r| r.method != "POST"),
+        "NeMo must not be called for an upstream error"
     );
 }
 

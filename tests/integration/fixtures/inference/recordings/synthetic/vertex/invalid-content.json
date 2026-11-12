@@ -84,6 +84,77 @@
       }
     },
     {
+      "name": "non-string-assistant-text-part",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "synthetic-vertex-model",
+              "messages": [
+                {
+                  "role": "assistant",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": null
+                    }
+                  ]
+                },
+                {
+                  "role": "user",
+                  "content": "continue"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "message": "assistant text part is missing `text`",
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    },
+    {
       "name": "text-metadata-response",
       "client": {
         "request": {

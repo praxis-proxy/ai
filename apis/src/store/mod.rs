@@ -39,8 +39,9 @@ use praxis_ai_store::StoreRegistry;
 // keeps its former name here.
 pub use praxis_ai_store::{
     BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
-    OwnerScopedStore as OwnerScopedResponseStore, PendingApprovalRecord, PersistedStateBackend, ResponseEventRecord,
-    ResponseRecord, ResponseStore, StoreError, json_payload_charge, json_values_charge, json_values_fit,
+    OwnerScopedStore as OwnerScopedResponseStore, PendingApprovalRecord, PersistedStateBackend, ResponseCasOutcome,
+    ResponseEventRecord, ResponseRecord, ResponseStore, StoreError, json_payload_charge, json_values_charge,
+    json_values_fit,
 };
 // TLS mode and compression config live in the SQL-free contract crate,
 // re-exported here at their old paths.

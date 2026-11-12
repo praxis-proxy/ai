@@ -35,7 +35,9 @@ import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, ClassVar
+from unittest.mock import Mock
 from urllib.parse import urlparse
 
 import httpx
@@ -58,6 +60,13 @@ from openai.types.responses import ResponseCustomToolCall
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-0.6B")
 VLLM_TEST_BACKEND = os.environ.get("VLLM_TEST_BACKEND", "live")
+
+# The pinned Codex apply_patch grammar, read from the same vendored file the compat
+# filter recognizes so the SDK declares the exact grammar the backend constrains.
+APPLY_PATCH_GRAMMAR = (
+    Path(__file__).resolve().parents[4]
+    / "apis/src/openai/responses/openai_client_tool_compat/apply_patch.lark"
+).read_text()
 OGX_BASE_URL = os.environ.get("OGX_BASE_URL", "http://127.0.0.1:8321")
 PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -288,6 +297,7 @@ def _write_full_flow_config(
     tool_admission: str | None = None,
     require_connector: bool | None = None,
     mcp_minimum_approval: str | None = None,
+    max_retained_bytes: int | None = None,
 ) -> str:
     """Patch the shared full-flow example for live or recording backends."""
     resolved_backend = backend_endpoint or _vllm_endpoint()
@@ -438,6 +448,12 @@ def _write_full_flow_config(
         config = config.replace(
             anchor,
             anchor + f"                minimum_approval: {mcp_minimum_approval}\n",
+        )
+    if max_retained_bytes is not None:
+        anchor = "                max_infer_iters: 7\n"
+        assert config.count(anchor) == 1, config
+        config = config.replace(
+            anchor, anchor + f"                max_retained_bytes: {max_retained_bytes}\n"
         )
     if compression:
         config = _enable_response_store_compression(config)
@@ -663,6 +679,8 @@ class MCPHandler(BaseHTTPRequestHandler):
 
     authorization_headers: ClassVar[list[str | None]] = []
     assertion_headers: ClassVar[list[str | None]] = []
+    # Attached as ``structuredContent`` to text tool results when set.
+    structured_content: ClassVar[dict | None] = None
 
     _request_count = 0
     _request_count_lock = threading.Lock()
@@ -775,9 +793,10 @@ class MCPHandler(BaseHTTPRequestHandler):
                     if tool_name == "get_time"
                     else f"72F and sunny in {city}"
                 )
-                self._json_rpc(
-                    rid, {"content": [{"type": "text", "text": result}]}
-                )
+                tool_result = {"content": [{"type": "text", "text": result}]}
+                if self.structured_content is not None:
+                    tool_result["structuredContent"] = self.structured_content
+                self._json_rpc(rid, tool_result)
         elif method == "ping":
             self._json_rpc(rid, {})
         else:
@@ -819,6 +838,11 @@ class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
     the advertised ``inputSchema`` before any outbound ``tools/call``.
     """
 
+    # ``city`` must be a string per the advertised schema; a number violates it,
+    # so the gateway rejects it before dispatch.
+    call_arguments: ClassVar[dict] = {"city": 42}
+    final_text: ClassVar[str] = "I passed the wrong type; let me correct it."
+
     @staticmethod
     def _encoded_get_weather(request_body: dict) -> str:
         """Find the function tool the resolver advertised for ``get_weather``."""
@@ -851,12 +875,7 @@ class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
                     "type": "message",
                     "status": "completed",
                     "role": "assistant",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": "I passed the wrong type; let me correct it.",
-                        }
-                    ],
+                    "content": [{"type": "output_text", "text": self.final_text}],
                 }
             ]
         else:
@@ -866,9 +885,7 @@ class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
                     "type": "function_call",
                     "call_id": "call_mcp_invalid_1",
                     "name": self._encoded_get_weather(request_body),
-                    # ``city`` must be a string per the advertised schema; a number
-                    # violates it, so the gateway rejects it before dispatch.
-                    "arguments": json.dumps({"city": 42}),
+                    "arguments": json.dumps(self.call_arguments),
                     "status": "completed",
                 }
             ]
@@ -892,6 +909,36 @@ class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         pass
+
+
+class StructuredMCPHandler(MCPHandler):
+    """MCP mock whose text tool results carry a Kubernetes-shaped
+    ``structuredContent`` of ~5 KiB and ~550 JSON nodes (issue #1847)."""
+
+    structured_content: ClassVar[dict | None] = {
+        "kind": "Deployment",
+        "containers": [
+            {
+                "name": f"container-{i}",
+                "image": "quay.io/example/app:v1",
+                "ready": True,
+                "restarts": 0,
+            }
+            for i in range(60)
+        ],
+    }
+
+
+class McpStructuredResultBackendHandler(McpInvalidArgsBackendHandler):
+    """Scripts one valid ``get_weather`` call, then a final message."""
+
+    call_arguments: ClassVar[dict] = {"city": "Paris"}
+    final_text: ClassVar[str] = "done"
+    request_count = 0
+
+    def do_POST(self):
+        type(self).request_count += 1
+        super().do_POST()
 
 
 class BraveSearchHandler(BaseHTTPRequestHandler):
@@ -1125,8 +1172,12 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
         if request_body and request_body.get("background") is True:
             self._send_background_response(request_body)
             return
-        if request_body and request_body.get("prompt") is not None:
-            self._send_prompt_response(request_body)
+        if request_body and (
+            request_body.get("prompt") is not None
+            or "access_programs" in request_body
+            or any(tool.get("type") == "code_interpreter" for tool in (request_body.get("tools") or []))
+        ):
+            self._send_provider_owned_response(request_body)
             return
         if request_body and request_body.get("model") in {
             "sdk-conversation-stream",
@@ -1207,8 +1258,8 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
         self.wfile.flush()
 
-    def _send_prompt_response(self, request_body):
-        """Serve an OpenAI-owned prompt-template response."""
+    def _send_provider_owned_response(self, request_body):
+        """Serve a deterministic response for OpenAI-owned capabilities."""
         response = {
             "id": f"resp_sdk_prompt_{time.time_ns()}",
             "object": "response",
@@ -2296,7 +2347,13 @@ def provider_compaction_client(tmp_path_factory, request):
         os.unlink(config_path)
 
 
-def _reasoning_capture_session(tmp_path_factory, request):
+def _reasoning_capture_session(
+    tmp_path_factory,
+    request,
+    *,
+    pre_routing_filter=True,
+    reasoning_dialect=None,
+):
     """Start the reasoning example with a capturing mock Chat backend.
 
     Yields ``(client, captured_bodies)`` where ``captured_bodies`` accumulates
@@ -2325,13 +2382,46 @@ def _reasoning_capture_session(tmp_path_factory, request):
     # openai_responses_to_chat_completions (so the "agentic" param needs no extra
     # wiring). Map that param onto the vLLM dialect; "none" disables it.
     param = getattr(request, "param", "vllm")
+    dialect = reasoning_dialect or ("vllm" if param == "agentic" else param)
     config_path = _write_full_flow_config(
         port,
         db_path,
         backend_endpoint=f"127.0.0.1:{backend_port}",
         chat_translation_model=VLLM_MODEL,
-        reasoning_dialect="vllm" if param == "agentic" else param,
+        reasoning_dialect=dialect,
     )
+    if not pre_routing_filter:
+        with open(config_path) as config_file:
+            config = config_file.read()
+        pre_routing_request_filter = (
+            "      - filter: openai_responses_request\n"
+            "        initialize_state: false\n"
+            "        on_invalid: continue\n"
+            "        headers:\n"
+            "          format: x-praxis-ai-format\n"
+            "          model: x-praxis-ai-model\n"
+            "          stream: x-praxis-ai-stream\n"
+            "          mode: x-praxis-responses-mode\n"
+        )
+        assert config.count(pre_routing_request_filter) == 1, config
+        config = config.replace(pre_routing_request_filter, "", 1)
+        # Without the pre-routing classifier, bind this isolated integration
+        # lane to its mock Chat backend by path so the managed request filter
+        # can be exercised independently.
+        route_marker = (
+            '          - path_prefix: "/v1/vector_stores"\n'
+            '            cluster: "vector-stores-backend"\n'
+        )
+        assert config.count(route_marker) == 1, config
+        config = config.replace(
+            route_marker,
+            '          - path: "/v1/responses"\n'
+            '            cluster: "chat-completions-backend"\n'
+            + route_marker,
+            1,
+        )
+        with open(config_path, "w") as config_file:
+            config_file.write(config)
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -2371,6 +2461,17 @@ def _reasoning_capture_session(tmp_path_factory, request):
 def reasoning_capture_client(tmp_path_factory, request):
     """Function-scoped reasoning proxy with a capturing mock Chat backend."""
     yield from _reasoning_capture_session(tmp_path_factory, request)
+
+
+@pytest.fixture()
+def code_interpreter_capture_client(tmp_path_factory, request):
+    """Capture managed SDK requests with or without a preceding facts-only pass."""
+    yield from _reasoning_capture_session(
+        tmp_path_factory,
+        request,
+        pre_routing_filter=request.param == "two-phase",
+        reasoning_dialect="vllm",
+    )
 
 
 @pytest.fixture(scope="session")
@@ -2486,6 +2587,87 @@ def web_search_chat_streaming_client(web_search_chat_streaming_proxy):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "code_interpreter_capture_client",
+    ["two-phase", "managed"],
+    indirect=True,
+    ids=["pre-routing-and-managed", "managed-only"],
+)
+@pytest.mark.parametrize("stream", [False, True], ids=["finite", "streaming"])
+def test_code_interpreter_is_rejected_before_backend_contact(
+    code_interpreter_capture_client, stream
+):
+    """Managed requests reject unsupported tools with either request-filter layout."""
+    client, forwarded = code_interpreter_capture_client
+
+    with pytest.raises(BadRequestError) as error:
+        client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="Compute 1 + 1.",
+            store=False,
+            stream=stream,
+            tools=[{"type": "code_interpreter", "container": {"type": "auto"}}],
+        )
+
+    assert error.value.status_code == 400, "unsupported tools must return a client error"
+    error_body = error.value.response.json()["error"]
+    assert error_body["type"] == "invalid_request_error", (
+        "unsupported tools must use the OpenAI invalid-request error type"
+    )
+    assert error_body["code"] == "invalid_request_error", (
+        "unsupported tools must use the same error code as Chat Completions translation"
+    )
+    assert error_body["message"] == "The code_interpreter tool is not supported by this gateway.", (
+        "the request filter must identify the tool the gateway cannot execute"
+    )
+    assert forwarded == [], "rejected Code Interpreter requests must not reach the backend"
+
+    response = client.responses.create(
+        model=CHAT_TRANSLATION_MODEL,
+        input="Answer directly.",
+        store=False,
+        tools=[
+            {
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+        tool_choice="none",
+    )
+    assert response.status == "completed", "supported client function tools must remain accepted"
+    assert len(forwarded) == 1, "only the supported-tool request must reach the backend"
+    assert forwarded[0]["tools"][0]["function"]["name"] == "lookup", (
+        "the supported function tool must be preserved in the backend request"
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["finite", "streaming"])
+def test_openai_bound_code_interpreter_is_forwarded_unchanged(witness_backend_client, stream):
+    """Direct OpenAI routes preserve Code Interpreter through the stock full-flow pipeline."""
+    client, forwarded = witness_backend_client
+    request_body = {
+        "model": "gpt-5",
+        "input": "Compute 1 + 1.",
+        "store": False,
+        "stream": stream,
+        "tools": [{"type": "code_interpreter", "container": {"type": "auto"}}],
+    }
+
+    response = client.responses.create(**request_body)
+    if stream:
+        events = list(response)
+        assert [event.type for event in events] == ["response.created", "response.completed"], (
+            "direct OpenAI streams must retain the provider's response lifecycle"
+        )
+        response = events[-1].response
+
+    assert response.status == "completed", "direct OpenAI requests must receive the provider's response"
+    assert forwarded == [request_body], (
+        "the direct OpenAI route must forward the complete Code Interpreter request unchanged"
+    )
 
 
 class TestOpenAIResponsesStoreCompression:
@@ -4066,6 +4248,19 @@ class TestOpenAIResponsesVLLM:
             "type": "invalid_request_error",
         }, "error envelope must report background mode is unsupported"
 
+    @pytest.mark.parametrize("selection", [{}, {"cyber": "daybreak_blue"}])
+    def test_access_programs_native_passthrough(self, witness_backend_client, selection):
+        client, forwarded = witness_backend_client
+        response = client.responses.create(
+            model="gpt-5",
+            input="SDK access programs passthrough",
+            store=False,
+            extra_body={"access_programs": selection},
+        )
+        assert response.status == "completed"
+        assert len(forwarded) == 1
+        assert forwarded[0]["access_programs"] == selection
+
     def test_openai_bound_background_create_and_stream(self, witness_backend_client):
         """The stock full-flow pipeline preserves OpenAI-owned background creates."""
         client, forwarded = witness_backend_client
@@ -5126,11 +5321,40 @@ class TestResponsesToChatCompletionsVLLM:
     # pipeline, not native Responses passthrough, so it measures the contract
     # owned by the translation filter.
 
+    @pytest.mark.parametrize(
+        "selection",
+        [
+            {},
+            {"cyber": "standard"},
+            {"cyber": "daybreak_blue"},
+            {"cyber": "daybreak_red"},
+            None,
+        ],
+    )
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_access_programs_is_rejected_before_chat_backend(
+        self, reasoning_capture_client, selection, stream
+    ):
+        client, forwarded = reasoning_capture_client
+        with pytest.raises(BadRequestError) as exc_info:
+            client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input="hello",
+                store=False,
+                stream=stream,
+                extra_body={"access_programs": selection},
+            )
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.body["type"] == "invalid_request_error"
+        assert exc_info.value.body["code"] == "invalid_request_error"
+        assert "access_programs" in exc_info.value.body["message"]
+        assert not forwarded
+
     def test_shared_controls_reach_chat_backend(self, reasoning_capture_client):
         """The SDK request's provider controls survive the checked-in pipeline."""
         client, forwarded = reasoning_capture_client
 
-        response = client.responses.create(
+        raw_response = client.responses.with_raw_response.create(
             model=CHAT_TRANSLATION_MODEL,
             input=[
                 {
@@ -5156,7 +5380,10 @@ class TestResponsesToChatCompletionsVLLM:
             },
         )
 
+        assert json.loads(raw_response.text).get("access_programs", "missing") is None
+        response = raw_response.parse()
         assert response.status == "completed"
+        assert response.access_programs is None
         assert (
             response.safety_identifier == "tenant-user"
         ), "safety_identifier echoed back"
@@ -6476,6 +6703,70 @@ class TestClientToolCompatVLLM:
         # Request phase echo: the client sees its original ``custom`` tool back.
         assert any(t.type == "custom" for t in response.tools), response.tools
 
+    @requires_vllm_compat
+    def test_apply_patch_grammar_tool_round_trip_constrains_and_restores(
+        self, client_tool_compat_client
+    ):
+        """#1834: a ``custom`` tool declaring the pinned Codex apply_patch Lark
+        grammar is lowered to a private ``function`` whose ``input`` carries a
+        JSON-Schema pattern; constrained decoding on vLLM emits a grammar-valid
+        patch, and the returned call is restored to a ``custom_tool_call`` whose
+        ``input`` is that patch. This is the live end-to-end proof that the pattern
+        actually constrains generation on the pinned runtime — distinct from the
+        ``exec_command`` coding workflow."""
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the apply_patch tool to add a file named hello.txt "
+                "containing the single line: hello world. Do not answer directly. "
+                "/no_think"
+            ),
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                    "format": {
+                        "type": "grammar",
+                        "syntax": "lark",
+                        "definition": APPLY_PATCH_GRAMMAR,
+                    },
+                }
+            ],
+            # Force the call so the small CI model is deterministic; the compat
+            # filter lowers this custom selector to a function selector for vLLM.
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status == "completed", response
+        custom_calls = [
+            item for item in response.output if item.type == "custom_tool_call"
+        ]
+        assert len(custom_calls) >= 1, (
+            "compat filter must restore the function_call to a custom_tool_call; "
+            f"got output types: {[i.type for i in response.output]}"
+        )
+        call = custom_calls[0]
+        assert call.name == "apply_patch"
+        assert isinstance(call.input, str)
+        # The grammar constrained generation to an actual patch envelope.
+        assert call.input.startswith("*** Begin Patch"), (
+            f"the pattern must constrain generation to a patch: {call.input!r}"
+        )
+        assert "*** End Patch" in call.input, (
+            f"the restored input must be a complete patch: {call.input!r}"
+        )
+        # No un-restored private function_call may leak to the client.
+        assert all(item.type != "function_call" for item in response.output), (
+            f"lowered function must not leak: {[i.type for i in response.output]}"
+        )
+        # The client sees its original grammar declaration echoed back.
+        echoed = [t for t in response.tools if t.type == "custom"]
+        assert echoed, f"the original custom grammar tool must be echoed: {response.tools}"
+
     def test_shell_tool_round_trip_lowers_and_restores(
         self, client_tool_compat_client
     ):
@@ -7209,6 +7500,96 @@ def test_mcp_schema_invalid_arguments_rejected_without_outbound_call(
         "the loop should resume to a model message after the rejection; got "
         f"{[item.type for item in response.output]}"
     )
+
+
+@pytest.fixture(scope="session")
+def structured_mcp_client(tmp_path_factory, request, nemo_guardrails_server):
+    """Full-flow agentic proxy with a 10 MiB retained budget, a scripted model,
+    and an MCP server returning ``structuredContent``."""
+    servers = []
+    for handler in (StructuredMCPHandler, McpStructuredResultBackendHandler):
+        server = HTTPServer(("127.0.0.1", _free_port()), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        servers.append(server)
+    mcp_port, backend_port = (s.server_address[1] for s in servers)
+
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("structured-mcp-responses")
+    config_path = _write_full_flow_config(
+        port,
+        str(db_dir / "responses.db"),
+        backend_endpoint=f"127.0.0.1:{backend_port}",
+        mcp_endpoint=f"http://127.0.0.1:{mcp_port}/mcp",
+        nemo_port=nemo_guardrails_server,
+        max_retained_bytes=10_485_760,
+    )
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    proc = subprocess.Popen(
+        [_find_binary(), "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield _make_openai_client(
+            port,
+            default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
+        )
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        for server in servers:
+            server.shutdown()
+        if not started or request.session.testsfailed > 0:
+            print(
+                f"\n=== Structured MCP Praxis logs ===\n{_read_log_tail(log_path, 200)}",
+                file=sys.stderr,
+            )
+        os.unlink(config_path)
+
+
+@qualification_profile("supporting")
+def test_retained_budget_admits_structured_mcp_result(structured_mcp_client):
+    """A structured MCP result fits a 10 MiB retained budget (issue #1847).
+
+    The per-call parse allowance is ~1.5 MB: enough for the MCP result charge
+    (~0.4 MB) but not the provider-output charge (~4.9 MB) once applied to MCP
+    replies.
+    """
+    calls_before = StructuredMCPHandler.tool_call_count()
+    model_requests_before = McpStructuredResultBackendHandler.request_count
+
+    response = structured_mcp_client.responses.create(
+        model=VLLM_MODEL,
+        input="What is the weather in Paris?",
+        tools=[
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "connector_id": "trusted-mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": "never",
+            }
+        ],
+        store=False,
+    )
+
+    assert response.status == "completed", response
+    mcp_calls = [item for item in response.output if item.type == "mcp_call"]
+    assert len(mcp_calls) == 1, [item.type for item in response.output]
+    assert mcp_calls[0].error is None, mcp_calls[0].error
+    assert "72F and sunny in Paris" in (mcp_calls[0].output or ""), mcp_calls[0]
+    assert StructuredMCPHandler.tool_call_count() == calls_before + 1
+    assert McpStructuredResultBackendHandler.request_count == model_requests_before + 2
+    assert response.output_text == "done"
 
 
 class TestAgenticLoopVLLM:
@@ -10424,6 +10805,7 @@ STRUCTURED_OUTPUT_SCHEMA_CASES = [
             "additionalProperties": False,
         },
         marks=pytest.mark.xfail(
+            condition=VLLM_MODEL == "Qwen/Qwen3-0.6B",
             strict=False,
             raises=json.JSONDecodeError,
             reason="CPU Qwen3-0.6B can exhaust the output limit for this schema",
@@ -11657,6 +12039,111 @@ def test_native_chat_completions_ttft_labeled_by_request_model(ttft_proxy):
         "praxis_ai_ttft_seconds must carry a sample labeled with the request "
         f"model {VLLM_MODEL!r}; got:\n{metrics_text}"
     )
+
+
+@pytest.fixture()
+def native_guardrails_client(tmp_path, request):
+    """Use the request guardrail example with passing NeMo and native backend mocks."""
+    class GuardrailChecksHandler(NemoGuardrailsHandler):
+        requests: ClassVar[list[dict[str, Any]]] = []
+        request_count = 0
+
+    class NativeBackendHandler(_FileResolveBackendHandler):
+        captured: ClassVar[list[dict]] = []
+
+    servers = []
+    for handler in (GuardrailChecksHandler, NativeBackendHandler):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        request.addfinalizer(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        request.addfinalizer(server.shutdown)
+        servers.append(server)
+
+    port = _free_port()
+    config = Path("examples/configs/nemo-guardrails.yaml").read_text()
+    config = config.replace("0.0.0.0:8080", f"127.0.0.1:{port}")
+    config = config.replace("127.0.0.1:3001", f"127.0.0.1:{servers[0].server_port}")
+    config = config.replace("127.0.0.1:3000", f"127.0.0.1:{servers[1].server_port}")
+    config_path = _persist_config(config)
+    request.addfinalizer(lambda: os.unlink(config_path))
+    log_path = tmp_path / "praxis.log"
+    with log_path.open("w") as log_file:
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", str(config_path)],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        started = False
+        try:
+            _wait_for_proxy(port, proc, str(log_path))
+            started = True
+            with _make_openai_client(port, timeout=30) as client:
+                yield client, GuardrailChecksHandler.requests, NativeBackendHandler.captured
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            if not started or request.session.testsfailed > 0:
+                log_file.flush()
+                print(f"\n=== Native guardrails Praxis logs ===\n{log_path.read_text()}", file=sys.stderr)
+
+
+@qualification_profile("supporting")
+@pytest.mark.parametrize("uid", [0, 1000], ids=["root", "non-root"])
+def test_native_guardrails_fixture_inherits_root_override(tmp_path, monkeypatch, request, uid):
+    """Check the actual fixture's launch config without needing a root process."""
+    monkeypatch.setattr(os, "geteuid", lambda: uid)
+    monkeypatch.setattr(sys.modules[__name__], "_find_binary", lambda: "praxis-ai")
+    monkeypatch.setattr(sys.modules[__name__], "_wait_for_proxy", lambda *args: None)
+    configs = []
+
+    def launch_proxy(argv, **kwargs):
+        config_path = Path(argv[2])
+        configs.append(config_path)
+        config = config_path.read_text()
+        if uid == 0:
+            assert config.count("allow_root: true") == 1, config
+        else:
+            assert "allow_root:" not in config, config
+        return Mock()
+
+    monkeypatch.setattr(subprocess, "Popen", launch_proxy)
+    fixture = native_guardrails_client.__wrapped__(tmp_path, request)
+    try:
+        next(fixture)
+    finally:
+        fixture.close()
+    assert len(configs) == 1
+
+
+@pytest.mark.parametrize(
+    "input_value",
+    ["Hello", [{"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}]],
+    ids=["string-input", "message-input"],
+)
+def test_guardrails_preserves_native_responses_options(native_guardrails_client, input_value):
+    """Native options must reach the model after a real SDK request is screened."""
+    client, checks, forwarded = native_guardrails_client
+    body = {
+        "model": "test",
+        "input": input_value,
+        "instructions": "Follow policy.",
+        "truncation": "auto",
+        "background": True,
+        "tools": [{"type": "code_interpreter", "container": {"type": "auto"}}],
+        "tool_choice": {"type": "code_interpreter"},
+    }
+    response = client.responses.create(**body)
+    assert response.status == "completed", "the native mock response should reach the SDK"
+    assert len(checks) == 1, "the request must actually reach NeMo before forwarding"
+    assert checks[0]["messages"] == [
+        {"role": "system", "content": "Follow policy."},
+        {"role": "user", "content": "Hello"},
+    ], "only canonical conversation messages should be sent for evaluation"
+    assert forwarded == [body], "the upstream must receive all original native request options"
 
 
 if __name__ == "__main__":

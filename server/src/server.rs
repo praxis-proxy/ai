@@ -673,9 +673,10 @@ pub fn fips_blocker(registry: &FilterRegistry) -> Option<String> {
 /// Call it before anything that might build a TLS configuration, including
 /// `--validate` and `--dump`. With `PRAXIS_REQUIRE_FIPS` set the process
 /// refuses to start unless FIPS mode is in effect (the provider reports
-/// FIPS-approved algorithms and the kernel flag is on), naming each missing
-/// signal. It is a check, never a switch: FIPS mode comes from the host, and
-/// praxis-ai never enables a provider on its own.
+/// FIPS-approved algorithms, the kernel flag is on, and the system crypto
+/// policy is FIPS), naming each missing signal. It is a check, never a
+/// switch: FIPS mode comes from the host, and praxis-ai never enables a
+/// provider on its own.
 pub fn install_crypto_provider() {
     praxis_tls::provider::install();
 
@@ -691,6 +692,7 @@ pub fn install_crypto_provider() {
         provider = status.name,
         provider_fips = status.provider_fips,
         kernel_fips = ?status.kernel_fips,
+        crypto_policy = ?status.crypto_policy,
         fips_required = praxis_tls::provider::required(),
         "installed rustls crypto provider"
     );

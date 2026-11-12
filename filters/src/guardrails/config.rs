@@ -13,7 +13,7 @@ use serde::Deserialize;
 /// outbound_chain: nemo-outbound # optional; defaults to an empty chain
 /// provider:
 ///   type: nemo
-///   endpoint: "http://nemo:8000/v1/checks"
+///   endpoint: "https://nemo.default.svc:8443/v1/checks"
 ///   guardrails:
 ///     config_ids: ["your-config"]
 ///   timeout_ms: 5000

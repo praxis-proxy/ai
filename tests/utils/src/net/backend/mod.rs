@@ -19,7 +19,7 @@ pub use scripted_http::{
 };
 pub use simple::{
     Backend, CapturedRequest, ChunkedBackend, RoutedBackend, StatefulBackend, StatefulCapturingBackend,
-    StatefulCapturingGuard, start_backend, start_backend_v6, start_backend_with_shutdown,
+    StatefulCapturingGuard, start_backend, start_backend_v6, start_backend_with_shutdown, start_body_aware_backend,
 };
 pub use specialized::{
     BackendGuard, StatefulBackendGuard, start_keepalive_backend, start_slow_backend, start_stateful_backend,

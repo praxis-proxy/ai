@@ -23,6 +23,7 @@ pub mod callout_policy;
 pub mod callout_target;
 pub mod classifier;
 pub mod credential_source;
+pub mod guardrail_messages;
 pub mod hash;
 #[cfg(all(test, feature = "openai-responses"))]
 mod history_allocation_tests;
@@ -49,6 +50,7 @@ pub(crate) mod web_search;
 pub const MODEL_PROVIDER_CLIENT_MODEL_METADATA: &str = "model_to_provider.client_model";
 
 pub use callout_credentials::{CalloutCredentials, CalloutCredentialsFilter};
+pub use callout_identity::credential_authority;
 pub use praxis_ai_store::{StateOwner, StateOwnerError};
 pub use project_state_owner_headers::ProjectStateOwnerHeadersFilter;
 pub use state_owner::{StateOwnerFilter, project_state_owner};

@@ -24,7 +24,7 @@ use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IdentityHeaderGuardFilter,
     InFlightRegistry, IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter, ModelToHeaderFilter,
     ModelToProviderFilter, PromptEnrichFilter, ProviderRouteFilter, StreamUsageInjectFilter, TimeToFirstTokenFilter,
-    TokenCountFilter, TokenUsageHeadersFilter,
+    TokenCountFilter, TokenUsageHeadersFilter, TokenUsageMetricsFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -258,6 +258,10 @@ fn register_token_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "token_usage_headers" => TokenUsageHeadersFilter::from_config
     );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "token_usage_metrics" => TokenUsageMetricsFilter::from_config
+    );
     #[cfg(feature = "token-rate-limit-filter")]
     praxis_filter::register_filters!(
         @register registry,
@@ -383,6 +387,10 @@ fn register_openai_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "openai_chat_completions_request" => praxis_ai_apis::openai::OpenaiChatCompletionsRequestFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_chat_completions_streaming_selector" => praxis_ai_apis::openai::OpenaiChatCompletionsStreamingSelectorFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -748,6 +756,7 @@ mod tests {
             "openai_responses_model_rewrite",
             "openai_tool_parse",
             "openai_chat_completions_request",
+            "openai_chat_completions_streaming_selector",
             "ai_operation",
             "a2a",
             "intelligent_route",
@@ -755,6 +764,8 @@ mod tests {
             "credential_inject",
             "anthropic_web_search",
             "request_id",
+            "token_usage_headers",
+            "token_usage_metrics",
             "openai_chat_completions_to_azureai_chat_completions",
             "openai_chat_completions_to_vertexai_gemini",
         ];
@@ -800,8 +811,35 @@ provider:
             .unwrap_or_else(|error| panic!("guardrails entry should parse: {error}")),
         ];
         let chains = HashMap::new();
-        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
+        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[])
             .expect("omitting outbound_chain should build an empty pass-through chain");
+    }
+
+    /// The post-auth config ai-gateway-controller compiles for an accepted
+    /// `AIGuardrail`. The controller pins the same file in its
+    /// `test/testdata/nemo-callout-contract`, so a provider field this
+    /// registry rejects fails here before an image ships.
+    #[test]
+    fn ai_gateway_controller_nemo_contract_builds() {
+        let directory = tempfile::tempdir().unwrap();
+        let token = directory.path().join("token");
+        std::fs::write(&token, "contract-token").unwrap();
+        let ca = directory.path().join("service-ca.crt");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        std::fs::write(&ca, params.self_signed(&key).unwrap().pem()).unwrap();
+
+        let source = include_str!("../testdata/ai-gateway-controller-extproc.yaml")
+            .replace("/var/run/secrets/tokens/nemo/token", token.to_str().unwrap())
+            .replace("/var/run/secrets/nemo-ca/service-ca.crt", ca.to_str().unwrap());
+        let config: serde_yaml::Value = serde_yaml::from_str(&source).unwrap();
+        let insecure: InsecureOptions = serde_yaml::from_value(config["insecure_options"].clone())
+            .expect("the controller's insecure_options must be fields Praxis accepts");
+        let mut entries: Vec<FilterEntry> =
+            serde_yaml::from_value(config["filter_chains"][0]["filters"].clone()).unwrap();
+        FilterPipeline::build_with_chains(&mut entries, &build_ai_registry(), &HashMap::new(), &insecure, &[])
+            .expect("the controller-compiled NeMo callout must build");
     }
 
     #[test]
@@ -821,7 +859,8 @@ provider:
             .unwrap_or_else(|error| panic!("guardrails entry should parse: {error}")),
         ];
         let chains = HashMap::new();
-        let result = FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default());
+        let result =
+            FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[]);
         assert!(
             result.is_err(),
             "production registry must reject an unbuildable outbound_chain"
@@ -846,9 +885,14 @@ provider:
     fn guardrails_ordering_errors(prefix: &str, allow_open_security: bool) -> Vec<String> {
         let registry = build_ai_registry();
         let mut entries = vec![guardrails_entry(prefix)];
-        let pipeline =
-            FilterPipeline::build_with_chains(&mut entries, &registry, &HashMap::new(), &InsecureOptions::default())
-                .expect("ai_guardrails should build");
+        let pipeline = FilterPipeline::build_with_chains(
+            &mut entries,
+            &registry,
+            &HashMap::new(),
+            &InsecureOptions::default(),
+            &[],
+        )
+        .expect("ai_guardrails should build");
         pipeline.ordering_errors(&entries, allow_open_security, &SkipPipelineChecks::default())
     }
 
@@ -968,6 +1012,7 @@ provider:
                 &registry,
                 &HashMap::new(),
                 &InsecureOptions::default(),
+                &[],
             );
             let Err(error) = result else {
                 panic!("an unavailable filter must fail pipeline construction");
@@ -1023,7 +1068,8 @@ outbound_chain:
 ",
         )];
         let chains = HashMap::new();
-        let result = FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default());
+        let result =
+            FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[]);
         assert!(
             result.is_err(),
             "an outbound chain referencing an unknown filter must fail the pipeline build"
@@ -1052,7 +1098,7 @@ allow_pre_security_callout: true
 ",
         )];
         let chains = HashMap::new();
-        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
+        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[])
             .expect("an omitted outbound_chain must default to an empty inline chain and bind");
     }
 
@@ -1075,7 +1121,8 @@ outbound_chain:
 ",
         )];
         let chains = HashMap::new();
-        let result = FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default());
+        let result =
+            FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[]);
         assert!(
             result.is_err(),
             "an outbound chain referencing an unknown filter must fail the pipeline build"
@@ -1103,7 +1150,7 @@ outbound_chain:
 ",
         )];
         let chains = HashMap::new();
-        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
+        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[])
             .expect("a resolvable outbound chain must build");
     }
 
@@ -1147,7 +1194,7 @@ outbound_chain:
         .expect("named outbound chain should parse");
         let chains = HashMap::from([("vector-store-outbound", chain_entries.as_slice())]);
 
-        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
+        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[])
             .expect("named outbound chain should resolve inside the IRR step");
     }
 }

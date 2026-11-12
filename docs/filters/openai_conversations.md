@@ -7,12 +7,15 @@ Handles all `/v1/conversations` endpoints locally.
 
 ## Configuration Notes
 
-All matched requests are served from the owner-scoped store and never forwarded upstream. Unmatched paths pass through as `Continue`. The filter keeps only request-scoped state: it resolves the store from the per-request registry the serving runtime provisions, and takes an owner-bound handle. `ai_operation` must precede this filter in the same chain. For a managed `POST /v1/responses` with `conversation`, completed JSON and SSE responses append the request input and final output items to the local Conversation. Streaming append-back reads the canonical terminal response state without buffering SSE. With the default fail-closed policy, it persists before `response.completed` is released; `failure_mode: open` opts out of that guarantee. Incomplete or failed streams do not append a turn. The provider owns history on a direct OpenAI passthrough route. Place this filter after `openai_response_store` in the request chain so reverse response hooks append the conversation turn before storing its successful response.
+All matched requests are served from the owner-scoped store and never forwarded upstream. Unmatched paths pass through as `Continue`. The filter resolves the store from the per-request registry the serving runtime provisions, and takes an owner-bound handle. `ai_operation` must precede this filter in the same chain. Optional `rate_limit` admission reuses the core request limiter and formats its 429 rejection as OpenAI JSON. One budget covers all local operations; `mode: global` shares it across callers and `mode: per_ip` uses the TCP peer address, not the authenticated owner or forwarded headers. `rate` is requests per second and `burst` is bucket capacity. The block is disabled when absent. Admission runs after trusted owner resolution and before store access; failed CRUD requests consume capacity too. A pipeline rebuild creates fresh buckets. Request-body pre-read can run before admission, so this policy does not bound body-buffering memory or ingress bandwidth. Configure connection and request-body size limits separately when those costs need to be constrained. Core per-IP state bounds and eviction apply. Shadow mode records decisions without rejecting. Successful local responses do not gain rate-limit headers.
+
+For a managed `POST /v1/responses` with `conversation`, completed JSON and SSE responses append the request input and final output items to the local Conversation. Streaming append-back reads the canonical terminal response state without buffering SSE. With the default fail-closed policy, it persists before `response.completed` is released; `failure_mode: open` opts out of that guarantee. Incomplete or failed streams do not append a turn. The provider owns history on a direct OpenAI passthrough route. Place this filter after `openai_response_store` in the request chain so reverse response hooks append the conversation turn before storing its successful response.
 
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
+| `rate_limit` | any | no | Optional request admission using the core `rate_limit` configuration. A mapping with required `mode` (`global` or `per_ip`), `rate` (positive requests per second), and `burst` (integer capacity, at least `rate`). Optional `ipv6_prefix_len` (1 to 128, default 128) groups IPv6 peers; `shadow` (boolean, default false) observes without rejecting. Global or per-IP budgets cover all eight local operations together. |
 | `backend` | `sqlite` \| `postgres` | yes | Storage backend to use. |
 | `database_url` | string (secret) | yes | Database connection URL. Wrapped in [`SecretString`] to prevent accidental logging of credentials. |
 | `conversations_table` | string | no | Table name for conversation records. |
@@ -38,4 +41,8 @@ All matched requests are served from the owner-scoped store and never forwarded 
   conversations_table: conversations
   items_table: conversation_items
   allow_private_database_url: true
+  rate_limit:
+    mode: global
+    rate: 100
+    burst: 200
 ```

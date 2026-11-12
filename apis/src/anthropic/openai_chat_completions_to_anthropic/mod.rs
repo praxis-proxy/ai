@@ -114,11 +114,16 @@ struct BufferedJsonResponse {
 /// ```yaml
 /// filter: openai_chat_completions_to_anthropic
 /// api_translation_enabled: true
-/// max_body_bytes: 1048576
+/// max_request_body_bytes: 2097152
+/// max_response_body_bytes: 1048576
 /// ```
 ///
-/// Only Chat Completions fields represented by Anthropic Messages are
-/// accepted. Unsupported fields and modalities fail with a 400 response.
+/// The compatibility contract defaults an omitted token limit to 4096 and
+/// ignores `user`, `n`, `seed`,
+/// and `parallel_tool_calls` after validating their types. Ignoring `n` does
+/// not produce multiple completions; ignoring `seed` does not make generation
+/// deterministic; and ignoring `parallel_tool_calls` does not constrain the
+/// provider's tool scheduling. Other unsupported fields fail with HTTP 400.
 pub struct OpenaiChatCompletionsToAnthropicFilter {
     /// Filter body-processing limits.
     config: OpenaiChatCompletionsToAnthropicConfig,
@@ -199,7 +204,7 @@ impl OpenaiChatCompletionsToAnthropicFilter {
 )]
 #[async_trait]
 impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
-    /// Return the registry name used by the `ExtProc` filter chain.
+    /// Return this filter's registry name.
     fn name(&self) -> &'static str {
         "openai_chat_completions_to_anthropic"
     }
@@ -212,7 +217,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
     /// Buffer a complete request within the configured cap before JSON translation.
     fn request_body_mode(&self) -> BodyMode {
         BodyMode::StreamBuffer {
-            max_bytes: Some(self.config.max_body_bytes),
+            max_bytes: Some(self.config.request_limit()),
         }
     }
 
@@ -286,7 +291,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
                 "Chat Completions request body is empty",
             )));
         };
-        if bytes.len() > self.config.max_body_bytes {
+        if bytes.len() > self.config.request_limit() {
             return Ok(SelectedUpstreamBodyOutcome::Reject(Self::openai_error_rejection(
                 413,
                 "request_too_large",
@@ -408,7 +413,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
         let current_len = ctx
             .get_filter_state::<BufferedJsonResponse>()
             .map_or(0, |state| state.bytes.len());
-        if current_len.saturating_add(chunk.len()) > self.config.max_body_bytes {
+        if current_len.saturating_add(chunk.len()) > self.config.response_limit() {
             ctx.remove_filter_state::<BufferedJsonResponse>();
             return Ok(FilterAction::Reject(Self::openai_error_rejection(
                 502,

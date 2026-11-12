@@ -109,6 +109,7 @@ macro_rules! operation_contract {
                 request: request_binding!($request),
                 responses: &[ResponseSpec {
                     status: "200",
+                    headers: &[],
                     description: "OK",
                     content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($response))],
                 }],
@@ -319,6 +320,14 @@ pub(crate) fn operation_for_id(operation_id: &str) -> Option<ResponsesOperation>
         .iter()
         .find(|spec| spec.operation_id() == operation_id)
         .map(|spec| spec.operation)
+}
+
+/// Whether a matched operation head is the Responses create call.
+///
+/// Consumers that act on inference-bearing Responses traffic use this registry
+/// predicate instead of duplicating the protocol and operation ID strings.
+pub(crate) fn is_create_response(protocol: ApplicationProtocol, operation_id: &str) -> bool {
+    protocol == APPLICATION_PROTOCOL && operation_for_id(operation_id) == Some(ResponsesOperation::CreateResponse)
 }
 
 #[cfg(test)]

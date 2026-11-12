@@ -60,7 +60,7 @@ use futures::{FutureExt as _, future::join_all};
 use praxis_core::config::InsecureOptions;
 use praxis_filter::{
     BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
-    HttpFilterContext, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    HttpFilterContext, Rejection, parse_filter_config,
 };
 use tracing::{debug, warn};
 
@@ -96,7 +96,7 @@ use super::{
 use crate::{
     callout_headers::effective_body_callout_headers,
     callout_identity::{McpCalloutIdentity, stage_mcp_callout_identity},
-    json_body::serialized_len,
+    json_body::{MAX_JSON_BODY_BYTES, serialized_len},
     mcp_client,
     state_owner::StateOwner,
     store::{OwnerScopedResponseStore, PendingApprovalRecord, ResponseStoreRegistry},
@@ -105,9 +105,9 @@ use crate::{
 /// Step-local metadata carrying the configured response fan-out cap to the owner.
 const MAX_CALLS_METADATA: &str = "responses.mcp_max_calls_per_round";
 
-/// A minimal JSON-RPC `initialize` reply needs roughly 150 KiB of lexical
-/// parser headroom under the shared node charge. Reserve a little more before
-/// a single-use approval can be consumed.
+/// A minimal JSON-RPC `initialize` reply needs roughly 13 KiB under
+/// `mcp_result_charge`. Keep a generous floor before a single-use approval
+/// can be consumed.
 const MIN_MCP_INITIALIZE_PARSE_CHARGE: usize = 256 * 1_024;
 
 /// A budget failure must terminate the request even when an MCP server or
@@ -182,7 +182,7 @@ fn reserve_mcp_execution(
     }
     let reserved = slot.checked_mul(count)?;
     let parse_charge_limit = slot / 2;
-    let wire_limit = parse_charge_limit / 64;
+    let wire_limit = parse_charge_limit / 16;
     if parse_charge_limit < MIN_MCP_INITIALIZE_PARSE_CHARGE
         || wire_limit < 512
         || !budget.reserve_additional_input(reserved)
@@ -504,8 +504,12 @@ impl McpDispatchFilter {
         };
         for result in results {
             let result_start = state.messages.len();
-            state.messages.push(result.message.clone());
-            state.persisted_messages.push(result.message);
+            if state.captures_persistence_history() {
+                state.messages.push(result.message.clone());
+                state.push_persisted_message(result.message);
+            } else {
+                state.messages.push(result.message);
+            }
             state.mark_local_tool_results_from(result_start);
             // Record execution provenance keyed on the item id `stream_events`
             // reads, so only this locally executed `mcp_call` gains a synthesized
@@ -1074,8 +1078,12 @@ fn apply_decision(state: &mut ResponsesState, decision: &ResolvedApproval) {
         debug!(approval_id = %decision.approval_id, "recording denied MCP approval");
         let denial = build_denial_message(&decision.approval_id, decision.reason.as_deref());
         let result_start = state.messages.len();
-        state.messages.push(denial.clone());
-        state.persisted_messages.push(denial);
+        if state.captures_persistence_history() {
+            state.messages.push(denial.clone());
+            state.push_persisted_message(denial);
+        } else {
+            state.messages.push(denial);
+        }
         state.mark_local_tool_results_from(result_start);
     }
 }
@@ -1302,7 +1310,9 @@ impl HttpFilter for McpDispatchFilter {
             let fallback = if body.as_ref().is_none_or(Bytes::is_empty) {
                 ctx.extensions
                     .get::<ResponsesState>()
-                    .and_then(|state| serde_json::to_vec(&state.request_body).ok())
+                    // Serialize the current request explicitly: `request_body` holds
+                    // parameters only, so re-attach the current input in its form (#1618).
+                    .and_then(|state| serde_json::to_vec(&super::request_input::CurrentRequestBody::new(state)).ok())
                     .unwrap_or_default()
             } else {
                 Vec::new()

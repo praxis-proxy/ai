@@ -281,10 +281,18 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // Strip the caller's Anthropic wire credentials so they never reach a
+        // Chat Completions backend. SDK v1 sends the key as `x-api-key`; SDK
+        // v2 sends it as `authorization: Bearer`. Symmetric with
+        // `openai_chat_completions_to_anthropic`, which strips the caller's
+        // `authorization` on the reverse route. Operators who want a backend
+        // credential compose `credential_injection` after this filter.
         ctx.request_headers_to_remove
             .push(http::header::HeaderName::from_static("anthropic-version"));
         ctx.request_headers_to_remove
             .push(http::header::HeaderName::from_static("x-api-key"));
+        ctx.request_headers_to_remove
+            .push(http::header::HeaderName::from_static("authorization"));
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
 
         Ok(FilterAction::Continue)
@@ -684,7 +692,7 @@ fn transform_non_streaming_body(
     reason = "tests"
 )]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use bytes::Bytes;
     use http::{Method, StatusCode};
@@ -722,13 +730,14 @@ mod tests {
 
     #[test]
     fn rejects_max_body_bytes_above_ceiling() {
-        let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 67108865").unwrap();
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            "max_body_bytes: {}",
+            praxis_filter::body::MAX_JSON_BODY_BYTES + 1
+        ))
+        .unwrap();
         let result = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml);
 
-        assert!(
-            result.is_err(),
-            "max_body_bytes above 64 MiB ceiling should be rejected"
-        );
+        assert!(result.is_err(), "max_body_bytes above the ceiling should be rejected");
     }
 
     #[tokio::test]
@@ -1164,6 +1173,27 @@ mod tests {
             ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING),
             "response transformation requires an unencoded upstream representation"
         );
+    }
+
+    #[tokio::test]
+    async fn on_request_strips_caller_anthropic_credentials() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        // The caller's Anthropic wire credentials must not reach a Chat
+        // Completions backend, whichever header the SDK lane puts them on:
+        // `x-api-key` (SDK v1) or `authorization: Bearer` (SDK v2).
+        for header in ["anthropic-version", "x-api-key", "authorization"] {
+            assert!(
+                ctx.request_headers_to_remove
+                    .contains(&http::header::HeaderName::from_static(header)),
+                "caller credential header {header} must be stripped"
+            );
+        }
     }
 
     #[test]
@@ -1745,31 +1775,71 @@ mod tests {
     /// Thread-shared sink the capture layer appends each WARN event to.
     type WarnSink = Arc<Mutex<Vec<CapturedWarn>>>;
 
+    thread_local! {
+        /// The active WARN capture for this test thread.
+        static ACTIVE_WARN_CAPTURE: std::cell::RefCell<Option<WarnSink>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    /// Restores a prior test-thread capture, including while unwinding.
+    struct WarnCaptureGuard {
+        previous: Option<WarnSink>,
+    }
+
+    impl Drop for WarnCaptureGuard {
+        fn drop(&mut self) {
+            ACTIVE_WARN_CAPTURE.with(|active| {
+                drop(active.replace(self.previous.take()));
+            });
+        }
+    }
+
     /// Capture every WARN event emitted on the current thread while `f` runs,
     /// returning each event's message and its `degraded_features` field value.
     ///
-    /// `tracing::subscriber::with_default` installs the subscriber for this thread
-    /// only, so the capture is deterministic and does not race other tests.
+    /// Tracing caches callsite interest process-wide. A scoped subscriber can race
+    /// another test and leave this callsite disabled, so install one
+    /// always-interested capture layer and route events through thread-local state.
     fn capture_warn_events<F: FnOnce()>(f: F) -> Vec<CapturedWarn> {
-        use tracing_subscriber::layer::SubscriberExt as _;
+        install_warn_capture();
 
         let events: WarnSink = Arc::new(Mutex::new(Vec::new()));
-        let layer = WarnEventCapture(Arc::clone(&events));
-        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), f);
+        let _guard = ACTIVE_WARN_CAPTURE.with(|active| WarnCaptureGuard {
+            previous: active.replace(Some(Arc::clone(&events))),
+        });
+        f();
         std::mem::take(&mut events.lock().unwrap())
     }
 
-    struct WarnEventCapture(WarnSink);
+    fn install_warn_capture() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            assert!(
+                tracing::subscriber::set_global_default(tracing_subscriber::registry().with(WarnEventCapture)).is_ok(),
+                "Anthropic WARN capture must own the test subscriber"
+            );
+        });
+    }
+
+    struct WarnEventCapture;
 
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnEventCapture {
+        fn register_callsite(&self, _metadata: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+
         fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
             if *event.metadata().level() == tracing::Level::WARN {
+                let sink = ACTIVE_WARN_CAPTURE.with(|active| active.borrow().clone());
+                let Some(sink) = sink else {
+                    return;
+                };
                 let mut visitor = WarnFieldVisitor::default();
                 event.record(&mut visitor);
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push((visitor.message, visitor.degraded_features));
+                sink.lock().unwrap().push((visitor.message, visitor.degraded_features));
             }
         }
     }

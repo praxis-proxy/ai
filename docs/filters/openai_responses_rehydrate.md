@@ -7,7 +7,7 @@ Validates `previous_response_id` by fetching the stored response, confirming its
 
 ## Configuration Notes
 
-The request body is **not** modified; downstream filters read from `ResponsesState.messages` instead.
+The request body is only modified when a stored `configuration_update` carries a reasoning default the request omitted: that default is merged into the live body so later filters observe (and may edit or remove) the effective setting. Everything else stays untouched; downstream filters read from `ResponsesState.messages` instead.
 
 ## Example
 

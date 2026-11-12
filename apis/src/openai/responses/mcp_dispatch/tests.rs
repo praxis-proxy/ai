@@ -113,7 +113,7 @@ fn budgeted_mcp_call_with_small_result_cap_still_admits_initialize() {
     let execution = reserve_mcp_execution(&mut state, 1, 8_192, 8_192)
         .expect("control response capacity must not depend on the tool result cap");
     let initialize = br#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"x","version":"1"}}}"#;
-    let parse_charge = crate::openai::responses::agentic_loop::budget::output_charge(initialize).unwrap();
+    let parse_charge = crate::openai::responses::agentic_loop::budget::mcp_result_charge(initialize).unwrap();
     assert!(parse_charge <= execution.parse_charge_limit);
     assert_eq!(execution.result_limit, 8_192);
 
@@ -424,7 +424,7 @@ fn filter_request_body_mode() {
         matches!(
             filter.request_body_mode(),
             praxis_filter::BodyMode::StreamBuffer {
-                max_bytes: Some(praxis_filter::body::MAX_JSON_BODY_BYTES)
+                max_bytes: Some(crate::json_body::MAX_JSON_BODY_BYTES)
             }
         ),
         "should buffer up to the absolute ceiling; body_limits governs the raw cap"

@@ -126,7 +126,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: test-schema-cargo
 
@@ -148,7 +148,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: test-inference-cargo
 
@@ -179,7 +179,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: ci-split-registry
           cache-target: "false"
@@ -206,16 +206,19 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: test-integration-cargo
 
       - name: Install pinned Claude Code CLI
         env:
-          CLAUDE_CODE_PINNED_VERSION: "2.1.267"
+          # Keep in sync with tests/integration/fixtures/claude-code-cli/pin.toml;
+          # the offline test `claude_code::claude_code_lane_is_wired_in_ci`
+          # enforces it.
+          CLAUDE_CODE_PINNED_VERSION: "2.1.278"
         run: |
           npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_PINNED_VERSION}"
-          claude --version
+          claude --version | grep -F "$CLAUDE_CODE_PINNED_VERSION"
 
       - name: Integration tests
         env:
@@ -247,7 +250,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: ci-split-registry
           cache-target: "false"
@@ -279,13 +282,13 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: ci-split-registry
           cache-target: "false"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: tests/integration/sdk/openai/test_bedrock_converse_chat_completions.py
@@ -337,7 +340,7 @@ jobs:
 
       - name: Setup Rust
         if: steps.scope.outputs.run == 'true'
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: test-environment-cargo
       - name: Environment tests
@@ -379,7 +382,7 @@ jobs:
 
       - name: Setup Rust
         if: steps.scope.outputs.run == 'true'
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: ci-split-registry
           cache-target: "false"
@@ -406,12 +409,12 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: azure-sdk-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: tests/integration/sdk/openai/test_azure_chat_completions.py
@@ -446,12 +449,12 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: agents-sdk-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: tests/integration/sdk/openai/test_openai_conversations.py
@@ -486,13 +489,13 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: ci-split-registry
           cache-target: "false"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: tests/integration/sdk/openai/test_openai_agents_sdk.py
@@ -521,18 +524,24 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: anthropic-sdk-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
-          cache-dependency-glob: tests/integration/sdk/anthropic/test_anthropic_messages_to_chat_completions.py
+          cache-dependency-glob: tests/integration/sdk/anthropic/*.py
 
       - name: Build Praxis
         run: cargo build -p praxis-ai-proxy
+
+      - name: Run Anthropic SDK v1 compatibility lane
+        run: uv run --with "anthropic==1.17.0" --with "pytest>=8.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s --anthropic-sdk-version=1.x
+
+      - name: Run Anthropic SDK v2 compatibility lane
+        run: uv run --with "anthropic==2.3.0" --with "pytest>=8.0" tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py -s --anthropic-sdk-version=2.x
 
       - name: Run Anthropic Python SDK tests
         run: uv run tests/integration/sdk/anthropic/test_anthropic_messages_to_chat_completions.py -s
@@ -560,6 +569,9 @@ jobs:
     permissions:
       contents: read
     env:
+      # Keep in sync with tests/integration/fixtures/codex-cli/pin.toml; the
+      # offline test `codex_pin::codex_lanes_are_wired_in_ci` enforces it.
+      CODEX_VERSION: "0.144.1"
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
     steps:
@@ -568,40 +580,40 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: codex-http-cargo
 
       - name: Cache pinned Codex CLI
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl
-          key: codex-0.144.1-x86_64-unknown-linux-musl-84091ae20c65fcc7d4120db97d1bd57d7ff8df9c7609fb781c78c2ebbd4f5a28
+          path: ${{ runner.tool_cache }}/codex/${{ env.CODEX_VERSION }}/x86_64-unknown-linux-musl
+          key: codex-${{ env.CODEX_VERSION }}-x86_64-unknown-linux-musl-${{ hashFiles('tests/integration/fixtures/codex-cli/*.sha256') }}
 
       - name: Download pinned Codex CLI
         run: |
-          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/0.144.1/x86_64-unknown-linux-musl"
+          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/$CODEX_VERSION/x86_64-unknown-linux-musl"
           mkdir -p "$codex_cache_dir"
           if [ ! -f "$codex_cache_dir/$CODEX_ARCHIVE" ]; then
             curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
               --output "$codex_cache_dir/$CODEX_ARCHIVE" \
-              "https://github.com/openai/codex/releases/download/rust-v0.144.1/$CODEX_ARCHIVE"
+              "https://github.com/openai/codex/releases/download/rust-v$CODEX_VERSION/$CODEX_ARCHIVE"
           fi
 
       - name: Verify and extract pinned Codex CLI
         run: |
-          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/0.144.1/x86_64-unknown-linux-musl"
+          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/$CODEX_VERSION/x86_64-unknown-linux-musl"
           cd "$codex_cache_dir"
           sha256sum --check \
-            "$GITHUB_WORKSPACE/tests/integration/fixtures/codex-cli/0.144.1-x86_64-unknown-linux-musl.sha256"
+            "$GITHUB_WORKSPACE/tests/integration/fixtures/codex-cli/$CODEX_VERSION-x86_64-unknown-linux-musl.sha256"
           tar --extract --gzip --file "$CODEX_ARCHIVE"
           chmod +x "$CODEX_BIN"
           test -x "$CODEX_BIN"
-          test "$("./$CODEX_BIN" --version)" = "codex-cli 0.144.1"
+          test "$("./$CODEX_BIN" --version)" = "codex-cli $CODEX_VERSION"
 
       - name: Build pinned Codex HTTP acceptance test
         env:
-          PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
+          PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/${{ env.CODEX_VERSION }}/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
         run: |
           test -x "$PRAXIS_TEST_CODEX_BIN"
           cargo test -p praxis-tests-integration --features openai-all --test suite --no-run
@@ -615,7 +627,7 @@ jobs:
 
       - name: Run pinned Codex HTTP acceptance test without external network access
         env:
-          PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
+          PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/${{ env.CODEX_VERSION }}/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
         run: |
           runner_uid="$(id -u)"
           runner_gid="$(id -g)"
@@ -680,11 +692,10 @@ jobs:
   # future startup fetch slip in unnoticed. Isolation is what makes that a
   # standing guarantee rather than a one-time observation.
   #
-  # Pins live in tests/integration/fixtures/opencode-cli/pin.toml. To bump the
-  # version, update that manifest, OPENCODE_PINNED_VERSION in
-  # tests/integration/tests/suite/harness.rs, and OPENCODE_VERSION below
-  # together; `pin_toml_version_matches_harness_const` and
-  # `opencode_lane_is_wired_in_ci` fail if any of the three drifts.
+  # Pins live in tests/integration/fixtures/opencode-cli/pin.toml. Bump with
+  # `cargo xtask bump-pins --pin opencode`, which rewrites the manifest,
+  # OPENCODE_PINNED_VERSION, OPENCODE_VERSION below, and the checksum fixture
+  # together; `cargo xtask check-pins` fails if any of them drifts.
   # ----------------------------------------------------------------------------
 
   opencode-cpu:
@@ -704,7 +715,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: opencode-cpu-cargo
 
@@ -784,12 +795,10 @@ jobs:
   # it against the committed checksum, exactly as the GPU lane does, so both
   # lanes stage a byte-identical client.
   #
-  # Pins live in tests/integration/fixtures/opencode-cli-v2/pin.toml. To bump
-  # the version, update that manifest, its checksum fixture,
-  # OPENCODE_V2_PINNED_VERSION in tests/integration/tests/suite/harness.rs, and
-  # OPENCODE_V2_VERSION below together; `pin_toml_version_matches_harness_const`,
-  # `checksum_fixture_names_the_pinned_platform_tarball`, and
-  # `opencode_v2_lane_is_wired_in_ci` fail if any of them drifts.
+  # Pins live in tests/integration/fixtures/opencode-cli-v2/pin.toml. Bump with
+  # `cargo xtask bump-pins --pin opencode-v2`, which rewrites the manifest,
+  # OPENCODE_V2_PINNED_VERSION, OPENCODE_V2_VERSION below, and the checksum
+  # fixture together; `cargo xtask check-pins` fails if any of them drifts.
   # ----------------------------------------------------------------------------
 
   opencode-v2-cpu:
@@ -810,7 +819,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: opencode-v2-cpu-cargo
 
@@ -911,12 +920,10 @@ jobs:
   # The whole extracted directory is staged: the binary reads its version and
   # assets from beside itself.
   #
-  # Pins live in tests/integration/fixtures/pi-cli/pin.toml. To bump the
-  # version, update that manifest, its checksum fixture, PI_PINNED_VERSION in
-  # tests/integration/tests/suite/harness.rs, and PI_VERSION below together;
-  # `pin_toml_version_matches_harness_const`,
-  # `checksum_fixture_names_the_pinned_release_archive`, and
-  # `pi_lane_is_wired_in_ci` fail if any of them drifts.
+  # Pins live in tests/integration/fixtures/pi-cli/pin.toml. Bump with
+  # `cargo xtask bump-pins --pin pi`, which rewrites the manifest,
+  # PI_PINNED_VERSION, PI_VERSION below, and the checksum fixture together;
+  # `cargo xtask check-pins` fails if any of them drifts.
   # ----------------------------------------------------------------------------
 
   pi-cpu:
@@ -937,7 +944,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: pi-cpu-cargo
 
@@ -1044,12 +1051,12 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: vertex-gemini-sdk-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: tests/integration/sdk/openai/test_vertex_gemini_chat_completions.py
@@ -1076,12 +1083,12 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: selected-anthropic-sdk-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: tests/integration/sdk/openai/test_selected_anthropic_chat_completions.py
@@ -1106,6 +1113,9 @@ jobs:
     permissions:
       contents: read
     env:
+      # Keep in sync with tests/integration/fixtures/codex-cli/pin.toml; the
+      # offline test `codex_pin::codex_lanes_are_wired_in_ci` enforces it.
+      CODEX_VERSION: "0.144.1"
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
     steps:
@@ -1114,19 +1124,19 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           cache-suffix: codex-websocket-cargo
 
       - name: Cache pinned Codex CLI
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl
-          key: codex-0.144.1-x86_64-unknown-linux-musl-84091ae20c65fcc7d4120db97d1bd57d7ff8df9c7609fb781c78c2ebbd4f5a28
+          path: ${{ runner.tool_cache }}/codex/${{ env.CODEX_VERSION }}/x86_64-unknown-linux-musl
+          key: codex-${{ env.CODEX_VERSION }}-x86_64-unknown-linux-musl-${{ hashFiles('tests/integration/fixtures/codex-cli/*.sha256') }}
 
       - name: Download pinned Codex CLI
         run: |
-          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/0.144.1/x86_64-unknown-linux-musl"
+          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/$CODEX_VERSION/x86_64-unknown-linux-musl"
           mkdir -p "$codex_cache_dir"
           archive_path="$codex_cache_dir/$CODEX_ARCHIVE"
           if [ ! -f "$archive_path" ]; then
@@ -1136,9 +1146,9 @@ jobs:
             if ! curl --proto '=https' --tlsv1.2 --fail --location \
               --retry 10 --retry-all-errors --retry-delay 10 \
               --output "$tmp_archive" \
-              "https://github.com/openai/codex/releases/download/rust-v0.144.1/$CODEX_ARCHIVE"; then
+              "https://github.com/openai/codex/releases/download/rust-v$CODEX_VERSION/$CODEX_ARCHIVE"; then
               rm -f "$tmp_archive"
-              gh release download rust-v0.144.1 \
+              gh release download "rust-v$CODEX_VERSION" \
                 --repo openai/codex \
                 --pattern "$CODEX_ARCHIVE" \
                 --dir "$tmp_dir" \
@@ -1147,25 +1157,25 @@ jobs:
             (
               cd "$tmp_dir"
               sha256sum --check \
-                "$GITHUB_WORKSPACE/tests/integration/fixtures/codex-cli/0.144.1-x86_64-unknown-linux-musl.sha256"
+                "$GITHUB_WORKSPACE/tests/integration/fixtures/codex-cli/$CODEX_VERSION-x86_64-unknown-linux-musl.sha256"
             )
             mv "$tmp_archive" "$archive_path"
           fi
 
       - name: Verify and extract pinned Codex CLI
         run: |
-          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/0.144.1/x86_64-unknown-linux-musl"
+          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/$CODEX_VERSION/x86_64-unknown-linux-musl"
           cd "$codex_cache_dir"
           sha256sum --check \
-            "$GITHUB_WORKSPACE/tests/integration/fixtures/codex-cli/0.144.1-x86_64-unknown-linux-musl.sha256"
+            "$GITHUB_WORKSPACE/tests/integration/fixtures/codex-cli/$CODEX_VERSION-x86_64-unknown-linux-musl.sha256"
           tar --extract --gzip --file "$CODEX_ARCHIVE"
           chmod +x "$CODEX_BIN"
           test -x "$CODEX_BIN"
-          test "$("./$CODEX_BIN" --version)" = "codex-cli 0.144.1"
+          test "$("./$CODEX_BIN" --version)" = "codex-cli $CODEX_VERSION"
 
       - name: Run pinned Codex WebSocket acceptance test
         env:
-          PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
+          PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/${{ env.CODEX_VERSION }}/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
         run: |
           test -x "$PRAXIS_TEST_CODEX_BIN"
           cargo test -p praxis-tests-integration --features openai-all,store-sqlite --test suite \

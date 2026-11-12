@@ -23,6 +23,7 @@ from openai import APIStatusError, OpenAI
 
 ROOT = Path(__file__).resolve().parents[4]
 OVERLAY = ROOT / "tests/integration/fixtures/inference/routing/openai-to-anthropic.json"
+FAILOVER_EXAMPLE = ROOT / "examples/configs/inference/fallback-with-provider-translation.yaml"
 MODEL = "fixture-openai-model"
 
 
@@ -46,16 +47,16 @@ class _BackendState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.scripted: deque[tuple[int, str, bytes]] = deque()
-        self.requests: list[tuple[str, dict]] = []
+        self.requests: list[tuple[str, dict[str, str], dict]] = []
 
     def script(self, status: int, content_type: str, body: dict | str) -> None:
         encoded = json.dumps(body).encode() if isinstance(body, dict) else body.encode()
         with self.lock:
             self.scripted.append((status, content_type, encoded))
 
-    def take(self, path: str, body: bytes) -> tuple[int, str, bytes]:
+    def take(self, path: str, headers: dict[str, str], body: bytes) -> tuple[int, str, bytes]:
         with self.lock:
-            self.requests.append((path, json.loads(body)))
+            self.requests.append((path, headers, json.loads(body)))
             return self.scripted.popleft()
 
 
@@ -72,7 +73,8 @@ def reset_backend_state():
 class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         length = int(self.headers["content-length"])
-        status, content_type, body = STATE.take(self.path, self.rfile.read(length))
+        headers = {key.lower(): value for key, value in self.headers.items()}
+        status, content_type, body = STATE.take(self.path, headers, self.rfile.read(length))
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -107,7 +109,7 @@ def _config(proxy_port: int, backend_port: int, api_translation_enabled: bool = 
                 {"filter": "openai_chat_completions_to_anthropic_stream", "max_partial_event_bytes": 1048576,
                  "max_tool_blocks": 256},
                 {"filter": "openai_chat_completions_to_anthropic", "api_translation_enabled": api_translation_enabled,
-                 "max_body_bytes": 1048576},
+                 "max_request_body_bytes": 2097152, "max_response_body_bytes": 1048576},
                 {"filter": "credential_inject", "credentials": [{
                     "name": "anthropic-fixture-secret", "namespace": "grid-fixture", "key": "api-key",
                     "strategy": "apikey", "header": "x-api-key", "value": "fixture-only-dummy-token"}]},
@@ -119,6 +121,17 @@ def _config(proxy_port: int, backend_port: int, api_translation_enabled: bool = 
         "shutdown_timeout_secs": 5,
         "insecure_options": {"allow_private_endpoints": True},
     }
+
+
+def _failover_config(proxy_port: int, primary_port: int, fallback_port: int) -> str:
+    """Render the checked-in cross-provider failover example for local SDK backends."""
+    return (
+        FAILOVER_EXAMPLE.read_text()
+        .replace("127.0.0.1:8080", f"127.0.0.1:{proxy_port}")
+        .replace("127.0.0.1:3001", f"127.0.0.1:{primary_port}")
+        .replace("127.0.0.1:3002", f"127.0.0.1:{fallback_port}")
+        .replace("tests/integration/fixtures/inference/routing/openai-to-anthropic.json", str(OVERLAY))
+    )
 
 
 @pytest.fixture(scope="module")
@@ -185,6 +198,50 @@ def translation_disabled_client():
                 proc.wait()
 
 
+@pytest.fixture
+def failover_client():
+    """OpenAI SDK client backed by the checked-in cross-provider failover example."""
+    proxy_port, primary_port, fallback_port = _port(), _port(), _port()
+    primary = ThreadingHTTPServer(("127.0.0.1", primary_port), _Handler)
+    fallback = ThreadingHTTPServer(("127.0.0.1", fallback_port), _Handler)
+    primary_thread = threading.Thread(target=primary.serve_forever, daemon=True)
+    fallback_thread = threading.Thread(target=fallback.serve_forever, daemon=True)
+    primary_thread.start()
+    fallback_thread.start()
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "praxis.yaml"
+            log = Path(directory) / "praxis.log"
+            config.write_text(_failover_config(proxy_port, primary_port, fallback_port))
+            with log.open("w") as log_file:
+                proc = subprocess.Popen([_binary(), "-c", str(config)], stdout=subprocess.DEVNULL, stderr=log_file)
+                try:
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        try:
+                            with socket.create_connection(("127.0.0.1", proxy_port), timeout=0.2):
+                                break
+                        except OSError:
+                            time.sleep(0.1)
+                    else:
+                        raise TimeoutError(f"Praxis did not start:\n{log.read_text()}")
+                    with OpenAI(api_key="caller-only", base_url=f"http://127.0.0.1:{proxy_port}/v1",
+                                max_retries=0, timeout=10) as sdk:
+                        yield sdk
+                finally:
+                    proc.send_signal(signal.SIGINT)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+    finally:
+        primary.shutdown()
+        fallback.shutdown()
+        primary_thread.join(timeout=5)
+        fallback_thread.join(timeout=5)
+
+
 def test_json_and_cached_usage(client: OpenAI) -> None:
     STATE.script(200, "application/json", _message(
         [{"type": "text", "text": "hello"}],
@@ -196,9 +253,101 @@ def test_json_and_cached_usage(client: OpenAI) -> None:
     assert response.usage.prompt_tokens == 1060, "cache tokens must count toward prompt usage"
     assert response.usage.completion_tokens == 4, "Anthropic output tokens must become completion tokens"
     assert response.usage.total_tokens == 1064, "total tokens must include cache and output tokens"
-    path, upstream = STATE.requests[-1]
+    path, _headers, upstream = STATE.requests[-1]
     assert path == "/v1/messages", "selected Anthropic requests must use the Messages path"
     assert upstream["model"] == "claude-fixture-model", "selected target model must reach Anthropic"
+
+
+def test_anthropic_backend_wire_headers(client: OpenAI) -> None:
+    STATE.script(200, "application/json", _message(
+        [{"type": "text", "text": "hello"}],
+        {"input_tokens": 10, "output_tokens": 4},
+    ))
+    client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16)
+    path, headers, _upstream = STATE.requests[-1]
+    assert path == "/v1/messages", "selected Anthropic requests must use the Messages path"
+    assert headers.get("anthropic-version") == "2023-06-01", (
+        "the selected Anthropic route must pin the API version on the backend request"
+    )
+    assert headers.get("x-api-key") == "fixture-only-dummy-token", (
+        "the injected provider credential must travel in x-api-key"
+    )
+    assert "authorization" not in headers, (
+        "the caller's OpenAI authorization header must not leak to the Anthropic backend"
+    )
+
+
+def test_legacy_omitted_tokens_and_ignored_openai_options(client: OpenAI) -> None:
+    STATE.script(200, "application/json", _message(
+        [{"type": "text", "text": "compatibility"}], {"input_tokens": 1, "output_tokens": 1},
+    ))
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": "hello"}],
+        user="customer-42",
+        n=2,
+        seed=17,
+        parallel_tool_calls=True,
+    )
+    assert response.choices[0].message.content == "compatibility", "accepted compatibility options must preserve the translated response"
+    assert len(response.choices) == 1, "ignored n does not request multiple completions from Anthropic"
+    _, _headers, upstream = STATE.requests[-1]
+    assert upstream["max_tokens"] == 4096, "omitted token limits must use the compatibility default"
+    assert upstream["model"] == "claude-fixture-model", "the selected provider model must replace the client model"
+    for field in ("user", "n", "seed", "parallel_tool_calls"):
+        assert field not in upstream, f"legacy compatibility field {field} must not leak into Anthropic JSON"
+
+
+def test_data_and_remote_image_urls_are_translated_without_fetching(client: OpenAI) -> None:
+    STATE.script(200, "application/json", _message(
+        [{"type": "text", "text": "image received"}], {"input_tokens": 2, "output_tokens": 2},
+    ))
+    client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": "before"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "detail": "high"}},
+            {"type": "text", "text": "after"},
+            {"type": "image_url", "image_url": {"url": "https://images.example.test/image.png"}},
+        ]}],
+        max_tokens=16,
+    )
+    path, _headers, upstream = STATE.requests[-1]
+    assert path == "/v1/messages", "image requests must use the Anthropic Messages endpoint"
+    content = upstream["messages"][0]["content"]
+    assert [block["type"] for block in content] == ["text", "image", "text", "image"], "conversion must preserve text and image ordering"
+    assert content[1]["source"] == {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}, "inline images must retain their original base64 data and media type"
+    assert content[3]["source"] == {"type": "url", "url": "https://images.example.test/image.png"}, "remote images must remain URL references"
+
+
+def test_assistant_image_is_rejected_before_provider_contact(client: OpenAI) -> None:
+    with pytest.raises(APIStatusError) as caught:
+        client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "image_url", "image_url": {"url": "https://images.example.test/image.png"}},
+                ]},
+            ],
+            max_tokens=16,
+        )
+    assert caught.value.status_code == 400, "unsupported or malformed images must return a client error"
+    assert "supported only in user messages" in str(caught.value), "assistant image rejection must explain the supported role"
+    assert not STATE.requests, "unsupported image roles must be rejected before provider contact"
+
+
+def test_malformed_image_is_rejected_before_provider_contact(client: OpenAI) -> None:
+    with pytest.raises(APIStatusError) as caught:
+        client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,%%%"}},
+            ]}],
+            max_tokens=16,
+        )
+    assert caught.value.status_code == 400, "unsupported or malformed images must return a client error"
+    assert not STATE.requests, "malformed image data must be rejected before contacting the provider"
 
 
 def test_null_cache_usage(client: OpenAI) -> None:
@@ -237,6 +386,43 @@ def test_streaming_and_terminal_usage(client: OpenAI) -> None:
     assert chunks[-1].usage.total_tokens == 1064, "SSE total usage must include cache and output tokens"
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_failover_example_supports_explicit_stream_modes(failover_client: OpenAI, stream: bool) -> None:
+    """The SDK must receive translated fallback responses in both IRR transport modes."""
+    STATE.script(503, "application/json", {"error": "primary unavailable"})
+    if stream:
+        events = (
+            'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_failover_stream",'
+            '"usage":{"input_tokens":3,"output_tokens":0}}}\n\n'
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+            '"content_block":{"type":"text","text":""}}\n\n'
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+            '"delta":{"type":"text_delta","text":"failover"}}\n\n'
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+            '"usage":{"output_tokens":2}}\n\n'
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+        )
+        STATE.script(200, "text/event-stream", events)
+        chunks = list(failover_client.chat.completions.create(
+            model=MODEL, messages=[{"role": "user", "content": "hi"}], stream=True, max_tokens=16,
+        ))
+        assert any(
+            chunk.choices and chunk.choices[0].delta.content == "failover" for chunk in chunks
+        ), "translated fallback SSE must reach the OpenAI client"
+    else:
+        STATE.script(200, "application/json", _message(
+            [{"type": "text", "text": "failover"}], {"input_tokens": 3, "output_tokens": 2},
+        ))
+        response = failover_client.chat.completions.create(
+            model=MODEL, messages=[{"role": "user", "content": "hi"}], stream=False, max_tokens=16,
+        )
+        assert response.choices[0].message.content == "failover", "translated fallback JSON must reach the OpenAI client"
+
+    assert [path for path, _, _ in STATE.requests] == ["/v1/chat/completions", "/v1/messages"]
+    assert STATE.requests[0][2]["stream"] is stream, "primary must receive the SDK stream selection"
+
+
 def test_tool_call_and_result_round_trip(client: OpenAI) -> None:
     STATE.script(200, "application/json", _message(
         [{"type": "tool_use", "id": "toolu_1", "name": "weather", "input": {"city": "Oslo"}}],
@@ -258,7 +444,7 @@ def test_tool_call_and_result_round_trip(client: OpenAI) -> None:
         {"role": "tool", "tool_call_id": call.id, "content": "sunny"},
     ], tools=tools, max_tokens=16)
     assert second.choices[0].message.content == "sunny", "tool-result round trip must return translated text"
-    assert STATE.requests[-1][1]["messages"][-1]["content"][0]["type"] == "tool_result", "OpenAI tool results must become Anthropic tool_result blocks"
+    assert STATE.requests[-1][2]["messages"][-1]["content"][0]["type"] == "tool_result", "OpenAI tool results must become Anthropic tool_result blocks"
 
 
 @pytest.mark.parametrize("status", [429, 529])

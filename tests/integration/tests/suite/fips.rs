@@ -688,6 +688,10 @@ fn the_binary_serves_under_require_fips_exactly_on_a_fips_host() {
             ] {
                 assert!(line.contains(field), "the status line lacks {field}: {line}");
             }
+            assert!(
+                line.contains("crypto_policy=Some(\"FIPS"),
+                "the status line must show a FIPS crypto policy: {line}"
+            );
         },
     }
 }

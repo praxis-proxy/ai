@@ -16,7 +16,8 @@ use tracing::info;
 
 use super::{
     BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
-    PendingApprovalRecord, PoolConfig, ResponseEventRecord, ResponseRecord, ResponseStore, SslMode, StoreError,
+    PendingApprovalRecord, PoolConfig, ResponseCasOutcome, ResponseEventRecord, ResponseRecord, ResponseStore, SslMode,
+    StoreError,
     compression::{StoreCompressionConfig, decode, decode_bounded, decode_budgeted, decode_bytes, run_blocking},
     json_payload_charge, json_values_charge, json_values_fit,
     pool::apply_pool_config,
@@ -159,6 +160,22 @@ impl PostgresResponseStore {
         StoreError::Database(super::redact_connection_error(&self.redact_url, &e.to_string()))
     }
 
+    /// Encode one response object into its stored form with the active codec.
+    async fn encode_object(&self, value: &serde_json::Value) -> Result<Vec<u8>, StoreError> {
+        let json = serde_json::to_vec(value).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let mut encoded = self.compression.encode_byte_values(&[&json]).await?.into_iter();
+        let Some(payload) = encoded.next() else {
+            return Err(StoreError::Serialization("compression returned no payload".to_owned()));
+        };
+        // With `algorithm: none` the codec hands back a borrow of `json`, so the
+        // buffer we already own is the stored form: move it rather than copying
+        // the whole object on every transition. zstd allocates its own frame.
+        Ok(match payload {
+            std::borrow::Cow::Borrowed(_) => json,
+            std::borrow::Cow::Owned(frame) => frame,
+        })
+    }
+
     /// Append items at the next positions and invalidate the retired message cache.
     ///
     /// Separate from the trait method so the insert loop and cache invalidation
@@ -199,7 +216,8 @@ impl PostgresResponseStore {
         let insert_sql = format!(
             "INSERT INTO {items_table} \
              (item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (tenant_id, owner_issuer, owner_subject, item_id) DO NOTHING"
         );
         for (i, item) in items.iter().enumerate() {
             let offset = i64::try_from(i).unwrap_or(i64::MAX);
@@ -207,7 +225,7 @@ impl PostgresResponseStore {
             let item_data =
                 serde_json::to_string(&item.item_data).map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-            sqlx::query(AssertSqlSafe(insert_sql.as_str()))
+            let result = sqlx::query(AssertSqlSafe(insert_sql.as_str()))
                 .bind(&item.item_id)
                 .bind(owner.tenant_id())
                 .bind(owner.issuer())
@@ -219,6 +237,12 @@ impl PostgresResponseStore {
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| self.db_err(&e))?;
+            if result.rows_affected() == 0 {
+                return Err(StoreError::InvalidInput(format!(
+                    "conversation item '{}' already exists",
+                    item.item_id
+                )));
+            }
         }
 
         pg_invalidate_messages(tx, conv_table, owner, conversation_id).await
@@ -727,6 +751,68 @@ impl ResponseStore for PostgresResponseStore {
             .await
             .map_err(|e| self.db_err(&e))?;
         require_owner_preserving_write(result.rows_affected(), "response")
+    }
+
+    async fn compare_and_swap_response_object(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        expected_response_object: &serde_json::Value,
+        response_object: &serde_json::Value,
+    ) -> Result<ResponseCasOutcome, StoreError> {
+        // Encode before opening the transaction: compressing a large object is
+        // the slowest step here, and `FOR UPDATE` would otherwise hold the row
+        // lock across it. The cost is a wasted encode when the comparison then
+        // fails, which is the rarer path.
+        let next = self.encode_object(response_object).await?;
+
+        // `FOR UPDATE` holds the row for the life of the transaction so the
+        // read, the comparison and the update are one atomic step and cannot
+        // interleave with a competing claimant. The begin future is boxed to
+        // keep this method inside the workspace stack-size budget.
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+
+        let select = format!(
+            "SELECT response_object FROM {} \
+             WHERE id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
+             FOR UPDATE",
+            self.tables.responses
+        );
+        let row = sqlx::query(AssertSqlSafe(select.as_str()))
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        // Owner-scoped, so another principal's record is indistinguishable
+        // from a missing one. Dropping the transaction rolls it back.
+        let Some(row) = row else {
+            return Ok(ResponseCasOutcome::NotFound);
+        };
+        let stored_bytes: Vec<u8> = row.try_get("response_object").map_err(|e| self.db_err(&e))?;
+        let stored = run_blocking(move || decode(&stored_bytes)).await?;
+        if &stored != expected_response_object {
+            return Ok(ResponseCasOutcome::Mismatch);
+        }
+
+        let update = format!(
+            "UPDATE {} SET response_object = $1 \
+             WHERE id = $2 AND tenant_id = $3 AND owner_issuer = $4 AND owner_subject = $5",
+            self.tables.responses
+        );
+        sqlx::query(AssertSqlSafe(update.as_str()))
+            .bind(&next)
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
+        Ok(ResponseCasOutcome::Applied)
     }
 
     async fn get_response(&self, owner: &StateOwner, id: &str) -> Result<Option<ResponseRecord>, StoreError> {
@@ -2561,9 +2647,9 @@ fn pg_prepare_legacy_prefix(json: &str) -> Result<Option<String>, StoreError> {
     Ok(None)
 }
 
-/// Clear the retired array cache, preserving the canonical internal prefix
-/// written at first append. Its exact leading key avoids JSON casts on malformed
-/// retired caches. The affected-row check preserves rollback if the parent vanished.
+/// Clear a stale array while preserving the canonical internal prefix written
+/// at first append. The caller holds the owner-scoped parent row lock, so an
+/// unchanged empty cache or prefix needs no conversation-row update.
 async fn pg_invalidate_messages(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     conv_table: &str,
@@ -2571,10 +2657,11 @@ async fn pg_invalidate_messages(
     conversation_id: &str,
 ) -> Result<(), StoreError> {
     let update_sql = format!(
-        "UPDATE {conv_table} SET messages = CASE WHEN left(messages, 19) = '{{\"legacy_messages\":' THEN messages ELSE '[]' END \
-         WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4"
+        "UPDATE {conv_table} SET messages = '[]' \
+         WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
+         AND (messages IS NULL OR (messages <> '[]' AND left(messages, 19) <> '{{\"legacy_messages\":'))"
     );
-    let updated = sqlx::query(AssertSqlSafe(update_sql.as_str()))
+    sqlx::query(AssertSqlSafe(update_sql.as_str()))
         .bind(conversation_id)
         .bind(owner.tenant_id())
         .bind(owner.issuer())
@@ -2582,12 +2669,6 @@ async fn pg_invalidate_messages(
         .execute(&mut **tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
-
-    if updated.rows_affected() == 0 {
-        return Err(StoreError::Database(format!(
-            "conversation disappeared during message sync: {conversation_id}"
-        )));
-    }
 
     Ok(())
 }
@@ -2911,6 +2992,72 @@ mod tests {
     use std::sync::{Arc, Mutex, Weak};
 
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    #[expect(clippy::too_many_lines, reason = "one cache-state matrix observes row updates")]
+    async fn invalidation_updates_only_stale_or_null_caches() {
+        let url = std::env::var("DATABASE_URL").expect("disposable test database");
+        let pool = PgPoolOptions::new().connect(&url).await.unwrap();
+        let owner = StateOwner::from_trusted_parts("tenant", "issuer", "subject").unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "CREATE TEMP TABLE nullable_conversations AS SELECT 'c'::text AS conversation_id, \
+             'tenant'::text AS tenant_id, 'issuer'::text AS owner_issuer, 'subject'::text AS owner_subject, \
+             NULL::text AS messages",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        for (cache, expected, writes) in [
+            (None, "[]", 1),
+            (Some("[]"), "[]", 0),
+            (Some("{\"legacy_messages\":[]}"), "{\"legacy_messages\":[]}", 0),
+            (Some("[1]"), "[]", 1),
+        ] {
+            sqlx::query(
+                "UPDATE nullable_conversations SET messages = $1 \
+                 WHERE conversation_id = $2 AND tenant_id = $3 AND owner_issuer = $4 AND owner_subject = $5",
+            )
+            .bind(cache)
+            .bind("c")
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            let updates_before: i64 = sqlx::query_scalar(
+                "SELECT pg_stat_get_xact_tuples_updated('pg_temp.nullable_conversations'::regclass)",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            pg_invalidate_messages(&mut tx, "nullable_conversations", &owner, "c")
+                .await
+                .unwrap();
+            let updates_after: i64 = sqlx::query_scalar(
+                "SELECT pg_stat_get_xact_tuples_updated('pg_temp.nullable_conversations'::regclass)",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            assert_eq!(updates_after - updates_before, writes, "cache: {cache:?}");
+            let messages: Option<String> = sqlx::query_scalar(
+                "SELECT messages FROM nullable_conversations \
+                 WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4",
+            )
+            .bind("c")
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+            assert_eq!(messages.as_deref(), Some(expected));
+        }
+    }
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]

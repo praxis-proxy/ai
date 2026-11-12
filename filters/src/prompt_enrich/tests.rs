@@ -8,6 +8,29 @@ use praxis_filter::{BodyAccess, BodyMode, FilterAction};
 
 use super::PromptEnrichFilter;
 
+#[tokio::test]
+async fn explicit_body_limit_rejects_before_parsing_invalid_json() {
+    let yaml = serde_yaml::from_str("max_body_bytes: 32\nprepend: [{role: system, content: hello}]").unwrap();
+    let filter = PromptEnrichFilter::from_config(&yaml).unwrap();
+    assert!(matches!(
+        filter.request_body_mode(),
+        BodyMode::StreamBuffer { max_bytes: None }
+    ));
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    for size in [32, 33] {
+        let mut body = Some(Bytes::from(vec![b'x'; size]));
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        if size == 32 {
+            assert!(matches!(action, FilterAction::Continue));
+        } else {
+            assert!(matches!(action, FilterAction::Reject(r) if r.status == 413));
+        }
+        assert_eq!(body.as_ref().unwrap().as_ref(), vec![b'x'; size]);
+    }
+}
+
+
 // -----------------------------------------------------------------------------
 // Config Tests
 // -----------------------------------------------------------------------------
@@ -545,7 +568,7 @@ fn body_access_is_read_write() {
 }
 
 #[test]
-fn body_mode_is_stream_buffer_with_configured_limit() {
+fn body_mode_inherits_pipeline_even_with_processing_limit() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 max_body_bytes: 2097152
@@ -557,13 +580,8 @@ prepend:
     .unwrap();
     let filter = PromptEnrichFilter::from_config(&yaml).unwrap();
     assert!(
-        matches!(
-            filter.request_body_mode(),
-            BodyMode::StreamBuffer {
-                max_bytes: Some(2_097_152)
-            }
-        ),
-        "body mode should be StreamBuffer with configured limit"
+        matches!(filter.request_body_mode(), BodyMode::StreamBuffer { max_bytes: None }),
+        "buffering inherits the pipeline; the configured limit is enforced before parsing"
     );
 }
 
