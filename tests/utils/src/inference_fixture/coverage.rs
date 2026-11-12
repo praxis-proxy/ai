@@ -1191,6 +1191,7 @@ mod tests {
         }
     }
 
+    /// The committed scenarios, recordings, and manifest remain an exact inventory.
     #[expect(
         clippy::too_many_lines,
         reason = "the test deliberately asserts every committed fixture field"

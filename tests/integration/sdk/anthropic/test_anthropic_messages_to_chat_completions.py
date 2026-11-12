@@ -85,6 +85,7 @@ class RecordingBackend(BaseHTTPRequestHandler):
     error_response_once = False
 
     def do_POST(self):
+        """Record a request and return the configured Chat Completions response."""
         length = int(self.headers.get("content-length", "0"))
         body = json.loads(self.rfile.read(length))
         RecordingBackend.bodies.append(body)
