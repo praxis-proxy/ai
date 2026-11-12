@@ -71,13 +71,15 @@ const UTF8_BUFFER_KEY: &str = "anthropic_stream.utf8_buffer";
 /// Metadata key indicating the filter is armed for streaming transformation.
 const ARMED_KEY: &str = "anthropic_stream.armed";
 
-/// Per-tool content-block state retained outside bounded routing metadata.
+/// Per-response stream state retained outside bounded routing metadata.
 #[derive(Default)]
-struct ToolBlocksState {
+struct StreamResponseState {
     /// Stable Anthropic block index and open/closed state by upstream key.
     blocks: HashMap<String, ToolBlockState>,
     /// Number of distinct content blocks opened during this response.
     opened_count: usize,
+    /// Client stop sequence the upstream reported as matched.
+    stop_sequence: Option<String>,
 }
 
 /// State for one translated tool-call content block.
@@ -86,13 +88,6 @@ struct ToolBlockState {
     index: u32,
     /// Whether the block still needs a terminal stop event.
     open: bool,
-}
-
-/// Response data that may exceed the bounded routing metadata value size.
-#[derive(Default)]
-struct StreamResponseState {
-    /// Client stop sequence the upstream reported as matched.
-    stop_sequence: Option<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -853,7 +848,7 @@ fn emit_tool_block_start(
     );
     set_tool_block_index(ctx, tool_call_key, idx);
     set_tool_block_open(ctx, tool_call_key, true);
-    if let Some(state) = ctx.get_filter_state_mut::<ToolBlocksState>() {
+    if let Some(state) = ctx.get_filter_state_mut::<StreamResponseState>() {
         state.opened_count += 1;
     }
     increment_block_index(ctx);
@@ -1104,16 +1099,16 @@ fn increment_block_index(ctx: &mut HttpFilterContext<'_>) {
 
 /// Return how many tool-call content blocks have opened this response.
 fn get_tool_block_count(ctx: &HttpFilterContext<'_>) -> usize {
-    ctx.get_filter_state::<ToolBlocksState>()
+    ctx.get_filter_state::<StreamResponseState>()
         .map_or(0, |state| state.opened_count)
 }
 
 /// Record the Anthropic block index assigned to an OpenAI tool-call index.
 fn set_tool_block_index(ctx: &mut HttpFilterContext<'_>, tool_call_key: &str, idx: u32) {
-    if ctx.get_filter_state::<ToolBlocksState>().is_none() {
-        ctx.insert_filter_state(ToolBlocksState::default());
+    if ctx.get_filter_state::<StreamResponseState>().is_none() {
+        ctx.insert_filter_state(StreamResponseState::default());
     }
-    if let Some(state) = ctx.get_filter_state_mut::<ToolBlocksState>() {
+    if let Some(state) = ctx.get_filter_state_mut::<StreamResponseState>() {
         state.blocks.insert(
             tool_call_key.to_owned(),
             ToolBlockState {
@@ -1126,7 +1121,7 @@ fn set_tool_block_index(ctx: &mut HttpFilterContext<'_>, tool_call_key: &str, id
 
 /// Return the Anthropic block index assigned to an OpenAI tool-call index.
 fn get_tool_block_index(ctx: &HttpFilterContext<'_>, tool_call_key: &str) -> Option<u32> {
-    ctx.get_filter_state::<ToolBlocksState>()
+    ctx.get_filter_state::<StreamResponseState>()
         .and_then(|state| state.blocks.get(tool_call_key))
         .map(|block| block.index)
 }
@@ -1134,7 +1129,7 @@ fn get_tool_block_index(ctx: &HttpFilterContext<'_>, tool_call_key: &str) -> Opt
 /// Record whether a tool call's Anthropic content block remains open.
 fn set_tool_block_open(ctx: &mut HttpFilterContext<'_>, tool_call_key: &str, open: bool) {
     if let Some(block) = ctx
-        .get_filter_state_mut::<ToolBlocksState>()
+        .get_filter_state_mut::<StreamResponseState>()
         .and_then(|state| state.blocks.get_mut(tool_call_key))
     {
         block.open = open;
@@ -1143,7 +1138,7 @@ fn set_tool_block_open(ctx: &mut HttpFilterContext<'_>, tool_call_key: &str, ope
 
 /// Check whether a tool call's Anthropic content block is currently open.
 fn is_tool_block_open(ctx: &HttpFilterContext<'_>, tool_call_key: &str) -> bool {
-    ctx.get_filter_state::<ToolBlocksState>()
+    ctx.get_filter_state::<StreamResponseState>()
         .and_then(|state| state.blocks.get(tool_call_key))
         .is_some_and(|block| block.open)
 }
@@ -1151,7 +1146,7 @@ fn is_tool_block_open(ctx: &HttpFilterContext<'_>, tool_call_key: &str) -> bool 
 /// Return open tool blocks ordered by their Anthropic content block index.
 fn open_tool_blocks(ctx: &HttpFilterContext<'_>) -> Vec<(u32, String)> {
     let mut blocks = ctx
-        .get_filter_state::<ToolBlocksState>()
+        .get_filter_state::<StreamResponseState>()
         .into_iter()
         .flat_map(|state| state.blocks.iter())
         .filter(|(_, block)| block.open)
@@ -1819,6 +1814,32 @@ mod tests {
     }
 
     #[test]
+    fn matched_stop_sequence_preserves_open_tool_block_state() {
+        let (filter, mut ctx) = make_filter_and_context();
+        ctx.extensions
+            .insert(crate::anthropic::messages_to_chat_completions::ClientStopSequences(
+                vec![",".to_owned()],
+            ));
+
+        let tool_start = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},\"index\":0}]}\n\n";
+        let mut body1 = Some(Bytes::from(tool_start));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let matched_stop = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\",\"stop_reason\":\",\"}]}\n\n";
+        let mut body2 = Some(Bytes::from(matched_stop));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let mut body3 = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut body3, false).unwrap());
+
+        let out = String::from_utf8(body3.unwrap().to_vec()).unwrap();
+        assert_eq!(out.matches("event: content_block_stop").count(), 1);
+        let delta = event_data(&out, "message_delta").get("delta").unwrap().clone();
+        assert_eq!(delta.get("stop_reason").and_then(Value::as_str), Some("stop_sequence"));
+        assert_eq!(delta.get("stop_sequence").and_then(Value::as_str), Some(","));
+    }
+
+    #[test]
     fn tool_call_delta_emits_tool_use_block_and_input_delta() {
         let (filter, mut ctx) = make_filter_and_context();
 
@@ -1872,7 +1893,7 @@ mod tests {
         drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
         let first_output = String::from_utf8(body.take().unwrap().to_vec()).unwrap();
         assert_eq!(first_output.matches("event: content_block_start").count(), 64);
-        assert_eq!(ctx.get_filter_state::<ToolBlocksState>().unwrap().blocks.len(), 64);
+        assert_eq!(ctx.get_filter_state::<StreamResponseState>().unwrap().blocks.len(), 64);
         assert_eq!(open_tool_blocks(&ctx).len(), 64);
 
         let mut done = Some(Bytes::from("data: [DONE]\n\n"));
@@ -1888,14 +1909,14 @@ mod tests {
         ctx.current_filter_id = Some(0);
         set_tool_block_index(&mut ctx, "first", 0);
         set_tool_block_open(&mut ctx, "first", true);
-        ctx.get_filter_state_mut::<ToolBlocksState>().unwrap().opened_count = 1;
+        ctx.get_filter_state_mut::<StreamResponseState>().unwrap().opened_count = 1;
 
         ctx.current_filter_id = Some(1);
         assert_eq!(get_tool_block_count(&ctx), 0);
         assert!(open_tool_blocks(&ctx).is_empty());
         set_tool_block_index(&mut ctx, "second", 0);
         set_tool_block_open(&mut ctx, "second", true);
-        ctx.get_filter_state_mut::<ToolBlocksState>().unwrap().opened_count = 1;
+        ctx.get_filter_state_mut::<StreamResponseState>().unwrap().opened_count = 1;
 
         ctx.current_filter_id = Some(0);
         assert_eq!(get_tool_block_count(&ctx), 1);
