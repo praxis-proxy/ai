@@ -4841,18 +4841,52 @@ class TestResponsesReasoningVLLM:
         assert stored.output[0].model_dump() == final.output[0].model_dump()
 
     @pytest.mark.parametrize("streaming", [False, True])
-    def test_reasoning_summary_request_is_rejected(self, reasoning_client, streaming):
-        """vLLM has no safe-summary contract, so a summary request is a 400."""
+    def test_reasoning_summary_auto_is_best_effort(self, reasoning_client, streaming):
+        """`auto` asks for a summary if one is cheap; vLLM answers without one.
+
+        Codex 0.166.0 sends `reasoning.summary: "auto"` on every request, so
+        rejecting it broke a real client rather than surfacing a capability gap.
+        The request must reach the backend and come back with no summary items.
+        """
+        response = reasoning_client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="What is 2+2? Think briefly, then answer.",
+            reasoning={"summary": "auto"},
+            temperature=0,
+            stream=streaming,
+            store=False,
+            max_output_tokens=1024,
+        )
+        if streaming:
+            terminals = [
+                event for event in response
+                if event.type in ("response.completed", "response.incomplete")
+            ]
+            assert terminals, "a best-effort summary request must complete rather than fail closed"
+            output = terminals[-1].response.output
+        else:
+            # The contract under test is "not rejected"; a reasoning model may
+            # still stop at the token cap, which is not a summary failure.
+            assert response.status in ("completed", "incomplete"), response.status
+            output = response.output
+        for item in output:
+            if item.type == "reasoning":
+                assert item.summary == [], "a best-effort summary must stay empty"
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    @pytest.mark.parametrize("summary", ["concise", "detailed"])
+    def test_explicit_reasoning_summary_request_is_rejected(self, reasoning_client, streaming, summary):
+        """vLLM has no safe-summary contract, so an explicit request is a 400."""
         with pytest.raises(BadRequestError) as exc_info:
             reasoning_client.responses.create(
                 model=CHAT_TRANSLATION_MODEL,
                 input="What is 2+2?",
-                reasoning={"summary": "auto"},
+                reasoning={"summary": summary},
                 stream=streaming,
                 store=False,
                 max_output_tokens=64,
             )
-        assert exc_info.value.status_code == 400, "reasoning summary request must return 400"
+        assert exc_info.value.status_code == 400, "explicit reasoning summary request must return 400"
 
     def test_non_object_reasoning_is_rejected(self, reasoning_client):
         """A proxy-owned `reasoning` field that is neither object nor null is a 400."""
@@ -4959,6 +4993,66 @@ class TestResponsesReasoningVLLM:
         assert assistant is not None, messages
         assert assistant.get("content") == "Done.", assistant
         assert assistant.get("reasoning") == "I picked 42.", assistant
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_reasoning_summary_auto_is_best_effort_against_a_capture(
+        self, reasoning_capture_client, streaming,
+    ):
+        """`auto` is forwarded with no summary and answered with no summary.
+
+        The mock Chat backend emits reasoning, so the summary assertion does not
+        depend on live model output: whatever reasoning comes back, its summary
+        must stay empty.
+        """
+        client, forwarded = reasoning_capture_client
+        before = len(forwarded)
+        response = client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="What is 2+2?",
+            reasoning={"summary": "auto"},
+            stream=streaming,
+            store=False,
+            max_output_tokens=64,
+        )
+        if streaming:
+            terminals = [
+                event for event in response if event.type == "response.completed"
+            ]
+            assert terminals, "a best-effort summary request must complete rather than fail closed"
+            resource = terminals[-1].response
+        else:
+            assert response.status in ("completed", "incomplete"), response.status
+            resource = response
+        output = resource.output
+
+        assert resource.reasoning.summary == "auto", resource.reasoning
+
+        seen = forwarded[before:]
+        assert len(seen) == 1, seen
+        assert "summary" not in seen[0], seen[0]
+        assert "generate_summary" not in seen[0], seen[0]
+
+        for item in output:
+            if item.type == "reasoning":
+                assert item.summary == [], "a best-effort summary must stay empty"
+
+    @pytest.mark.parametrize("summary", ["concise", "detailed"])
+    def test_explicit_reasoning_summary_is_rejected_against_a_capture(
+        self, reasoning_capture_client, summary,
+    ):
+        """An explicit summary value still fails closed before the backend."""
+        client, forwarded = reasoning_capture_client
+        before = len(forwarded)
+        with pytest.raises(BadRequestError) as exc_info:
+            client.responses.create(
+                model=CHAT_TRANSLATION_MODEL,
+                input="What is 2+2?",
+                reasoning={"summary": summary},
+                store=False,
+                max_output_tokens=64,
+            )
+        assert exc_info.value.status_code == 400
+        assert forwarded[before:] == [], "a rejected summary must not reach the backend"
 
     def test_reasoning_only_stored_continuation(self, reasoning_capture_client):
         client, forwarded = reasoning_capture_client

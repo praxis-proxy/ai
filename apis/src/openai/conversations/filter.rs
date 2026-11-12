@@ -68,6 +68,13 @@ use crate::{
 /// Core per-IP state bounds and eviction apply. Shadow mode records decisions
 /// without rejecting. Successful local responses do not gain rate-limit headers.
 ///
+/// Local validation errors return OpenAI JSON 400, missing owner-scoped resources
+/// return 404, and storage failures return a generic JSON 500. Error envelopes
+/// always include `message`, `type`, `code`, and `param` (the latter two may be
+/// null). Initial items commit atomically with their new conversation. Item deletion
+/// returns conversation metadata captured under the same mutation lock, without
+/// a fallible post-commit read.
+///
 /// For a managed `POST /v1/responses` with `conversation`, completed JSON and
 /// SSE responses append the request input and final output items to the local
 /// Conversation. Streaming append-back reads the canonical terminal response
@@ -1055,6 +1062,8 @@ fn reject_store_unavailable() -> Rejection {
         "error": {
             "message": "Internal server error.",
             "type": "server_error",
+            "code": null,
+            "param": null,
         }
     });
     Rejection::status(500)
@@ -1068,6 +1077,8 @@ fn reject_classifier_unavailable() -> Rejection {
         "error": {
             "message": "Internal server error.",
             "type": "server_error",
+            "code": null,
+            "param": null,
         }
     });
     Rejection::status(500)

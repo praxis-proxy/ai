@@ -1321,6 +1321,8 @@ mod tests {
                 vec!["responses_native_passthrough"],
                 vec!["openai_chat_completions_to_anthropic_messages"],
                 vec!["openai_responses_to_chat_completions"],
+                vec!["openai_chat_completions_to_anthropic_messages"],
+                vec!["openai_chat_completions_to_anthropic_messages"],
                 vec!["openai_responses_to_chat_completions"],
                 vec!["responses_native_passthrough"],
             ]
@@ -1425,11 +1427,13 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 93, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 72, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 77, "manifest recording inventory count");
+        assert_eq!(report.features_total, 95, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 73, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 78, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1458,6 +1462,7 @@ mod tests {
                 "messages/upstream-error-stream",
                 "messages/upstream-error-unknown-type",
                 "openai_legacy/anthropic-json-sse-error",
+                "openai_legacy/anthropic-version-sampling",
                 "responses/agentic-deferred-mcp-connectors",
                 "responses/agentic-parallel-tool-calls",
                 "responses/agentic-status-less-function-call",
@@ -1507,7 +1512,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 93, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 95, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1926,6 +1931,14 @@ mod tests {
                     &vec!["responses/chat-orphan-tool-output".to_owned()]
                 ),
                 (
+                    &"external_model.anthropic.request.legacy_sampling".to_owned(),
+                    &vec!["openai_legacy/anthropic-json-sse-error".to_owned()]
+                ),
+                (
+                    &"external_model.anthropic.request.version_sampling".to_owned(),
+                    &vec!["openai_legacy/anthropic-version-sampling".to_owned()]
+                ),
+                (
                     &"responses.chat.access_programs".to_owned(),
                     &vec![
                         "responses/chat-basic-nonstream".to_owned(),
@@ -2106,7 +2119,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)],
         );
-        for feature in &manifest.features[62..93] {
+        for feature in &manifest.features[62..95] {
             assert_eq!(
                 feature
                     .providers

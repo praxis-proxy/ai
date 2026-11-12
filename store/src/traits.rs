@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use crate::{
     owner::StateOwner,
     types::{
-        BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-        ResponseCasOutcome, ResponseEventRecord, ResponseRecord, StoreError, SweepStats,
+        BudgetedRecord, ConversationItemRecord, ConversationRecord, ConversationSnapshot, EventLogStatus,
+        PendingApprovalRecord, ResponseCasOutcome, ResponseEventRecord, ResponseRecord, StoreError, SweepStats,
     },
 };
 
@@ -473,6 +473,23 @@ pub trait ConversationItemStore: Send + Sync {
     /// would replace a preserved legacy prefix.
     async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError>;
 
+    /// Insert a new conversation and its initial items in one commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without writing rows on collision or persistence failure.
+    /// Backends must opt in rather than falling back to partially committed writes.
+    async fn create_conversation_with_items(
+        &self,
+        _record: &ConversationRecord,
+        _items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement atomic conversation creation".to_owned(),
+        ))
+    }
+
+
     /// Update only the legacy message cache for a conversation.
     ///
     /// Returns `true` if a record was updated, `false` if no matching
@@ -736,6 +753,28 @@ pub trait ConversationItemStore: Send + Sync {
     ) -> Result<(), StoreError> {
         Err(StoreError::Unavailable(
             "backend does not implement bounded conversation appends".to_owned(),
+        ))
+    }
+
+    /// Delete an item and return public conversation fields from the same lock.
+    ///
+    /// The snapshot is captured after acquiring the parent lock and before
+    /// committing the deletion and cache invalidation. No fallible read follows
+    /// commit. Returns `None` when the item is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] for a missing or foreign-owned parent.
+    /// Any failure preserves the item. Backends without this atomic boundary
+    /// fail closed with [`StoreError::Unavailable`].
+    async fn delete_item_and_get_conversation(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<ConversationSnapshot>, StoreError> {
+        Err(StoreError::Unavailable(
+            "backend does not implement atomic item deletion snapshots".to_owned(),
         ))
     }
 

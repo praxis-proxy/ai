@@ -3208,7 +3208,6 @@ fn reasoning_stream_with_no_raw_reasoning_only_emits_the_answer() {
     assert!(!events.iter().any(|(name, _)| name.contains("reasoning")));
 }
 
-
 #[test]
 fn late_reasoning_replay_position_is_published_once_only_after_success() {
     for finish_reason in ["stop", "tool_calls", "length", "content_filter"] {
