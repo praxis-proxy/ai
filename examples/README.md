@@ -62,7 +62,7 @@ for how these are authored and regenerated.
 | [model-to-header-routing.yaml](configs/model-to-header-routing.yaml) | Routes LLM API requests to different backends based on the "model" field in the JSON request body |
 | [model-to-header-trust-existing.yaml](configs/model-to-header-trust-existing.yaml) | Routes on a model header that a trusted hop in front of Praxis has already set, skipping the filter entirely when the header is present |
 | [model-to-provider.yaml](configs/model-to-provider.yaml) | Map a stable public model ID to an existing upstream cluster and target model |
-| [multimodal-routing.yaml](configs/multimodal-routing.yaml) | Derives a proxy-owned modality fact from OpenAI-style message content |
+| [multimodal-routing.yaml](configs/multimodal-routing.yaml) | The existing protocol request filter derives a proxy-owned modality fact from structured message content |
 | [nemo-guardrails-response.yaml](configs/nemo-guardrails-response.yaml) | Evaluates upstream responses against a NeMo Guardrails service |
 | [nemo-guardrails-service-account.yaml](configs/nemo-guardrails-service-account.yaml) | Sends the pod's service account token on Praxis's calls to NeMo, so kube-rbac-proxy can decide whether Praxis is allowed to call |
 | [nemo-guardrails.yaml](configs/nemo-guardrails.yaml) | Evaluates incoming requests against a NeMo Guardrails service |
