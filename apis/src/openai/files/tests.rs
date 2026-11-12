@@ -16,9 +16,12 @@ use super::{
     routes::{FilesOperationSpec, operation_specs},
 };
 use crate::{
-    openai::operation::conformance::{
-        OperationKey, assert_matches_schema, generated_operation_keys, generated_response_schemas, resolve_schema_ref,
-        schema_matches_value,
+    openai::{
+        error::ErrorResponse,
+        operation::conformance::{
+            OperationKey, assert_matches_schema, generated_operation_keys, generated_response_schemas,
+            resolve_schema_ref, schema_matches_value,
+        },
     },
     operation::Transport,
     operation_classifier::classify,
@@ -144,6 +147,58 @@ fn conformance_files_success_payloads_match_generated_response_schemas() {
     assert_eq!(binary["type"], "string");
     assert_eq!(binary["format"], "binary");
     println!("PRAXIS_CONFORMANCE_OK files success_response_contract");
+}
+
+/// Error bodies with `code`/`param` null and set.
+fn error_samples() -> [Value; 2] {
+    [
+        payload(&ErrorResponse::new("bad request", "invalid_request_error", None, None)),
+        payload(&ErrorResponse::new(
+            "no such file",
+            "invalid_request_error",
+            Some("file_not_found"),
+            Some("file_id"),
+        )),
+    ]
+}
+
+/// Relevant portion of the pinned `OpenAPI` reference.
+#[derive(serde::Deserialize)]
+struct PinnedReference {
+    /// Pinned paths by template and lowercase method.
+    paths: BTreeMap<String, BTreeMap<String, Value>>,
+}
+
+#[test]
+fn conformance_files_error_responses_match_pinned_contract() {
+    let pinned: PinnedReference =
+        serde_yaml::from_str(include_str!("../../../../docs/conformance/specs/openai-openapi.yaml")).unwrap();
+    let spec = generated_openapi_spec();
+    let samples = error_samples();
+
+    for operation in operation_specs() {
+        let method = operation.method().as_str().to_lowercase();
+        let label = format!("{method} {}", operation.spec_path);
+        let pinned_responses = pinned.paths[operation.spec_path][&method]["responses"]
+            .as_object()
+            .unwrap();
+        let generated_responses = spec["paths"][operation.spec_path][&method]["responses"]
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            pinned_responses.keys().collect::<Vec<_>>(),
+            generated_responses.keys().collect::<Vec<_>>(),
+            "{label}: generated statuses must equal the pinned statuses"
+        );
+        for (status, response) in generated_responses.iter().filter(|(status, _)| *status != "200") {
+            let schema = &response["content"]["application/json"]["schema"];
+            assert!(schema.is_object(), "{label} {status} must declare a JSON error schema");
+            for value in &samples {
+                assert_matches_schema(&spec, &format!("{label} {status}"), schema, value);
+            }
+        }
+    }
+    println!("PRAXIS_CONFORMANCE_OK files error_response_contract");
 }
 
 #[test]

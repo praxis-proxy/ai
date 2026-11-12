@@ -141,8 +141,12 @@ generated operation identity three ways and runs in `make lint`.
   `status` is always present (`processed`); `expires_at` and `status_details`
   are omitted when absent; an empty list has `first_id` and `last_id` set to
   `""`.
-- **Error responses.** None are declared until a handler produces them, by the
-  same rule as [Rate-limit response ownership](#rate-limit-response-ownership).
+- **Error responses.** All pinned error responses (400/404/429/500, the shared
+  `ErrorResponse` envelope, no `Retry-After` on 429) are declared as contract
+  groundwork and validated through DTO instances, like the success schemas.
+  While operations are `passthrough`, upstream produces them and Praxis forwards
+  them unchanged. The registry test blocks switching an operation to `local`
+  until handler-produced rejection tests exist for every declared status.
 - **Authentication.** Deployment-owned, as for Conversations. The Files scope
   uses `without_inherited_security()` so the pinned global bearer requirement
   is not compared against the passthrough routes, which do not authenticate; see
@@ -159,7 +163,9 @@ reuses the core request limiter. It runs after classification and trusted owner
 resolution, before store access, and covers all eight local operations. Its
 adapter adds the OpenAI JSON error envelope while preserving the core limiter's
 `Retry-After` and rate-limit headers. The operation registry declares the shared
-429 body and optional retry header from runtime contract types.
+429 body and optional retry header from runtime contract types. This producer
+rule applies to `local` operations; `passthrough` contracts (Files) describe
+the forwarded wire contract.
 
 `mode: global` shares a budget across callers of that filter instance;
 `mode: per_ip` groups requests by their TCP peer address, independently of the

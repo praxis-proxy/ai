@@ -129,12 +129,12 @@ macro_rules! operation_contract {
                         description: "Minimum integer seconds to wait before retrying, when a delay can be computed.",
                         schema: super::rate_limit::retry_after_schema,
                     }],
-                    content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!(super::error::ErrorResponse<'static>))],
+                    content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!(crate::openai::error::ErrorResponse<'static>))],
                 }, $(ResponseSpec {
                     status: $status,
                     description: "Conversations error",
                     headers: &[],
-                    content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!(super::error::ErrorResponse<'static>))],
+                    content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!(crate::openai::error::ErrorResponse<'static>))],
                 }),*],
             })
         }

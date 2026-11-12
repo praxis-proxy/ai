@@ -108,6 +108,11 @@ const FILES_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
         evidence: "openai::files::tests::conformance_files_generated_schema_check_rejects_invalid_payload",
         success_sentinel: "PRAXIS_CONFORMANCE_OK files schema_check_sensitivity",
     },
+    RuntimeVerificationCheck {
+        kind: "error_response_contract",
+        evidence: "openai::files::tests::conformance_files_error_responses_match_pinned_contract",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK files error_response_contract",
+    },
 ];
 
 /// Evidence-backed discrepancies for Files operations.

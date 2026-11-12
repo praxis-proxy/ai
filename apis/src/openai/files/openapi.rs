@@ -73,7 +73,7 @@ mod tests {
         for (path, item) in document["paths"].as_object().unwrap() {
             for (method, operation) in item.as_object().unwrap() {
                 let statuses = operation["responses"].as_object().unwrap().keys().collect::<Vec<_>>();
-                assert_eq!(statuses, ["200"], "{method} {path}");
+                assert!(statuses.contains(&&"200".to_owned()), "{method} {path}");
             }
         }
     }

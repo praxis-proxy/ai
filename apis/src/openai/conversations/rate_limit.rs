@@ -21,7 +21,7 @@ pub(super) fn retry_after_schema() -> RefOr<Schema> {
 
 /// Add the OpenAI envelope while preserving the core limiter's status and headers.
 pub(super) fn format_rejection(rejection: Rejection) -> Result<Rejection, FilterError> {
-    let body = super::error::ErrorResponse::new(
+    let body = crate::openai::error::ErrorResponse::new(
         "Rate limit exceeded. Please retry after the indicated delay.",
         "rate_limit_error",
         Some("rate_limit_exceeded"),

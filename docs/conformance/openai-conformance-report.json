@@ -796,91 +796,15 @@
         "implementation_source": "generated:praxis-ai-apis/openai/files",
         "operation_contracts": {
           "total": 5,
-          "exact": 0,
+          "exact": 5,
           "missing": 0,
-          "drifted": 5,
+          "drifted": 0,
           "request_drifted": 0,
-          "response_drifted": 5,
+          "response_drifted": 0,
           "other_drifted": 0,
-          "exact_percent": 0.0,
+          "exact_percent": 100.0,
           "missing_operations": [],
-          "drifted_operations": [
-            {
-              "operation": {
-                "method": "DELETE",
-                "path": "/files/{file_id}",
-                "operation": "DELETE /files/{file_id}"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "GET",
-                "path": "/files",
-                "operation": "GET /files"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "GET",
-                "path": "/files/{file_id}",
-                "operation": "GET /files/{file_id}"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "GET",
-                "path": "/files/{file_id}/content",
-                "operation": "GET /files/{file_id}/content"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "POST",
-                "path": "/files",
-                "operation": "POST /files"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            }
-          ]
+          "drifted_operations": []
         },
         "inherited_contract": {
           "exact": true,
@@ -954,18 +878,18 @@
             "evidence": "praxis-ai-apis/openai/files/contracts.rs: OpenAiFile derived schema"
           }
         ],
-        "all_exact": false
+        "all_exact": true
       }
     ],
     "operation_contracts": {
       "total": 14,
-      "exact": 8,
+      "exact": 13,
       "missing": 0,
-      "drifted": 6,
+      "drifted": 1,
       "request_drifted": 0,
-      "response_drifted": 6,
+      "response_drifted": 1,
       "other_drifted": 0,
-      "exact_percent": 57.14285714285714,
+      "exact_percent": 92.85714285714286,
       "by_area": [
         {
           "area": "Conversations",
@@ -981,13 +905,13 @@
         {
           "area": "Files",
           "total": 5,
-          "conformant": 0,
+          "conformant": 5,
           "missing": 0,
-          "drifted": 5,
+          "drifted": 0,
           "request_drifted": 0,
-          "response_drifted": 5,
+          "response_drifted": 0,
           "other_drifted": 0,
-          "conformance_percent": 0.0
+          "conformance_percent": 100.0
         },
         {
           "area": "Responses",
@@ -1022,99 +946,14 @@
     "all_exact": false,
     "fixes_required": {
       "summary": {
-        "operations_to_fix": 6,
+        "operations_to_fix": 1,
         "area_contracts_to_fix": 0,
         "missing_operations": 0,
         "request_drift_operations": 0,
-        "response_drift_operations": 6,
+        "response_drift_operations": 1,
         "other_drift_operations": 0
       },
       "by_operation": [
-        {
-          "operation": {
-            "method": "DELETE",
-            "path": "/files/{file_id}",
-            "operation": "DELETE /files/{file_id}"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "GET",
-            "path": "/files",
-            "operation": "GET /files"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "GET",
-            "path": "/files/{file_id}",
-            "operation": "GET /files/{file_id}"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "GET",
-            "path": "/files/{file_id}/content",
-            "operation": "GET /files/{file_id}/content"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "POST",
-            "path": "/files",
-            "operation": "POST /files"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
         {
           "operation": {
             "method": "POST",
@@ -1223,6 +1062,10 @@
           {
             "kind": "schema_check_sensitivity",
             "evidence": "openai::files::tests::conformance_files_generated_schema_check_rejects_invalid_payload"
+          },
+          {
+            "kind": "error_response_contract",
+            "evidence": "openai::files::tests::conformance_files_error_responses_match_pinned_contract"
           }
         ]
       }

@@ -9,12 +9,14 @@
 //! upload is `multipart/form-data` and the download returns opaque bytes, so
 //! neither can be classified by inspecting a JSON body.
 //!
-//! Each operation declares its owned contract (parameters, request body, and
-//! response) once, and the runtime request-body shape is derived from that same
-//! declaration so the two cannot diverge. Entries stay `Passthrough` until local
-//! handlers land; generation and conformance comparison follow the declared
-//! contract, not the handling mode. Operation IDs are the official ones
-//! from the pinned OpenAI specification, reproduced verbatim including
+//! Each operation declares its owned contract (parameters, request body,
+//! success response, and pinned error responses) once, and the runtime
+//! request-body shape is derived from that same declaration so the two cannot
+//! diverge. Entries stay `Passthrough` until local handlers land, so the
+//! success and error responses are contract groundwork; generation and
+//! conformance comparison follow the declared contract, not the handling mode.
+//! Operation IDs are the official ones from the pinned OpenAI specification,
+//! reproduced verbatim including
 //! upstream's casing.
 
 use std::ops::Deref;
@@ -24,6 +26,8 @@ use super::contracts::{
     CreateFileRequest, DeleteFileResponse, FileContent, ListFilesResponse, OpenAiFile, list_files_limit_schema,
     list_files_order_schema,
 };
+#[cfg(feature = "openai-files")]
+use crate::openai::error::ErrorResponse;
 #[cfg(feature = "openai-files")]
 use crate::openai::operation::{
     MediaTypeSpec, OwnedOperationContract, RequestBodySpec, ResponseSpec, path_parameter, query_parameter,
@@ -114,7 +118,8 @@ macro_rules! operation_contract {
         {
             parameters: [$($parameter:expr),* $(,)?],
             request: $request:tt,
-            response: $response:tt $(,)?
+            response: $response:tt,
+            errors: [$($status:literal),* $(,)?] $(,)?
         }
     ) => {{
         #[cfg(feature = "openai-files")]
@@ -122,12 +127,20 @@ macro_rules! operation_contract {
             Some(OwnedOperationContract {
                 parameters: &[$($parameter),*],
                 request: request_binding!($request),
-                responses: &[ResponseSpec {
-                    status: "200",
-                    headers: &[],
-                    description: "OK",
-                    content: &[response_binding!($response)],
-                }],
+                responses: &[
+                    ResponseSpec {
+                        status: "200",
+                        headers: &[],
+                        description: "OK",
+                        content: &[response_binding!($response)],
+                    },
+                    $(ResponseSpec {
+                        status: $status,
+                        headers: &[],
+                        description: "Files error",
+                        content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!(ErrorResponse<'static>))],
+                    }),*
+                ],
             })
         }
         #[cfg(not(feature = "openai-files"))]
@@ -152,7 +165,15 @@ macro_rules! request_body_shape {
 /// Reads the same `request:` token as `operation_contract!`, so the body shape
 /// and the generated contract cannot drift apart.
 macro_rules! contract_request_body {
-    ({ parameters: [$($parameter:expr),* $(,)?],request: $request:tt,response: $response:tt $(,)? }) => {
+    (
+        {
+            parameters:
+            [$($parameter:expr),* $(,)?],request:
+            $request:tt,response:
+            $response:tt,errors:
+            [$($status:literal),* $(,)?] $(,)?
+        }
+    ) => {
         request_body_shape!($request)
     };
 }
@@ -237,6 +258,7 @@ files_operations! {
             ],
             request: [none],
             response: [json ListFilesResponse],
+            errors: ["400", "404", "429"],
         },
     },
     CreateFile {
@@ -249,6 +271,7 @@ files_operations! {
             parameters: [],
             request: [required multipart CreateFileRequest],
             response: [json OpenAiFile],
+            errors: ["400", "429", "500"],
         },
     },
     RetrieveFile {
@@ -261,6 +284,7 @@ files_operations! {
             parameters: [path_parameter!("file_id", "The ID of the file to use for this request.")],
             request: [none],
             response: [json OpenAiFile],
+            errors: ["404", "429"],
         },
     },
     DeleteFile {
@@ -273,6 +297,7 @@ files_operations! {
             parameters: [path_parameter!("file_id", "The ID of the file to use for this request.")],
             request: [none],
             response: [json DeleteFileResponse],
+            errors: ["404", "429"],
         },
     },
     DownloadFile {
@@ -285,6 +310,7 @@ files_operations! {
             parameters: [path_parameter!("file_id", "The ID of the file to use for this request.")],
             request: [none],
             response: [binary FileContent],
+            errors: ["400", "404", "429", "500"],
         },
     },
 }
@@ -393,7 +419,12 @@ mod tests {
                     "{} lacks a contract",
                     spec.operation_id()
                 );
-                assert!(!spec.owns_contract(), "{} is passthrough", spec.operation_id());
+                assert!(
+                    !spec.owns_contract(),
+                    "{} is passthrough; switching to local requires handler-produced rejection \
+                     tests for every declared error status",
+                    spec.operation_id()
+                );
             }
         }
 
