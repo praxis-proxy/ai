@@ -15,6 +15,10 @@ The normal server pipeline validation checks mapped and fallback cluster names a
 
 The filter does not restore the client-facing model ID in responses, so a provider that echoes the model it served returns `target_model` to the client unless a provider response adapter reads the client-facing ID back from the `model_to_provider.client_model` metadata key.
 
+Request buffering inherits the pipeline's `max_request_bytes` and `max_buffer_bytes`. Optional `max_body_bytes` is a hard processing limit: bodies larger than it return HTTP 413 before parsing, independently of other filters' buffer declarations. The limit applies to the body received by this filter, before its own rewriting or enrichment.
+
+Omitting the limit removes the former implicit 10 MiB filter cap; pipeline limits still apply. Existing positive values remain valid and are now enforced even when another filter requests a larger shared buffer. Zero remains invalid; YAML `null` behaves like omission.
+
 ## Configuration
 
 | Field | Type | Required | Description |
@@ -25,7 +29,7 @@ The filter does not restore the client-facing model ID in responses, so a provid
 | `models[].target_model` | string | yes | Provider-specific model written into the request body. |
 | `models[].paths` | string[] | yes | Exact inference paths on which this mapping applies. |
 | `fallback_upstream` | string | no | Existing load-balancer cluster selected when no model/path mapping matches. |
-| `max_body_bytes` | integer | no | Maximum JSON request body buffered to inspect the model field. |
+| `max_body_bytes` | integer | no | Optional hard request-body processing limit in bytes. Omit to inherit pipeline `max_request_bytes` and `max_buffer_bytes`; oversize bodies return HTTP 413 before parsing. |
 
 ## Example
 

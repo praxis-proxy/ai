@@ -27,6 +27,7 @@ filter_chains:
 
       - filter: openai_chat_completions_to_anthropic
         api_translation_enabled: true
+        api_version: "2023-06-01"
         max_body_bytes: 1048576
 
       - filter: credential_inject

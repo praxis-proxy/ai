@@ -11,10 +11,34 @@ use serde_json::json;
 use super::*;
 use crate::test_utils::{make_filter_context, make_request};
 
+#[tokio::test]
+async fn explicit_body_limit_rejects_before_parsing_invalid_json() {
+    let yaml = serde_yaml::from_str("max_body_bytes: 32\nmodels: [{model: public, upstream: backend, target_model: private, paths: [/v1/messages]}]").unwrap();
+    let filter = ModelToProviderFilter::from_config(&yaml).unwrap();
+    assert!(matches!(
+        filter.request_body_mode(),
+        BodyMode::StreamBuffer { max_bytes: None }
+    ));
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    for size in [32, 33] {
+        let mut body = Some(Bytes::from(vec![b'x'; size]));
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        if size == 32 {
+            assert!(matches!(action, FilterAction::Continue));
+        } else {
+            assert!(matches!(action, FilterAction::Reject(r) if r.status == 413));
+        }
+        assert_eq!(body.as_ref().unwrap().as_ref(), vec![b'x'; size]);
+    }
+}
+
+
 #[test]
 fn config_rejects_empty_duplicates_and_invalid_entries() {
     for yaml in [
         "models: []",
+        "max_body_bytes: 0\nmodels: [{model: public, upstream: backend, target_model: private, paths: [/v1/messages]}]",
         "models: [{model: same, upstream: vertex, target_model: a, paths: [/v1/messages]}, {model: same, upstream: other, target_model: b, paths: [/v1/messages]}]",
         "models: [{model: claude, upstream: '', target_model: a, paths: [/v1/messages]}]",
         "models: [{model: claude, upstream: vertex, target_model: a, paths: []}]",

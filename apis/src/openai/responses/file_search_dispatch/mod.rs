@@ -33,7 +33,7 @@ use bytes::Bytes;
 use http::HeaderMap;
 use praxis_filter::{
     BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
-    HttpFilterContext, IterationState, SubrequestRuntime, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    HttpFilterContext, IterationState, SubrequestRuntime, parse_filter_config,
 };
 use serde_json::Value;
 use tracing::warn;
@@ -51,6 +51,7 @@ use crate::{
     callout_identity::{CalloutContextMissing, stage_callout_identity},
     callout_policy::{MISSING_CALLOUT_CONTEXT, OnFailure},
     http_hop::connection_nominates_header,
+    json_body::MAX_JSON_BODY_BYTES,
     openai::{
         responses::{
             bounded_json_size,
@@ -778,18 +779,15 @@ fn continuation_state_fits(
         };
         used = used.saturating_add(size);
     }
-    for values in [
-        &state.accumulated_output,
-        &state.input,
-        &state.previous_tools,
-        &state.tools,
-    ] {
+    for values in [&state.accumulated_output, &state.previous_tools, &state.tools] {
         let Some(size) = bounded_json_size(values, max_bytes.saturating_sub(used)).ok().flatten() else {
             return false;
         };
         used = used.saturating_add(size);
     }
-    for history in [&state.messages, &state.persisted_messages] {
+    // `input` shares item payloads with `messages`, so charging all three is a
+    // conservative over-estimate — safe for a fail-closed DoS bound (#313/#1618).
+    for history in [&state.input, &state.messages, &state.persisted_messages] {
         let Some(size) = bounded_json_size(history, max_bytes.saturating_sub(used))
             .ok()
             .flatten()

@@ -51,7 +51,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -70,6 +70,7 @@ use super::{
 };
 use crate::{
     callout_policy::OnFailure,
+    json_body::MAX_JSON_BODY_BYTES,
     state_owner::{StateOwner, require_state_owner},
     store::{OwnerScopedResponseStore, ResponseRecord, ResponseStoreRegistry, StoreError},
     subrequest::{self, SubRequest, SubRequestClient},
@@ -1911,19 +1912,29 @@ fn build_compaction_item(id: &str, summary: &str, summary_prefix: &str) -> Value
 fn replace_messages(state: &mut ResponsesState, compaction_item: &Value) {
     let input_len = state.input.len();
     let mut message_tail = split_current_turn(&mut state.messages, input_len);
-    let mut persisted_tail = split_current_turn(&mut state.persisted_messages, input_len);
+    let persisted_tail = state
+        .persisted_messages_mut()
+        .map(|persisted_messages| split_current_turn(persisted_messages, input_len));
     // The replay view carries the unmarked compaction item while the persisted
     // copy is marked, so the two views genuinely differ and cannot share one
     // payload. Rehydration strips the marker from the replay projection.
-    let persisted_compaction_item = mark_local_compaction_item(compaction_item);
+    let persisted_compaction_item = state
+        .captures_persistence_history()
+        .then(|| mark_local_compaction_item(compaction_item));
 
     state.messages.clear();
     state.messages.push(compaction_item.clone());
     state.messages.append(&mut message_tail);
 
-    state.persisted_messages.clear();
-    state.persisted_messages.push(persisted_compaction_item);
-    state.persisted_messages.append(&mut persisted_tail);
+    if let (Some(persisted_messages), Some(mut persisted_tail), Some(persisted_compaction_item)) = (
+        state.persisted_messages_mut(),
+        persisted_tail,
+        persisted_compaction_item,
+    ) {
+        persisted_messages.clear();
+        persisted_messages.push(persisted_compaction_item);
+        persisted_messages.append(&mut persisted_tail);
+    }
 }
 
 /// Move the current-turn tail off `items`, leaving history behind to drop.

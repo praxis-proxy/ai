@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use futures::TryStreamExt as _;
 use percent_encoding::percent_decode_str;
-use praxis_ai_store::StateOwner;
+use praxis_ai_store::{ConversationSnapshot, StateOwner};
 use sqlx::{
     AssertSqlSafe, Row as _, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
@@ -27,6 +27,13 @@ use super::{
         schema_version_table, sqlite_has_text_affinity, sqlite_key_column_folding,
     },
 };
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// SQLite's extended primary-key constraint code, distinct from unique indexes.
+const SQLITE_CONSTRAINT_PRIMARYKEY: &str = "1555";
 
 // -----------------------------------------------------------------------------
 // SqliteResponseStore
@@ -1405,6 +1412,55 @@ impl ResponseStore for SqliteResponseStore {
 )]
 #[async_trait]
 impl ConversationItemStore for SqliteResponseStore {
+    async fn create_conversation_with_items(
+        &self,
+        record: &ConversationRecord,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        require_matching_item_scope(&record.owner, &record.conversation_id, items)?;
+        let metadata = serde_json::to_string(&record.metadata).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let messages = serde_json::to_string(&record.messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let sql = format!(
+            "INSERT INTO {} (conversation_id, tenant_id, owner_issuer, owner_subject, created_at, metadata, messages) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            self.tables.conversations
+        );
+        sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(&record.conversation_id)
+            .bind(record.owner.tenant_id())
+            .bind(record.owner.issuer())
+            .bind(record.owner.subject())
+            .bind(record.created_at)
+            .bind(&metadata)
+            .bind(&messages)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        if !items.is_empty() {
+            let items_table = self
+                .tables
+                .items
+                .as_deref()
+                .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
+            sqlite_create_items_and_sync(
+                &mut tx,
+                items_table,
+                &self.tables.conversations,
+                &record.owner,
+                &record.conversation_id,
+                items,
+                None,
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError> {
         self.upsert_conversation_record(record).await
     }
@@ -1805,6 +1861,18 @@ impl ConversationItemStore for SqliteResponseStore {
         conversation_id: &str,
         item_id: &str,
     ) -> Result<bool, StoreError> {
+        Ok(self
+            .delete_item_and_get_conversation(owner, conversation_id, item_id)
+            .await?
+            .is_some())
+    }
+
+    async fn delete_item_and_get_conversation(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<Option<ConversationSnapshot>, StoreError> {
         let items_table = self
             .tables
             .items
@@ -1818,12 +1886,35 @@ impl ConversationItemStore for SqliteResponseStore {
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        sqlite_require_conversation(&mut tx, conv_table, owner, conversation_id).await?;
+        let sql = format!(
+            "SELECT conversation_id, created_at, metadata FROM {conv_table} WHERE conversation_id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?"
+        );
+        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(conversation_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?
+            .ok_or(StoreError::NotFound)?;
+        let metadata: String = row
+            .try_get("metadata")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let snapshot = ConversationSnapshot {
+            conversation_id: row
+                .try_get("conversation_id")
+                .map_err(|e| StoreError::Database(e.to_string()))?,
+            created_at: row
+                .try_get("created_at")
+                .map_err(|e| StoreError::Database(e.to_string()))?,
+            metadata: serde_json::from_str(&metadata).map_err(|e| StoreError::Serialization(e.to_string()))?,
+        };
         let deleted =
             sqlite_delete_item_and_sync(&mut tx, items_table, conv_table, owner, conversation_id, item_id).await?;
 
         tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
-        Ok(deleted)
+        Ok(deleted.then_some(snapshot))
     }
 }
 
@@ -2436,7 +2527,18 @@ async fn sqlite_create_items_and_sync(
             .bind(position)
             .execute(&mut **tx)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|error| {
+                // This table's primary key is the owner-scoped item ID. Position
+                // conflicts use a separate unique index and remain database errors.
+                if error
+                    .as_database_error()
+                    .is_some_and(|database| database.code().as_deref() == Some(SQLITE_CONSTRAINT_PRIMARYKEY))
+                {
+                    StoreError::InvalidInput(format!("conversation item '{}' already exists", item.item_id))
+                } else {
+                    StoreError::Database(error.to_string())
+                }
+            })?;
     }
 
     sqlite_invalidate_messages(tx, conv_table, owner, conversation_id).await

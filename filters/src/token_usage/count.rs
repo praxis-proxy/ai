@@ -29,8 +29,9 @@ use std::fmt::Write as _;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use praxis_ai_apis::json_body::MAX_JSON_BODY_BYTES;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext,
     builtins::http::payload_processing::config_validation::validate_max_body_bytes, parse_filter_config,
 };
 use serde::Deserialize;

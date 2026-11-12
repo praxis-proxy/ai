@@ -47,6 +47,17 @@ use self::config::{InvalidBodyBehavior, PromptEnrichConfig, message_to_value, va
 /// In chains that also use `json_body_field` or
 /// `model_to_header`, place `prompt_enrich` first.
 ///
+/// Request buffering inherits the pipeline's `max_request_bytes` and
+/// `max_buffer_bytes`. Optional `max_body_bytes` is a hard processing limit:
+/// bodies larger than it return HTTP 413 before parsing, independently of
+/// other filters' buffer declarations. The limit applies to the body received
+/// by this filter, before its own rewriting or enrichment.
+///
+/// Omitting the limit removes the former implicit 10 MiB filter cap; pipeline
+/// limits still apply. Existing positive values remain valid and are now
+/// enforced even when another filter requests a larger shared buffer. Zero
+/// remains invalid; YAML `null` behaves like omission.
+///
 /// # YAML configuration
 ///
 /// ```yaml
@@ -85,8 +96,8 @@ pub struct PromptEnrichFilter {
     #[cfg(feature = "openai-responses")]
     enrichment_charge: usize,
 
-    /// Maximum request body size to buffer.
-    max_body_bytes: usize,
+    /// Optional hard request-body processing limit, independent of shared buffering.
+    max_body_bytes: Option<usize>,
 
     /// Behavior when the body cannot be enriched.
     on_invalid: InvalidBodyBehavior,
@@ -150,9 +161,7 @@ impl HttpFilter for PromptEnrichFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
-        BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_body_bytes),
-        }
+        BodyMode::StreamBuffer { max_bytes: None }
     }
 
     #[expect(
@@ -176,6 +185,10 @@ impl HttpFilter for PromptEnrichFilter {
         let Some(raw) = body.as_ref() else {
             return Ok(FilterAction::Continue);
         };
+
+        if self.max_body_bytes.is_some_and(|limit| raw.len() > limit) {
+            return Ok(FilterAction::Reject(Rejection::status(413)));
+        }
 
         #[cfg(feature = "openai-responses")]
         let budget_policy = budgeted_create_policy(ctx);

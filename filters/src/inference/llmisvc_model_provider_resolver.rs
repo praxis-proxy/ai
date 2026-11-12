@@ -10,9 +10,8 @@ use bytes::Bytes;
 use http::HeaderName;
 use praxis_ai_apis::json_body::replace_json_body;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, PendingHeaderResult,
-    body::DEFAULT_JSON_BODY_MAX_BYTES, builtins::http::payload_processing::config_validation::validate_max_body_bytes,
-    parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, PendingHeaderResult, Rejection,
+    builtins::http::payload_processing::config_validation::validate_max_body_bytes, parse_filter_config,
 };
 use serde::Deserialize;
 use tracing::debug;
@@ -48,19 +47,15 @@ struct LlmisvcModelProviderResolverConfig {
     #[serde(default = "default_header")]
     header: String,
 
-    /// Maximum request body size to buffer before parsing.
-    #[serde(default = "default_max_body_bytes")]
-    max_body_bytes: usize,
+    /// Optional hard request-body processing limit in bytes. Omit to inherit pipeline
+    /// `max_request_bytes` and `max_buffer_bytes`; oversize bodies return HTTP 413 before parsing.
+    #[serde(default)]
+    max_body_bytes: Option<usize>,
 }
 
 /// Default header name.
 fn default_header() -> String {
     DEFAULT_HEADER.to_owned()
-}
-
-/// Default for `max_body_bytes`.
-fn default_max_body_bytes() -> usize {
-    DEFAULT_JSON_BODY_MAX_BYTES
 }
 
 // -----------------------------------------------------------------------------
@@ -82,6 +77,17 @@ fn default_max_body_bytes() -> usize {
 /// Does **not** resolve `ExternalModel` / `ExternalProvider` CRDs, perform
 /// weighted provider selection, rewrite `Host`, or inject credentials.
 ///
+/// Request buffering inherits the pipeline's `max_request_bytes` and
+/// `max_buffer_bytes`. Optional `max_body_bytes` is a hard processing limit:
+/// bodies larger than it return HTTP 413 before parsing, independently of
+/// other filters' buffer declarations. The limit applies to the body received
+/// by this filter, before its own rewriting or enrichment.
+///
+/// Omitting the limit removes the former implicit 10 MiB filter cap; pipeline
+/// limits still apply. Existing positive values remain valid and are now
+/// enforced even when another filter requests a larger shared buffer. Zero
+/// remains invalid; YAML `null` behaves like omission.
+///
 /// # YAML configuration
 ///
 /// ```yaml
@@ -102,8 +108,8 @@ pub struct LlmisvcModelProviderResolverFilter {
     /// Header that carries the publisher ID used for `KServe` routing.
     header: HeaderName,
 
-    /// Maximum request body size to buffer.
-    max_body_bytes: usize,
+    /// Optional hard request-body processing limit, independent of shared buffering.
+    max_body_bytes: Option<usize>,
 }
 
 impl LlmisvcModelProviderResolverFilter {
@@ -136,7 +142,9 @@ impl LlmisvcModelProviderResolverFilter {
         let header: HeaderName = header
             .parse()
             .map_err(|e| format!("llmisvc_model_provider_resolver: invalid 'header' name: {e}"))?;
-        validate_max_body_bytes("llmisvc_model_provider_resolver", cfg.max_body_bytes)?;
+        if let Some(limit) = cfg.max_body_bytes {
+            validate_max_body_bytes("llmisvc_model_provider_resolver", limit)?;
+        }
 
         Ok(Box::new(Self {
             header,
@@ -191,9 +199,7 @@ impl HttpFilter for LlmisvcModelProviderResolverFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
-        BodyMode::StreamBuffer {
-            max_bytes: Some(self.max_body_bytes),
-        }
+        BodyMode::StreamBuffer { max_bytes: None }
     }
 
     async fn on_request_body(
@@ -204,6 +210,13 @@ impl HttpFilter for LlmisvcModelProviderResolverFilter {
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
+        }
+
+        if self
+            .max_body_bytes
+            .is_some_and(|limit| body.as_ref().is_some_and(|raw| raw.len() > limit))
+        {
+            return Ok(FilterAction::Reject(Rejection::status(413)));
         }
 
         self.rewrite_body(ctx, body)
@@ -408,14 +421,32 @@ bogus_field: true
             "must mutate the request body"
         );
         assert!(
-            matches!(
-                filter.request_body_mode(),
-                BodyMode::StreamBuffer {
-                    max_bytes: Some(limit)
-                } if limit > 0
-            ),
-            "body mode should be StreamBuffer with a default size limit"
+            matches!(filter.request_body_mode(), BodyMode::StreamBuffer { max_bytes: None }),
+            "body buffering must inherit pipeline limits"
         );
+    }
+
+
+    #[tokio::test]
+    async fn explicit_body_limit_rejects_before_parsing_invalid_json() {
+        let yaml = serde_yaml::from_str("max_body_bytes: 32").unwrap();
+        let filter = LlmisvcModelProviderResolverFilter::from_config(&yaml).unwrap();
+        assert!(matches!(
+            filter.request_body_mode(),
+            BodyMode::StreamBuffer { max_bytes: None }
+        ));
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+        let mut ctx = crate::test_utils::make_filter_context(&request);
+        for size in [32, 33] {
+            let mut body = Some(Bytes::from(vec![b'x'; size]));
+            let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+            if size == 32 {
+                assert!(matches!(action, FilterAction::Continue));
+            } else {
+                assert!(matches!(action, FilterAction::Reject(r) if r.status == 413));
+            }
+            assert_eq!(body.as_ref().unwrap().as_ref(), vec![b'x'; size]);
+        }
     }
 
     #[test]

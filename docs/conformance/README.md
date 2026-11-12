@@ -1,7 +1,7 @@
 # OpenAI Conformance
 
 This directory tracks Praxis AI conformance against selected OpenAI API
-surfaces. The current scope is Conversations only.
+surfaces. The current scope is Conversations and Responses.
 
 This directory also vendors the upstream Anthropic Messages API OpenAPI
 document at `specs/anthropic-spec.json`. It is read by the automated PR review
@@ -21,9 +21,9 @@ Conformance compares two independent truths:
   `specs/openai-openapi.yaml`, with its immutable commit and SHA-256 recorded
   in `specs/openai-openapi-source.json`. Every area is projected semantically
   from this one source during the conformance run.
-- Praxis behavior is declared by the Conversations operation registry. Each
-  operation has one route, handling mode, and, when Praxis owns the payload,
-  request and response contract bindings.
+- Praxis behavior is declared by the Conversations and Responses operation
+  registries. Each operation has one route, handling mode, and, when Praxis
+  owns the payload, request and response contract bindings.
 
 The registry generates runtime matching, capability claims, and the local
 implementation OpenAPI document. The report is derived output; editing it
@@ -108,19 +108,45 @@ The pinned OpenAI reference declares a `429` response on all eight
 Conversations operations. Its `TooManyRequests` contract includes an optional
 integer `Retry-After` header (minimum 1) and an `ErrorResponse` JSON body.
 
-The local Conversations handlers do not produce `429` responses. Their registry
-therefore does not declare that response. A deployment rate limiter can reject
-traffic before the handler, but that does not establish the upstream response
-contract for the locally owned operation. In particular, the token rate limiter
-returns a bodyless rejection, while `OpenAiErrorFormatter` formats fatal proxy
-errors, not arbitrary filter rejections.
+The Conversations filter owns an optional `rate_limit` admission path that
+reuses the core request limiter. It runs after classification and trusted owner
+resolution, before store access, and covers all eight local operations. Its
+adapter adds the OpenAI JSON error envelope while preserving the core limiter's
+`Retry-After` and rate-limit headers. The operation registry declares the shared
+429 body and optional retry header from runtime contract types.
 
-The eight missing `429` responses remain actionable response drift. Do not copy
-the upstream error schema into the implementation document without a runtime
-path that produces it, or exclude the status from comparison. Closing this gap
-requires a runtime-owned rate-limit response path and focused tests of its JSON
-body and optional retry header before changing the registry and regenerating
-this report.
+`mode: global` shares a budget across callers of that filter instance;
+`mode: per_ip` groups requests by their TCP peer address, independently of the
+Conversations store's owner isolation. The core configuration controls refill,
+burst, IPv6 grouping, and shadow mode. Omitting the block disables admission.
+Buckets are local to the pipeline instance and reset when it is rebuilt. This is
+request admission, not a distributed or owner-specific quota guarantee.
+
+The focused conformance suite requires a runtime rejection test for every
+operation, validated against the pinned error schema. SDK tests exercise all
+eight HTTP paths and verify that rejected mutations preserve existing state.
+The default example demonstrates admission and has a functional rejection test.
+The fatal proxy error formatter remains a separate response path.
+
+### Other Conversations errors
+
+The operation registry also declares the current pin's 16 non-admission error
+responses: five `400`, seven `404`, and four `500` responses. Validation, missing
+owner-scoped resources, and storage failures provide their runtime paths. Every
+local error includes `message`, `type`, `code`, and `param`; the last two may be
+null. Storage failures expose a generic message without backend details.
+The shared schema includes optional `misalignment.review_target`, with its
+nullable opaque-target constraints; locally generated errors omit misalignment.
+
+The required runtime suite checks every declared status against the pinned
+schema and verifies foreign-owner resources remain inaccessible. SDK coverage
+checks all eight operations, unchanged state after rejected mutations, and real
+SQL transaction rollback using injected write failures. Conversation creation
+and initial items commit atomically; item deletion uses the metadata snapshot
+read before mutation so a later read cannot report a failed committed deletion.
+The example's functional suite exercises all eight admission paths and the
+client-error envelopes. Existing evidence-backed Conversations exceptions
+remain unchanged (11 entries); exact conformance is measured after them.
 
 ### Authentication ownership
 
@@ -244,9 +270,9 @@ active.
 
 OpenAI Conversations responses were checked against `api.openai.com` on
 2026-07-27. Omitted and explicitly null create metadata returned `{}`, while a
-populated string map round-tripped unchanged. Praxis therefore retains its
-string-map response schema and records the 12 missing upstream metadata
-constraints as explicit exceptions.
+populated string map round-tripped unchanged. The refreshed upstream spec now
+defines the string-map response schema. Four exceptions remain for Praxis's
+metadata-key constraint, which that response schema omits.
 
 The same probe covered the update request body. An absent body returned `400
 missing_required_parameter` and null metadata returned `400 invalid_type`, so

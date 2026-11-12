@@ -61,8 +61,19 @@ pub fn create_subrequest_client(config: &Config) -> SubRequestClient {
                 half_open_timeout: Duration::from_secs(cb.half_open_timeout_secs),
             }),
     });
-    let response_ceiling = config.body_limits.max_response_bytes.unwrap_or(usize::MAX);
+    let response_ceiling = buffered_response_limit(config);
     SubRequestClient::with_max_response_bytes(connector, response_ceiling)
+}
+
+/// Buffered callout responses must satisfy both the transfer and memory bounds.
+/// `max_response_bytes: null` removes the transfer limit, but buffered responses
+/// remain bounded by `body_limits.max_buffer_bytes`.
+pub(crate) fn buffered_response_limit(config: &Config) -> usize {
+    config
+        .body_limits
+        .max_response_bytes
+        .unwrap_or(usize::MAX)
+        .min(config.body_limits.max_buffer_bytes.get())
 }
 
 /// Spawn idle-circuit eviction when `runtime.subrequest_circuit_breaker` is set.
@@ -140,6 +151,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn buffered_callouts_inherit_both_response_limits() {
+        for (limits, expected) in [
+            ("", 10_485_760),
+            ("max_buffer_bytes: 1024", 1024),
+            ("max_response_bytes: 512, max_buffer_bytes: 1024", 512),
+            ("max_response_bytes: null, max_buffer_bytes: 1024", 1024),
+            (
+                "max_response_bytes: 134217728, max_buffer_bytes: 134217728",
+                134_217_728,
+            ),
+        ] {
+            let config = minimal_config(&format!(
+                "body_limits: {{ {limits} }}\ninsecure_options: {{ allow_unbounded_body: true }}"
+            ));
+            let client = create_subrequest_client(&config);
+            assert_eq!(client.max_response_bytes(), expected, "callout ceiling for {limits}");
+        }
+    }
+
+    #[test]
+    fn client_response_ceiling_respects_max_buffer_bytes() {
+        for (buffer_cap, response_cap, expected) in [
+            (4096, Some(8192), 4096),
+            (8192, Some(4096), 4096),
+            (4096, None, 4096),
+            (134_217_728, None, 134_217_728),
+        ] {
+            let mut config = minimal_config("");
+            config.body_limits.max_buffer_bytes = buffer_cap.try_into().unwrap();
+            config.body_limits.max_response_bytes = response_cap;
+            let client = create_subrequest_client(&config);
+            assert_eq!(
+                client.max_response_bytes(),
+                expected,
+                "buffered callouts must respect both response and buffering caps"
+            );
+        }
+    }
+
+    #[test]
     fn absent_circuit_breaker_leaves_isolation_disabled() {
         let client = create_subrequest_client(&minimal_config(""));
         let debug = format!("{client:?}");
@@ -212,7 +263,7 @@ runtime:
         )
         .unwrap();
         let chains: HashMap<&str, &[FilterEntry]> = HashMap::new();
-        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
+        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default(), &[])
             .expect("file-search factory should build against the shared client");
     }
 
