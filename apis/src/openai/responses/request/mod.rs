@@ -47,7 +47,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
+    body::{BodyAccess, BodyMode},
     parse_filter_config,
 };
 use tracing::{debug, trace};
@@ -62,6 +62,7 @@ use super::{
 };
 use crate::{
     classifier::{AiRequestFormat, ClassifiedRequest, classify_object, empty_result},
+    json_body::MAX_JSON_BODY_BYTES,
     operation::RequestBody,
     operation_classifier::AiOperationMatch,
 };
@@ -95,6 +96,8 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// `responses.response_id` (`resp_` + 32 hex chars, CSPRNG),
 /// `responses.conversation_id`, `responses.store`, `responses.background`, and
 /// `responses.stream`.
+/// Structured image/audio input is published as `modality` metadata and a
+/// branch result; it is never promoted to an HTTP header.
 pub struct OpenaiResponsesRequestFilter {
     /// Classification, promotion, and state configuration.
     config: ResponsesRequestConfig,
@@ -789,7 +792,7 @@ fn insert_responses_state(
     response_id: &str,
     budget: Option<super::agentic_loop::budget::SimpleBudget>,
 ) {
-    let mut state = ResponsesState::from_request_body(parsed);
+    let mut state = ResponsesState::from_managed_request_body(parsed);
     state.response_id = Some(response_id.to_owned());
     state.simple_budget = budget;
     ctx.extensions.insert(state);

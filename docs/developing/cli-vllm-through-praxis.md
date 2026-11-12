@@ -20,6 +20,10 @@ Anthropic-compatible API. For Codex, Praxis keeps `/v1/responses` end to end
 and lowers only client-owned tool types that vLLM does not understand. Use a
 translated path for a backend that only exposes OpenAI Chat Completions.
 
+To run these clients inside NVIDIA OpenShell sandboxes while Praxis and vLLM
+stay on the host, follow this guide for vLLM and Praxis, then
+[Run your Code Harness in OpenShell through Praxis and vLLM](openshell-cli-vllm-through-praxis.md).
+
 ## 1. Start vLLM
 
 ### On-demand GPU endpoint
@@ -168,11 +172,22 @@ supports their respective endpoints.
 ### Serving all four clients from one gateway
 
 One proxy process can serve all four CLIs over their native paths at once.
-There is no example config for this, because it is the two native examples
-above placed in one file: the Claude Code, OpenCode, and pi chain from
+It is the two native examples above placed in one file:
+[`openshell/sandboxed-coding-clients.yaml`](../../examples/configs/openshell/sandboxed-coding-clients.yaml)
+— under `openshell/` because the sandbox guide reuses it, not because the file
+is OpenShell-specific. It contains the Claude Code, OpenCode, and pi chain from
 `anthropic/messages-native-vllm.yaml` and the Codex chain from
 `openai/responses/client-tool-compat.yaml`, behind two listeners, pointed at
 the same vLLM server and sharing one `GATEWAY_AUTH_PASSWORD`.
+
+The example binds both listeners to `0.0.0.0` because sandboxed clients arrive
+on the host's container-bridge interface. Bind `127.0.0.1` when every client
+runs on the gateway host, and use `0.0.0.0` only for callers on another host or
+in a sandbox. For that remote case, firewall both ports to the callers you
+intend and put TLS in front of the listeners: the client credential is a Basic
+value, so on plain HTTP it is recoverable by anyone who can read the
+connection. A remote client's base URL must use `https://`. Plain HTTP is for a
+loopback gateway only.
 
 ```yaml
 listeners:
@@ -247,6 +262,8 @@ Basic credential rather than a Bearer key — see
 and from the container image the store needs the same absolute `database_url`
 as the native Codex example, see
 [the writable database path note](#the-native-codex-example-needs-a-writable-database-path).
+Selecting PostgreSQL instead avoids that path edit entirely; see
+[Using PostgreSQL instead of SQLite](#using-postgresql-instead-of-sqlite).
 
 The native Codex example uses `127.0.0.1:3001` as its fixture backend; change
 that endpoint to `127.0.0.1:8000` for the local vLLM server. The other examples
@@ -299,8 +316,23 @@ Praxis listens at `http://127.0.0.1:8080`.
 
 ### Run Praxis from a container image
 
-The published image leaves experimental Responses and the agentic loop out.
-Build an image with an explicit opt-in for the examples in this guide:
+The standard published image leaves the experimental Responses filters, the
+agentic loop, and both stores out. Every release and nightly tag is also
+published with an `-experimental` suffix, built as
+`PRAXIS_AI_FEATURES=full,openai-all,store-all`, so the examples in this guide
+need no local build:
+
+```console
+docker pull ghcr.io/praxis-proxy/ai:latest-experimental
+```
+
+`latest-experimental` moves on each release. Pin a versioned tag such as
+`0.10.0-experimental`, or `nightly-experimental` for a pre-release, when you
+want reproducible behavior, and substitute it for `praxis-ai-responses` in the
+`docker run` commands below.
+
+Build locally only for a feature set the tags do not carry, or for an
+unreleased commit:
 
 ```console
 docker build -f Containerfile -t praxis-ai-responses \
@@ -340,11 +372,14 @@ to the copied config:
 2. Change the local vLLM endpoint from `127.0.0.1:8000` to
    `host.docker.internal:8000`, and pass
    `--add-host=host.docker.internal:host-gateway` on the command line.
-3. Add `allow_private_upstreams: true` beside the existing
-   `allow_private_endpoints: true`. The existing option covers literal private
-   endpoints written in the config; the new one is needed because that
-   hostname *resolves* to a private address, and without it the request fails
-   with `upstream hostname resolved to private/reserved IP address`.
+3. Add `host.docker.internal` to `trusted_private_endpoints` on both
+   `load_balancer` clusters (`vllm-backend` and `vllm-responses-backend`). The
+   existing `allow_private_endpoints` covers literal private endpoints written
+   in the config; the new entry is needed because that hostname *resolves* to a
+   private address. Without it, the request fails with
+   `upstream hostname resolved to private/reserved IP address`. Prefer this
+   scoped entry over `insecure_options.allow_private_upstreams`, which relaxes
+   the check for every upstream.
 
 ```console
 docker run -d --rm --name praxis-vllm \
@@ -357,7 +392,8 @@ docker run -d --rm --name praxis-vllm \
 
 With Podman, both commands work unchanged. Podman also resolves
 `host.containers.internal` on its own, so the published-port config can use
-that name and drop `--add-host`.
+that name and drop `--add-host` — and use the same name in
+`trusted_private_endpoints`.
 
 The on-demand GPU endpoint needs no backend-specific container handling: the
 tunnel hostname is public, so the `endpoints` and `tls.sni` edits above are the
@@ -380,9 +416,10 @@ the cleanup section with `docker rm -f praxis-vllm`.
 
 #### The native Codex example needs a writable database path
 
-The custom image above includes `openai-all,store-sqlite`, so
-`client-tool-compat.yaml` — the preferred native Codex example — is available. The other three
-configurations in this section have no store filter and need no change at all.
+The `-experimental` tags and the custom image above both include the stores, so
+`client-tool-compat.yaml` — the preferred native Codex example — is available.
+The other three configurations in this section have no store filter and need no
+change at all.
 
 The one edit the store example does need is an absolute `database_url`. The
 image's `/etc/praxis` working directory is root-owned while the process runs as
@@ -411,10 +448,48 @@ restarts, mount a volume at `/var/lib/praxis`: `-v praxis-state:/var/lib/praxis`
 with Podman adds `:U` to chown it to the container user, and a host directory
 needs `chown 100:100` (or `-m 0777`) before the first run.
 
-The stock image rejects these experimental filters at startup. A custom image
-can also serve this example with PostgreSQL by selecting `store-postgres`
-instead of `store-sqlite`; see
-`examples/configs/openai/responses/response-store-postgres-mtls.yaml`.
+The standard image rejects these experimental filters at startup, so use an
+`-experimental` tag for the examples in this guide.
+
+#### Using PostgreSQL instead of SQLite
+
+Both backends are built into the `-experimental` tags; a local build selects one
+with `store-postgres`, `store-sqlite`, or `store-all`. Switching the Codex
+example to PostgreSQL is a single filter edit:
+
+```yaml
+- filter: openai_responses_store
+  backend: postgres
+  database_url: "postgres://praxis@127.0.0.1:5432/praxis"
+  responses_table: openai_responses
+  conversations_table: openai_conversations
+  allow_private_database_url: true
+  ssl_mode: disable
+```
+
+- `allow_private_database_url` is required for a loopback or other
+  local-sensitive target; the URL validator rejects those by default. It is
+  intended for local development; see
+  [`openai_responses_store`](../filters/openai_responses_store.md) for the full
+  field reference.
+- `ssl_mode` defaults to `verify-full`, which a local server without TLS can
+  never satisfy. `disable` is honest only when the connection never leaves the
+  host. Keep the default for a remote database and supply `ssl_root_cert`; the
+  certificate-authentication profile in
+  `examples/configs/openai/responses/response-store-postgres-mtls.yaml` shows
+  the client-certificate variant.
+- The URL can omit the password. Praxis parses it with SQLx, which reads
+  `PGPASSWORD` from the process environment when the URL carries none, so a
+  container receives the secret through `-e PGPASSWORD` instead of a URL baked
+  into the config. The `require_certificate_authentication` profile fails
+  closed when `PGPASSWORD` is set.
+- Start PostgreSQL before Praxis. The store pool is provisioned eagerly at
+  startup, and a refused connection gets three immediate retries before the
+  process exits.
+- Schema upgrades are recreate-only: a Praxis release that requires a newer
+  schema refuses to start against the old tables, so treat stored responses as
+  disposable and recreate the database. See
+  [Responses store schema upgrade](../store/schema-migration.md).
 
 ## 3. Connect Codex
 
@@ -567,17 +642,17 @@ export DISABLE_PROMPT_CACHING=1
 ```
 
 Claude Code does not know the served model's real window, so it sends the
-default `max_tokens` for the Anthropic model name it believes it is calling —
-around 21,000 tokens. vLLM treats that budget as an upper bound, not a
-reservation: `get_max_tokens` caps it at `--max-model-len` minus the prompt
-length, and a request is rejected up front only when the prompt itself exceeds
-the window or the budget alone exceeds `--max-model-len` (verified against
-vLLM 0.32.0 — the version the on-demand endpoint and the GPU nightly serve —
-on both the Chat Completions and the Anthropic-compatible `/v1/messages`
-paths). Claude Code's default stays below the 32,768-token window, so an
-oversized budget costs no prompt space, and the 8192 cap above is optional: it
-is kept to make each turn's output budget predictable on the 32,768-token
-server, not to prevent a failure.
+default `max_tokens` for the Anthropic model name it believes it is calling,
+which is a fixed client-side number that does not track the backend. vLLM
+treats that budget as an upper bound, not a reservation: `get_max_tokens` caps
+it at `--max-model-len` minus the prompt length, and a request is rejected up
+front only when the prompt itself exceeds the window or the budget alone
+exceeds `--max-model-len` (verified against vLLM 0.32.0 — the version the
+on-demand endpoint and the GPU nightly serve — on both the Chat Completions and
+the Anthropic-compatible `/v1/messages` paths). Because vLLM clamps instead of
+reserving, an oversized default costs no prompt space as long as the budget
+alone stays under the window. The 8192 cap above is optional; it keeps each
+turn's output budget predictable rather than preventing a failure.
 
 Claude Code also sizes its own auto-compaction against the window it assumes
 for a model name it does not recognize, not the server's real one, so on its
@@ -586,16 +661,19 @@ own it will not compact in time: once the prompt alone passes
 conversation cannot be compacted, only `/clear`ed.
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` names the real window for a model Claude Code
 does not recognize — any name that is not a canonical `claude-*` id, which
-includes the served alias — so set it to the server's `--max-model-len`. It is
-the variable the GPU nightly's Claude Code acceptance test sets against the
-pinned Claude Code 2.1.278, whose compaction scenario asserts that the client
-then auto-compacts below the server window on its own. Do not reach for
-`CLAUDE_CODE_AUTO_COMPACT_WINDOW` here: it accepts 100,000 to 1,000,000 tokens,
-and a smaller value draws a startup warning and is treated as the 100k minimum,
-still above the 32,768-token server. Run `/compact` by hand if a long session
-still creeps toward the limit. A larger window is the alternative, but Qwen3-8B
-is natively 32,768 tokens and anything beyond it needs `--rope-scaling` on
-`vllm serve`.
+includes the served alias — so set it to the server's `--max-model-len`. The
+32,768-token server above is only the example; the rule is the backend's real
+window at any size. It is the variable the GPU nightly's Claude Code acceptance
+test sets against the pinned Claude Code 2.1.278, whose compaction scenario
+asserts that the client then auto-compacts below the server window on its own.
+Do not reach for `CLAUDE_CODE_AUTO_COMPACT_WINDOW` for a window below 100,000
+tokens: it accepts 100,000 to 1,000,000 tokens, and a smaller value draws a
+startup warning and is treated as the 100k minimum. A backend large enough to
+be in that range can use either, but `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is the
+one value that works at every size, and it states the server's window rather
+than a client-side bound. Run `/compact` by hand if a long session still creeps
+toward the limit. A larger window is the alternative, but Qwen3-8B is natively
+32,768 tokens and anything beyond it needs `--rope-scaling` on `vllm serve`.
 
 Praxis and vLLM do not implement Anthropic's server-side auto-mode classifier
 protocol. `CLAUDE_CODE_AUTO_MODE_SERVER=0` makes Claude Code initiate the
@@ -603,6 +681,19 @@ classifier model requests through Praxis instead. This setting only affects
 Claude Code's `auto` permission mode; the classifier still consumes model
 inference and is not an on-device check. Do not set it to `1` for this setup.
 See [Anthropic's auto-mode classifier documentation](https://code.claude.com/docs/en/auto-mode-classifier-billing).
+
+### Using a Claude Code settings file
+
+The variables above can live in a `claude --settings` file's `env` block
+instead of the shell, under the same names and values. A settings file's `env`
+block takes precedence over shell exports in the sessions that load it, so pick
+one path per session: sourcing an env file and loading a settings file together
+means the file wins. Keep the context window in `env` as
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` rather than in
+`modelSettings.<model>.autoCompactWindow`. The settings key lowers Claude
+Code's own compaction threshold but is capped at the window the client already
+assumes, so it cannot raise that belief for a model name it does not recognize
+the way the environment variable does.
 
 ## 5. Connect OpenCode
 

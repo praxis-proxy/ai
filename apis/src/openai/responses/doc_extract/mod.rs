@@ -54,7 +54,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    Rejection, parse_filter_config,
 };
 use tracing::{debug, trace, warn};
 
@@ -75,7 +75,10 @@ use super::{
     responses_proxy::serialized_outbound_body_len,
     state::ResponsesState,
 };
-use crate::{classifier::is_responses_create, json_body::serialize_json_body};
+use crate::{
+    classifier::is_responses_create,
+    json_body::{MAX_JSON_BODY_BYTES, serialize_json_body},
+};
 
 /// Converts `input_file` content parts to `input_text` for backends
 /// that do not support `input_file` natively (e.g. vLLM, llm-d).
@@ -320,10 +323,11 @@ fn projected_document_growth(ctx: &HttpFilterContext<'_>, parsed: &serde_json::V
         .map_or(Some(0), parts_growth)?;
     if let Some(state) = ctx.extensions.get::<ResponsesState>() {
         let history_end = state.messages.len().checked_sub(state.input.len())?;
-        let persisted_end = state.persisted_messages.len().checked_sub(state.input.len())?;
-        growth = growth
-            .checked_add(parts_growth(state.messages.iter().take(history_end))?)?
-            .checked_add(parts_growth(state.persisted_messages.iter().take(persisted_end))?)?;
+        growth = growth.checked_add(parts_growth(state.messages.iter().take(history_end))?)?;
+        if state.captures_persistence_history() {
+            let persisted_end = state.persisted_messages.len().checked_sub(state.input.len())?;
+            growth = growth.checked_add(parts_growth(state.persisted_messages.iter().take(persisted_end))?)?;
+        }
     }
     Some(growth)
 }
@@ -392,10 +396,11 @@ fn reject_retained_document_budget() -> FilterAction {
 
 /// Walk the current request input and extract text-safe `input_file` parts.
 fn extract_current_input(parsed: &mut serde_json::Value, budget: &mut ExtractionBudget) -> Result<usize, ExtractError> {
-    let Some(items) = parsed.get_mut("input").and_then(serde_json::Value::as_array_mut) else {
-        return Ok(0);
-    };
-    extract_items(items, budget)
+    match parsed.get_mut("input") {
+        Some(serde_json::Value::Array(items)) => extract_items(items, budget),
+        Some(item @ serde_json::Value::Object(_)) => extract_items(std::slice::from_mut(item), budget),
+        _ => Ok(0),
+    }
 }
 
 /// Walk items and extract text-safe `input_file` content parts.
@@ -463,22 +468,24 @@ fn sync_state_after_rewrite(
         return Ok(());
     };
 
-    state.request_body = resolved_body;
-
     let input_len = state.input.len();
-    let ResponsesState {
-        request_body,
-        messages,
-        persisted_messages,
-        ..
-    } = state;
-
-    let Some(resolved_input) = request_body.get("input").and_then(serde_json::Value::as_array) else {
-        return Ok(());
+    // Resolve the history tails from the locally owned resolved body before it is
+    // stored as request parameters; the resolved input is not retained in
+    // `request_body` (the params-only invariant, #1618).
+    let resolved_input = match resolved_body.get("input") {
+        Some(serde_json::Value::Array(items)) => Some(items.as_slice()),
+        Some(item @ serde_json::Value::Object(_)) => Some(std::slice::from_ref(item)),
+        _ => None,
     };
+    if let Some(resolved_input) = resolved_input {
+        sync_message_history(&mut state.messages, input_len, Some(resolved_input), budget)?;
+        if let Some(persisted_messages) = state.persisted_messages_mut() {
+            sync_persisted_history(persisted_messages, input_len, Some(resolved_input), budget)?;
+        }
+    }
 
-    sync_message_history(messages, input_len, Some(resolved_input), budget)?;
-    sync_persisted_history(persisted_messages, input_len, Some(resolved_input), budget)
+    state.set_request_params(resolved_body);
+    Ok(())
 }
 
 /// Test helper that creates an isolated request extraction budget.
@@ -502,7 +509,10 @@ fn extract_state_history(ctx: &mut HttpFilterContext<'_>, budget: &mut Extractio
     let input_len = state.input.len();
 
     sync_message_history(&mut state.messages, input_len, None, budget)?;
-    sync_persisted_history(&mut state.persisted_messages, input_len, None, budget)
+    if let Some(persisted_messages) = state.persisted_messages_mut() {
+        sync_persisted_history(persisted_messages, input_len, None, budget)?;
+    }
+    Ok(())
 }
 
 /// Sync the persisted-messages mirror with independent count and

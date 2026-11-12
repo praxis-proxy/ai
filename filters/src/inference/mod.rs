@@ -6,9 +6,7 @@
 mod llmisvc_model_provider_resolver;
 mod model_to_header;
 mod model_to_provider;
-mod multimodal_to_header;
 
 pub use llmisvc_model_provider_resolver::LlmisvcModelProviderResolverFilter;
 pub use model_to_header::ModelToHeaderFilter;
 pub use model_to_provider::ModelToProviderFilter;
-pub use multimodal_to_header::MultimodalToHeaderFilter;

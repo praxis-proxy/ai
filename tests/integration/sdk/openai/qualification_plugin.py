@@ -25,7 +25,8 @@ PROFILE_FIXTURES = {
         "openai_client", "other_owner_openai_client", "compression_openai_client",
         "irr_streaming_client", "compact_client", "client_tool_compat_client",
         "agentic_client", "agentic_proxy", "file_search_client",
-        "file_search_streaming_client",
+        "file_search_streaming_client", "admission_client",
+        "mcp_approval_floor_client",
     },
     "translation": {
         "chat_streaming_client", "reasoning_client", "web_search_chat_streaming_client",
@@ -37,7 +38,9 @@ PROFILE_FIXTURES = {
         "witness_replay_limited_tool_client", "provider_compaction_client",
         "reasoning_capture_client", "file_resolve_stub_env", "model_rewrite_client",
         "model_rewrite_proxy",
-        "streaming_mcp_failure_client",
+        "streaming_mcp_failure_client", "witness_backend_tool_client",
+        "code_interpreter_capture_client", "backend_error_client",
+        "ttft_proxy", "native_guardrails_client",
     },
 }
 

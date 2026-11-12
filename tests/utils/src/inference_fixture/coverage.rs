@@ -1321,6 +1321,10 @@ mod tests {
                 vec!["responses_native_passthrough"],
                 vec!["openai_chat_completions_to_anthropic_messages"],
                 vec!["openai_responses_to_chat_completions"],
+                vec!["openai_chat_completions_to_anthropic_messages"],
+                vec!["openai_chat_completions_to_anthropic_messages"],
+                vec!["openai_responses_to_chat_completions"],
+                vec!["responses_native_passthrough"],
             ]
         );
         assert_eq!(
@@ -1421,11 +1425,15 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 91, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 71, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 76, "manifest recording inventory count");
+        assert_eq!(report.features_total, 95, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 73, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 78, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1454,6 +1462,7 @@ mod tests {
                 "messages/upstream-error-stream",
                 "messages/upstream-error-unknown-type",
                 "openai_legacy/anthropic-json-sse-error",
+                "openai_legacy/anthropic-version-sampling",
                 "responses/agentic-deferred-mcp-connectors",
                 "responses/agentic-parallel-tool-calls",
                 "responses/agentic-status-less-function-call",
@@ -1495,6 +1504,7 @@ mod tests {
                 "responses/native-continuation",
                 "responses/native-continuation-stream",
                 "responses/native-tool-call",
+                "responses/object-document-input",
                 "responses/responses-to-chat-completions-reasoning-agentic",
                 "vertex/anthropic-wire-translation",
                 "vertex/bounded-stream-limits",
@@ -1502,7 +1512,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 91, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 95, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1920,6 +1930,25 @@ mod tests {
                     &"responses.chat.tools.orphan_output_projection".to_owned(),
                     &vec!["responses/chat-orphan-tool-output".to_owned()]
                 ),
+                (
+                    &"external_model.anthropic.request.legacy_sampling".to_owned(),
+                    &vec!["openai_legacy/anthropic-json-sse-error".to_owned()]
+                ),
+                (
+                    &"external_model.anthropic.request.version_sampling".to_owned(),
+                    &vec!["openai_legacy/anthropic-version-sampling".to_owned()]
+                ),
+                (
+                    &"responses.chat.access_programs".to_owned(),
+                    &vec![
+                        "responses/chat-basic-nonstream".to_owned(),
+                        "responses/chat-unrepresentable-parameters".to_owned(),
+                    ]
+                ),
+                (
+                    &"responses.request.object_document_input".to_owned(),
+                    &vec!["responses/object-document-input".to_owned()]
+                ),
             ]
         );
         for feature in &manifest.features[0..2] {
@@ -2090,7 +2119,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)],
         );
-        for feature in &manifest.features[62..91] {
+        for feature in &manifest.features[62..95] {
             assert_eq!(
                 feature
                     .providers
@@ -2390,6 +2419,7 @@ mod tests {
                 "responses.chat.continuation",
                 "responses.chat.auto_tool_choice_without_tools",
                 "responses.chat.shared_controls",
+                "responses.chat.access_programs",
             ]
         );
         assert_eq!(responses_chat.turns.len(), 2);

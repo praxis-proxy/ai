@@ -11,7 +11,7 @@ use bytes::Bytes;
 use praxis_ai_apis::openai::{local_tool_guardrail_messages, record_local_tool_guardrail_failure};
 use praxis_ai_apis::{
     guardrail_messages::{GuardrailMessageDirection, extract_guardrail_messages},
-    json_body::replace_json_body,
+    json_body::{MAX_JSON_BODY_BYTES, replace_json_body},
     openai::{ChatCompletionsOperation, chat_completions_operation_specs},
     operation::Transport,
     operation_classifier::AiOperationMatch,
@@ -24,7 +24,7 @@ use praxis_core::{
 use praxis_filter::parse_filter_config;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, FilterPipeline, HttpFilter, HttpFilterContext, IterationState,
-    Rejection, SubrequestRuntime, body::MAX_JSON_BODY_BYTES,
+    Rejection, SubrequestRuntime,
 };
 use serde::Deserialize;
 

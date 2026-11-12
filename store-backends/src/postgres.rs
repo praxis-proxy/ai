@@ -7,7 +7,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use futures::TryStreamExt as _;
-use praxis_ai_store::StateOwner;
+use praxis_ai_store::{ConversationSnapshot, StateOwner};
 use sqlx::{
     AssertSqlSafe, Row as _,
     postgres::{PgConnectOptions, PgPoolOptions, PgRow, PgSslMode},
@@ -216,7 +216,8 @@ impl PostgresResponseStore {
         let insert_sql = format!(
             "INSERT INTO {items_table} \
              (item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (tenant_id, owner_issuer, owner_subject, item_id) DO NOTHING"
         );
         for (i, item) in items.iter().enumerate() {
             let offset = i64::try_from(i).unwrap_or(i64::MAX);
@@ -224,7 +225,7 @@ impl PostgresResponseStore {
             let item_data =
                 serde_json::to_string(&item.item_data).map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-            sqlx::query(AssertSqlSafe(insert_sql.as_str()))
+            let result = sqlx::query(AssertSqlSafe(insert_sql.as_str()))
                 .bind(&item.item_id)
                 .bind(owner.tenant_id())
                 .bind(owner.issuer())
@@ -236,6 +237,12 @@ impl PostgresResponseStore {
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| self.db_err(&e))?;
+            if result.rows_affected() == 0 {
+                return Err(StoreError::InvalidInput(format!(
+                    "conversation item '{}' already exists",
+                    item.item_id
+                )));
+            }
         }
 
         pg_invalidate_messages(tx, conv_table, owner, conversation_id).await
@@ -1617,6 +1624,50 @@ impl ResponseStore for PostgresResponseStore {
 )]
 #[async_trait]
 impl ConversationItemStore for PostgresResponseStore {
+    async fn create_conversation_with_items(
+        &self,
+        record: &ConversationRecord,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        require_matching_item_scope(&record.owner, &record.conversation_id, items)?;
+        let metadata = serde_json::to_string(&record.metadata).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let messages = serde_json::to_string(&record.messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
+        let sql = format!(
+            "INSERT INTO {} (conversation_id, tenant_id, owner_issuer, owner_subject, created_at, metadata, messages) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            self.tables.conversations
+        );
+        sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(&record.conversation_id)
+            .bind(record.owner.tenant_id())
+            .bind(record.owner.issuer())
+            .bind(record.owner.subject())
+            .bind(record.created_at)
+            .bind(&metadata)
+            .bind(&messages)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        if !items.is_empty() {
+            let items_table = self
+                .tables
+                .items
+                .as_deref()
+                .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
+            Box::pin(self.insert_items_and_sync(
+                &mut tx,
+                items_table,
+                &self.tables.conversations,
+                &record.owner,
+                &record.conversation_id,
+                items,
+            ))
+            .await?;
+        }
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
+        Ok(())
+    }
+
     async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError> {
         self.upsert_conversation_record(record).await
     }
@@ -2012,6 +2063,18 @@ impl ConversationItemStore for PostgresResponseStore {
         conversation_id: &str,
         item_id: &str,
     ) -> Result<bool, StoreError> {
+        Ok(self
+            .delete_item_and_get_conversation(owner, conversation_id, item_id)
+            .await?
+            .is_some())
+    }
+
+    async fn delete_item_and_get_conversation(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<Option<ConversationSnapshot>, StoreError> {
         self.delete_item_and_sync_messages_inner(owner, conversation_id, item_id)
             .await
     }
@@ -2534,7 +2597,7 @@ impl PostgresResponseStore {
         owner: &StateOwner,
         conversation_id: &str,
         item_id: &str,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<Option<ConversationSnapshot>, StoreError> {
         let items_table = self
             .tables
             .items
@@ -2545,7 +2608,7 @@ impl PostgresResponseStore {
         let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
 
         let lock_sql = format!(
-            "SELECT 1 FROM {conv_table} \
+            "SELECT conversation_id, created_at, metadata FROM {conv_table} \
              WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
              FOR UPDATE"
         );
@@ -2557,9 +2620,13 @@ impl PostgresResponseStore {
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| self.db_err(&e))?;
-        if locked.is_none() {
-            return Err(StoreError::NotFound);
-        }
+        let row = locked.ok_or(StoreError::NotFound)?;
+        let metadata: String = row.try_get("metadata").map_err(|e| self.db_err(&e))?;
+        let snapshot = ConversationSnapshot {
+            conversation_id: row.try_get("conversation_id").map_err(|e| self.db_err(&e))?,
+            created_at: row.try_get("created_at").map_err(|e| self.db_err(&e))?,
+            metadata: serde_json::from_str(&metadata).map_err(|e| StoreError::Serialization(e.to_string()))?,
+        };
 
         let delete_sql = format!(
             "DELETE FROM {items_table} \
@@ -2578,13 +2645,13 @@ impl PostgresResponseStore {
 
         if result.rows_affected() == 0 {
             tx.commit().await.map_err(|e| self.db_err(&e))?;
-            return Ok(false);
+            return Ok(None);
         }
 
         pg_invalidate_messages(&mut tx, conv_table, owner, conversation_id).await?;
 
         tx.commit().await.map_err(|e| self.db_err(&e))?;
-        Ok(true)
+        Ok(Some(snapshot))
     }
 }
 

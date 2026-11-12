@@ -376,6 +376,51 @@ def _write_passthrough_config(port: int, backend_port: int) -> str:
     return path
 
 
+def _write_managed_state_config(port: int, backend_port: int) -> str:
+    """Write a chain that initializes Responses state before routing.
+
+    With state initialized, `input` is moved out of `request_body` (#1618) and the
+    outbound request is rebuilt from the shared history, so this exercises that the
+    backend still receives the client's input through the real SDK.
+    """
+    config = {
+        "listeners": [
+            {
+                "name": "managed",
+                "address": f"127.0.0.1:{port}",
+                "filter_chains": ["managed-pipeline"],
+            }
+        ],
+        "filter_chains": [
+            {
+                "name": "managed-pipeline",
+                "filters": [
+                    {"filter": "ai_operation"},
+                    {"filter": "openai_responses_request", "on_invalid": "reject"},
+                    {
+                        "filter": "router",
+                        "routes": [{"path_prefix": "/", "cluster": "backend"}],
+                    },
+                    {
+                        "filter": "load_balancer",
+                        "clusters": [
+                            {
+                                "name": "backend",
+                                "endpoints": [f"127.0.0.1:{backend_port}"],
+                            }
+                        ],
+                    },
+                ],
+            }
+        ],
+        "insecure_options": {"allow_private_endpoints": True},
+    }
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        json.dump(config, f)
+    return path
+
+
 def _chunked_response_store_filters(db_path: str, port: int) -> tuple[dict, dict]:
     """Build matching filters for the listener-level regression test."""
     tables = {
@@ -767,6 +812,42 @@ def passthrough_client():
 
 
 @pytest.fixture
+def managed_state_client():
+    """Start a state-initializing proxy and a recording backend."""
+    _RecordingResponsesBackend.forwarded = []
+    backend = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _RecordingResponsesBackend
+    )
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+
+    port = _free_port()
+    config_path = _write_managed_state_config(port, backend.server_address[1])
+    proc = subprocess.Popen(
+        [_find_binary(), "-c", config_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_proxy(port, proc)
+        yield OpenAI(
+            api_key="not-needed",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            max_retries=0,
+            timeout=10.0,
+        )
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        backend.shutdown()
+        os.unlink(config_path)
+
+
+@pytest.fixture
 def chunked_response_store():
     """Start a composed response-store/Conversations proxy and chunked backend."""
     backend = http.server.ThreadingHTTPServer(
@@ -1036,6 +1117,31 @@ class TestOpenAIConversations:
         assert forwarded[0]["path"] == "/v1/responses", "the create path must be forwarded unchanged"
         assert forwarded[0]["body"]["model"] == "gpt-4.1", "the forwarded body must preserve the requested model"
         assert forwarded[0]["body"]["input"] == "Hello", "the forwarded body must preserve the request input"
+
+    def test_managed_create_forwards_input_rebuilt_from_state(self, managed_state_client):
+        """A managed create still forwards input after #1618 strips it internally.
+
+        With state initialized, `input` is moved out of `request_body` and the
+        outbound request is rebuilt from the shared history. The backend must still
+        receive the client's array input, proving the move did not drop it.
+        """
+        input_items = [
+            {"role": "user", "content": [{"type": "input_text", "text": "What is 2+2?"}]}
+        ]
+        response = managed_state_client.responses.create(
+            model="gpt-4.1",
+            input=input_items,
+        )
+
+        assert response.status == "completed", "the backend response must reach the client"
+
+        forwarded = _RecordingResponsesBackend.forwarded
+        assert len(forwarded) == 1, "exactly one request should reach the backend"
+        assert forwarded[0]["path"] == "/v1/responses"
+        assert forwarded[0]["body"]["input"] == input_items, (
+            "the outbound body must carry the input rebuilt from state, "
+            "not the input-stripped request_body"
+        )
 
     @pytest.mark.skipif(
         os.environ.get("PRAXIS_TEST_RESPONSES_ONLY") != "1",
@@ -1799,6 +1905,43 @@ class TestOpenAIConversations:
             )
         assert exc_info.value.status_code == 400, "duplicate item id must be rejected with 400"
 
+    def test_owner_wide_item_id_conflict_is_rejected_atomically(
+        self, openai_client, other_owner_client
+    ):
+        shared = {
+            "id": "item_owner_wide_conflict",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "original"}],
+        }
+        first = openai_client.conversations.create(items=[shared])
+        second = openai_client.conversations.create()
+        before = openai_client.conversations.items.list(first.id).model_dump()
+        preceding = {**shared, "id": "item_before_owner_wide_conflict"}
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.create(items=[preceding, shared])
+        assert exc_info.value.status_code == 400, "an owner-wide item ID conflict on create must return 400"
+        assert exc_info.value.body["type"] == "invalid_request_error", "create conflicts must use the invalid_request_error envelope"
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.items.create(
+                second.id, items=[preceding, shared]
+            )
+        assert exc_info.value.status_code == 400, "an owner-wide item ID conflict on append must return 400"
+        assert exc_info.value.body["type"] == "invalid_request_error", "append conflicts must use the invalid_request_error envelope"
+        assert openai_client.conversations.items.list(first.id).model_dump() == before, "the source conversation must be unchanged"
+        assert openai_client.conversations.items.list(second.id).data == [], "the failed batch must not persist its preceding item"
+
+        created = openai_client.conversations.items.create(
+            second.id, items=[preceding]
+        )
+        assert [item.id for item in created.data] == [preceding["id"]]
+        other = other_owner_client.conversations.create(items=[shared])
+        assert [
+            item.id for item in other_owner_client.conversations.items.list(other.id).data
+        ] == [shared["id"]]
+
     @pytest.mark.parametrize(
         "query",
         ["limit=101", "limit=-1", "order=sideways", "after="],
@@ -2154,6 +2297,10 @@ class TestOpenAIConversations:
                     "content": "keep me",
                 },
             ],
+        )
+
+        conversation = openai_client.conversations.update(
+            conversation.id, metadata={"topic": "committed-before-delete"},
         )
 
         updated = openai_client.conversations.items.delete(
@@ -3037,6 +3184,35 @@ def test_structured_mcp_failure_append_back(conversation_backend):
     ), "append-back must retain the structured error verbatim"
 
 
+def test_completed_response_stores_original_request_input(conversation_backend):
+    """#1618: the original request input round-trips into stored history.
+
+    Managed state init moves ``input`` out of ``request_body`` and the store/
+    append-back path reconstructs it from the shared snapshot. A completed
+    response must therefore persist the original user input as a conversation
+    item, exercising the shared input path end-to-end through the OpenAI client.
+    """
+    client, _, _output, _translated = conversation_backend
+    conversation = client.conversations.create()
+    response = client.responses.create(
+        model="test-model", conversation=conversation.id, input="remember this exact input"
+    )
+    assert response.status == "completed"
+
+    page = client.conversations.items.list(conversation.id, order="asc")
+    texts = []
+    for item in page.data:
+        if getattr(item, "role", None) != "user":
+            continue
+        for part in item.content or []:
+            text = part.text if hasattr(part, "text") else part.get("text") if isinstance(part, dict) else None
+            if text:
+                texts.append(text)
+    assert any("remember this exact input" in text for text in texts), (
+        "the original request input must be stored after #1618 moves it out of request_body"
+    )
+
+
 class _CapturingResponsesBackend(_ChunkedResponsesBackend):
     """Responses backend that records forwarded request bodies for assertions."""
 
@@ -3207,3 +3383,233 @@ def test_ttl_purges_conversation_after_expiration(ttl_proxy_client):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"] + sys.argv[1:]))
+
+
+@pytest.fixture(scope="module")
+def rate_limited_conversation_clients(request):
+    with tempfile.TemporaryDirectory() as db_dir:
+        port, control_port, readiness_port = _free_port(), _free_port(), _free_port()
+        path = _write_config(port, os.path.join(db_dir, "rate_limited.db"))
+        with open(path) as config_file:
+            config = json.load(config_file)
+        control_chain = json.loads(json.dumps(config["filter_chains"][0]))
+        control_chain["name"] = "control"
+        config["filter_chains"][0]["filters"][-1]["rate_limit"] = {
+            "mode": "global", "rate": getattr(request, "param", 0.000001), "burst": 1,
+        }
+        config["filter_chains"].append(control_chain)
+        config["listeners"].append({
+            "name": "control", "address": f"127.0.0.1:{control_port}",
+            "filter_chains": ["control"],
+        })
+        with open(path, "w") as config_file:
+            json.dump(config, config_file)
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", path], stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, text=True, env=_proxy_env(readiness_port),
+        )
+        clients = [OpenAI(api_key="not-needed", base_url=f"http://127.0.0.1:{p}/v1",
+                          default_headers={OWNER_HEADER: _owner_assertion("alice")},
+                          max_retries=0, timeout=10.0) for p in (port, control_port)]
+        try:
+            _wait_for_proxy(port, proc)
+            _wait_for_store_ready(readiness_port, proc)
+            limited, control = clients
+            conversation = limited.conversations.create(metadata={"original": "yes"}, items=[{
+                "type": "message", "role": "user", "content": "keep this item",
+            }])
+            item = control.conversations.items.list(conversation.id).data[0]
+            yield limited, control, conversation.id, item.id
+        finally:
+            for client in clients:
+                client.close()
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(path)
+
+
+@pytest.mark.parametrize("operation", [
+    "create", "retrieve", "update", "delete", "create_items", "list_items", "retrieve_item", "delete_item",
+])
+def test_conversations_rate_limit_contract(rate_limited_conversation_clients, operation):
+    limited, control, conversation_id, item_id = rate_limited_conversation_clients
+    actions = {
+        "create": limited.conversations.create,
+        "retrieve": lambda: limited.conversations.retrieve(conversation_id),
+        "update": lambda: limited.conversations.update(conversation_id, metadata={"changed": "yes"}),
+        "delete": lambda: limited.conversations.delete(conversation_id),
+        "create_items": lambda: limited.conversations.items.create(conversation_id, items=[{
+            "type": "message", "role": "user", "content": "should not be added",
+        }]),
+        "list_items": lambda: limited.conversations.items.list(conversation_id),
+        "retrieve_item": lambda: limited.conversations.items.retrieve(item_id, conversation_id=conversation_id),
+        "delete_item": lambda: limited.conversations.items.delete(item_id, conversation_id=conversation_id),
+    }
+    with pytest.raises(openai.RateLimitError) as raised:
+        actions[operation]()
+    response = raised.value.response
+    assert response.status_code == 429, f"{operation}: exhausted admission must return 429"
+    assert response.headers["content-type"].startswith("application/json"), f"{operation}: errors must be JSON"
+    assert int(response.headers["retry-after"]) >= 1, f"{operation}: Retry-After must be positive seconds"
+    error = response.json()["error"]
+    assert error["type"] == "rate_limit_error", f"{operation}: expected admission error category"
+    assert error["code"] == "rate_limit_exceeded", f"{operation}: expected admission error code"
+    assert error["param"] is None, f"{operation}: admission is independent of a request parameter"
+    assert isinstance(error["message"], str), f"{operation}: error message must be a string"
+    assert error["message"], f"{operation}: error message must be nonempty"
+    assert control.conversations.retrieve(conversation_id).metadata == {"original": "yes"}, f"{operation}: denied requests must preserve metadata"
+    assert [item.id for item in control.conversations.items.list(conversation_id).data] == [item_id], f"{operation}: denied requests must preserve items"
+
+
+@pytest.mark.parametrize("rate_limited_conversation_clients", [1], indirect=True)
+def test_conversations_rate_limit_recovers_after_retry_delay(rate_limited_conversation_clients):
+    limited, _, conversation_id, _ = rate_limited_conversation_clients
+    for _ in range(10):
+        try:
+            limited.conversations.retrieve(conversation_id)
+        except openai.RateLimitError as error:
+            retry_after = int(error.response.headers["retry-after"])
+            break
+    else:
+        pytest.fail("could not establish exhaustion before testing recovery")
+    assert retry_after == 1, "a one-request-per-second bucket must advertise a one-second retry"
+    time.sleep(retry_after + 0.05)
+    assert limited.conversations.retrieve(conversation_id).id == conversation_id, "admission must recover after Retry-After"
+
+
+@pytest.fixture(params=[False, True], ids=["native", "translated"])
+def conversation_backend_doc_extract(request, tmp_path):
+    """Both inference lanes with document extraction after rehydration."""
+    yield from _run_conversation_proxy(
+        tmp_path, request.param, [{"filter": "openai_doc_extract", "allow_pre_security_callout": True}]
+    )
+
+
+def test_object_input_document_extraction_preserves_original_snapshot(
+    conversation_backend_doc_extract,
+):
+    """Object input is extracted for inference while original input is persisted."""
+    import base64
+
+    client, captured, _, translated = conversation_backend_doc_extract
+    conversation = client.conversations.create()
+    original = {
+        "role": "user",
+        "content": [{
+            "type": "input_file",
+            "filename": "notes.txt",
+            "file_data": "data:text/plain;base64," + base64.b64encode(b"document content").decode(),
+        }],
+    }
+    response = client.responses.create(
+        model="test-model",
+        conversation=conversation.id,
+        extra_body={"input": original},
+    )
+    assert response.status == "completed", "object document input must complete"
+    _, forwarded = captured[-1]
+    messages = forwarded["messages" if translated else "input"]
+    assert "document content" in json.dumps(messages), "backend must receive extracted text"
+    assert "file_data" not in json.dumps(messages), "backend must not receive the original file"
+    page = client.conversations.items.list(conversation.id, order="asc")
+    users = [item.model_dump() for item in page.data if getattr(item, "role", None) == "user"]
+    assert original["content"][0]["file_data"] in json.dumps(users), (
+        "the original file input must survive extraction in the client snapshot"
+    )
+
+
+def _assert_conversation_error(response, status):
+    assert response.status_code == status
+    assert response.headers["content-type"].startswith("application/json")
+    error = response.json()["error"]
+    assert isinstance(error["message"], str) and error["message"]
+    assert error["type"] == ("server_error" if status == 500 else "invalid_request_error")
+    for field in ("param", "code"):
+        assert field in error and (error[field] is None or isinstance(error[field], str))
+    assert "retry-after" not in response.headers
+    assert "injected private database failure" not in response.text
+
+
+@pytest.mark.parametrize("operation", [
+    "retrieve", "update", "delete", "create_items", "list_items", "retrieve_item", "delete_item",
+])
+def test_conversations_not_found_contract_preserves_owner(openai_client, other_owner_client, operation):
+    conversation = openai_client.conversations.create(metadata={"keep": "original"}, items=[{
+        "type": "message", "role": "user", "content": "private item",
+    }])
+    item = openai_client.conversations.items.list(conversation.id).data[0]
+    actions = {
+        "retrieve": lambda cid: other_owner_client.conversations.retrieve(cid),
+        "update": lambda cid: other_owner_client.conversations.update(cid, metadata={"changed": "yes"}),
+        "delete": lambda cid: other_owner_client.conversations.delete(cid),
+        "create_items": lambda cid: other_owner_client.conversations.items.create(cid, items=[]),
+        "list_items": lambda cid: other_owner_client.conversations.items.list(cid),
+        "retrieve_item": lambda cid: other_owner_client.conversations.items.retrieve(item.id, conversation_id=cid),
+        "delete_item": lambda cid: other_owner_client.conversations.items.delete(item.id, conversation_id=cid),
+    }
+    for cid in (conversation.id, "conv_absent"):
+        with pytest.raises(NotFoundError) as raised:
+            actions[operation](cid)
+        _assert_conversation_error(raised.value.response, 404)
+        assert "private item" not in raised.value.response.text
+        assert "original" not in raised.value.response.text
+    assert openai_client.conversations.retrieve(conversation.id).metadata == {"keep": "original"}
+    assert [row.id for row in openai_client.conversations.items.list(conversation.id).data] == [item.id]
+
+
+@pytest.mark.parametrize("operation", ["create", "update", "create_items", "list_items", "delete_item"])
+def test_conversations_bad_request_contract_preserves_state(openai_client, operation):
+    conversation = openai_client.conversations.create(metadata={"keep": "original"})
+    actions = {
+        "create": lambda: openai_client.conversations.create(metadata="invalid"),
+        "update": lambda: openai_client.conversations.update(conversation.id, metadata="invalid"),
+        "create_items": lambda: openai_client.conversations.items.create(conversation.id, items=[{"type": "unknown"}]),
+        "list_items": lambda: openai_client.conversations.items.list(conversation.id, limit=-1),
+        "delete_item": lambda: openai_client.delete(f"/conversations/{conversation.id}/items/%FF", cast_to=object),
+    }
+    with pytest.raises(BadRequestError) as raised:
+        actions[operation]()
+    _assert_conversation_error(raised.value.response, 400)
+    assert openai_client.conversations.retrieve(conversation.id).metadata == {"keep": "original"}
+    assert openai_client.conversations.items.list(conversation.id).data == []
+
+
+@pytest.mark.skipif(DATABASE_URL.startswith("postgres"), reason="fault injection uses SQLite triggers")
+@pytest.mark.parametrize("operation", ["create", "update", "create_items", "delete_item"])
+def test_conversations_database_error_rolls_back_mutation(legacy_sqlite_record_clients, operation):
+    client, db_path, items_table = legacy_sqlite_record_clients
+    conversations_table = items_table.removesuffix("_conversation_items") + "_conversations"
+    conversation = client.conversations.create(metadata={"keep": "original"}, items=[{
+        "type": "message", "role": "user", "content": "keep item",
+    }])
+    item = client.conversations.items.list(conversation.id).data[0]
+    event, table = {
+        "create": ("INSERT", items_table),
+        "update": ("UPDATE", conversations_table),
+        "create_items": ("INSERT", items_table),
+        "delete_item": ("DELETE", items_table),
+    }[operation]
+    with sqlite3.connect(db_path) as database:
+        before_conversations = database.execute(f'SELECT * FROM "{conversations_table}"').fetchall()
+        before_items = database.execute(f'SELECT * FROM "{items_table}"').fetchall()
+        database.execute(f'''CREATE TRIGGER fail_mutation AFTER {event} ON "{table}"
+            BEGIN SELECT RAISE(ABORT, 'injected private database failure'); END''')
+    actions = {
+        "create": lambda: client.conversations.create(items=[{"type": "message", "role": "user", "content": "rollback"}]),
+        "update": lambda: client.conversations.update(conversation.id, metadata={"changed": "yes"}),
+        "create_items": lambda: client.conversations.items.create(conversation.id, items=[{"type": "message", "role": "user", "content": "rollback"}]),
+        "delete_item": lambda: client.conversations.items.delete(item.id, conversation_id=conversation.id),
+    }
+    with pytest.raises(InternalServerError) as raised:
+        actions[operation]()
+    _assert_conversation_error(raised.value.response, 500)
+    with sqlite3.connect(db_path) as database:
+        assert database.execute(f'SELECT * FROM "{conversations_table}"').fetchall() == before_conversations
+        assert database.execute(f'SELECT * FROM "{items_table}"').fetchall() == before_items
+        database.execute("DROP TRIGGER fail_mutation")
+    assert client.conversations.retrieve(conversation.id).metadata == {"keep": "original"}
+    assert [row.id for row in client.conversations.items.list(conversation.id).data] == [item.id]

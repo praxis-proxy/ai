@@ -85,6 +85,19 @@ pub struct ConversationRecord {
     pub messages: serde_json::Value,
 }
 
+/// Public conversation fields captured under the item mutation's parent lock.
+///
+/// Excludes message history so returning a deletion result never buffers items.
+#[derive(Debug)]
+pub struct ConversationSnapshot {
+    /// Conversation identifier.
+    pub conversation_id: String,
+    /// Original creation timestamp.
+    pub created_at: i64,
+    /// Metadata observed while the mutation holds the parent lock.
+    pub metadata: serde_json::Value,
+}
+
 // -----------------------------------------------------------------------------
 // ConversationItemRecord
 // -----------------------------------------------------------------------------

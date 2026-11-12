@@ -26,8 +26,8 @@ use crate::{
     retained_charge,
     traits::{ConversationItemStore, ResponseStore},
     types::{
-        BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-        ResponseCasOutcome, ResponseEventRecord, ResponseRecord, StoreError,
+        BudgetedRecord, ConversationItemRecord, ConversationRecord, ConversationSnapshot, EventLogStatus,
+        PendingApprovalRecord, ResponseCasOutcome, ResponseEventRecord, ResponseRecord, StoreError,
     },
 };
 
@@ -721,6 +721,35 @@ impl ResponseStore for InMemoryStore {
 
 #[async_trait]
 impl ConversationItemStore for InMemoryStore {
+    async fn create_conversation_with_items(
+        &self,
+        record: &ConversationRecord,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock()?;
+        if inner.conversation_ids.contains_key(&record.conversation_id) {
+            return Err(StoreError::Database("conversation id collision".to_owned()));
+        }
+        if items
+            .iter()
+            .any(|item| item.owner != record.owner || item.conversation_id != record.conversation_id)
+        {
+            return Err(StoreError::InvalidInput("initial item scope mismatch".to_owned()));
+        }
+        reject_duplicate_item_ids(&inner, items)?;
+        let key = (record.owner.clone(), record.conversation_id.clone());
+        // The store retains these records after the caller's borrowed batch ends.
+        inner
+            .conversation_ids
+            .insert(record.conversation_id.clone(), record.owner.clone());
+        inner.conversations.insert(key.clone(), record.clone());
+        for item in items {
+            inner.item_ids.insert((item.owner.clone(), item.item_id.clone()));
+        }
+        inner.items.insert(key, items.to_vec());
+        Ok(())
+    }
+
     async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError> {
         let mut inner = self.lock()?;
         if let Some(existing_owner) = inner.conversation_ids.get(&record.conversation_id)
@@ -1019,20 +1048,34 @@ impl ConversationItemStore for InMemoryStore {
         conversation_id: &str,
         item_id: &str,
     ) -> Result<bool, StoreError> {
+        Ok(self
+            .delete_item_and_get_conversation(owner, conversation_id, item_id)
+            .await?
+            .is_some())
+    }
+
+    async fn delete_item_and_get_conversation(
+        &self,
+        owner: &StateOwner,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<Option<ConversationSnapshot>, StoreError> {
         let mut inner = self.lock()?;
         let key = (owner.clone(), conversation_id.to_owned());
+        let parent = inner.conversations.get(&key).ok_or(StoreError::NotFound)?;
+        // Only public fields must outlive the mutex guard; never clone history.
+        let snapshot = ConversationSnapshot {
+            conversation_id: parent.conversation_id.clone(),
+            created_at: parent.created_at,
+            metadata: parent.metadata.clone(),
+        };
         let Some(index) = inner
             .items
             .get(&key)
             .and_then(|items| items.iter().position(|item| item.item_id == item_id))
         else {
-            return Ok(false);
+            return Ok(None);
         };
-        if !inner.conversations.contains_key(&key) {
-            return Err(StoreError::Database(format!(
-                "conversation disappeared during message sync: {conversation_id}"
-            )));
-        }
         preserve_legacy_history(&mut inner, &key)?;
         let items = inner
             .items
@@ -1040,7 +1083,7 @@ impl ConversationItemStore for InMemoryStore {
             .ok_or_else(|| StoreError::Database("conversation items disappeared during message sync".to_owned()))?;
         items.remove(index);
         inner.item_ids.remove(&(owner.clone(), item_id.to_owned()));
-        Ok(true)
+        Ok(Some(snapshot))
     }
 }
 

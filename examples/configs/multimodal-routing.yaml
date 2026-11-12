@@ -1,9 +1,9 @@
 # Multimodal Content Routing
 #
-# Derives a proxy-owned modality fact from OpenAI-style message content. Image,
-# audio, combined image/audio, and text-only requests can be routed to backends
-# with matching capabilities. The internal fact namespace cannot be supplied by
-# clients, and the filter replaces any previously staged copy before routing.
+# The existing protocol request filter derives a proxy-owned modality fact from
+# structured message content. Branch conditions route image, audio, combined
+# image/audio, and text-only requests without exposing the fact as an HTTP
+# header. The Responses and Anthropic request filters publish the same fact.
 
 listeners:
   - name: gateway
@@ -13,26 +13,54 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: multimodal_to_header
-        # Base64 expands media payloads; size this for the largest accepted request.
-        max_body_bytes: 16777216 # 16 MiB
+      - filter: ai_operation
+      - filter: openai_chat_completions_request
+        branch_chains:
+          - name: image-audio
+            on_result:
+              filter: openai_chat_completions_request
+              key: modality
+              result: image_audio
+            chains:
+              - name: image-audio-route
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: image-audio
+            rejoin: shared-load-balancer
+          - name: image
+            on_result:
+              filter: openai_chat_completions_request
+              key: modality
+              result: image
+            chains:
+              - name: image-route
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: image
+            rejoin: shared-load-balancer
+          - name: audio
+            on_result:
+              filter: openai_chat_completions_request
+              key: modality
+              result: audio
+            chains:
+              - name: audio-route
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: audio
+            rejoin: shared-load-balancer
       - filter: router
         routes:
           - path_prefix: "/"
-            headers:
-              x-praxis-ai-modality: image_audio
-            cluster: image-audio
-          - path_prefix: "/"
-            headers:
-              x-praxis-ai-modality: image
-            cluster: image
-          - path_prefix: "/"
-            headers:
-              x-praxis-ai-modality: audio
-            cluster: audio
-          - path_prefix: "/"
             cluster: text
-      - filter: load_balancer
+      - name: shared-load-balancer
+        filter: load_balancer
         clusters:
           - name: image-audio
             endpoints:

@@ -1,0 +1,54 @@
+# Sandbox image for coding harnesses that reach Praxis from OpenShell.
+#
+# Installs the npm packages named in HARNESS_PACKAGES on the official Node
+# image, so their binaries land under /usr/local/lib/node_modules where
+# `examples/openshell/praxis-gateway-profile.yaml` expects them. Take each
+# version from its pin under `tests/integration/fixtures/*/pin.toml`; CI
+# installs some of those as release archives, but the version is the same:
+#
+#   docker build -f examples/openshell/Containerfile.harnesses -t praxis-harness:local \
+#     --build-arg HARNESS_PACKAGES="@anthropic-ai/claude-code@<pin> @openai/codex@<pin>" \
+#     examples/openshell
+#
+# The build context is `examples/openshell`, because the repository's
+# `.dockerignore` excludes `examples/`. Build with the container engine your
+# OpenShell gateway uses. See
+# `docs/developing/openshell-cli-vllm-through-praxis.md`.
+
+FROM node:22-bookworm-slim
+
+# Space-separated npm package specs, for example
+# "@anthropic-ai/claude-code@<pin> @openai/codex@<pin> opencode-ai@<pin>
+# @earendil-works/pi-coding-agent@<pin>". There is no default, so every
+# version is chosen deliberately.
+ARG HARNESS_PACKAGES
+
+# The sandbox blocks first-use downloads, so ship the search tools harnesses
+# would otherwise fetch (pi downloads fd and ripgrep, for example).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash ca-certificates curl fd-find git ripgrep \
+    && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN test -n "$HARNESS_PACKAGES" || { echo "set --build-arg HARNESS_PACKAGES" >&2; exit 1; } \
+    && npm install -g $HARNESS_PACKAGES \
+    && npm cache clean --force
+
+# Writes each harness's gateway config from the provider placeholder, then
+# execs the harness.
+COPY --chmod=0755 praxis-harness-env.sh /usr/local/bin/praxis-harness-env
+
+RUN mkdir -p /workspace && chown node:node /workspace
+USER node
+WORKDIR /workspace
+
+# The default sandbox policy makes only /tmp and the working directory
+# writable, so keep every harness's settings and sessions under /tmp.
+ENV HOME=/tmp/home \
+    CLAUDE_CONFIG_DIR=/tmp/claude \
+    CODEX_HOME=/tmp/codex \
+    XDG_CONFIG_HOME=/tmp/xdg/config \
+    XDG_DATA_HOME=/tmp/xdg/data \
+    XDG_STATE_HOME=/tmp/xdg/state \
+    XDG_CACHE_HOME=/tmp/xdg/cache \
+    PI_CODING_AGENT_DIR=/tmp/pi-agent

@@ -17,7 +17,7 @@
 //! applies to every request traversing the chain — not only streaming chat
 //! completions. The default matches the workspace-wide 10 MiB JSON body
 //! default used by the other body-rewriting filters; deployments with larger
-//! legitimate requests should raise `max_body_bytes` (ceiling 64 MiB).
+//! legitimate requests should raise `max_body_bytes`.
 //!
 //! # YAML
 //!
@@ -133,7 +133,7 @@ impl StreamUsageInjectFilter {
     /// # Errors
     ///
     /// Returns [`FilterError`] if the YAML config is invalid or
-    /// `max_body_bytes` is zero or exceeds the 64 MiB ceiling.
+    /// `max_body_bytes` is zero or exceeds the ceiling Praxis enforces.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: StreamUsageConfig = parse_filter_config("stream_usage_inject", config)?;
         validate_max_body_bytes("stream_usage_inject", cfg.max_body_bytes)?;

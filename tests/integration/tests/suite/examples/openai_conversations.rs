@@ -624,6 +624,152 @@ fn list_items_with_invalid_query_on_nonexistent_conversation_returns_400() {
     assert_eq!(body["error"]["type"], "invalid_request_error");
 }
 
+#[test]
+fn configured_rate_limit_returns_openai_error() {
+    let proxy_port = free_port();
+    let control_port = free_port();
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("conversations.db").display()
+    );
+    let yaml = std::fs::read_to_string(example_config_path("openai/conversations/conversations.yaml")).unwrap();
+    for expected in ["sqlite://conversations.db?mode=rwc", "rate: 100", "burst: 200"] {
+        assert!(
+            yaml.contains(expected),
+            "example configuration changed: missing {expected}"
+        );
+    }
+    let patched = patch_yaml(
+        &yaml
+            .replace("sqlite://conversations.db?mode=rwc", &database_url)
+            .replace("rate: 100", "rate: 0.000001")
+            .replace("burst: 200", "burst: 1"),
+        proxy_port,
+        &HashMap::new(),
+    );
+    let mut config = praxis_core::config::Config::from_yaml(&patched).unwrap();
+    let mut control_chain = config.filter_chains[0].clone();
+    control_chain.name = "control".to_owned();
+    let conversations = control_chain
+        .filters
+        .iter_mut()
+        .find(|entry| entry.filter_type == "openai_conversations")
+        .unwrap();
+    conversations.config.as_mapping_mut().unwrap().remove("rate_limit");
+    let mut control_listener = config.listeners[0].clone();
+    control_listener.name = "control".to_owned();
+    control_listener.address = format!("127.0.0.1:{control_port}");
+    control_listener.filter_chains = vec![control_chain.name.clone()];
+    config.filter_chains.push(control_chain);
+    config.listeners.push(control_listener);
+    let proxy = start_proxy(&config);
+    let id = create_conversation(&proxy, "{}");
+    for (method, path) in [
+        ("POST", "/v1/conversations".to_owned()),
+        ("GET", format!("/v1/conversations/{id}")),
+        ("POST", format!("/v1/conversations/{id}")),
+        ("DELETE", format!("/v1/conversations/{id}")),
+        ("POST", format!("/v1/conversations/{id}/items")),
+        ("GET", format!("/v1/conversations/{id}/items")),
+        ("GET", format!("/v1/conversations/{id}/items/item_absent")),
+        ("DELETE", format!("/v1/conversations/{id}/items/item_absent")),
+    ] {
+        let request = if method == "POST" {
+            json_post(&path, "{}")
+        } else {
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        };
+        let raw = http_send(proxy.addr(), &request);
+        assert_eq!(parse_status(&raw), 429, "{raw}");
+        assert!(
+            raw.to_ascii_lowercase().contains("content-type: application/json"),
+            "{method}: denial must declare JSON"
+        );
+        assert!(
+            raw.to_ascii_lowercase().contains("retry-after:"),
+            "{method}: denial must provide a retry delay"
+        );
+        let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+        assert_eq!(
+            body["error"]["type"], "rate_limit_error",
+            "{method}: admission error category"
+        );
+        assert_eq!(
+            body["error"]["code"], "rate_limit_exceeded",
+            "{method}: admission error code"
+        );
+        assert!(
+            body["error"]["param"].is_null(),
+            "{method}: admission is independent of request parameters"
+        );
+    }
+    let raw = http_send(
+        &format!("127.0.0.1:{control_port}"),
+        &format!("GET /v1/conversations/{id} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "denied DELETE must preserve the conversation: {raw}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(
+        body["id"], id,
+        "the control listener must observe the original conversation"
+    );
+}
+
+#[test]
+fn error_envelopes_cover_declared_client_errors() {
+    let proxy = start_test_proxy();
+    let id = create_conversation(&proxy, r#"{"metadata":{"keep":"original"}}"#);
+    for (method, path, body, status) in [
+        ("POST", "/v1/conversations".to_owned(), "{", 400),
+        ("POST", format!("/v1/conversations/{id}"), "{", 400),
+        ("POST", format!("/v1/conversations/{id}/items"), "{", 400),
+        ("GET", format!("/v1/conversations/{id}/items?limit=-1"), "", 400),
+        ("DELETE", format!("/v1/conversations/{id}/items/%FF"), "", 400),
+        ("GET", "/v1/conversations/conv_absent".to_owned(), "", 404),
+        (
+            "POST",
+            "/v1/conversations/conv_absent".to_owned(),
+            r#"{"metadata":{}}"#,
+            404,
+        ),
+        ("DELETE", "/v1/conversations/conv_absent".to_owned(), "", 404),
+        (
+            "POST",
+            "/v1/conversations/conv_absent/items".to_owned(),
+            r#"{"items":[]}"#,
+            404,
+        ),
+        ("GET", "/v1/conversations/conv_absent/items".to_owned(), "", 404),
+        ("GET", format!("/v1/conversations/{id}/items/item_absent"), "", 404),
+        ("DELETE", format!("/v1/conversations/{id}/items/item_absent"), "", 404),
+    ] {
+        let request = if method == "POST" {
+            json_post(&path, body)
+        } else {
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        };
+        let raw = http_send(proxy.addr(), &request);
+        assert_eq!(parse_status(&raw), status, "{path}: {raw}");
+        let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+        let error = &body["error"];
+        assert_eq!(error["type"], "invalid_request_error");
+        assert!(error["message"].is_string());
+        assert!(error.get("code").is_some());
+        assert!(error.get("param").is_some());
+    }
+    let raw = http_send(
+        proxy.addr(),
+        &format!("GET /v1/conversations/{id} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+    );
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["metadata"], serde_json::json!({"keep":"original"}));
+}
+
 // -----------------------------------------------------------------------------
 // Test Helpers
 // -----------------------------------------------------------------------------

@@ -36,6 +36,19 @@ filter_chains:
       - filter: ai_operation
 
       - filter: openai_conversations
+        # Reuses the core request limiter, shared across all eight operations.
+        # Global budgets cover this filter instance; per_ip uses the TCP peer IP.
+        # Each admitted request consumes one token, including later client errors.
+        # A rejection returns OpenAI JSON with Retry-After integer seconds.
+        # Omit this block to disable admission. A reload starts a fresh budget.
+        rate_limit:
+          mode: global
+          rate: 100
+          burst: 200
+        # Invalid input returns OpenAI JSON 400; missing owner-scoped resources
+        # return 404; storage failures return a generic JSON 500. Error code and
+        # param are always present, possibly null. Initial items and their new
+        # conversation commit together, so failed writes leave no partial create.
         backend: sqlite
         # In-memory:
         #   database_url: "sqlite::memory:"

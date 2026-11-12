@@ -39,7 +39,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SelectedUpstreamBodyOutcome,
-    SubRequestResponseMode, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    SubRequestResponseMode, parse_filter_config,
 };
 use serde::{Deserialize, ser::SerializeMap as _};
 use tracing::{debug, trace};
@@ -51,7 +51,7 @@ use super::{
     error::responses_error_rejection,
     state::{ResponsesState, normalize_input_owned},
 };
-use crate::json_body::SerializedJson;
+use crate::json_body::{MAX_JSON_BODY_BYTES, SerializedJson};
 
 // -----------------------------------------------------------------------------
 // ResponsesProxyFilter

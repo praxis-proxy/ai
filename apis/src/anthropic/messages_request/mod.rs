@@ -76,6 +76,9 @@ const FILTER_NAME: &str = "anthropic_messages_request";
 
 /// Processes an Anthropic create-message body once and publishes its facts.
 ///
+/// Structured image/audio content is published as `modality` metadata and a
+/// branch result; it is never promoted to an HTTP header.
+///
 /// The registry decides which operation this filter owns, so only
 /// `POST /v1/messages` has its body processed. Every other Anthropic Messages
 /// operation — token counting, the batch family — is released without body
@@ -339,6 +342,9 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedReques
     if classified.has_tools {
         ctx.set_metadata("anthropic_messages_request.has_tools", "true");
     }
+    if let Some(modality) = classified.modality {
+        ctx.set_metadata("anthropic_messages_request.modality", modality.as_str());
+    }
 }
 
 /// Promote the configured routing headers.
@@ -393,6 +399,9 @@ fn promote_filter_results(ctx: &mut HttpFilterContext<'_>, classified: &Classifi
     }
     if classified.has_tools {
         results.set("has_tools", "true")?;
+    }
+    if let Some(modality) = classified.modality {
+        results.set("modality", modality.as_str())?;
     }
 
     Ok(())

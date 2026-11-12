@@ -2,7 +2,10 @@
 
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -57,6 +60,114 @@ def report():
 
 
 class QualificationTest(unittest.TestCase):
+    def test_release_uses_recent_ancestor_nightly_and_discloses_newer_failure(self):
+        timestamp = qualification.now()
+        def run(identifier, conclusion="success", sha="a" * 40, created=timestamp):
+            return {"id": identifier, "run_attempt": 2, "head_sha": sha,
+                    "status": "completed", "conclusion": conclusion,
+                    "created_at": created, "html_url": f"https://example.test/{identifier}"}
+
+        for scenario in ("passed", "expired", "unrelated", "missing_job", "incomplete", "invalid", "missing_artifact"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                older = run(17, created="2020-01-01T00:00:00+00:00" if scenario == "expired" else timestamp)
+                newer = run(18, "failure")
+                source = report()
+                if scenario == "incomplete":
+                    source.update(status="incomplete", reason="required provenance unavailable: vLLM version")
+                    source["backend"]["version"] = None
+                if scenario == "invalid":
+                    source["gateway"]["checkout_sha"] = "z" * 40
+
+                def api(endpoint):
+                    if "/runs?" in endpoint:
+                        return {"workflow_runs": [newer, older]}
+                    if "/compare/" in endpoint:
+                        return {"status": "diverged" if scenario == "unrelated" else "ahead"}
+                    jobs = [{"name": name, "conclusion": "success"} for name in qualification.GPU_REQUIRED_JOBS]
+                    if scenario == "missing_job":
+                        jobs.pop()
+                    return {"jobs": jobs, "total_count": len(jobs)}
+
+                def download(argv, **kwargs):
+                    path = Path(argv[argv.index("--dir") + 1])
+                    path.mkdir(parents=True)
+                    (path / "qualification.json").write_text(json.dumps(source))
+                    return SimpleNamespace(returncode=1 if scenario == "missing_artifact" else 0)
+
+                with mock.patch.object(qualification, "gh_json", side_effect=api), \
+                     mock.patch.object(qualification.subprocess, "run", side_effect=download):
+                    qualification.release_evidence(SimpleNamespace(repo="example/repo", sha="b" * 40, output_dir=directory))
+                selected = json.loads((Path(directory) / "qualification.json").read_text())
+                if scenario == "passed":
+                    self.assertEqual(selected["status"], "passed")
+                    self.assertEqual(selected["gateway"]["checkout_sha"], "a" * 40)
+                    self.assertEqual(selected["release_context"]["release_sha"], "b" * 40)
+                    self.assertEqual(selected["release_context"]["newer_runs"][0]["conclusion"], "failure")
+                    rendered = qualification.render(selected)
+                    self.assertIn("changes since that checkout have not been GPU validated", rendered)
+                    self.assertIn("https://example.test/18", rendered)
+                else:
+                    self.assertEqual(selected["status"], "unavailable")
+
+    def test_capture_with_python3_only_container(self):
+        # The pinned runtime image installs python3 without a python alias.
+        # Execute the actual probe code with a tiny stand-in vllm package.
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            (directory / "vllm.py").write_text('__version__ = "0.32.0"\n')
+            cases = directory / "cases.json"
+            cases.write_text(json.dumps({
+                "selected": [
+                    {"id": profile, "profile": profile, "outcome": "passed", "reason": ""}
+                    for profile in ("native", "translation")
+                ],
+                "exit_code": 0, "dependencies": {"openai": "2.9.0"},
+            }))
+            output = directory / "raw.json"
+            check_output = subprocess.check_output
+            probes = []
+
+            def container_command(argv, **kwargs):
+                if argv[:3] == ("podman", "exec", "vllm"):
+                    probes.append(argv)
+                    if argv[3] != "python3":
+                        raise subprocess.CalledProcessError(127, argv)
+                    return check_output(
+                        [sys.executable, *argv[4:]], cwd=directory,
+                        env={**os.environ, "PYTHONPATH": str(directory)}, **kwargs,
+                    )
+                return "a" * 40 if argv == ("git", "rev-parse", "HEAD") else "available"
+
+            with mock.patch.dict(os.environ, {
+                "CONTAINER_RUNTIME": "podman", "VLLM_GPU_MODEL": "test-model",
+                "GITHUB_RUN_ID": "17", "GITHUB_RUN_ATTEMPT": "2",
+            }), mock.patch.object(qualification.subprocess, "check_output", side_effect=container_command), \
+                 mock.patch.object(qualification, "file_hash", return_value="b" * 64), \
+                 mock.patch.object(qualification, "locked_version", return_value="0.8.0"), \
+                 mock.patch.object(qualification, "image_inspect", return_value="image-id"):
+                qualification.capture(SimpleNamespace(
+                    responses=cases, credentialed=cases, setup="passed", output=output,
+                ))
+            captured = json.loads(output.read_text())
+            self.assertEqual(captured["backend"]["version"], "0.32.0")
+            # Missing model metadata remains unknown, not fabricated.
+            self.assertIsNone(captured["model"]["resolved_revision"])
+            self.assertEqual(len(probes), 2)
+            self.assertTrue(all(argv[3] == "python3" for argv in probes))
+            finished = qualification.finish(
+                output, True, "success", "success", "skipped", "skipped",
+                17, 2, "https://example.test/run", "a" * 40,
+            )
+            self.assertEqual(finished["status"], "passed", finished["reason"])
+            captured["backend"]["version"] = None
+            output.write_text(json.dumps(captured))
+            unavailable = qualification.finish(
+                output, True, "success", "success", "skipped", "skipped",
+                17, 2, "https://example.test/run", "a" * 40,
+            )
+            self.assertEqual(unavailable["status"], "incomplete")
+            self.assertEqual(unavailable["reason"], "required provenance unavailable: vLLM version")
+
     def test_client_fixture_profiles_and_unknown_paths(self):
         def item(*fixtures, override=None):
             return SimpleNamespace(
@@ -71,6 +182,21 @@ class QualificationTest(unittest.TestCase):
         self.assertEqual(plugin.profile_for_item(item("new_gateway_client")), "unclassified")
         self.assertEqual(plugin.profile_for_item(item("openai_client", "chat_streaming_client")), "unclassified")
         self.assertEqual(plugin.profile_for_item(item(override="supporting")), "supporting")
+
+    def test_nightly_regression_fixture_profiles(self):
+        profiles = {
+            "admission_client": "native",
+            "mcp_approval_floor_client": "native",
+            "code_interpreter_capture_client": "supporting",
+            "witness_backend_tool_client": "supporting",
+            "backend_error_client": "supporting",
+            "ttft_proxy": "supporting",
+            "native_guardrails_client": "supporting",
+        }
+        for fixture, expected in profiles.items():
+            with self.subTest(fixture=fixture):
+                item = SimpleNamespace(fixturenames=[fixture], obj=SimpleNamespace())
+                self.assertEqual(plugin.profile_for_item(item), expected)
 
     def test_mixed_profiles_do_not_turn_skipped_native_into_passed_qualification(self):
         with tempfile.TemporaryDirectory() as directory:

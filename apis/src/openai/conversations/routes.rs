@@ -25,8 +25,8 @@ use super::contracts::{
 use crate::openai::{
     include::IncludeField,
     operation::{
-        MediaTypeSpec, OwnedOperationContract, ParameterLocation, ParameterSpec, RequestBodySpec, ResponseSpec,
-        schema_binding,
+        MediaTypeSpec, OwnedOperationContract, ParameterLocation, ParameterSpec, RequestBodySpec, ResponseHeaderSpec,
+        ResponseSpec, schema_binding,
     },
 };
 #[cfg(feature = "openai-conversations")]
@@ -106,7 +106,8 @@ macro_rules! operation_contract {
         owned {
             parameters: [$($parameter:expr),* $(,)?],
             request: $request:tt,
-            response: $response:ty $(,)?
+            response: $response:ty,
+            errors: [$($status:literal),* $(,)?] $(,)?
         }
     ) => {{
         #[cfg(feature = "openai-conversations")]
@@ -116,9 +117,24 @@ macro_rules! operation_contract {
                 request: request_binding!($request),
                 responses: &[ResponseSpec {
                     status: "200",
+                    headers: &[],
                     description: "OK",
                     content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($response))],
-                }],
+                }, ResponseSpec {
+                    status: "429",
+                    description: "Rate limit exceeded",
+                    headers: &[ResponseHeaderSpec {
+                        name: "Retry-After",
+                        description: "Minimum integer seconds to wait before retrying, when a delay can be computed.",
+                        schema: super::rate_limit::retry_after_schema,
+                    }],
+                    content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!(super::error::ErrorResponse<'static>))],
+                }, $(ResponseSpec {
+                    status: $status,
+                    description: "Conversations error",
+                    headers: &[],
+                    content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!(super::error::ErrorResponse<'static>))],
+                }),*],
             })
         }
         #[cfg(not(feature = "openai-conversations"))]
@@ -156,7 +172,15 @@ macro_rules! contract_request_body {
     (none {}) => {
         RequestBody::None
     };
-    (owned { parameters: [$($parameter:expr),* $(,)?],request: $request:tt,response: $response:ty $(,)? }) => {
+    (
+        owned {
+            parameters:
+            [$($parameter:expr),* $(,)?],request:
+            $request:tt,response:
+            $response:ty,errors:
+            [$($status:literal),* $(,)?] $(,)?
+        }
+    ) => {
         request_body_shape!($request)
     };
 }
@@ -305,6 +329,7 @@ conversation_operations! {
             parameters: [],
             request: [optional CreateConversationRequest],
             response: ConversationResource,
+            errors: ["400", "500"],
         },
     },
     GetConversation {
@@ -319,6 +344,7 @@ conversation_operations! {
             )],
             request: [none],
             response: ConversationResource,
+            errors: ["404"],
         },
     },
     UpdateConversation {
@@ -333,6 +359,7 @@ conversation_operations! {
             )],
             request: [required UpdateConversationRequest],
             response: ConversationResource,
+            errors: ["400", "404", "500"],
         },
     },
     DeleteConversation {
@@ -347,6 +374,7 @@ conversation_operations! {
             )],
             request: [none],
             response: DeletedConversationResource,
+            errors: ["404"],
         },
     },
     CreateConversationItems {
@@ -368,6 +396,7 @@ conversation_operations! {
             ],
             request: [required CreateConversationItemsRequest],
             response: ConversationItemList,
+            errors: ["400", "404", "500"],
         },
     },
     ListConversationItems {
@@ -392,6 +421,7 @@ conversation_operations! {
             ],
             request: [none],
             response: ConversationItemList,
+            errors: ["400", "404"],
         },
     },
     GetConversationItem {
@@ -414,6 +444,7 @@ conversation_operations! {
             ],
             request: [none],
             response: ConversationItem,
+            errors: ["404"],
         },
     },
     DeleteConversationItem {
@@ -431,6 +462,7 @@ conversation_operations! {
             ],
             request: [none],
             response: ConversationResource,
+            errors: ["400", "404", "500"],
         },
     },
 }
