@@ -12,6 +12,8 @@ pub(crate) mod config;
 #[cfg(feature = "openai-conversations")]
 pub(crate) mod contracts;
 #[cfg(feature = "openai-conversations")]
+mod error;
+#[cfg(feature = "openai-conversations")]
 mod filter;
 #[cfg(feature = "openai-conversations")]
 mod handlers;

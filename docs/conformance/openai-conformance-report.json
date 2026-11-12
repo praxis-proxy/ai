@@ -408,136 +408,15 @@
         "implementation_source": "generated:praxis-ai-apis/openai/conversations",
         "operation_contracts": {
           "total": 8,
-          "exact": 0,
+          "exact": 8,
           "missing": 0,
-          "drifted": 8,
+          "drifted": 0,
           "request_drifted": 0,
-          "response_drifted": 8,
+          "response_drifted": 0,
           "other_drifted": 0,
-          "exact_percent": 0.0,
+          "exact_percent": 100.0,
           "missing_operations": [],
-          "drifted_operations": [
-            {
-              "operation": {
-                "method": "DELETE",
-                "path": "/conversations/{conversation_id}",
-                "operation": "DELETE /conversations/{conversation_id}"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "DELETE",
-                "path": "/conversations/{conversation_id}/items/{item_id}",
-                "operation": "DELETE /conversations/{conversation_id}/items/{item_id}"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "GET",
-                "path": "/conversations/{conversation_id}",
-                "operation": "GET /conversations/{conversation_id}"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "GET",
-                "path": "/conversations/{conversation_id}/items",
-                "operation": "GET /conversations/{conversation_id}/items"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "GET",
-                "path": "/conversations/{conversation_id}/items/{item_id}",
-                "operation": "GET /conversations/{conversation_id}/items/{item_id}"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "POST",
-                "path": "/conversations",
-                "operation": "POST /conversations"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "POST",
-                "path": "/conversations/{conversation_id}",
-                "operation": "POST /conversations/{conversation_id}"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "POST",
-                "path": "/conversations/{conversation_id}/items",
-                "operation": "POST /conversations/{conversation_id}/items"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            }
-          ]
+          "drifted_operations": []
         },
         "inherited_contract": {
           "exact": true,
@@ -666,7 +545,7 @@
             "evidence": "api.openai.com probe on 2026-07-27: update with null metadata returned 400 invalid_type, update with object metadata returned 200"
           }
         ],
-        "all_exact": false
+        "all_exact": true
       },
       {
         "area_id": "responses",
@@ -799,24 +678,24 @@
     ],
     "operation_contracts": {
       "total": 9,
-      "exact": 0,
+      "exact": 8,
       "missing": 0,
-      "drifted": 9,
+      "drifted": 1,
       "request_drifted": 0,
-      "response_drifted": 9,
+      "response_drifted": 1,
       "other_drifted": 0,
-      "exact_percent": 0.0,
+      "exact_percent": 88.88888888888889,
       "by_area": [
         {
           "area": "Conversations",
           "total": 8,
-          "conformant": 0,
+          "conformant": 8,
           "missing": 0,
-          "drifted": 8,
+          "drifted": 0,
           "request_drifted": 0,
-          "response_drifted": 8,
+          "response_drifted": 0,
           "other_drifted": 0,
-          "conformance_percent": 0.0
+          "conformance_percent": 100.0
         },
         {
           "area": "Responses",
@@ -846,150 +725,14 @@
     "all_exact": false,
     "fixes_required": {
       "summary": {
-        "operations_to_fix": 9,
+        "operations_to_fix": 1,
         "area_contracts_to_fix": 0,
         "missing_operations": 0,
         "request_drift_operations": 0,
-        "response_drift_operations": 9,
+        "response_drift_operations": 1,
         "other_drift_operations": 0
       },
       "by_operation": [
-        {
-          "operation": {
-            "method": "DELETE",
-            "path": "/conversations/{conversation_id}",
-            "operation": "DELETE /conversations/{conversation_id}"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "DELETE",
-            "path": "/conversations/{conversation_id}/items/{item_id}",
-            "operation": "DELETE /conversations/{conversation_id}/items/{item_id}"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "GET",
-            "path": "/conversations/{conversation_id}",
-            "operation": "GET /conversations/{conversation_id}"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "GET",
-            "path": "/conversations/{conversation_id}/items",
-            "operation": "GET /conversations/{conversation_id}/items"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "GET",
-            "path": "/conversations/{conversation_id}/items/{item_id}",
-            "operation": "GET /conversations/{conversation_id}/items/{item_id}"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "POST",
-            "path": "/conversations",
-            "operation": "POST /conversations"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "POST",
-            "path": "/conversations/{conversation_id}",
-            "operation": "POST /conversations/{conversation_id}"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "POST",
-            "path": "/conversations/{conversation_id}/items",
-            "operation": "POST /conversations/{conversation_id}/items"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
         {
           "operation": {
             "method": "POST",
@@ -1022,6 +765,14 @@
         "status": "passed",
         "command": "cargo test -p praxis-ai-apis --no-default-features --features openai-conversations,store-all --lib conformance_conversations_ -- --show-output",
         "checks": [
+          {
+            "kind": "storage_error_rollback",
+            "evidence": "openai::conversations::tests::conformance_conversations_storage_errors_roll_back_mutations"
+          },
+          {
+            "kind": "error_response_contract",
+            "evidence": "openai::conversations::tests::conformance_conversations_declared_errors_match_pinned_contract_and_preserve_owners"
+          },
           {
             "kind": "rate_limit_response_contract",
             "evidence": "openai::conversations::tests::conformance_conversations_rate_limit_rejects_every_operation_before_store_access"
