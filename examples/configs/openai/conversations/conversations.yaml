@@ -45,6 +45,10 @@ filter_chains:
           mode: global
           rate: 100
           burst: 200
+        # Invalid input returns OpenAI JSON 400; missing owner-scoped resources
+        # return 404; storage failures return a generic JSON 500. Error code and
+        # param are always present, possibly null. Initial items and their new
+        # conversation commit together, so failed writes leave no partial create.
         backend: sqlite
         # In-memory:
         #   database_url: "sqlite::memory:"
