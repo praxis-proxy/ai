@@ -2788,12 +2788,13 @@ class TestOpenAIResponsesVLLM:
             openai_client.responses.retrieve(response.id)
         assert exc_info.value.status_code == 404, "store=false response must not be retrievable"
 
-    def test_store_and_retrieve(self, openai_client):
+    @pytest.mark.parametrize("store_options", [{}, {"store": True}], ids=["default", "explicit"])
+    def test_store_and_retrieve(self, openai_client, store_options):
         response = openai_client.responses.create(
             model=VLLM_MODEL,
             input="Say exactly: STORED-OK /no_think",
             temperature=0,
-            store=True,
+            **store_options,
             max_output_tokens=128,
         )
 

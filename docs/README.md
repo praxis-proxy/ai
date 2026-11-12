@@ -29,6 +29,13 @@ provider API integrations on top of [Praxis](https://github.com/praxis-proxy/pra
 - [Anthropic Messages replay testing](anthropic-messages-replay-test-plan.md)
 - [AI filter overview](filters/README.md)
 
+## Conformance
+
+- [OpenAI conformance scope, report, and verification](conformance/README.md)
+- [OpenAI Responses state conformance](conformance/openai-responses-state-conformance.md)
+- [OpenResponses translation coverage](conformance/openresponses-translation.md)
+- [Provider translation compatibility matrix](conformance/translation-matrix.md)
+
 ## Development
 
 For repository contributors building, testing, or extending Praxis AI:

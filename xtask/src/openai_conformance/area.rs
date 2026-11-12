@@ -82,6 +82,111 @@ const RESPONSES_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
         evidence: "openai::responses::tests::conformance_responses_generated_schema_check_rejects_incomplete_payloads",
         success_sentinel: "PRAXIS_CONFORMANCE_OK responses schema_check_sensitivity",
     },
+    RuntimeVerificationCheck {
+        kind: "persistence_default",
+        evidence: "openai::responses::store::tests::conformance_responses_on_request_body_arms_persistence_for_persisted_response",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses persistence_default",
+    },
+    RuntimeVerificationCheck {
+        kind: "persistence_opt_out",
+        evidence: "openai::responses::store::tests::conformance_responses_on_request_body_does_not_arm_persistence_when_store_false",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses persistence_opt_out",
+    },
+    RuntimeVerificationCheck {
+        kind: "persistence_buffered",
+        evidence: "openai::responses::store::tests::conformance_responses_on_response_body_persists_valid_response",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses persistence_buffered",
+    },
+    RuntimeVerificationCheck {
+        kind: "persistence_streamed",
+        evidence: "openai::responses::store::tests::conformance_responses_on_response_body_persists_streaming_response_at_eos",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses persistence_streamed",
+    },
+    RuntimeVerificationCheck {
+        kind: "lifecycle_retrieve",
+        evidence: "openai::responses::store::tests::conformance_responses_get_response_returns_200_when_found",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses lifecycle_retrieve",
+    },
+    RuntimeVerificationCheck {
+        kind: "lifecycle_missing",
+        evidence: "openai::responses::store::tests::conformance_responses_get_response_returns_404_when_not_found",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses lifecycle_missing",
+    },
+    RuntimeVerificationCheck {
+        kind: "lifecycle_owner_isolation",
+        evidence: "openai::responses::store::tests::conformance_responses_response_endpoints_hide_same_tenant_cross_owner_resources",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses lifecycle_owner_isolation",
+    },
+    RuntimeVerificationCheck {
+        kind: "lifecycle_input_items",
+        evidence: "openai::responses::store::tests::conformance_responses_get_input_items_with_cursor",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses lifecycle_input_items",
+    },
+    RuntimeVerificationCheck {
+        kind: "lifecycle_delete",
+        evidence: "openai::responses::store::tests::conformance_responses_delete_existing_response_returns_200",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses lifecycle_delete",
+    },
+    RuntimeVerificationCheck {
+        kind: "lifecycle_replay",
+        evidence: "openai::responses::store::tests::conformance_responses_replay_returns_events_in_order_ending_with_terminal",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses lifecycle_replay",
+    },
+    RuntimeVerificationCheck {
+        kind: "lifecycle_replay_cursor",
+        evidence: "openai::responses::store::tests::conformance_responses_replay_starting_after_skips_earlier_events",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses lifecycle_replay_cursor",
+    },
+    RuntimeVerificationCheck {
+        kind: "lifecycle_replay_owner",
+        evidence: "openai::responses::store::tests::conformance_responses_replay_cross_owner_returns_404",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses lifecycle_replay_owner",
+    },
+    RuntimeVerificationCheck {
+        kind: "rehydration_previous_response",
+        evidence: "openai::responses::rehydrate::tests::conformance_responses_validates_previous_response_and_sets_metadata",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses rehydration_previous_response",
+    },
+    RuntimeVerificationCheck {
+        kind: "rehydration_conversation",
+        evidence: "openai::responses::rehydrate::tests::conformance_responses_rehydrates_from_conversation_string_id",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses rehydration_conversation",
+    },
+    RuntimeVerificationCheck {
+        kind: "rehydration_conversation_object",
+        evidence: "openai::responses::rehydrate::tests::conformance_responses_rehydrates_from_conversation_object_form",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses rehydration_conversation_object",
+    },
+    RuntimeVerificationCheck {
+        kind: "rehydration_missing",
+        evidence: "openai::responses::rehydrate::tests::conformance_responses_rejects_when_previous_response_not_found",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses rehydration_missing",
+    },
+    RuntimeVerificationCheck {
+        kind: "rehydration_incomplete",
+        evidence: "openai::responses::rehydrate::tests::conformance_responses_rejects_when_status_not_completed",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses rehydration_incomplete",
+    },
+    RuntimeVerificationCheck {
+        kind: "rehydration_owner_isolation",
+        evidence: "openai::responses::rehydrate::tests::conformance_responses_body_first_previous_response_lookup_is_exact_owner_scoped",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses rehydration_owner_isolation",
+    },
+    RuntimeVerificationCheck {
+        kind: "rehydration_restore_json",
+        evidence: "openai::responses::rehydrate::tests::conformance_responses_restores_previous_response_id_into_response_body",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses rehydration_restore_json",
+    },
+    RuntimeVerificationCheck {
+        kind: "rehydration_restore_sse",
+        evidence: "openai::responses::rehydrate::tests::conformance_responses_restores_streaming_across_chunk_boundary",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses rehydration_restore_sse",
+    },
+    RuntimeVerificationCheck {
+        kind: "persistence_pipeline",
+        evidence: "openai::responses::store::tests::conformance_responses_pipeline_persists_after_format_request_body_classification",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses persistence_pipeline",
+    },
 ];
 
 /// Evidence-backed discrepancies for Responses operations.

@@ -819,9 +819,204 @@
           {
             "kind": "schema_check_sensitivity",
             "evidence": "openai::responses::tests::conformance_responses_generated_schema_check_rejects_incomplete_payloads"
+          },
+          {
+            "kind": "persistence_default",
+            "evidence": "openai::responses::store::tests::conformance_responses_on_request_body_arms_persistence_for_persisted_response"
+          },
+          {
+            "kind": "persistence_opt_out",
+            "evidence": "openai::responses::store::tests::conformance_responses_on_request_body_does_not_arm_persistence_when_store_false"
+          },
+          {
+            "kind": "persistence_buffered",
+            "evidence": "openai::responses::store::tests::conformance_responses_on_response_body_persists_valid_response"
+          },
+          {
+            "kind": "persistence_streamed",
+            "evidence": "openai::responses::store::tests::conformance_responses_on_response_body_persists_streaming_response_at_eos"
+          },
+          {
+            "kind": "lifecycle_retrieve",
+            "evidence": "openai::responses::store::tests::conformance_responses_get_response_returns_200_when_found"
+          },
+          {
+            "kind": "lifecycle_missing",
+            "evidence": "openai::responses::store::tests::conformance_responses_get_response_returns_404_when_not_found"
+          },
+          {
+            "kind": "lifecycle_owner_isolation",
+            "evidence": "openai::responses::store::tests::conformance_responses_response_endpoints_hide_same_tenant_cross_owner_resources"
+          },
+          {
+            "kind": "lifecycle_input_items",
+            "evidence": "openai::responses::store::tests::conformance_responses_get_input_items_with_cursor"
+          },
+          {
+            "kind": "lifecycle_delete",
+            "evidence": "openai::responses::store::tests::conformance_responses_delete_existing_response_returns_200"
+          },
+          {
+            "kind": "lifecycle_replay",
+            "evidence": "openai::responses::store::tests::conformance_responses_replay_returns_events_in_order_ending_with_terminal"
+          },
+          {
+            "kind": "lifecycle_replay_cursor",
+            "evidence": "openai::responses::store::tests::conformance_responses_replay_starting_after_skips_earlier_events"
+          },
+          {
+            "kind": "lifecycle_replay_owner",
+            "evidence": "openai::responses::store::tests::conformance_responses_replay_cross_owner_returns_404"
+          },
+          {
+            "kind": "rehydration_previous_response",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_validates_previous_response_and_sets_metadata"
+          },
+          {
+            "kind": "rehydration_conversation",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_rehydrates_from_conversation_string_id"
+          },
+          {
+            "kind": "rehydration_conversation_object",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_rehydrates_from_conversation_object_form"
+          },
+          {
+            "kind": "rehydration_missing",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_rejects_when_previous_response_not_found"
+          },
+          {
+            "kind": "rehydration_incomplete",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_rejects_when_status_not_completed"
+          },
+          {
+            "kind": "rehydration_owner_isolation",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_body_first_previous_response_lookup_is_exact_owner_scoped"
+          },
+          {
+            "kind": "rehydration_restore_json",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_restores_previous_response_id_into_response_body"
+          },
+          {
+            "kind": "rehydration_restore_sse",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_restores_streaming_across_chunk_boundary"
+          },
+          {
+            "kind": "persistence_pipeline",
+            "evidence": "openai::responses::store::tests::conformance_responses_pipeline_persists_after_format_request_body_classification"
           }
         ]
       }
     ]
+  },
+  "responses_state_verification": {
+    "profile": "native-responses-stateful",
+    "boundary": "Focused runtime checks of Praxis-owned state; backend generation and Chat translation are outside this claim. A group passes only when the complete Responses runtime suite and all required sentinels pass.",
+    "groups": {
+      "persistence": {
+        "status": "passed",
+        "scope": "Local response persistence: default persistence, store:false, buffered and streamed responses",
+        "command": "cargo test -p praxis-ai-apis --no-default-features --features openai-responses,store-all --lib conformance_responses_ -- --show-output",
+        "checks": [
+          {
+            "kind": "persistence_default",
+            "evidence": "openai::responses::store::tests::conformance_responses_on_request_body_arms_persistence_for_persisted_response"
+          },
+          {
+            "kind": "persistence_opt_out",
+            "evidence": "openai::responses::store::tests::conformance_responses_on_request_body_does_not_arm_persistence_when_store_false"
+          },
+          {
+            "kind": "persistence_buffered",
+            "evidence": "openai::responses::store::tests::conformance_responses_on_response_body_persists_valid_response"
+          },
+          {
+            "kind": "persistence_streamed",
+            "evidence": "openai::responses::store::tests::conformance_responses_on_response_body_persists_streaming_response_at_eos"
+          },
+          {
+            "kind": "persistence_pipeline",
+            "evidence": "openai::responses::store::tests::conformance_responses_pipeline_persists_after_format_request_body_classification"
+          }
+        ]
+      },
+      "rehydration": {
+        "status": "passed",
+        "scope": "Stored previous_response_id and conversation history, rejection and owner isolation, JSON and SSE id restoration",
+        "command": "cargo test -p praxis-ai-apis --no-default-features --features openai-responses,store-all --lib conformance_responses_ -- --show-output",
+        "checks": [
+          {
+            "kind": "rehydration_previous_response",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_validates_previous_response_and_sets_metadata"
+          },
+          {
+            "kind": "rehydration_conversation",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_rehydrates_from_conversation_string_id"
+          },
+          {
+            "kind": "rehydration_conversation_object",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_rehydrates_from_conversation_object_form"
+          },
+          {
+            "kind": "rehydration_missing",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_rejects_when_previous_response_not_found"
+          },
+          {
+            "kind": "rehydration_incomplete",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_rejects_when_status_not_completed"
+          },
+          {
+            "kind": "rehydration_owner_isolation",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_body_first_previous_response_lookup_is_exact_owner_scoped"
+          },
+          {
+            "kind": "rehydration_restore_json",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_restores_previous_response_id_into_response_body"
+          },
+          {
+            "kind": "rehydration_restore_sse",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_restores_streaming_across_chunk_boundary"
+          }
+        ]
+      },
+      "lifecycle": {
+        "status": "passed",
+        "scope": "Local retrieval, missing resources, owner isolation, input-item pagination, deletion and stored SSE replay",
+        "command": "cargo test -p praxis-ai-apis --no-default-features --features openai-responses,store-all --lib conformance_responses_ -- --show-output",
+        "checks": [
+          {
+            "kind": "lifecycle_retrieve",
+            "evidence": "openai::responses::store::tests::conformance_responses_get_response_returns_200_when_found"
+          },
+          {
+            "kind": "lifecycle_missing",
+            "evidence": "openai::responses::store::tests::conformance_responses_get_response_returns_404_when_not_found"
+          },
+          {
+            "kind": "lifecycle_owner_isolation",
+            "evidence": "openai::responses::store::tests::conformance_responses_response_endpoints_hide_same_tenant_cross_owner_resources"
+          },
+          {
+            "kind": "lifecycle_input_items",
+            "evidence": "openai::responses::store::tests::conformance_responses_get_input_items_with_cursor"
+          },
+          {
+            "kind": "lifecycle_delete",
+            "evidence": "openai::responses::store::tests::conformance_responses_delete_existing_response_returns_200"
+          },
+          {
+            "kind": "lifecycle_replay",
+            "evidence": "openai::responses::store::tests::conformance_responses_replay_returns_events_in_order_ending_with_terminal"
+          },
+          {
+            "kind": "lifecycle_replay_cursor",
+            "evidence": "openai::responses::store::tests::conformance_responses_replay_starting_after_skips_earlier_events"
+          },
+          {
+            "kind": "lifecycle_replay_owner",
+            "evidence": "openai::responses::store::tests::conformance_responses_replay_cross_owner_returns_404"
+          }
+        ]
+      }
+    }
   }
 }
