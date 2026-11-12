@@ -5,7 +5,9 @@ provider API integrations on top of [Praxis](https://github.com/praxis-proxy/pra
 
 ## Start here
 
-- [Quickstart](quickstart.md)
+- [Quickstart](quickstart.md): build and forward a first hosted API request
+- [Client and provider paths](client-provider-paths.md): choose a protocol,
+  upstream, credentials, and build features
 - [Feature overview](features.md)
 - [Example configurations](../examples/README.md)
 - [Generated filter reference](filters/reference.md)
@@ -28,6 +30,8 @@ provider API integrations on top of [Praxis](https://github.com/praxis-proxy/pra
 - [AI filter overview](filters/README.md)
 
 ## Development
+
+For repository contributors building, testing, or extending Praxis AI:
 
 - [Development setup](developing/getting-started.md)
 - [Run your Code Harness through Praxis and vLLM](developing/cli-vllm-through-praxis.md)
