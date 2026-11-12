@@ -1314,8 +1314,15 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_tool_arguments_do_not_set_modality() {
-        let body = br#"{"input":[{"type":"function_call","call_id":"call_123","name":"inspect","arguments":"{\"image_url\":\"data:image/png;base64,AAAA\"}"}],"messages":[{"content":[{"type":"tool_use","input":{"image_url":"data:image/png;base64,AAAA"}}]}]}"#;
+    fn responses_function_arguments_do_not_set_modality() {
+        let body = br#"{"input":[{"type":"function_call","call_id":"call_123","name":"inspect","arguments":"{\"image_url\":\"data:image/png;base64,AAAA\"}"}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, None);
+    }
+
+    #[test]
+    fn anthropic_tool_arguments_do_not_set_modality() {
+        let body = br#"{"max_tokens":128,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_123","name":"inspect","input":{"image_url":"data:image/png;base64,AAAA"}}]}]}"#;
 
         assert_eq!(classify_request_body(body).modality, None);
     }
