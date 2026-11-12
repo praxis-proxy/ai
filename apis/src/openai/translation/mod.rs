@@ -2779,9 +2779,24 @@ mod tests {
     }
 
     #[test]
-    fn summary_request_rejected_for_dialect_without_safe_summary() {
+    fn auto_summary_is_best_effort_on_every_dialect() {
+        // Codex CLI >= 0.166.0 sends `reasoning: {"summary": "auto"}` even for
+        // models outside its metadata table, so `auto` must not be rejected on
+        // dialects without a safe-summary contract: the translation satisfies
+        // the best-effort request by producing no summary items.
+        for options in [vllm_options(), ReasoningOptions::default()] {
+            validate_reasoning(
+                &json!({"model": "m", "input": "hi", "reasoning": {"summary": "auto"}}),
+                &options,
+            )
+            .expect("auto summary is best-effort and accepted");
+        }
+    }
+
+    #[test]
+    fn explicit_summary_request_rejected_for_dialect_without_safe_summary() {
         let error = validate_reasoning(
-            &json!({"model": "m", "input": "hi", "reasoning": {"summary": "auto"}}),
+            &json!({"model": "m", "input": "hi", "reasoning": {"summary": "concise"}}),
             &vllm_options(),
         )
         .unwrap_err();
@@ -2829,12 +2844,25 @@ mod tests {
     }
 
     #[test]
-    fn matching_summary_controls_still_rejected_by_capability() {
-        let error = validate_reasoning(
+    fn matching_auto_summary_controls_are_accepted() {
+        validate_reasoning(
             &json!({
                 "model": "m",
                 "input": "hi",
                 "reasoning": {"summary": "auto", "generate_summary": "auto"}
+            }),
+            &vllm_options(),
+        )
+        .expect("matching auto summary controls are a best-effort request");
+    }
+
+    #[test]
+    fn matching_explicit_summary_controls_still_rejected_by_capability() {
+        let error = validate_reasoning(
+            &json!({
+                "model": "m",
+                "input": "hi",
+                "reasoning": {"summary": "concise", "generate_summary": "concise"}
             }),
             &vllm_options(),
         )

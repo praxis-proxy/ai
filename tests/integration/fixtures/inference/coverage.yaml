@@ -872,6 +872,25 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: external_model.anthropic.request.legacy_sampling
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  # Covers sampling preservation, backend errors, and a conflicting native default.
+  - id: external_model.anthropic.request.version_sampling
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-version-sampling
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.access_programs
     scopes:
       - openai_responses_to_chat_completions

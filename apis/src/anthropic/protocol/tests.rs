@@ -82,6 +82,25 @@ async fn does_not_inject_when_header_present() {
     );
 }
 
+/// A translation-owned queued version must suppress native defaults.
+#[tokio::test]
+async fn does_not_inject_when_version_set_is_pending() {
+    let filter = make_filter("{}");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.request_headers_to_set.push((
+        http::HeaderName::from_static("anthropic-version"),
+        http::HeaderValue::from_static("2026-10-21"),
+    ));
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    assert!(
+        ctx.extra_request_headers.is_empty(),
+        "native default must not override a queued contract"
+    );
+}
+
 #[tokio::test]
 async fn custom_default_version() {
     let filter = make_filter("default_version: \"2024-06-01\"");

@@ -87,7 +87,13 @@ impl HttpFilter for AnthropicMessagesProtocolFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let has_version = ctx.request.headers.get(ANTHROPIC_VERSION_HEADER).is_some();
+        // A translated route may already own the version through a queued set.
+        // Do not append a native default that would override that contract.
+        let has_version = ctx.request.headers.get(ANTHROPIC_VERSION_HEADER).is_some()
+            || ctx
+                .request_headers_to_set
+                .iter()
+                .any(|(name, _)| name == ANTHROPIC_VERSION_HEADER);
 
         if !has_version && !restore_original_header(ctx, ANTHROPIC_VERSION_HEADER) {
             debug!(

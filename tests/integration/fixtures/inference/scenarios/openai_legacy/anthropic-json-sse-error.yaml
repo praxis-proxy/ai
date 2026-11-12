@@ -5,6 +5,7 @@ protocol: openai_chat_completions
 example_config: openai-selected-provider-legacy-fixture.yaml
 upstream_authority: 127.0.0.1:8001
 features:
+  - external_model.anthropic.request.legacy_sampling
   - external_model.anthropic.request.text
   - external_model.anthropic.response.json
   - external_model.anthropic.response.sse
@@ -28,6 +29,8 @@ turns:
           messages:
             - role: user
               content: Say hello.
+          temperature: 0.5
+          top_p: 0.9
           stream: false
     expect:
       client_status: 200
