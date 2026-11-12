@@ -5,6 +5,10 @@ and our [translation coverage](openresponses-translation.md) answer different
 questions. Translation coverage runs seven selected templates against a
 text-only CPU backend. Full acceptance runs every template in the pinned
 upstream inventory, including image input, compaction, and WebSockets.
+The CPU lane uses upstream's exported runner with an explicit 300-second
+request budget because the small model can exceed the suite's 30-second
+default. Templates and validators are unchanged; the full acceptance CLI
+continues to use the upstream default deadline.
 
 ## Verified result: November 12, 2026
 

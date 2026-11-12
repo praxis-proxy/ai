@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from openai import OpenAI, BadRequestError
@@ -21,7 +22,7 @@ import pytest
 
 from run_responses_acceptance import gateway, run_template
 from test_responses_conformance import (
-    REPO_ROOT, _ensure_suite, _find_binary, _free_port, _wait_for_proxy,
+    REPO_ROOT, _ensure_suite, _find_binary, _free_port, _run_compliance, _wait_for_proxy,
 )
 
 
@@ -36,6 +37,8 @@ def acceptance_gateway(tmp_path_factory):
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             captured.append((self.path, body))
+            if body["model"] == "slow-acceptance-model":
+                time.sleep(0.25)
             payload = json.dumps({
                 "id": "chatcmpl_controlled", "object": "chat.completion",
                 "model": body["model"],
@@ -122,6 +125,26 @@ def test_openai_sdk_image_and_compact(acceptance_gateway):
         with pytest.raises(BadRequestError):
             client.post("/responses/compact", cast_to=dict, body={"input": "Remember Tuesday."})
         assert len(captured) == before
+
+
+def test_cpu_request_timeout_does_not_change_validation(acceptance_gateway, monkeypatch):
+    """A short deadline fails; the CPU budget admits the identical valid response."""
+    import test_responses_conformance
+    from urllib.parse import urlsplit
+
+    base_url, _captured = acceptance_gateway
+    port = urlsplit(base_url).port
+    monkeypatch.setattr(test_responses_conformance, "VLLM_MODEL", "slow-acceptance-model")
+    suite = _ensure_suite()
+    short = _run_compliance(suite, port, {"basic-response"}, timeout_ms=25)
+    assert short.returncode != 0
+    failed = json.loads(short.stdout)["results"][0]
+    assert "timed out" in " ".join(failed["errors"])
+    normal = _run_compliance(suite, port, {"basic-response"})
+    assert normal.returncode == 0, normal.stdout + normal.stderr
+    assert json.loads(normal.stdout)["summary"] == {
+        "passed": 1, "failed": 0, "skipped": 0, "total": 1,
+    }
 
 
 def test_live_image_acceptance(monkeypatch):
