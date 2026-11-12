@@ -13,6 +13,8 @@ For Anthropic candidates, non-streaming JSON response chunks are retained in bou
 
 Anthropic translation runs only when the filter's `api_translation_enabled` setting is true, as derived from the tenant's API translation permission.
 
+`api_version` selects the backend contract independently of caller headers. It defaults to `2023-06-01`. Supported sampling fields are preserved under either version; the backend owns version-specific parameter validation. Unknown versions fail configuration parsing. OpenAI-compatible candidates and native Messages passthrough are unaffected.
+
 The compatibility contract defaults an omitted token limit to 4096 and ignores `user`, `n`, `seed`, and `parallel_tool_calls` after validating their types. Ignoring `n` does not produce multiple completions; ignoring `seed` does not make generation deterministic; and ignoring `parallel_tool_calls` does not constrain the provider's tool scheduling. Other unsupported fields fail with HTTP 400.
 
 ## Configuration
@@ -20,6 +22,7 @@ The compatibility contract defaults an omitted token limit to 4096 and ignores `
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `api_translation_enabled` | bool | no | Permission from trusted application configuration. Anthropic requests fail closed when this is false (the default). |
+| `api_version` | string | no | Operator-selected Anthropic contract: `2023-06-01` (default) or `2026-10-21`. Independent of caller headers; sampling validation remains the responsibility of the backend. |
 | `max_body_bytes` | integer | no | Compatibility setting for the former shared request/response limit. A direction-specific limit takes precedence when set. |
 | `max_request_body_bytes` | integer | no | Maximum complete translated Chat Completions request body. |
 | `max_response_body_bytes` | integer | no | Maximum complete Anthropic JSON response body retained for conversion. |

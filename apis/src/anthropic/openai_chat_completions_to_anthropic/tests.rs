@@ -49,14 +49,63 @@ fn converts_legacy_request_direction_and_binds_target_model() {
 }
 
 #[test]
-fn rejects_unmapped_fields_but_preserves_supported_image_content() {
-    let unsupported =
-        br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"frequency_penalty":0.3}"#;
-    assert!(
-        translate_request(unsupported, "provider-model")
-            .unwrap_err()
-            .contains("frequency_penalty")
-    );
+fn supported_sampling_values_are_preserved() {
+    for field in ["temperature", "top_p"] {
+        for value in [json!(0), json!(1), json!(0.5)] {
+            let mut input = json!({"model":"m","messages":[{"role":"user","content":"hi"}]});
+            input[field] = value.clone();
+            let (translated, _) = translate_request(&serde_json::to_vec(&input).unwrap(), "provider-model").unwrap();
+            let body: Value = serde_json::from_slice(&translated).unwrap();
+            assert_eq!(body[field], value, "sampling values must reach the provider unchanged");
+        }
+    }
+}
+
+#[tokio::test]
+async fn configured_version_overrides_caller_version() {
+    for version in ["2023-06-01", "2026-10-21"] {
+        let config = serde_yaml::from_str(&format!("api_translation_enabled: true\napi_version: '{version}'")).unwrap();
+        let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
+        let mut request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+        request
+            .headers
+            .insert("anthropic-version", HeaderValue::from_static("caller-version"));
+        let mut ctx = crate::test_utils::make_filter_context(&request);
+        selected_profile_metadata(&mut ctx);
+        ctx.extra_request_headers
+            .push(("Anthropic-Version".into(), "native-default".to_owned()));
+        ctx.extra_request_headers
+            .push(("x-unrelated".into(), "preserved".to_owned()));
+        assert!(matches!(
+            filter.on_request(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        assert_eq!(
+            ctx.extra_request_headers,
+            vec![("x-unrelated".into(), "preserved".to_owned())],
+            "translation must remove competing version extras while preserving unrelated headers"
+        );
+        assert!(
+            ctx.request_headers_to_set
+                .iter()
+                .any(|(header, value)| header == "anthropic-version" && value == version),
+            "translated routes must use operator-selected version {version}"
+        );
+    }
+}
+
+#[test]
+fn rejects_unmapped_fields() {
+    for (field, value) in [("frequency_penalty", json!(0.3)), ("top_k", json!(40))] {
+        let mut input = json!({"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":8});
+        input[field] = value;
+        assert!(
+            translate_request(&serde_json::to_vec(&input).unwrap(), "provider-model")
+                .unwrap_err()
+                .contains(field),
+            "unsupported fields must retain structural validation"
+        );
+    }
 }
 
 #[test]

@@ -11,16 +11,16 @@
   "normalization": {
     "version": 1,
     "linked_ids": {
-      "chatcmpl-msg_json": "chatcmpl-recorded-0001",
-      "chatcmpl-msg_stream": "chatcmpl-recorded-0003",
-      "msg_json": "msg_recorded_0002",
-      "msg_stream": "msg_recorded_0004",
       "chatcmpl-msg_context_json": "chatcmpl-recorded-0005",
-      "msg_context_json": "msg_recorded_0006",
       "chatcmpl-msg_context_stream": "chatcmpl-recorded-0007",
-      "msg_context_stream": "msg_recorded_0008",
+      "chatcmpl-msg_json": "chatcmpl-recorded-0001",
       "chatcmpl-msg_null": "chatcmpl-recorded-0009",
-      "msg_null": "msg_recorded_0010"
+      "chatcmpl-msg_stream": "chatcmpl-recorded-0003",
+      "msg_context_json": "msg_recorded_0006",
+      "msg_context_stream": "msg_recorded_0008",
+      "msg_json": "msg_recorded_0002",
+      "msg_null": "msg_recorded_0010",
+      "msg_stream": "msg_recorded_0004"
     }
   },
   "turns": [
@@ -46,7 +46,9 @@
                 }
               ],
               "model": "fixture-openai-model",
-              "stream": false
+              "stream": false,
+              "temperature": 0.5,
+              "top_p": 0.9
             }
           }
         },
@@ -114,7 +116,9 @@
                 }
               ],
               "model": "claude-fixture-model",
-              "stream": false
+              "stream": false,
+              "temperature": 0.5,
+              "top_p": 0.9
             }
           }
         },
@@ -809,9 +813,9 @@
               "stop_reason": "end_turn",
               "type": "message",
               "usage": {
-                "input_tokens": 10,
-                "cache_read_input_tokens": null,
                 "cache_creation_input_tokens": null,
+                "cache_read_input_tokens": null,
+                "input_tokens": 10,
                 "output_tokens": 2
               }
             }

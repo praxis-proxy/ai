@@ -128,6 +128,26 @@ eight HTTP paths and verify that rejected mutations preserve existing state.
 The default example demonstrates admission and has a functional rejection test.
 The fatal proxy error formatter remains a separate response path.
 
+### Other Conversations errors
+
+The operation registry also declares the current pin's 16 non-admission error
+responses: five `400`, seven `404`, and four `500` responses. Validation, missing
+owner-scoped resources, and storage failures provide their runtime paths. Every
+local error includes `message`, `type`, `code`, and `param`; the last two may be
+null. Storage failures expose a generic message without backend details.
+The shared schema includes optional `misalignment.review_target`, with its
+nullable opaque-target constraints; locally generated errors omit misalignment.
+
+The required runtime suite checks every declared status against the pinned
+schema and verifies foreign-owner resources remain inaccessible. SDK coverage
+checks all eight operations, unchanged state after rejected mutations, and real
+SQL transaction rollback using injected write failures. Conversation creation
+and initial items commit atomically; item deletion uses the metadata snapshot
+read before mutation so a later read cannot report a failed committed deletion.
+The example's functional suite exercises all eight admission paths and the
+client-error envelopes. Existing evidence-backed Conversations exceptions
+remain unchanged (11 entries); exact conformance is measured after them.
+
 ### Authentication ownership
 
 The `openai_conversations` filter terminates matching requests but does not
