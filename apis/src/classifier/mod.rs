@@ -310,10 +310,12 @@ fn detect_responses_input(value: Option<&serde_json::Value>, detected: &mut Dete
         return;
     };
     for item in items {
-        if item.get("content").is_some() {
-            detect_content(item.get("content"), detected);
-        } else {
-            detect_content_part(item, detected);
+        match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("computer_call_output" | "function_call_output") => {
+                detect_content(item.get("output"), detected);
+            },
+            _ if item.get("content").is_some() => detect_content(item.get("content"), detected),
+            _ => detect_content_part(item, detected),
         }
         if detected.is_complete() {
             break;
@@ -368,8 +370,23 @@ fn detect_content_part(part: &serde_json::Value, detected: &mut DetectedModaliti
     {
         detect_media_source(source, detected);
     }
+    detect_embedded_media(part, part_type, detected);
+}
+
+/// Inspect media metadata and schema-defined nested content containers.
+fn detect_embedded_media(
+    part: &serde_json::Map<String, serde_json::Value>,
+    part_type: Option<&str>,
+    detected: &mut DetectedModalities,
+) {
     if let Some(media_type) = part.get("media_type").and_then(serde_json::Value::as_str) {
         detected.observe_media_type(media_type);
+    }
+
+    // Anthropic tool results may return typed content blocks. Arbitrary tool
+    // inputs remain opaque because no other object type is traversed here.
+    if matches!(part_type, Some("tool_result")) {
+        detect_content(part.get("content"), detected);
     }
 }
 
@@ -1273,6 +1290,34 @@ mod tests {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":128,"system":"help","messages":[{"role":"user","content":[{"type":"audio","source":{"type":"base64","media_type":"audio/wav","data":"UklGRg=="}}]}]}"#;
 
         assert_eq!(classify_request_body(body).modality, Some(ContentModality::Audio));
+    }
+
+    #[test]
+    fn responses_computer_screenshot_sets_image_modality() {
+        let body = br#"{"input":[{"type":"computer_call_output","call_id":"call_123","output":{"type":"computer_screenshot","image_url":"data:image/png;base64,AAAA"}}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+    }
+
+    #[test]
+    fn responses_function_output_image_sets_image_modality() {
+        let body = br#"{"input":[{"type":"function_call_output","call_id":"call_123","output":[{"type":"input_text","text":"result"},{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+    }
+
+    #[test]
+    fn anthropic_tool_result_image_sets_image_modality() {
+        let body = br#"{"max_tokens":128,"system":"help","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":[{"type":"text","text":"result"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+    }
+
+    #[test]
+    fn arbitrary_tool_arguments_do_not_set_modality() {
+        let body = br#"{"input":[{"type":"function_call","call_id":"call_123","name":"inspect","arguments":"{\"image_url\":\"data:image/png;base64,AAAA\"}"}],"messages":[{"content":[{"type":"tool_use","input":{"image_url":"data:image/png;base64,AAAA"}}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, None);
     }
 
     #[test]

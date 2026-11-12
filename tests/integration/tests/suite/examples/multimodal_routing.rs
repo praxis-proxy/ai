@@ -30,33 +30,35 @@ static ROUTING_TEST_LOCK: Mutex<()> = Mutex::new(());
 #[test]
 fn image_url_routes_to_image_cluster() {
     let _lock = routing_test_lock();
-    let (proxy, _backends) = start_gateway();
+    let (proxy, backends) = start_gateway();
     let body = r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/image.png"}}]}]}"#;
 
     let (status, response) = http_post_retry(proxy.addr(), "/v1/chat/completions", body);
 
     assert_eq!(status, 200, "image request should be proxied: {response}");
     assert_eq!(response, "image", "image content should select the image cluster");
+    assert_routed_unchanged(&backends, 1, body);
 }
 
 /// Route inline base64 audio to an audio-capable backend.
 #[test]
 fn base64_audio_routes_to_audio_cluster() {
     let _lock = routing_test_lock();
-    let (proxy, _backends) = start_gateway();
+    let (proxy, backends) = start_gateway();
     let body = r#"{"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"UklGRg==","format":"wav"}}]}]}"#;
 
     let (status, response) = http_post_retry(proxy.addr(), "/v1/chat/completions", body);
 
     assert_eq!(status, 200, "audio request should be proxied: {response}");
     assert_eq!(response, "audio", "audio content should select the audio cluster");
+    assert_routed_unchanged(&backends, 2, body);
 }
 
 /// Route combined image and audio content to the combined-capability backend.
 #[test]
 fn image_and_audio_route_to_combined_cluster() {
     let _lock = routing_test_lock();
-    let (proxy, _backends) = start_gateway();
+    let (proxy, backends) = start_gateway();
     let body = r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw=="}},{"type":"input_audio","input_audio":{"data":"UklGRg==","format":"wav"}}]}]}"#;
 
     let (status, response) = http_post_retry(proxy.addr(), "/v1/chat/completions", body);
@@ -66,6 +68,7 @@ fn image_and_audio_route_to_combined_cluster() {
         response, "image-audio",
         "combined content should select the image-audio cluster"
     );
+    assert_routed_unchanged(&backends, 0, body);
 }
 
 /// Keep text-only content on the example's default text backend.
@@ -133,4 +136,17 @@ fn start_gateway() -> (ProxyGuard, [StatefulCapturingGuard; 4]) {
 /// Start a backend that captures the request and returns a fixed response.
 fn capturing_backend(body: &str) -> StatefulCapturingGuard {
     StatefulCapturingBackend::new(vec![(200, body.to_owned())]).start_with_shutdown()
+}
+
+/// Assert that exactly one backend received the original request body.
+fn assert_routed_unchanged(backends: &[StatefulCapturingGuard; 4], selected: usize, body: &str) {
+    for (index, backend) in backends.iter().enumerate() {
+        let requests = backend.requests();
+        if index == selected {
+            assert_eq!(requests.len(), 1, "selected backend should receive one request");
+            assert_eq!(requests[0].body, body, "routing must not mutate the request body");
+        } else {
+            assert!(requests.is_empty(), "unselected backend {index} received a request");
+        }
+    }
 }
