@@ -2027,6 +2027,32 @@ mod tests {
     }
 
     #[test]
+    fn matched_stop_sequence_preserves_open_tool_block_state() {
+        let (filter, mut ctx) = make_filter_and_context();
+        ctx.extensions
+            .insert(crate::anthropic::messages_to_chat_completions::ClientStopSequences(
+                vec![",".to_owned()],
+            ));
+
+        let tool_start = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},\"index\":0}]}\n\n";
+        let mut body1 = Some(Bytes::from(tool_start));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let matched_stop = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\",\"stop_reason\":\",\"}]}\n\n";
+        let mut body2 = Some(Bytes::from(matched_stop));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let mut body3 = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut body3, false).unwrap());
+
+        let out = String::from_utf8(body3.unwrap().to_vec()).unwrap();
+        assert_eq!(out.matches("event: content_block_stop").count(), 1);
+        let delta = event_data(&out, "message_delta").get("delta").unwrap().clone();
+        assert_eq!(delta.get("stop_reason").and_then(Value::as_str), Some("stop_sequence"));
+        assert_eq!(delta.get("stop_sequence").and_then(Value::as_str), Some(","));
+    }
+
+    #[test]
     fn tool_call_delta_emits_tool_use_block_and_input_delta() {
         let (filter, mut ctx) = make_filter_and_context();
 
