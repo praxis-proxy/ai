@@ -560,13 +560,13 @@ pub(super) fn write_state_badges(report: &CoverageReport, directory: &Path) -> R
             _ => ("not verified", "#9f9f9f"),
         };
         let svg = format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="245" height="20" role="img" aria-label="Responses {group}: {label}">
-  <title>Responses {group}: {label}</title>
-  <rect width="245" height="20" rx="3" fill="#555"/>
-  <path fill="{color}" d="M155 0h87a3 3 0 0 1 3 3v14a3 3 0 0 1-3 3h-87z"/>
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="300" height="20" role="img" aria-label="OpenAI Responses {group}: {label}">
+  <title>OpenAI Responses {group}: {label}</title>
+  <rect width="300" height="20" rx="3" fill="#555"/>
+  <path fill="{color}" d="M210 0h87a3 3 0 0 1 3 3v14a3 3 0 0 1-3 3h-87z"/>
   <g fill="#fff" text-anchor="middle" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11">
-    <text x="77.5" y="14">Responses {group}</text>
-    <text x="200" y="14">{label}</text>
+    <text x="105" y="14">OpenAI Responses {group}</text>
+    <text x="255" y="14">{label}</text>
   </g>
 </svg>
 "##,

@@ -14,18 +14,18 @@ backends and applies policy.
 
 <!-- Dynamic badge queries select index 0 (Conversations) in each report section.
      Keep these queries aligned if the generated report area order changes. -->
-[![Conversations routes](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fpraxis-proxy%2Fai%2Fmain%2Fdocs%2Fconformance%2Fopenai-conformance-report.json&query=%24.capability_coverage.by_area%5B0%5D.coverage_percent&label=Conversations+routes&color=blue&suffix=%25)](docs/conformance/README.md#reading-the-report)
-[![Conversations contracts](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fpraxis-proxy%2Fai%2Fmain%2Fdocs%2Fconformance%2Fopenai-conformance-report.json&query=%24.owned_contract_conformance.areas%5B0%5D.operation_contracts.exact_percent&label=Conversations+contracts&color=blue&suffix=%25)](docs/conformance/README.md#reading-the-report)
-[![Conversations runtime](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fpraxis-proxy%2Fai%2Fmain%2Fdocs%2Fconformance%2Fopenai-conformance-report.json&query=%24.runtime_verification.areas%5B0%5D.status&label=Conversations+runtime&color=blue)](docs/conformance/README.md#reading-the-report)
+[![OpenAI Conversations routes](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fpraxis-proxy%2Fai%2Fmain%2Fdocs%2Fconformance%2Fopenai-conformance-report.json&query=%24.capability_coverage.by_area%5B0%5D.coverage_percent&label=OpenAI+Conversations+routes&color=blue&suffix=%25)](docs/conformance/README.md#reading-the-report)
+[![OpenAI Conversations contracts](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fpraxis-proxy%2Fai%2Fmain%2Fdocs%2Fconformance%2Fopenai-conformance-report.json&query=%24.owned_contract_conformance.areas%5B0%5D.operation_contracts.exact_percent&label=OpenAI+Conversations+contracts&color=blue&suffix=%25)](docs/conformance/README.md#reading-the-report)
+[![OpenAI Conversations runtime](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fpraxis-proxy%2Fai%2Fmain%2Fdocs%2Fconformance%2Fopenai-conformance-report.json&query=%24.runtime_verification.areas%5B0%5D.status&label=OpenAI+Conversations+runtime&color=blue)](docs/conformance/README.md#reading-the-report)
 
 Conversations badges reflect the checked-in conformance report on `main`: route
 coverage, exact owned contracts after documented upstream-spec exceptions, and
 focused runtime verification against the pinned OpenAI reference. Authentication
 is deployment-owned. See the [conformance scope and evidence](docs/conformance/README.md).
 
-[![Responses persistence](docs/conformance/badges/responses-persistence.svg)](docs/conformance/README.md#responses-state-verification)
-[![Responses rehydration](docs/conformance/badges/responses-rehydration.svg)](docs/conformance/README.md#responses-state-verification)
-[![Responses lifecycle](docs/conformance/badges/responses-lifecycle.svg)](docs/conformance/README.md#responses-state-verification)
+[![OpenAI Responses persistence](docs/conformance/badges/responses-persistence.svg)](docs/conformance/README.md#responses-state-verification)
+[![OpenAI Responses rehydration](docs/conformance/badges/responses-rehydration.svg)](docs/conformance/README.md#responses-state-verification)
+[![OpenAI Responses lifecycle](docs/conformance/badges/responses-lifecycle.svg)](docs/conformance/README.md#responses-state-verification)
 
 Responses badges track focused checks of Praxis-owned persistence, rehydration,
 and stored-response lifecycle behavior in the native Responses pipeline. The
