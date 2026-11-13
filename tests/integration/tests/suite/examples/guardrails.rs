@@ -220,14 +220,18 @@ fn nemo_guardrails_unchanged_modifications_preserve_native_conversations() {
     }
 }
 
-/// Unsupported request rewrites reject before the model, even if the operator permits fail-open errors.
+/// Multi-block rewrites reject before the model, even if the operator permits fail-open errors.
 #[test]
-fn nemo_guardrails_rejects_non_chat_redaction() {
+fn nemo_guardrails_rejects_multiblock_redaction() {
     for (path, input, expected_checks) in [
-        ("/v1/responses", r#"{"model":"test","input":"secret first"}"#, 1),
+        (
+            "/v1/responses",
+            r#"{"model":"test","input":[{"role":"user","content":[{"type":"input_text","text":"secret "},{"type":"input_text","text":"first"}]}]}"#,
+            1,
+        ),
         (
             "/v1/messages",
-            r#"{"model":"test","max_tokens":16,"system":"Follow policy","messages":[{"role":"user","content":"secret first"},{"role":"user","content":"second"}]}"#,
+            r#"{"model":"test","max_tokens":16,"system":"Follow policy","messages":[{"role":"user","content":[{"type":"text","text":"secret "},{"type":"text","text":"first"}]},{"role":"user","content":"second"}]}"#,
             2,
         ),
     ] {
@@ -266,7 +270,7 @@ fn nemo_guardrails_rejects_non_chat_redaction() {
             "unsupported {path} redaction must reject explicitly: {body}"
         );
         assert!(
-            body.contains("only for Chat Completions"),
+            body.contains("cannot be safely rewritten"),
             "the rejection must explain the rewrite limit"
         );
         assert_eq!(
@@ -759,4 +763,99 @@ fn nemo_mock(body: &'static str) -> BackendGuard {
     Backend::status(200, body)
         .header("Content-Type", "application/json")
         .start_with_shutdown()
+}
+
+/// A native request with a NeMo modification reaches the upstream masked.
+#[test]
+fn nemo_guardrails_redacts_native_requests() {
+    for (path, input, target) in [
+        ("/v1/responses", r#"{"model":"test","input":"secret"}"#, "/input"),
+        (
+            "/v1/messages",
+            r#"{"model":"test","max_tokens":16,"system":"rules","messages":[{"role":"user","content":[{"type":"text","text":"secret"}]}]}"#,
+            "/messages/0/content/0/text",
+        ),
+    ] {
+        let backend = StatefulCapturingBackend::new(vec![(200, "ok".to_owned())]).start_with_shutdown();
+        let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"modified","content":"masked"}"#.to_owned())])
+            .start_with_shutdown();
+        let config = load_example_config(
+            "nemo-guardrails.yaml",
+            free_port(),
+            HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", nemo.port())]),
+        );
+        let proxy = start_proxy(&config);
+        let (status, body) = http_post(proxy.addr(), path, input);
+        assert_eq!(status, 200, "{body}");
+        let requests = backend.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a successful native redaction must forward exactly one request"
+        );
+        let forwarded: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+        assert_eq!(
+            forwarded.pointer(target).and_then(serde_json::Value::as_str),
+            Some("masked"),
+            "the model must receive the masked native text"
+        );
+        assert!(
+            !requests[0].body.contains("secret"),
+            "the original text must not reach the model"
+        );
+    }
+}
+
+/// Manual validation with a local NeMo server whose input rail masks PII.
+#[test]
+#[ignore = "requires a local NeMo service with input masking on port 18001"]
+fn live_nemo_redacts_native_requests() {
+    for (path, input, target) in [
+        (
+            "/v1/responses",
+            r#"{"model":"test","input":"Contact alice@example.com"}"#,
+            "/input",
+        ),
+        (
+            "/v1/messages",
+            r#"{"model":"test","max_tokens":16,"messages":[{"role":"user","content":"Contact alice@example.com"}]}"#,
+            "/messages/0/content",
+        ),
+    ] {
+        let backend = StatefulCapturingBackend::new(vec![(200, "ok".to_owned())]).start_with_shutdown();
+        let mut config = load_example_config(
+            "nemo-guardrails.yaml",
+            free_port(),
+            HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", 18001)]),
+        );
+        let guard = config
+            .filter_chains
+            .iter_mut()
+            .flat_map(|chain| &mut chain.filters)
+            .find(|filter| filter.filter_type == "ai_guardrails")
+            .unwrap();
+        guard
+            .config
+            .as_mapping_mut()
+            .unwrap()
+            .get_mut(serde_yaml::Value::from("provider"))
+            .unwrap()
+            .as_mapping_mut()
+            .unwrap()
+            .remove(serde_yaml::Value::from("guardrails"));
+        let proxy = start_proxy(&config);
+        let (status, body) = http_post(proxy.addr(), path, input);
+        assert_eq!(status, 200, "{body}");
+        let requests = backend.requests();
+        let forwarded: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+        let text = forwarded.pointer(target).and_then(serde_json::Value::as_str).unwrap();
+        assert!(
+            text.contains("<EMAIL_ADDRESS>"),
+            "the real NeMo replacement must reach the model"
+        );
+        assert!(
+            !text.contains("alice@example.com"),
+            "the original email must not reach the model"
+        );
+    }
 }

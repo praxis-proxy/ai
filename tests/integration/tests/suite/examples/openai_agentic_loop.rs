@@ -21,13 +21,57 @@ use std::{
 
 use praxis_test_utils::{
     McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, build_pipeline, example_config_path,
-    free_port, http_get, http_send, json_post, parse_body, parse_status, patch_yaml, start_mcp_mock_server_with_config,
-    start_proxy,
+    free_port, http_get, http_send, json_post, parse_body, parse_status, patch_yaml, start_body_aware_backend,
+    start_mcp_mock_server_with_config, start_proxy, start_proxy_with_registry, test_subrequest_client,
 };
 
 // -----------------------------------------------------------------------------
 // Pipeline Build
 // -----------------------------------------------------------------------------
+
+/// Make the final model message observable to response screening in this
+/// fixture: the agentic loop otherwise adds MCP output items, which the
+/// text-only guardrail extractor rejects before evaluating the final message.
+struct FinalMessageOnly;
+
+#[async_trait::async_trait]
+impl praxis_filter::HttpFilter for FinalMessageOnly {
+    fn name(&self) -> &'static str {
+        "test_final_message_only"
+    }
+
+    async fn on_request(
+        &self,
+        _ctx: &mut praxis_filter::HttpFilterContext<'_>,
+    ) -> Result<praxis_filter::FilterAction, praxis_filter::FilterError> {
+        Ok(praxis_filter::FilterAction::Continue)
+    }
+
+    fn response_body_access(&self) -> praxis_filter::BodyAccess {
+        praxis_filter::BodyAccess::ReadWrite
+    }
+
+    fn on_response_body(
+        &self,
+        _ctx: &mut praxis_filter::HttpFilterContext<'_>,
+        body: &mut Option<bytes::Bytes>,
+        end_of_stream: bool,
+    ) -> Result<praxis_filter::FilterAction, praxis_filter::FilterError> {
+        if !end_of_stream {
+            return Ok(praxis_filter::FilterAction::Continue);
+        }
+        if let Some(bytes) = body {
+            let mut json: serde_json::Value = serde_json::from_slice(bytes)?;
+            if let Some(output) = json.get_mut("output").and_then(serde_json::Value::as_array_mut)
+                && output.iter().any(|item| item["type"] == "message")
+            {
+                output.retain(|item| item["type"] == "message");
+                *bytes = bytes::Bytes::from(serde_json::to_vec(&json)?);
+            }
+        }
+        Ok(praxis_filter::FilterAction::Continue)
+    }
+}
 
 #[test]
 fn example_config_builds_pipeline() {
@@ -1355,6 +1399,152 @@ fn agentic_guardrail_blocks_mcp_result_before_second_inference() {
             .is_some_and(|content| content.contains("mock result for get_weather")),
         "NeMo must receive the MCP result rather than the stale IRR request body: {check:#}"
     );
+}
+
+#[test]
+fn agentic_guardrail_rejects_modified_structured_output_after_local_tool_result() {
+    assert_agentic_redaction_after_local_tool_result(false);
+    assert_agentic_redaction_after_local_tool_result(true);
+}
+
+/// Keep pipeline construction separate from the request and response fixtures.
+#[inline(never)]
+fn combined_agentic_guardrail_config(model_port: u16, nemo_port: u16) -> Box<praxis_core::config::Config> {
+    let path = example_config_path("openai/responses/agentic-loop-guardrails.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read guarded agentic-loop example");
+    let original_phase = "                  response: false\n                  tool_results: true";
+    assert_eq!(
+        yaml.matches(original_phase).count(),
+        1,
+        "the example must expose the tool-result phase"
+    );
+    let yaml = yaml.replacen(
+        original_phase,
+        "                  response: true\n                  tool_results: true",
+        1,
+    );
+    let owner = "              # Sole continuation and terminal-response owner.";
+    assert_eq!(yaml.matches(owner).count(), 1, "the example must expose the loop owner");
+    let yaml = yaml.replacen(
+        owner,
+        &format!("              - filter: test_final_message_only\n\n{owner}"),
+        1,
+    );
+    let yaml = patch_yaml(
+        &yaml,
+        free_port(),
+        &HashMap::from([("127.0.0.1:3001", model_port), ("127.0.0.1:3002", nemo_port)]),
+    );
+    Box::new(praxis_core::config::Config::from_yaml(&yaml).expect("parse combined guardrail phases"))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "exercises the local tool-result and structured response phases in one agentic loop"
+)]
+fn assert_agentic_redaction_after_local_tool_result(structured: bool) {
+    let first_response = serde_json::json!({
+        "id":"resp_structured_tool_1", "object":"response", "status":"completed",
+        "output":[{"type":"function_call", "id":"fc_structured_tool_1", "call_id":"call_structured_tool_1",
+            "name":"weather__get_weather", "arguments":r#"{"location":"SF"}"#, "status":"completed"}]
+    });
+    let final_response = serde_json::json!({
+        "id":"resp_structured_tool_2", "object":"response", "status":"completed",
+        "output":[{"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"secret"}]}]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first_response.to_string()),
+        (200, final_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let nemo = start_body_aware_backend(|body| {
+        let payload: serde_json::Value = serde_json::from_str(body).expect("NeMo call must contain JSON");
+        let is_modified_output = payload["guardrails"]["rail_types"] == serde_json::json!(["output"])
+            && payload["messages"][0]["content"] == "secret";
+        let verdict = if is_modified_output {
+            serde_json::json!({"status":"modified", "content":"masked"})
+        } else {
+            serde_json::json!({"status":"passed", "content":"safe"})
+        };
+        (200, verdict.to_string())
+    });
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+
+    let config = combined_agentic_guardrail_config(model.port(), nemo.port());
+    let mut registry = praxis_ai::build_full_registry(&test_subrequest_client());
+    registry
+        .register(
+            "test_final_message_only",
+            praxis_filter::FilterFactory::Http(Arc::new(|_| Ok(Box::new(FinalMessageOnly)))),
+        )
+        .expect("register test response fixture");
+    let proxy = start_proxy_with_registry(&config, &registry);
+    let mut request = serde_json::json!({
+        "model":"gpt-4.1", "input":"What is the weather in SF?",
+        "text":{"format":{"type":"json_schema", "name":"answer", "schema":{"type":"object"}}},
+        "tools":[{"type":"mcp", "server_label":"weather", "server_url":format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools":["get_weather"], "require_approval":"never"}]
+    });
+    if !structured {
+        assert!(
+            request.as_object_mut().unwrap().remove("text").is_some(),
+            "the comparison case must request an ordinary text response"
+        );
+    }
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "a passed local tool result must permit the second inference"
+    );
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "the local tool must execute before the final response"
+    );
+    let checks: Vec<serde_json::Value> = nemo
+        .requests()
+        .iter()
+        .map(|request| serde_json::from_str(&request.body).expect("captured NeMo check must be JSON"))
+        .collect();
+    assert!(
+        checks.iter().any(
+            |check| check["guardrails"]["rail_types"] == serde_json::json!(["input"])
+                && check["messages"][0]["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("mock result for get_weather"))
+        ),
+        "the early-return path must actually screen the local tool result: {checks:#?}"
+    );
+    assert!(
+        checks.iter().any(
+            |check| check["guardrails"]["rail_types"] == serde_json::json!(["output"])
+                && check["messages"][0]["content"] == "secret"
+        ),
+        "the final output must reach NeMo before deciding the rewrite: {checks:#?}; client response: {raw}"
+    );
+    let body = parse_body(&raw);
+    if structured {
+        assert!(
+            body.contains("evaluation_failed"),
+            "the changed structured output must fail closed: {raw}"
+        );
+        assert!(
+            !body.contains("secret") && !body.contains("masked"),
+            "neither original nor partial rewrite may reach the client: {raw}"
+        );
+    } else {
+        let json: serde_json::Value = serde_json::from_str(&body).expect("the unstructured response must be JSON");
+        assert_eq!(
+            json.pointer("/output/0/content/0/text")
+                .and_then(serde_json::Value::as_str),
+            Some("masked"),
+            "the same local tool-result flow must allow a safe unstructured rewrite: {raw}"
+        );
+    }
 }
 
 #[test]

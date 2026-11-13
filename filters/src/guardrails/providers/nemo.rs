@@ -254,13 +254,15 @@ impl NemoProvider {
         messages: Vec<serde_json::Value>,
         phase: GuardPhase,
         runtime: &GuardCalloutRuntime<'_>,
+        native_text: bool,
     ) -> Result<GuardResult, FilterError> {
         let indices = target_message_indices(&messages, phase);
         if indices.is_empty() {
             return Ok(GuardResult::Pass);
         }
         ensure_check_limit(indices.len(), self.max_message_checks)?;
-        self.evaluate_messages(messages, indices, phase, runtime).await
+        let policy = MessageCheckPolicy { phase, native_text };
+        self.evaluate_messages(messages, indices, runtime, policy).await
     }
 
     /// Evaluate each target message concurrently to completion before deciding the result.
@@ -272,18 +274,15 @@ impl NemoProvider {
         &self,
         messages: Vec<serde_json::Value>,
         indices: Vec<usize>,
-        phase: GuardPhase,
         runtime: &GuardCalloutRuntime<'_>,
+        policy: MessageCheckPolicy,
     ) -> Result<GuardResult, FilterError> {
         ensure_deadline_remaining(runtime.deadline)?;
 
         let mut pending_indices = indices.into_iter();
         let mut checks = FuturesUnordered::new();
-        for _ in 0..MAX_IN_FLIGHT_CHECKS {
-            let Some(end) = pending_indices.next() else {
-                break;
-            };
-            checks.push(self.check_target_message(&messages, end, phase, runtime));
+        for end in pending_indices.by_ref().take(MAX_IN_FLIGHT_CHECKS) {
+            checks.push(self.check_target_message(&messages, end, runtime, policy));
         }
 
         let mut results = Vec::with_capacity(checks.len());
@@ -293,19 +292,15 @@ impl NemoProvider {
             collect_prefix_result(completed, &mut results, &mut block_reason, &mut first_error);
             if schedule_pending && pending_indices.len() > 0 {
                 match next_prefix_before_deadline(&mut pending_indices, runtime.deadline, &mut first_error) {
-                    NextPrefix::Index(end) => checks.push(self.check_target_message(&messages, end, phase, runtime)),
+                    NextPrefix::Index(end) => {
+                        checks.push(self.check_target_message(&messages, end, runtime, policy));
+                    },
                     NextPrefix::Done | NextPrefix::DeadlineElapsed => schedule_pending = false,
                 }
             }
         }
 
-        if let Some(reason) = block_reason {
-            return Ok(GuardResult::Block { reason });
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(combine_slice_results(results))
+        finish_message_checks(results, block_reason, first_error)
     }
 
     /// Retain request history, isolate response outputs, and preserve the original index.
@@ -313,21 +308,26 @@ impl NemoProvider {
         &self,
         messages: &[serde_json::Value],
         end: usize,
-        phase: GuardPhase,
         runtime: &GuardCalloutRuntime<'_>,
+        policy: MessageCheckPolicy,
     ) -> Result<(usize, NemoVerdict), FilterError> {
         ensure_deadline_remaining(runtime.deadline)?;
         let target = messages
             .get(end)
             .ok_or_else(|| -> FilterError { "ai_guardrails (nemo): invalid message index".into() })?;
-        let context = match phase {
+        let context = match policy.phase {
             GuardPhase::Request => messages
                 .get(..=end)
                 .ok_or_else(|| -> FilterError { "ai_guardrails (nemo): invalid message index".into() })?,
             GuardPhase::Response => std::slice::from_ref(target),
         };
-        let verdict = self.check_messages(context, phase, runtime).await?;
-        Ok((end, normalize_unchanged_modification(verdict, target)))
+        let verdict = self.check_messages(context, policy.phase, runtime).await?;
+        let verdict = if policy.native_text && unchanged_text_parts(&verdict, target) {
+            NemoVerdict::Pass
+        } else {
+            normalize_unchanged_modification(verdict, target)
+        };
+        Ok((end, verdict))
     }
 
     /// POST one message slice to `/v1/checks` through the outbound chain.
@@ -583,6 +583,41 @@ fn ensure_deadline_remaining(deadline: Instant) -> Result<(), FilterError> {
         .checked_duration_since(Instant::now())
         .map(|_| ())
         .ok_or_else(|| "ai_guardrails (nemo): overall evaluation deadline exceeded".into())
+}
+
+/// Phase and text representation used by every check in one evaluation.
+#[derive(Clone, Copy)]
+struct MessageCheckPolicy {
+    /// Whether the checked messages belong to the request or response.
+    phase: GuardPhase,
+    /// Whether canonical text parts use the native redaction contract.
+    native_text: bool,
+}
+
+/// Decide the verdict after all started checks have completed.
+fn finish_message_checks(
+    results: Vec<(usize, NemoVerdict)>,
+    block_reason: Option<String>,
+    first_error: Option<FilterError>,
+) -> Result<GuardResult, FilterError> {
+    if let Some(reason) = block_reason {
+        return Ok(GuardResult::Block { reason });
+    }
+    if let Some(error) = first_error {
+        // A known modification must never be discarded into a generic
+        // error that could be configured to fail open.
+        if results
+            .iter()
+            .any(|(_, verdict)| matches!(verdict, NemoVerdict::Modified { .. }))
+        {
+            return Ok(GuardResult::Redact {
+                replacements: Vec::new(),
+                reason: "a concurrent guardrail check failed".to_owned(),
+            });
+        }
+        return Err(error);
+    }
+    Ok(combine_slice_results(results))
 }
 
 /// The next queued prefix scheduling decision after one check completes.
@@ -849,6 +884,25 @@ fn normalize_unchanged_modification(verdict: NemoVerdict, target: &serde_json::V
         },
         _ => verdict,
     }
+}
+
+/// Compare a native message's canonical text parts without allocating a joined string.
+fn unchanged_text_parts(verdict: &NemoVerdict, target: &serde_json::Value) -> bool {
+    let NemoVerdict::Modified { content, .. } = verdict else {
+        return false;
+    };
+    let Some(parts) = target.get("content").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    if parts.is_empty() {
+        return false;
+    }
+    parts.iter().try_fold(content.as_str(), |remaining, part| {
+        if part.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+            return None;
+        }
+        remaining.strip_prefix(part.get("text")?.as_str()?)
+    }) == Some("")
 }
 
 /// Map a deserialized [`NemoResponse`] to a [`NemoVerdict`].
@@ -1217,6 +1271,29 @@ guardrails:
             normalize_unchanged_modification(verdict, &target),
             NemoVerdict::Pass,
             "an identical replacement needs no body rewrite"
+        );
+    }
+
+    #[test]
+    fn unchanged_native_text_parts_match_without_losing_boundaries() {
+        let target = serde_json::json!({"content": [
+            {"type":"text","text":"first"}, {"type":"text","text":"second"}
+        ]});
+        let same = NemoVerdict::Modified {
+            content: "firstsecond".into(),
+            reason: "pii".into(),
+        };
+        let changed = NemoVerdict::Modified {
+            content: "masked".into(),
+            reason: "pii".into(),
+        };
+        assert!(
+            unchanged_text_parts(&same, &target),
+            "identical text parts must need no rewrite"
+        );
+        assert!(
+            !unchanged_text_parts(&changed, &target),
+            "changed text must retain redaction handling"
         );
     }
 

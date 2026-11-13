@@ -1341,6 +1341,73 @@ async fn on_request_body_fails_closed_when_one_concurrent_check_errors() {
 }
 
 #[tokio::test]
+async fn native_known_modification_is_not_lost_when_a_sibling_check_errors() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::body_json};
+    let server = MockServer::start().await;
+    Mock::given(body_json(serde_json::json!({"model":"", "messages":[{"role":"user","content":"first"}], "guardrails":{"rail_types":["input"]}})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status":"modified","content":"masked"}))).mount(&server).await;
+    Mock::given(body_json(serde_json::json!({"model":"", "messages":[{"role":"user","content":"first"},{"role":"user","content":"second"}], "guardrails":{"rail_types":["input"]}})))
+        .respond_with(ResponseTemplate::new(500)).mount(&server).await;
+    let filter = nemo_filter(&format!("{}/v1/checks", server.uri()));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = operation_context(&req, "openai_responses", "createResponse");
+    let mut body = Some(bytes::Bytes::from_static(
+        br#"{"input":[{"role":"user","content":"first"},{"role":"user","content":"second"}]}"#,
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert_eq!(
+        as_rejection(action).status,
+        502,
+        "a known modification must explicitly reject when another check fails"
+    );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "checks pass and modification paths through the provider"
+)]
+async fn responses_orphan_tool_output_is_checked_but_unsafe_redaction_is_rejected() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::body_json};
+
+    for (verdict, should_pass) in [("passed", true), ("modified", false)] {
+        let server = MockServer::start().await;
+        Mock::given(body_json(serde_json::json!({
+            "model":"", "messages":[{"role":"user","content":"done"}], "guardrails":{"rail_types":["input"]}
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"status":verdict,"content":"masked"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+        let filter = nemo_filter(&format!("{}/v1/checks", server.uri()));
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = operation_context(&req, "openai_responses", "createResponse");
+        let original = br#"{"input":[{"type":"function_call_output","output":"done"}]}"#;
+        let mut body = Some(bytes::Bytes::from_static(original));
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        if should_pass {
+            assert!(
+                matches!(action, praxis_filter::FilterAction::Continue),
+                "passed output must be forwarded"
+            );
+        } else {
+            assert_eq!(
+                as_rejection(action).status,
+                502,
+                "orphan output cannot be rewritten safely"
+            );
+        }
+        assert_eq!(
+            body.as_deref(),
+            Some(original.as_slice()),
+            "the original body must remain intact"
+        );
+    }
+}
+
+#[tokio::test]
 #[expect(
     clippy::too_many_lines,
     reason = "integration setup verifies the deadline stops queued large prefixes"
@@ -1571,80 +1638,125 @@ async fn on_request_body_modified_without_user_message_fails_closed() {
     );
 }
 
-/// Ensure a modified verdict never applies Chat indices to a different request protocol.
-async fn assert_protocol_request_redaction_rejected(
-    protocol: &'static str,
-    operation_id: &'static str,
-    original: &'static [u8],
-    index: usize,
-) {
-    let filter = AiGuardrailsFilter::with_verdict(
-        GuardResult::redact_message(index, "masked".into(), "pii".into()),
-        PhaseConfig::default(),
-    )
-    .expect("test filter");
-    let req = crate::test_utils::make_request(http::Method::POST, "/test");
-    let mut ctx = operation_context(&req, protocol, operation_id);
-    let mut body = Some(bytes::Bytes::from_static(original));
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    let rejection = as_rejection(action);
-    assert_eq!(
-        rejection.status, 502,
-        "unsupported request redaction must reject explicitly"
-    );
-    assert!(
-        String::from_utf8_lossy(&rejection.body.expect("rejection body")).contains("only for Chat Completions"),
-        "the rejection must identify the unsupported rewrite"
-    );
-    assert_eq!(
-        body.as_deref(),
-        Some(original),
-        "rejected requests must not rewrite another message"
-    );
+#[tokio::test]
+async fn native_request_redaction_preserves_protocol_and_context() {
+    for (protocol, operation, original, index, path) in [
+        ("anthropic_messages", "messages_post", br#"{"system":"rules","messages":[{"role":"user","content":"secret"}],"model":"m"}"#.as_slice(), 1, "/messages/0/content"),
+        ("openai_responses", "createResponse", br#"{"instructions":"rules","input":[{"role":"user","content":[{"type":"input_text","text":"secret"}]}],"model":"m"}"#.as_slice(), 1, "/input/0/content/0/text"),
+        ("openai_responses", "createResponse", br#"{"input":"secret","model":"m"}"#.as_slice(), 0, "/input"),
+    ] {
+        let filter = AiGuardrailsFilter::with_verdict(GuardResult::redact_message(index, "masked".into(), "pii".into()), PhaseConfig::default()).unwrap();
+        let req = crate::test_utils::make_request(http::Method::POST, "/test");
+        let mut ctx = operation_context(&req, protocol, operation);
+        let mut body = Some(bytes::Bytes::copy_from_slice(original));
+        assert!(matches!(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(), praxis_filter::FilterAction::Continue), "a safe native rewrite must continue");
+        let json: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+        let mut expected: serde_json::Value = serde_json::from_slice(original).unwrap();
+        *expected.pointer_mut(path).unwrap() = serde_json::json!("masked");
+        assert_eq!(json, expected, "only the intended text may change; system, instructions, and native fields must survive");
+    }
 }
 
 #[tokio::test]
-async fn on_request_body_rejects_anthropic_redaction_with_shifted_indices() {
-    assert_protocol_request_redaction_rejected(
-        "anthropic_messages",
-        "messages_post",
-        br#"{"system":"Follow policy","messages":[{"role":"user","content":"secret first"},{"role":"user","content":"second"}]}"#,
-        1,
-    )
-    .await;
-    assert_protocol_request_redaction_rejected(
-        "anthropic_messages",
-        "messages_post",
-        br#"{"messages":[{"role":"user","content":"secret first"}]}"#,
-        0,
-    )
-    .await;
+#[expect(
+    clippy::too_many_lines,
+    reason = "checks out-of-order responses for both native protocols"
+)]
+async fn native_request_redactions_follow_message_identity_when_checks_finish_out_of_order() {
+    use std::time::Duration;
+
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::body_json};
+    for (protocol, operation, original, first, second) in [
+        (
+            "openai_responses",
+            "createResponse",
+            br#"{"input":[{"role":"user","content":"first"},{"role":"user","content":"second"}]}"#.as_slice(),
+            "/input/0/content",
+            "/input/1/content",
+        ),
+        (
+            "anthropic_messages",
+            "messages_post",
+            br#"{"messages":[{"role":"user","content":"first"},{"role":"user","content":"second"}]}"#.as_slice(),
+            "/messages/0/content",
+            "/messages/1/content",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        for (messages, replacement, delay) in [
+            (
+                serde_json::json!([{"role":"user","content":"first"}]),
+                "masked first",
+                100,
+            ),
+            (
+                serde_json::json!([{"role":"user","content":"first"},{"role":"user","content":"second"}]),
+                "masked second",
+                1,
+            ),
+        ] {
+            Mock::given(body_json(
+                serde_json::json!({"model":"", "messages":messages, "guardrails":{"rail_types":["input"]}}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(delay))
+                    .set_body_json(serde_json::json!({"status":"modified","content":replacement})),
+            )
+            .mount(&server)
+            .await;
+        }
+        let filter = nemo_filter(&format!("{}/v1/checks", server.uri()));
+        let req = crate::test_utils::make_request(http::Method::POST, "/test");
+        let mut ctx = operation_context(&req, protocol, operation);
+        let mut body = Some(bytes::Bytes::copy_from_slice(original));
+        assert!(
+            matches!(
+                filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+                praxis_filter::FilterAction::Continue
+            ),
+            "both safe native rewrites must continue"
+        );
+        let json: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            json.pointer(first).and_then(serde_json::Value::as_str),
+            Some("masked first"),
+            "the first verdict must rewrite the first user message"
+        );
+        assert_eq!(
+            json.pointer(second).and_then(serde_json::Value::as_str),
+            Some("masked second"),
+            "the second verdict must rewrite the second user message"
+        );
+    }
 }
 
-#[tokio::test]
-async fn on_request_body_rejects_responses_redaction() {
-    assert_protocol_request_redaction_rejected(
-        "openai_responses",
-        "createResponse",
-        br#"{"model":"m","input":"secret first"}"#,
-        0,
-    )
-    .await;
-    assert_protocol_request_redaction_rejected(
-        "openai_responses",
-        "createResponse",
-        br#"{"model":"m","input":"secret first","messages":[{"role":"user","content":"decoy"}]}"#,
-        0,
-    )
-    .await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_response_redaction_clears_sensitive_metadata() {
+    for (protocol, operation, original, path) in [
+        ("openai_responses", "createResponse", br#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"secret","annotations":[{"title":"secret"}],"logprobs":[{"token":"secret"}]}]}],"id":"id"}"#.as_slice(), "/output/0/content/0/text"),
+        ("anthropic_messages", "messages_post", br#"{"role":"assistant","content":[{"type":"text","text":"secret","citations":[{"cited_text":"secret"}]}],"stop_details":{"type":"refusal","category":"general_harms","explanation":"secret"},"id":"id"}"#.as_slice(), "/content/0/text"),
+    ] {
+        let filter = AiGuardrailsFilter::with_verdict(GuardResult::redact_message(0, "masked".into(), "pii".into()), PhaseConfig { request: false, response: true, ..PhaseConfig::default() }).unwrap();
+        let req = crate::test_utils::make_request(http::Method::POST, "/test");
+        let mut ctx = operation_context(&req, protocol, operation);
+        buffer_response(&mut ctx);
+        let mut body = Some(bytes::Bytes::copy_from_slice(original));
+        assert!(matches!(filter.on_response_body(&mut ctx, &mut body, true).unwrap(), praxis_filter::FilterAction::Continue), "a safe native response rewrite must continue");
+        let bytes = body.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json.pointer(path).and_then(serde_json::Value::as_str), Some("masked"), "the response text must be masked");
+        assert_eq!(json.get("id").and_then(serde_json::Value::as_str), Some("id"), "the native response ID must be preserved");
+        assert!(!String::from_utf8_lossy(&bytes).contains("secret"), "rewritten response metadata must not expose the original text");
+        if protocol == "anthropic_messages" {
+            assert_eq!(json.pointer("/content/0/citations"), Some(&serde_json::Value::Null), "citations remain nullable");
+            assert_eq!(json.pointer("/stop_details/explanation"), Some(&serde_json::Value::Null), "refusal explanation is cleared");
+        }
+    }
 }
 
-/// Ensure non-Chat responses cannot use a coincidental choices field for rewriting.
-fn assert_protocol_response_redaction_rejected(
-    protocol: &'static str,
-    operation_id: &'static str,
-    original: &'static [u8],
-) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_redaction_rejects_a_secondary_text_field() {
     let filter = AiGuardrailsFilter::with_verdict(
         GuardResult::redact_message(0, "masked".into(), "pii".into()),
         PhaseConfig {
@@ -1653,35 +1765,213 @@ fn assert_protocol_response_redaction_rejected(
             ..PhaseConfig::default()
         },
     )
-    .expect("test filter");
-    let req = crate::test_utils::make_request(http::Method::POST, "/test");
-    let mut ctx = operation_context(&req, protocol, operation_id);
+    .unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = operation_context(&req, "openai_responses", "createResponse");
     buffer_response(&mut ctx);
-    let mut body = Some(bytes::Bytes::from_static(original));
-    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    let mut body = Some(bytes::Bytes::from_static(br#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"secret","refusal":"secret"}]}]}"#));
     assert!(
-        matches!(action, praxis_filter::FilterAction::Continue),
-        "the unsafe output must be replaced"
+        matches!(
+            filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+            praxis_filter::FilterAction::Continue
+        ),
+        "unsafe output should be replaced by an error"
     );
-    let replaced = body.as_ref().expect("replacement body");
-    assert_error_body_json(replaced, "evaluation_failed");
+    let result = body.as_ref().unwrap();
+    assert_error_body_json(result, "evaluation_failed");
     assert!(
-        !String::from_utf8_lossy(replaced).contains("secret"),
-        "the replacement must not contain original protocol text"
+        !String::from_utf8_lossy(result).contains("secret"),
+        "the unsafe field must not reach the client"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_rejects_non_chat_redaction_even_with_chat_shaped_fields() {
-    assert_protocol_response_redaction_rejected(
-        "openai_responses",
-        "createResponse",
-        br#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"secret output"}]}],"choices":[{"index":0,"message":{"role":"assistant","content":"decoy"}}]}"#,
+#[expect(
+    clippy::too_many_lines,
+    reason = "verifies all output locations after concurrent checks"
+)]
+async fn native_responses_redaction_keeps_original_output_indices_when_checks_finish_out_of_order() {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_out_of_order_output_redactions(&mock_server).await;
+    let filter = nemo_filter_response(&format!("{}/v1/checks", mock_server.uri()));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = operation_context(&req, "openai_responses", "createResponse");
+    buffer_response(&mut ctx);
+    let mut body = Some(bytes::Bytes::from_static(br#"{"output":[{"type":"reasoning","summary":[]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first secret"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second secret"}]}]}"#));
+    assert!(
+        matches!(
+            filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+            praxis_filter::FilterAction::Continue
+        ),
+        "both safe response rewrites must continue"
     );
-    assert_protocol_response_redaction_rejected(
-        "anthropic_messages",
-        "messages_post",
-        br#"{"role":"assistant","content":[{"type":"text","text":"secret output"}],"choices":[{"index":0,"message":{"role":"assistant","content":"decoy"}}]}"#,
+    let json: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        json.pointer("/output/1/content/0/text")
+            .and_then(serde_json::Value::as_str),
+        Some("first masked"),
+        "the first result must retain its original output location"
+    );
+    assert_eq!(
+        json.pointer("/output/2/content/0/text")
+            .and_then(serde_json::Value::as_str),
+        Some("second masked"),
+        "the second result must retain its original output location"
+    );
+    assert_eq!(
+        json.pointer("/output/0/type").and_then(serde_json::Value::as_str),
+        Some("reasoning"),
+        "opaque reasoning before the output messages must remain unchanged"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "checks structured request state and response rejection together"
+)]
+async fn native_structured_output_redaction_fails_closed() {
+    let filter = AiGuardrailsFilter::with_verdict(
+        GuardResult::redact_message(0, "masked".into(), "pii".into()),
+        PhaseConfig {
+            request: false,
+            response: true,
+            ..PhaseConfig::default()
+        },
+    )
+    .unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = operation_context(&req, "openai_responses", "createResponse");
+    ctx.current_filter_id = Some(0);
+    let mut request = Some(bytes::Bytes::from_static(
+        br#"{"input":"hello","text":{"format":{"type":"json_schema"}}}"#,
+    ));
+    assert!(
+        matches!(
+            filter.on_request_body(&mut ctx, &mut request, true).await.unwrap(),
+            praxis_filter::FilterAction::Continue
+        ),
+        "the structured request must reach the model"
+    );
+    buffer_response(&mut ctx);
+    let mut body = Some(bytes::Bytes::from_static(
+        br#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"secret"}]}]}"#,
+    ));
+    assert!(
+        matches!(
+            filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+            praxis_filter::FilterAction::Continue
+        ),
+        "the unsafe structured response must be replaced by an error"
+    );
+    assert_error_body_json(body.as_ref().unwrap(), "evaluation_failed");
+}
+
+#[tokio::test]
+async fn chat_response_screening_does_not_use_native_structured_output_fields() {
+    let filter = AiGuardrailsFilter::with_verdict(
+        GuardResult::Pass,
+        PhaseConfig {
+            request: false,
+            response: true,
+            ..PhaseConfig::default()
+        },
+    )
+    .unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = guardrails_context(&req);
+    ctx.current_filter_id = Some(0);
+    let mut body = Some(bytes::Bytes::from_static(
+        br#"{"messages":[{"role":"user","content":"hello"}],"text":{"format":{"type":"json_schema"}}}"#,
+    ));
+    assert!(
+        matches!(
+            filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+            praxis_filter::FilterAction::Continue
+        ),
+        "a Chat request must continue through response screening"
+    );
+    assert_eq!(
+        screening(&ctx),
+        Some(ResponseScreening::Screen),
+        "native structured-output fields must not alter Chat response screening"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "checks structured request state and refusal rewriting together"
+)]
+async fn structured_responses_refusal_redaction_remains_supported() {
+    let filter = AiGuardrailsFilter::with_verdict(
+        GuardResult::redact_message(0, "masked refusal".into(), "pii".into()),
+        PhaseConfig {
+            request: false,
+            response: true,
+            ..PhaseConfig::default()
+        },
+    )
+    .unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = operation_context(&req, "openai_responses", "createResponse");
+    ctx.current_filter_id = Some(0);
+    let mut request = Some(bytes::Bytes::from_static(
+        br#"{"input":"hello","text":{"format":{"type":"json_schema"}}}"#,
+    ));
+    assert!(
+        matches!(
+            filter.on_request_body(&mut ctx, &mut request, true).await.unwrap(),
+            praxis_filter::FilterAction::Continue
+        ),
+        "the structured request must reach response screening"
+    );
+    assert_eq!(
+        screening(&ctx),
+        Some(ResponseScreening::ScreenStructured),
+        "the structured request must retain its response-format state"
+    );
+    buffer_response(&mut ctx);
+    let mut body = Some(bytes::Bytes::from_static(
+        br#"{"output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"secret"}]}]}"#,
+    ));
+    assert!(
+        matches!(
+            filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+            praxis_filter::FilterAction::Continue
+        ),
+        "a structured Responses refusal may be rewritten"
+    );
+    let json: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        json.pointer("/output/0/content/0/refusal")
+            .and_then(serde_json::Value::as_str),
+        Some("masked refusal"),
+        "the refusal must contain NeMo's replacement"
+    );
+}
+
+#[tokio::test]
+async fn native_multiblock_redaction_fails_closed() {
+    let filter = AiGuardrailsFilter::with_verdict(
+        GuardResult::redact_message(0, "masked".into(), "pii".into()),
+        PhaseConfig::default(),
+    )
+    .unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/test");
+    let mut ctx = operation_context(&req, "anthropic_messages", "messages_post");
+    let original =
+        br#"{"messages":[{"role":"user","content":[{"type":"text","text":"sec"},{"type":"text","text":"ret"}]}]}"#;
+    let mut body = Some(bytes::Bytes::from_static(original));
+    assert_eq!(
+        as_rejection(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap()).status,
+        502,
+        "a changed multi-block message cannot be safely rewritten"
+    );
+    assert_eq!(
+        body.as_deref(),
+        Some(original.as_slice()),
+        "a rejected rewrite must leave the original buffered body intact"
     );
 }
 
