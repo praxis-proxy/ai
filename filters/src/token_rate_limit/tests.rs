@@ -13,12 +13,21 @@ use crate::token_usage::{
     META_TOKEN_STATUS, META_TOKEN_TOTAL, TOKEN_STATUS_OVERFLOW,
 };
 
+/// Parse fixtures that exercise unrelated fields with an explicit memory backend.
+fn parse_filter_yaml(yaml: &str) -> Result<serde_yaml::Value, serde_yaml::Error> {
+    if yaml.lines().any(|line| line.starts_with("backend:")) {
+        serde_yaml::from_str(yaml)
+    } else {
+        serde_yaml::from_str(&format!("backend:\n  kind: memory\n{yaml}"))
+    }
+}
+
 /// Wrap one rule body (already-valid YAML lines, unindented) into a
 /// full one-rule `rules:` config, named `"default"`. Most scenarios
 /// pre-date per-rule algorithm choice and only care about one rule's
 /// behavior in isolation -- multi-rule dispatch itself is covered
 /// separately below.
-fn single_rule(body: &str) -> String {
+fn single_rule_without_backend(body: &str) -> String {
     let indented = body
         .lines()
         .map(|line| format!("    {line}"))
@@ -27,15 +36,25 @@ fn single_rule(body: &str) -> String {
     format!("rules:\n  - name: default\n{indented}\n")
 }
 
-/// [`single_rule`], parsed straight into a [`serde_yaml::Value`].
-fn single_rule_yaml(body: &str) -> serde_yaml::Value {
-    serde_yaml::from_str(&single_rule(body)).unwrap()
+/// [`single_rule_without_backend`], with an explicit in-memory backend.
+fn single_rule(body: &str) -> String {
+    format!("backend:\n  kind: memory\n{}", single_rule_without_backend(body))
 }
 
-/// [`single_rule`], with a filter-level `top_level` block (e.g.
-/// `backend: {...}`) prepended as a sibling of `rules:`.
+/// [`single_rule`], parsed straight into a [`serde_yaml::Value`].
+fn single_rule_yaml(body: &str) -> serde_yaml::Value {
+    parse_filter_yaml(&single_rule(body)).unwrap()
+}
+
+/// [`single_rule`], with a filter-level `top_level` block prepended as a
+/// sibling of `backend:` and `rules:`.
 fn single_rule_yaml_with(top_level: &str, body: &str) -> serde_yaml::Value {
-    serde_yaml::from_str(&format!("{top_level}\n{}", single_rule(body))).unwrap()
+    parse_filter_yaml(&format!("{top_level}\n{}", single_rule(body))).unwrap()
+}
+
+/// [`single_rule_without_backend`], with a caller-provided backend block.
+fn single_rule_yaml_with_backend(backend: &str, body: &str) -> serde_yaml::Value {
+    parse_filter_yaml(&format!("{backend}\n{}", single_rule_without_backend(body))).unwrap()
 }
 
 /// Build a request carrying a single extra header, for `match` tests.
@@ -436,7 +455,7 @@ async fn assert_max_keys_cap(algorithm_body: &str) {
 
 #[tokio::test]
 async fn max_keys_is_enforced_per_rule_not_across_rules() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "max_keys: 1\n\
          key:\n\
          \x20 - header: x-tenant-id\n\
@@ -491,14 +510,14 @@ async fn max_keys_is_enforced_per_rule_not_across_rules() {
 
 #[test]
 fn from_config_rejects_an_empty_rules_list() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("rules: []\n").unwrap();
+    let yaml: serde_yaml::Value = parse_filter_yaml("rules: []\n").unwrap();
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
     assert!(err.to_string().contains("at least one rule"), "got: {err}");
 }
 
 #[test]
 fn from_config_rejects_duplicate_rule_names() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "rules:\n\
          \x20 - name: dup\n\
          \x20   algorithm: sliding_window\n\
@@ -584,7 +603,8 @@ fn from_config_rejects_unknown_field() {
 
 #[test]
 fn from_config_rejects_the_old_flat_pre_rules_shape() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("window: 1h\ncapacity: 100000\nreserved_tokens: 500").unwrap();
+    let yaml: serde_yaml::Value =
+        parse_filter_yaml("backend:\n  kind: memory\nwindow: 1h\ncapacity: 100000\nreserved_tokens: 500").unwrap();
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
     assert!(err.to_string().contains("rules"), "got: {err}");
 }
@@ -594,17 +614,18 @@ fn from_config_rejects_the_old_flat_pre_rules_shape() {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn from_config_defaults_to_memory_backend_when_backend_block_absent() {
-    // No `backend:` block at all must keep working exactly like before this
-    // field was added -- a config written before the Valkey backend existed
-    // should never start silently expecting shared state it never asked for.
-    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5");
-    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+fn from_config_rejects_missing_backend_block() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&single_rule_without_backend(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    ))
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("missing field `backend`"), "got: {err}");
 }
 
 #[test]
 fn from_config_accepts_explicit_memory_backend() {
-    let yaml = single_rule_yaml_with(
+    let yaml = single_rule_yaml_with_backend(
         "backend:\n  kind: memory",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
@@ -612,11 +633,43 @@ fn from_config_accepts_explicit_memory_backend() {
 }
 
 #[test]
+fn from_config_rejects_backend_without_kind() {
+    let yaml = single_rule_yaml_with_backend(
+        "backend: {}",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("missing field `kind`"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_network_settings_for_memory_backend() {
+    for (setting, backend) in [
+        ("url", "backend:\n  kind: memory\n  url: redis://127.0.0.1:6379"),
+        (
+            "sentinel",
+            "backend:\n  kind: memory\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster",
+        ),
+        ("namespace", "backend:\n  kind: memory\n  namespace: local"),
+        ("on_failure", "backend:\n  kind: memory\n  on_failure: open"),
+        ("connect_timeout", "backend:\n  kind: memory\n  connect_timeout: 1s"),
+        ("operation_timeout", "backend:\n  kind: memory\n  operation_timeout: 1s"),
+    ] {
+        let yaml = single_rule_yaml_with_backend(
+            backend,
+            "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+        );
+        let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+        assert!(err.to_string().contains(&format!("backend.{setting}")), "got: {err}");
+    }
+}
+
+#[test]
 fn from_config_rejects_valkey_backend_without_url() {
     // A distributed deployment that forgets `backend.url` must fail loudly
     // at startup, not silently fall back to per-instance state -- silent
     // fallback would defeat the whole point of asking for a shared backend.
-    let yaml = single_rule_yaml_with(
+    let yaml = single_rule_yaml_with_backend(
         "backend:\n  kind: valkey",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
@@ -629,7 +682,7 @@ fn from_config_rejects_valkey_backend_without_url() {
 
 #[test]
 fn from_config_accepts_valkey_backend_with_url() {
-    let yaml = single_rule_yaml_with(
+    let yaml = single_rule_yaml_with_backend(
         "backend:\n  kind: valkey\n  url: redis://127.0.0.1:6399",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
@@ -638,7 +691,7 @@ fn from_config_accepts_valkey_backend_with_url() {
 
 #[test]
 fn from_config_accepts_redis_backend_with_the_same_native_sentinel_path() {
-    let yaml = single_rule_yaml_with(
+    let yaml = single_rule_yaml_with_backend(
         "backend:\n  kind: redis\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
@@ -647,7 +700,7 @@ fn from_config_accepts_redis_backend_with_the_same_native_sentinel_path() {
 
 #[test]
 fn from_config_accepts_native_sentinel_backend_without_discovery_at_startup() {
-    let yaml = single_rule_yaml_with(
+    let yaml = single_rule_yaml_with_backend(
         "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    discovery_timeout: 2s",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
@@ -656,7 +709,7 @@ fn from_config_accepts_native_sentinel_backend_without_discovery_at_startup() {
 
 #[test]
 fn from_config_rejects_mixed_standalone_and_sentinel_topology() {
-    let yaml = single_rule_yaml_with(
+    let yaml = single_rule_yaml_with_backend(
         "backend:\n  kind: valkey\n  url: redis://127.0.0.1:6379\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
@@ -668,7 +721,7 @@ fn from_config_rejects_mixed_standalone_and_sentinel_topology() {
 
 #[test]
 fn from_config_rejects_a_missing_network_topology_during_parsing() {
-    let yaml = single_rule_yaml_with(
+    let yaml = single_rule_yaml_with_backend(
         "backend:\n  kind: valkey",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
@@ -683,7 +736,7 @@ fn from_config_rejects_a_missing_network_topology_during_parsing() {
 
 #[test]
 fn from_config_rejects_insecure_tls_configuration() {
-    let yaml = single_rule_yaml_with(
+    let yaml = single_rule_yaml_with_backend(
         "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    tls_insecure: true",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
@@ -695,7 +748,7 @@ fn from_config_rejects_insecure_tls_configuration() {
 
 #[test]
 fn from_config_rejects_the_removed_sentinel_tls_flag() {
-    let yaml = single_rule_yaml_with(
+    let yaml = single_rule_yaml_with_backend(
         "backend:\n  kind: redis\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    tls: true",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
@@ -707,7 +760,7 @@ fn from_config_rejects_the_removed_sentinel_tls_flag() {
 
 #[test]
 fn from_config_accepts_a_valkeys_tls_sentinel_endpoint() {
-    let yaml = single_rule_yaml_with(
+    let yaml = single_rule_yaml_with_backend(
         "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [valkeys://127.0.0.1:26379]\n    service_name: mymaster",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
@@ -719,7 +772,7 @@ fn from_config_accepts_two_rules_with_different_algorithms_sharing_one_filter_le
     // The whole point of moving `backend:` from per-rule to per-filter:
     // one `backend:` block, two rules with two different algorithms, one
     // shared Valkey connection underneath -- not one connection per rule.
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "backend:\n\
          \x20 kind: valkey\n\
          \x20 url: redis://127.0.0.1:6399\n\
@@ -902,7 +955,7 @@ async fn a_request_matching_no_rule_is_not_rate_limited() {
     // become a global rate limiter for traffic it was never configured
     // to cover -- operators who want a catch-all budget add a trailing
     // rule with no `match`.
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "rules:\n\
          \x20 - name: alpha-only\n\
          \x20   match:\n\
@@ -1253,7 +1306,7 @@ fn from_config_rejects_invalid_reservation_timeout() {
 /// Two rules, one per algorithm, matched by `x-app-id`: `alpha` gets a
 /// tiny sliding-window budget, `beta` gets a tiny token-bucket budget.
 fn two_algorithm_rules_yaml() -> serde_yaml::Value {
-    serde_yaml::from_str(
+    parse_filter_yaml(
         "rules:\n\
          \x20 - name: team-alpha\n\
          \x20   match:\n\
@@ -1340,7 +1393,7 @@ async fn on_request_with_no_matching_rule_admits_without_reserving_any_budget() 
 /// 100, `reserved_tokens` 40 -- smaller than capacity so a correct vs.
 /// wrong/no-op credit-back is observably distinguishable).
 fn team_alpha_sliding_and_team_beta_bucket_config() -> serde_yaml::Value {
-    serde_yaml::from_str(
+    parse_filter_yaml(
         "rules:\n\
          \x20 - name: team-alpha\n\
          \x20   match:\n\
@@ -1555,7 +1608,7 @@ async fn malformed_json_body_uses_fallback_estimate() {
 /// prepended -- shared by the cross-instance/worker-reconciliation
 /// scenarios below, which only vary the algorithm-specific rule body.
 fn single_rule_valkey_yaml(algorithm_body: &str, url: &str, namespace: &str) -> serde_yaml::Value {
-    single_rule_yaml_with(
+    single_rule_yaml_with_backend(
         &format!("backend:\n  kind: valkey\n  url: {url}\n  namespace: {namespace}"),
         algorithm_body,
     )
@@ -1633,7 +1686,7 @@ async fn poll_until_admitted_with_max_tokens(
 }
 
 fn valkey_header_key_yaml(algorithm_body: &str, url: &str, namespace: &str) -> serde_yaml::Value {
-    single_rule_yaml_with(
+    single_rule_yaml_with_backend(
         &format!(
             "max_keys: 1\nkey:\n  - header: x-tenant-id\nbackend:\n  kind: valkey\n  url: {url}\n  namespace: \
              {namespace}"
@@ -1775,7 +1828,7 @@ async fn valkey_key_policy_skew_fails_closed_with_503() {
         &namespace,
     ))
     .unwrap();
-    let keyed = TokenRateLimitFilter::from_config(&single_rule_yaml_with(
+    let keyed = TokenRateLimitFilter::from_config(&single_rule_yaml_with_backend(
         &format!("key: model\nbackend:\n  kind: valkey\n  url: {url}\n  namespace: {namespace}"),
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 5\nreserved_tokens: 1",
     ))
@@ -1938,7 +1991,7 @@ async fn valkey_failure_fails_closed() {
     // when its state store is unavailable defeats the point of rate
     // limiting it at all, right when a backend outage makes runaway
     // spend/load most likely.
-    let yaml = single_rule_yaml_with(
+    let yaml = single_rule_yaml_with_backend(
         "backend:\n  kind: valkey\n  url: redis://127.0.0.1:1",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 10",
     );
@@ -1956,7 +2009,7 @@ async fn valkey_failure_fails_closed() {
 
 #[tokio::test]
 async fn valkey_failure_open_forwards_once_without_a_reservation_handle() {
-    let yaml = single_rule_yaml_with(
+    let yaml = single_rule_yaml_with_backend(
         "backend:\n  kind: valkey\n  url: redis://127.0.0.1:1\n  on_failure: open\n  operation_timeout: 20ms",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 10",
     );
@@ -1984,7 +2037,7 @@ async fn valkey_failure_open_forwards_once_without_a_reservation_handle() {
 
 #[test]
 fn from_config_rejects_an_unbounded_backend_timeout() {
-    let yaml = single_rule_yaml_with(
+    let yaml = single_rule_yaml_with_backend(
         "backend:\n  kind: valkey\n  url: redis://127.0.0.1:6379\n  operation_timeout: 61s",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
@@ -1996,7 +2049,7 @@ fn from_config_rejects_an_unbounded_backend_timeout() {
 
 #[test]
 fn from_config_rejects_a_zero_backend_timeout() {
-    let yaml = single_rule_yaml_with(
+    let yaml = single_rule_yaml_with_backend(
         "backend:\n  kind: valkey\n  sentinel:\n    endpoints: [redis://127.0.0.1:26379]\n    service_name: mymaster\n    discovery_timeout: 0ms",
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
     );
@@ -2088,7 +2141,7 @@ async fn valkey_token_bucket_failure_fails_closed() {
     // unreachable Valkey backend must not silently admit token-bucket
     // requests either -- fail-closed has to hold for both algorithms,
     // not just the sliding-window one it was first proven on.
-    let yaml = single_rule_yaml_with(
+    let yaml = single_rule_yaml_with_backend(
         "backend:\n  kind: valkey\n  url: redis://127.0.0.1:1",
         "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 1\nreserved_tokens: 10",
     );
@@ -2106,7 +2159,7 @@ async fn valkey_token_bucket_failure_fails_closed() {
 
 #[tokio::test]
 async fn valkey_token_bucket_failure_open_forwards_without_reconciliation_metadata() {
-    let yaml = single_rule_yaml_with(
+    let yaml = single_rule_yaml_with_backend(
         "backend:\n  kind: redis\n  url: redis://127.0.0.1:1\n  on_failure: open\n  operation_timeout: 20ms",
         "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 1\nreserved_tokens: 10",
     );
@@ -2786,7 +2839,7 @@ async fn mixed_rules_body_dependent_strategy_extracts_from_body() {
 }
 
 fn mixed_fixed_and_body_dependent_yaml() -> serde_yaml::Value {
-    serde_yaml::from_str(
+    parse_filter_yaml(
         "rules:\n\
          \x20 - name: fixed-rule\n\
          \x20   match:\n\
@@ -2915,7 +2968,7 @@ async fn unweighted_total_of_the_same_cached_request_would_starve_the_window() {
 
 #[tokio::test]
 async fn per_rule_weight_overlay_is_isolated_from_filter_defaults() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "default_weights:\n\
          \x20 cached_input: 0.1\n\
          rules:\n\
@@ -3222,7 +3275,7 @@ fn tiered_rule_yaml(capacity: u64, reserved_tokens: u64, tiers_yaml: &str) -> se
          \x20   tiers:\n\
          {indented_tiers}\n"
     );
-    serde_yaml::from_str(&yaml).unwrap()
+    parse_filter_yaml(&yaml).unwrap()
 }
 
 // -- Config validation --
@@ -3240,7 +3293,7 @@ fn tier_config_parses_valid_inject_and_deny_tiers() {
 
 #[test]
 fn tier_config_rejects_empty_tiers_list() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "rules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 100\n    \
          reserved_tokens: 10\n    tiers: []\n",
     )
@@ -3264,7 +3317,7 @@ fn tier_config_rejects_non_ascending_capacities() {
 
 #[test]
 fn tier_config_rejects_deny_tier_not_last() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "rules:\n\
          \x20 - name: default\n\
          \x20   algorithm: sliding_window\n\
@@ -3585,7 +3638,7 @@ async fn inject_only_tiers_never_deny() {
 #[tokio::test]
 async fn tier_evaluation_with_token_bucket_algorithm() {
     // Same tier behavior should work with token_bucket.
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "rules:\n\
          \x20 - name: default\n\
          \x20   algorithm: token_bucket\n\
@@ -3618,7 +3671,7 @@ async fn tier_evaluation_with_token_bucket_algorithm() {
 #[tokio::test]
 async fn tier_headers_injected_from_on_request_body_path() {
     // Body-dependent estimation with tiers.
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "rules:\n\
          \x20 - name: default\n\
          \x20   algorithm: sliding_window\n\
@@ -3658,7 +3711,7 @@ async fn tier_headers_injected_from_on_request_body_path() {
 
 #[tokio::test]
 async fn tiers_with_match_condition_only_apply_to_matching_requests() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "rules:\n\
          \x20 - name: team-alpha\n\
          \x20   match:\n\
@@ -3709,7 +3762,7 @@ async fn tiers_with_match_condition_only_apply_to_matching_requests() {
 /// a below-threshold client from spoofing the tier signal.
 #[tokio::test]
 async fn client_supplied_tier_header_is_stripped_on_admission() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "rules:\n\
          \x20 - name: default\n\
          \x20   algorithm: sliding_window\n\
@@ -3750,7 +3803,7 @@ async fn client_supplied_tier_header_is_stripped_on_admission() {
 /// the ordered log as well as `request_headers_to_set`.
 #[tokio::test]
 async fn tier_headers_join_pre_read_mutations_when_ordered_log_is_active() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "rules:\n\
          \x20 - name: default\n\
          \x20   algorithm: sliding_window\n\
@@ -4351,7 +4404,7 @@ fn soft_enforcement_yaml(extra_over_quota: &str) -> serde_yaml::Value {
          \x20       X-Over-Quota: \"true\"\n\
          {extra_over_quota}"
     );
-    serde_yaml::from_str(&yaml).unwrap()
+    parse_filter_yaml(&yaml).unwrap()
 }
 
 #[test]
@@ -4563,7 +4616,7 @@ async fn soft_enforcement_strips_spoofed_over_quota_headers() {
 async fn soft_enforcement_strips_spoofed_headers_when_estimate_is_unavailable() {
     // Fallback-free body strategy can return Continue before reserve; spoof
     // headers must still be stripped at match time.
-    let yaml = serde_yaml::from_str(
+    let yaml = parse_filter_yaml(
         "rules:\n\
          \x20 - name: default\n\
          \x20   algorithm: sliding_window\n\
@@ -4688,7 +4741,7 @@ fn hierarchy_yaml(hierarchy_block: &str) -> serde_yaml::Value {
          \x20   reserved_tokens: 500\n\
          {hierarchy_block}"
     );
-    serde_yaml::from_str(&yaml).unwrap()
+    parse_filter_yaml(&yaml).unwrap()
 }
 
 fn valid_hierarchy_block() -> String {
@@ -4881,7 +4934,7 @@ fn from_config_rejects_hierarchy_user_level_with_identity_header_instead_of_iden
 
 #[test]
 fn from_config_rejects_hierarchy_without_a_catch_all_rule() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "rules:\n\
          \x20 - name: scoped\n\
          \x20   match:\n\
@@ -4917,7 +4970,7 @@ fn from_config_rejects_hierarchy_without_a_catch_all_rule() {
 
 #[test]
 fn from_config_rejects_hierarchy_when_a_rule_can_skip_estimation() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "rules:\n\
          \x20 - name: default\n\
          \x20   algorithm: sliding_window\n\
@@ -5063,7 +5116,7 @@ async fn hierarchy_missing_subject_returns_401() {
 
 #[test]
 fn from_config_rejects_hierarchy_with_a_zero_fallback_estimate() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "rules:\n\
          \x20 - name: default\n\
          \x20   algorithm: sliding_window\n\
@@ -5098,7 +5151,7 @@ fn from_config_rejects_hierarchy_with_a_zero_fallback_estimate() {
 
 #[test]
 fn from_config_rejects_hierarchy_when_reserved_tokens_exceed_level_capacity() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "rules:\n\
          \x20 - name: default\n\
          \x20   algorithm: sliding_window\n\
@@ -5131,7 +5184,7 @@ fn from_config_rejects_hierarchy_when_reserved_tokens_exceed_level_capacity() {
 
 #[test]
 fn from_config_rejects_hierarchy_when_fixed_multiplier_exceeds_level_capacity() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "rules:\n\
          \x20 - name: default\n\
          \x20   algorithm: sliding_window\n\
@@ -5186,7 +5239,7 @@ fn extract_max_tokens_uses_fallback_for_zero_and_keeps_zero_without_one() {
 
 #[test]
 fn from_config_rejects_a_rule_named_like_a_hierarchy_level() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
+    let yaml: serde_yaml::Value = parse_filter_yaml(
         "rules:\n\
          \x20 - name: hierarchy:user\n\
          \x20   algorithm: sliding_window\n\
