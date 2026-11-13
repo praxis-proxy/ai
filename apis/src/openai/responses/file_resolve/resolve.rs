@@ -1065,10 +1065,10 @@ fn rewrite_part(part: &mut serde_json::Value, part_type: &str, source: Reference
 
     match source {
         ReferenceKind::FileId => {
-            obj.remove("file_id");
+            obj.shift_remove("file_id");
         },
         ReferenceKind::FileUrl => {
-            obj.remove("file_url");
+            obj.shift_remove("file_url");
         },
     }
 
@@ -1879,6 +1879,36 @@ mod tests {
 
         assert_eq!(count, 0, "parts with image_url (no file_id) should not be resolved");
         assert_eq!(body, original, "body should be unchanged, including detail field");
+    }
+
+    #[test]
+    fn rewrite_part_preserves_unrelated_member_order() {
+        for (field, source) in [("file_id", ReferenceKind::FileId), ("file_url", ReferenceKind::FileUrl)] {
+            let mut part: serde_json::Value = serde_json::from_str(&format!(
+                r#"{{"{field}":"reference","type":"input_file","filename":"client.pdf","opaque":{{"z":1,"a":2}}}}"#
+            ))
+            .unwrap();
+            rewrite_part(
+                &mut part,
+                "input_file",
+                source,
+                ResolvedFile {
+                    base64: "JVBER".to_owned(),
+                    content_type: "application/pdf".to_owned(),
+                    filename: Some("server.pdf".to_owned()),
+                },
+            );
+            assert_eq!(
+                part.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
+                ["type", "filename", "opaque", "file_data"]
+            );
+            assert_eq!(part["filename"], "client.pdf");
+            assert_eq!(part["opaque"].to_string(), r#"{"z":1,"a":2}"#);
+            assert_eq!(
+                part["file_data"].as_str().unwrap().split(',').next_back(),
+                Some("JVBER")
+            );
+        }
     }
 
     #[test]

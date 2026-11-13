@@ -1,0 +1,175 @@
+{
+  "version": 1,
+  "scenario_id": "azure/request-preservation",
+  "protocol": "openai_chat_completions",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-azure-model",
+    "source_id": "controlled-azure-request-preservation"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "chatcmpl-preservation": "chatcmpl-recorded-0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "remove-model",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "extra": {
+                "alpha": 2,
+                "zebra": 1
+              },
+              "messages": [
+                {
+                  "content": "Hello",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-azure-model",
+              "tools": [
+                {
+                  "function": {
+                    "name": "inspect",
+                    "parameters": {
+                      "properties": {
+                        "alpha": {
+                          "type": "number"
+                        },
+                        "zebra": {
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  },
+                  "type": "function"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "index": 0,
+                  "message": {
+                    "content": "ok",
+                    "role": "assistant"
+                  }
+                }
+              ],
+              "id": "chatcmpl-recorded-0001",
+              "model": "synthetic-azure-model",
+              "object": "chat.completion",
+              "usage": {
+                "completion_tokens": 1,
+                "prompt_tokens": 1,
+                "total_tokens": 2
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "extra": {
+                "alpha": 2,
+                "zebra": 1
+              },
+              "messages": [
+                {
+                  "content": "Hello",
+                  "role": "user"
+                }
+              ],
+              "tools": [
+                {
+                  "function": {
+                    "name": "inspect",
+                    "parameters": {
+                      "properties": {
+                        "alpha": {
+                          "type": "number"
+                        },
+                        "zebra": {
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  },
+                  "type": "function"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "index": 0,
+                  "message": {
+                    "content": "ok",
+                    "role": "assistant"
+                  }
+                }
+              ],
+              "id": "chatcmpl-recorded-0001",
+              "model": "synthetic-azure-model",
+              "object": "chat.completion",
+              "usage": {
+                "completion_tokens": 1,
+                "prompt_tokens": 1,
+                "total_tokens": 2
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

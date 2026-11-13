@@ -11702,6 +11702,8 @@ class _FileUrlStubHandler(BaseHTTPRequestHandler):
                 "x-user-id",
                 "authorization",
                 "x-user-ogx-key",
+                "x-user-mcp-key",
+                "x-mcp-authorized",
             )
             if self.headers.get(name) is not None
         ]
@@ -11743,7 +11745,7 @@ class _FileResolveBackendHandler(BaseHTTPRequestHandler):
 
 
 @pytest.fixture()
-def file_resolve_stub_env(tmp_path_factory, request):
+def file_resolve_stub_env(tmp_path_factory, request, mcp_server):
     """Function-scoped file-resolve proxy with fully stubbed upstreams.
 
     Needs only the compiled binary — no vLLM and no OGX — so it exercises the
@@ -11784,6 +11786,7 @@ def file_resolve_stub_env(tmp_path_factory, request):
         backend_endpoint=f"127.0.0.1:{backend_port}",
         ogx_endpoint=f"127.0.0.1:{files_port}",
         file_url_origin=f"http://127.0.0.1:{file_url_port}",
+        mcp_endpoint=f"http://127.0.0.1:{mcp_server}/mcp",
     )
     started = False
     proc = subprocess.Popen(
@@ -11798,6 +11801,7 @@ def file_resolve_stub_env(tmp_path_factory, request):
             port,
             default_headers={
                 **TRUSTED_OWNER_HEADERS,
+                **TRUSTED_MCP_HEADERS,
                 "x-user-ogx-key": "Bearer test",
             },
             timeout=60,
@@ -11921,6 +11925,98 @@ class TestFileResolveOutboundChain:
         assert _FileUrlStubHandler.requests == 1, (
             "repeated file_url parts should share one fetch"
         )
+
+    @pytest.mark.parametrize("reference", ["file_id", "file_url"])
+    def test_file_resolution_preserves_member_order(
+        self, file_resolve_stub_env, reference
+    ):
+        client, _, backend, file_url = file_resolve_stub_env
+        part = {
+            reference: _FILE_RESOLVE_ID if reference == "file_id" else file_url,
+            "type": "input_file",
+            "filename": "client.pdf",
+            "opaque": {"z": 1, "a": 2},
+        }
+        response = client.responses.create(
+            model="gpt-4.1",
+            input=[{"content": [part], "role": "user", "type": "message"}],
+            store=False,
+        )
+        assert response.status == "completed"
+        assert len(backend.captured) == 1
+        actual = backend.captured[0]["input"][0]["content"][0]
+        assert list(actual) == ["type", "filename", "opaque", "file_data"]
+        assert actual["filename"] == "client.pdf"
+        assert list(actual["opaque"]) == ["z", "a"]
+        assert actual["file_data"].endswith(_FILE_RESOLVE_B64)
+
+    def test_mcp_resolution_preserves_request_and_tool_order(
+        self, file_resolve_stub_env
+    ):
+        client, _, backend, _ = file_resolve_stub_env
+        sent = []
+
+        def capture_request(request):
+            sent.append(json.loads(request.content))
+
+        tools = [
+            {
+                "type": "function", "name": name,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"z": {"type": "string"}, "a": {"type": "number"}},
+                },
+            }
+            for name in ["zebra", "alpha"]
+        ]
+        tools.append({
+            "type": "mcp", "server_label": "weather",
+            "connector_id": "trusted-mcp", "require_approval": "never",
+        })
+        with httpx.Client(event_hooks={"request": [capture_request]}) as transport:
+            response = client.with_options(http_client=transport).responses.create(
+                model="gpt-4.1", input="hello", tools=tools, store=False,
+                tool_choice={"type": "mcp", "server_label": "weather", "name": "get_weather"},
+                metadata={"z": "last", "a": "first"},
+                extra_body={"extra": {"z": 1, "a": 2}},
+            )
+        assert response.status == "completed"
+        assert len(sent) == len(backend.captured) == 1
+        before, after = sent[0], backend.captured[0]
+        assert [key for key in before if key in after] == [
+            key for key in after if key in before
+        ]
+        assert after["tools"][:2] == tools[:2]
+        assert [tool["name"] for tool in after["tools"][:2]] == ["zebra", "alpha"]
+        for tool in after["tools"][:2]:
+            assert list(tool["parameters"]["properties"]) == ["z", "a"]
+        assert list(after["metadata"]) == ["z", "a"]
+        assert list(after["extra"]) == ["z", "a"]
+        assert after["tool_choice"] == {"type": "function", "name": "weather__get_weather"}
+        assert any(
+            tool.get("type") == "function" and tool.get("name") == "weather__get_weather"
+            for tool in after["tools"]
+        ), "the selected MCP function definition must reach the backend"
+
+    def test_deferred_mcp_sanitization_preserves_public_member_order(
+        self, file_resolve_stub_env
+    ):
+        client, _, backend, _ = file_resolve_stub_env
+        tool = {
+            "type": "mcp", "connector_id": "trusted-mcp",
+            "server_label": "weather", "defer_loading": True,
+            "server_description": "weather lookup", "allowed_callers": ["assistant"],
+            "allowed_tools": ["get_weather"], "require_approval": "never",
+        }
+        response = client.responses.create(
+            model="gpt-4.1", input="hello", store=False,
+            tools=[{"type": "tool_search"}, tool],
+        )
+        assert response.status == "completed"
+        assert len(backend.captured) == 1
+        actual = backend.captured[0]["tools"][1]
+        assert list(actual) == [key for key in tool if key != "connector_id"]
+        assert actual == {key: value for key, value in tool.items() if key != "connector_id"}
 
     def test_file_url_rejects_cloud_metadata(self, file_resolve_stub_env):
         """Private-origin opt-ins must not grant access to metadata services."""

@@ -308,11 +308,33 @@ CI runs both lanes as sequential steps in the `anthropic-sdk` job of
 
 ## API version compatibility
 
+Anthropic Messages API version `2026-10-21` rejects requests that
+`2023-06-01` accepts:
+
+- `temperature`, `top_p`, and `top_k`, even when they carry default values
+- `document` content blocks in assistant messages
+- non-empty `citations` on user `text` blocks
+
+Anthropic SDK v2 selects `2026-10-21` by default, so upgrading a client SDK
+can change which version reaches the backend. Praxis does not reject these
+fields based on version. Each route either forwards the version chosen by the
+caller or the operator and lets the backend validate it, or ends the Anthropic
+contract entirely.
+
+| Route | `anthropic-version` sent to the backend | Caller credential | Sampling fields | Assistant `document`, user text citations |
+|---|---|---|---|---|
+| Native passthrough (`anthropic_messages_protocol`) | The caller's version; `default_version` only when the caller sends none | Forwarded unless the chain removes it | Forwarded; a `2026-10-21` backend rejects them | Forwarded; a `2026-10-21` backend rejects them |
+| Messages to Chat Completions (`anthropic_messages_to_chat_completions`) | None; the header is removed | `x-api-key` and `authorization` removed | `temperature` and `top_p` mapped, `top_k` forwarded, under either version | Rejected with a 400 under either version: Chat Completions cannot represent them |
+| Chat Completions to Messages (`openai_chat_completions_to_anthropic`) | The operator's `api_version` (default `2023-06-01`); caller headers ignored | `authorization` and `x-api-key` removed; `credential_inject` adds the provider key | `temperature` and `top_p` forwarded; a `2026-10-21` backend rejects them; `top_k` rejected by the bridge | Never produced: the translator emits only text, image, and tool blocks |
+
 Native passthrough preserves a caller-supplied `anthropic-version` and the
 request body. `anthropic_messages_protocol.default_version` fills in a
 missing version; it does not override the caller or enforce version-specific
-body restrictions. A backend selecting `2026-10-21` may reject sampling
-fields even when they contain defaults.
+body restrictions. An SDK v1 client therefore reaches the backend with
+`2023-06-01` and an SDK v2 client with `2026-10-21`, even when the chain sets
+`default_version: "2023-06-01"`. A backend that accepts the newer version
+returns its own error for unsupported fields; how a backend treats a version
+it does not recognize is up to that backend.
 
 For Chat Completions clients translated to Anthropic Messages, the operator
 selects `openai_chat_completions_to_anthropic.api_version`. Its default is
@@ -324,6 +346,51 @@ filter order. It applies to the whole translator configuration, not individual
 routing-overlay providers. Compatible Messages-to-Chat Completions and native vLLM
 routes retain their sampling support. See the
 [version and sampling contract](developing/openai-anthropic-compatibility.md#api-version-and-sampling).
+
+### SDK credentials and gateway authentication
+
+SDK v1 sends the API key as `x-api-key`; SDK v2 sends it as
+`authorization: Bearer` (see the
+[compatibility lanes](#anthropic-sdk-v1v2-compatibility-lanes-issue-1825)).
+A chain that removes only `x-api-key` stops the SDK v1 key, but not the
+SDK v2 key. Pick the case that matches your deployment:
+
+- **The caller's key is meant for the upstream.** A pure passthrough
+  forwards either header unchanged. This is correct when every client brings
+  its own Anthropic key.
+- **The gateway owns the upstream credential.** Remove both `x-api-key` and
+  `authorization` with a `headers` `request_remove`, then add the upstream
+  key with `credential_injection`. Pending removals run before injected
+  values, so the filter order doesn't matter. See
+  [Passthrough to Anthropic API](#passthrough-to-anthropic-api).
+- **The gateway authenticates the caller.** The committed vLLM examples run
+  `basic_auth` with `strip_authorization: true`. It accepts only `Basic`, so
+  an SDK v2 Bearer key is rejected with a 401 before routing and never
+  reaches the backend. To use SDK v2 with these gateways, send the gateway
+  credential as the `Authorization` header. SDK v2 then sends it in place of
+  its Bearer key rather than alongside it:
+
+  ```python
+  import base64
+  import os
+
+  from anthropic import Anthropic
+
+  token = base64.b64encode(f"gateway:{os.environ['GATEWAY_AUTH_PASSWORD']}".encode()).decode()
+  client = Anthropic(
+      base_url="http://127.0.0.1:8080",
+      api_key="unused-by-gateway",
+      default_headers={"Authorization": f"Basic {token}"},
+  )
+  ```
+
+  SDK v1 sends that header next to `x-api-key`. The examples' `headers`
+  filter removes `x-api-key`. Claude Code supplies the same header through
+  `ANTHROPIC_CUSTOM_HEADERS`.
+
+The Messages to Chat Completions translator removes both Anthropic
+credential forms on its own: a Chat Completions backend can't tell an
+Anthropic key from its own token.
 
 ## Passthrough to Anthropic API
 
@@ -568,7 +635,9 @@ explicitly.
 ### `anthropic_messages_protocol`
 
 Injects `anthropic-version` header if absent.
-No body transformation.
+A caller-supplied version, including the SDK v2 default `2026-10-21`, is
+forwarded unchanged. No body transformation, version-specific validation,
+or credential handling. See [API version compatibility](#api-version-compatibility).
 
 ```yaml
 filter: anthropic_messages_protocol

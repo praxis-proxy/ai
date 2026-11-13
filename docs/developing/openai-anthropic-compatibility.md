@@ -39,6 +39,16 @@ Existing structural validation is unchanged: this bridge still rejects
 `top_k` and unsupported field types. Selecting a different API version does
 not expand the supported field set.
 
+The other `2026-10-21` restrictions can't be triggered through this bridge.
+Translated requests contain only text, image, and tool blocks, so they never
+include assistant `document` blocks or user text blocks with citations.
+
+Credentials follow the same trusted-configuration rule. For a selected
+Anthropic provider, the translator removes the caller's `authorization` and
+`x-api-key` headers, and `credential_inject` installs the selected provider's
+key. A Chat Completions client's
+bearer token therefore never reaches Anthropic.
+
 Native Messages passthrough has a different contract:
 `anthropic_messages_protocol` preserves caller-supplied `anthropic-version`
 and does not change the body or validate version-specific sampling rules.
