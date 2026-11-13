@@ -3,6 +3,10 @@
 This directory tracks Praxis AI conformance against selected OpenAI API
 surfaces. The current scope is Conversations and Responses.
 
+For the external OpenResponses runtime suite, see
+[full acceptance](openresponses-acceptance.md) and the separately scoped
+[translation coverage](openresponses-translation.md).
+
 This directory also vendors the upstream Anthropic Messages API OpenAPI
 document at `specs/anthropic-spec.json`. It is read by the automated PR review
 prompt (`.github/prompts/automated-review.md`) when a change touches Anthropic

@@ -15,7 +15,7 @@ entry from it rather than keeping their own copy of the pins.
 | Key | Tag | Model | Consumed by |
 | --- | --- | --- | --- |
 | `text` | `:Qwen3-8B` | `Qwen/Qwen3-8B` | `vllm-integration.yaml` full GPU Responses suite |
-| `vision` | `:Qwen3-VL-4B-Instruct` | `Qwen/Qwen3-VL-4B-Instruct` (revision-pinned) | `anthropic-vllm-vision.yaml` nightly |
+| `vision` | `:Qwen3-VL-4B-Instruct` | `Qwen/Qwen3-VL-4B-Instruct` (revision-pinned) | `anthropic-vllm-vision.yaml` nightly: Anthropic SDK images and OpenResponses/OpenAI SDK image acceptance |
 
 ## Requirements
 

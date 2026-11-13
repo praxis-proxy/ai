@@ -3,6 +3,7 @@ name: Anthropic Messages vLLM Vision
 # A separate model is required: the Qwen3-8B used by the Claude Code nightly
 # accepts text only. This job proves image requests from the official Anthropic
 # SDK reach a real vision model through both Praxis production example routes.
+# It also runs OpenResponses image acceptance through Responses-to-Chat translation.
 #
 # The model-baked image comes from GHCR, published by vllm-gpu-container.yaml.
 # Rebuilding it here nightly would recreate a byte-identical image -- the model
@@ -67,7 +68,7 @@ jobs:
           github-token: ${{ secrets.PRAXIS_RUNNER_PAT }}
 
   anthropic-sdk-vision:
-    name: Anthropic SDK image requests through Praxis to vLLM
+    name: Anthropic SDK and OpenResponses image requests through Praxis to vLLM
     needs: [gpu-start-runner]
     runs-on: ${{ needs.gpu-start-runner.outputs.label }}
     timeout-minutes: 75
@@ -180,7 +181,13 @@ jobs:
           api-key: ${{ env.VLLM_API_KEY }}
 
       - name: Build Praxis
-        run: cargo build -p praxis-ai-proxy
+        run: cargo build -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-sqlite
+
+      - name: Install pinned OpenResponses runner
+        run: |
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            https://bun.sh/install | bash -s "bun-v1.3.12"
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
 
       - name: Wait for vLLM readiness
         uses: ./.github/actions/wait-vllm
@@ -207,6 +214,13 @@ jobs:
           PRAXIS_TEST_VLLM_MODEL: ${{ steps.spec.outputs.served-model-name }}
           PRAXIS_TEST_REQUIRE_LIVE: "1"
         run: uv run tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py -s -k image
+
+      - name: Run OpenResponses image acceptance through Praxis translation
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ steps.spec.outputs.served-model-name }}
+          PRAXIS_TEST_REQUIRE_LIVE: "1"
+        run: uv run tests/integration/sdk/openai/test_responses_acceptance_gateway.py -s -k live_image
 
       - name: vLLM logs on failure
         if: failure()

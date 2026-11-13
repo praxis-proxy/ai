@@ -1,0 +1,80 @@
+# Acceptance profile: Praxis owns HTTP translation and compaction; the backend
+# owns WebSocket response.create and connection-local continuation state.
+# Build with --no-default-features --features standard,openai-all,store-sqlite.
+# Replace the three backend addresses below together when using a remote server.
+listeners:
+  - name: acceptance
+    address: "127.0.0.1:8080"
+    filter_chains: [acceptance]
+
+filter_chains:
+  - name: acceptance
+    filters:
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: acceptance
+      # Native WebSockets bypass the HTTP-only translator, just as they do in
+      # examples/configs/openai/responses/full-flow-agentic.yaml.
+      - filter: headers
+        conditions:
+          - when:
+              headers:
+                upgrade: "websocket"
+        branch_chains:
+          - name: websocket
+            rejoin: terminal
+            chains:
+              - name: websocket-dispatch
+                filters:
+                  - filter: router
+                    routes:
+                      - path: "/v1/responses"
+                        cluster: responses-websocket
+                  - filter: load_balancer
+                    clusters:
+                      - name: responses-websocket
+                        endpoints: ["127.0.0.1:3001"]
+
+      - filter: ai_operation
+      - filter: openai_responses_request
+        on_invalid: reject
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "sqlite://acceptance.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+      - filter: openai_responses_compact
+        allow_pre_security_callout: true
+        inference_url: "http://127.0.0.1:3001/v1/chat/completions"
+        allow_private_inference_url: true
+        default_model: acceptance-model
+        timeout_ms: 60000
+        on_failure: closed
+      - filter: openai_responses_rehydrate
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 1
+        timeout_ms: 120000
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_stream_events
+              - filter: openai_responses_to_chat_completions
+              - filter: path_rewrite
+                replace:
+                  pattern: "^/v1/responses/?$"
+                  replacement: "/v1/chat/completions"
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: chat-backend
+              - filter: load_balancer
+                clusters:
+                  - name: chat-backend
+                    endpoints: ["127.0.0.1:3001"]
+            on_result:
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true
