@@ -10,7 +10,8 @@ balancing, rate limiting, compression, CORS, health checks, and credential
 injection, see the [Praxis core documentation][praxis].
 
 For client setup, provider authentication, and build choices, use
-[Client and provider paths](client-provider-paths.md).
+[Client and provider paths](client-provider-paths.md). For operator problems,
+required ordering, and examples, use the [capability overview](filters/README.md).
 
 ## Inference routing and transformation
 
@@ -19,10 +20,16 @@ For client setup, provider authentication, and build choices, use
 - Rewrite models and enrich prompts without changing application code.
 - Translate Anthropic Messages requests and responses for
   Chat Completions-compatible inference backends.
+- Adapt Chat Completions to selected Anthropic Messages, Azure OpenAI,
+  Vertex Gemini, or Bedrock Converse paths with their documented limitations.
 - Normalize provider protocol headers and validate the JSON envelope fields
   required by the proxy.
 
 ## OpenAI Responses and Conversations
+
+Native forwarding is available with ordinary standard routing. The state and
+tool capabilities below require experimental managed filters and the selected
+store/tool feature groups; see the [managed recipe](recipes/managed-responses.md).
 
 - Proxy native Responses API traffic and rebuild enriched request state.
 - Store and rehydrate response history through SQLite or PostgreSQL.
@@ -38,6 +45,10 @@ explains how the agentic loop bounds payload held across inference rounds,
 tools, streaming, and Store operations.
 
 ## Anthropic Messages
+
+Choose [native forwarding or a supported translation path](client-provider-paths.md).
+The detailed [Messages guide](anthropic-messages.md) records SDK version and
+backend qualification limits.
 
 - Classify and validate Anthropic Messages requests.
 - Normalize native Anthropic protocol headers.
@@ -99,6 +110,7 @@ groups need a backend at runtime, so pair them with
 `store-postgres`, `store-postgres-cert-auth`, or `store-sqlite` (for example
 `--features openai-all,store-sqlite`). The experimental `http-callout-filter`,
 `azure-ad-filter`, `gcp-adc-filter`, `token-rate-limit-filter`,
+`token-ceiling-filter`, `inflight-tracker-filter`,
 `vertex-anthropic-filter`, and `basic-auth-filter` features, and the `llmd-ext-proc` and `opentelemetry`
 features, are opt-in as before. A configuration that names a filter the binary
 was built without fails at startup with an unknown filter type error.
