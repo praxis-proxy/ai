@@ -29,7 +29,7 @@ WORKFLOWS = (
     ("openresponses-conformance.yaml", "OpenResponses conformance", "Responses translation against CPU vLLM"),
     ("container.yaml", "Container", "Container build and runtime smoke tests"),
     ("vllm-gpu-container.yaml", "vLLM GPU images", "Model image builds and smoke tests"),
-    ("fips.yaml", "FIPS", "UBI image checks and FIPS host proof"),
+    ("fips.yaml", "FIPS", "UBI image checks, FIPS host proof, Responses and Conversations mTLS coverage"),
     ("coverage.yaml", "Coverage", "Instrumented Rust tests"),
     ("msrv.yaml", "MSRV", "Minimum supported Rust compilation"),
     ("supply-chain.yaml", "Supply chain", "Dependency, license, and vulnerability checks"),

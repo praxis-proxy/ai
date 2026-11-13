@@ -91,7 +91,10 @@ mod openai_client_tool_compat;
 #[cfg(feature = "openai-conversations")]
 #[cfg(feature = "store-sqlite")]
 mod openai_conversations;
-#[cfg(all(feature = "store-postgres", feature = "openai-conversations"))]
+#[cfg(all(
+    any(feature = "store-postgres", feature = "store-postgres-cert-auth"),
+    feature = "openai-conversations"
+))]
 mod openai_conversations_postgres_mtls;
 #[cfg(feature = "openai-file-resolve-filter")]
 mod openai_doc_extract;

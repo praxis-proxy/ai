@@ -516,9 +516,10 @@ coverage-check:
 #
 # Both published images leave experimental Responses and agentic loops out.
 # The default FIPS profile also excludes the policy engine's non-OpenSSL crypto.
-# Certificate-authenticated PostgreSQL and Responses remain explicit opt-ins:
-#   make release-fips FIPS_FEATURES=aws-sigv4-filter,openai-responses,openai-file-resolve-filter,store-postgres-cert-auth
-# General SQLx password authentication, SQLite, compaction, Conversations and
+# Certificate-authenticated PostgreSQL, Responses, and Conversations remain
+# explicit opt-ins:
+#   make release-fips FIPS_FEATURES=aws-sigv4-filter,openai-responses,openai-file-resolve-filter,openai-conversations,store-postgres-cert-auth
+# General SQLx password authentication, SQLite, compaction, and
 # MCP dependencies have not been cleared for the FIPS profile.
 # FIPS_FEATURES mirrors Containerfile.fips and xtask/src/fips.rs.
 #
@@ -711,15 +712,17 @@ test-schema-fips:
 # This runs outside the toolchain container because the test starts a sibling
 # PostgreSQL container through the host's rootless podman. It still resolves
 # the explicit experimental certificate-auth profile, fails closed unless the host and
-# provider report FIPS mode, and exercises a write/read round trip with a
-# password-less URL against a server whose only TCP rule is `hostssl ... cert`.
-# A second peer selects SCRAM and must receive the fork's explicit
-# password-authentication-disabled refusal before any exchange begins.
+# provider report FIPS mode, and exercises Responses and Conversations
+# write/read round trips with a password-less URL against a server whose only
+# TCP rule is `hostssl ... cert`. A second peer selects SCRAM and must receive
+# the fork's explicit password-authentication-disabled refusal before any
+# exchange begins.
 test-postgres-fips-host: | require-podman
 	PRAXIS_FIPS_HOST=1 PRAXIS_REQUIRE_FIPS=1 PRAXIS_TEST_FIPS_PROVIDER=1 \
 	cargo test --target-dir $(FIPS_TARGET_DIR) -p praxis-tests-integration \
-		--no-default-features --features $(FIPS_FEATURES),store-postgres-cert-auth \
-		--test suite -- --ignored openai_response_store_postgres_mtls $(if $(V),--nocapture)
+		--no-default-features --features $(FIPS_FEATURES),store-postgres-cert-auth,openai-conversations \
+		--test suite -- --ignored openai_response_store_postgres_mtls \
+		openai_conversations_postgres_mtls $(if $(V),--nocapture)
 
 # The same unit tests with the RHEL FIPS provider active in every test
 # process: OPENSSL_CONF names xtask/assets/fips/fips-provider.cnf (the file
