@@ -68,9 +68,11 @@ Details per use case:
   `codex_http::pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http`
   (configs `openai/responses/client-tool-compat.yaml` and
   `openai/responses/client-tool-compat-chat-completions.yaml`). The test selects
-  Codex's known `gpt-5.4` model metadata so the CLI exposes `apply_patch` without
-  requesting reasoning summaries, then rewrites the request's model field to the
-  live vLLM model; inference still runs against the configured Qwen backend.
+  Codex's known `gpt-5.5` model metadata so the CLI exposes grammar-based
+  `apply_patch`, then rewrites the request's model field to the live vLLM model;
+  inference still runs against the configured Qwen backend. The offline pinned
+  HTTP test checks that this catalog entry declares the grammar tool, so client
+  upgrades cannot silently remove it (as 0.167.0 did for `gpt-5.4`).
 - **Claude Code — native vs translated.** A pinned Claude Code binary completes
   the same multi-step task under four scenarios: {native (`messages-native-vllm.yaml`)
   / transformed (`messages-to-openai-vllm.yaml`)} × {deterministic `acceptEdits`
