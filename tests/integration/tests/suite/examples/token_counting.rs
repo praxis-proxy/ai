@@ -367,12 +367,7 @@ fn example_config_token_counting_openai() {
 
 #[test]
 fn auto_anthropic_non_streaming_meters_usage() {
-    auto_dialect_meters_usage(
-        "/v1/messages",
-        ANTHROPIC_JSON,
-        "application/json",
-        "auto-anthropic",
-    );
+    auto_dialect_meters_usage("/v1/messages", ANTHROPIC_JSON, "application/json", "auto-anthropic");
 }
 
 #[test]
@@ -484,9 +479,7 @@ fn counter_value(metrics: &str, name: &str, model: &str) -> Option<u64> {
     metrics
         .lines()
         .find(|l| {
-            l.starts_with(name)
-                && l.contains(&format!(r#"model="{model}""#))
-                && l.contains(r#"cluster="backend""#)
+            l.starts_with(name) && l.contains(&format!(r#"model="{model}""#)) && l.contains(r#"cluster="backend""#)
         })
         .and_then(|l| l.rsplit(' ').next())
         .and_then(|v| v.parse().ok())

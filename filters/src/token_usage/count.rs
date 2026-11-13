@@ -424,26 +424,7 @@ impl HttpFilter for TokenCountFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let content_type = ctx
-            .response_header
-            .as_ref()
-            .and_then(|r| r.headers.get("content-type"))
-            .and_then(|v| v.to_str().ok());
-
-        let Some(ct) = content_type else {
-            return Ok(FilterAction::Continue);
-        };
-
-        if is_event_stream_content_type(ct) {
-            ctx.insert_filter_state(CaptureState::Sse {
-                scanner: sse::SseScanState::default(),
-                counts: StreamCounts::default(),
-            });
-            trace!("content-type is SSE, will extract tokens from stream events");
-        } else if is_json_content_type(ct) {
-            ctx.insert_filter_state(CaptureState::Json { body: Vec::new() });
-            trace!("content-type is JSON, will extract tokens from full body");
-        } else {
+        if !start_body_capture(ctx) {
             return Ok(FilterAction::Continue);
         }
 
@@ -871,6 +852,37 @@ fn publish_accumulated_streaming_usage(ctx: &mut HttpFilterContext<'_>, counts: 
 // -----------------------------------------------------------------------------
 // Content-Type Helpers
 // -----------------------------------------------------------------------------
+
+/// Starts the body capture implied by the response content-type, storing the
+/// matching [`CaptureState`] for `on_response_body`. Returns `false` when the
+/// content-type is absent or matches neither `text/event-stream` nor
+/// `application/json`, in which case there is nothing to extract.
+fn start_body_capture(ctx: &mut HttpFilterContext<'_>) -> bool {
+    let ct = ctx
+        .response_header
+        .as_ref()
+        .and_then(|r| r.headers.get("content-type"))
+        .and_then(|v| v.to_str().ok());
+
+    let Some(ct) = ct else {
+        return false;
+    };
+
+    if is_event_stream_content_type(ct) {
+        ctx.insert_filter_state(CaptureState::Sse {
+            scanner: sse::SseScanState::default(),
+            counts: StreamCounts::default(),
+        });
+        trace!("content-type is SSE, will extract tokens from stream events");
+        true
+    } else if is_json_content_type(ct) {
+        ctx.insert_filter_state(CaptureState::Json { body: Vec::new() });
+        trace!("content-type is JSON, will extract tokens from full body");
+        true
+    } else {
+        false
+    }
+}
 
 /// Whether a content-type header value indicates `text/event-stream`.
 fn is_event_stream_content_type(ct: &str) -> bool {

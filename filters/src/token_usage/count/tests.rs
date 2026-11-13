@@ -1922,7 +1922,7 @@ async fn run_json_extraction_at_path(
 ) -> (Option<String>, Option<String>, Option<String>) {
     let filter = make_filter(ProviderKind::Auto);
     let req = crate::test_utils::make_request(http::Method::POST, path);
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json");
     ctx.response_header = Some(&mut resp);
@@ -1989,7 +1989,7 @@ async fn auto_skips_unmeterable_path_without_metadata() {
 
     let filter = make_filter(ProviderKind::Auto);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/models");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json");
     ctx.response_header = Some(&mut resp);
@@ -2013,7 +2013,7 @@ async fn auto_skips_unmeterable_path_without_metadata() {
 async fn auto_bedrock_invoke_model_meters_from_headers() {
     let filter = make_filter(ProviderKind::Auto);
     let req = crate::test_utils::make_request(http::Method::POST, "/model/invoke");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_status_and_content_type(http::StatusCode::OK, "application/json");
     resp.headers
@@ -2035,7 +2035,7 @@ async fn auto_bedrock_invoke_model_meters_from_headers() {
 async fn auto_sse_anthropic_accumulates_events() {
     let filter = make_filter(ProviderKind::Auto);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("text/event-stream");
     ctx.response_header = Some(&mut resp);
@@ -2061,7 +2061,7 @@ async fn auto_sse_anthropic_accumulates_events() {
 async fn auto_non_success_response_meters_nothing() {
     let filter = make_filter(ProviderKind::Auto);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_status_and_content_type(http::StatusCode::BAD_REQUEST, "application/json");
     ctx.response_header = Some(&mut resp);
