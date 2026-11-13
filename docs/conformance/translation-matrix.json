@@ -559,15 +559,15 @@
           "feature": "reasoning-content",
           "label": "Reasoning / thinking content",
           "status": "rejected",
-          "note": "Under the default dialect `none`, reasoning input items are rejected 400 and upstream reasoning fields are not read. Under the `vllm` dialect reasoning round-trips on both the finite and the streaming path (delta.reasoning and delta.reasoning_content become response.reasoning_text events). reasoning.summary is rejected unconditionally — no dialect reports supports_safe_summary.",
-          "evidence": "apis/src/openai/translation/reasoning.rs:57-62; apis/src/openai/translation/reasoning.rs:106-123; apis/src/openai/translation/reasoning.rs:186-205; apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:755-796",
+          "note": "Under the default dialect `none`, reasoning input items are rejected 400 and upstream reasoning fields are not read. Under the `vllm` dialect reasoning round-trips on both the finite and the streaming path (delta.reasoning and delta.reasoning_content become response.reasoning_text events). reasoning.summary `auto` is a best-effort request and is accepted (the backend simply produces no summary items); explicit summary values are rejected 400 because no dialect reports supports_safe_summary.",
+          "evidence": "apis/src/openai/translation/reasoning.rs:57-62; apis/src/openai/translation/reasoning.rs:106-123; apis/src/openai/translation/reasoning.rs:186-212; apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:755-796",
           "blocker": null
         },
         {
           "feature": "request-reasoning-cache-controls",
           "label": "Request-side thinking / prompt-cache controls",
           "status": "translated",
-          "note": "reasoning.effort maps to reasoning_effort regardless of dialect. prompt_cache_key, prompt_cache_retention and prompt_cache_options are copied verbatim. reasoning.summary is rejected 400 (see reasoning-content).",
+          "note": "reasoning.effort maps to reasoning_effort regardless of dialect. prompt_cache_key, prompt_cache_retention and prompt_cache_options are copied verbatim. reasoning.summary `auto` translates as a best-effort request; explicit summary values are rejected 400 (see reasoning-content).",
           "evidence": "apis/src/openai/translation/chat_completions.rs:577-581; apis/src/openai/translation/chat_completions.rs:473-476",
           "blocker": null
         },
