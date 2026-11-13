@@ -39,6 +39,12 @@ Before tagging a release:
 - [ ] Inspect the latest successful GPU nightly within 48 hours and any newer
       failures; release publishing reuses ancestor evidence and records its
       tested SHA separately from the release SHA
+- [ ] If native GPU qualification is desired, dispatch the **vLLM
+      Integration** workflow at the final release commit or tag with
+      `run_live_vllm` enabled; it defaults to false and skips the complete
+      live suite. The release reuses a verified run at that exact commit for
+      live validation and renders `not validated` without one, while the CI
+      qualification section keeps reporting ancestor nightly evidence
 
 ## Tagging a Release
 
@@ -112,11 +118,13 @@ job counts, and run link for each tracked CI workflow at the release commit.
 The release's own unit, schema, and integration test gate is included. Missing
 runs remain visible, including workflows with path filters or optional triggers.
 
-The release attaches three reports:
+The release attaches five reports:
 
 - `release-qualification.md`: readable CI job and step outcomes plus GPU details
 - `release-qualification.json`: versioned CI snapshot and the GPU report
 - `qualification.json`: the original vLLM GPU qualification report
+- `support-report.md`: readable release support report
+- `support-report.json`: versioned support report with per-cell evidence
 
 CI evidence is a snapshot at publication time, not a claim of complete API
 coverage. Skipped jobs and steps remain visible even in successful workflows;
@@ -124,7 +132,7 @@ job counts are not individual test counts. The report selects the newest
 eligible run for the exact release commit and its latest attempt. PR runs are
 excluded because they may check out a synthetic merge. No results are borrowed
 from another commit or an older green run. Rerunning Release refreshes the
-snapshot and replaces both marked sections and all three assets.
+snapshot and replaces the marked sections and their report assets.
 The CI workflow inventory and its scope descriptions live in
 `.github/scripts/release_qualification.py`; update them when adding or changing
 a validation workflow. Run `python3 -m unittest discover -s tests/qualification`
@@ -136,6 +144,45 @@ its reason and instructions to collect it; it does not block the release.
 The additional CI inventory is informational and does not change existing
 release gates. See [native vLLM qualification](developing/vllm-qualification.md)
 for the GPU schema and recent ancestor nightly selection policy.
+
+## Release support report
+
+Every release also carries a **Release support report** assembled from the
+committed conformance reports and this release's exact-commit evidence:
+
+- Provenance: release commit, gateway binary, Praxis core, vLLM, model,
+  reference config, and pinned client versions.
+- Native API surfaces and the translation support matrix, including every
+  known gap and its blocker.
+- OpenAI operation conformance and OpenResponses translation coverage. The
+  OpenAI percentage states its non-beta, non-deprecated scope and the number of
+  operations that scope excludes.
+- Live qualification status with client acceptance suite status, reasons, and
+  per-scenario results, when a verified GPU run exists at the release commit.
+  A client suite that failed before producing its scenario artifact is still
+  listed. The report never substitutes the ancestor nightly the CI
+  qualification section uses for the release commit.
+- Exact-commit CI workflow outcomes.
+- Translation cell status changes since the release published before this one,
+  when that release's `support-report.json` is available.
+
+The report is intentionally narrower than a product support matrix. It covers
+the Praxis AI gateway and the vLLM backend the qualification suite uses; the
+model gateway, API server, per-field API support, and live hosted-provider
+validation are named as out of scope in the report itself. Missing live
+evidence renders as `not validated` rather than being omitted. The report also
+refuses evidence collected at another commit: a qualification report for a
+different checkout or one that cannot name its checkout, or CI evidence
+recording a different release SHA, renders as `provenance mismatch` and copies
+no results.
+
+Generation reads `docs/conformance/translation-matrix.json` and
+`docs/conformance/openresponses-coverage.json`, which
+`cargo xtask translation-matrix --fix` and
+`cargo xtask openresponses-coverage --fix` generate and verify beside their
+Markdown documents. `.github/scripts/support_report.py` assembles the report;
+run `python3 -m unittest tests.qualification.test_support_report` to check
+rendering, missing-evidence handling, and diffing.
 
 [gh-releases]: https://github.com/praxis-proxy/ai/releases
 
