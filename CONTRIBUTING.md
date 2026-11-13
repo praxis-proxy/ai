@@ -48,6 +48,11 @@ go through the [proposal process].
 CI enforces reviewability on every PR:
 
 - A maximum added lines count of production code (tests, docs, examples excluded)
+- No more than three open PRs per contributor in this repository. Drafts count.
+  The Praxis bot comments on and fails a PR that takes its author over the
+  limit and skips automatic reviewer assignment; it will receive review
+  attention once enough other PRs are merged to bring the author's open count
+  back to three or fewer. Edit or update the PR to refresh the check.
 - A link to the issue the PR addresses, using `Closes #123` when the PR
   completes the issue or `Refs #123` when the issue remains open.
 - A description with non-empty **Why**, **What**, and **How** sections. Explain

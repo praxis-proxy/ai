@@ -102,13 +102,24 @@ status checks.
 
 ## Pull Request Review Assignment
 
+Contributors may have at most three open pull requests in this
+repository at a time, including drafts. If opening a PR takes the
+author over that limit, the bot comments on the PR and fails its
+limit check. The PR receives no review attention until enough of the
+author's other PRs are merged to bring the open count back to three
+or fewer. Edit or update the PR to refresh the limit check and reviewer
+assignment after merging other PRs.
+
 Every pull request must link the issue it addresses. Use
 `Closes #123` when merging the PR completes the issue, or
 `Refs #123` when the issue remains open.
 
-The bot assigns a reviewer from `ai-reviewers` when a PR
-is opened, reopened, or marked ready for review. It does
-not randomly assign maintainers. A maintainer takes
+When the author's open PR count is within the limit, the
+bot assigns a reviewer from `ai-reviewers` when a PR is
+opened, edited, synchronized, reopened, or marked ready
+for review. Over-limit PRs receive no automatic reviewer
+assignment. The bot does not randomly assign maintainers.
+A maintainer takes
 ownership deliberately after all required CI checks pass;
 that assignment signals that maintainer review has
 started. Contributors should wait for green CI before

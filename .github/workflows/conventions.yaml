@@ -140,6 +140,73 @@ jobs:
           echo "PR description contains non-empty Why, What, and How sections and links an issue."
 
   # ----------------------------------------------------------------------------
+  # Author Open PR Limit
+  # ----------------------------------------------------------------------------
+
+  author-open-pr-limit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Generate token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.PRAXIS_BOT_APP_ID }}
+          private-key: ${{ secrets.PRAXIS_BOT_APP_PRIVATE_KEY }}
+
+      - name: Enforce the open PR limit
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+
+          max_open_prs=3
+          marker="<!-- praxis:author-open-pr-limit -->"
+          open_prs=$(gh pr list --repo "$GH_REPO" --author "$PR_AUTHOR" --state open \
+            --limit 1000 --json number,title,url,isDraft)
+          open_pr_count=$(jq 'length' <<< "$open_prs")
+          if ! jq -e --argjson current "$PR_NUMBER" \
+              'any(.[]; .number == $current)' <<< "$open_prs" >/dev/null; then
+            open_pr_count=$((open_pr_count + 1))
+          fi
+          comment_id=$(gh api --paginate "repos/${GH_REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
+            --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | sed -n '1p')
+
+          if [ "$open_pr_count" -gt "$max_open_prs" ]; then
+            other_prs=$(jq -r --argjson current "$PR_NUMBER" \
+              '.[] | select(.number != $current) | "- [#\(.number) \(.title)](\(.url))" + (if .isDraft then " (draft)" else "" end)' \
+              <<< "$open_prs")
+            body=$(cat <<EOF
+          ${marker}
+          **Open PR limit exceeded: ${open_pr_count} open PRs; the maximum is ${max_open_prs}.**
+
+          This PR will not receive review attention until enough of your other PRs are merged to bring your total down to ${max_open_prs} or fewer. Draft PRs count. After merging them, edit or update this PR to refresh the check.
+
+          Other open PRs:
+          ${other_prs}
+          EOF
+          )
+            if [ -n "$comment_id" ]; then
+              gh api -X PATCH "repos/${GH_REPO}/issues/comments/${comment_id}" -f body="$body" >/dev/null
+            else
+              gh pr comment "$PR_NUMBER" --repo "$GH_REPO" --body "$body"
+            fi
+            echo "::error::${PR_AUTHOR} has ${open_pr_count} open PRs; the maximum is ${max_open_prs}. Draft PRs count."
+            exit 1
+          fi
+
+          if [ -n "$comment_id" ]; then
+            body="${marker}
+          **Open PR limit cleared:** you now have ${open_pr_count} open PRs; the maximum is ${max_open_prs}. Draft PRs count."
+            gh api -X PATCH "repos/${GH_REPO}/issues/comments/${comment_id}" -f body="$body" >/dev/null
+          fi
+
+          echo "${PR_AUTHOR} has ${open_pr_count} open PRs; the maximum is ${max_open_prs}."
+
+  # ----------------------------------------------------------------------------
   # Dependency Version Check
   # ----------------------------------------------------------------------------
 

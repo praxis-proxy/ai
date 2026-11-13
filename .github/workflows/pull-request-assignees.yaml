@@ -4,9 +4,10 @@ name: Pull Request Assignees
 # Workflow Settings
 # ------------------------------------------------------------------------------
 #
-# Gives each ready-for-review PR a reviewer from ai-reviewers. Maintainers are
-# assigned deliberately after required CI passes; a maintainer assignment
-# signals that review has started.
+# Gives each ready-for-review PR within the author's three-open-PR limit a
+# reviewer from ai-reviewers. Over-limit PRs wait without reviewer assignment.
+# Maintainers are assigned deliberately after required CI passes; a maintainer
+# assignment signals that review has started.
 #
 # Reviewers come from REVIEWER_TEAMS below. The PR author and bot accounts are
 # never picked, and an existing reviewer assignment is preserved. When a
@@ -23,7 +24,7 @@ name: Pull Request Assignees
 
 on:
   pull_request_target:
-    types: [opened, reopened, ready_for_review]
+    types: [opened, edited, reopened, ready_for_review, synchronize]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
@@ -61,6 +62,19 @@ jobs:
           REVIEWER_TEAMS: ai-reviewers
         run: |
           set -euo pipefail
+
+          max_open_prs=3
+          author_open_prs=$(gh pr list --repo "$GH_REPO" --author "$PR_AUTHOR" --state open \
+            --limit 1000 --json number)
+          author_open_pr_count=$(jq 'length' <<< "$author_open_prs")
+          if ! jq -e --argjson current "$PR_NUMBER" \
+              'any(.[]; .number == $current)' <<< "$author_open_prs" >/dev/null; then
+            author_open_pr_count=$((author_open_pr_count + 1))
+          fi
+          if [ "$author_open_pr_count" -gt "$max_open_prs" ]; then
+            echo "::notice::${PR_AUTHOR} has ${author_open_pr_count} open PRs; skipping reviewer assignment until the count is ${max_open_prs} or fewer"
+            exit 0
+          fi
 
           # --------------------------------------------------------------------
           # Helpers
