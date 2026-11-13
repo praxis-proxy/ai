@@ -3634,6 +3634,7 @@ dependencies = [
  "openssl",
  "percent-encoding",
  "praxis-ai-apis",
+ "praxis-policy",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-tls",
@@ -3734,7 +3735,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "yaml_serde",
- "zstd 0.14.3",
+ "zstd",
 ]
 
 [[package]]
@@ -3909,8 +3910,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "679704b99eaf94186b434f762e71676eff8194000de879182a7be88b4107609b"
+source = "git+https://github.com/praxis-proxy/praxis.git?rev=433518c98deee8f1ce20687db54376af489fb0c8#433518c98deee8f1ce20687db54376af489fb0c8"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -3931,8 +3931,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-core"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fdbdddaea5d23868729aa8a314fa3a9ba22f7da836e16f47336a16f57575a5"
+source = "git+https://github.com/praxis-proxy/praxis.git?rev=433518c98deee8f1ce20687db54376af489fb0c8#433518c98deee8f1ce20687db54376af489fb0c8"
 dependencies = [
  "bytes",
  "chrono",
@@ -3957,8 +3956,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-filter"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9077d3bbe1506e63f1f4599496190f8231d6d84340a551d64caed877b90e157a"
+source = "git+https://github.com/praxis-proxy/praxis.git?rev=433518c98deee8f1ce20687db54376af489fb0c8#433518c98deee8f1ce20687db54376af489fb0c8"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3992,8 +3990,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-protocol"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69767ac4ddc99631de4fb4a1fc70f3635f3d027faf78599d855bccbf980e964b"
+source = "git+https://github.com/praxis-proxy/praxis.git?rev=433518c98deee8f1ce20687db54376af489fb0c8#433518c98deee8f1ce20687db54376af489fb0c8"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4023,8 +4020,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-tls"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85f714e194d42c841c5464cc5efabbde3461a7f0640c5d8134dd83d3fbb7547e"
+source = "git+https://github.com/praxis-proxy/praxis.git?rev=433518c98deee8f1ce20687db54376af489fb0c8#433518c98deee8f1ce20687db54376af489fb0c8"
 dependencies = [
  "arc-swap",
  "notify",
@@ -4490,20 +4486,20 @@ dependencies = [
  "windows-sys 0.59.0",
  "x509-parser",
  "yaml_serde",
- "zstd 0.14.3",
+ "zstd",
 ]
 
 [[package]]
 name = "quixotic-plecostomus-error"
-version = "0.11.0"
+version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f5194971dca8add6ff0af06c581ecd9a36c16e7d930e997ca507a87fe44714d"
+checksum = "8a76f53bd72ce9a7e1ce66ecd1196bdca3ce602f7963e7e5da6d2b7069465b10"
 
 [[package]]
 name = "quixotic-plecostomus-header-serde"
-version = "0.11.0"
+version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ae773393e9a1ef81add82f4d8a95a47fd7c9cb7fc39ae1b40fce22836e21915"
+checksum = "f6169b0102aff5e460cbfb342b047c7b534c2dcfbc62520e42a628d1cf3f26e4"
 dependencies = [
  "bytes",
  "http",
@@ -4511,15 +4507,15 @@ dependencies = [
  "quixotic-plecostomus-error",
  "quixotic-plecostomus-http",
  "thread_local",
- "zstd 0.13.3",
- "zstd-safe 7.3.0",
+ "zstd",
+ "zstd-safe",
 ]
 
 [[package]]
 name = "quixotic-plecostomus-http"
-version = "0.11.0"
+version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c5b9b84e31715f3636a3d9795259ad752ba7f2a250a72e9d44b56dbdecb8dce"
+checksum = "e8b706dc57349a6a5e56e585568402a8f1556af06eb6ab3f40603d3037afffed"
 dependencies = [
  "bytes",
  "http",
@@ -7332,29 +7328,11 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zstd"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
-dependencies = [
- "zstd-safe 7.3.0",
-]
-
-[[package]]
-name = "zstd"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
- "zstd-safe 8.2.0",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "7.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
-dependencies = [
- "zstd-sys",
+ "zstd-safe",
 ]
 
 [[package]]
