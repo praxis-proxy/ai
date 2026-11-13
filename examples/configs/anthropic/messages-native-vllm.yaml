@@ -37,6 +37,18 @@
 #   backend, only authenticated callers are upgraded with the backend
 #   credential, and the backend only ever sees the server-owned token.
 #
+# Anthropic SDK v2 sends its API key as `Authorization: Bearer` instead of
+# `x-api-key`. `basic_auth` accepts only `Basic`, so a v2 client that sends
+# just its Bearer key is rejected with a 401 and the key never reaches vLLM.
+# Configure v2 clients to send the gateway credential as the `Authorization`
+# header (for example `default_headers={"Authorization": "Basic ..."}`); the
+# SDK then sends it in place of its Bearer key.
+#
+# API version: `default_version: "2023-06-01"` applies only to callers that
+# send no `anthropic-version`. A caller's version passes through unchanged:
+# `2023-06-01` from SDK v1, `2026-10-21` from SDK v2. Request bodies are not
+# altered, so vLLM decides how to handle the version and any sampling fields.
+#
 # The gateway password is resolved from `GATEWAY_AUTH_PASSWORD` at pipeline
 # build time; set it (and `VLLM_API_KEY`) in the proxy's environment. See
 # `credential-injection.yaml` for alternative client gates (mTLS, IP ACL).
