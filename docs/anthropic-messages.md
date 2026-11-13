@@ -1,9 +1,15 @@
 # Anthropic Messages API
 
-Praxis supports the Anthropic Messages API
-(`/v1/messages`) through five composable filters.
-Operators can route, validate JSON envelopes, and transform
-Anthropic requests to reach any backend.
+Praxis AI can forward Anthropic Messages (`/v1/messages`) to a native
+backend, or translate supported requests to a Chat Completions backend.
+Start with the [complete operator recipes](recipes/anthropic.md) for build,
+credentials, startup, requests, and cleanup. This page owns the detailed
+protocol and qualification notes; the [client/provider table](client-provider-paths.md)
+also covers the optional Vertex Anthropic path.
+
+Translation is a bounded compatibility layer. Review rejected fields, explicit
+lossy opt-ins, and [known gaps](conformance/translation-matrix.md#known-gaps)
+before choosing it over a native backend.
 
 ## Filters
 
@@ -12,7 +18,7 @@ Anthropic requests to reach any backend.
 | `anthropic_messages_request` | Process the create-message body once: validate the envelope and promote routing facts |
 | `anthropic_messages_protocol` | Header management for native `/v1/messages` backends |
 | `anthropic_messages_to_chat_completions` | Bidirectional body transformation to the Chat Completions wire shape |
-| `anthropic_messages_to_chat_completions_stream` | SSE event transformation (per-chunk streaming, conformant with Inference Proxy Conformance Guidelines) |
+| `anthropic_messages_to_chat_completions_stream` | Incremental Chat Completions SSE to Messages events; see compatibility limits below |
 
 ## Passthrough to vLLM
 
@@ -23,7 +29,7 @@ Anthropic endpoint enabled).
 ```yaml
 listeners:
   - name: gateway
-    address: "0.0.0.0:8080"
+    address: "127.0.0.1:8080"
     filter_chains: [anthropic]
 
 filter_chains:
@@ -45,6 +51,9 @@ filter_chains:
           - name: vllm
             endpoints:
               - "127.0.0.1:8000"
+
+insecure_options:
+  allow_private_endpoints: true # local development backend
 ```
 
 Test:
@@ -411,7 +420,7 @@ are applied before injected values in `apply_pending_header_mutations`. The
 ```yaml
 listeners:
   - name: gateway
-    address: "0.0.0.0:8080"
+    address: "127.0.0.1:8080"
     filter_chains: [anthropic]
 
 filter_chains:
@@ -474,7 +483,7 @@ without Anthropic support).
 ```yaml
 listeners:
   - name: gateway
-    address: "0.0.0.0:8080"
+    address: "127.0.0.1:8080"
     filter_chains: [transform]
 
 filter_chains:
@@ -510,6 +519,9 @@ filter_chains:
           - name: vllm
             endpoints:
               - "127.0.0.1:8000"
+
+insecure_options:
+  allow_private_endpoints: true # local development backend
 ```
 
 The `anthropic_messages_to_chat_completions` filter:

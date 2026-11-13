@@ -132,8 +132,11 @@ Anthropic, MCP, A2A, routing, guardrails, token usage, and more.
 | If you want to… | Start here |
 | --- | --- |
 | Run Praxis AI locally | [Quickstart](docs/quickstart.md) |
-| Browse supported capabilities | [Feature overview](docs/features.md) |
-| Configure a filter | [Filter reference](docs/filters/README.md) |
+| Choose an API and provider | [Client/provider selector](docs/client-provider-paths.md) |
+| Follow an operator recipe | [Recipe index](docs/recipes/README.md) |
+| Browse supported capabilities | [Capability overview](docs/filters/README.md) |
+| Configure a filter | [Generated filter reference](docs/filters/reference.md) |
+| Deploy or troubleshoot | [Operations guide](docs/operations.md) |
 | Understand the design | [Architecture docs](docs/README.md#architecture) |
 | Build or test the workspace | [Development guide](docs/developing/getting-started.md) |
 | Add a new filter | [Adding filters](docs/developing/adding-filters.md) |
