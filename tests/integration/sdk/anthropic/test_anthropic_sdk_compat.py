@@ -568,7 +568,7 @@ class TestTranslatedToChatCompletions:
             )
 
         assert excinfo.value.status_code == 400
-        assert "unsupported Anthropic content block" in str(excinfo.value)
+        assert "`citations` cannot be translated" in str(excinfo.value)
         assert TRANSLATED_STATE.requests == [], "rejected request must not reach the backend"
 
     def test_document_block_is_rejected(self, translated_client):
