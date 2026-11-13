@@ -25,8 +25,6 @@
 )]
 mod tests;
 
-use std::fmt::Write as _;
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_ai_apis::json_body::MAX_JSON_BODY_BYTES;
@@ -61,62 +59,6 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576; // 1 MiB
 /// [`DEFAULT_MAX_BODY_BYTES`]: worst-case capture memory per in-flight
 /// stream is 2 MiB either way.
 const DEFAULT_MAX_SCRATCH_BYTES: usize = 1_048_576; // 1 MiB
-
-/// Metadata key prefix for all `token_count` working state.
-const META_PREFIX: &str = "token_count.";
-
-/// Metadata key for the extraction mode (`sse` or `json`).
-const META_MODE: &str = "token_count.mode";
-
-/// Metadata key for accumulated input tokens (streaming).
-const META_INPUT: &str = "token_count.input";
-
-/// Metadata key for accumulated output tokens (streaming).
-const META_OUTPUT: &str = "token_count.output";
-
-/// Metadata key for the provider-supplied or parser-computed total (streaming).
-///
-/// Complete-usage SSE events persist this so Google thoughts, which are not
-/// part of `token.output`, are not dropped when the total is published.
-const META_TOTAL: &str = "token_count.total";
-
-/// Metadata key for accumulated prompt cache reads (streaming).
-const META_CACHE_READ: &str = "token_count.cache_read";
-
-/// Metadata key for accumulated prompt cache writes (streaming).
-const META_CACHE_WRITE: &str = "token_count.cache_write";
-
-/// Metadata key for accumulated reasoning / thinking tokens (streaming).
-const META_REASONING: &str = "token_count.reasoning";
-
-/// Metadata key for hex-encoded JSON body buffer (non-streaming).
-const META_BUF_HEX: &str = "token_count.buf_hex";
-
-/// Metadata key for byte count of buffered body (non-streaming).
-const META_BUF_BYTES: &str = "token_count.buf_bytes";
-
-/// Metadata key for SSE scanner line buffer.
-const META_SSE_LINE_BUF: &str = "token_count.sse_line_buf_hex";
-
-/// Metadata key for SSE scanner data buffer.
-const META_SSE_DATA_HEX: &str = "token_count.sse_data_hex";
-
-/// Metadata key for SSE scanner `has_data` flag.
-const META_SSE_HAS_DATA: &str = "token_count.sse_has_data";
-
-/// Metadata key for SSE scanner `prev_cr` flag.
-const META_SSE_PREV_CR: &str = "token_count.sse_prev_cr";
-
-/// Metadata key for SSE scanner scratch byte count.
-const META_SSE_SCRATCH: &str = "token_count.sse_scratch_bytes";
-
-/// Metadata key for the SSE scanner's oversized-event skip phase.
-const META_SSE_SKIP: &str = "token_count.sse_skip";
-
-/// Metadata key recording that the most recent SSE stream action was
-/// discarding an oversized event. Used by [`finalize_streaming_counts`]
-/// to mark overflow when the terminal usage event itself was dropped.
-const META_SSE_DROPPED_TAIL: &str = "token_count.sse_dropped_tail";
 
 /// Bedrock `InvokeModel` response header carrying the input token count.
 const HEADER_BEDROCK_INPUT: &str = "x-amzn-bedrock-input-token-count";
@@ -196,6 +138,78 @@ impl ProviderKind {
             Self::Bedrock => streaming::parse_bedrock_event(event_data),
             Self::OpenAi | Self::Azure | Self::Google | Self::BedrockInvokeModel => StreamingTokens::default(),
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Capture State
+// -----------------------------------------------------------------------------
+
+/// What one `token_count` instance has captured of the current response.
+///
+/// `on_response` stores it with [`HttpFilterContext::insert_filter_state`]
+/// when a success response has a supported content type; it is removed once
+/// usage is published or capture is abandoned.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "filter_state boxes the capture once per response and it is only accessed by reference"
+)]
+enum CaptureState {
+    /// `application/json`: the body is captured whole and parsed at
+    /// end-of-stream, because usage may appear anywhere in it.
+    Json {
+        /// Body bytes captured so far, at most `max_body_bytes`.
+        body: Vec<u8>,
+    },
+
+    /// `text/event-stream`: events are scanned as they arrive.
+    Sse {
+        /// Scanner state carried between body chunks.
+        scanner: sse::SseScanState,
+
+        /// Counts accumulated from the stream's usage-bearing events.
+        counts: StreamCounts,
+    },
+}
+
+/// Token counts accumulated from a stream's SSE events.
+///
+/// Each count is `None` until an event reports it.
+#[derive(Default)]
+struct StreamCounts {
+    /// Input tokens, cached tokens included.
+    input: Option<u64>,
+
+    /// Output tokens.
+    output: Option<u64>,
+
+    /// Provider-supplied or parser-computed total from a complete-usage event.
+    ///
+    /// Kept so Google thoughts, which are not part of `token.output`, are not
+    /// dropped when the total is published.
+    total: Option<u64>,
+
+    /// Input tokens served from the prompt cache.
+    cache_read: Option<u64>,
+
+    /// Input tokens written to the prompt cache.
+    cache_write: Option<u64>,
+
+    /// Reasoning / thinking tokens.
+    reasoning: Option<u64>,
+}
+
+/// Stop capturing the current response, dropping anything captured so far.
+fn clear_capture(ctx: &mut HttpFilterContext<'_>) {
+    ctx.remove_filter_state::<CaptureState>();
+}
+
+/// Stop capturing the current response and return its captured JSON body,
+/// which is empty when nothing was captured.
+fn take_json_capture(ctx: &mut HttpFilterContext<'_>) -> Vec<u8> {
+    match ctx.remove_filter_state::<CaptureState>() {
+        Some(CaptureState::Json { body }) => body,
+        Some(CaptureState::Sse { .. }) | None => Vec::new(),
     }
 }
 
@@ -315,10 +329,13 @@ impl HttpFilter for TokenCountFilter {
         };
 
         if is_event_stream_content_type(ct) {
-            ctx.filter_metadata.insert(META_MODE.to_owned(), "sse".to_owned());
+            ctx.insert_filter_state(CaptureState::Sse {
+                scanner: sse::SseScanState::default(),
+                counts: StreamCounts::default(),
+            });
             trace!("content-type is SSE, will extract tokens from stream events");
         } else if is_json_content_type(ct) {
-            ctx.filter_metadata.insert(META_MODE.to_owned(), "json".to_owned());
+            ctx.insert_filter_state(CaptureState::Json { body: Vec::new() });
             trace!("content-type is JSON, will extract tokens from full body");
         }
 
@@ -335,12 +352,14 @@ impl HttpFilter for TokenCountFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let mode = ctx.get_metadata(META_MODE).map(str::to_owned);
-
-        match mode.as_deref() {
-            Some("sse") => handle_sse_body(ctx, body, end_of_stream, self.provider, self.max_scratch_bytes),
-            Some("json") => handle_json_body(ctx, body, end_of_stream, self.provider, self.max_body_bytes),
-            _ => {},
+        match ctx.get_filter_state::<CaptureState>() {
+            Some(CaptureState::Sse { .. }) => {
+                handle_sse_body(ctx, body, end_of_stream, self.provider, self.max_scratch_bytes);
+            },
+            Some(CaptureState::Json { .. }) => {
+                handle_json_body(ctx, body, end_of_stream, self.provider, self.max_body_bytes);
+            },
+            None => {},
         }
 
         Ok(FilterAction::Continue)
@@ -408,8 +427,8 @@ fn handle_json_body(
         // then re-delivers the frozen whole buffer at end-of-stream, so that body
         // must not be appended to the chunks already captured.
         (BodyMode::StreamBuffer { .. }, true, Some(eos_body)) => {
-            record_buffered_eos_usage(ctx, provider, eos_body, max_body_bytes);
-            clear_all_metadata(ctx);
+            let captured = take_json_capture(ctx);
+            record_buffered_eos_usage(ctx, provider, eos_body, captured, max_body_bytes);
         },
         _ => accumulate_json_body(ctx, body, end_of_stream, provider, max_body_bytes),
     }
@@ -429,20 +448,39 @@ fn accumulate_json_body(
     max_body_bytes: usize,
 ) {
     if let Some(chunk) = body.as_ref()
-        && !accumulate_response_hex(ctx, chunk, max_body_bytes)
+        && !capture_json_chunk(ctx, chunk, max_body_bytes)
     {
         mark_json_overflow(ctx);
-        clear_all_metadata(ctx);
+        clear_capture(ctx);
         return;
     }
 
     if end_of_stream {
-        if let Some(data) = ctx.filter_metadata.get(META_BUF_HEX).and_then(|hex| decode_hex(hex)) {
-            record_json_usage(ctx, provider, &data);
-        }
-
-        clear_all_metadata(ctx);
+        let captured = take_json_capture(ctx);
+        record_json_usage(ctx, provider, &captured);
     }
+}
+
+/// Append a body chunk to the JSON capture. Returns `false`, leaving the
+/// capture unchanged, if the chunk would take it past `max_bytes`, and `true`
+/// without capturing anything when no JSON capture is active.
+fn capture_json_chunk(ctx: &mut HttpFilterContext<'_>, chunk: &[u8], max_bytes: usize) -> bool {
+    let Some(CaptureState::Json { body }) = ctx.get_filter_state_mut::<CaptureState>() else {
+        return true;
+    };
+
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        debug!(
+            existing_bytes = body.len(),
+            chunk_len = chunk.len(),
+            max_bytes,
+            "response body exceeds token_count capture limit"
+        );
+        return false;
+    }
+
+    body.extend_from_slice(chunk);
+    true
 }
 
 /// Extracts usage from the body a buffered chain hands filters at
@@ -455,11 +493,13 @@ fn accumulate_json_body(
 /// therefore retried as the captured chunks followed by that body, unless it
 /// already starts with every captured byte: then it is the frozen buffer of a
 /// response that reports no usage, and the concatenation could only fail to
-/// parse or trip the capture limit.
+/// parse or trip the capture limit. `captured` holds the chunks captured
+/// before end-of-stream.
 fn record_buffered_eos_usage(
     ctx: &mut HttpFilterContext<'_>,
     provider: ProviderKind,
     eos_body: &[u8],
+    mut captured: Vec<u8>,
     max_body_bytes: usize,
 ) {
     if eos_body.len() > max_body_bytes {
@@ -471,22 +511,22 @@ fn record_buffered_eos_usage(
         return;
     }
 
-    let Some(mut data) = ctx.filter_metadata.get(META_BUF_HEX).and_then(|hex| decode_hex(hex)) else {
+    if captured.is_empty() {
         return;
-    };
+    }
 
-    if eos_body.starts_with(&data) {
+    if eos_body.starts_with(&captured) {
         trace!("buffered end-of-stream body repeats the captured chunks and reports no usage");
         return;
     }
 
-    if data.len().saturating_add(eos_body.len()) > max_body_bytes {
+    if captured.len().saturating_add(eos_body.len()) > max_body_bytes {
         mark_json_overflow(ctx);
         return;
     }
 
-    data.extend_from_slice(eos_body);
-    record_json_usage(ctx, provider, &data);
+    captured.extend_from_slice(eos_body);
+    record_json_usage(ctx, provider, &captured);
 }
 
 /// Parses JSON usage and records the normalized counts, prompt cache
@@ -552,13 +592,13 @@ fn handle_sse_body(
     provider: ProviderKind,
     max_scratch_bytes: usize,
 ) {
-    if let Some(chunk) = body.as_ref() {
-        let mut state = load_sse_scan_state(ctx);
-
-        let result = sse::scan_sse_chunk(&mut state, chunk, max_scratch_bytes);
+    if let Some(chunk) = body.as_ref()
+        && let Some(CaptureState::Sse { scanner, counts }) = ctx.get_filter_state_mut::<CaptureState>()
+    {
+        let result = sse::scan_sse_chunk(scanner, chunk, max_scratch_bytes);
 
         for payload in &result.payloads {
-            process_sse_payload(ctx, payload, provider);
+            counts.record_payload(payload, provider);
         }
 
         if result.dropped_events > 0 {
@@ -567,108 +607,85 @@ fn handle_sse_body(
                 "SSE event exceeded scratch limit, discarding and resuming at next event boundary"
             );
         }
-
-        save_sse_scan_state(ctx, &state);
     }
 
-    if end_of_stream {
-        let mut state = load_sse_scan_state(ctx);
+    if end_of_stream
+        && let Some(CaptureState::Sse {
+            mut scanner,
+            mut counts,
+        }) = ctx.remove_filter_state::<CaptureState>()
+    {
         let mut pending = Vec::new();
-        sse::flush_sse_state(&mut state, &mut pending);
+        sse::flush_sse_state(&mut scanner, &mut pending);
         for payload in &pending {
-            process_sse_payload(ctx, payload, provider);
+            counts.record_payload(payload, provider);
         }
 
-        finalize_streaming_counts(ctx, state.tail == sse::ScanTail::Dropped);
-        clear_all_metadata(ctx);
+        finalize_streaming_counts(ctx, &counts, scanner.tail == sse::ScanTail::Dropped);
     }
 }
 
-/// Try to extract token usage from a single SSE data payload.
-fn process_sse_payload(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: ProviderKind) {
-    if payload == b"[DONE]" {
-        return;
+impl StreamCounts {
+    /// Fold one SSE `data:` payload into the counts.
+    fn record_payload(&mut self, payload: &[u8], provider: ProviderKind) {
+        if payload == b"[DONE]" {
+            return;
+        }
+
+        if let Some(usage) = provider.extract_token_usage(payload) {
+            self.record_complete_usage(usage);
+            return;
+        }
+
+        self.merge_partial_usage(provider.extract_streaming_tokens(payload));
     }
 
-    if try_complete_usage(ctx, payload, provider) {
-        return;
+    /// Record complete usage (OpenAI, Google, Azure final events).
+    ///
+    /// Cache and reasoning counts are replaced only when the event reports
+    /// them, so an unreported count stays absent instead of being pinned to
+    /// zero at finalization.
+    fn record_complete_usage(&mut self, usage: TokenUsage) {
+        self.input = Some(usage.input_tokens());
+        self.output = Some(usage.output_tokens());
+        self.total = Some(usage.total_tokens());
+        self.cache_read = usage.cache_read_tokens().or(self.cache_read);
+        self.cache_write = usage.cache_write_tokens().or(self.cache_write);
+        self.reasoning = usage.reasoning_tokens().or(self.reasoning);
+
+        trace!(
+            input = usage.input_tokens(),
+            output = usage.output_tokens(),
+            total = usage.total_tokens(),
+            cache_read = ?usage.cache_read_tokens(),
+            cache_write = ?usage.cache_write_tokens(),
+            reasoning = ?usage.reasoning_tokens(),
+            "complete token usage found in SSE event"
+        );
     }
 
-    try_partial_usage(ctx, payload, provider);
-}
-
-/// Try complete usage extraction (OpenAI, Google, Azure final events).
-fn try_complete_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: ProviderKind) -> bool {
-    let Some(usage) = provider.extract_token_usage(payload) else {
-        return false;
-    };
-
-    ctx.filter_metadata
-        .insert(META_INPUT.to_owned(), usage.input_tokens().to_string());
-    ctx.filter_metadata
-        .insert(META_OUTPUT.to_owned(), usage.output_tokens().to_string());
-    ctx.filter_metadata
-        .insert(META_TOTAL.to_owned(), usage.total_tokens().to_string());
-
-    // Only accumulate counts the event actually reported, so an unreported
-    // count stays absent instead of being pinned to zero at finalization.
-    store_optional_count(ctx, META_CACHE_READ, usage.cache_read_tokens());
-    store_optional_count(ctx, META_CACHE_WRITE, usage.cache_write_tokens());
-    store_optional_count(ctx, META_REASONING, usage.reasoning_tokens());
-
-    trace!(
-        input = usage.input_tokens(),
-        output = usage.output_tokens(),
-        total = usage.total_tokens(),
-        cache_read = ?usage.cache_read_tokens(),
-        cache_write = ?usage.cache_write_tokens(),
-        reasoning = ?usage.reasoning_tokens(),
-        "complete token usage found in SSE event"
-    );
-    true
-}
-
-/// Stores one optional streaming accumulator; skips omitted counts.
-fn store_optional_count(ctx: &mut HttpFilterContext<'_>, key: &str, value: Option<u64>) {
-    if let Some(value) = value {
-        ctx.filter_metadata.insert(key.to_owned(), value.to_string());
+    /// Merge partial counts (Anthropic, Bedrock streaming), skipping counts
+    /// the event omitted.
+    fn merge_partial_usage(&mut self, tokens: StreamingTokens) {
+        merge_reported_count(&mut self.input, tokens.input, "input");
+        merge_reported_count(&mut self.output, tokens.output, "output");
+        merge_reported_count(&mut self.cache_read, tokens.cache_read, "cache_read");
+        merge_reported_count(&mut self.cache_write, tokens.cache_write, "cache_write");
+        merge_reported_count(&mut self.reasoning, tokens.reasoning, "reasoning");
     }
 }
 
-/// Try partial extraction (Anthropic, Bedrock streaming).
-fn try_partial_usage(ctx: &mut HttpFilterContext<'_>, payload: &[u8], provider: ProviderKind) {
-    let tokens = provider.extract_streaming_tokens(payload);
-
-    merge_reported_count(ctx, META_INPUT, tokens.input);
-    merge_reported_count(ctx, META_OUTPUT, tokens.output);
-    merge_reported_count(ctx, META_CACHE_READ, tokens.cache_read);
-    merge_reported_count(ctx, META_CACHE_WRITE, tokens.cache_write);
-    merge_reported_count(ctx, META_REASONING, tokens.reasoning);
-}
-
-/// Merge one count into its accumulator, skipping counts the event omitted.
-fn merge_reported_count(ctx: &mut HttpFilterContext<'_>, key: &str, value: Option<u64>) {
-    let Some(value) = value else {
+/// Merge one reported count into its accumulator via max: correct for
+/// providers that report running totals (latest value wins) and for those
+/// that report each count once (single value preserved). `count` names the
+/// count in trace output.
+fn merge_reported_count(accumulated: &mut Option<u64>, reported: Option<u64>, count: &'static str) {
+    let Some(value) = reported else {
         return;
     };
 
-    merge_accumulated_count(ctx, key, value);
-    trace!(key, value, "partial token count from SSE event");
-}
-
-/// Merge via max: correct for providers that report running totals
-/// (latest value wins) and for those that report each count once
-/// (single value preserved).
-fn merge_accumulated_count(ctx: &mut HttpFilterContext<'_>, key: &str, value: u64) {
-    let existing: u64 = ctx.filter_metadata.get(key).and_then(|v| v.parse().ok()).unwrap_or(0);
-
-    let new_value = existing.max(value);
-    ctx.filter_metadata.insert(key.to_owned(), new_value.to_string());
-}
-
-/// Reads an accumulated count, returning `None` when no event reported it.
-fn read_accumulated(ctx: &HttpFilterContext<'_>, key: &str) -> Option<u64> {
-    ctx.filter_metadata.get(key).and_then(|value| value.parse().ok())
+    *accumulated = Some(accumulated.map_or(value, |existing| existing.max(value)));
+    trace!(count, value, "partial token count from SSE event");
 }
 
 /// Write accumulated streaming counts to the well-known metadata keys.
@@ -679,8 +696,8 @@ fn read_accumulated(ctx: &HttpFilterContext<'_>, key: &str) -> Option<u64> {
 /// status is recorded so this is distinguishable from a complete capture.
 /// Recovered usage that arrived *after* an oversized event is treated as
 /// authoritative and does not set overflow.
-fn finalize_streaming_counts(ctx: &mut HttpFilterContext<'_>, dropped_tail: bool) {
-    let has_accumulated = ctx.filter_metadata.contains_key(META_INPUT) || ctx.filter_metadata.contains_key(META_OUTPUT);
+fn finalize_streaming_counts(ctx: &mut HttpFilterContext<'_>, counts: &StreamCounts, dropped_tail: bool) {
+    let has_accumulated = counts.input.is_some() || counts.output.is_some();
 
     if dropped_tail {
         set_token_status_overflow(ctx);
@@ -691,24 +708,20 @@ fn finalize_streaming_counts(ctx: &mut HttpFilterContext<'_>, dropped_tail: bool
     }
 
     if has_accumulated {
-        publish_accumulated_streaming_usage(ctx);
+        publish_accumulated_streaming_usage(ctx, counts);
     }
 }
 
 /// Publishes streaming accumulators to the well-known `token.*` metadata keys.
-fn publish_accumulated_streaming_usage(ctx: &mut HttpFilterContext<'_>) {
-    let input = read_accumulated(ctx, META_INPUT).unwrap_or(0);
-    let output = read_accumulated(ctx, META_OUTPUT).unwrap_or(0);
+fn publish_accumulated_streaming_usage(ctx: &mut HttpFilterContext<'_>, counts: &StreamCounts) {
+    let input = counts.input.unwrap_or(0);
+    let output = counts.output.unwrap_or(0);
     // Prefer the parser-computed total from a complete-usage event. Partial
-    // streams (Anthropic / Bedrock) omit META_TOTAL, so TokenUsage::new
-    // falls back to input + output, which is correct when reasoning is a
-    // subset of output.
-    let usage = TokenUsage::new(input, output, read_accumulated(ctx, META_TOTAL))
-        .with_cache(
-            read_accumulated(ctx, META_CACHE_READ),
-            read_accumulated(ctx, META_CACHE_WRITE),
-        )
-        .with_reasoning(read_accumulated(ctx, META_REASONING));
+    // streams (Anthropic / Bedrock) omit it, so TokenUsage::new falls back to
+    // input + output, which is correct when reasoning is a subset of output.
+    let usage = TokenUsage::new(input, output, counts.total)
+        .with_cache(counts.cache_read, counts.cache_write)
+        .with_reasoning(counts.reasoning);
 
     publish_token_usage(ctx, usage);
     debug!(
@@ -720,144 +733,6 @@ fn publish_accumulated_streaming_usage(ctx: &mut HttpFilterContext<'_>) {
         reasoning = ?usage.reasoning_tokens(),
         "finalized streaming token counts"
     );
-}
-
-// -----------------------------------------------------------------------------
-// SSE Scanner State Persistence
-// -----------------------------------------------------------------------------
-
-/// Reconstructs scanner state from hex-encoded `filter_metadata` keys.
-fn load_sse_scan_state(ctx: &HttpFilterContext<'_>) -> sse::SseScanState {
-    let line_buf = ctx
-        .filter_metadata
-        .get(META_SSE_LINE_BUF)
-        .and_then(|hex| decode_hex(hex))
-        .unwrap_or_default();
-
-    let data_buf = ctx
-        .filter_metadata
-        .get(META_SSE_DATA_HEX)
-        .and_then(|hex| decode_hex(hex))
-        .unwrap_or_default();
-
-    let has_data = ctx.filter_metadata.get(META_SSE_HAS_DATA).is_some_and(|v| v == "true");
-
-    let prev_cr = ctx.filter_metadata.get(META_SSE_PREV_CR).is_some_and(|v| v == "true");
-
-    let scratch_bytes: usize = ctx
-        .filter_metadata
-        .get(META_SSE_SCRATCH)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-
-    let skip = sse::SkipPhase::from_metadata_str(ctx.filter_metadata.get(META_SSE_SKIP).map(String::as_str));
-    let tail = sse::ScanTail::from_metadata_str(ctx.filter_metadata.get(META_SSE_DROPPED_TAIL).map(String::as_str));
-
-    sse::SseScanState {
-        line_buf,
-        data_buf,
-        has_data,
-        prev_cr,
-        scratch_bytes,
-        skip,
-        tail,
-    }
-}
-
-/// Persists scanner state back to `filter_metadata` for the next chunk.
-fn save_sse_scan_state(ctx: &mut HttpFilterContext<'_>, state: &sse::SseScanState) {
-    set_hex_metadata(ctx, META_SSE_LINE_BUF, &state.line_buf);
-    set_hex_metadata(ctx, META_SSE_DATA_HEX, &state.data_buf);
-
-    ctx.filter_metadata.insert(
-        META_SSE_HAS_DATA.to_owned(),
-        if state.has_data { "true" } else { "false" }.to_owned(),
-    );
-    ctx.filter_metadata.insert(
-        META_SSE_PREV_CR.to_owned(),
-        if state.prev_cr { "true" } else { "false" }.to_owned(),
-    );
-    ctx.filter_metadata
-        .insert(META_SSE_SCRATCH.to_owned(), state.scratch_bytes.to_string());
-
-    ctx.filter_metadata
-        .insert(META_SSE_SKIP.to_owned(), state.skip.as_str().to_owned());
-    ctx.filter_metadata
-        .insert(META_SSE_DROPPED_TAIL.to_owned(), state.tail.as_str().to_owned());
-}
-
-// -----------------------------------------------------------------------------
-// Hex Encoding Utilities
-// -----------------------------------------------------------------------------
-
-/// Accumulate raw bytes as hex to avoid corruption when chunk boundaries
-/// split multibyte UTF-8 code points. Returns `false` if the byte limit
-/// was exceeded.
-fn accumulate_response_hex(ctx: &mut HttpFilterContext<'_>, chunk: &[u8], max_bytes: usize) -> bool {
-    let existing_bytes: usize = ctx
-        .filter_metadata
-        .get(META_BUF_BYTES)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-
-    if existing_bytes.saturating_add(chunk.len()) > max_bytes {
-        debug!(
-            existing_bytes,
-            chunk_len = chunk.len(),
-            max_bytes,
-            "response body exceeds token_count capture limit"
-        );
-        return false;
-    }
-
-    let hex_buf = ctx.filter_metadata.entry(META_BUF_HEX.to_owned()).or_default();
-    for byte in chunk {
-        _ = write!(hex_buf, "{byte:02x}");
-    }
-
-    let new_total = existing_bytes + chunk.len();
-    ctx.filter_metadata
-        .insert(META_BUF_BYTES.to_owned(), new_total.to_string());
-
-    true
-}
-
-/// Inverse of the hex encoding.
-fn decode_hex(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
-        return None;
-    }
-
-    hex.as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let hi = hex_digit(*pair.first()?)?;
-            let lo = hex_digit(*pair.last()?)?;
-            Some(hi << 4 | lo)
-        })
-        .collect()
-}
-
-/// Supports lowercase `a`-`f` only (our encoder writes lowercase).
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        _ => None,
-    }
-}
-
-/// Hex-encodes raw bytes into a metadata value, or removes the key if empty.
-fn set_hex_metadata(ctx: &mut HttpFilterContext<'_>, key: &str, data: &[u8]) {
-    if data.is_empty() {
-        ctx.filter_metadata.remove(key);
-    } else {
-        let mut hex = String::with_capacity(data.len() * 2);
-        for byte in data {
-            _ = write!(hex, "{byte:02x}");
-        }
-        ctx.filter_metadata.insert(key.to_owned(), hex);
-    }
 }
 
 // -----------------------------------------------------------------------------
@@ -876,13 +751,4 @@ fn is_json_content_type(ct: &str) -> bool {
     ct.split(';')
         .next()
         .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
-}
-
-// -----------------------------------------------------------------------------
-// Metadata Cleanup
-// -----------------------------------------------------------------------------
-
-/// Remove all `token_count.*` working state from `filter_metadata`.
-fn clear_all_metadata(ctx: &mut HttpFilterContext<'_>) {
-    ctx.filter_metadata.retain(|key, _| !key.starts_with(META_PREFIX));
 }
