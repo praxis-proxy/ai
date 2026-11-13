@@ -2043,27 +2043,47 @@ fn full_flow_agentic_web_search_enforces_domain_filters() {
     assert_eq!(search.requests().len(), 1, "the web-search dispatcher should run once");
     let model_requests = model.requests();
     assert_eq!(model_requests.len(), 2, "the filtered result should reach round two");
-    let second_input = &model_requests[1].body;
+    // Assert on the tool output rather than the whole body: round two echoes the
+    // client's `tools`, whose filters name the domains the results must not have.
+    let second_input = serde_json::from_str::<Value>(&model_requests[1].body).expect("second inference JSON");
+    let tool_outputs: Vec<&str> = second_input["input"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item["type"] == "function_call_output")
+                .filter_map(|item| item["output"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        tool_outputs.len(),
+        1,
+        "round two should carry one web-search tool output: {second_input:#}"
+    );
     assert!(
-        second_input.contains("praxis-proxy.github.io"),
-        "the permitted result should reach inference round two: {second_input}"
+        tool_outputs[0].contains("https://praxis-proxy.github.io/"),
+        "the permitted result should reach inference round two: {second_input:#}"
     );
     let nemo_requests = nemo.requests();
     assert_eq!(nemo_requests.len(), 1, "NeMo should check the web-search result once");
-    // The round-two body echoes the client's `tools`, so match the filtered
-    // result URLs rather than the bare domains they also declare.
+    let check: Value = serde_json::from_str(&nemo_requests[0].body).expect("NeMo request JSON");
+    let checked = check["messages"][0]["content"].as_str().unwrap_or_default();
+    assert!(
+        checked.contains("https://praxis-proxy.github.io/"),
+        "NeMo should receive the permitted result: {check:#}"
+    );
     for rejected in [
         "https://outside.example/result",
         "https://docs.praxis-proxy.github.io/private",
     ] {
         assert!(
-            !second_input.contains(rejected),
-            "a filtered result ({rejected}) must not reach inference round two: {second_input}"
+            !tool_outputs[0].contains(rejected),
+            "a filtered result ({rejected}) must not reach inference round two: {second_input:#}"
         );
         assert!(
-            !nemo_requests[0].body.contains(rejected),
-            "a filtered result ({rejected}) must not reach the guardrail: {}",
-            nemo_requests[0].body
+            !checked.contains(rejected),
+            "a filtered result ({rejected}) must not reach the guardrail: {check:#}"
         );
     }
 }
