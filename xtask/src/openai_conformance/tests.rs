@@ -14,8 +14,9 @@ use super::{
     json_report::report_json,
     model::{
         AppliedContractException, ContractDriftKind, ContractException, CoverageMode, OasdiffAreaDrift,
-        OasdiffAreaReport, OasdiffOperationDrift, OperationKey, ReferenceSourceReport, RuntimeVerificationCheck,
-        SpecOperation, SpecSourceReport, SupportedOperation, percent,
+        OasdiffAreaReport, OasdiffOperationDrift, OperationKey, ReferenceSourceReport, RuntimeVerificationArea,
+        RuntimeVerificationCheck, RuntimeVerificationStatus, SpecOperation, SpecSourceReport, SupportedOperation,
+        percent,
     },
     oasdiff::{
         OASDIFF_VERSION, apply_contract_exceptions, build_oasdiff_report, collect_oasdiff_operation_status,
@@ -92,6 +93,7 @@ fn support(method: &str, path: &str, area: &str, mode: CoverageMode) -> Supporte
         area: area.to_owned(),
         mode,
         evidence: "test evidence".to_owned(),
+        contract_declared: false,
     }
 }
 
@@ -130,6 +132,7 @@ fn test_args() -> Args {
         implementation_spec: None,
         list_oasdiff: false,
         output_json: None,
+        output_badges_dir: None,
         fail_under: None,
         fail_oasdiff_under: None,
     }
@@ -202,6 +205,9 @@ fn selects_registered_areas_by_stable_id() {
     assert_eq!(selected.first().unwrap().scope.id, "conversations");
 
     args.areas = vec!["files".to_owned()];
+    assert_eq!(selected_areas(&args).unwrap().len(), 1, "Files is a registered area");
+
+    args.areas = vec!["vector_stores".to_owned()];
     assert!(selected_areas(&args).is_err(), "unregistered areas should be rejected");
 }
 
@@ -703,6 +709,53 @@ fn coverage_mode_labels_and_owned_modes_are_stable() {
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "table-style fixture")]
+fn contract_operations_include_owned_modes_and_declared_contracts() {
+    let supported = vec![
+        // Passthrough with a declared contract: compared.
+        SupportedOperation {
+            contract_declared: true,
+            ..support("POST", "/conversations", "Conversations", CoverageMode::Passthrough)
+        },
+        // Passthrough without a contract: not compared.
+        support(
+            "GET",
+            "/conversations/{conversation_id}",
+            "Conversations",
+            CoverageMode::Passthrough,
+        ),
+        // Owned mode: compared regardless of the flag.
+        support(
+            "GET",
+            "/conversations/{conversation_id}/items",
+            "Conversations",
+            CoverageMode::Local,
+        ),
+    ];
+    let report = calculate_coverage(
+        test_reference(),
+        test_sources(),
+        scoped_operations(),
+        &supported,
+        false,
+        false,
+    );
+
+    let compared: BTreeSet<String> = report
+        .contract_operations()
+        .iter()
+        .map(|operation| operation.key.to_string())
+        .collect();
+    assert_eq!(
+        compared,
+        BTreeSet::from([
+            "POST /conversations".to_owned(),
+            "GET /conversations/{conversation_id}/items".to_owned(),
+        ])
+    );
+}
+
+#[test]
 fn finite_percentage_parser_rejects_nan_infinity_and_out_of_range_values() {
     assert_eq!(parse_percent("0").unwrap(), 0.0);
     assert_eq!(parse_percent("100").unwrap(), 100.0);
@@ -1000,4 +1053,72 @@ fn sentinel_empty_output_reports_all_missing() {
 fn sentinel_leading_trailing_whitespace_trimmed() {
     let stdout = "  PRAXIS_CONFORMANCE_OK area alpha  \n\tPRAXIS_CONFORMANCE_OK area beta\t\n";
     assert!(find_missing_sentinels(stdout, TEST_CHECKS).is_empty());
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "checks passed, failed, unexecuted and missing-evidence states together"
+)]
+fn responses_state_badges_require_executed_checks_and_a_successful_suite() {
+    let mut report = calculate_coverage(
+        test_reference(),
+        test_sources(),
+        scoped_operations(),
+        &test_supported_operations(),
+        false,
+        false,
+    );
+    let area = CONFORMANCE_AREAS
+        .iter()
+        .find(|area| area.scope.id == "responses")
+        .unwrap();
+    let unverified = report_json(&report, &test_args());
+    for group in ["persistence", "rehydration", "lifecycle"] {
+        assert_eq!(
+            unverified
+                .pointer(&format!("/responses_state_verification/groups/{group}/status"))
+                .and_then(Value::as_str),
+            Some("not_verified")
+        );
+    }
+    report.runtime_verifications.push(RuntimeVerificationArea {
+        area: "Responses",
+        command: area.runtime_test_command,
+        checks: area.runtime_checks,
+        status: RuntimeVerificationStatus::Passed,
+    });
+    let passed = report_json(&report, &test_args());
+    for group in ["persistence", "rehydration", "lifecycle"] {
+        let result = passed
+            .pointer(&format!("/responses_state_verification/groups/{group}"))
+            .unwrap();
+        assert_eq!(result.get("status").and_then(Value::as_str), Some("passed"));
+        assert!(!result.get("checks").and_then(Value::as_array).unwrap().is_empty());
+        assert_eq!(
+            result.get("command").and_then(Value::as_str),
+            Some(area.runtime_test_command)
+        );
+    }
+    report.runtime_verifications.first_mut().unwrap().status = RuntimeVerificationStatus::Failed;
+    let failed = report_json(&report, &test_args());
+    for group in ["persistence", "rehydration", "lifecycle"] {
+        assert_eq!(
+            failed
+                .pointer(&format!("/responses_state_verification/groups/{group}/status"))
+                .and_then(Value::as_str),
+            Some("failed")
+        );
+    }
+    report.runtime_verifications.first_mut().unwrap().status = RuntimeVerificationStatus::Passed;
+    report.runtime_verifications.first_mut().unwrap().checks = TEST_CHECKS;
+    let missing = report_json(&report, &test_args());
+    for group in ["persistence", "rehydration", "lifecycle"] {
+        assert_eq!(
+            missing
+                .pointer(&format!("/responses_state_verification/groups/{group}/status"))
+                .and_then(Value::as_str),
+            Some("not_verified")
+        );
+    }
 }

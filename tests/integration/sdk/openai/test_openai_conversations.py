@@ -2299,6 +2299,10 @@ class TestOpenAIConversations:
             ],
         )
 
+        conversation = openai_client.conversations.update(
+            conversation.id, metadata={"topic": "committed-before-delete"},
+        )
+
         updated = openai_client.conversations.items.delete(
             "item_delete_once",
             conversation_id=conversation.id,
@@ -2791,6 +2795,38 @@ def test_configuration_update_controls_subsequent_inference(conversation_backend
             body.get("messages" if translated else "input")
         ), "configuration_update must be consumed, not forwarded as history"
     assert len(captured) == 5, "each of the five turns must reach the backend once"
+
+
+def test_rehydration_preserves_unrelated_parameter_order(conversation_backend):
+    """Moving input into history must not reorder the remaining parameters."""
+    client, captured, _, translated = conversation_backend
+    if translated:
+        pytest.skip("Parameter order applies to native Responses forwarding")
+    conversation = client.conversations.create(
+        items=[{"type": "configuration_update", "reasoning": {"effort": "low"}}]
+    )
+    sent = []
+
+    def capture_request(request):
+        sent.append(json.loads(request.content))
+
+    with httpx.Client(event_hooks={"request": [capture_request]}) as transport:
+        response = client.with_options(http_client=transport).responses.create(
+            model="test-model", conversation=conversation.id,
+            input=[{"role": "user", "content": "hello"}],
+            metadata={"z": "last", "a": "first"}, store=False,
+            extra_body={"extra": {"z": 1, "a": 2}},
+        )
+    assert response.status == "completed"
+    assert len(sent) == len(captured) == 1
+    before, (_, after) = sent[0], captured[0]
+    retained = set(before) - {"input", "conversation", "reasoning"}
+    assert [key for key in before if key in retained] == [
+        key for key in after if key in retained
+    ]
+    assert after["reasoning"] == {"effort": "low"}
+    assert list(after["metadata"]) == ["z", "a"]
+    assert list(after["extra"]) == ["z", "a"]
 
 
 @pytest.fixture(params=["/reasoning", "/reasoning/effort"], ids=["member", "effort"])
@@ -3516,3 +3552,96 @@ def test_object_input_document_extraction_preserves_original_snapshot(
     assert original["content"][0]["file_data"] in json.dumps(users), (
         "the original file input must survive extraction in the client snapshot"
     )
+
+
+def _assert_conversation_error(response, status):
+    assert response.status_code == status
+    assert response.headers["content-type"].startswith("application/json")
+    error = response.json()["error"]
+    assert isinstance(error["message"], str) and error["message"]
+    assert error["type"] == ("server_error" if status == 500 else "invalid_request_error")
+    for field in ("param", "code"):
+        assert field in error and (error[field] is None or isinstance(error[field], str))
+    assert "retry-after" not in response.headers
+    assert "injected private database failure" not in response.text
+
+
+@pytest.mark.parametrize("operation", [
+    "retrieve", "update", "delete", "create_items", "list_items", "retrieve_item", "delete_item",
+])
+def test_conversations_not_found_contract_preserves_owner(openai_client, other_owner_client, operation):
+    conversation = openai_client.conversations.create(metadata={"keep": "original"}, items=[{
+        "type": "message", "role": "user", "content": "private item",
+    }])
+    item = openai_client.conversations.items.list(conversation.id).data[0]
+    actions = {
+        "retrieve": lambda cid: other_owner_client.conversations.retrieve(cid),
+        "update": lambda cid: other_owner_client.conversations.update(cid, metadata={"changed": "yes"}),
+        "delete": lambda cid: other_owner_client.conversations.delete(cid),
+        "create_items": lambda cid: other_owner_client.conversations.items.create(cid, items=[]),
+        "list_items": lambda cid: other_owner_client.conversations.items.list(cid),
+        "retrieve_item": lambda cid: other_owner_client.conversations.items.retrieve(item.id, conversation_id=cid),
+        "delete_item": lambda cid: other_owner_client.conversations.items.delete(item.id, conversation_id=cid),
+    }
+    for cid in (conversation.id, "conv_absent"):
+        with pytest.raises(NotFoundError) as raised:
+            actions[operation](cid)
+        _assert_conversation_error(raised.value.response, 404)
+        assert "private item" not in raised.value.response.text
+        assert "original" not in raised.value.response.text
+    assert openai_client.conversations.retrieve(conversation.id).metadata == {"keep": "original"}
+    assert [row.id for row in openai_client.conversations.items.list(conversation.id).data] == [item.id]
+
+
+@pytest.mark.parametrize("operation", ["create", "update", "create_items", "list_items", "delete_item"])
+def test_conversations_bad_request_contract_preserves_state(openai_client, operation):
+    conversation = openai_client.conversations.create(metadata={"keep": "original"})
+    actions = {
+        "create": lambda: openai_client.conversations.create(metadata="invalid"),
+        "update": lambda: openai_client.conversations.update(conversation.id, metadata="invalid"),
+        "create_items": lambda: openai_client.conversations.items.create(conversation.id, items=[{"type": "unknown"}]),
+        "list_items": lambda: openai_client.conversations.items.list(conversation.id, limit=-1),
+        "delete_item": lambda: openai_client.delete(f"/conversations/{conversation.id}/items/%FF", cast_to=object),
+    }
+    with pytest.raises(BadRequestError) as raised:
+        actions[operation]()
+    _assert_conversation_error(raised.value.response, 400)
+    assert openai_client.conversations.retrieve(conversation.id).metadata == {"keep": "original"}
+    assert openai_client.conversations.items.list(conversation.id).data == []
+
+
+@pytest.mark.skipif(DATABASE_URL.startswith("postgres"), reason="fault injection uses SQLite triggers")
+@pytest.mark.parametrize("operation", ["create", "update", "create_items", "delete_item"])
+def test_conversations_database_error_rolls_back_mutation(legacy_sqlite_record_clients, operation):
+    client, db_path, items_table = legacy_sqlite_record_clients
+    conversations_table = items_table.removesuffix("_conversation_items") + "_conversations"
+    conversation = client.conversations.create(metadata={"keep": "original"}, items=[{
+        "type": "message", "role": "user", "content": "keep item",
+    }])
+    item = client.conversations.items.list(conversation.id).data[0]
+    event, table = {
+        "create": ("INSERT", items_table),
+        "update": ("UPDATE", conversations_table),
+        "create_items": ("INSERT", items_table),
+        "delete_item": ("DELETE", items_table),
+    }[operation]
+    with sqlite3.connect(db_path) as database:
+        before_conversations = database.execute(f'SELECT * FROM "{conversations_table}"').fetchall()
+        before_items = database.execute(f'SELECT * FROM "{items_table}"').fetchall()
+        database.execute(f'''CREATE TRIGGER fail_mutation AFTER {event} ON "{table}"
+            BEGIN SELECT RAISE(ABORT, 'injected private database failure'); END''')
+    actions = {
+        "create": lambda: client.conversations.create(items=[{"type": "message", "role": "user", "content": "rollback"}]),
+        "update": lambda: client.conversations.update(conversation.id, metadata={"changed": "yes"}),
+        "create_items": lambda: client.conversations.items.create(conversation.id, items=[{"type": "message", "role": "user", "content": "rollback"}]),
+        "delete_item": lambda: client.conversations.items.delete(item.id, conversation_id=conversation.id),
+    }
+    with pytest.raises(InternalServerError) as raised:
+        actions[operation]()
+    _assert_conversation_error(raised.value.response, 500)
+    with sqlite3.connect(db_path) as database:
+        assert database.execute(f'SELECT * FROM "{conversations_table}"').fetchall() == before_conversations
+        assert database.execute(f'SELECT * FROM "{items_table}"').fetchall() == before_items
+        database.execute("DROP TRIGGER fail_mutation")
+    assert client.conversations.retrieve(conversation.id).metadata == {"keep": "original"}
+    assert [row.id for row in client.conversations.items.list(conversation.id).data] == [item.id]

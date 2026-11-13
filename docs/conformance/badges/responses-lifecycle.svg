@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="20" role="img" aria-label="OpenAI Responses lifecycle: passed">
+  <title>OpenAI Responses lifecycle: passed</title>
+  <rect width="300" height="20" rx="3" fill="#555"/>
+  <path fill="#4c1" d="M210 0h87a3 3 0 0 1 3 3v14a3 3 0 0 1-3 3h-87z"/>
+  <g fill="#fff" text-anchor="middle" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11">
+    <text x="105" y="14">OpenAI Responses lifecycle</text>
+    <text x="255" y="14">passed</text>
+  </g>
+</svg>

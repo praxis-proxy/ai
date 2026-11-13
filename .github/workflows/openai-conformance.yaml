@@ -105,11 +105,13 @@ jobs:
         run: >-
           cargo xtask openai-conformance
           --output-json docs/conformance/openai-conformance-report.json
+          --output-badges-dir docs/conformance/badges
 
       - name: Check generated artifacts
         run: >-
           git diff --exit-code --
           docs/conformance/openai-conformance-report.json
+          docs/conformance/badges/
           docs/conformance/specs/openai-openapi.yaml
           docs/conformance/specs/openai-openapi-source.json
 

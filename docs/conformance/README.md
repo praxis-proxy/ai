@@ -1,7 +1,11 @@
 # OpenAI Conformance
 
 This directory tracks Praxis AI conformance against selected OpenAI API
-surfaces. The current scope is Conversations and Responses.
+surfaces. The current scopes are Conversations, Responses and Files.
+
+For the external OpenResponses runtime suite, see
+[full acceptance](openresponses-acceptance.md) and the separately scoped
+[translation coverage](openresponses-translation.md).
 
 This directory also vendors the upstream Anthropic Messages API OpenAPI
 document at `specs/anthropic-spec.json`. It is read by the automated PR review
@@ -28,6 +32,17 @@ Conformance compares two independent truths:
 The registry generates runtime matching, capability claims, and the local
 implementation OpenAPI document. The report is derived output; editing it
 does not add support.
+
+Files is a Praxis-owned contract on top of the same pin. The source chain is:
+
+1. the pinned full spec, projected to the `/files` scope;
+2. the `files_operations!` registry, which owns operation identity and the
+   declared contract of each operation;
+3. the DTOs in `files/contracts.rs`, which the registry references;
+4. the generated `files_openapi_json()` document.
+
+There is no trimmed or hand-maintained copy of the Files spec. Everything
+downstream of the pin is generated or derived from the registry.
 
 ## How It Fits Together
 
@@ -74,6 +89,12 @@ than declaring behavior Praxis does not implement.
   response types shared by runtime behavior and generated schemas.
 - `apis/src/openai/conversations/openapi.rs` builds the implementation OpenAPI
   document from the registry.
+- `apis/src/openai/files/routes/` (`mod.rs`), `contracts.rs`, `openapi.rs`, and
+  `tests.rs` play the same roles for Files: the `files_operations!` registry,
+  the wire DTOs, the generated implementation document, and the
+  `conformance_files_` runtime checks.
+- `xtask/src/openai_conformance/files_registry.rs` implements
+  `cargo xtask check-files-registry`.
 - `apis/src/openai/operation.rs` provides handling modes and reusable
   parameter, media-type, request, response, and OpenAPI generation metadata.
 - `apis/src/openai/conversations/filter.rs` and `handlers.rs` execute the
@@ -99,8 +120,41 @@ Every operation has one proxy-boundary mode:
 - `transform`: map between input and output contracts owned by Praxis.
 - `local`: terminate the request and produce the response in Praxis.
 
-Only `transform` and `local` operations enter owned-contract OpenAPI
-comparison. All eight current Conversations operations are `local`.
+Operations with an owned mode (`transform` or `local`) or a declared
+contract enter owned-contract OpenAPI comparison. The generator emits every
+operation that declares a contract, so the comparison covers exactly what is
+generated. All eight current Conversations operations are `local`.
+
+The five Files operations are `passthrough` but declare their contracts, so
+oasdiff compares them against the pinned Files projection. See
+[Files contract](#files-contract) for the recorded deviations.
+`cargo xtask check-files-registry` additionally compares pinned, runtime, and
+generated operation identity three ways and runs in `make lint`.
+
+### Files contract
+
+- **Handling mode versus contract.** All five Files operations are
+  `passthrough`: Praxis forwards them without mutation. Each still declares a
+  contract, and generation and oasdiff comparison follow the declared contract,
+  not the handling mode.
+- **Schema deviations from the pin.** These are recorded as
+  `FILES_CONTRACT_EXCEPTIONS` in `xtask/src/openai_conformance/area.rs`:
+  `evals` is added to `OpenAIFile.purpose` (it is an accepted upload purpose),
+  and the generated `OpenAIFile` states `type: object` explicitly.
+- **Serialization choices within the pinned schema** (not exceptions):
+  `status` is always present (`processed`); `expires_at` and `status_details`
+  are omitted when absent; an empty list has `first_id` and `last_id` set to
+  `""`.
+- **Error responses.** All pinned error responses (400/404/429/500, the shared
+  `ErrorResponse` envelope, no `Retry-After` on 429) are declared as contract
+  groundwork and validated through DTO instances, like the success schemas.
+  While operations are `passthrough`, upstream produces them and Praxis forwards
+  them unchanged. The registry test blocks switching an operation to `local`
+  until handler-produced rejection tests exist for every declared status.
+- **Authentication.** Deployment-owned, as for Conversations. The Files scope
+  uses `without_inherited_security()` so the pinned global bearer requirement
+  is not compared against the passthrough routes, which do not authenticate; see
+  [Authentication ownership](#authentication-ownership).
 
 ### Rate-limit response ownership
 
@@ -113,7 +167,9 @@ reuses the core request limiter. It runs after classification and trusted owner
 resolution, before store access, and covers all eight local operations. Its
 adapter adds the OpenAI JSON error envelope while preserving the core limiter's
 `Retry-After` and rate-limit headers. The operation registry declares the shared
-429 body and optional retry header from runtime contract types.
+429 body and optional retry header from runtime contract types. This producer
+rule applies to `local` operations; `passthrough` contracts (Files) describe
+the forwarded wire contract.
 
 `mode: global` shares a budget across callers of that filter instance;
 `mode: per_ip` groups requests by their TCP peer address, independently of the
@@ -127,6 +183,26 @@ operation, validated against the pinned error schema. SDK tests exercise all
 eight HTTP paths and verify that rejected mutations preserve existing state.
 The default example demonstrates admission and has a functional rejection test.
 The fatal proxy error formatter remains a separate response path.
+
+### Other Conversations errors
+
+The operation registry also declares the current pin's 16 non-admission error
+responses: five `400`, seven `404`, and four `500` responses. Validation, missing
+owner-scoped resources, and storage failures provide their runtime paths. Every
+local error includes `message`, `type`, `code`, and `param`; the last two may be
+null. Storage failures expose a generic message without backend details.
+The shared schema includes optional `misalignment.review_target`, with its
+nullable opaque-target constraints; locally generated errors omit misalignment.
+
+The required runtime suite checks every declared status against the pinned
+schema and verifies foreign-owner resources remain inaccessible. SDK coverage
+checks all eight operations, unchanged state after rejected mutations, and real
+SQL transaction rollback using injected write failures. Conversation creation
+and initial items commit atomically; item deletion uses the metadata snapshot
+read before mutation so a later read cannot report a failed committed deletion.
+The example's functional suite exercises all eight admission paths and the
+client-error envelopes. Existing evidence-backed Conversations exceptions
+remain unchanged (11 entries); exact conformance is measured after them.
 
 ### Authentication ownership
 
@@ -159,7 +235,8 @@ Generate the report:
 
 ```console
 cargo xtask openai-conformance \
-  --output-json docs/conformance/openai-conformance-report.json
+  --output-json docs/conformance/openai-conformance-report.json \
+  --output-badges-dir docs/conformance/badges
 ```
 
 The default selects all registered areas. Use `--area conversations` for a
@@ -181,6 +258,21 @@ cargo xtask openai-conversation-item-contracts --check
 When Conversations is selected, conformance generation performs the check
 before comparing schemas, so the runtime validator and generated implementation
 document cannot silently drift from the pinned item union.
+
+Check Files operation identity three ways (pinned specification, runtime
+registry, generated document):
+
+```console
+cargo xtask check-files-registry
+```
+
+It compares `(method, path, operationId)` and fails if any source disagrees.
+Schemas are left to oasdiff. `make lint` runs it. The Files report area also
+runs the `conformance_files_` tests, which cover route dispatch, success
+payloads against the generated response schemas, and a sensitivity check that
+the schema validation rejects an invalid payload. Each test prints a
+`PRAXIS_CONFORMANCE_OK files <check>` sentinel that the report requires as
+evidence.
 
 ## Reference Refresh
 
@@ -225,7 +317,7 @@ excluded from comparison), and keeps three independent dimensions:
 
 1. `capability_coverage` groups selected operations by handling mode and shows
    missing or stale support claims.
-2. `owned_contract_conformance` compares `local` and `transform` contracts
+2. `owned_contract_conformance` compares owned-mode and declared contracts
    with pinned `oasdiff`. Operation drift and inherited area drift, such as
    global authentication, are reported separately.
 3. `runtime_verification` records the focused commands, exact test evidence,
@@ -237,6 +329,38 @@ global security mismatch.
 
 Use `owned_contract_conformance.fixes_required` as the actionable contract
 backlog.
+
+### Responses state verification
+
+`responses_state_verification` reports focused runtime evidence for the native
+Responses pipeline with local state filters configured. Its `groups` object has
+stable keys used by the README badges. `--output-badges-dir` generates local SVG
+assets from the same results, so badges render on branches and local README
+previews without fetching the report from `main`. CI regenerates and checks
+these assets alongside the report:
+
+
+| Group | Checked behavior |
+| --- | --- |
+| `persistence` | Default persistence admission, `store:false` preventing buffered and streamed writes, buffered and streamed persistence, and persistence through the classified pipeline. |
+| `rehydration` | History from `previous_response_id` and both `conversation` forms, missing or unfinished response rejection, owner isolation, and previous-response ID restoration in JSON and chunked SSE. |
+| `lifecycle` | Retrieval and missing-resource errors, owner isolation, input-item cursor pagination, deletion, and ordered stored SSE replay with cursor and owner checks. |
+
+Each group includes its scope, executed command, and required test evidence.
+A group is `passed` only if it has declared checks and the complete Responses
+runtime command succeeds with every required success sentinel present. Any
+suite failure or missing sentinel marks all declared groups `failed`;
+`not_verified` means the Responses suite was not run or the group has no checks.
+The command fails on runtime verification failure, including missing tests.
+
+These are test results, not percentages of the complete OpenAI contract.
+The state checks exercise local SQLite storage and controlled test fixtures;
+they do not certify every storage backend or a live vLLM deployment. The OpenAI
+SDK suite separately covers persistence, continuation, and lifecycle behavior;
+its results are not included in these badge statuses. Generation behavior belongs
+to the backend, and Chat Completions translation is a separate profile. Owned
+OpenAPI drift remains visible independently in `owned_contract_conformance`.
+See the [state conformance boundary](openai-responses-state-conformance.md).
 
 ### Upstream specification exceptions
 
@@ -288,6 +412,10 @@ Follow-up fixes remove their fingerprints from the report without needing the
 label. When no failures remain, the strict gate passes and no acknowledgement
 step runs.
 
+For Files, `make lint` additionally fails when `check-files-registry` finds
+operation drift, and the report run fails when a `conformance_files_` test or
+its sentinel is missing.
+
 ## Change Workflow
 
 When OpenAI-compatible behavior changes:
@@ -299,6 +427,23 @@ When OpenAI-compatible behavior changes:
 5. Regenerate `openai-conformance-report.json`.
 6. Commit code, the generated report, and reference artifacts only when the
    upstream pin was intentionally changed.
+
+### Changing the Files contract
+
+1. Edit the registry entry in `files/routes/mod.rs` and/or the DTOs in
+   `files/contracts.rs`.
+2. Run `cargo xtask check-files-registry`.
+3. Run the `conformance_files_` tests.
+4. Regenerate `openai-conformance-report.json`. Oasdiff drift must be fixed or
+   carry an evidence-backed contract exception.
+
+### Refreshing the upstream pin for Files
+
+1. Run `cargo xtask openai-conformance-reference --revision <sha>`.
+2. Run `cargo xtask check-files-registry`; it flags operation drift.
+3. Regenerate the report; oasdiff shows Files schema drift.
+4. Update the DTOs, and update or remove any exception that the stale-exception
+   rule flags (generation fails when a declared fingerprint no longer appears).
 
 Future API areas should add one data-driven path selector, operation registry
 adapter, generated owned-contract document, and focused runtime suite. They

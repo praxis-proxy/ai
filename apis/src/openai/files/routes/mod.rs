@@ -9,14 +9,30 @@
 //! upload is `multipart/form-data` and the download returns opaque bytes, so
 //! neither can be classified by inspecting a JSON body.
 //!
-//! Praxis proxies the Files contract rather than owning it, so these operations
-//! declare their runtime request-body shape without an
-//! `OwnedOperationContract`. Operation IDs are the official ones from the
-//! pinned OpenAI specification, reproduced verbatim including upstream's
-//! casing.
+//! Each operation declares its owned contract (parameters, request body,
+//! success response, and pinned error responses) once, and the runtime
+//! request-body shape is derived from that same declaration so the two cannot
+//! diverge. Entries stay `Passthrough` until local handlers land, so the
+//! success and error responses are contract groundwork; generation and
+//! conformance comparison follow the declared contract, not the handling mode.
+//! Operation IDs are the official ones from the pinned OpenAI specification,
+//! reproduced verbatim including
+//! upstream's casing.
 
 use std::ops::Deref;
 
+#[cfg(feature = "openai-files")]
+use super::contracts::{
+    CreateFileRequest, DeleteFileResponse, FileContent, ListFilesResponse, OpenAiFile, list_files_limit_schema,
+    list_files_order_schema,
+};
+#[cfg(feature = "openai-files")]
+use crate::openai::error::ErrorResponse;
+#[cfg(feature = "openai-files")]
+use crate::openai::operation::{
+    MediaTypeSpec, OwnedOperationContract, RequestBodySpec, ResponseSpec, path_parameter, query_parameter,
+    schema_binding,
+};
 use crate::{
     openai::operation::OpenAiOperationSpec,
     operation::{
@@ -54,13 +70,111 @@ impl OperationEntry for FilesOperationSpec {
     }
 }
 
-/// Convert a registry body declaration into a runtime request-body shape.
+/// JSON media type used by Files metadata responses.
+#[cfg(feature = "openai-files")]
+const JSON_CONTENT_TYPE: &str = "application/json";
+
+/// Multipart media type of the upload body.
+#[cfg(feature = "openai-files")]
+const MULTIPART_CONTENT_TYPE: &str = "multipart/form-data";
+
+/// Binary media type of the download response.
+#[cfg(feature = "openai-files")]
+const BINARY_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// Convert a registry request declaration into an optional schema binding.
+#[cfg(feature = "openai-files")]
+macro_rules! request_binding {
+    ([none]) => {
+        None
+    };
+    ([required multipart $schema:ty]) => {
+        Some(RequestBodySpec {
+            required: true,
+            content: &[MediaTypeSpec::new(MULTIPART_CONTENT_TYPE, schema_binding!($schema))],
+        })
+    };
+}
+
+/// Convert a registry response declaration into a media type binding.
+#[cfg(feature = "openai-files")]
+macro_rules! response_binding {
+    ([json $schema:ty]) => {
+        MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($schema))
+    };
+    ([binary $schema:ty]) => {
+        MediaTypeSpec::new(BINARY_CONTENT_TYPE, schema_binding!($schema))
+    };
+}
+
+/// Convert a registry contract declaration into owned metadata.
+#[cfg(any(
+    feature = "openai-files",
+    feature = "openai-conversations",
+    feature = "openai-responses-openapi"
+))]
+macro_rules! operation_contract {
+    (
+        {
+            parameters: [$($parameter:expr),* $(,)?],
+            request: $request:tt,
+            response: $response:tt,
+            errors: [$($status:literal),* $(,)?] $(,)?
+        }
+    ) => {{
+        #[cfg(feature = "openai-files")]
+        {
+            Some(OwnedOperationContract {
+                parameters: &[$($parameter),*],
+                request: request_binding!($request),
+                responses: &[
+                    ResponseSpec {
+                        status: "200",
+                        headers: &[],
+                        description: "OK",
+                        content: &[response_binding!($response)],
+                    },
+                    $(ResponseSpec {
+                        status: $status,
+                        headers: &[],
+                        description: "Files error",
+                        content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!(ErrorResponse<'static>))],
+                    }),*
+                ],
+            })
+        }
+        #[cfg(not(feature = "openai-files"))]
+        {
+            None
+        }
+    }};
+}
+
+/// Derive the runtime request-body shape from a registry request declaration.
 macro_rules! request_body_shape {
     ([none]) => {
         RequestBody::None
     };
-    ([required multipart]) => {
+    ([required multipart $schema:ty]) => {
         RequestBody::Multipart { required: true }
+    };
+}
+
+/// Derive the runtime request-body shape from a contract declaration.
+///
+/// Reads the same `request:` token as `operation_contract!`, so the body shape
+/// and the generated contract cannot drift apart.
+macro_rules! contract_request_body {
+    (
+        {
+            parameters:
+            [$($parameter:expr),* $(,)?],request:
+            $request:tt,response:
+            $response:tt,errors:
+            [$($status:literal),* $(,)?] $(,)?
+        }
+    ) => {
+        request_body_shape!($request)
     };
 }
 
@@ -74,7 +188,7 @@ macro_rules! files_operations {
                 transport: $transport:ident,
                 path: $path:literal,
                 mode: $mode:ident,
-                body: $body:tt $(,)?
+                contract: $contract:tt $(,)?
             }
         ),+ $(,)?
     ) => {
@@ -100,11 +214,15 @@ macro_rules! files_operations {
                             transport: Transport::$transport,
                             runtime_path: concat!("/v1", $path),
                             mode: HandlingMode::$mode,
-                            request_body: request_body_shape!($body),
+                            request_body: contract_request_body!($contract),
                         },
                         spec_path: $path,
-                        #[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
-                        owned_contract: None,
+                        #[cfg(any(
+                            feature = "openai-conversations",
+                            feature = "openai-files",
+                            feature = "openai-responses-openapi"
+                        ))]
+                        owned_contract: operation_contract!($contract),
                     },
                 },
             )+
@@ -119,7 +237,29 @@ files_operations! {
         transport: Http,
         path: "/files",
         mode: Passthrough,
-        body: [none],
+        contract: {
+            parameters: [
+                query_parameter!("purpose", String, "Only return files with the given purpose."),
+                query_parameter!(
+                    "limit",
+                    schema_fn = list_files_limit_schema,
+                    "A limit on the number of objects to be returned. Limit can range between 1 and 10,000, and the default is 10,000."
+                ),
+                query_parameter!(
+                    "order",
+                    schema_fn = list_files_order_schema,
+                    "Sort order by the `created_at` timestamp of the objects. `asc` for ascending order and `desc` for descending order."
+                ),
+                query_parameter!(
+                    "after",
+                    String,
+                    "A cursor for use in pagination. `after` is an object ID that defines your place in the list."
+                ),
+            ],
+            request: [none],
+            response: [json ListFilesResponse],
+            errors: ["400", "404", "429"],
+        },
     },
     CreateFile {
         operation_id: "createFile",
@@ -127,7 +267,12 @@ files_operations! {
         transport: Http,
         path: "/files",
         mode: Passthrough,
-        body: [required multipart],
+        contract: {
+            parameters: [],
+            request: [required multipart CreateFileRequest],
+            response: [json OpenAiFile],
+            errors: ["400", "429", "500"],
+        },
     },
     RetrieveFile {
         operation_id: "retrieveFile",
@@ -135,7 +280,12 @@ files_operations! {
         transport: Http,
         path: "/files/{file_id}",
         mode: Passthrough,
-        body: [none],
+        contract: {
+            parameters: [path_parameter!("file_id", "The ID of the file to use for this request.")],
+            request: [none],
+            response: [json OpenAiFile],
+            errors: ["404", "429"],
+        },
     },
     DeleteFile {
         operation_id: "deleteFile",
@@ -143,7 +293,12 @@ files_operations! {
         transport: Http,
         path: "/files/{file_id}",
         mode: Passthrough,
-        body: [none],
+        contract: {
+            parameters: [path_parameter!("file_id", "The ID of the file to use for this request.")],
+            request: [none],
+            response: [json DeleteFileResponse],
+            errors: ["404", "429"],
+        },
     },
     DownloadFile {
         operation_id: "downloadFile",
@@ -151,7 +306,12 @@ files_operations! {
         transport: Http,
         path: "/files/{file_id}/content",
         mode: Passthrough,
-        body: [none],
+        contract: {
+            parameters: [path_parameter!("file_id", "The ID of the file to use for this request.")],
+            request: [none],
+            response: [binary FileContent],
+            errors: ["400", "404", "429", "500"],
+        },
     },
 }
 
@@ -244,6 +404,44 @@ mod tests {
                 match_route(method, path).is_none(),
                 "{method} {path} must not match a Files operation"
             );
+        }
+    }
+
+    #[cfg(feature = "openai-files")]
+    mod contract {
+        use super::*;
+
+        #[test]
+        fn every_spec_declares_a_contract_but_passthrough_does_not_own_it() {
+            for spec in OPERATION_SPECS {
+                assert!(
+                    spec.owned_contract().is_some(),
+                    "{} lacks a contract",
+                    spec.operation_id()
+                );
+                assert!(
+                    !spec.owns_contract(),
+                    "{} is passthrough; switching to local requires handler-produced rejection \
+                     tests for every declared error status",
+                    spec.operation_id()
+                );
+            }
+        }
+
+        #[test]
+        fn declared_request_body_shape_matches_generated_contract() {
+            for spec in OPERATION_SPECS {
+                let contract_has_body = spec.owned_contract().is_some_and(|contract| contract.request.is_some());
+                assert_eq!(
+                    spec.request_body().is_present(),
+                    contract_has_body,
+                    "request_body shape drifted from the contract for {:?}",
+                    spec.operation
+                );
+                if let Some(request) = spec.owned_contract().and_then(|contract| contract.request) {
+                    assert_eq!(spec.request_body().is_required(), request.required);
+                }
+            }
         }
     }
 }

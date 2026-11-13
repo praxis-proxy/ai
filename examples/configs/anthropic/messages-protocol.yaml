@@ -7,6 +7,19 @@
 #
 # No request or response body transformation. Use this when the
 # backend natively supports `/v1/messages`.
+#
+# API version: `default_version: "2023-06-01"` applies only when the caller
+# sends no `anthropic-version`. A caller's version passes through unchanged,
+# so Anthropic SDK v1 clients reach the backend with `2023-06-01` and SDK v2
+# clients with `2026-10-21`. Praxis does not enforce version-specific body
+# rules. Under `2026-10-21`, the backend rejects sampling fields, assistant
+# `document` blocks, and non-empty citations on user text blocks.
+#
+# Credentials: this chain forwards the caller's credential unchanged:
+# `x-api-key` from SDK v1 or `Authorization: Bearer` from SDK v2. Use it when
+# each client brings its own backend key. When the gateway owns the upstream
+# credential, remove both headers and inject the gateway's key (see
+# `docs/anthropic-messages.md`, "SDK credentials and gateway authentication").
 
 listeners:
   - name: anthropic-gateway

@@ -32,6 +32,8 @@ filter_chains:
             cluster: backend
 
       - filter: token_rate_limit
+        backend:
+          kind: memory
         key:
           - header: x-tenant-id
         default_weights:

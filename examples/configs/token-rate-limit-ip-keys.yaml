@@ -47,6 +47,8 @@ filter_chains:
             cluster: backend
 
       - filter: token_rate_limit
+        backend:
+          kind: memory
         key:
           ip:
             header: x-forwarded-for

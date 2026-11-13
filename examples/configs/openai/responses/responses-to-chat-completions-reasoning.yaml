@@ -18,9 +18,12 @@
 #     for older backends, emitting it as a reasoning item whose content is
 #     reasoning_text. Raw reasoning is never placed in the item summary, which
 #     is reserved for safe summaries.
-#   - vLLM has no safe-summary capability, so a client that requests
-#     reasoning.summary (or the deprecated reasoning.generate_summary) is
-#     rejected with a 400 before the request is forwarded.
+#   - vLLM has no safe-summary capability. reasoning.summary "auto", the
+#     value Codex 0.166.0 sends by default, is best effort and is satisfied
+#     by emitting no summary items, so it is accepted and forwarded. An
+#     explicit value such as "concise" or "detailed" is rejected with a 400
+#     before the request is forwarded, because that is a capability request
+#     vLLM cannot honor.
 #   - max_reasoning_bytes bounds the raw reasoning preserved per
 #     response; oversized reasoning fails closed rather than truncating.
 #   - On a continuation, raw reasoning is replayed in the following

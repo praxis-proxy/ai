@@ -5,6 +5,64 @@ request translator for Anthropic Messages. It does not make unsupported fields
 generally permissive: the translator continues to reject fields and content
 shapes outside the explicit contract below.
 
+## API version and sampling
+
+The `openai_chat_completions_to_anthropic` filter selects the backend API
+contract from trusted configuration, independently of caller headers:
+
+```yaml
+filter: openai_chat_completions_to_anthropic
+api_translation_enabled: true
+api_version: "2026-10-21"
+```
+
+`api_version` defaults to `2023-06-01`. Only `2023-06-01` and `2026-10-21`
+are accepted; unknown versions fail configuration parsing. The selected value
+overrides any caller-supplied `anthropic-version` and any co-configured
+`anthropic_messages_protocol.default_version` on translated requests,
+regardless of the order of those two filters. Native passthrough retains its
+own version behavior.
+
+Version selection is scoped to the translator's filter configuration, not to
+individual provider entries in the routing overlay. Use separate configured
+routes for Anthropic-compatible backends requiring different API versions.
+OpenAI-compatible provider selections are unaffected by this setting.
+
+Under either version, supported numeric `temperature` and `top_p` values
+are forwarded unchanged, including explicit defaults and non-default values.
+The translator selects the wire version; the backend owns version-specific
+sampling validation. Praxis does not drop supported sampling fields or reject
+them based on the configured API version. An upstream rejection is returned
+through the existing OpenAI-compatible error translation.
+
+Existing structural validation is unchanged: this bridge still rejects
+`top_k` and unsupported field types. Selecting a different API version does
+not expand the supported field set.
+
+The other `2026-10-21` restrictions can't be triggered through this bridge.
+Translated requests contain only text, image, and tool blocks, so they never
+include assistant `document` blocks or user text blocks with citations.
+
+Credentials follow the same trusted-configuration rule. For a selected
+Anthropic provider, the translator removes the caller's `authorization` and
+`x-api-key` headers, and `credential_inject` installs the selected provider's
+key. A Chat Completions client's
+bearer token therefore never reaches Anthropic.
+
+Native Messages passthrough has a different contract:
+`anthropic_messages_protocol` preserves caller-supplied `anthropic-version`
+and does not change the body or validate version-specific sampling rules.
+Its `default_version` applies only when the caller supplies no version.
+The backend can therefore reject a new-version request with sampling controls.
+Messages-to-Chat Completions translation also retains sampling support,
+including `top_k`, for compatible vLLM backends; it does not apply Anthropic
+provider restrictions to those backends.
+
+The controlled example
+[`openai-selected-provider-version-fixture.yaml`](../../examples/configs/openai-selected-provider-version-fixture.yaml)
+and inference replay cover new-version sampling preservation and upstream error propagation.
+They use synthetic backend responses, not live Anthropic evidence.
+
 ## Request contract
 
 | OpenAI Chat Completions input | Anthropic Messages output | Behavior |

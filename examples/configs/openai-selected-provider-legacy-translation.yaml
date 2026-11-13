@@ -1,8 +1,19 @@
+# OpenAI Chat Completions -> Selected Anthropic or OpenAI-compatible Provider
+#
 # OpenAI Chat Completions clients reach the overlay-selected Anthropic Messages
 # or OpenAI-compatible provider and receive translated Anthropic JSON/SSE or
 # unchanged OpenAI-compatible responses.
 # `intelligent_route` binds the trusted provider profile to each request before
 # response and SSE processing.
+#
+# API version: Anthropic-bound requests use `api_version: "2023-06-01"`
+# regardless of caller headers. Set `2026-10-21` to select the newer contract;
+# sampling fields are still forwarded, and the provider rejects them under that
+# version. See `docs/developing/openai-anthropic-compatibility.md`.
+#
+# Credentials: for an Anthropic provider, the translator removes the caller's
+# `Authorization` and `x-api-key`, and `credential_inject` adds the selected
+# provider key from the projected credential mount.
 
 listeners:
   - name: proxy
@@ -27,6 +38,7 @@ filter_chains:
 
       - filter: openai_chat_completions_to_anthropic
         api_translation_enabled: true
+        api_version: "2023-06-01"
         max_body_bytes: 1048576
 
       - filter: credential_inject

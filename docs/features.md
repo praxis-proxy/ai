@@ -9,6 +9,10 @@ For base proxy capabilities such as TLS, HTTP/2, TCP, WebSocket, load
 balancing, rate limiting, compression, CORS, health checks, and credential
 injection, see the [Praxis core documentation][praxis].
 
+For client setup, provider authentication, and build choices, use
+[Client and provider paths](client-provider-paths.md). For operator problems,
+required ordering, and examples, use the [capability overview](filters/README.md).
+
 ## Inference routing and transformation
 
 - Classify requests by provider format, model, streaming mode, and tool
@@ -16,10 +20,16 @@ injection, see the [Praxis core documentation][praxis].
 - Rewrite models and enrich prompts without changing application code.
 - Translate Anthropic Messages requests and responses for
   Chat Completions-compatible inference backends.
+- Adapt Chat Completions to selected Anthropic Messages, Azure OpenAI,
+  Vertex Gemini, or Bedrock Converse paths with their documented limitations.
 - Normalize provider protocol headers and validate the JSON envelope fields
   required by the proxy.
 
 ## OpenAI Responses and Conversations
+
+Native forwarding is available with ordinary standard routing. The state and
+tool capabilities below require experimental managed filters and the selected
+store/tool feature groups; see the [managed recipe](recipes/managed-responses.md).
 
 - Proxy native Responses API traffic and rebuild enriched request state.
 - Store and rehydrate response history through SQLite or PostgreSQL.
@@ -35,6 +45,10 @@ explains how the agentic loop bounds payload held across inference rounds,
 tools, streaming, and Store operations.
 
 ## Anthropic Messages
+
+Choose [native forwarding or a supported translation path](client-provider-paths.md).
+The detailed [Messages guide](anthropic-messages.md) records SDK version and
+backend qualification limits.
 
 - Classify and validate Anthropic Messages requests.
 - Normalize native Anthropic protocol headers.
@@ -86,6 +100,7 @@ in [#1717](https://github.com/praxis-proxy/ai/issues/1717).
 | `openai-file-resolve-filter` | `openai_file_resolve` | none beyond `openai-responses`; uses the shared subrequest client |
 | `store-postgres`, `store-postgres-cert-auth`, `store-sqlite`, `store-all` | `openai_responses_store`, `openai_responses_rehydrate`, and the SQL backends | `sqlx` (PostgreSQL adds native TLS through the system OpenSSL; the certificate-only profile omits password authentication) |
 | `openai-conversations` | `openai_conversations` | `jsonschema`, `utoipa`, a store backend |
+| `openai-files` | none yet (Files wire contracts, generated OpenAPI, and conformance checks) | `utoipa`; activates `experimental` |
 | `openai-compact` | `openai_responses_compact` | `tiktoken-rs`, a store backend |
 | `openai-mcp-tools` | `openai_mcp_tool_resolve`, `openai_mcp_dispatch`, `openai_mcp_streaming_selector` | `rmcp`, a store backend |
 | `openai-all` | every OpenAI group above, without choosing a store backend | |
@@ -96,6 +111,7 @@ groups need a backend at runtime, so pair them with
 `store-postgres`, `store-postgres-cert-auth`, or `store-sqlite` (for example
 `--features openai-all,store-sqlite`). The experimental `http-callout-filter`,
 `azure-ad-filter`, `gcp-adc-filter`, `token-rate-limit-filter`,
+`token-ceiling-filter`, `inflight-tracker-filter`,
 `vertex-anthropic-filter`, and `basic-auth-filter` features, and the `llmd-ext-proc` and `opentelemetry`
 features, are opt-in as before. A configuration that names a filter the binary
 was built without fails at startup with an unknown filter type error.

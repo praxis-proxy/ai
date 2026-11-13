@@ -223,6 +223,7 @@ features:
       synthetic:
         status: synthetic_only
   - id: responses.native.request
+    reason: Native request ordering also has controlled local Files API and SDK evidence; independent file callouts are outside the one-exchange replay model.
     scopes:
       - responses_native_passthrough
     status: live_covered
@@ -638,6 +639,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: azure.chat.request.preservation
+    scopes:
+      - openai_chat_completions_to_azureai_chat_completions
+    status: synthetic_only
+    scenarios:
+      - azure/request-preservation
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: azure.chat.response.annotation_stream
     scopes:
       - openai_chat_completions_to_azureai_chat_completions
@@ -863,6 +873,25 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: external_model.anthropic.request.legacy_sampling
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-json-sse-error
+    providers:
+      synthetic:
+        status: synthetic_only
+  # Covers sampling preservation, backend errors, and a conflicting native default.
+  - id: external_model.anthropic.request.version_sampling
+    scopes:
+      - openai_chat_completions_to_anthropic_messages
+    status: synthetic_only
+    scenarios:
+      - openai_legacy/anthropic-version-sampling
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.access_programs
     scopes:
       - openai_responses_to_chat_completions
@@ -879,6 +908,15 @@ features:
     status: synthetic_only
     scenarios:
       - responses/object-document-input
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.agentic.mcp_rewrite_preservation
+    scopes:
+    - responses_agentic_loop
+    status: synthetic_only
+    scenarios:
+    - responses/mcp-request-preservation
     providers:
       synthetic:
         status: synthetic_only

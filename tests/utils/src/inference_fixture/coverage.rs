@@ -1298,6 +1298,7 @@ mod tests {
                 vec!["chat_completions_to_bedrock_converse"],
                 vec!["openai_chat_completions_to_azureai_chat_completions"],
                 vec!["openai_chat_completions_to_azureai_chat_completions"],
+                vec!["openai_chat_completions_to_azureai_chat_completions"],
                 vec!["openai_chat_completions_to_vertexai_gemini"],
                 vec!["chat_completions_to_bedrock_converse"],
                 vec!["messages_to_chat_completions"],
@@ -1321,8 +1322,11 @@ mod tests {
                 vec!["responses_native_passthrough"],
                 vec!["openai_chat_completions_to_anthropic_messages"],
                 vec!["openai_responses_to_chat_completions"],
+                vec!["openai_chat_completions_to_anthropic_messages"],
+                vec!["openai_chat_completions_to_anthropic_messages"],
                 vec!["openai_responses_to_chat_completions"],
                 vec!["responses_native_passthrough"],
+                vec!["responses_agentic_loop"],
             ]
         );
         assert_eq!(
@@ -1425,16 +1429,21 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 93, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 72, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 77, "manifest recording inventory count");
+        assert_eq!(report.features_total, 97, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 75, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 80, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
                 "azure/annotation-stream",
                 "azure/error-status-event-stream",
+                "azure/request-preservation",
                 "bedrock/basic-nonstream",
                 "messages/basic-nonstream",
                 "messages/basic-stream",
@@ -1458,6 +1467,7 @@ mod tests {
                 "messages/upstream-error-stream",
                 "messages/upstream-error-unknown-type",
                 "openai_legacy/anthropic-json-sse-error",
+                "openai_legacy/anthropic-version-sampling",
                 "responses/agentic-deferred-mcp-connectors",
                 "responses/agentic-parallel-tool-calls",
                 "responses/agentic-status-less-function-call",
@@ -1493,6 +1503,7 @@ mod tests {
                 "responses/client-tool-compat-stream-shell-order",
                 "responses/invalid-stream-event-type",
                 "responses/irr-terminal-streaming",
+                "responses/mcp-request-preservation",
                 "responses/mcp-tool-admission-untrusted-direct",
                 "responses/native-basic-nonstream",
                 "responses/native-basic-stream",
@@ -1507,7 +1518,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 93, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 97, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1826,6 +1837,10 @@ mod tests {
                     &vec!["bedrock/basic-nonstream".to_owned()]
                 ),
                 (
+                    &"azure.chat.request.preservation".to_owned(),
+                    &vec!["azure/request-preservation".to_owned()]
+                ),
+                (
                     &"azure.chat.response.annotation_stream".to_owned(),
                     &vec!["azure/annotation-stream".to_owned()]
                 ),
@@ -1926,6 +1941,14 @@ mod tests {
                     &vec!["responses/chat-orphan-tool-output".to_owned()]
                 ),
                 (
+                    &"external_model.anthropic.request.legacy_sampling".to_owned(),
+                    &vec!["openai_legacy/anthropic-json-sse-error".to_owned()]
+                ),
+                (
+                    &"external_model.anthropic.request.version_sampling".to_owned(),
+                    &vec!["openai_legacy/anthropic-version-sampling".to_owned()]
+                ),
+                (
                     &"responses.chat.access_programs".to_owned(),
                     &vec![
                         "responses/chat-basic-nonstream".to_owned(),
@@ -1935,6 +1958,10 @@ mod tests {
                 (
                     &"responses.request.object_document_input".to_owned(),
                     &vec!["responses/object-document-input".to_owned()]
+                ),
+                (
+                    &"responses.agentic.mcp_rewrite_preservation".to_owned(),
+                    &vec!["responses/mcp-request-preservation".to_owned()]
                 ),
             ]
         );
@@ -2106,7 +2133,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)],
         );
-        for feature in &manifest.features[62..93] {
+        for feature in &manifest.features[62..97] {
             assert_eq!(
                 feature
                     .providers
@@ -2116,9 +2143,13 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)],
             );
         }
-        assert!(manifest.features.iter().all(|feature| {
-            feature.reason.is_none() && feature.providers.values().all(|coverage| coverage.reason.is_none())
-        }));
+        for feature in &manifest.features {
+            let expected_reason = (feature.id == "responses.native.request").then_some(
+                "Native request ordering also has controlled local Files API and SDK evidence; independent file callouts are outside the one-exchange replay model.",
+            );
+            assert_eq!(feature.reason.as_deref(), expected_reason);
+            assert!(feature.providers.values().all(|coverage| coverage.reason.is_none()));
+        }
 
         let nonstream = InferenceScenario::load(&root.join("scenarios/messages/basic-nonstream.yaml")).unwrap();
         assert_scenario(
