@@ -1,0 +1,75 @@
+name: Recover release publication
+
+# Run reviewed publication tooling from main while keeping the released source,
+# original test evidence, tag, and already published containers unchanged.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+      release-run-id:
+        description: Original Release workflow run with successful release gates
+        required: true
+        type: string
+
+concurrency:
+  group: Release-refs/tags/${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Check out corrected tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tooling
+          persist-credentials: false
+
+      - name: Check out released source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          path: release
+          persist-credentials: false
+
+      - name: Verify original gates and install corrected publication tooling
+        id: evidence
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          RELEASE_RUN_ID: ${{ inputs.release-run-id }}
+        run: |
+          set -euo pipefail
+          python3 ../tooling/.github/scripts/release_recovery.py \
+            --repo "$GH_REPO" --tag "$TAG" --run-id "$RELEASE_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$(bash ../tooling/.github/scripts/release-prerelease.sh "${TAG#v}")" >> "$GITHUB_OUTPUT"
+          echo "Publication tooling commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo "Release commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          # Support inventory stays at the tagged revision. Only the publisher
+          # and its report generators come from this recovery workflow's commit.
+          for script in publish-release.sh release_qualification.py vllm_qualification.py support_report.py; do
+            cp "../tooling/.github/scripts/$script" ".github/scripts/$script"
+          done
+
+      - name: Publish release and qualification reports
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ steps.evidence.outputs.prerelease }}
+          RELEASE_RUN_ID: ${{ inputs.release-run-id }}
+          RELEASE_RUN_ATTEMPT: ${{ steps.evidence.outputs.attempt }}
+        run: bash .github/scripts/publish-release.sh

@@ -56,6 +56,28 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
+## Recovering Publication
+
+If the tests and container publishing passed but GitHub Release creation failed,
+keep the tag and published images unchanged. Rerunning the original workflow
+uses the scripts at the tag, so it cannot pick up a publication-script fix on
+`main`.
+
+After merging the tooling fix, dispatch **Recover release publication** from
+`main`, supplying the existing tag and original Release run ID:
+
+```console
+gh workflow run release-recovery.yaml --repo praxis-proxy/ai --ref main \
+  -f tag=v0.11.0 -f release-run-id=43437245497
+```
+
+Recovery verifies the original run's repository, tag, commit, latest attempt,
+and successful validation, test, container, and FIPS proof gates. Only a failure
+in `github-release` is recoverable. It then uses the corrected publication
+scripts while reading the support inventory from the tagged source. CI evidence
+continues to reference the original release run and commit; GPU evidence retains
+its actual tested checkout. Recovery does not rebuild images or move tags.
+
 ## Publishing Container Images
 
 Container images are published to
