@@ -618,12 +618,15 @@ fn spawn_health_check_tasks(
 /// are also present. Those profiles either restore `SQLx` password
 /// authentication or have not yet had their additional dependency boundaries
 /// cleared for the FIPS build.
+///
+/// `openai-conversations` is safe with `store-postgres-cert-auth`: it pulls
+/// only non-cryptographic dependencies (`jsonschema`, `utoipa`) and uses the
+/// same certificate-only SQLx profile the Responses store does.
 const FIPS_SAFE_STORE_PROFILE: bool = cfg!(all(
     feature = "store-postgres-cert-auth",
     not(any(
         feature = "store-postgres",
         feature = "store-sqlite",
-        feature = "openai-conversations",
         feature = "openai-compact",
         feature = "openai-mcp-tools"
     ))
