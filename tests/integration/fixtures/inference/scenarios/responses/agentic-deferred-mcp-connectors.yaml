@@ -1,6 +1,6 @@
 version: 1
 id: responses/agentic-deferred-mcp-connectors
-description: Deferred MCP connectors are sanitized on the first inference round without listing tools.
+description: Deferred MCP connectors are sanitized on the first inference round without listing tools, preserving public member order.
 protocol: openai_responses
 example_config: openai/responses/agentic-loop-deferred-mcp-fixture.yaml
 upstream_authority: 127.0.0.1:3001

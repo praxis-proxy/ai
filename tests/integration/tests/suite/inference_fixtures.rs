@@ -8,7 +8,97 @@ use std::{collections::BTreeSet, path::PathBuf};
 use praxis_test_utils::inference_fixture::{
     RecordedBody, ScenarioRunner, WireFixture, check_coverage, discover_recordings, discover_scenarios,
 };
-use serde_json::json;
+use serde_json::{Value, json};
+
+/// Exercise recorded transformations with noncanonical payload-member order.
+/// Provider-owned envelopes retain their scenario order during translation;
+/// arbitrary tool schemas and metadata are varied even across translations.
+#[tokio::test]
+pub(super) async fn all_inference_fixtures_preserve_retained_json_order() {
+    let root = fixture_root();
+    let scenarios = discover_scenarios(&root).expect("inference scenarios must be discoverable");
+    let recordings = discover_recordings(&root).expect("inference recordings must be discoverable");
+    let mut exercised = 0;
+    for recording in recordings {
+        if !cfg!(feature = "vertex-anthropic-filter") && recording.scenario_id == "vertex/anthropic-wire-translation" {
+            continue;
+        }
+        let scenario_path = scenarios
+            .get(&recording.scenario_id)
+            .expect("recording must have a scenario");
+        let mut scenario = praxis_test_utils::inference_fixture::InferenceScenario::load(scenario_path)
+            .expect("preservation scenario must load");
+        let expected = WireFixture::load(&recording.path).expect("preservation recording must load");
+        for (turn, expected_turn) in scenario.turns.iter_mut().zip(&expected.turns) {
+            if let RecordedBody::Json { value } = &mut turn.request.body {
+                if same_json_except_model(&expected_turn.client.request.body, &expected_turn.upstream.request.body) {
+                    reverse_object_members(value);
+                } else {
+                    vary_opaque_json_order(value);
+                }
+            }
+        }
+        ScenarioRunner::replay(&scenario, &expected)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "retained JSON order changed for scenario `{}` and provider `{}`: {error}",
+                    recording.scenario_id, recording.provider
+                );
+            });
+        exercised += 1;
+    }
+    assert!(exercised > 0, "the preservation sweep must execute recordings");
+}
+
+/// The expected fixture identifies same-format forwarding independently of
+/// the implementation being tested. Model replacement/removal is permitted.
+fn same_json_except_model(before: &RecordedBody, after: &RecordedBody) -> bool {
+    let (RecordedBody::Json { value: before }, RecordedBody::Json { value: after }) = (before, after) else {
+        return false;
+    };
+    let (Some(before), Some(after)) = (before.as_object(), after.as_object()) else {
+        return false;
+    };
+    before.keys().filter(|key| key.as_str() != "model").count()
+        == after.keys().filter(|key| key.as_str() != "model").count()
+        && before
+            .iter()
+            .filter(|(key, _)| key.as_str() != "model")
+            .all(|(key, value)| after.get(key) == Some(value))
+}
+
+/// Change caller-owned JSON data, rather than provider protocol envelopes.
+fn vary_opaque_json_order(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if matches!(key.as_str(), "parameters" | "input_schema" | "metadata") {
+                    reverse_object_members(value);
+                } else {
+                    vary_opaque_json_order(value);
+                }
+            }
+        },
+        Value::Array(values) => values.iter_mut().for_each(vary_opaque_json_order),
+        _ => {},
+    }
+}
+
+/// Reverse every object's insertion order without changing values or arrays.
+fn reverse_object_members(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            let members = std::mem::take(object);
+            for (key, mut value) in members.into_iter().rev() {
+                reverse_object_members(&mut value);
+                object.insert(key, value);
+            }
+        },
+        Value::Array(values) => values.iter_mut().for_each(reverse_object_members),
+        _ => {},
+    }
+}
 
 const STREAM_SCENARIO: &str = "messages/basic-stream";
 const STREAM_PROVIDER: &str = "openai";
@@ -489,7 +579,7 @@ fn assert_native_responses_tool_call(actual: &WireFixture, scenario_id: &str, pr
     let arguments = function_call["arguments"].as_str().unwrap_or_else(|| {
         panic!("scenario `{scenario_id}` and provider `{provider}` must contain string function arguments");
     });
-    let decoded: serde_json::Value = serde_json::from_str(arguments).unwrap_or_else(|error| {
+    let decoded: Value = serde_json::from_str(arguments).unwrap_or_else(|error| {
         panic!("scenario `{scenario_id}` and provider `{provider}` returned invalid function arguments: {error}");
     });
     assert!(

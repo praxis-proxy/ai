@@ -17,15 +17,19 @@ use praxis_core::config::{ChainRef, Config, FilterEntry, ProtocolKind};
 use serde_json::Value;
 
 use super::{
-    BodyKind, FixtureError, FixtureProvenance, ImportedUpstream, InferenceScenario, NormalizationMetadata,
-    RecordedBody, RecordedExchange, RecordedRequest, RecordedResponse, RedactionRules, ScenarioExpectation,
-    ScenarioTurn, WIRE_FIXTURE_VERSION, WireFixture, WireTurn,
+    BodyKind, FixtureError, FixtureProvenance, ImportedUpstream, InferenceProtocol, InferenceScenario,
+    NormalizationMetadata, RecordedBody, RecordedExchange, RecordedRequest, RecordedResponse, RedactionRules,
+    ScenarioExpectation, ScenarioTurn, WIRE_FIXTURE_VERSION, WireFixture, WireTurn,
     bounds::{MAX_SCRIPTED_RESPONSE_BODY_BYTES, body_has_rendered_content, parse_response_body, validate_request_body},
     header_policy::{http_fixture_headers, recorded_transport_headers},
     http_server::ScriptedHttpServer,
     sanitize::sanitize_fixture_preserving_structure,
 };
-use crate::{ProxyGuard, example_config_path, free_port_guard, patch_yaml, start_proxy};
+use crate::{
+    ProxyGuard,
+    body_contract::{retained_json_order_mismatch, retained_tool_order_mismatch, translated_json_order_mismatch},
+    example_config_path, free_port_guard, patch_yaml, start_proxy,
+};
 
 /// Maximum time allowed for one backend capture to become observable.
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -169,6 +173,29 @@ impl ScenarioRunner {
                 let empty = uncontacted_upstream();
                 (empty.request, empty.response)
             };
+            // Normalization deliberately sorts object members. Check retained
+            // input before that pass so a reserialization regression cannot be
+            // erased by the fixture comparison's canonical representation.
+            if let (RecordedBody::Json { value: before }, RecordedBody::Json { value: after }) =
+                (&scenario.request.body, &upstream_request.body)
+                && let Some(position) = {
+                    // A different API endpoint may reconstruct protocol envelopes.
+                    // Its mapping is checked by the expected-output fixture; native
+                    // same-endpoint edits still preserve unrelated sibling order.
+                    let mismatch =
+                        if same_request_protocol(bound.protocol, &scenario.request.path, &upstream_request.path) {
+                            retained_json_order_mismatch(before, after)
+                        } else {
+                            translated_json_order_mismatch(before, after)
+                        };
+                    mismatch.or_else(|| retained_tool_order_mismatch(before, after))
+                }
+            {
+                return Err(mismatch(
+                    &format!("turns[{turn_index}].upstream.request.{position}"),
+                    "retained JSON object member order changed",
+                ));
+            }
             let turn = WireTurn {
                 name: scenario.name,
                 client: RecordedExchange {
@@ -409,6 +436,20 @@ pub(super) fn build_replay_config_with_aliases(
     validate_replay_network_surfaces(&config, expected_listener, &expected_backend)?;
     validate_replay_filters(&config)?;
     Ok(config)
+}
+
+/// Prefix and query rewrites retain the wire format of the scenario's API.
+fn same_request_protocol(protocol: InferenceProtocol, client_path: &str, upstream_path: &str) -> bool {
+    let suffix = match protocol {
+        InferenceProtocol::OpenaiResponses => "/responses",
+        InferenceProtocol::AnthropicMessages => "/messages",
+        InferenceProtocol::OpenaiChatCompletions => "/chat/completions",
+    };
+    client_path == upstream_path
+        || upstream_path
+            .split('?')
+            .next()
+            .is_some_and(|path| path.ends_with(suffix))
 }
 
 /// Rejects filter entries that can create independent live callouts.
@@ -1658,7 +1699,7 @@ fn normalize_request_projection(
     let mut fixture = WireFixture {
         version: WIRE_FIXTURE_VERSION,
         scenario_id: scenario_id.to_owned(),
-        protocol: super::InferenceProtocol::OpenaiChatCompletions,
+        protocol: InferenceProtocol::OpenaiChatCompletions,
         provenance: provenance.clone(),
         normalization: NormalizationMetadata {
             version: 1,
@@ -1933,6 +1974,21 @@ fn runtime_error(message: &'static str) -> FixtureError {
     reason = "tests"
 )]
 mod tests {
+    #[test]
+    fn native_path_rewrites_do_not_skip_envelope_order_checks() {
+        use super::super::InferenceProtocol;
+        assert!(super::same_request_protocol(
+            InferenceProtocol::OpenaiChatCompletions,
+            "/v1/chat/completions",
+            "/openai/deployments/model/chat/completions?api-version=test",
+        ));
+        assert!(!super::same_request_protocol(
+            InferenceProtocol::AnthropicMessages,
+            "/v1/messages",
+            "/v1/chat/completions",
+        ));
+    }
+
     use std::{
         collections::BTreeMap, error::Error as _, fmt::Write as _, net::TcpListener, path::Path, time::Duration,
     };

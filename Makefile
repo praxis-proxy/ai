@@ -273,14 +273,14 @@ test-integration-experimental:
 	PRAXIS_AI_BIN=$(abspath $(or $(CARGO_TARGET_DIR),target)/debug/praxis-ai) \
 	cargo test -p praxis-tests-integration --features openai-all,store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
 		-- examples::azure_ad examples::gcp_adc examples::lakera_guard examples::token_rate_limit examples::token_ceiling examples::inflight_tracking \
-		examples::vertex_anthropic \
+		examples::vertex_anthropic body_contracts \
 		$(if $(V),--nocapture)
 
 test-inference-fixtures: test-inference-fixtures-core test-inference-xtask
 
 test-inference-fixtures-core:
 	cargo test -p praxis-test-utils --features openai-all,store-all,vertex-anthropic-filter $(_NOCAPTURE)
-	cargo test -p praxis-tests-integration --features openai-all,store-all,vertex-anthropic-filter --test suite inference_fixtures $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --features openai-all,store-all,vertex-anthropic-filter --test suite -- inference_fixtures body_contracts $(if $(V),--nocapture)
 
 # The xtask inference-fixture compile is a distinct crate graph from the
 # test-utils/suite builds above; split into its own parallel CI job so it no
