@@ -425,6 +425,37 @@ jobs:
       - name: Run Azure OpenAI Python SDK tests
         run: uv run tests/integration/sdk/openai/test_azure_chat_completions.py -s
 
+  models-sdk:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: models-sdk-cargo
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: tests/integration/sdk/openai/test_openai_models.py
+
+      - name: Build Praxis
+        run: cargo build -p praxis-ai-proxy --features basic-auth-filter,model-catalog-filter
+
+      - name: Run OpenAI models Python SDK tests
+        run: uv run tests/integration/sdk/openai/test_openai_models.py -s
+
   # ----------------------------------------------------------------------------
   # Responses/agentic feature-boundary checks
   #
