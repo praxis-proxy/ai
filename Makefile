@@ -42,8 +42,8 @@ PRAXIS_AI_FEATURES ?= full
 LEAN_GRAPH_DENY := sqlx sqlx-core libsqlite3-sys native-tls rmcp sse-stream \
 	jsonschema utoipa tiktoken-rs reqwest serde_json_path tonic prost
 # Upper bound on crates (name@version, normal + build edges, host target) in the
-# explicit lean graph. Linux hosts measure about 428, macOS about 432.
-LEAN_GRAPH_BUDGET ?= 434
+# explicit lean graph. Linux hosts measure 431, macOS 435 with Cargo.lock.
+LEAN_GRAPH_BUDGET ?= 435
 STORE_BACKEND_FREE_FEATURES := standard,openai-all
 STORE_POSTGRES_FEATURES := standard,openai-all,store-postgres
 STORE_POSTGRES_CERT_AUTH_FEATURES := openai-responses,store-postgres-cert-auth
