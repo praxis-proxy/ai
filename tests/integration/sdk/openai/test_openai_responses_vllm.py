@@ -11701,6 +11701,8 @@ class _FileUrlStubHandler(BaseHTTPRequestHandler):
                 "x-user-id",
                 "authorization",
                 "x-user-ogx-key",
+                "x-user-mcp-key",
+                "x-mcp-authorized",
             )
             if self.headers.get(name) is not None
         ]
@@ -11990,6 +11992,30 @@ class TestFileResolveOutboundChain:
         assert list(after["metadata"]) == ["z", "a"]
         assert list(after["extra"]) == ["z", "a"]
         assert after["tool_choice"] == {"type": "function", "name": "weather__get_weather"}
+        assert any(
+            tool.get("type") == "function" and tool.get("name") == "weather__get_weather"
+            for tool in after["tools"]
+        ), "the selected MCP function definition must reach the backend"
+
+    def test_deferred_mcp_sanitization_preserves_public_member_order(
+        self, file_resolve_stub_env
+    ):
+        client, _, backend, _ = file_resolve_stub_env
+        tool = {
+            "type": "mcp", "connector_id": "trusted-mcp",
+            "server_label": "weather", "defer_loading": True,
+            "server_description": "weather lookup", "allowed_callers": ["assistant"],
+            "allowed_tools": ["get_weather"], "require_approval": "never",
+        }
+        response = client.responses.create(
+            model="gpt-4.1", input="hello", store=False,
+            tools=[{"type": "tool_search"}, tool],
+        )
+        assert response.status == "completed"
+        assert len(backend.captured) == 1
+        actual = backend.captured[0]["tools"][1]
+        assert list(actual) == [key for key in tool if key != "connector_id"]
+        assert actual == {key: value for key, value in tool.items() if key != "connector_id"}
 
     def test_file_url_rejects_cloud_metadata(self, file_resolve_stub_env):
         """Private-origin opt-ins must not grant access to metadata services."""

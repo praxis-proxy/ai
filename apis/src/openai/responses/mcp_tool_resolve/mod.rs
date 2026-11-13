@@ -2579,21 +2579,20 @@ fn sanitize_deferred_connector_tool(tool: serde_json::Value) -> serde_json::Valu
         serde_json::Value::Object(obj) => obj,
         other => return other,
     };
-    let mut sanitized = serde_json::Map::new();
-    for key in [
-        "type",
-        "server_label",
-        "server_description",
-        "defer_loading",
-        "allowed_tools",
-        "allowed_callers",
-        "require_approval",
-    ] {
-        if let Some(value) = obj.remove(key) {
-            sanitized.insert(key.to_owned(), value);
-        }
-    }
-    serde_json::Value::Object(sanitized)
+    // Filter in place so removing private connector fields cannot reorder public ones.
+    obj.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "type"
+                | "server_label"
+                | "server_description"
+                | "defer_loading"
+                | "allowed_tools"
+                | "allowed_callers"
+                | "require_approval"
+        )
+    });
+    serde_json::Value::Object(obj)
 }
 
 /// Detect duplicate function names involving at least one

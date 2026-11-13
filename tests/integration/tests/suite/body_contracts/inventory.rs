@@ -120,6 +120,13 @@ const NON_REQUEST_MUTATORS: &[(&str, &str)] = &[
     ("inflight_tracker", "tracks concurrent inference requests"),
 ];
 
+/// External processors own their output bytes and have separate protocol tests.
+/// They cannot promise the native AI filters' JSON-preservation contract.
+const EXTERNAL_PROCESSORS: &[(&str, &str)] = &[(
+    "ext_proc",
+    "processor-directed body replacement; covered by the llmd ext-proc suite",
+)];
+
 #[test]
 fn every_registered_ai_filter_has_a_body_contract_decision() {
     let registry = praxis_ai::build_full_registry(&test_subrequest_client());
@@ -163,7 +170,7 @@ fn unclassified_filters(registry: &FilterRegistry, covered: &BTreeSet<String>) -
     let core = FilterRegistry::with_builtins();
     let core_names = core.available_filters();
     let mut exemptions = BTreeSet::new();
-    for &(name, reason) in NON_REQUEST_MUTATORS {
+    for &(name, reason) in NON_REQUEST_MUTATORS.iter().chain(EXTERNAL_PROCESSORS) {
         assert!(!reason.trim().is_empty(), "{name} needs a classification reason");
         assert!(exemptions.insert(name), "duplicate classification for {name}");
     }

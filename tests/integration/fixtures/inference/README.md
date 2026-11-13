@@ -330,7 +330,10 @@ actual fixture with the committed fixture.
 Fixture normalization sorts JSON object members, so normalized fixture equality
 does not prove that a filter preserved the incoming member order or body bytes.
 The runner now checks semantically retained JSON subtrees against the upstream
-capture before normalization. A second sweep reverses object-member order in
+capture before normalization. Native API requests compare retained sibling keys
+even when another member changes. Provider API translations own their protocol
+envelopes, so those mappings use expected-output assertions while intact payloads
+and retained tool schemas still receive ordering checks. A second sweep reverses object-member order in
 same-format requests, retaining array order. For provider translations it varies
 caller-owned schemas and metadata while retaining protocol envelope order.
 It replays every recording through that check and the existing expected-output
@@ -411,7 +414,11 @@ time; translation witnesses must instantiate the filter and have an actual
 client-to-upstream request change in a replayed recording. No-op configuration
 membership and `on_result` conditions cannot satisfy this requirement. Observers,
 local endpoints, and response-only writers have documented reasons in
-`NON_REQUEST_MUTATORS`. Core builtins retain their upstream test coverage.
+`NON_REQUEST_MUTATORS`. External processors are classified separately: the optional
+`ext_proc` compatibility filter delegates body replacement to an external service,
+which can intentionally return arbitrary bytes. Its protocol suite covers those
+mutations; it does not promise the native filters' JSON-preservation contract.
+Core builtins retain their upstream test coverage.
 
 Adding a mutator requires an active-mutation case that checks the intended edits
 and retained ordering, plus exact-byte cases for supported no-op paths. Declare

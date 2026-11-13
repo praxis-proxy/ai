@@ -52,17 +52,23 @@ pub fn assert_json_changes_only(before: &[u8], after: &[u8], changes: &[&str]) {
     compare_unchanged(&before, &after, changes, "", "body");
 }
 
-/// Find an ordering regression in a semantically retained JSON subtree.
+/// Find a change to the relative order of semantically retained object members.
 ///
 /// This complements a transformation's expected-output assertions. It compares
-/// corresponding fields and array positions only, so moved/translated content
+/// corresponding fields and array positions even when sibling values change.
+/// Added and removed keys are ignored, so moved/translated content
 /// still needs a filter-specific mapping test. Call before fixture normalization,
 /// which intentionally sorts keys and would erase this evidence.
 ///
 /// Returns an opaque position rather than payload values or field names.
 #[must_use]
 pub fn retained_json_order_mismatch(before: &Value, after: &Value) -> Option<String> {
-    retained_order(before, after, "body")
+    retained_order(before, after, "body", true)
+}
+
+/// Endpoint translations own their protocol envelopes; intact subtrees still retain order.
+pub(crate) fn translated_json_order_mismatch(before: &Value, after: &Value) -> Option<String> {
+    retained_order(before, after, "body", false)
 }
 
 /// Check retained function-tool order and schema property order across the
@@ -138,7 +144,7 @@ fn push_tool_schema<'a>(tool: &'a Value, schemas: &mut Vec<(&'a str, Option<&'a 
 /// Schema value conversions may change types, but retained property names
 /// must not be sorted or otherwise permuted as a side effect.
 fn schema_order(before: &Value, after: &Value, position: &str) -> Option<String> {
-    if let Some(position) = retained_order(before, after, position) {
+    if let Some(position) = retained_order(before, after, position, true) {
         return Some(position);
     }
     match (before, after) {
@@ -169,13 +175,17 @@ fn schema_order(before: &Value, after: &Value, position: &str) -> Option<String>
 /// Compare property order even if a provider converted schema type values.
 fn schema_properties_reordered(before: &Map<String, Value>, after: &Map<String, Value>) -> bool {
     match (before.get("properties"), after.get("properties")) {
-        (Some(Value::Object(before)), Some(Value::Object(after))) => {
-            before.len() == after.len()
-                && before.keys().all(|key| after.contains_key(key))
-                && !before.keys().eq(after.keys())
-        },
+        (Some(Value::Object(before)), Some(Value::Object(after))) => shared_keys_reordered(before, after),
         _ => false,
     }
+}
+
+/// Added, removed, and modified members cannot hide a permutation of retained keys.
+fn shared_keys_reordered(before: &Map<String, Value>, after: &Map<String, Value>) -> bool {
+    !before
+        .keys()
+        .filter(|key| after.contains_key(*key))
+        .eq(after.keys().filter(|key| before.contains_key(*key)))
 }
 
 /// Validate JSON pointer escapes without accepting malformed `~` sequences.
@@ -254,16 +264,28 @@ fn compare_object_members(
     assert!(after.next().is_none(), "undeclared JSON field addition at {position}");
 }
 
+/// An edited member is owned by the transformation; its siblings still retain order.
+fn retained_members_reordered(before: &Map<String, Value>, after: &Map<String, Value>) -> bool {
+    let before_keys = before
+        .iter()
+        .filter_map(|(key, value)| (after.get(key) == Some(value)).then_some(key));
+    let after_keys = after
+        .iter()
+        .filter_map(|(key, value)| (before.get(key) == Some(value)).then_some(key));
+    !before_keys.eq(after_keys)
+}
+
 /// Inspect retained content even when a surrounding object was transformed.
-fn retained_order(before: &Value, after: &Value, position: &str) -> Option<String> {
+fn retained_order(before: &Value, after: &Value, position: &str, preserve_envelope: bool) -> Option<String> {
     match (before, after) {
         (Value::Object(before_object), Value::Object(after_object)) => {
-            if before == after && !before_object.keys().eq(after_object.keys()) {
+            if (preserve_envelope || before == after) && retained_members_reordered(before_object, after_object) {
                 return Some(position.to_owned());
             }
             for (index, (key, before)) in before_object.iter().enumerate() {
                 if let Some(after) = after_object.get(key)
-                    && let Some(mismatch) = retained_order(before, after, &format!("{position}.<key[{index}]>"))
+                    && let Some(mismatch) =
+                        retained_order(before, after, &format!("{position}.<key[{index}]>"), preserve_envelope)
                 {
                     return Some(mismatch);
                 }
@@ -271,7 +293,9 @@ fn retained_order(before: &Value, after: &Value, position: &str) -> Option<Strin
         },
         (Value::Array(before), Value::Array(after)) => {
             for (index, (before, after)) in before.iter().zip(after).enumerate() {
-                if let Some(mismatch) = retained_order(before, after, &format!("{position}[{index}]")) {
+                if let Some(mismatch) =
+                    retained_order(before, after, &format!("{position}[{index}]"), preserve_envelope)
+                {
                     return Some(mismatch);
                 }
             }
@@ -344,6 +368,47 @@ mod tests {
             Some("body.<key[1]>[0]")
         );
         assert!(retained_json_order_mismatch(&before, &before).is_none());
+    }
+
+    #[test]
+    fn changed_siblings_do_not_hide_retained_key_reordering() {
+        let before: Value = serde_json::from_str(r#"{"model":"alias","a":1,"b":2}"#).unwrap();
+        let after: Value = serde_json::from_str(r#"{"model":"target","b":2,"a":1}"#).unwrap();
+        assert_eq!(retained_json_order_mismatch(&before, &after).as_deref(), Some("body"));
+        let after: Value = serde_json::from_str(r#"{"added":0,"a":1,"b":2}"#).unwrap();
+        assert!(retained_json_order_mismatch(&before, &after).is_none());
+        let after: Value = serde_json::from_str(r#"{"b":2,"a":1,"added":0}"#).unwrap();
+        assert!(retained_json_order_mismatch(&before, &after).is_some());
+    }
+
+    #[test]
+    fn translated_envelopes_keep_payload_order_checks() {
+        let before: Value = serde_json::from_str(r#"{"model":"m","max_tokens":8,"metadata":{"z":1,"a":2}}"#).unwrap();
+        let after: Value =
+            serde_json::from_str(r#"{"max_tokens":8,"model":"target","metadata":{"z":1,"a":2}}"#).unwrap();
+        assert!(translated_json_order_mismatch(&before, &after).is_none());
+        let after: Value =
+            serde_json::from_str(r#"{"max_tokens":8,"model":"target","metadata":{"a":2,"z":1}}"#).unwrap();
+        assert!(translated_json_order_mismatch(&before, &after).is_some());
+    }
+
+    #[test]
+    fn changed_schema_properties_do_not_hide_retained_key_reordering() {
+        let before: Value =
+            serde_json::from_str(r#"{"properties":{"z":{"type":"string"},"a":{"type":"number"},"removed":{}}}"#)
+                .unwrap();
+        let after: Value =
+            serde_json::from_str(r#"{"properties":{"a":{"type":"NUMBER"},"z":{"type":"STRING"},"added":{}}}"#).unwrap();
+        assert!(schema_properties_reordered(
+            before.as_object().unwrap(),
+            after.as_object().unwrap()
+        ));
+        let after: Value =
+            serde_json::from_str(r#"{"properties":{"added":{},"z":{"type":"STRING"},"a":{"type":"NUMBER"}}}"#).unwrap();
+        assert!(!schema_properties_reordered(
+            before.as_object().unwrap(),
+            after.as_object().unwrap()
+        ));
     }
 
     #[test]

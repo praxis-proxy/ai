@@ -6796,3 +6796,16 @@ fn deferred_expansion_preserves_request_member_order() {
     assert_eq!(actual["tools"][1]["name"], "server__inspect");
     assert_eq!(actual["metadata"].to_string(), r#"{"z":"last","a":"first"}"#);
 }
+
+/// Sanitization drops private fields without rebuilding the public envelope.
+#[test]
+fn deferred_sanitization_preserves_public_member_order() {
+    let tool = serde_json::from_str(
+        r#"{"type":"mcp","connector_id":"private","server_label":"drive","defer_loading":true,"server_description":"files","allowed_callers":["assistant"],"allowed_tools":["search"],"authorization":"secret","require_approval":"never"}"#,
+    ).unwrap();
+    let actual = sanitize_deferred_connector_tool(tool);
+    assert_eq!(
+        actual.to_string(),
+        r#"{"type":"mcp","server_label":"drive","defer_loading":true,"server_description":"files","allowed_callers":["assistant"],"allowed_tools":["search"],"require_approval":"never"}"#
+    );
+}
