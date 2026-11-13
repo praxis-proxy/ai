@@ -106,7 +106,7 @@ macro_rules! vector_stores_operations {
                             request_body: request_body_shape!($body),
                         },
                         spec_path: $path,
-                        #[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
+                        #[cfg(any(feature = "openai-conversations", feature = "openai-files", feature = "openai-responses-openapi"))]
                         owned_contract: None,
                     },
                 },

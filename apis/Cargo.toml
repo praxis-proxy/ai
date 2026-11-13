@@ -46,12 +46,15 @@ store-all = ["store-postgres", "store-sqlite"]
 # Locally served Conversations API with JSON Schema item validation and the
 # generated implementation OpenAPI document.
 openai-conversations = ["store", "dep:jsonschema", "dep:utoipa"]
+# Files API contract: wire DTOs and owned operation metadata for the generated
+# implementation OpenAPI document.
+openai-files = ["experimental", "dep:utoipa"]
 # Context compaction with tiktoken token estimation.
 openai-compact = ["store", "dep:tiktoken-rs"]
 # MCP tool resolution and dispatch through the rmcp client (approvals persist).
 openai-mcp-tools = ["store", "dep:rmcp", "dep:sse-stream", "dep:jsonschema"]
 # Every OpenAI group, including experimental capabilities, without a backend.
-openai-all = ["openai-agentic-loop", "openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools", "openai-responses-openapi"]
+openai-all = ["openai-agentic-loop", "openai-file-resolve-filter", "openai-conversations", "openai-files", "openai-compact", "openai-mcp-tools", "openai-responses-openapi"]
 # Every non-experimental capability. Experimental OpenAI groups stay opt-in.
 full = []
 # Passive marker activated by experimental capabilities; enables none itself.

@@ -8,7 +8,7 @@
 //! registered method/path/ID must match the pinned specification, and a Praxis
 //! protocol extension must remain absent from that specification.
 
-use std::ops::Deref;
+use std::{collections::BTreeMap, ops::Deref};
 
 use praxis_ai_apis::openai::OpenAiOperationSpec;
 
@@ -111,6 +111,46 @@ where
     tally
 }
 
+/// One operation identity: `(METHOD, path)` mapped to its operation ID.
+pub(super) type OperationIds = BTreeMap<(String, String), String>;
+
+/// Compare pinned, runtime, and generated operation identities.
+///
+/// Reports every disagreement rather than stopping at the first:
+///
+/// - runtime vs pinned: registered but absent, ID mismatch, or pinned but unregistered;
+/// - generated vs runtime: missing on either side, or ID mismatch.
+pub(super) fn compare_three_way(
+    pinned: &OperationIds,
+    runtime: &OperationIds,
+    generated: &OperationIds,
+) -> Vec<String> {
+    let mut failures = compare_against(runtime, ("pinned specification", pinned));
+    failures.extend(compare_against(runtime, ("generated document", generated)));
+    failures
+}
+
+/// Compare the runtime registry with one other source, in both directions.
+fn compare_against(runtime: &OperationIds, (label, other): (&str, &OperationIds)) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (key, runtime_id) in runtime {
+        let (method, path) = key;
+        match other.get(key) {
+            Some(other_id) if other_id == runtime_id => {},
+            Some(other_id) => failures.push(format!(
+                "{method} {path} registers operation ID {runtime_id} but the {label} says {other_id}"
+            )),
+            None => failures.push(format!("{method} {path} is registered but absent from the {label}")),
+        }
+    }
+    for (method, path) in other.keys().filter(|key| !runtime.contains_key(*key)) {
+        failures.push(format!(
+            "{method} {path} is in the {label} but has no runtime registry entry"
+        ));
+    }
+    failures
+}
+
 /// Format a successful drift-check summary.
 pub(super) fn ok_summary(family: &str, tally: &Tally) -> String {
     format!(
@@ -121,7 +161,104 @@ pub(super) fn ok_summary(family: &str, tally: &Tally) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Comparison, compare};
+    use super::{Comparison, OperationIds, compare, compare_three_way};
+
+    /// Build an identity map from `(method, path, operationId)` triples.
+    fn ids(entries: &[(&str, &str, &str)]) -> OperationIds {
+        entries
+            .iter()
+            .map(|(method, path, id)| (((*method).to_owned(), (*path).to_owned()), (*id).to_owned()))
+            .collect()
+    }
+
+    /// Whether any failure contains `needle`.
+    fn has(failures: &[String], needle: &str) -> bool {
+        failures.iter().any(|failure| failure.contains(needle))
+    }
+
+    /// Two operations shared by every source in the agreeing baseline.
+    fn baseline() -> OperationIds {
+        ids(&[("GET", "/files", "listFiles"), ("POST", "/files", "createFile")])
+    }
+
+    #[test]
+    fn three_way_all_sources_agree() {
+        assert!(compare_three_way(&baseline(), &baseline(), &baseline()).is_empty());
+    }
+
+    #[test]
+    fn three_way_pinned_only_operation_is_reported() {
+        let mut pinned = baseline();
+        pinned.extend(ids(&[("DELETE", "/files/{file_id}", "deleteFile")]));
+        let failures = compare_three_way(&pinned, &baseline(), &baseline());
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(has(&failures, "DELETE /files/{file_id}") && has(&failures, "no runtime registry entry"));
+    }
+
+    #[test]
+    fn three_way_runtime_only_operation_is_reported_against_both() {
+        let mut runtime = baseline();
+        runtime.extend(ids(&[("PUT", "/files", "putFiles")]));
+        let failures = compare_three_way(&baseline(), &runtime, &baseline());
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("absent from the pinned specification"))
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("absent from the generated document"))
+        );
+    }
+
+    #[test]
+    fn three_way_generated_only_operation_is_reported() {
+        let mut generated = baseline();
+        generated.extend(ids(&[("PUT", "/files", "putFiles")]));
+        let failures = compare_three_way(&baseline(), &baseline(), &generated);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(has(
+            &failures,
+            "in the generated document but has no runtime registry entry"
+        ));
+    }
+
+    #[test]
+    fn three_way_generated_missing_operation_is_reported() {
+        let generated = ids(&[("GET", "/files", "listFiles")]);
+        let failures = compare_three_way(&baseline(), &baseline(), &generated);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(has(&failures, "POST /files") && has(&failures, "absent from the generated document"));
+    }
+
+    #[test]
+    fn three_way_id_mismatch_is_reported_per_pair() {
+        let wrong = ids(&[("GET", "/files", "listFiles"), ("POST", "/files", "uploadFile")]);
+
+        let failures = compare_three_way(&wrong, &baseline(), &baseline());
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(has(&failures, "pinned specification says uploadFile"));
+
+        let failures = compare_three_way(&baseline(), &baseline(), &wrong);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(has(&failures, "generated document says uploadFile"));
+
+        let failures = compare_three_way(&baseline(), &wrong, &baseline());
+        assert_eq!(failures.len(), 2, "{failures:?}");
+    }
+
+    #[test]
+    fn three_way_reports_multiple_failures_together() {
+        let pinned = ids(&[
+            ("GET", "/files", "listFiles"),
+            ("DELETE", "/files/{file_id}", "deleteFile"),
+        ]);
+        let generated = ids(&[("POST", "/files", "createFile")]);
+        let failures = compare_three_way(&pinned, &baseline(), &generated);
+        assert_eq!(failures.len(), 3, "every disagreement is reported: {failures:?}");
+    }
 
     /// Return the drift reason, or `None` when the comparison agrees.
     fn drift(comparison: Comparison) -> Option<String> {
