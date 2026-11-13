@@ -20,7 +20,9 @@ pub(crate) fn strip_ignored_fields(body: &[u8]) -> Option<Vec<u8>> {
     let mut value: Value = serde_json::from_slice(body).ok()?;
     let obj = value.as_object_mut()?;
 
-    obj.remove("model")?;
+    // `remove` swaps the last member into this slot under preserve_order.
+    // Removing an Azure-ignored field must retain every other member's order.
+    obj.shift_remove("model")?;
 
     serde_json::to_vec(&value).ok()
 }
@@ -45,6 +47,20 @@ mod tests {
     fn returns_none_without_model() {
         let input = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
         assert!(strip_ignored_fields(input).is_none());
+    }
+
+    #[test]
+    fn stripping_model_preserves_remaining_member_order() {
+        let expected =
+            br#"{"messages":[{"content":"hi","role":"user"}],"tools":[{"z":1,"a":2}],"extra":{"z":1,"a":2}}"#;
+        for input in [
+            br#"{"model":"gpt-4o","messages":[{"content":"hi","role":"user"}],"tools":[{"z":1,"a":2}],"extra":{"z":1,"a":2}}"#.as_slice(),
+            br#"{"messages":[{"content":"hi","role":"user"}],"model":"gpt-4o","tools":[{"z":1,"a":2}],"extra":{"z":1,"a":2}}"#.as_slice(),
+            br#"{"messages":[{"content":"hi","role":"user"}],"tools":[{"z":1,"a":2}],"extra":{"z":1,"a":2},"model":"gpt-4o"}"#.as_slice(),
+        ] {
+            let actual = strip_ignored_fields(input).unwrap();
+            assert_eq!(actual, expected, "removing model must preserve all remaining member order");
+        }
     }
 
     #[test]

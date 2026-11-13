@@ -42,6 +42,15 @@ const ANTHROPIC_BETA_HEADER: &str = "anthropic-beta";
 /// Normalizes Anthropic Messages protocol headers for native
 /// backends.
 ///
+/// `default_version` applies only when the caller sends no
+/// `anthropic-version`; a caller-supplied version, such as the `2026-10-21`
+/// default of Anthropic SDK v2, is forwarded unchanged. The filter does not
+/// validate version-specific body rules, so under `2026-10-21` the backend
+/// owns rejecting `temperature`, `top_p`, `top_k`, assistant `document`
+/// blocks, and non-empty citations on user text blocks. It does not touch
+/// credentials: remove `x-api-key` and `authorization` separately when the
+/// gateway owns the upstream credential.
+///
 /// # YAML
 ///
 /// ```yaml

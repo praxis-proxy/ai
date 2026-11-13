@@ -127,6 +127,14 @@ const DEGRADED_FEATURES_HEADER: &str = "x-degraded-features";
 /// from the allowlist, malformed markers, and other `context_management` edits
 /// are still rejected with a 400.
 ///
+/// Translation ends the Anthropic wire contract, so the filter removes
+/// `anthropic-version` and both Anthropic credential forms (`x-api-key` from
+/// SDK v1 and `authorization: Bearer` from SDK v2) before the request reaches
+/// the Chat Completions backend. Use `credential_injection` to add the
+/// backend's own token. The caller's API version does not change translation:
+/// `temperature`, `top_p`, and `top_k` are forwarded under either version, and
+/// `document` blocks and non-empty citations are rejected under either version.
+///
 /// # YAML
 ///
 /// ```yaml
