@@ -23,8 +23,9 @@ use crate::TokenRateLimitFilter;
 use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IdentityHeaderGuardFilter,
     InFlightRegistry, IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter, ModelToHeaderFilter,
-    ModelToProviderFilter, PromptEnrichFilter, ProviderRouteFilter, StreamUsageInjectFilter, TimeToFirstTokenFilter,
-    TokenCountFilter, TokenUsageHeadersFilter, TokenUsageMetricsFilter,
+    ModelToProviderFilter, PromptEnrichFilter, PromptLengthToHeaderFilter, ProviderRouteFilter,
+    StreamUsageInjectFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    TokenUsageMetricsFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -237,6 +238,10 @@ fn register_inference_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "model_to_provider" => ModelToProviderFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "prompt_length_to_header" => PromptLengthToHeaderFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -750,6 +755,7 @@ mod tests {
             "identity_header_guard",
             "llmisvc_model_provider_resolver",
             "model_to_provider",
+            "prompt_length_to_header",
             "state_owner",
             "project_state_owner_headers",
             "callout_credentials",
