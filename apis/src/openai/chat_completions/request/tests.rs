@@ -72,11 +72,11 @@ fn declares_read_only_buffering() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn create_request_publishes_model_fact() {
+async fn create_request_publishes_routing_facts() {
     let (ctx, action) = run_filter(
         Method::POST,
         "/v1/chat/completions",
-        r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}],"stream":true}"#,
+        r#"{"model":"gpt-4","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/image.png"}}]}],"stream":true}"#,
     )
     .await;
 
@@ -103,6 +103,11 @@ async fn create_request_publishes_model_fact() {
         Some("true"),
         "stream flag comes from the buffered body"
     );
+    assert_eq!(
+        ctx.get_metadata("openai_chat_completions_request.modality"),
+        Some("image"),
+        "modality comes from structured message content"
+    );
 
     let results = ctx
         .filter_results
@@ -111,6 +116,7 @@ async fn create_request_publishes_model_fact() {
     assert_eq!(results.get("format"), Some("openai_chat_completions"));
     assert_eq!(results.get("model"), Some("gpt-4"));
     assert_eq!(results.get("stream"), Some("true"));
+    assert_eq!(results.get("modality"), Some("image"));
 }
 
 #[tokio::test]

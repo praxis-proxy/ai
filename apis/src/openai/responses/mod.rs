@@ -589,6 +589,9 @@ fn write_optional_metadata(ctx: &mut HttpFilterContext<'_>, classified: &Classif
             max_output_tokens.to_string(),
         );
     }
+    if let Some(modality) = classified.modality {
+        ctx.set_metadata("openai_responses_request.modality", modality.as_str());
+    }
 }
 
 /// Write boolean presence flags to metadata.
@@ -696,6 +699,9 @@ fn promote_optional_results(
 
     if let Some(max_output_tokens) = classified.max_output_tokens {
         results.set("max_output_tokens", max_output_tokens.to_string())?;
+    }
+    if let Some(modality) = classified.modality {
+        results.set("modality", modality.as_str())?;
     }
 
     Ok(())

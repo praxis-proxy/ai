@@ -13,7 +13,7 @@ The operation is recognized from the request head, and the registry decides whic
 
 On managed paths, rejects `code_interpreter`, `background=true`, and non-null `prompt` with a 400 because the gateway does not implement them. The pre-routing fact publisher leaves these fields intact for direct upstreams. A non-null `prompt` is the deprecated OpenAI reusable prompt object (`{ id, version, variables }`); OpenAI retires reusable prompts and `v1/prompts` on 2026-11-30, so clients should move its content into `input` rather than rely on the gateway to resolve the saved object. Prefer `input` over top-level `instructions`, which managed-path content-policy extraction does not screen.
 
-Promotes `openai_responses_request.*` metadata, publishes filter results under `openai_responses_request`, and generates `responses.response_id` (`resp_` + 32 hex chars, CSPRNG), `responses.conversation_id`, `responses.store`, `responses.background`, and `responses.stream`.
+Promotes `openai_responses_request.*` metadata, publishes filter results under `openai_responses_request`, and generates `responses.response_id` (`resp_` + 32 hex chars, CSPRNG), `responses.conversation_id`, `responses.store`, `responses.background`, and `responses.stream`. Structured image/audio input is published as `modality` metadata and a branch result; it is never promoted to an HTTP header.
 
 Extends the shared classification settings with the one option that gates the managed-path lifecycle, so a pre-routing fact publisher and the managed owner can be configured from the same filter.
 

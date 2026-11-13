@@ -31,10 +31,11 @@ header is never a fact.
 | Fact | Producer | Carrier | Remove-then-set | Read by routing |
 |---|---|---|---|---|
 | Model name | `model_to_header` | header `X-Model` (configurable) | yes (#1039) | `intelligent_route`, `provider_route`, `token_rate_limit` |
+| Content modality | `openai_responses_request`, `anthropic_messages_request`, `openai_chat_completions_request` | metadata `<filter>.modality`; matching `filter_results` value | not applicable (proxy-owned, no request-header carrier) | branch conditions |
 | MCP method and tool name | `mcp` | metadata `mcp.method`, `mcp.name`; headers `x-praxis-mcp-*` | reserved prefix stripped at ingress | `intelligent_route` (tool routing takes precedence over the model header) |
 | A2A context/task owner | `a2a` | header `x-praxis-a2a-route-cluster` | reserved prefix stripped at ingress | core `router` |
 | Operation and protocol | `ai_operation` | headers `x-praxis-ai-operation`, `x-praxis-ai-application-protocol`; metadata `ai_operation.*` | yes (removed on no match) | branch conditions only |
-| Format, stream flag, tool presence, token limits | `openai_responses_request`, `anthropic_messages_request`, `openai_chat_completions_request` (metadata only) | headers `x-praxis-ai-format`, `x-praxis-ai-model`, `x-praxis-ai-stream`; metadata `<filter>.model`, `.stream`, `.has_tools`, `.max_tokens` | partial: default `x-praxis-ai-*` names are reserved; custom names are not stripped yet (praxis-proxy/ai#418) | `time_to_first_token` (model label); not yet by routing |
+| Format, stream flag, tool presence, token limits | `openai_responses_request`, `anthropic_messages_request`, `openai_chat_completions_request` (metadata only) | headers `x-praxis-ai-format`, `x-praxis-ai-model`, `x-praxis-ai-stream`; metadata `<filter>.model`, `.stream`, `.has_tools`, `.max_tokens` | partial: default `x-praxis-ai-*` names are reserved; custom names are not stripped yet (praxis-proxy/ai#418) | `time_to_first_token` (model label); branch conditions |
 | Session key | request header or cookie named in `session_affinity` | request | not applicable (client-owned by design) | `intelligent_route` affinity |
 | Tenant and subject | `identity_header_guard` (`identity.<header>` metadata), `state_owner` (`StateOwner` extension), authentication filters (`AuthenticatedIdentity` extension) | three carriers | partial: only `AuthenticatedIdentity` is verified in-process; `identity.*` and `StateOwner` are read from request headers and are trustworthy only behind an auth layer that strips client copies | `token_rate_limit` (subject), `external_metering` |
 | Over-quota tier | `token_rate_limit` soft tiers | injected upstream header | written by the filter | core `router` |
@@ -42,8 +43,8 @@ header is never a fact.
 
 Facts that do not exist yet, and would be produced in the same
 pre-read pass that `model_to_header` already performs: prompt
-size, modality, and a tools-present flag for routing (tracked in
-praxis-proxy/ai#106, #107, #108).
+size and a tools-present flag for routing (tracked in
+praxis-proxy/ai#106 and #107).
 
 ## Rules
 

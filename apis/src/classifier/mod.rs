@@ -42,6 +42,32 @@ impl AiRequestFormat {
 }
 
 // -----------------------------------------------------------------------------
+// ContentModality
+// -----------------------------------------------------------------------------
+
+/// Bounded content capability derived from structured request content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContentModality {
+    /// Audio content only.
+    Audio,
+    /// Image content only.
+    Image,
+    /// Both image and audio content.
+    ImageAudio,
+}
+
+impl ContentModality {
+    /// Stable value used by metadata and branch results.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Audio => "audio",
+            Self::Image => "image",
+            Self::ImageAudio => "image_audio",
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // ClassifiedRequest
 // -----------------------------------------------------------------------------
 
@@ -93,6 +119,8 @@ pub(crate) struct ClassifiedRequest {
     pub max_output_tokens: Option<u64>,
     /// Extracted `max_tokens` field value, if present.
     pub max_tokens: Option<u64>,
+    /// Image/audio capability required by structured request content.
+    pub modality: Option<ContentModality>,
     /// Extracted `model` field value, if present.
     pub model: Option<String>,
     /// Extracted `store` field value, if present.
@@ -191,10 +219,207 @@ fn classify_fields(obj: &serde_json::Map<String, serde_json::Value>, model: Opti
             .is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty())),
         max_output_tokens: obj.get("max_output_tokens").and_then(serde_json::Value::as_u64),
         max_tokens: obj.get("max_tokens").and_then(serde_json::Value::as_u64),
+        modality: detect_content_modality(obj, format),
         model,
         store: obj.get("store").and_then(serde_json::Value::as_bool),
         stream: obj.get("stream").and_then(serde_json::Value::as_bool),
     }
+}
+
+/// Detect image/audio requirements from the protocol's structured content.
+///
+/// The classifier walks the JSON value each request filter has already parsed;
+/// it does not deserialize the body a second time or copy media payloads.
+fn detect_content_modality(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    format: AiRequestFormat,
+) -> Option<ContentModality> {
+    let mut detected = DetectedModalities::default();
+
+    match format {
+        AiRequestFormat::Responses => detect_responses_input(obj.get("input"), &mut detected),
+        AiRequestFormat::AnthropicMessages | AiRequestFormat::ChatCompletions => {
+            detect_messages(obj.get("messages"), &mut detected);
+        },
+        AiRequestFormat::UnknownJson | AiRequestFormat::InvalidJson | AiRequestFormat::NonJson => {},
+    }
+
+    detected.modality()
+}
+
+/// Image and audio signals accumulated while walking structured content.
+#[derive(Default)]
+struct DetectedModalities {
+    /// Whether audio content was observed.
+    audio: bool,
+    /// Whether image content was observed.
+    image: bool,
+}
+
+impl DetectedModalities {
+    /// Return true once no additional signal can change the routing value.
+    const fn is_complete(&self) -> bool {
+        self.audio && self.image
+    }
+
+    /// Convert accumulated signals to the bounded public routing value.
+    const fn modality(&self) -> Option<ContentModality> {
+        match (self.image, self.audio) {
+            (false, false) => None,
+            (false, true) => Some(ContentModality::Audio),
+            (true, false) => Some(ContentModality::Image),
+            (true, true) => Some(ContentModality::ImageAudio),
+        }
+    }
+
+    /// Record an image/audio MIME type.
+    fn observe_media_type(&mut self, media_type: &str) {
+        if starts_with_ascii_case_insensitive(media_type, "image/") {
+            self.image = true;
+        } else if starts_with_ascii_case_insensitive(media_type, "audio/") {
+            self.audio = true;
+        }
+    }
+
+    /// Record a media data URL while ignoring ordinary text and URLs.
+    fn observe_data_url(&mut self, value: &str) {
+        if starts_with_ascii_case_insensitive(value, "data:image/") {
+            self.image = true;
+        } else if starts_with_ascii_case_insensitive(value, "data:audio/") {
+            self.audio = true;
+        }
+    }
+}
+
+/// Inspect Chat Completions or Anthropic message content.
+fn detect_messages(value: Option<&serde_json::Value>, detected: &mut DetectedModalities) {
+    let Some(messages) = value.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for message in messages {
+        detect_content(message.get("content"), detected);
+        if detected.is_complete() {
+            break;
+        }
+    }
+}
+
+/// Inspect Responses API input messages and direct content items.
+fn detect_responses_input(value: Option<&serde_json::Value>, detected: &mut DetectedModalities) {
+    let Some(items) = value.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for item in items {
+        match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("computer_call_output" | "function_call_output") => {
+                detect_content(item.get("output"), detected);
+            },
+            _ if item.get("content").is_some() => detect_content(item.get("content"), detected),
+            _ => detect_content_part(item, detected),
+        }
+        if detected.is_complete() {
+            break;
+        }
+    }
+}
+
+/// Inspect a structured content object or array.
+fn detect_content(value: Option<&serde_json::Value>, detected: &mut DetectedModalities) {
+    match value {
+        Some(serde_json::Value::Array(parts)) => {
+            for part in parts {
+                detect_content_part(part, detected);
+                if detected.is_complete() {
+                    break;
+                }
+            }
+        },
+        Some(value @ serde_json::Value::Object(_)) => detect_content_part(value, detected),
+        _ => {},
+    }
+}
+
+/// Inspect one typed content part and its known media source fields.
+fn detect_content_part(part: &serde_json::Value, detected: &mut DetectedModalities) {
+    let Some(part) = part.as_object() else {
+        return;
+    };
+    let part_type = part.get("type").and_then(serde_json::Value::as_str);
+    let image_url = present(part.get("image_url"));
+    let audio_url = present(part.get("audio_url"));
+    let input_audio = present(part.get("input_audio"));
+    let source = present(part.get("source"));
+    let file_id = present(part.get("file_id"));
+
+    if image_url || matches!(part_type, Some("input_image")) && file_id || matches!(part_type, Some("image")) && source
+    {
+        detected.image = true;
+    }
+    if audio_url || input_audio || matches!(part_type, Some("audio")) && source {
+        detected.audio = true;
+    }
+
+    for source in [
+        part.get("image_url"),
+        part.get("audio_url"),
+        part.get("input_audio"),
+        part.get("source"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        detect_media_source(source, detected);
+    }
+    detect_embedded_media(part, part_type, detected);
+}
+
+/// Inspect media metadata and schema-defined nested content containers.
+fn detect_embedded_media(
+    part: &serde_json::Map<String, serde_json::Value>,
+    part_type: Option<&str>,
+    detected: &mut DetectedModalities,
+) {
+    if let Some(media_type) = part.get("media_type").and_then(serde_json::Value::as_str) {
+        detected.observe_media_type(media_type);
+    }
+
+    // Anthropic tool results may return typed content blocks. Arbitrary tool
+    // inputs remain opaque because no other object type is traversed here.
+    if matches!(part_type, Some("tool_result")) {
+        detect_content(part.get("content"), detected);
+    }
+}
+
+/// Inspect a direct data URL or a structured media source without cloning it.
+fn detect_media_source(value: &serde_json::Value, detected: &mut DetectedModalities) {
+    match value {
+        serde_json::Value::String(value) => detected.observe_data_url(value),
+        serde_json::Value::Object(source) => {
+            if let Some(media_type) = source.get("media_type").and_then(serde_json::Value::as_str) {
+                detected.observe_media_type(media_type);
+            }
+            for value in [source.get("data"), source.get("url")]
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+            {
+                detected.observe_data_url(value);
+            }
+        },
+        _ => {},
+    }
+}
+
+/// Return true when a source field exists and is non-null.
+fn present(value: Option<&serde_json::Value>) -> bool {
+    value.is_some_and(|value| !value.is_null())
+}
+
+/// Compare an ASCII prefix without allocating a lowercase media payload.
+fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
 }
 
 /// Determine format from top-level keys.
@@ -276,6 +501,7 @@ pub(crate) fn empty_result(format: AiRequestFormat) -> ClassifiedRequest {
         has_tools: false,
         max_output_tokens: None,
         max_tokens: None,
+        modality: None,
         model: None,
         store: None,
         stream: None,
@@ -1035,5 +1261,83 @@ mod tests {
             Some("bad\nmodel"),
             "model with control chars should still be extracted by classifier"
         );
+    }
+
+    #[test]
+    fn chat_image_url_sets_image_modality() {
+        let body = br#"{"model":"gpt-4.1","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/image.png"}}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+    }
+
+    #[test]
+    fn chat_image_and_audio_set_combined_modality() {
+        let body = br#"{"messages":[{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},{"type":"input_audio","input_audio":{"data":"UklGRg==","format":"wav"}}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::ImageAudio));
+    }
+
+    #[test]
+    fn responses_input_image_sets_image_modality() {
+        let body =
+            br#"{"model":"gpt-4.1","input":[{"role":"user","content":[{"type":"input_image","file_id":"file_123"}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+    }
+
+    #[test]
+    fn anthropic_base64_source_sets_audio_modality() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":128,"system":"help","messages":[{"role":"user","content":[{"type":"audio","source":{"type":"base64","media_type":"audio/wav","data":"UklGRg=="}}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Audio));
+    }
+
+    #[test]
+    fn responses_computer_screenshot_sets_image_modality() {
+        let body = br#"{"input":[{"type":"computer_call_output","call_id":"call_123","output":{"type":"computer_screenshot","image_url":"data:image/png;base64,AAAA"}}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+    }
+
+    #[test]
+    fn responses_function_output_image_sets_image_modality() {
+        let body = br#"{"input":[{"type":"function_call_output","call_id":"call_123","output":[{"type":"input_text","text":"result"},{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+    }
+
+    #[test]
+    fn anthropic_tool_result_image_sets_image_modality() {
+        let body = br#"{"max_tokens":128,"system":"help","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":[{"type":"text","text":"result"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, Some(ContentModality::Image));
+    }
+
+    #[test]
+    fn responses_function_arguments_do_not_set_modality() {
+        let body = br#"{"input":[{"type":"function_call","call_id":"call_123","name":"inspect","arguments":"{\"image_url\":\"data:image/png;base64,AAAA\"}"}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, None);
+    }
+
+    #[test]
+    fn anthropic_tool_arguments_do_not_set_modality() {
+        let body = br#"{"max_tokens":128,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_123","name":"inspect","input":{"image_url":"data:image/png;base64,AAAA"}}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, None);
+    }
+
+    #[test]
+    fn missing_media_source_does_not_set_modality() {
+        let body = br#"{"messages":[{"content":[{"type":"image_url"},{"type":"input_image","file_id":null},{"type":"input_audio","input_audio":null}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, None);
+    }
+
+    #[test]
+    fn media_like_text_does_not_set_modality() {
+        let body = br#"{"messages":[{"content":[{"type":"text","text":"explain data:image/png;base64,AAAA"}]}]}"#;
+
+        assert_eq!(classify_request_body(body).modality, None);
     }
 }

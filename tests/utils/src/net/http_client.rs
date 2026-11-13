@@ -77,6 +77,19 @@ pub fn http_post(addr: &str, path: &str, body: &str) -> (u16, String) {
     (parse_status(&raw), parse_body(&raw))
 }
 
+/// Send an HTTP POST, retrying up to 3 times on transient 5xx responses.
+#[expect(clippy::disallowed_methods, reason = "blocking test utility, not async")]
+pub fn http_post_retry(addr: &str, path: &str, body: &str) -> (u16, String) {
+    for _ in 0..2 {
+        let (status, response) = http_post(addr, path, body);
+        if status < 500 {
+            return (status, response);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    http_post(addr, path, body)
+}
+
 // -----------------------------------------------------------------------------
 // IPv6 Wrappers
 // -----------------------------------------------------------------------------

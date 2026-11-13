@@ -82,6 +82,7 @@ mod model_to_header;
 mod model_to_header_body_limits;
 mod model_to_header_trust_existing;
 mod model_to_provider;
+mod multimodal_routing;
 #[cfg(all(feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
 #[cfg(feature = "store-sqlite")]
 mod openai_agentic_loop;

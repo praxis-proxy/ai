@@ -728,7 +728,10 @@ async fn filter_results_are_published_under_this_filter() {
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({
             "model": "gpt-4.1",
-            "input": "hi",
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_image", "file_id": "file_123"}]
+            }],
             "previous_response_id": "resp_1"
         }))
         .unwrap(),
@@ -741,6 +744,8 @@ async fn filter_results_are_published_under_this_filter() {
         .get("openai_responses_request")
         .expect("results belong to the filter that published them");
     assert_eq!(results.get("format"), Some("openai_responses"));
+    assert_eq!(results.get("modality"), Some("image"));
+    assert_eq!(ctx.get_metadata("openai_responses_request.modality"), Some("image"));
     assert_eq!(
         results.get("mode"),
         Some("stateful"),
