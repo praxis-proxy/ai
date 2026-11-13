@@ -402,7 +402,11 @@ async fn rehydration_merges_reasoning_and_history_without_reordering_other_field
 
 
 /// Compile-time links to active cases, independent of bypass configurations.
-#[cfg(all(feature = "openai-all", feature = "store-sqlite"))]
+#[cfg(all(
+    feature = "openai-all",
+    feature = "store-sqlite",
+    feature = "vertex-anthropic-filter"
+))]
 pub(super) fn mutation_witnesses() -> Vec<&'static str> {
     let _ = document_extraction_changes_only_the_file_content_part;
     let _ = file_resolution_changes_only_reference_fields;
