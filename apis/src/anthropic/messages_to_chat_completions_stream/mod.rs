@@ -32,64 +32,8 @@ use crate::{
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Metadata key for the partial line buffer between chunks.
-const LINE_BUFFER_KEY: &str = "anthropic_stream.line_buffer";
-
-/// Metadata key for the internal streaming state.
-const STREAM_STATE_KEY: &str = "anthropic_stream.state";
-
-/// Internal stream state value recorded after emitting `message_start`.
-const STREAM_STATE_STARTED: &str = "started";
-
-/// Internal stream state value recorded after emitting a terminal error event.
-const STREAM_STATE_FAILED: &str = "failed";
-
-/// OpenAI Chat Completions SSE sentinel that marks logical stream completion.
+/// OpenAI logical stream completion sentinel.
 const OPENAI_DONE_SENTINEL: &str = "[DONE]";
-
-/// Metadata key tracking whether a text content block is open.
-const TEXT_BLOCK_OPEN_KEY: &str = "anthropic_stream.text_block_open";
-
-/// Metadata key prefix for per-tool-call content block state.
-const TOOL_BLOCK_KEY_PREFIX: &str = "anthropic_stream.tool_block.";
-
-/// Metadata key suffix for a tool call's Anthropic content block index.
-const TOOL_BLOCK_INDEX_SUFFIX: &str = ".index";
-
-/// Metadata key suffix tracking whether a tool call's content block is open.
-const TOOL_BLOCK_OPEN_SUFFIX: &str = ".open";
-
-/// Metadata key counting distinct tool-call content blocks opened so far.
-///
-/// Each opened block pins per-block state (index and open/closed flag)
-/// for the response's lifetime; this count bounds that growth against
-/// `max_tool_blocks`. The trailing token is `tool_block_count`, not
-/// `tool_block.<key>`, so it never matches [`TOOL_BLOCK_KEY_PREFIX`].
-const TOOL_BLOCK_COUNT_KEY: &str = "anthropic_stream.tool_block_count";
-
-/// Metadata key for the finish reason from the upstream provider.
-const FINISH_REASON_KEY: &str = "anthropic_stream.finish_reason";
-
-/// Metadata key for the client stop sequence the upstream reported as matched.
-const STOP_SEQUENCE_KEY: &str = "anthropic_stream.stop_sequence";
-
-/// Metadata key for accumulated output token count.
-const OUTPUT_TOKENS_KEY: &str = "anthropic_stream.output_tokens";
-
-/// Metadata key for accumulated input (prompt) token count.
-const INPUT_TOKENS_KEY: &str = "anthropic_stream.input_tokens";
-
-/// Metadata key for cached input token count.
-const CACHE_READ_TOKENS_KEY: &str = "anthropic_stream.cache_read_tokens";
-
-/// Metadata key for the current content block index.
-const BLOCK_INDEX_KEY: &str = "anthropic_stream.block_index";
-
-/// Metadata key for incomplete UTF-8 bytes (hex-encoded) between chunks.
-const UTF8_BUFFER_KEY: &str = "anthropic_stream.utf8_buffer";
-
-/// Metadata key indicating the filter is armed for streaming transformation.
-const ARMED_KEY: &str = "anthropic_stream.armed";
 
 // -----------------------------------------------------------------------------
 // AnthropicMessagesToChatCompletionsStreamFilter
@@ -152,13 +96,17 @@ impl AnthropicMessagesToChatCompletionsStreamFilter {
         bytes: &Bytes,
         end_of_stream: bool,
     ) -> Result<Option<Bytes>, FilterError> {
-        decode_and_process_chunk(
+        let result = decode_and_process_chunk(
             ctx,
             bytes,
             end_of_stream,
             self.config.max_partial_event_bytes,
             self.config.max_tool_blocks,
-        )
+        );
+        if result.is_err() || end_of_stream {
+            ctx.remove_filter_state::<StreamState>();
+        }
+        result
     }
 }
 
@@ -190,11 +138,12 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsStreamFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        ctx.remove_filter_state::<StreamState>();
         if !should_arm(ctx) {
             return Ok(FilterAction::Continue);
         }
 
-        ctx.set_metadata(ARMED_KEY, "true".to_owned());
+        ctx.insert_filter_state(StreamState::default());
 
         if let Some(resp) = &mut ctx.response_header {
             resp.headers.remove(http::header::CONTENT_LENGTH);
@@ -218,6 +167,9 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsStreamFilter {
         }
 
         if is_stream_failed(ctx) {
+            if end_of_stream {
+                ctx.remove_filter_state::<StreamState>();
+            }
             if body.is_some() {
                 *body = Some(Bytes::new());
             }
@@ -263,7 +215,7 @@ fn decode_and_process_chunk(
     let combined = combine_pending_utf8(ctx, bytes);
     let Some(valid_up_to) = valid_utf8_prefix_len(ctx, combined.as_slice(), end_of_stream) else {
         // Never mix raw upstream bytes into an Anthropic event stream.
-        ctx.filter_metadata.remove(LINE_BUFFER_KEY);
+        state_mut(ctx).buffer = EventBuffer::default();
         return Err(FilterError::from(
             "anthropic_messages_to_chat_completions_stream: upstream SSE contains malformed UTF-8",
         ));
@@ -284,13 +236,12 @@ fn decode_and_process_chunk(
 
 /// Prefix any incomplete UTF-8 bytes retained from the previous chunk.
 fn combine_pending_utf8<'a>(ctx: &mut HttpFilterContext<'_>, bytes: &'a Bytes) -> CombinedUtf8Chunk<'a> {
-    match ctx.filter_metadata.remove(UTF8_BUFFER_KEY) {
-        Some(hex) => {
-            let mut pending = decode_hex_bytes(&hex);
-            pending.extend_from_slice(bytes);
-            CombinedUtf8Chunk::Owned(pending)
-        },
-        None => CombinedUtf8Chunk::Borrowed(bytes),
+    let mut pending = std::mem::take(&mut state_mut(ctx).utf8);
+    if pending.is_empty() {
+        CombinedUtf8Chunk::Borrowed(bytes)
+    } else {
+        pending.extend_from_slice(bytes);
+        CombinedUtf8Chunk::Owned(pending)
     }
 }
 
@@ -307,8 +258,7 @@ fn valid_utf8_prefix_len(ctx: &mut HttpFilterContext<'_>, combined: &[u8], end_o
             if tail.len() > 3 {
                 return None;
             }
-            ctx.filter_metadata
-                .insert(UTF8_BUFFER_KEY.to_owned(), encode_hex_bytes(tail));
+            state_mut(ctx).utf8.extend_from_slice(tail);
             Some(valid)
         },
         Err(_) => None,
@@ -334,6 +284,89 @@ impl CombinedUtf8Chunk<'_> {
     }
 }
 
+/// Incremental normalized event buffer. Scanning resumes at the last byte
+/// inspected, including one byte of overlap for a split blank line.
+#[derive(Default)]
+struct EventBuffer {
+    /// Normalized partial event text.
+    text: String,
+    /// Next delimiter search offset, including one byte of overlap.
+    scanned: usize,
+    /// A trailing CR may belong to a split CRLF pair.
+    pending_cr: bool,
+}
+
+impl EventBuffer {
+    /// Append and normalize only incoming text, preserving a split CRLF pair.
+    fn append(&mut self, chunk_str: &str, end_of_stream: bool) {
+        let mut incoming = chunk_str;
+        if self.pending_cr {
+            self.text.push('\n');
+            incoming = incoming.strip_prefix('\n').unwrap_or(incoming);
+        }
+        // Two consecutive bare CRs complete a blank line immediately,
+        // including when the pair spans chunks.
+        let flush_cr_pair = self.pending_cr && chunk_str == "\r";
+        let (text, pending_cr) = split_deferred_trailing_cr(incoming, end_of_stream || flush_cr_pair);
+        self.pending_cr = pending_cr;
+        self.text.push_str(&normalize_line_endings(text));
+    }
+}
+
+/// Progress of the client-visible stream.
+#[derive(Default)]
+enum StreamProgress {
+    /// No message start has been emitted.
+    #[default]
+    Waiting,
+    /// A message is in progress.
+    Started,
+    /// A terminal error was emitted; suppress subsequent chunks.
+    Failed,
+}
+
+/// Private state owned by one pipeline filter instance.
+#[derive(Default)]
+struct StreamState {
+    /// Incremental SSE framing state.
+    buffer: EventBuffer,
+    /// Incomplete UTF-8 suffix, at most three bytes.
+    utf8: Vec<u8>,
+    /// Message and terminal-error progress.
+    progress: StreamProgress,
+    /// Whether the current text block needs closing.
+    text_open: bool,
+    /// Next Anthropic content block index.
+    block_index: u32,
+    /// Number of distinct tool blocks opened against the configured limit.
+    tool_count: usize,
+    /// Upstream tool index to Anthropic index and open flag.
+    tools: std::collections::HashMap<String, (u32, bool)>,
+    /// Most recently reported upstream finish reason.
+    finish_reason: Option<String>,
+    /// Matched client-provided stop sequence.
+    stop_sequence: Option<String>,
+    /// Most recently reported completion token count.
+    output_tokens: u64,
+    /// Most recently reported prompt token count.
+    input_tokens: Option<u64>,
+    /// Most recently reported cached prompt token count.
+    cache_read_tokens: Option<u64>,
+}
+
+/// Access initialized instance state during pipeline execution.
+#[expect(
+    clippy::expect_used,
+    reason = "pipeline assigns a filter ID and this filter owns its state slot"
+)]
+fn state_mut<'a>(ctx: &'a mut HttpFilterContext<'_>) -> &'a mut StreamState {
+    if ctx.get_filter_state::<StreamState>().is_none() {
+        ctx.insert_filter_state(StreamState::default());
+    }
+    ctx.get_filter_state_mut::<StreamState>()
+        .expect("stream filter requires pipeline instance ID")
+}
+
 /// Parse SSE event boundaries from the combined buffer, transform
 /// each complete event, and store any leftover partial data.
 ///
@@ -348,48 +381,58 @@ fn process_sse_chunk(
     max_partial_event_bytes: usize,
     max_tool_blocks: usize,
 ) -> Result<Bytes, FilterError> {
-    let leftover = ctx.filter_metadata.get(LINE_BUFFER_KEY).map(String::as_str);
-    let combined = combine_chunk_with_leftover(leftover, chunk_str);
-    let (to_normalize, pending_cr) = split_deferred_trailing_cr(combined.as_ref(), end_of_stream);
-    let normalized = normalize_line_endings(to_normalize);
+    let mut buffer = std::mem::take(&mut state_mut(ctx).buffer);
+    buffer.append(chunk_str, end_of_stream);
     let mut output = Vec::new();
-    let remaining = process_complete_event_blocks(ctx, &normalized, &mut output, max_tool_blocks)?;
-
-    let to_buffer = if pending_cr {
-        format!("{remaining}\r")
-    } else {
-        remaining.to_owned()
-    };
-
-    store_line_buffer(ctx, to_buffer, max_partial_event_bytes)?;
-
-    if output.is_empty() {
-        Ok(Bytes::new())
-    } else {
-        Ok(Bytes::from(output))
-    }
-}
-
-/// Transform complete SSE event blocks and return the unconsumed suffix.
-fn process_complete_event_blocks<'a>(
-    ctx: &mut HttpFilterContext<'_>,
-    mut remaining: &'a str,
-    output: &mut Vec<u8>,
-    max_tool_blocks: usize,
-) -> Result<&'a str, FilterError> {
-    while let Some((event_block, rest)) = remaining.split_once("\n\n") {
-        remaining = rest;
-        process_event_block(ctx, event_block, output, max_tool_blocks)?;
+    let mut consumed = 0;
+    while let Some(offset) = buffer
+        .text
+        .as_bytes()
+        .get(buffer.scanned..)
+        .and_then(|tail| tail.windows(2).position(|pair| pair == b"\n\n"))
+    {
+        let end = buffer.scanned + offset;
+        let block = buffer.text.get(consumed..end).ok_or("invalid SSE event boundary")?;
+        process_event_block(ctx, block, &mut output, max_tool_blocks)?;
+        consumed = end + 2;
+        buffer.scanned = consumed;
         if is_stream_failed(ctx) {
-            return Ok("");
+            mark_stream_failed(ctx);
+            return Ok(Bytes::from(output));
         }
     }
-    Ok(remaining)
+    store_event_buffer(ctx, buffer, consumed, end_of_stream, max_partial_event_bytes)?;
+    Ok(Bytes::from(output))
+}
+
+/// Compact completed events once, enforce the partial-event limit, and retain
+/// the owned buffer until the next chunk or transport EOF.
+fn store_event_buffer(
+    ctx: &mut HttpFilterContext<'_>,
+    mut buffer: EventBuffer,
+    consumed: usize,
+    end_of_stream: bool,
+    max_partial_event_bytes: usize,
+) -> Result<(), FilterError> {
+    if consumed != 0 {
+        buffer.text.drain(..consumed);
+    }
+    buffer.scanned = buffer.text.len().saturating_sub(1);
+    if buffer.text.len() + usize::from(buffer.pending_cr) > max_partial_event_bytes {
+        return Err(format!(
+            "Anthropic Messages stream event exceeds a size limit set by the platform administrator (maximum {max_partial_event_bytes} bytes)."
+        ).into());
+    }
+    if !end_of_stream && (!buffer.text.is_empty() || buffer.pending_cr) {
+        state_mut(ctx).buffer = buffer;
+    }
+    Ok(())
 }
 
 /// Prefix the current chunk with any buffered incomplete SSE text.
 ///
 /// Returns borrowed `chunk_str` when there is no leftover prefix.
+#[cfg(test)]
 fn combine_chunk_with_leftover<'a>(leftover: Option<&str>, chunk_str: &'a str) -> Cow<'a, str> {
     match leftover {
         Some(prefix) if !prefix.is_empty() => {
@@ -413,39 +456,15 @@ fn split_deferred_trailing_cr(combined: &str, end_of_stream: bool) -> (&str, boo
         .map_or((combined, false), |without| (without, true))
 }
 
-/// Store bounded incomplete SSE event data between response chunks.
-fn store_line_buffer(
-    ctx: &mut HttpFilterContext<'_>,
-    buffer: String,
-    max_partial_event_bytes: usize,
-) -> Result<(), FilterError> {
-    if buffer.is_empty() {
-        ctx.filter_metadata.remove(LINE_BUFFER_KEY);
-        return Ok(());
-    }
-
-    if buffer.len() > max_partial_event_bytes {
-        ctx.filter_metadata.remove(LINE_BUFFER_KEY);
-        let msg = format!(
-            "Anthropic Messages stream event exceeds a size limit set by the platform administrator (maximum {max_partial_event_bytes} bytes)."
-        );
-        return Err(msg.into());
-    }
-
-    ctx.filter_metadata.insert(LINE_BUFFER_KEY.to_owned(), buffer);
-    Ok(())
-}
-
 /// Whether the filter has been armed in the response phase.
 fn is_armed(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.filter_metadata.get(ARMED_KEY).is_some_and(|v| v == "true")
+    ctx.get_filter_state::<StreamState>().is_some()
 }
 
 /// Whether a terminal error event has already ended the client-visible stream.
 fn is_stream_failed(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.filter_metadata
-        .get(STREAM_STATE_KEY)
-        .is_some_and(|v| v == STREAM_STATE_FAILED)
+    ctx.get_filter_state::<StreamState>()
+        .is_some_and(|state| matches!(state.progress, StreamProgress::Failed))
 }
 
 /// Whether the filter should arm: streaming request, SSE Content-Type, success status.
@@ -592,9 +611,8 @@ fn transform_chunk(
     }
 
     let started = ctx
-        .filter_metadata
-        .get(STREAM_STATE_KEY)
-        .is_some_and(|v| v == STREAM_STATE_STARTED);
+        .get_filter_state::<StreamState>()
+        .is_some_and(|state| matches!(state.progress, StreamProgress::Started));
 
     if !started {
         emit_message_start(ctx, chunk, output);
@@ -605,14 +623,14 @@ fn transform_chunk(
             transform_delta(ctx, delta, output, max_tool_blocks)?;
         }
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-            ctx.set_metadata(FINISH_REASON_KEY, reason.to_owned());
+            state_mut(ctx).finish_reason = Some(reason.to_owned());
         }
         // vLLM reports the matched stop string in a choice-level `stop_reason`;
         // only a client-provided sequence may be reported back as one.
         if let Some(matched) = choice.get("stop_reason").and_then(Value::as_str)
             && client_stop_sequences(ctx).iter().any(|sequence| sequence == matched)
         {
-            ctx.set_metadata(STOP_SEQUENCE_KEY, matched.to_owned());
+            state_mut(ctx).stop_sequence = Some(matched.to_owned());
         }
     }
 
@@ -644,21 +662,21 @@ fn reject_untranslatable_choice(ctx: &mut HttpFilterContext<'_>, choice: &Value,
     true
 }
 
-/// Extract token usage from a chunk and store in filter metadata.
+/// Retain typed token usage from a chunk.
 fn extract_usage_tokens(ctx: &mut HttpFilterContext<'_>, chunk: &Value) {
     if let Some(usage) = chunk.get("usage") {
         if let Some(ot) = usage.get("completion_tokens").and_then(Value::as_u64) {
-            ctx.set_metadata(OUTPUT_TOKENS_KEY, ot.to_string());
+            state_mut(ctx).output_tokens = ot;
         }
         if let Some(pt) = usage.get("prompt_tokens").and_then(Value::as_u64) {
-            ctx.set_metadata(INPUT_TOKENS_KEY, pt.to_string());
+            state_mut(ctx).input_tokens = Some(pt);
         }
         if let Some(ct) = usage
             .get("prompt_tokens_details")
             .and_then(|d| d.get("cached_tokens"))
             .and_then(Value::as_u64)
         {
-            ctx.set_metadata(CACHE_READ_TOKENS_KEY, ct.to_string());
+            state_mut(ctx).cache_read_tokens = Some(ct);
         }
     }
 }
@@ -686,7 +704,7 @@ fn emit_message_start(ctx: &mut HttpFilterContext<'_>, chunk: &Value, output: &m
             }
         }),
     );
-    ctx.set_metadata(STREAM_STATE_KEY, STREAM_STATE_STARTED.to_owned());
+    state_mut(ctx).progress = StreamProgress::Started;
 }
 
 /// Extract the first choice from a Chat Completions streaming chunk.
@@ -748,7 +766,7 @@ fn emit_text_delta(ctx: &mut HttpFilterContext<'_>, content: &str, output: &mut 
                 "content_block": content_block
             }),
         );
-        ctx.set_metadata(TEXT_BLOCK_OPEN_KEY, "true".to_owned());
+        state_mut(ctx).text_open = true;
     }
 
     let idx = get_block_index(ctx);
@@ -800,7 +818,7 @@ fn close_text_block_if_open(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8
         &serde_json::json!({"type": "content_block_stop", "index": idx}),
     );
     increment_block_index(ctx);
-    ctx.set_metadata(TEXT_BLOCK_OPEN_KEY, "false".to_owned());
+    state_mut(ctx).text_open = false;
 }
 
 /// Return the stable key used to associate OpenAI tool-call deltas.
@@ -850,7 +868,7 @@ fn emit_tool_block_start(
     set_tool_block_index(ctx, tool_call_key, idx);
     set_tool_block_open(ctx, tool_call_key, true);
     increment_block_index(ctx);
-    ctx.set_metadata(TOOL_BLOCK_COUNT_KEY, (opened + 1).to_string());
+    state_mut(ctx).tool_count = opened + 1;
 
     Ok(true)
 }
@@ -874,9 +892,10 @@ fn extract_or_fail_tool_call<'a>(
 
 /// Discard parser state and suppress every event after a terminal stream error.
 fn mark_stream_failed(ctx: &mut HttpFilterContext<'_>) {
-    ctx.filter_metadata.remove(LINE_BUFFER_KEY);
-    ctx.filter_metadata.remove(UTF8_BUFFER_KEY);
-    ctx.set_metadata(STREAM_STATE_KEY, STREAM_STATE_FAILED.to_owned());
+    *state_mut(ctx) = StreamState {
+        progress: StreamProgress::Failed,
+        ..StreamState::default()
+    };
 }
 
 /// Extract and validate the tool-call ID and function name from an OpenAI tool-call delta.
@@ -968,9 +987,8 @@ fn emit_done(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) {
     }
 
     let started = ctx
-        .filter_metadata
-        .get(STREAM_STATE_KEY)
-        .is_some_and(|v| v == STREAM_STATE_STARTED);
+        .get_filter_state::<StreamState>()
+        .is_some_and(|state| matches!(state.progress, StreamProgress::Started));
     if !started {
         emit_message_start(ctx, &Value::Null, output);
     }
@@ -993,8 +1011,9 @@ fn emit_final_block_stop(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) 
 
 /// Emit the `message_delta` event with stop reason and usage.
 fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
-    let stop_sequence = ctx.filter_metadata.get(STOP_SEQUENCE_KEY);
-    let stop_reason = match ctx.filter_metadata.get(FINISH_REASON_KEY).map(String::as_str) {
+    let state = ctx.get_filter_state::<StreamState>();
+    let stop_sequence = state.and_then(|state| state.stop_sequence.as_ref());
+    let stop_reason = match state.and_then(|state| state.finish_reason.as_deref()) {
         Some("stop") if stop_sequence.is_some() => "stop_sequence",
         Some(reason) => map_stop_reason(reason),
         None => "end_turn",
@@ -1018,20 +1037,12 @@ fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
     );
 }
 
-/// Collect token counts from metadata and build the terminal delta usage.
+/// Build terminal delta usage from the retained typed counts.
 fn collect_delta_usage(ctx: &HttpFilterContext<'_>) -> MessageDeltaUsage {
-    let output_tokens: u64 = ctx
-        .filter_metadata
-        .get(OUTPUT_TOKENS_KEY)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-
-    let prompt_tokens: Option<u64> = ctx.filter_metadata.get(INPUT_TOKENS_KEY).and_then(|v| v.parse().ok());
-
-    let cache_read: Option<u64> = ctx
-        .filter_metadata
-        .get(CACHE_READ_TOKENS_KEY)
-        .and_then(|v| v.parse().ok());
+    let state = ctx.get_filter_state::<StreamState>();
+    let output_tokens = state.map_or(0, |state| state.output_tokens);
+    let prompt_tokens = state.and_then(|state| state.input_tokens);
+    let cache_read = state.and_then(|state| state.cache_read_tokens);
 
     let input_tokens = prompt_tokens.map(|pt| match cache_read {
         Some(cached) => pt.saturating_sub(cached),
@@ -1061,82 +1072,68 @@ fn map_stop_reason(reason: &str) -> &str {
 
 /// Check whether a text content block is currently open.
 fn is_text_block_open(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.filter_metadata
-        .get(TEXT_BLOCK_OPEN_KEY)
-        .is_some_and(|v| v == "true")
+    ctx.get_filter_state::<StreamState>()
+        .is_some_and(|state| state.text_open)
 }
 
-/// Get the current block index from metadata.
+/// Get the current block index.
 fn get_block_index(ctx: &HttpFilterContext<'_>) -> u32 {
-    ctx.filter_metadata
-        .get(BLOCK_INDEX_KEY)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+    ctx.get_filter_state::<StreamState>()
+        .map_or(0, |state| state.block_index)
 }
 
-/// Increment the block index in metadata.
+/// Increment the block index.
 fn increment_block_index(ctx: &mut HttpFilterContext<'_>) {
     let current = get_block_index(ctx);
-    ctx.set_metadata(BLOCK_INDEX_KEY, (current + 1).to_string());
+    state_mut(ctx).block_index = current + 1;
 }
 
 /// Return how many tool-call content blocks have opened this response.
 fn get_tool_block_count(ctx: &HttpFilterContext<'_>) -> usize {
-    ctx.filter_metadata
-        .get(TOOL_BLOCK_COUNT_KEY)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+    ctx.get_filter_state::<StreamState>()
+        .map_or(0, |state| state.tool_count)
 }
 
-/// Build the metadata key for a tool call's Anthropic block index.
-fn tool_block_index_key(tool_call_key: &str) -> String {
-    format!("{TOOL_BLOCK_KEY_PREFIX}{tool_call_key}{TOOL_BLOCK_INDEX_SUFFIX}")
+/// Record the block index assigned to a tool call.
+fn set_tool_block_index(ctx: &mut HttpFilterContext<'_>, key: &str, idx: u32) {
+    state_mut(ctx).tools.entry(key.to_owned()).or_default().0 = idx;
 }
 
-/// Build the metadata key for a tool call's open/closed state.
-fn tool_block_open_key(tool_call_key: &str) -> String {
-    format!("{TOOL_BLOCK_KEY_PREFIX}{tool_call_key}{TOOL_BLOCK_OPEN_SUFFIX}")
+/// Return the Anthropic index assigned to a tool call.
+fn get_tool_block_index(ctx: &HttpFilterContext<'_>, key: &str) -> Option<u32> {
+    ctx.get_filter_state::<StreamState>()?
+        .tools
+        .get(key)
+        .map(|block| block.0)
 }
 
-/// Record the Anthropic block index assigned to an OpenAI tool-call index.
-fn set_tool_block_index(ctx: &mut HttpFilterContext<'_>, tool_call_key: &str, idx: u32) {
-    ctx.set_metadata(tool_block_index_key(tool_call_key), idx.to_string());
+/// Update the open flag of an existing tool block.
+fn set_tool_block_open(ctx: &mut HttpFilterContext<'_>, key: &str, open: bool) {
+    if let Some(block) = state_mut(ctx).tools.get_mut(key) {
+        block.1 = open;
+    }
 }
 
-/// Return the Anthropic block index assigned to an OpenAI tool-call index.
-fn get_tool_block_index(ctx: &HttpFilterContext<'_>, tool_call_key: &str) -> Option<u32> {
-    ctx.filter_metadata
-        .get(&tool_block_index_key(tool_call_key))
-        .and_then(|v| v.parse().ok())
+/// Whether an existing tool block is open.
+fn is_tool_block_open(ctx: &HttpFilterContext<'_>, key: &str) -> bool {
+    ctx.get_filter_state::<StreamState>()
+        .and_then(|state| state.tools.get(key))
+        .is_some_and(|block| block.1)
 }
 
-/// Record whether a tool call's Anthropic content block remains open.
-fn set_tool_block_open(ctx: &mut HttpFilterContext<'_>, tool_call_key: &str, open: bool) {
-    ctx.set_metadata(tool_block_open_key(tool_call_key), open.to_string());
-}
-
-/// Check whether a tool call's Anthropic content block is currently open.
-fn is_tool_block_open(ctx: &HttpFilterContext<'_>, tool_call_key: &str) -> bool {
-    ctx.filter_metadata
-        .get(&tool_block_open_key(tool_call_key))
-        .is_some_and(|v| v == "true")
-}
-
-/// Return open tool blocks ordered by their Anthropic content block index.
+/// Return open blocks in Anthropic index order.
 fn open_tool_blocks(ctx: &HttpFilterContext<'_>) -> Vec<(u32, String)> {
     let mut blocks = ctx
-        .filter_metadata
-        .iter()
-        .filter_map(|(key, value)| {
-            if value != "true" {
-                return None;
-            }
-            let tool_call_key = key
-                .strip_prefix(TOOL_BLOCK_KEY_PREFIX)?
-                .strip_suffix(TOOL_BLOCK_OPEN_SUFFIX)?;
-            get_tool_block_index(ctx, tool_call_key).map(|idx| (idx, tool_call_key.to_owned()))
+        .get_filter_state::<StreamState>()
+        .map(|state| {
+            state
+                .tools
+                .iter()
+                .filter(|(_, block)| block.1)
+                .map(|(key, block)| (block.0, key.to_owned()))
+                .collect::<Vec<_>>()
         })
-        .collect::<Vec<_>>();
+        .unwrap_or_default();
     blocks.sort_by_key(|(idx, _)| *idx);
     blocks
 }
@@ -1184,32 +1181,6 @@ fn normalize_line_endings(s: &str) -> Cow<'_, str> {
     }
 }
 
-/// Hex-encode a byte slice (for buffering incomplete UTF-8 sequences).
-fn encode_hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Decode a hex-encoded byte slice.
-fn decode_hex_bytes(hex: &str) -> Vec<u8> {
-    hex.as_bytes()
-        .chunks_exact(2)
-        .filter_map(|pair| {
-            let hi = hex_nibble(*pair.first()?)?;
-            let lo = hex_nibble(*pair.last()?)?;
-            Some(hi << 4 | lo)
-        })
-        .collect()
-}
-
-/// Convert a single lowercase hex digit to its numeric value.
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        _ => None,
-    }
-}
-
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -1220,6 +1191,143 @@ mod tests {
     use std::borrow::Cow;
 
     use super::*;
+
+    #[test]
+    fn split_bare_cr_pair_emits_before_eof_at_partial_limit() {
+        for limit in [9, 1024] {
+            let (filter, mut ctx) = make_filter_and_context_from_yaml(&format!("max_partial_event_bytes: {limit}"));
+            let mut first = Some(Bytes::from_static(b"data: {}\r"));
+            drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
+            assert!(first.unwrap().is_empty(), "single trailing CR remains deferred");
+            let mut second = Some(Bytes::from_static(b"\r"));
+            drop(filter.on_response_body(&mut ctx, &mut second, false).unwrap());
+            assert!(
+                String::from_utf8(second.unwrap().to_vec())
+                    .unwrap()
+                    .contains("message_start"),
+                "the second bare CR must emit the completed event before EOF at limit {limit}"
+            );
+            assert!(
+                state_mut(&mut ctx).buffer.text.is_empty(),
+                "completed event must not count toward the partial limit"
+            );
+        }
+    }
+
+    #[test]
+    fn fragmented_limit_error_releases_instance_state() {
+        let (filter, mut ctx) = make_filter_and_context_from_yaml("max_partial_event_bytes: 8");
+        for _ in 0..8 {
+            let mut body = Some(Bytes::from_static(b"x"));
+            drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        }
+        let mut body = Some(Bytes::from_static(b"x"));
+        assert!(filter.on_response_body(&mut ctx, &mut body, false).is_err());
+        assert!(ctx.get_filter_state::<StreamState>().is_none());
+    }
+
+    #[test]
+    fn transport_eof_releases_working_state() {
+        let (filter, mut ctx) = make_filter_and_context();
+        let mut body = Some(Bytes::from_static(b"data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+        assert!(ctx.get_filter_state::<StreamState>().is_none());
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exercise every byte split for each SSE line ending"
+    )]
+    fn every_byte_boundary_preserves_utf8_and_line_endings() {
+        let events = |bytes: &[u8]| {
+            std::str::from_utf8(bytes)
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|data| {
+                    let mut value: Value = serde_json::from_str(data).unwrap();
+                    if let Some(message) = value.get_mut("message").and_then(Value::as_object_mut) {
+                        message.remove("id"); // Generated independently for each response.
+                    }
+                    value
+                })
+                .collect::<Vec<_>>()
+        };
+        for ending in ["\n", "\r\n", "\r"] {
+            let event = format!(
+                "data: {{\"id\":\"fixed\",\"choices\":[{{\"delta\":{{\"content\":\"é🌍\"}}}}]}}{ending}{ending}data: [DONE]{ending}{ending}"
+            );
+            let (filter, mut reference) = make_filter_and_context();
+            let mut whole = Some(Bytes::copy_from_slice(event.as_bytes()));
+            drop(filter.on_response_body(&mut reference, &mut whole, true).unwrap());
+            for split in 0..=event.len() {
+                let (filter, mut ctx) = make_filter_and_context();
+                let mut first = Some(Bytes::copy_from_slice(event.as_bytes().get(..split).unwrap()));
+                drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
+                let mut last = Some(Bytes::copy_from_slice(event.as_bytes().get(split..).unwrap()));
+                drop(filter.on_response_body(&mut ctx, &mut last, true).unwrap());
+                let actual = [first.unwrap().as_ref(), last.unwrap().as_ref()].concat();
+                assert_eq!(
+                    events(&actual),
+                    events(whole.as_ref().unwrap().as_ref()),
+                    "split {split}, ending {ending:?}"
+                );
+                assert!(ctx.get_filter_state::<StreamState>().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn instances_keep_independent_partial_events() {
+        let (filter, mut ctx) = make_filter_and_context();
+        let mut partial = Some(Bytes::from_static(b"data: {\"choices\":"));
+        drop(filter.on_response_body(&mut ctx, &mut partial, false).unwrap());
+        let second_filter = make_filter();
+        ctx.current_filter_id = Some(1);
+        ctx.insert_filter_state(StreamState::default());
+        let mut other = Some(Bytes::from_static(b"data: [DONE]\n\n"));
+        drop(second_filter.on_response_body(&mut ctx, &mut other, true).unwrap());
+        assert!(ctx.get_filter_state::<StreamState>().is_none());
+        ctx.current_filter_id = Some(0);
+        let mut tail = Some(Bytes::from_static(b"[]}\n\ndata: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut tail, true).unwrap());
+        assert!(
+            String::from_utf8(tail.unwrap().to_vec())
+                .unwrap()
+                .contains("message_stop")
+        );
+        assert!(ctx.filter_state.is_empty());
+    }
+
+    #[test]
+    #[expect(clippy::print_stderr, reason = "report the focused allocation measurement")]
+    fn fragmented_large_event_allocation_measurement() {
+        let input = format!(":{}", "x".repeat(256 * 1024));
+        let chunks = input.as_bytes().chunks(128).collect::<Vec<_>>();
+        let mut old = String::new();
+        let baseline = allocation_counter::measure(|| {
+            for chunk in &chunks {
+                let combined = combine_chunk_with_leftover(Some(&old), std::str::from_utf8(chunk).unwrap());
+                let normalized = normalize_line_endings(&combined);
+                old = normalized
+                    .rsplit_once("\n\n")
+                    .map_or_else(|| normalized.as_ref(), |(_, tail)| tail)
+                    .to_owned();
+            }
+        });
+        let (_, mut ctx) = make_filter_and_context();
+        let incremental = allocation_counter::measure(|| {
+            for chunk in &chunks {
+                process_sse_chunk(&mut ctx, std::str::from_utf8(chunk).unwrap(), false, 1024 * 1024, 10).unwrap();
+            }
+        });
+        eprintln!(
+            "fragmented 256KiB / 128B: baseline allocations={} bytes={}; incremental allocations={} bytes={}",
+            baseline.count_total, baseline.bytes_total, incremental.count_total, incremental.bytes_total
+        );
+        assert!(incremental.bytes_total < baseline.bytes_total);
+    }
 
     #[test]
     fn default_config_parses() {
@@ -1238,6 +1346,7 @@ mod tests {
         let filter = make_filter();
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
         let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.current_filter_id = Some(0);
 
         drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -1570,6 +1679,7 @@ mod tests {
         let filter = make_filter();
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
         let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.current_filter_id = Some(0);
         let mut resp = crate::test_utils::make_response();
         resp.headers.insert(
             http::header::CONTENT_TYPE,
@@ -1595,6 +1705,7 @@ mod tests {
         let filter = make_filter();
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
         let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.current_filter_id = Some(0);
         let mut resp = crate::test_utils::make_response();
         resp.headers.insert(
             http::header::CONTENT_TYPE,
@@ -1616,6 +1727,7 @@ mod tests {
         let filter = make_filter();
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
         let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.current_filter_id = Some(0);
         let mut resp = crate::test_utils::make_response();
         resp.headers.insert(
             http::header::CONTENT_TYPE,
@@ -1637,6 +1749,7 @@ mod tests {
         let filter = make_filter();
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
         let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.current_filter_id = Some(0);
         let mut resp = crate::test_utils::make_response();
         resp.headers.insert(
             http::header::CONTENT_TYPE,
@@ -1658,6 +1771,7 @@ mod tests {
         let filter = make_filter();
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
         let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.current_filter_id = Some(0);
         let mut resp = crate::test_utils::make_response();
         resp.headers.insert(
             http::header::CONTENT_TYPE,
@@ -1687,6 +1801,7 @@ mod tests {
         let filter = make_filter();
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
         let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.current_filter_id = Some(0);
         let mut resp = crate::test_utils::make_response();
         resp.headers.insert(
             http::header::CONTENT_TYPE,
@@ -1717,6 +1832,7 @@ mod tests {
         let filter = make_filter();
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
         let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.current_filter_id = Some(0);
         let mut resp = crate::test_utils::make_response();
         resp.headers.insert(
             http::header::CONTENT_TYPE,
@@ -1738,6 +1854,7 @@ mod tests {
         let filter = make_filter();
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
         let mut ctx = crate::test_utils::make_filter_context(Box::leak(Box::new(req)));
+        ctx.current_filter_id = Some(0);
 
         let chunk =
             "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\n";
@@ -1978,7 +2095,8 @@ mod tests {
             "malformed UTF-8 should fail the transformed stream"
         );
         assert!(
-            !ctx.filter_metadata.contains_key(UTF8_BUFFER_KEY),
+            ctx.get_filter_state::<StreamState>()
+                .is_none_or(|state| state.utf8.is_empty()),
             "malformed UTF-8 should not be buffered as incomplete"
         );
     }
@@ -2015,7 +2133,8 @@ mod tests {
             "truncated final UTF-8 should fail the transformed stream"
         );
         assert!(
-            !ctx.filter_metadata.contains_key(UTF8_BUFFER_KEY),
+            ctx.get_filter_state::<StreamState>()
+                .is_none_or(|state| state.utf8.is_empty()),
             "truncated final UTF-8 should not leave buffered bytes"
         );
     }
@@ -2038,7 +2157,8 @@ mod tests {
             "missing final body should reject pending incomplete UTF-8"
         );
         assert!(
-            !ctx.filter_metadata.contains_key(UTF8_BUFFER_KEY),
+            ctx.get_filter_state::<StreamState>()
+                .is_none_or(|state| state.utf8.is_empty()),
             "rejected pending UTF-8 should clear the buffer"
         );
     }
@@ -2062,7 +2182,8 @@ mod tests {
             "malformed UTF-8 should fail the transformed stream"
         );
         assert!(
-            !ctx.filter_metadata.contains_key(LINE_BUFFER_KEY),
+            ctx.get_filter_state::<StreamState>()
+                .is_none_or(|state| state.buffer.text.is_empty()),
             "malformed UTF-8 should discard buffered SSE data"
         );
         assert_stream_buffers_present(&ctx, false);
@@ -2353,7 +2474,8 @@ mod tests {
             "oversized incomplete SSE event should attribute the configured limit to the platform administrator"
         );
         assert!(
-            !ctx.filter_metadata.contains_key(LINE_BUFFER_KEY),
+            ctx.get_filter_state::<StreamState>()
+                .is_none_or(|state| state.buffer.text.is_empty()),
             "oversized incomplete SSE event should not remain buffered"
         );
     }
@@ -2637,12 +2759,14 @@ mod tests {
 
     fn assert_stream_buffers_present(ctx: &HttpFilterContext<'_>, expected: bool) {
         assert_eq!(
-            ctx.filter_metadata.contains_key(LINE_BUFFER_KEY),
+            ctx.get_filter_state::<StreamState>()
+                .is_some_and(|state| !state.buffer.text.is_empty()),
             expected,
             "SSE line buffer presence should be {expected}"
         );
         assert_eq!(
-            ctx.filter_metadata.contains_key(UTF8_BUFFER_KEY),
+            ctx.get_filter_state::<StreamState>()
+                .is_some_and(|state| !state.utf8.is_empty()),
             expected,
             "UTF-8 buffer presence should be {expected}"
         );
@@ -2676,7 +2800,8 @@ mod tests {
     fn make_filter_and_context_from_yaml(yaml: &str) -> (Box<dyn HttpFilter>, HttpFilterContext<'static>) {
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
         let mut ctx = crate::test_utils::make_filter_context(Box::leak(Box::new(req)));
-        ctx.set_metadata(ARMED_KEY, "true".to_owned());
+        ctx.current_filter_id = Some(0);
+        ctx.insert_filter_state(StreamState::default());
         (make_filter_from_yaml(yaml), ctx)
     }
 }

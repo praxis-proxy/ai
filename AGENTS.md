@@ -182,6 +182,28 @@ which existing filters were considered and why extending them is unsuitable.
   streaming and SSE filters should use
   `BodyMode::Stream` and process chunks
   incrementally.
+- **Per-response working state**: keep private parser
+  buffers, counters, indices, and progress in a typed
+  struct in `filter_state`, isolated per filter instance.
+  Reserve `filter_metadata` for intentional consumers
+  outside the filter; inspect readers before moving keys.
+  Retain bytes directly rather than encoding private
+  buffers as strings or hex. Release retained buffers
+  on completion or abandonment.
+- **Incremental parsing**: before adding a streaming
+  parser, inspect existing helpers and reuse them when
+  their boundary, UTF-8, limit, and EOF behavior matches.
+  Explain behavior or crate-dependency constraints that
+  prevent reuse. Carry owned buffers and scanning progress
+  across chunks so unfinished prefixes are not repeatedly
+  copied or rescanned. For buffering changes, measure
+  allocated bytes across increasing event sizes at a fixed
+  chunk size to detect quadratic growth.
+- **Streaming regressions**: test delivery before EOF,
+  split delimiters and UTF-8, configured limits, terminal
+  cleanup, and two instances sharing one request context.
+  Assert output after intermediate chunks as well as the
+  final combined output.
 - **Validate only proxy-needed fields**: let the
   backend handle parameter ranges, model
   availability, and role ordering.

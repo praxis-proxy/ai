@@ -82,6 +82,7 @@ class RecordingBackend(BaseHTTPRequestHandler):
     tool_call_arguments = "{}"
     untranslatable_reply_once: str | None = None
     untranslatable_stream_once: str | None = None
+    fragmented_stream_once = False
     error_response_once = False
 
     def do_POST(self):
@@ -104,6 +105,22 @@ class RecordingBackend(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(reply)))
             self.end_headers()
             self.wfile.write(reply)
+            return
+        if body.get("stream") and RecordingBackend.fragmented_stream_once:
+            RecordingBackend.fragmented_stream_once = False
+            text = "é🌍" * 2048
+            event = {"id": "chatcmpl-stub", "model": MODEL,
+                     "choices": [{"index": 0, "delta": {"content": text},
+                                  "finish_reason": "stop"}]}
+            payload = ("data: " + json.dumps(event, ensure_ascii=False)
+                       + "\r\n\r\ndata: [DONE]\r\n\r\n").encode()
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            for offset in range(0, len(payload), 127):
+                self.wfile.write(payload[offset:offset + 127])
+                self.wfile.flush()
             return
         if body.get("stream"):
             if RecordingBackend.untranslatable_stream_once:
@@ -654,6 +671,20 @@ class TestResponseValidation:
 
 
 class TestStreamingResponseValidation:
+    def test_fragmented_utf8_crlf_stream(self, anthropic_client):
+        RecordingBackend.fragmented_stream_once = True
+        try:
+            with anthropic_client.messages.stream(
+                model=MODEL, max_tokens=8192,
+                messages=[{"role": "user", "content": "hello"}],
+            ) as stream:
+                text = "".join(stream.text_stream)
+                message = stream.get_final_message()
+            assert text == "é🌍" * 2048
+            assert message.stop_reason == "end_turn"
+        finally:
+            RecordingBackend.fragmented_stream_once = False
+
     def test_invalid_tool_id_aborts_incomplete_stream(self, anthropic_client):
         RecordingBackend.bodies.clear()
         events = []
