@@ -46,6 +46,8 @@ filter_chains:
       - filter: model_to_header
 
       - filter: token_rate_limit
+        backend:
+          kind: memory
         key: model
         max_keys: 100000
         default_weights:

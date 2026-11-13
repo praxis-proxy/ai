@@ -21,6 +21,13 @@ pub(super) const CONVERSATIONS_SCOPE: OperationScope =
 pub(super) const RESPONSES_SCOPE: OperationScope =
     OperationScope::new("responses", "Responses", &["/responses"]).without_inherited_security();
 
+/// Files operations selected from the full OpenAI reference.
+///
+/// Inherited security is excluded: the generated Files document declares none
+/// because authentication is deployment-owned, as for Conversations.
+pub(super) const FILES_SCOPE: OperationScope =
+    OperationScope::new("files", "Files", &["/files"]).without_inherited_security();
+
 /// Runtime checks executed while generating the Conversations conformance report.
 const CONVERSATIONS_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
     RuntimeVerificationCheck {
@@ -188,6 +195,96 @@ const RESPONSES_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
         success_sentinel: "PRAXIS_CONFORMANCE_OK responses persistence_pipeline",
     },
 ];
+
+/// Runtime checks executed while generating the Files conformance report.
+const FILES_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
+    RuntimeVerificationCheck {
+        kind: "route_dispatch",
+        evidence: "openai::files::tests::conformance_files_routes_match_runtime_registry",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK files route_dispatch",
+    },
+    RuntimeVerificationCheck {
+        kind: "success_response_contract",
+        evidence: "openai::files::tests::conformance_files_success_payloads_match_generated_response_schemas",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK files success_response_contract",
+    },
+    RuntimeVerificationCheck {
+        kind: "schema_check_sensitivity",
+        evidence: "openai::files::tests::conformance_files_generated_schema_check_rejects_invalid_payload",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK files schema_check_sensitivity",
+    },
+    RuntimeVerificationCheck {
+        kind: "error_response_contract",
+        evidence: "openai::files::tests::conformance_files_error_responses_match_pinned_contract",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK files error_response_contract",
+    },
+];
+
+/// Evidence-backed discrepancies for Files operations.
+///
+/// Two kinds, each on every operation returning `OpenAIFile` that oasdiff
+/// reports: `evals` added to `OpenAIFile.purpose`, and an explicit
+/// `type: object` the pinned schema leaves implicit.
+const FILES_CONTRACT_EXCEPTIONS: &[ContractException] = &[
+    files_purpose_exception(
+        "GET",
+        "/files",
+        "responses.200.content.application/json.schema.properties.data.items.properties.purpose.enum.added",
+    ),
+    files_purpose_exception(
+        "GET",
+        "/files/{file_id}",
+        "responses.200.content.application/json.schema.properties.purpose.enum.added",
+    ),
+    files_purpose_exception(
+        "POST",
+        "/files",
+        "responses.200.content.application/json.schema.properties.purpose.enum.added",
+    ),
+    files_object_type_exception(
+        "GET",
+        "/files",
+        "responses.200.content.application/json.schema.properties.data.items.type.added",
+    ),
+    files_object_type_exception(
+        "GET",
+        "/files/{file_id}",
+        "responses.200.content.application/json.schema.type.added",
+    ),
+    files_object_type_exception(
+        "POST",
+        "/files",
+        "responses.200.content.application/json.schema.type.added",
+    ),
+];
+
+/// Declare one `OpenAIFile.purpose` exception.
+const fn files_purpose_exception(method: &'static str, path: &'static str, detail: &'static str) -> ContractException {
+    ContractException {
+        kind: super::model::ContractDriftKind::Response,
+        method: Some(method),
+        path: Some(path),
+        detail,
+        rationale: "the pinned CreateFileRequest.purpose enum accepts evals as an upload purpose, so a round-tripped file can report it, while the pinned OpenAIFile.purpose enum omits it",
+        evidence: "docs/conformance/specs/openai-openapi.yaml: CreateFileRequest.purpose enum includes evals; OpenAIFile.purpose enum omits it",
+    }
+}
+
+/// Declare one `OpenAIFile` explicit object-type exception.
+const fn files_object_type_exception(
+    method: &'static str,
+    path: &'static str,
+    detail: &'static str,
+) -> ContractException {
+    ContractException {
+        kind: super::model::ContractDriftKind::Response,
+        method: Some(method),
+        path: Some(path),
+        detail,
+        rationale: "the generated OpenAIFile schema states `type: object`, which the pinned schema leaves implicit; its properties already make it an object",
+        evidence: "praxis-ai-apis/openai/files/contracts.rs: OpenAiFile derived schema",
+    }
+}
 
 /// Evidence-backed discrepancies for Responses operations.
 const RESPONSES_CONTRACT_EXCEPTIONS: &[ContractException] = &[
@@ -399,6 +496,27 @@ pub(super) const CONFORMANCE_AREAS: &[ApiArea] = &[
         runtime_checks: RESPONSES_RUNTIME_CHECKS,
         contract_exceptions: RESPONSES_CONTRACT_EXCEPTIONS,
     },
+    ApiArea {
+        scope: FILES_SCOPE,
+        implementation_source: "generated:praxis-ai-apis/openai/files",
+        implementation_spec: files_implementation_spec,
+        supported_operations: files_supported_operations,
+        runtime_test_command: "cargo test -p praxis-ai-apis --no-default-features --features openai-files --lib conformance_files_ -- --show-output",
+        runtime_test_args: &[
+            "test",
+            "-p",
+            "praxis-ai-apis",
+            "--no-default-features",
+            "--features",
+            "openai-files",
+            "--lib",
+            "conformance_files_",
+            "--",
+            "--show-output",
+        ],
+        runtime_checks: FILES_RUNTIME_CHECKS,
+        contract_exceptions: FILES_CONTRACT_EXCEPTIONS,
+    },
 ];
 
 /// Generate the Conversations implementation spec from crate code.
@@ -430,6 +548,38 @@ fn conversations_supported_operations() -> Vec<SupportedOperation> {
                 "praxis_ai_apis::openai::conversations_operation_specs::{:?}",
                 spec.operation
             ),
+            contract_declared: spec.declares_contract(),
+        })
+        .collect()
+}
+
+/// Generate the Files implementation spec from crate code.
+fn files_implementation_spec() -> Result<String, String> {
+    #[cfg(feature = "openai-all")]
+    {
+        praxis_ai_apis::openai::files_openapi_json()
+            .map_err(|e| format!("failed to generate Files implementation OpenAPI spec: {e}"))
+    }
+    #[cfg(not(feature = "openai-all"))]
+    {
+        Err(
+            "Files conformance requires the experimental APIs: use cargo xtask or cargo run -p xtask --features openai-all --"
+                .to_owned(),
+        )
+    }
+}
+
+/// Return Files operations from the runtime route table.
+fn files_supported_operations() -> Vec<SupportedOperation> {
+    praxis_ai_apis::openai::files_operation_specs()
+        .iter()
+        .map(|spec| SupportedOperation {
+            method: spec.method().as_str().to_owned(),
+            path: spec.spec_path.to_owned(),
+            area: "Files".to_owned(),
+            mode: coverage_mode(spec.mode()),
+            evidence: format!("praxis_ai_apis::openai::files_operation_specs::{:?}", spec.operation),
+            contract_declared: spec.declares_contract(),
         })
         .collect()
 }
@@ -466,6 +616,7 @@ fn responses_supported_operations() -> Vec<SupportedOperation> {
                 "praxis_ai_apis::openai::responses_operation_specs::{:?}",
                 spec.operation
             ),
+            contract_declared: spec.declares_contract(),
         })
         .collect()
 }

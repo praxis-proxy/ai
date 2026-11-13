@@ -3,6 +3,7 @@
   "scope": {
     "areas": [
       "Conversations",
+      "Files",
       "Responses"
     ],
     "include_deprecated": false,
@@ -32,11 +33,18 @@
       "projection_sha256": "2da4413ec49e555fb5dc015e13906d92b1016255ca6105bcce2a005fcd10caa8",
       "operations": 14,
       "inherited_security": "deployment"
+    },
+    {
+      "area_id": "files",
+      "area": "Files",
+      "projection_sha256": "ed9723726e09ec9b0638644c759afe6def671d9fd7e41132dbfd18076e0c4fc7",
+      "operations": 5,
+      "inherited_security": "deployment"
     }
   ],
   "capability_coverage": {
-    "total_operations": 15,
-    "covered_operations_count": 15,
+    "total_operations": 20,
+    "covered_operations_count": 20,
     "missing_operations_count": 0,
     "coverage_percent": 100.0,
     "ignored": {
@@ -52,6 +60,13 @@
         "coverage_percent": 100.0
       },
       {
+        "area": "Files",
+        "total": 5,
+        "covered": 5,
+        "missing": 0,
+        "coverage_percent": 100.0
+      },
+      {
         "area": "Responses",
         "total": 7,
         "covered": 7,
@@ -62,7 +77,7 @@
     "by_mode": [
       {
         "mode": "passthrough",
-        "operations": 6
+        "operations": 11
       },
       {
         "mode": "inspect",
@@ -377,6 +392,106 @@
           "mode": "passthrough",
           "evidence": "praxis_ai_apis::openai::responses_operation_specs::CancelResponse"
         }
+      },
+      {
+        "operation": {
+          "method": "DELETE",
+          "path": "/files/{file_id}",
+          "operation": "DELETE /files/{file_id}",
+          "area": "Files",
+          "tag": "Files",
+          "operation_id": "deleteFile",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "DELETE",
+          "path": "/files/{file_id}",
+          "operation": "DELETE /files/{file_id}",
+          "area": "Files",
+          "mode": "passthrough",
+          "evidence": "praxis_ai_apis::openai::files_operation_specs::DeleteFile"
+        }
+      },
+      {
+        "operation": {
+          "method": "GET",
+          "path": "/files",
+          "operation": "GET /files",
+          "area": "Files",
+          "tag": "Files",
+          "operation_id": "listFiles",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "GET",
+          "path": "/files",
+          "operation": "GET /files",
+          "area": "Files",
+          "mode": "passthrough",
+          "evidence": "praxis_ai_apis::openai::files_operation_specs::ListFiles"
+        }
+      },
+      {
+        "operation": {
+          "method": "GET",
+          "path": "/files/{file_id}",
+          "operation": "GET /files/{file_id}",
+          "area": "Files",
+          "tag": "Files",
+          "operation_id": "retrieveFile",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "GET",
+          "path": "/files/{file_id}",
+          "operation": "GET /files/{file_id}",
+          "area": "Files",
+          "mode": "passthrough",
+          "evidence": "praxis_ai_apis::openai::files_operation_specs::RetrieveFile"
+        }
+      },
+      {
+        "operation": {
+          "method": "GET",
+          "path": "/files/{file_id}/content",
+          "operation": "GET /files/{file_id}/content",
+          "area": "Files",
+          "tag": "Files",
+          "operation_id": "downloadFile",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "GET",
+          "path": "/files/{file_id}/content",
+          "operation": "GET /files/{file_id}/content",
+          "area": "Files",
+          "mode": "passthrough",
+          "evidence": "praxis_ai_apis::openai::files_operation_specs::DownloadFile"
+        }
+      },
+      {
+        "operation": {
+          "method": "POST",
+          "path": "/files",
+          "operation": "POST /files",
+          "area": "Files",
+          "tag": "Files",
+          "operation_id": "createFile",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "POST",
+          "path": "/files",
+          "operation": "POST /files",
+          "area": "Files",
+          "mode": "passthrough",
+          "evidence": "praxis_ai_apis::openai::files_operation_specs::CreateFile"
+        }
       }
     ],
     "missing_operations": [],
@@ -674,22 +789,123 @@
           }
         ],
         "all_exact": false
+      },
+      {
+        "area_id": "files",
+        "area": "Files",
+        "implementation_source": "generated:praxis-ai-apis/openai/files",
+        "operation_contracts": {
+          "total": 5,
+          "exact": 5,
+          "missing": 0,
+          "drifted": 0,
+          "request_drifted": 0,
+          "response_drifted": 0,
+          "other_drifted": 0,
+          "exact_percent": 100.0,
+          "missing_operations": [],
+          "drifted_operations": []
+        },
+        "inherited_contract": {
+          "exact": true,
+          "details": []
+        },
+        "upstream_spec_exceptions": [
+          {
+            "kind": "response",
+            "operation": {
+              "method": "GET",
+              "path": "/files",
+              "operation": "GET /files"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.data.items.properties.purpose.enum.added",
+            "rationale": "the pinned CreateFileRequest.purpose enum accepts evals as an upload purpose, so a round-tripped file can report it, while the pinned OpenAIFile.purpose enum omits it",
+            "evidence": "docs/conformance/specs/openai-openapi.yaml: CreateFileRequest.purpose enum includes evals; OpenAIFile.purpose enum omits it"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "GET",
+              "path": "/files/{file_id}",
+              "operation": "GET /files/{file_id}"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.purpose.enum.added",
+            "rationale": "the pinned CreateFileRequest.purpose enum accepts evals as an upload purpose, so a round-tripped file can report it, while the pinned OpenAIFile.purpose enum omits it",
+            "evidence": "docs/conformance/specs/openai-openapi.yaml: CreateFileRequest.purpose enum includes evals; OpenAIFile.purpose enum omits it"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "POST",
+              "path": "/files",
+              "operation": "POST /files"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.purpose.enum.added",
+            "rationale": "the pinned CreateFileRequest.purpose enum accepts evals as an upload purpose, so a round-tripped file can report it, while the pinned OpenAIFile.purpose enum omits it",
+            "evidence": "docs/conformance/specs/openai-openapi.yaml: CreateFileRequest.purpose enum includes evals; OpenAIFile.purpose enum omits it"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "GET",
+              "path": "/files",
+              "operation": "GET /files"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.data.items.type.added",
+            "rationale": "the generated OpenAIFile schema states `type: object`, which the pinned schema leaves implicit; its properties already make it an object",
+            "evidence": "praxis-ai-apis/openai/files/contracts.rs: OpenAiFile derived schema"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "GET",
+              "path": "/files/{file_id}",
+              "operation": "GET /files/{file_id}"
+            },
+            "detail": "responses.200.content.application/json.schema.type.added",
+            "rationale": "the generated OpenAIFile schema states `type: object`, which the pinned schema leaves implicit; its properties already make it an object",
+            "evidence": "praxis-ai-apis/openai/files/contracts.rs: OpenAiFile derived schema"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "POST",
+              "path": "/files",
+              "operation": "POST /files"
+            },
+            "detail": "responses.200.content.application/json.schema.type.added",
+            "rationale": "the generated OpenAIFile schema states `type: object`, which the pinned schema leaves implicit; its properties already make it an object",
+            "evidence": "praxis-ai-apis/openai/files/contracts.rs: OpenAiFile derived schema"
+          }
+        ],
+        "all_exact": true
       }
     ],
     "operation_contracts": {
-      "total": 9,
-      "exact": 8,
+      "total": 14,
+      "exact": 13,
       "missing": 0,
       "drifted": 1,
       "request_drifted": 0,
       "response_drifted": 1,
       "other_drifted": 0,
-      "exact_percent": 88.88888888888889,
+      "exact_percent": 92.85714285714286,
       "by_area": [
         {
           "area": "Conversations",
           "total": 8,
           "conformant": 8,
+          "missing": 0,
+          "drifted": 0,
+          "request_drifted": 0,
+          "response_drifted": 0,
+          "other_drifted": 0,
+          "conformance_percent": 100.0
+        },
+        {
+          "area": "Files",
+          "total": 5,
+          "conformant": 5,
           "missing": 0,
           "drifted": 0,
           "request_drifted": 0,
@@ -713,6 +929,11 @@
     "area_contracts": [
       {
         "area": "Conversations",
+        "exact": true,
+        "details": []
+      },
+      {
+        "area": "Files",
         "exact": true,
         "details": []
       },
@@ -903,6 +1124,32 @@
           {
             "kind": "persistence_pipeline",
             "evidence": "openai::responses::store::tests::conformance_responses_pipeline_persists_after_format_request_body_classification"
+          }
+        ]
+      },
+      {
+        "area": "Files",
+        "modes": [
+          "passthrough"
+        ],
+        "status": "passed",
+        "command": "cargo test -p praxis-ai-apis --no-default-features --features openai-files --lib conformance_files_ -- --show-output",
+        "checks": [
+          {
+            "kind": "route_dispatch",
+            "evidence": "openai::files::tests::conformance_files_routes_match_runtime_registry"
+          },
+          {
+            "kind": "success_response_contract",
+            "evidence": "openai::files::tests::conformance_files_success_payloads_match_generated_response_schemas"
+          },
+          {
+            "kind": "schema_check_sensitivity",
+            "evidence": "openai::files::tests::conformance_files_generated_schema_check_rejects_invalid_payload"
+          },
+          {
+            "kind": "error_response_contract",
+            "evidence": "openai::files::tests::conformance_files_error_responses_match_pinned_contract"
           }
         ]
       }

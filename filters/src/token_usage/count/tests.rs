@@ -6,7 +6,7 @@
 use bytes::Bytes;
 use http::header::HeaderValue;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-use praxis_filter::{FilterAction, HttpFilter as _, Response};
+use praxis_filter::{FilterAction, HttpFilter as _, Request, Response};
 
 use super::*;
 
@@ -72,7 +72,7 @@ fn from_config_rejects_unknown_fields() {
 async fn on_response_sets_sse_mode_for_event_stream() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("text/event-stream");
     ctx.response_header = Some(&mut resp);
@@ -80,7 +80,7 @@ async fn on_response_sets_sse_mode_for_event_stream() {
     ctx.response_header = None;
 
     assert_eq!(
-        ctx.get_metadata(META_MODE),
+        capture_mode(&ctx),
         Some("sse"),
         "SSE content-type should set mode to sse"
     );
@@ -90,7 +90,7 @@ async fn on_response_sets_sse_mode_for_event_stream() {
 async fn on_response_sets_json_mode_for_application_json() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json");
     ctx.response_header = Some(&mut resp);
@@ -98,7 +98,7 @@ async fn on_response_sets_json_mode_for_application_json() {
     ctx.response_header = None;
 
     assert_eq!(
-        ctx.get_metadata(META_MODE),
+        capture_mode(&ctx),
         Some("json"),
         "JSON content-type should set mode to json"
     );
@@ -108,7 +108,7 @@ async fn on_response_sets_json_mode_for_application_json() {
 async fn on_response_handles_content_type_with_charset() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json; charset=utf-8");
     ctx.response_header = Some(&mut resp);
@@ -116,7 +116,7 @@ async fn on_response_handles_content_type_with_charset() {
     ctx.response_header = None;
 
     assert_eq!(
-        ctx.get_metadata(META_MODE),
+        capture_mode(&ctx),
         Some("json"),
         "JSON with charset should still set mode to json"
     );
@@ -126,7 +126,7 @@ async fn on_response_handles_content_type_with_charset() {
 async fn on_response_handles_case_insensitive_content_type() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("Text/Event-Stream");
     ctx.response_header = Some(&mut resp);
@@ -134,7 +134,7 @@ async fn on_response_handles_case_insensitive_content_type() {
     ctx.response_header = None;
 
     assert_eq!(
-        ctx.get_metadata(META_MODE),
+        capture_mode(&ctx),
         Some("sse"),
         "case-insensitive content-type should be recognized"
     );
@@ -144,51 +144,42 @@ async fn on_response_handles_case_insensitive_content_type() {
 async fn on_response_skips_non_success_status() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_status_and_content_type(http::StatusCode::BAD_REQUEST, "application/json");
     ctx.response_header = Some(&mut resp);
     drop(filter.on_response(&mut ctx).await.unwrap());
     ctx.response_header = None;
 
-    assert!(
-        ctx.get_metadata(META_MODE).is_none(),
-        "non-success status should not set mode"
-    );
+    assert!(capture_mode(&ctx).is_none(), "non-success status should not set mode");
 }
 
 #[tokio::test]
 async fn on_response_skips_unknown_content_type() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("text/plain");
     ctx.response_header = Some(&mut resp);
     drop(filter.on_response(&mut ctx).await.unwrap());
     ctx.response_header = None;
 
-    assert!(
-        ctx.get_metadata(META_MODE).is_none(),
-        "unknown content-type should not set mode"
-    );
+    assert!(capture_mode(&ctx).is_none(), "unknown content-type should not set mode");
 }
 
 #[tokio::test]
 async fn on_response_skips_missing_content_type() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = crate::test_utils::make_response();
     ctx.response_header = Some(&mut resp);
     drop(filter.on_response(&mut ctx).await.unwrap());
     ctx.response_header = None;
 
-    assert!(
-        ctx.get_metadata(META_MODE).is_none(),
-        "missing content-type should not set mode"
-    );
+    assert!(capture_mode(&ctx).is_none(), "missing content-type should not set mode");
 }
 
 // -----------------------------------------------------------------------------
@@ -344,7 +335,7 @@ async fn json_empty_body_sets_nothing() {
 async fn json_chunked_body_reassembled() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json");
     ctx.response_header = Some(&mut resp);
@@ -366,11 +357,11 @@ async fn json_chunked_body_reassembled() {
 }
 
 #[tokio::test]
-async fn json_clears_working_metadata() {
+async fn json_clears_capture_state() {
     let json = br#"{"usage":{"prompt_tokens":15,"completion_tokens":42,"total_tokens":57}}"#;
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json");
     ctx.response_header = Some(&mut resp);
@@ -380,15 +371,9 @@ async fn json_clears_working_metadata() {
     let mut body = Some(Bytes::from_static(json));
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
-    let working_keys: Vec<_> = ctx
-        .filter_metadata
-        .keys()
-        .filter(|k| k.starts_with(META_PREFIX))
-        .collect();
-
     assert!(
-        working_keys.is_empty(),
-        "all token_count.* working metadata should be cleared after extraction"
+        capture_mode(&ctx).is_none(),
+        "token_count capture state should be cleared after extraction"
     );
 }
 
@@ -459,6 +444,43 @@ async fn sse_anthropic_includes_prompt_cache_tokens() {
 }
 
 #[tokio::test]
+async fn sse_anthropic_counts_from_separate_chunks_are_combined() {
+    let filter = make_filter(ProviderKind::Anthropic);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = make_ctx(&req);
+
+    let mut resp = make_response_with_content_type("text/event-stream");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let chunks = [
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":500}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"Hi\"}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n",
+    ];
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let end_of_stream = index == chunks.len().saturating_sub(1);
+        let mut body = Some(Bytes::from_static(chunk.as_bytes()));
+        drop(filter.on_response_body(&mut ctx, &mut body, end_of_stream).unwrap());
+    }
+
+    let published = [
+        "token.input",
+        "token.output",
+        "token.total",
+        "token.cache_read",
+        "token.cache_write",
+    ]
+    .map(|key| ctx.get_metadata(key));
+    assert_eq!(
+        published,
+        [Some("610"), Some("42"), Some("652"), Some("500"), Some("100")],
+        "input and cache counts from the first chunk combine with output from the last"
+    );
+}
+
+#[tokio::test]
 async fn sse_google_final_usage_event() {
     let events = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}]}}]}\n\ndata: {\"usageMetadata\":{\"promptTokenCount\":15,\"candidatesTokenCount\":42,\"totalTokenCount\":57}}\n\n";
 
@@ -484,7 +506,7 @@ async fn sse_done_sentinel_ignored() {
 async fn sse_chunks_split_across_calls() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("text/event-stream");
     ctx.response_header = Some(&mut resp);
@@ -521,11 +543,11 @@ async fn sse_no_usage_events_sets_nothing() {
 }
 
 #[tokio::test]
-async fn sse_clears_working_metadata() {
+async fn sse_clears_capture_state() {
     let events = b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}\n\n";
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("text/event-stream");
     ctx.response_header = Some(&mut resp);
@@ -535,7 +557,7 @@ async fn sse_clears_working_metadata() {
     let mut body = Some(Bytes::copy_from_slice(events));
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
-    assert_no_working_metadata(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 // -----------------------------------------------------------------------------
@@ -615,7 +637,7 @@ async fn sse_oversized_event_recovers_and_captures_terminal_usage() {
 
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("text/event-stream");
     ctx.response_header = Some(&mut resp);
@@ -642,7 +664,7 @@ async fn sse_oversized_event_recovers_and_captures_terminal_usage() {
 async fn sse_overflow_does_not_finalize_mid_stream() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("text/event-stream");
     ctx.response_header = Some(&mut resp);
@@ -674,14 +696,14 @@ async fn sse_overflow_does_not_finalize_mid_stream() {
         Some("overflow"),
         "a drop after captured usage means later events (possibly a usage correction) were lost"
     );
-    assert_no_working_metadata(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 #[tokio::test]
 async fn sse_overflow_with_no_usage_sets_overflow_status() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("text/event-stream");
     ctx.response_header = Some(&mut resp);
@@ -712,7 +734,7 @@ async fn sse_partial_then_oversized_terminal_event_sets_overflow_status() {
     let mut filter = make_filter(ProviderKind::Anthropic);
     filter.max_scratch_bytes = 256;
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut resp = make_response_with_content_type("text/event-stream");
     ctx.response_header = Some(&mut resp);
     drop(filter.on_response(&mut ctx).await.unwrap());
@@ -742,7 +764,7 @@ async fn sse_partial_then_oversized_terminal_event_sets_overflow_status() {
 async fn sse_responses_completed_event_larger_than_64kib_captured_at_default_scratch() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("text/event-stream");
     ctx.response_header = Some(&mut resp);
@@ -766,7 +788,7 @@ async fn sse_responses_completed_event_beyond_scratch_marks_overflow() {
     let mut filter = make_filter(ProviderKind::OpenAi);
     filter.max_scratch_bytes = 65_536;
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("text/event-stream");
     ctx.response_header = Some(&mut resp);
@@ -795,7 +817,7 @@ async fn sse_responses_completed_event_beyond_scratch_marks_overflow() {
 fn on_response_body_noop_without_mode() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::GET, "/health");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut body = Some(Bytes::from_static(b"hello"));
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
@@ -820,7 +842,7 @@ fn on_response_body_noop_without_mode() {
 async fn json_overflow_sets_explicit_status_not_zero() {
     let filter = make_filter(ProviderKind::OpenAi);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json");
     ctx.response_header = Some(&mut resp);
@@ -840,7 +862,7 @@ async fn json_overflow_sets_explicit_status_not_zero() {
         Some("overflow"),
         "billing consumers must not mistake missing counts for zero usage"
     );
-    assert_no_working_metadata(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 /// A valid response with usage near the end but larger than the
@@ -850,7 +872,7 @@ async fn json_valid_usage_beyond_configured_limit_sets_overflow_status() {
     let mut filter = make_filter(ProviderKind::OpenAi);
     filter.max_body_bytes = 64;
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json");
     ctx.response_header = Some(&mut resp);
@@ -964,32 +986,6 @@ fn is_json_recognizes_variants() {
 }
 
 // -----------------------------------------------------------------------------
-// Hex Encoding
-// -----------------------------------------------------------------------------
-
-#[test]
-fn decode_hex_roundtrips() {
-    let data = b"hello world";
-    let encoded = data.iter().fold(String::new(), |mut s, b| {
-        _ = write!(s, "{b:02x}");
-        s
-    });
-    let decoded = decode_hex(&encoded).unwrap();
-
-    assert_eq!(decoded, data, "hex roundtrip should preserve data");
-}
-
-#[test]
-fn decode_hex_rejects_odd_length() {
-    assert!(decode_hex("abc").is_none(), "odd-length hex should return None");
-}
-
-#[test]
-fn decode_hex_rejects_invalid_chars() {
-    assert!(decode_hex("zz").is_none(), "invalid hex chars should return None");
-}
-
-// -----------------------------------------------------------------------------
 // Bedrock InvokeModel: Header-Only Path
 // -----------------------------------------------------------------------------
 
@@ -997,7 +993,7 @@ fn decode_hex_rejects_invalid_chars() {
 async fn bedrock_invoke_model_extracts_headers_on_response() {
     let filter = make_filter(ProviderKind::BedrockInvokeModel);
     let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = crate::test_utils::make_response();
     resp.headers.insert(HEADER_BEDROCK_INPUT, "25".parse().unwrap());
@@ -1027,7 +1023,7 @@ async fn bedrock_invoke_model_extracts_headers_on_response() {
 async fn bedrock_invoke_model_headers_absent_is_noop() {
     let filter = make_filter(ProviderKind::BedrockInvokeModel);
     let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = crate::test_utils::make_response();
     ctx.response_header = Some(&mut resp);
@@ -1048,7 +1044,7 @@ async fn bedrock_invoke_model_headers_absent_is_noop() {
 async fn bedrock_invoke_model_partial_headers_is_noop() {
     let filter = make_filter(ProviderKind::BedrockInvokeModel);
     let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = crate::test_utils::make_response();
     resp.headers.insert(HEADER_BEDROCK_INPUT, "25".parse().unwrap());
@@ -1066,7 +1062,7 @@ async fn bedrock_invoke_model_partial_headers_is_noop() {
 async fn bedrock_invoke_model_non_numeric_headers_is_noop() {
     let filter = make_filter(ProviderKind::BedrockInvokeModel);
     let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = crate::test_utils::make_response();
     resp.headers.insert(HEADER_BEDROCK_INPUT, "abc".parse().unwrap());
@@ -1089,7 +1085,7 @@ async fn bedrock_invoke_model_non_numeric_headers_is_noop() {
 async fn bedrock_invoke_model_skips_non_success_status() {
     let filter = make_filter(ProviderKind::BedrockInvokeModel);
     let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp =
         make_response_with_status_and_content_type(http::StatusCode::INTERNAL_SERVER_ERROR, "application/json");
@@ -1113,7 +1109,7 @@ async fn bedrock_invoke_model_skips_non_success_status() {
 async fn bedrock_invoke_model_does_not_set_content_type_mode() {
     let filter = make_filter(ProviderKind::BedrockInvokeModel);
     let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json");
     resp.headers.insert(HEADER_BEDROCK_INPUT, "25".parse().unwrap());
@@ -1123,7 +1119,7 @@ async fn bedrock_invoke_model_does_not_set_content_type_mode() {
     ctx.response_header = None;
 
     assert!(
-        ctx.get_metadata(META_MODE).is_none(),
+        capture_mode(&ctx).is_none(),
         "header-only path should never set the body extraction mode"
     );
 }
@@ -1144,7 +1140,7 @@ fn other_providers_response_body_access_is_read_only() {
 fn on_response_body_noop_for_bedrock_invoke_model() {
     let filter = make_filter(ProviderKind::BedrockInvokeModel);
     let req = crate::test_utils::make_request(http::Method::POST, "/model/amazon.titan/invoke");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut body: Option<Bytes> = None;
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
@@ -1350,7 +1346,7 @@ async fn sse_google_final_usage_records_cached_tokens() {
 async fn bedrock_invoke_model_headers_record_no_cache() {
     let filter = make_filter(ProviderKind::BedrockInvokeModel);
     let req = crate::test_utils::make_request(http::Method::POST, "/model/claude/invoke");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json");
     resp.headers
@@ -1626,7 +1622,7 @@ async fn json_stream_buffer_double_delivery_extracts_once() {
     let json = br#"{"usage":{"input_tokens":15,"output_tokens":42}}"#;
     let filter = make_filter(ProviderKind::Anthropic);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json");
     ctx.response_header = Some(&mut resp);
@@ -1662,7 +1658,7 @@ async fn json_stream_buffer_released_falls_back_to_chunks() {
     let json = br#"{"usage":{"input_tokens":7,"output_tokens":11}}"#;
     let filter = make_filter(ProviderKind::Anthropic);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json");
     ctx.response_header = Some(&mut resp);
@@ -1700,7 +1696,7 @@ async fn json_stream_buffer_released_final_chunk_extracts_usage() {
     let json = br#"{"id":"msg_1","usage":{"input_tokens":9,"output_tokens":13}}"#;
     let filter = make_filter(ProviderKind::Anthropic);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json");
     ctx.response_header = Some(&mut resp);
@@ -1730,7 +1726,7 @@ async fn json_stream_buffer_released_final_chunk_extracts_usage() {
         ctx.get_metadata("token.status").is_none(),
         "a released chain within the capture limit must not report overflow"
     );
-    assert_no_working_metadata(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 /// Another filter may buffer more than `token_count` is allowed to capture, so
@@ -1741,7 +1737,7 @@ async fn json_stream_buffer_frozen_body_beyond_limit_sets_overflow_status() {
     let mut filter = make_filter(ProviderKind::OpenAi);
     filter.max_body_bytes = 64;
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json");
     ctx.response_header = Some(&mut resp);
@@ -1770,7 +1766,7 @@ async fn json_stream_buffer_frozen_body_beyond_limit_sets_overflow_status() {
         Some("overflow"),
         "an oversized frozen body must report overflow, not zero usage"
     );
-    assert_no_working_metadata(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 /// A frozen buffer that reports no usage repeats the captured chunks. Retrying
@@ -1782,7 +1778,7 @@ async fn json_stream_buffer_frozen_body_without_usage_is_not_overflow() {
     let mut filter = make_filter(ProviderKind::OpenAi);
     filter.max_body_bytes = json.len() + json.len() / 2;
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/models");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json");
     ctx.response_header = Some(&mut resp);
@@ -1808,7 +1804,7 @@ async fn json_stream_buffer_frozen_body_without_usage_is_not_overflow() {
         ctx.get_metadata("token.status").is_none(),
         "a frozen body within the capture limit must not report overflow"
     );
-    assert_no_working_metadata(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 /// The released-chain fallback joins the captured chunks to the final chunk,
@@ -1819,7 +1815,7 @@ async fn json_stream_buffer_released_fallback_beyond_limit_sets_overflow_status(
     let mut filter = make_filter(ProviderKind::Anthropic);
     filter.max_body_bytes = json.len() - 1;
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json");
     ctx.response_header = Some(&mut resp);
@@ -1844,14 +1840,12 @@ async fn json_stream_buffer_released_fallback_beyond_limit_sets_overflow_status(
         Some("overflow"),
         "an oversized released capture must report overflow, not zero usage"
     );
-    assert_no_working_metadata(&ctx);
+    assert_capture_cleared(&ctx);
 }
 
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
-
-use std::fmt::Write as _;
 
 /// Builds a Responses-API stream whose terminal `response.completed` event
 /// embeds an output object padded to `pad_bytes`, mirroring how agentic
@@ -1870,6 +1864,22 @@ fn responses_stream_with_padded_completed_event(pad_bytes: usize) -> Vec<u8> {
         b"\"}],\"usage\":{\"input_tokens\":62000,\"output_tokens\":13000,\"total_tokens\":75000}}}\n\n",
     );
     events
+}
+
+/// A filter context with a filter invocation ID, which `token_count` needs to
+/// keep its capture in `filter_state`.
+fn make_ctx(req: &Request) -> HttpFilterContext<'_> {
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.current_filter_id = Some(0);
+    ctx
+}
+
+/// The body capture `on_response` started (`sse` or `json`), if one is active.
+fn capture_mode(ctx: &HttpFilterContext<'_>) -> Option<&'static str> {
+    ctx.get_filter_state::<CaptureState>().map(|capture| match capture {
+        CaptureState::Json { .. } => "json",
+        CaptureState::Sse { .. } => "sse",
+    })
 }
 
 fn make_filter(provider: ProviderKind) -> TokenCountFilter {
@@ -1895,15 +1905,10 @@ fn make_response_with_status_and_content_type(status: http::StatusCode, ct: &str
     resp
 }
 
-fn assert_no_working_metadata(ctx: &HttpFilterContext<'_>) {
-    let working_keys: Vec<_> = ctx
-        .filter_metadata
-        .keys()
-        .filter(|k| k.starts_with(META_PREFIX))
-        .collect();
+fn assert_capture_cleared(ctx: &HttpFilterContext<'_>) {
     assert!(
-        working_keys.is_empty(),
-        "all token_count.* working metadata should be cleared"
+        capture_mode(ctx).is_none(),
+        "token_count capture state should be cleared"
     );
 }
 
@@ -1914,7 +1919,7 @@ async fn run_json_extraction(
 ) -> (Option<String>, Option<String>, Option<String>) {
     let filter = make_filter(provider);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("application/json");
     ctx.response_header = Some(&mut resp);
@@ -1940,7 +1945,7 @@ async fn run_cache_extraction(
 ) -> (Option<String>, Option<String>) {
     let filter = make_filter(provider);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type(content_type);
     ctx.response_header = Some(&mut resp);
@@ -1961,7 +1966,7 @@ async fn run_cache_extraction(
 async fn run_reasoning_extraction(provider: ProviderKind, content_type: &str, body_bytes: &[u8]) -> Option<String> {
     let filter = make_filter(provider);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type(content_type);
     ctx.response_header = Some(&mut resp);
@@ -1981,7 +1986,7 @@ async fn run_sse_extraction(
 ) -> (Option<String>, Option<String>, Option<String>) {
     let filter = make_filter(provider);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
 
     let mut resp = make_response_with_content_type("text/event-stream");
     ctx.response_header = Some(&mut resp);
@@ -2006,7 +2011,7 @@ async fn run_sse_extraction(
 #[expect(clippy::too_many_lines, reason = "test asserts many metrics")]
 fn publish_token_usage_records_llm_metrics() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     ctx.cluster = Some("cb-glm".to_owned().into());
     ctx.set_metadata("openai_chat_completions_request.model", "gpt-x");
 
@@ -2050,7 +2055,7 @@ fn publish_token_usage_records_llm_metrics() {
 #[test]
 fn publish_token_usage_bumps_empty_completions_on_zero_output() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "gpt-x");
 
     let recorder = DebuggingRecorder::new();
@@ -2077,7 +2082,7 @@ fn publish_token_usage_bumps_empty_completions_on_zero_output() {
 #[expect(clippy::too_many_lines, reason = "test asserts many metrics")]
 fn bedrock_headers_record_llm_metrics() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     ctx.cluster = Some("bedrock".to_owned().into());
     ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "claude-x");
     let mut headers = http::HeaderMap::new();
@@ -2127,7 +2132,7 @@ fn bedrock_headers_record_llm_metrics() {
 #[test]
 fn bedrock_headers_without_headers_record_nothing() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = make_ctx(&req);
     let mut resp = Response {
         headers: http::HeaderMap::new(),
         status: http::StatusCode::OK,

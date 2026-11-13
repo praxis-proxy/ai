@@ -42,8 +42,8 @@ PRAXIS_AI_FEATURES ?= full
 LEAN_GRAPH_DENY := sqlx sqlx-core libsqlite3-sys native-tls rmcp sse-stream \
 	jsonschema utoipa tiktoken-rs reqwest serde_json_path tonic prost
 # Upper bound on crates (name@version, normal + build edges, host target) in the
-# explicit lean graph. Linux hosts measure about 428, macOS about 432.
-LEAN_GRAPH_BUDGET ?= 434
+# explicit lean graph. Linux hosts measure 431, macOS 435 with Cargo.lock.
+LEAN_GRAPH_BUDGET ?= 435
 STORE_BACKEND_FREE_FEATURES := standard,openai-all
 STORE_POSTGRES_FEATURES := standard,openai-all,store-postgres
 STORE_POSTGRES_CERT_AUTH_FEATURES := openai-responses,store-postgres-cert-auth
@@ -67,7 +67,7 @@ endif
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
 	test-token-rate-limit-sentinel-integration \
 	openai-conformance check-openai-conformance-reference test-openai-conformance \
-	test-responses-conformance test-responses-acceptance \
+	test-responses-conformance test-responses-acceptance support-report \
 	lint lint-clippy lint-xtask lint-lean check-dep-budget fmt doc audit coverage-check \
 	setup-lint-toolchains \
 	require-container-engine \
@@ -358,6 +358,13 @@ check-openai-conformance-reference:
 	cargo xtask openai-conformance-reference --check
 
 test-openai-conformance: openai-conformance
+
+support-report:
+	python3 .github/scripts/support_report.py generate \
+		--tag "$${TAG:-dev}" --sha "$$(git rev-parse HEAD)" \
+		--qualification "$${QUALIFICATION:-}" \
+		--release-qualification "$${RELEASE_QUALIFICATION:-}" \
+		--output-dir "$${OUTPUT_DIR:-target/support-report}"
 
 test-responses-conformance:
 	uv run tests/integration/sdk/openai/test_responses_conformance.py -v $(RESPONSES_CONFORMANCE_ARGS)
@@ -992,6 +999,7 @@ help:
 	@echo "  openai-conformance   compare registered API areas with OpenAI's OpenAPI spec"
 	@echo "  check-openai-conformance-reference  verify the pinned complete OpenAI reference"
 	@echo "  test-responses-conformance  Run OpenResponses suite against the translation filter (needs bun, uv, vLLM)"
+	@echo "  support-report       Assemble a local release support report from committed evidence"
 	@echo "  test-responses-acceptance   Run every OpenResponses template against a deployed Praxis endpoint"
 	@echo ""
 	@echo "Quality:"

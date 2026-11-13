@@ -93,6 +93,7 @@ fn support(method: &str, path: &str, area: &str, mode: CoverageMode) -> Supporte
         area: area.to_owned(),
         mode,
         evidence: "test evidence".to_owned(),
+        contract_declared: false,
     }
 }
 
@@ -204,6 +205,9 @@ fn selects_registered_areas_by_stable_id() {
     assert_eq!(selected.first().unwrap().scope.id, "conversations");
 
     args.areas = vec!["files".to_owned()];
+    assert_eq!(selected_areas(&args).unwrap().len(), 1, "Files is a registered area");
+
+    args.areas = vec!["vector_stores".to_owned()];
     assert!(selected_areas(&args).is_err(), "unregistered areas should be rejected");
 }
 
@@ -702,6 +706,53 @@ fn coverage_mode_labels_and_owned_modes_are_stable() {
     assert!(!CoverageMode::Inspect.is_owned());
     assert!(CoverageMode::Transform.is_owned());
     assert!(CoverageMode::Local.is_owned());
+}
+
+#[test]
+#[expect(clippy::too_many_lines, reason = "table-style fixture")]
+fn contract_operations_include_owned_modes_and_declared_contracts() {
+    let supported = vec![
+        // Passthrough with a declared contract: compared.
+        SupportedOperation {
+            contract_declared: true,
+            ..support("POST", "/conversations", "Conversations", CoverageMode::Passthrough)
+        },
+        // Passthrough without a contract: not compared.
+        support(
+            "GET",
+            "/conversations/{conversation_id}",
+            "Conversations",
+            CoverageMode::Passthrough,
+        ),
+        // Owned mode: compared regardless of the flag.
+        support(
+            "GET",
+            "/conversations/{conversation_id}/items",
+            "Conversations",
+            CoverageMode::Local,
+        ),
+    ];
+    let report = calculate_coverage(
+        test_reference(),
+        test_sources(),
+        scoped_operations(),
+        &supported,
+        false,
+        false,
+    );
+
+    let compared: BTreeSet<String> = report
+        .contract_operations()
+        .iter()
+        .map(|operation| operation.key.to_string())
+        .collect();
+    assert_eq!(
+        compared,
+        BTreeSet::from([
+            "POST /conversations".to_owned(),
+            "GET /conversations/{conversation_id}/items".to_owned(),
+        ])
+    );
 }
 
 #[test]
