@@ -2698,6 +2698,61 @@ async fn preflight_allows_web_search_tools_repeating_the_same_country() {
     );
 }
 
+#[test]
+fn country_pick_skips_earlier_null_user_location() {
+    // An earlier `user_location: null` must not stop dispatch from taking a later
+    // tool's country. Preflight already accepts this shape.
+    let state = ResponsesState::from_request_body(serde_json::json!({
+        "model": "gpt-4o",
+        "input": "weather near me",
+        "tools": [
+            {"type": "web_search", "user_location": null},
+            {"type": "web_search_preview", "user_location": {"type": "approximate", "country": "FR"}},
+        ],
+    }));
+    assert_eq!(web_search_country_from_state(&state), Some("FR"));
+}
+
+#[test]
+fn country_pick_skips_earlier_null_country_member() {
+    // `{type:approximate,country:null}` is unset for forwarding; a later FR must
+    // still become the outbound country.
+    let state = ResponsesState::from_request_body(serde_json::json!({
+        "model": "gpt-4o",
+        "input": "weather near me",
+        "tools": [
+            {"type": "web_search", "user_location": {"type": "approximate", "country": null}},
+            {"type": "web_search_preview", "user_location": {"type": "approximate", "country": "FR"}},
+        ],
+    }));
+    assert_eq!(web_search_country_from_state(&state), Some("FR"));
+}
+
+#[test]
+fn country_pick_keeps_single_tool_country() {
+    let state = ResponsesState::from_request_body(serde_json::json!({
+        "model": "gpt-4o",
+        "input": "weather near me",
+        "tools": [
+            {"type": "web_search_preview", "user_location": {"type": "approximate", "country": "FR"}},
+        ],
+    }));
+    assert_eq!(web_search_country_from_state(&state), Some("FR"));
+}
+
+#[test]
+fn country_pick_returns_none_when_every_location_is_unset() {
+    let state = ResponsesState::from_request_body(serde_json::json!({
+        "model": "gpt-4o",
+        "input": "weather near me",
+        "tools": [
+            {"type": "web_search", "user_location": null},
+            {"type": "web_search_preview", "user_location": {"type": "approximate", "country": null}},
+        ],
+    }));
+    assert_eq!(web_search_country_from_state(&state), None);
+}
+
 #[tokio::test]
 async fn preflight_rejects_a_malformed_country_for_you_com() {
     // You.com carries the country in a JSON alpha-2 enum. A malformed value passes
