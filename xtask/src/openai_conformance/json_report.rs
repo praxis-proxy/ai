@@ -69,6 +69,7 @@ pub(super) fn report_json(report: &CoverageReport, args: &Args) -> Value {
             .as_ref()
             .map_or_else(oasdiff_not_run_json, oasdiff_report_json),
         "runtime_verification": runtime_verification_json(report),
+        "responses_state_verification": responses_state_verification_json(report),
     })
 }
 
@@ -483,4 +484,95 @@ fn runtime_verification_area_json(report: &CoverageReport, verification: &Runtim
             "evidence": check.evidence,
         })).collect::<Vec<_>>(),
     })
+}
+
+/// Report focused checks of Praxis-owned Responses state, separately from API schemas.
+#[expect(
+    clippy::too_many_lines,
+    reason = "three explicit state verification groups share suite-level evidence"
+)]
+fn responses_state_verification_json(report: &CoverageReport) -> Value {
+    let verification = report
+        .runtime_verifications
+        .iter()
+        .find(|area| area.area == "Responses");
+    let mut groups = serde_json::Map::new();
+    for (id, scope) in [
+        (
+            "persistence",
+            "Local response persistence: default persistence, store:false, buffered and streamed responses",
+        ),
+        (
+            "rehydration",
+            "Stored previous_response_id and conversation history, rejection and owner isolation, JSON and SSE id restoration",
+        ),
+        (
+            "lifecycle",
+            "Local retrieval, missing resources, owner isolation, input-item pagination, deletion and stored SSE replay",
+        ),
+    ] {
+        let prefix = format!("{id}_");
+        let checks = verification
+            .into_iter()
+            .flat_map(|area| area.checks)
+            .filter(|check| check.kind.starts_with(&prefix))
+            .map(|check| json!({ "kind": check.kind, "evidence": check.evidence }))
+            .collect::<Vec<_>>();
+        let status = verification
+            .filter(|_| !checks.is_empty())
+            .map_or("not_verified", |area| area.status.as_str());
+        groups.insert(
+            id.to_owned(),
+            json!({
+                "status": status,
+                "scope": scope,
+                "command": verification.map(|area| area.command),
+                "checks": checks,
+            }),
+        );
+    }
+    json!({
+        "profile": "native-responses-stateful",
+        "boundary": "Focused runtime checks of Praxis-owned state; backend generation and Chat translation are outside this claim. A group passes only when the complete Responses runtime suite and all required sentinels pass.",
+        "groups": groups,
+    })
+}
+
+/// Write state badge assets from the same runtime evidence as the JSON report.
+#[expect(
+    clippy::too_many_lines,
+    reason = "self-contained SVG template and artifact error handling"
+)]
+pub(super) fn write_state_badges(report: &CoverageReport, directory: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("failed to create badge directory {}: {error}", directory.display()))?;
+    let verification = responses_state_verification_json(report);
+    for group in ["persistence", "rehydration", "lifecycle"] {
+        let status = verification
+            .get("groups")
+            .and_then(|groups| groups.get(group))
+            .and_then(|group| group.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("not_verified");
+        let (label, color) = match status {
+            "passed" => ("passed", "#4c1"),
+            "failed" => ("failed", "#e05d44"),
+            _ => ("not verified", "#9f9f9f"),
+        };
+        let svg = format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="300" height="20" role="img" aria-label="OpenAI Responses {group}: {label}">
+  <title>OpenAI Responses {group}: {label}</title>
+  <rect width="300" height="20" rx="3" fill="#555"/>
+  <path fill="{color}" d="M210 0h87a3 3 0 0 1 3 3v14a3 3 0 0 1-3 3h-87z"/>
+  <g fill="#fff" text-anchor="middle" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11">
+    <text x="105" y="14">OpenAI Responses {group}</text>
+    <text x="255" y="14">{label}</text>
+  </g>
+</svg>
+"##,
+        );
+        let path = directory.join(format!("responses-{group}.svg"));
+        std::fs::write(&path, svg).map_err(|error| format!("failed to write badge {}: {error}", path.display()))?;
+    }
+    Ok(())
 }

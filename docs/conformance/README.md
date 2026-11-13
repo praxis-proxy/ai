@@ -183,7 +183,8 @@ Generate the report:
 
 ```console
 cargo xtask openai-conformance \
-  --output-json docs/conformance/openai-conformance-report.json
+  --output-json docs/conformance/openai-conformance-report.json \
+  --output-badges-dir docs/conformance/badges
 ```
 
 The default selects all registered areas. Use `--area conversations` for a
@@ -261,6 +262,38 @@ global security mismatch.
 
 Use `owned_contract_conformance.fixes_required` as the actionable contract
 backlog.
+
+### Responses state verification
+
+`responses_state_verification` reports focused runtime evidence for the native
+Responses pipeline with local state filters configured. Its `groups` object has
+stable keys used by the README badges. `--output-badges-dir` generates local SVG
+assets from the same results, so badges render on branches and local README
+previews without fetching the report from `main`. CI regenerates and checks
+these assets alongside the report:
+
+
+| Group | Checked behavior |
+| --- | --- |
+| `persistence` | Default persistence admission, `store:false` preventing buffered and streamed writes, buffered and streamed persistence, and persistence through the classified pipeline. |
+| `rehydration` | History from `previous_response_id` and both `conversation` forms, missing or unfinished response rejection, owner isolation, and previous-response ID restoration in JSON and chunked SSE. |
+| `lifecycle` | Retrieval and missing-resource errors, owner isolation, input-item cursor pagination, deletion, and ordered stored SSE replay with cursor and owner checks. |
+
+Each group includes its scope, executed command, and required test evidence.
+A group is `passed` only if it has declared checks and the complete Responses
+runtime command succeeds with every required success sentinel present. Any
+suite failure or missing sentinel marks all declared groups `failed`;
+`not_verified` means the Responses suite was not run or the group has no checks.
+The command fails on runtime verification failure, including missing tests.
+
+These are test results, not percentages of the complete OpenAI contract.
+The state checks exercise local SQLite storage and controlled test fixtures;
+they do not certify every storage backend or a live vLLM deployment. The OpenAI
+SDK suite separately covers persistence, continuation, and lifecycle behavior;
+its results are not included in these badge statuses. Generation behavior belongs
+to the backend, and Chat Completions translation is a separate profile. Owned
+OpenAPI drift remains visible independently in `owned_contract_conformance`.
+See the [state conformance boundary](openai-responses-state-conformance.md).
 
 ### Upstream specification exceptions
 
