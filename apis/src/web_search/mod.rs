@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 pub(crate) use config::OpenAiWebSearchConfig;
 pub(crate) use config::{SearchContextSize, ValidatedConfig, WebSearchFilterConfig, build_config};
 #[cfg(feature = "openai-responses")]
-pub(crate) use domains::AllowedDomains;
+pub(crate) use domains::{DomainField, DomainFilters, DomainList};
 #[cfg(test)]
 use praxis_filter::FilterError;
 pub(crate) use provider::{CalloutContext, SearchClient, SearchOutcome, SearchResult};

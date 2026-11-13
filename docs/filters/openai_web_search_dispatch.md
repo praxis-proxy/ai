@@ -11,7 +11,9 @@ Detects pending web search calls in the response phase and executes them on re-e
 
 Each provider request is executed through the shared filtered-subrequest executor, which enforces destination authority, DNS/SSRF, TLS/SNI, and `Host` centrally. An optional `outbound_chain` runs operator-managed cross-cutting filters (headers, credentials, logging) on the callout; when omitted it defaults to an empty inline chain (pure passthrough), so the central protections still apply.
 
-A client's web-search `filters.allowed_domains` is enforced by the proxy on every provider result, so a result outside the allow-list (or its subdomains) never reaches the model or `action.sources`. Malformed, unsupported, or conflicting `filters` are rejected with HTTP 400 before the first inference round.
+A client's web-search `filters.allowed_domains` and `filters.blocked_domains` are enforced by the proxy on every provider result, so a result outside the allow-list (or under a blocked domain) never reaches the model or `action.sources`. Malformed, unsupported, or conflicting `filters` are rejected with HTTP 400 before the first inference round.
+
+Domain handling matches hosted OpenAI where hosted documents it: each list accepts up to 100 bare domains (no scheme), both match subdomains, and an absent, null, or empty list restricts nothing. Hosted does not document how the two lists combine; dispatch applies the allow-list and then removes blocked domains, so a host matching both is blocked. Requests whose web-search tools declare different `filters` are rejected because dispatch applies one filter to every search in the request; hosted behavior for that disagreement is undocumented.
 
 ## Configuration
 

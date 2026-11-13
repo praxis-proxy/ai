@@ -57,9 +57,10 @@ use crate::{
     callout_policy::MISSING_CALLOUT_CONTEXT,
     json_body::MAX_JSON_BODY_BYTES,
     web_search::{
-        AllowedDomains, CalloutContext, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize,
-        SearchOutcome, SearchQueryValidation, SearchResult, build_config, config::MAX_CALLS_PER_ROUND,
-        format_search_results, is_web_search_tool_type, provider::MAX_SEARCH_RESPONSE_BYTES, validate_search_query,
+        CalloutContext, DomainField, DomainFilters, DomainList, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE,
+        SearchClient, SearchContextSize, SearchOutcome, SearchQueryValidation, SearchResult, build_config,
+        config::MAX_CALLS_PER_ROUND, format_search_results, is_web_search_tool_type,
+        provider::MAX_SEARCH_RESPONSE_BYTES, validate_search_query,
     },
 };
 
@@ -131,11 +132,20 @@ const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before 
 /// omitted it defaults to an empty inline chain (pure passthrough), so the
 /// central protections still apply.
 ///
-/// A client's web-search `filters.allowed_domains` is enforced by the proxy on
-/// every provider result, so a result outside the allow-list (or its
-/// subdomains) never reaches the model or `action.sources`. Malformed,
-/// unsupported, or conflicting `filters` are rejected with HTTP 400 before the
-/// first inference round.
+/// A client's web-search `filters.allowed_domains` and `filters.blocked_domains`
+/// are enforced by the proxy on every provider result, so a result outside the
+/// allow-list (or under a blocked domain) never reaches the model or
+/// `action.sources`. Malformed, unsupported, or conflicting `filters` are
+/// rejected with HTTP 400 before the first inference round.
+///
+/// Domain handling matches hosted OpenAI where hosted documents it: each list
+/// accepts up to 100 bare domains (no scheme), both match subdomains, and an
+/// absent, null, or empty list restricts nothing. Hosted does not document how
+/// the two lists combine; dispatch applies the allow-list and then removes
+/// blocked domains, so a host matching both is blocked. Requests whose
+/// web-search tools declare different `filters` are rejected because dispatch
+/// applies one filter to every search in the request; hosted behavior for that
+/// disagreement is undocumented.
 ///
 /// # YAML
 ///
@@ -376,9 +386,7 @@ impl WebSearchDispatchFilter {
                     // Providers cannot be trusted to honor a domain restriction, so
                     // enforce it here before a result reaches the model or the
                     // public `action.sources` (issue #1768).
-                    if let Some(allowed) = scope.allowed_domains {
-                        query_results.retain(|result| allowed.permits_url(&result.url));
-                    }
+                    query_results.retain(|result| scope.domain_filters.permits_url(&result.url));
                     results.append(&mut query_results);
                 },
                 SearchOutcome::RetainedLimitExceeded => {
@@ -664,9 +672,10 @@ impl HttpFilter for WebSearchDispatchFilter {
 
         // Round-0 location and domain-filter preflight. The canonical web-search
         // state preserves the full `user_location` and `filters`, but the dispatcher
-        // only forwards a supported ISO `country` and enforces `allowed_domains`.
-        // Reject anything else explicitly rather than silently changing search
-        // semantics by dropping constraints dispatch cannot honor (issues #1548, #1768).
+        // only forwards a supported ISO `country` and enforces `allowed_domains`
+        // and `blocked_domains`. Reject anything else explicitly rather than
+        // silently changing search semantics by dropping constraints dispatch
+        // cannot honor (issues #1548, #1768).
         if is_initial_request(ctx)
             && request_declares_eligible_web_search(state)
             && let Err(rejection) = self
@@ -708,11 +717,10 @@ impl HttpFilter for WebSearchDispatchFilter {
         // takes a mutable borrow of state would otherwise conflict. The code is a
         // short alpha-2 string, so this owns the minimum needed across the boundary.
         let country: Option<String> = web_search_country_from_state(state).map(str::to_owned);
-        // Own the domain allow-list for the same reason. The round-0 preflight
+        // Own the domain filters for the same reason. The round-0 preflight
         // already rejected an unenforceable filter; should one still reach
         // re-entry, fail closed by permitting no result rather than dropping it.
-        let allowed_domains =
-            web_search_allowed_domains_from_state(state).unwrap_or_else(|_| Some(AllowedDomains::default()));
+        let domain_filters = web_search_domain_filters_from_state(state).unwrap_or(DomainFilters::DenyAll);
 
         // Only the ID and action fields need an async local owner while the
         // canonical full items stay in accumulated_output.
@@ -780,7 +788,7 @@ impl HttpFilter for WebSearchDispatchFilter {
                     context_size,
                     scope: SearchScope {
                         country: country.as_deref(),
-                        allowed_domains: allowed_domains.as_ref(),
+                        domain_filters: &domain_filters,
                     },
                 },
             )
@@ -1050,9 +1058,9 @@ struct SearchScope<'a> {
     /// Supported ISO country code forwarded to the provider, when the request's
     /// `user_location` set one (issue #1548). `None` leaves location unset.
     country: Option<&'a str>,
-    /// Domain allow-list enforced on every provider result, when the request's
-    /// `filters.allowed_domains` set one (issue #1768). `None` is unrestricted.
-    allowed_domains: Option<&'a AllowedDomains>,
+    /// Domain filters enforced on every provider result (issue #1768).
+    /// [`DomainFilters::Unrestricted`] permits every result.
+    domain_filters: &'a DomainFilters,
 }
 
 /// Public and bridge identifiers for one appended web-search result.
@@ -1308,61 +1316,73 @@ fn web_search_country_from_state(state: &ResponsesState) -> Option<&str> {
 /// Fail closed with a 400 when the initial request declares web-search `filters`
 /// dispatch cannot enforce (issue #1768).
 fn preflight_domain_filters(state: &ResponsesState) -> Result<(), Rejection> {
-    web_search_allowed_domains_from_state(state).map(drop)
+    web_search_domain_filters_from_state(state).map(drop)
 }
 
-/// Resolve the domain allow-list every declared web-search tool agrees on.
+/// Resolve the domain filters every declared web-search tool agrees on.
 ///
 /// A model's `web_search_call` cannot be attributed to one declared tool, so
-/// tools that restrict domains differently — including one restricted tool next
+/// tools that declare different filters — including one restricted tool next
 /// to an unrestricted one — are rejected rather than silently widened to the
-/// least restrictive filter (issue #1768). `Ok(None)` means unrestricted.
-fn web_search_allowed_domains_from_state(state: &ResponsesState) -> Result<Option<AllowedDomains>, Rejection> {
+/// least restrictive declaration (issue #1768).
+fn web_search_domain_filters_from_state(state: &ResponsesState) -> Result<DomainFilters, Rejection> {
     let mut tools = state.tools.iter().filter(|tool| {
         tool.get("type")
             .and_then(Value::as_str)
             .is_some_and(is_web_search_tool_type)
     });
     let Some(first) = tools.next() else {
-        return Ok(None);
+        return Ok(DomainFilters::Unrestricted);
     };
-    let allowed = tool_allowed_domains(first)?;
+    let filters = tool_domain_filters(first)?;
     for tool in tools {
-        if tool_allowed_domains(tool)? != allowed {
+        if tool_domain_filters(tool)? != filters {
             return Err(invalid_filters(
-                "web-search tools declare conflicting filters.allowed_domains; \
+                "web-search tools declare conflicting filters; \
                  dispatch applies a single domain filter, so declare the same filters on every tool.",
             ));
         }
     }
-    Ok(allowed)
+    Ok(filters)
 }
 
 /// Parse one web-search tool's `filters`, rejecting members dispatch cannot enforce.
 ///
 /// Rejection messages never echo client-supplied keys or values.
-fn tool_allowed_domains(tool: &Value) -> Result<Option<AllowedDomains>, Rejection> {
+fn tool_domain_filters(tool: &Value) -> Result<DomainFilters, Rejection> {
     let filters = match tool.get("filters") {
-        None | Some(Value::Null) => return Ok(None),
+        None | Some(Value::Null) => return Ok(DomainFilters::Unrestricted),
         Some(Value::Object(filters)) => filters,
         Some(_) => return Err(invalid_filters("web search filters must be an object or null.")),
     };
-    if filters.keys().any(|key| key != "allowed_domains") {
+    if filters
+        .keys()
+        .any(|key| !matches!(key.as_str(), "allowed_domains" | "blocked_domains"))
+    {
         return Err(responses_error_rejection_with_code(
             400,
             "invalid_request_error",
             "unsupported_parameter",
-            "web search filters support only allowed_domains.",
+            "web search filters support only allowed_domains and blocked_domains.",
         ));
     }
-    match filters.get("allowed_domains") {
+    let allowed = domain_list(filters.get("allowed_domains"), DomainField::Allowed)?;
+    let blocked = domain_list(filters.get("blocked_domains"), DomainField::Blocked)?;
+    Ok(DomainFilters::new(allowed, blocked))
+}
+
+/// Parse one `filters` domain list from its JSON member.
+fn domain_list(value: Option<&Value>, field: DomainField) -> Result<Option<DomainList>, Rejection> {
+    match value {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Array(entries)) if entries.iter().all(Value::is_string) => {
-            AllowedDomains::parse(entries.iter().filter_map(Value::as_str)).map_err(|message| invalid_filters(&message))
+            DomainList::parse(field, entries.iter().filter_map(Value::as_str))
+                .map_err(|message| invalid_filters(&message))
         },
-        Some(_) => Err(invalid_filters(
-            "filters.allowed_domains must be an array of strings or null.",
-        )),
+        Some(_) => Err(invalid_filters(&format!(
+            "filters.{} must be an array of strings or null.",
+            field.as_str()
+        ))),
     }
 }
 

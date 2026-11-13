@@ -3383,18 +3383,92 @@ class TestOpenAIResponsesVLLM:
                 store=False,
                 extra_headers={"x-user-brave-key": "controlled-test-only"},
             )
-            assert response.status == "completed"
-            assert [item.type for item in response.output] == ["web_search_call", "message"]
-            assert BraveSearchHandler.request_count == 1
+            assert response.status == "completed", (
+                "the filtered response should complete: "
+                f"{getattr(response, 'error', None)}"
+            )
+            assert [item.type for item in response.output] == ["web_search_call", "message"], (
+                "a filtered search should still produce a call and a message"
+            )
+            assert BraveSearchHandler.request_count == 1, (
+                "the dispatcher should issue exactly one provider request"
+            )
             sources = response.output[0].model_dump()["action"]["sources"]
             assert [source["url"] for source in sources] == ["https://example.com/mock"], (
                 "only allowed-domain results may be public sources"
             )
             assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
             reentry = json.dumps(forwarded[1]["input"])
-            assert "Mock Search Result" in reentry
+            assert "Mock Search Result" in reentry, (
+                "the allowed result must reach the model"
+            )
             assert "outside.example" not in reentry, (
                 "an off-domain result must not reach the model"
+            )
+        finally:
+            BraveSearchHandler.reset()
+
+    def test_hosted_web_search_enforces_blocked_domains(self, witness_tool_client):
+        """Native hosted search drops provider results on ``blocked_domains`` (#1768).
+
+        The Brave mock returns a result on a blocked host and one on a blocked
+        subdomain of an allowed domain. Only the result inside the allow-list
+        and outside the block-list may reach the model re-entry or the public
+        ``action.sources``.
+        """
+        client, forwarded = witness_tool_client
+        BraveSearchHandler.reset()
+        BraveSearchHandler.extra_results = [
+            {
+                "title": "Blocked Domain Result",
+                "url": "https://outside.example/result",
+                "description": "A result on a blocked domain",
+            },
+            {
+                "title": "Blocked Subdomain Result",
+                "url": "https://docs.example.com/private",
+                "description": "A result on a blocked subdomain",
+            },
+        ]
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-tool-stream",
+                input="DOMAIN-FILTER-BLOCKED-1768",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "filters": {
+                            "allowed_domains": ["example.com"],
+                            "blocked_domains": ["outside.example", "docs.example.com"],
+                        },
+                    }
+                ],
+                include=["web_search_call.action.sources"],
+                max_tool_calls=1,
+                store=False,
+                extra_headers={"x-user-brave-key": "controlled-test-only"},
+            )
+            assert response.status == "completed", (
+                "the filtered response should complete: "
+                f"{getattr(response, 'error', None)}"
+            )
+            assert BraveSearchHandler.request_count == 1, (
+                "the dispatcher should issue exactly one provider request"
+            )
+            sources = response.output[0].model_dump()["action"]["sources"]
+            assert [source["url"] for source in sources] == ["https://example.com/mock"], (
+                "blocked domains must not be public sources"
+            )
+            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
+            reentry = json.dumps(forwarded[1]["input"])
+            assert "Mock Search Result" in reentry, (
+                "the permitted result must reach the model"
+            )
+            assert "outside.example" not in reentry, (
+                "a blocked-domain result must not reach the model"
+            )
+            assert "docs.example.com" not in reentry, (
+                "a blocked subdomain result must not reach the model"
             )
         finally:
             BraveSearchHandler.reset()
@@ -3404,8 +3478,9 @@ class TestOpenAIResponsesVLLM:
         client, forwarded = witness_tool_client
         BraveSearchHandler.reset()
         cases = [
-            ({"blocked_domains": ["example.com"]}, "unsupported_parameter"),
+            ({"search_domain_filter": ["example.com"]}, "unsupported_parameter"),
             ({"allowed_domains": ["example.com/path"]}, "invalid_value"),
+            ({"blocked_domains": ["https://example.com/path"]}, "invalid_value"),
         ]
         for filters, code in cases:
             with pytest.raises(BadRequestError) as exc_info:
@@ -3416,8 +3491,12 @@ class TestOpenAIResponsesVLLM:
                     store=False,
                     extra_headers={"x-user-brave-key": "controlled-test-only"},
                 )
-            assert exc_info.value.status_code == 400
-            assert exc_info.value.body["code"] == code
+            assert exc_info.value.status_code == 400, (
+                f"preflight should reject {filters} with 400"
+            )
+            assert exc_info.value.body["code"] == code, (
+                f"preflight should reject {filters} with {code}: {exc_info.value.body}"
+            )
         assert BraveSearchHandler.request_count == 0, "preflight must precede any callout"
         assert forwarded == [], "preflight must precede any inference round"
 

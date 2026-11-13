@@ -1940,10 +1940,11 @@ fn full_flow_agentic_web_search_result_passes_guardrail_before_reentry() {
 }
 
 #[test]
-fn full_flow_agentic_web_search_enforces_allowed_domains() {
-    // Regression for issue #1768: the provider returns a result outside the
-    // client's `filters.allowed_domains`. It must reach neither the guardrail,
-    // the second inference round, nor the public `action.sources`.
+fn full_flow_agentic_web_search_enforces_domain_filters() {
+    // Regression for issue #1768: the provider returns one result outside the
+    // client's `filters.allowed_domains` and one on a blocked subdomain. Neither
+    // may reach the guardrail, the second inference round, or the public
+    // `action.sources`.
     let first_model_response = json!({
         "id": "resp_web_search_domains",
         "object": "response",
@@ -1979,6 +1980,7 @@ fn full_flow_agentic_web_search_enforces_allowed_domains() {
         json!({
             "web": {"results": [
                 {"title": "Outside", "url": "https://outside.example/result", "description": "Disallowed."},
+                {"title": "Blocked", "url": "https://docs.praxis-proxy.github.io/private", "description": "Blocked."},
                 {"title": "Praxis proxy", "url": "https://praxis-proxy.github.io/", "description": "Allowed."}
             ]}
         })
@@ -2011,7 +2013,10 @@ fn full_flow_agentic_web_search_enforces_allowed_domains() {
         "model": "gpt-4.1",
         "input": "Search for Praxis proxy",
         "include": ["web_search_call.action.sources"],
-        "tools": [{"type": "web_search", "filters": {"allowed_domains": ["github.io"]}}]
+        "tools": [{"type": "web_search", "filters": {
+            "allowed_domains": ["github.io"],
+            "blocked_domains": ["docs.praxis-proxy.github.io"],
+        }}]
     });
     let request = json_post("/v1/responses", &request.to_string()).replacen(
         "Content-Type: application/json",
@@ -2033,7 +2038,7 @@ fn full_flow_agentic_web_search_enforces_allowed_domains() {
     assert_eq!(
         sources,
         ["https://praxis-proxy.github.io/"],
-        "only allowed-domain results may be public sources: {response:#}"
+        "only permitted results may be public sources: {response:#}"
     );
     assert_eq!(search.requests().len(), 1, "the web-search dispatcher should run once");
     let model_requests = model.requests();
@@ -2041,19 +2046,26 @@ fn full_flow_agentic_web_search_enforces_allowed_domains() {
     let second_input = &model_requests[1].body;
     assert!(
         second_input.contains("praxis-proxy.github.io"),
-        "the allowed result should reach inference round two: {second_input}"
-    );
-    assert!(
-        !second_input.contains("outside.example"),
-        "a disallowed result must not reach inference round two: {second_input}"
+        "the permitted result should reach inference round two: {second_input}"
     );
     let nemo_requests = nemo.requests();
     assert_eq!(nemo_requests.len(), 1, "NeMo should check the web-search result once");
-    assert!(
-        !nemo_requests[0].body.contains("outside.example"),
-        "a disallowed result must not reach the guardrail: {}",
-        nemo_requests[0].body
-    );
+    // The round-two body echoes the client's `tools`, so match the filtered
+    // result URLs rather than the bare domains they also declare.
+    for rejected in [
+        "https://outside.example/result",
+        "https://docs.praxis-proxy.github.io/private",
+    ] {
+        assert!(
+            !second_input.contains(rejected),
+            "a filtered result ({rejected}) must not reach inference round two: {second_input}"
+        );
+        assert!(
+            !nemo_requests[0].body.contains(rejected),
+            "a filtered result ({rejected}) must not reach the guardrail: {}",
+            nemo_requests[0].body
+        );
+    }
 }
 
 #[test]
