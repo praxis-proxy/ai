@@ -8,7 +8,8 @@ upstream inventory, including image input, compaction, and WebSockets.
 The CPU lane uses upstream's exported runner with an explicit 300-second
 request budget because the small model can exceed the suite's 30-second
 default. Templates and validators are unchanged; the full acceptance CLI
-continues to use the upstream default deadline.
+retains upstream's 30-second HTTP request / WebSocket turn deadline, with a
+separate 360-second subprocess cap described below.
 
 ## Verified result: November 12, 2026
 
@@ -27,9 +28,12 @@ The dev workflow did not pin the model weight revision.
 
 The managed profile passed all nine HTTP endpoint cases and the local phase
 schema fixture. This includes actual image inference (the model identified
-the supplied red heart), function calling, SSE streaming, compaction, and
-missing-model rejection. The separate real-image check also passed through
-the official OpenAI Python SDK 3.49.0.
+the supplied red heart), tool declaration acceptance with a translated
+`function_call` output, SSE streaming, compaction, and missing-model rejection.
+The managed profile permits only one inference round (`max_iterations: 1`):
+this tool case does not execute the function or test a subsequent
+`function_call_output` continuation. The separate real-image check also passed
+through the official OpenAI Python SDK 3.49.0.
 
 All seven managed-profile failures were WebSocket connection failures. An
 upgrade request sent directly to the backend returned HTTP 405, and the
@@ -90,6 +94,13 @@ is saved after each template; `complete: false` means the run was interrupted.
 The report records the suite revision, Praxis HEAD/dirty state, backend
 description, evidence type and, when launching locally, the binary SHA-256 and
 effective configuration with the upstream authority redacted.
+
+The Python harness additionally caps each template's CLI subprocess at 360
+seconds, covering startup and all HTTP requests or WebSocket turns within that
+template. This outer wall-clock guard does not change upstream's per-request
+or per-turn deadline. If it expires, the JSON ledger records a failed result
+whose `errors` contains Python's subprocess timeout message; that is a harness
+process timeout, not an upstream schema-validation verdict.
 
 ## Who owns each behavior
 
