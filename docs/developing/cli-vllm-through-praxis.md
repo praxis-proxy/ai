@@ -625,21 +625,41 @@ claude --model "$VLLM_MODEL"
 the Praxis process. The other variables configure Claude Code.
 
 The translated `messages-to-openai-vllm.yaml` route enables
-`allow_lossy_features: [prompt_caching, extended_thinking]`, so you do **not**
-need to disable Anthropic thinking or prompt caching in Claude Code. Chat
-Completions cannot represent either feature, so Praxis strips the wire markers an
-unmodified client sends and reports the loss (a `WARN` log, the
+`allow_lossy_features: [prompt_caching, extended_thinking,
+mid_conversation_system]`, so you do **not** need to disable Anthropic thinking
+or prompt caching in Claude Code. Chat Completions cannot represent those
+features, so Praxis strips the thinking and cache markers an unmodified client
+sends and reports the loss (a `WARN` log, the
 `praxis_anthropic_messages_to_chat_completions_degraded_total` counter, and an
 `x-degraded-features` response header) instead of rejecting the request.
+Claude Code also sends a `system` message after its first user turn (the
+environment block); real OpenAI accepts that shape. Whether a Chat Completions
+backend rejects it depends on the model's chat template: some vLLM-hosted
+templates fail with "System message must be at the beginning" when a system
+message follows a non-system one, while others — including this guide's default
+Qwen3-8B template — render it in place. The same allowlist entry folds it into
+the leading system message, so the translated request no longer depends on the
+template's tolerance for that ordering.
 
-To see the strict behavior instead — a 400 when either feature appears — use the
-`messages-to-openai.yaml` route (empty allowlist) and disable both features in
-Claude Code:
+To see the strict behavior instead — a 400 when a thinking or prompt-caching
+marker appears — remove the `allow_lossy_features` block from the
+`anthropic_messages_to_chat_completions` filter in your copy of
+`messages-to-openai-vllm.yaml` and disable both of those features in Claude
+Code. Stay on this route rather than switching to the plain
+`messages-to-openai.yaml` example: that example injects no backend credential,
+so against the keyed vLLM server above it fails with a 401 before any strict
+rejection:
 
 ```console
 export CLAUDE_CODE_DISABLE_THINKING=1
 export DISABLE_PROMPT_CACHING=1
 ```
+
+Claude Code cannot disable the mid-conversation `system` message — it always
+sends the environment block — and the strict route passes it through in its
+original position, so whether the request survives is up to the model's chat
+template: some reject it there ("System message must be at the beginning"),
+while this guide's default Qwen3-8B template renders it in place.
 
 Claude Code does not know the served model's real window, so it sends the
 default `max_tokens` for the Anthropic model name it believes it is calling,
