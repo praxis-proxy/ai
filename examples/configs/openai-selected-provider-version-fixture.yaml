@@ -30,7 +30,6 @@ filter_chains:
         max_tool_blocks: 256
 
       - filter: openai_chat_completions_to_anthropic
-        api_translation_enabled: true
         api_version: "2026-10-21"
         max_body_bytes: 1048576
 
