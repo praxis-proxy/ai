@@ -136,7 +136,7 @@ def collect(repo, sha, gpu, release_run=None, attempt=None):
         "selection": "Newest eligible run per workflow for the exact release commit; latest attempt only. The current release run is pinned when supplied. No older green fallback.",
         "limitations": [
             "CI records workflow head SHA and job/step outcomes, not individual test counts or complete API conformance.",
-            "PR runs are excluded because their checkout can be a synthetic merge; no evidence is borrowed from other commits.",
+            "CI PR runs are excluded because their checkout can be a synthetic merge; CI evidence is scoped to the release commit. GPU evidence may describe a recent ancestor nightly, explicitly identified separately.",
             "Missing runs may reflect path filters or optional triggers; no execution is inferred.",
             "This is a publication-time snapshot; queued or running jobs may finish later. Rerun Release to refresh it.",
             "GPU qualification identifies its tested checkout and binary separately from CI and the published container.",
@@ -170,7 +170,7 @@ def render(report, detailed=False):
     gpu = report["gpu"]
     if gpu.get("status") in ("unavailable", "not_requested"):
         lines += ["", f"GPU evidence: **{gpu['status']}**. {cell(gpu.get('reason', 'No GPU report'))}.",
-                  "To collect GPU evidence, dispatch `vllm-integration.yaml` with `run_live_vllm=true` on this release tag, wait for its summary, then rerun Release on the same tag."]
+                  "GPU evidence requires a complete successful ancestor nightly within 48 hours. Rerun Release to refresh this snapshot after the nightly completes."]
     if detailed:
         lines += ["", "#### CI job and step outcomes"]
         for entry in report["workflows"]:
@@ -183,6 +183,28 @@ def render(report, detailed=False):
     return "\n".join(lines)
 
 
+def identifies_release(gpu, sha):
+    """Check the selector's release binding without relabeling its tested SHA.
+
+    release-evidence already verifies nightly ancestry, freshness, required jobs,
+    and artifact provenance. Its release context identifies the target release;
+    workflow and gateway SHAs continue to identify the actual tested checkout.
+    Reports produced before release contexts existed still require an exact SHA.
+    """
+    if not isinstance(gpu, dict):
+        return False
+    workflow, gateway = gpu.get("workflow"), gpu.get("gateway")
+    if not isinstance(workflow, dict) or not isinstance(gateway, dict):
+        return False
+    run_sha, checkout_sha = workflow.get("run_sha"), gateway.get("checkout_sha")
+    if not (run_sha or checkout_sha) or (run_sha and checkout_sha and run_sha != checkout_sha):
+        return False
+    if "release_context" in gpu:
+        context = gpu["release_context"]
+        return isinstance(context, dict) and context.get("release_sha") == sha
+    return (run_sha or checkout_sha) == sha
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for field in ("repo", "sha", "gpu-report", "existing-notes", "output-dir"):
@@ -193,8 +215,7 @@ def main():
     if (args.run_id is None) != (args.attempt is None):
         parser.error("--run-id and --attempt must be supplied together")
     gpu = read_json(args.gpu_report)
-    if not isinstance(gpu, dict) or (
-            gpu.get("workflow", {}).get("run_sha") or gpu.get("gateway", {}).get("checkout_sha")) != args.sha:
+    if not identifies_release(gpu, args.sha):
         parser.error("GPU report must identify the release commit")
     report = collect(args.repo, args.sha, gpu, args.run_id, args.attempt)
     output = Path(args.output_dir)

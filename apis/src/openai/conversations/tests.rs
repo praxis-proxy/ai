@@ -23,8 +23,14 @@ use super::{
     validate::validate_metadata,
 };
 use crate::{
-    openai::responses::{
-        AgenticBudgetPolicy, DEFAULT_TENANT_ID, agentic_loop::budget::SimpleBudget, state::ResponsesState,
+    openai::{
+        operation::conformance::{
+            OperationKey, assert_matches_schema, generated_operation_keys, generated_response_schemas,
+            schema_matches_value,
+        },
+        responses::{
+            AgenticBudgetPolicy, DEFAULT_TENANT_ID, agentic_loop::budget::SimpleBudget, state::ResponsesState,
+        },
     },
     operation::{ApplicationProtocol, Transport},
     operation_classifier::{AiOperationFilter, AiOperationMatch, classify},
@@ -3748,7 +3754,7 @@ async fn streaming_terminal_appends_once_without_buffering_sse() {
     ctx.set_metadata("openai_responses_request.stream", "true");
     ctx.set_metadata("openai_responses_request.store", "false");
     ctx.extensions.insert(ResponsesState {
-        input: vec![serde_json::json!({"role":"user","content":"streamed question"})],
+        input: vec![serde_json::json!({"role":"user","content":"streamed question"})].into(),
         response_object: serde_json::json!({
             "status": "completed",
             "output": [{"type":"message","role":"assistant","content":"streamed answer"}]
@@ -3805,7 +3811,7 @@ async fn local_stream_completion_appends_before_eos() {
     ctx.set_metadata("responses.conversation_id", &conv_id);
     ctx.set_metadata("openai_responses_request.stream", "true");
     ctx.extensions.insert(ResponsesState {
-        input: vec![serde_json::json!({"type":"message","role":"user","content":"local input"})],
+        input: vec![serde_json::json!({"type":"message","role":"user","content":"local input"})].into(),
         response_object: serde_json::json!({
             "status":"completed",
             "output":[{"type":"message","role":"assistant","content":"local output"}]
@@ -3861,7 +3867,7 @@ async fn stream_without_completed_terminal_does_not_append_conversation_items() 
         ctx.set_metadata("responses.conversation_id", &conv_id);
         ctx.set_metadata("openai_responses_request.stream", "true");
         ctx.extensions.insert(ResponsesState {
-            input: vec![serde_json::json!({"type":"message","role":"user","content":"unfinished"})],
+            input: vec![serde_json::json!({"type":"message","role":"user","content":"unfinished"})].into(),
             response_object: serde_json::json!({"status":status,"output":[]}),
             logical_stream_terminal_emitted: status == "incomplete",
             ..ResponsesState::default()
@@ -4245,7 +4251,7 @@ async fn on_response_body_appends_completed_response() {
         "content": "hello from append"
     })];
     ctx.extensions.insert(ResponsesState {
-        input: input_items.clone(),
+        input: input_items.clone().into(),
         ..ResponsesState::default()
     });
 
@@ -4268,11 +4274,10 @@ async fn on_response_body_appends_completed_response() {
     let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
-    assert_eq!(
+    assert!(
         ctx.extensions
             .get::<ResponsesState>()
-            .map(|state| state.input.as_slice()),
-        Some(input_items.as_slice()),
+            .is_some_and(|state| state.input == input_items),
         "append-back must clone ResponsesState.input without taking or clearing it"
     );
 
@@ -4319,7 +4324,7 @@ async fn append_back_cannot_write_another_owners_conversation() {
     ctx.set_metadata("openai_responses_request.has_conversation", "true");
     ctx.set_metadata("responses.conversation_id", &conversation_id);
     ctx.extensions.insert(ResponsesState {
-        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "intruder"})],
+        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "intruder"})].into(),
         ..ResponsesState::default()
     });
     drop(filter.on_request(&mut ctx).await.unwrap());
@@ -4368,7 +4373,7 @@ async fn on_response_body_surfaces_item_insert_failure() {
     set_append_back_metadata(&mut ctx);
     capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
     ctx.extensions.insert(ResponsesState {
-        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "hello from append"})],
+        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "hello from append"})].into(),
         ..ResponsesState::default()
     });
 
@@ -4409,7 +4414,7 @@ async fn streaming_terminal_propagates_append_failure_before_release() {
     set_append_back_metadata(&mut ctx);
     ctx.set_metadata("openai_responses_request.stream", "true");
     ctx.extensions.insert(ResponsesState {
-        input: vec![serde_json::json!({"type":"message","role":"user","content":"hello"})],
+        input: vec![serde_json::json!({"type":"message","role":"user","content":"hello"})].into(),
         response_object: serde_json::json!({"status":"completed","output":[]}),
         logical_stream_terminal_emitted: true,
         ..ResponsesState::default()
@@ -4451,7 +4456,7 @@ async fn on_response_body_surfaces_transaction_failure() {
     set_append_back_metadata(&mut ctx);
     capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
     ctx.extensions.insert(ResponsesState {
-        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "hello from append"})],
+        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "hello from append"})].into(),
         ..ResponsesState::default()
     });
 
@@ -4520,7 +4525,12 @@ fn conformance_conversations_routes_match_runtime_registry() {
 async fn conformance_conversations_success_payloads_match_generated_response_schemas() {
     let (filter, store) = harness();
     let spec = generated_openapi_spec();
-    let schemas = generated_response_schemas(&spec);
+    let schemas = generated_response_schemas(&spec, "application/json");
+    assert_eq!(
+        schemas.keys().cloned().collect::<Vec<_>>(),
+        route_operation_keys(),
+        "generated OpenAPI operations should match Conversations operation_specs()"
+    );
     let payloads = successful_conversation_payloads(filter.as_ref(), &store).await;
 
     let schema_operations: Vec<_> = schemas.keys().collect();
@@ -4603,6 +4613,56 @@ async fn forwarding_adapter_reads_legacy_prefix_and_item_rows() {
             .expect("other owner"),
         None,
         "forwarding preserves owner isolation"
+    );
+}
+
+#[tokio::test]
+async fn delete_item_returns_metadata_committed_before_its_lock() {
+    let inner = Arc::new(
+        SqliteResponseStore::new(
+            "sqlite::memory:",
+            "test_responses",
+            "test_conversations",
+            Some("test_items"),
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    inner
+        .create_conversation_with_items(
+            &ConversationRecord {
+                conversation_id: "conv_race".to_owned(),
+                owner: crate::test_utils::test_owner(DEFAULT_TENANT_ID),
+                created_at: 1000,
+                metadata: serde_json::json!({"topic": "stale"}),
+                messages: serde_json::json!([]),
+            },
+            &[race_item("item_a")],
+        )
+        .await
+        .unwrap();
+    let (filter, store) = harness_with(Arc::new(AppendDuringUpdateStore::new(
+        Arc::clone(&inner),
+        race_item("item_b"),
+    )));
+    let req = make_request(Method::DELETE, "/v1/conversations/conv_race/items/item_a");
+    let mut ctx = conv_ctx(&store, &req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected local response")
+    };
+    assert_eq!(rejection.status, 200);
+    let body = rejection_body(&rejection);
+    assert_eq!(body["metadata"]["topic"], "committed-before-delete");
+    assert_eq!(body["created_at"], 1000);
+    assert!(
+        inner
+            .get_conversation_item(&crate::test_utils::test_owner(DEFAULT_TENANT_ID), "conv_race", "item_a")
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -5006,6 +5066,16 @@ struct FailingItemStore {
     reason = "test double still uses the former tenant-oriented names"
 )]
 impl ConversationItemStore for FailingItemStore {
+    async fn create_conversation_with_items(
+        &self,
+        record: &ConversationRecord,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        self.upsert_conversation(record).await?;
+        self.create_items_and_sync_messages(&record.owner, &record.conversation_id, items)
+            .await
+    }
+
     async fn conversation_history(
         &self,
         _owner: &crate::StateOwner,
@@ -5159,6 +5229,18 @@ impl ConversationItemStore for FailingItemStore {
         Ok(0)
     }
 
+    async fn delete_item_and_get_conversation(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<praxis_ai_store::ConversationSnapshot>, StoreError> {
+        if !self.conversation_exists || matches!(self.append_failure, AppendFailure::ConversationDeleted) {
+            return Err(StoreError::NotFound);
+        }
+        Ok(None)
+    }
+
     async fn delete_item_and_sync_messages(
         &self,
         _tenant_id: &crate::StateOwner,
@@ -5281,7 +5363,8 @@ impl ResponseStore for FailingItemStore {
 /// On the first `get_conversation` call — the read the update handler performs
 /// before writing metadata — it returns the pre-append conversation snapshot and
 /// then commits a concurrent item append that rebuilds the denormalized
-/// `messages` cache. Every other operation delegates to a real SQLite store that
+/// `messages` cache. Item deletion commits a metadata update before acquiring
+/// the mutation lock. Other operations delegate to the real SQLite store that
 /// the test also holds, so it can assert the final persisted state.
 struct AppendDuringUpdateStore {
     /// Ensures the concurrent append fires exactly once.
@@ -5308,6 +5391,14 @@ impl AppendDuringUpdateStore {
     reason = "test double still uses the former tenant-oriented names"
 )]
 impl ConversationItemStore for AppendDuringUpdateStore {
+    async fn create_conversation_with_items(
+        &self,
+        record: &ConversationRecord,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        self.inner.create_conversation_with_items(record, items).await
+    }
+
     async fn conversation_history(
         &self,
         owner: &crate::StateOwner,
@@ -5450,12 +5541,32 @@ impl ConversationItemStore for AppendDuringUpdateStore {
 
     async fn delete_item_and_sync_messages(
         &self,
-        tenant_id: &crate::StateOwner,
+        owner: &crate::StateOwner,
         conversation_id: &str,
         item_id: &str,
     ) -> Result<bool, StoreError> {
+        Ok(self
+            .delete_item_and_get_conversation(owner, conversation_id, item_id)
+            .await?
+            .is_some())
+    }
+
+    async fn delete_item_and_get_conversation(
+        &self,
+        owner: &crate::StateOwner,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<Option<praxis_ai_store::ConversationSnapshot>, StoreError> {
+        // A metadata writer commits immediately before the delete takes its lock.
         self.inner
-            .delete_item_and_sync_messages(tenant_id, conversation_id, item_id)
+            .update_conversation_metadata(
+                owner,
+                conversation_id,
+                &serde_json::json!({"topic": "committed-before-delete"}),
+            )
+            .await?;
+        self.inner
+            .delete_item_and_get_conversation(owner, conversation_id, item_id)
             .await
     }
 }
@@ -5593,25 +5704,6 @@ fn cache_item_ids(messages: &Value) -> Vec<String> {
         .collect();
     ids.sort();
     ids
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct OperationKey {
-    method: String,
-    path: String,
-}
-
-impl OperationKey {
-    fn new(method: impl Into<String>, path: impl Into<String>) -> Self {
-        Self {
-            method: method.into(),
-            path: path.into(),
-        }
-    }
-
-    fn label(&self) -> String {
-        format!("{} {}", self.method, self.path)
-    }
 }
 
 async fn successful_conversation_payloads(
@@ -5779,263 +5871,6 @@ fn route_operation_keys() -> Vec<OperationKey> {
     keys
 }
 
-fn generated_operation_keys(spec: &Value) -> Vec<OperationKey> {
-    let mut keys = Vec::new();
-    let paths = spec
-        .get("paths")
-        .and_then(Value::as_object)
-        .unwrap_or_else(|| panic!("generated OpenAPI spec missing paths object"));
-
-    for (path, path_item) in paths {
-        let path_item = path_item
-            .as_object()
-            .unwrap_or_else(|| panic!("generated path item {path} should be an object"));
-        for (method, _operation) in path_item {
-            if matches!(method.as_str(), "delete" | "get" | "post") {
-                keys.push(OperationKey::new(method.to_uppercase(), path));
-            }
-        }
-    }
-
-    keys.sort();
-    keys
-}
-
-fn generated_response_schemas(spec: &Value) -> BTreeMap<OperationKey, Value> {
-    let mut schemas = BTreeMap::new();
-    let paths = spec
-        .get("paths")
-        .and_then(Value::as_object)
-        .unwrap_or_else(|| panic!("generated OpenAPI spec missing paths object"));
-
-    for (path, path_item) in paths {
-        let path_item = path_item
-            .as_object()
-            .unwrap_or_else(|| panic!("generated path item {path} should be an object"));
-        for (method, operation) in path_item {
-            if !matches!(method.as_str(), "delete" | "get" | "post") {
-                continue;
-            }
-
-            let schema = operation
-                .pointer("/responses/200/content/application~1json/schema")
-                .unwrap_or_else(|| panic!("generated operation {method} {path} missing 200 JSON response schema"));
-            let previous = schemas.insert(OperationKey::new(method.to_uppercase(), path), schema.clone());
-            assert!(previous.is_none(), "duplicate generated operation {method} {path}");
-        }
-    }
-
-    let schema_operations = schemas.keys().cloned().collect::<Vec<_>>();
-    assert_eq!(
-        schema_operations,
-        route_operation_keys(),
-        "generated OpenAPI operations should match Conversations operation_specs()"
-    );
-
-    schemas
-}
-
-fn assert_matches_schema(spec: &Value, path: &str, schema: &Value, value: &Value) {
-    assert!(
-        schema_matches_value(spec, schema, value),
-        "{path} does not match generated schema: {value}"
-    );
-    let schema = resolve_schema_ref(spec, schema);
-
-    if let Some(enum_values) = schema.get("enum").and_then(Value::as_array) {
-        assert!(
-            enum_values.contains(value),
-            "{path} should be one of {enum_values:?}, got {value}"
-        );
-    }
-
-    if let Some(schema_type) = schema.get("type").and_then(Value::as_str) {
-        assert_schema_type(path, schema_type, value);
-    } else if schema.get("properties").is_some() || schema.get("required").is_some() {
-        assert_schema_type(path, "object", value);
-    }
-
-    if let Some(items_schema) = schema.get("items") {
-        for (idx, item) in value
-            .as_array()
-            .unwrap_or_else(|| panic!("{path} should be an array"))
-            .iter()
-            .enumerate()
-        {
-            assert_matches_schema(spec, &format!("{path}[{idx}]"), items_schema, item);
-        }
-    }
-
-    let Some(obj) = value.as_object() else {
-        return;
-    };
-
-    if let Some(required) = schema.get("required").and_then(Value::as_array) {
-        for required_name in required {
-            let required_name = required_name.as_str().unwrap();
-            assert!(
-                obj.contains_key(required_name),
-                "{path} missing required property {required_name}"
-            );
-        }
-    }
-
-    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-        for (property_name, property_schema) in properties {
-            if let Some(property_value) = obj.get(property_name) {
-                assert_matches_schema(
-                    spec,
-                    &format!("{path}.{property_name}"),
-                    property_schema,
-                    property_value,
-                );
-            }
-        }
-    }
-
-    if let Some(additional_schema) = schema.get("additionalProperties").filter(|schema| schema.is_object()) {
-        let properties = schema.get("properties").and_then(Value::as_object);
-        for (property_name, property_value) in obj {
-            if properties.is_none_or(|properties| !properties.contains_key(property_name)) {
-                assert_matches_schema(
-                    spec,
-                    &format!("{path}.{property_name}"),
-                    additional_schema,
-                    property_value,
-                );
-            }
-        }
-    }
-}
-
-fn schema_matches_value(spec: &Value, schema: &Value, value: &Value) -> bool {
-    let schema = resolve_schema_ref(spec, schema);
-
-    if value.is_null() && schema.get("nullable").and_then(Value::as_bool) == Some(true) {
-        return true;
-    }
-    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array)
-        && variants
-            .iter()
-            .filter(|variant| schema_matches_value(spec, variant, value))
-            .count()
-            != 1
-    {
-        return false;
-    }
-    if let Some(variants) = schema.get("anyOf").and_then(Value::as_array)
-        && !variants
-            .iter()
-            .any(|variant| schema_matches_value(spec, variant, value))
-    {
-        return false;
-    }
-    if let Some(variants) = schema.get("allOf").and_then(Value::as_array)
-        && !variants
-            .iter()
-            .all(|variant| schema_matches_value(spec, variant, value))
-    {
-        return false;
-    }
-    if schema
-        .get("enum")
-        .and_then(Value::as_array)
-        .is_some_and(|values| !values.contains(value))
-    {
-        return false;
-    }
-    if let Some(schema_type) = schema.get("type") {
-        let matches_type = schema_type.as_str().map_or_else(
-            || {
-                schema_type.as_array().is_some_and(|types| {
-                    types
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .any(|kind| value_has_type(value, kind))
-                })
-            },
-            |kind| value_has_type(value, kind),
-        );
-        if !matches_type {
-            return false;
-        }
-    }
-
-    if let Some(items_schema) = schema.get("items") {
-        let Some(items) = value.as_array() else {
-            return false;
-        };
-        if !items.iter().all(|item| schema_matches_value(spec, items_schema, item)) {
-            return false;
-        }
-    }
-
-    let Some(object) = value.as_object() else {
-        return schema.get("properties").is_none() && schema.get("required").is_none();
-    };
-    if schema
-        .get("required")
-        .and_then(Value::as_array)
-        .is_some_and(|required| {
-            required
-                .iter()
-                .filter_map(Value::as_str)
-                .any(|name| !object.contains_key(name))
-        })
-    {
-        return false;
-    }
-
-    let properties = schema.get("properties").and_then(Value::as_object);
-    if let Some(properties) = properties
-        && properties.iter().any(|(name, property_schema)| {
-            object
-                .get(name)
-                .is_some_and(|property| !schema_matches_value(spec, property_schema, property))
-        })
-    {
-        return false;
-    }
-
-    match schema.get("additionalProperties") {
-        Some(Value::Bool(false)) => {
-            properties.is_none_or(|properties| object.keys().all(|name| properties.contains_key(name)))
-        },
-        Some(additional_schema @ Value::Object(_)) => object.iter().all(|(name, property)| {
-            properties.is_some_and(|properties| properties.contains_key(name))
-                || schema_matches_value(spec, additional_schema, property)
-        }),
-        _ => true,
-    }
-}
-
-fn resolve_schema_ref<'a>(spec: &'a Value, schema: &'a Value) -> &'a Value {
-    let Some(ref_path) = schema.get("$ref").and_then(Value::as_str) else {
-        return schema;
-    };
-    let pointer = ref_path.strip_prefix('#').unwrap_or(ref_path);
-    spec.pointer(pointer)
-        .unwrap_or_else(|| panic!("missing generated schema ref {ref_path}"))
-}
-
-fn assert_schema_type(path: &str, schema_type: &str, value: &Value) {
-    let matches = value_has_type(value, schema_type);
-    assert!(matches, "{path} should be {schema_type}, got {value}");
-}
-
-fn value_has_type(value: &Value, schema_type: &str) -> bool {
-    match schema_type {
-        "array" => value.is_array(),
-        "boolean" => value.is_boolean(),
-        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
-        "null" => value.is_null(),
-        "number" => value.as_f64().is_some(),
-        "object" => value.is_object(),
-        "string" => value.is_string(),
-        _ => false,
-    }
-}
-
 #[tokio::test]
 async fn create_conversation_response_field_order_matches_openai() {
     let (filter, store) = harness();
@@ -6056,8 +5891,7 @@ async fn create_conversation_response_field_order_matches_openai() {
     assert_eq!(keys, &["id", "object", "created_at", "metadata"]);
 }
 
-#[tokio::test]
-async fn conformance_conversations_rate_limit_rejects_every_operation_before_store_access() {
+fn pinned_error_validator() -> jsonschema::Validator {
     #[derive(serde::Deserialize)]
     struct Reference {
         components: Components,
@@ -6080,7 +5914,12 @@ async fn conformance_conversations_rate_limit_rejects_every_operation_before_sto
     let pinned: Reference =
         serde_yaml::from_str(include_str!("../../../../docs/conformance/specs/openai-openapi.yaml")).unwrap();
     let reference = serde_json::json!({"$ref": "#/components/schemas/ErrorResponse", "components": {"schemas": pinned.components.schemas}});
-    let validator = jsonschema::validator_for(&reference).unwrap();
+    jsonschema::validator_for(&reference).unwrap()
+}
+
+#[tokio::test]
+async fn conformance_conversations_rate_limit_rejects_every_operation_before_store_access() {
+    let validator = pinned_error_validator();
     for operation in operation_specs() {
         let config = serde_yaml::from_str(
             "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nrate_limit: {mode: global, rate: 0.000001, burst: 1}",
@@ -6267,4 +6106,242 @@ async fn shadow_rate_limit_preserves_preread_requests_after_exhaustion() {
             "shadow bookkeeping must preserve pre-read body data"
         );
     }
+}
+
+
+/// Drive the real request/body dispatch, including bodyless routes.
+async fn run_contract_request(
+    filter: &dyn HttpFilter,
+    store: Option<&Arc<dyn PersistedStateBackend>>,
+    req: &Request,
+    body: &'static [u8],
+    owner: crate::StateOwner,
+) -> praxis_filter::Rejection {
+    let mut ctx = store.map_or_else(|| make_owned_filter_context(req), |store| conv_ctx(store, req));
+    ctx.extensions.insert(owner);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let action = if matches!(action, FilterAction::Continue) {
+        let mut body = Some(Bytes::from_static(body));
+        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap()
+    } else {
+        action
+    };
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected local response for {}", req.uri);
+    };
+    rejection
+}
+
+fn assert_error_contract(validator: &jsonschema::Validator, rejection: &praxis_filter::Rejection, status: u16) {
+    assert_eq!(rejection.status, status);
+    assert!(
+        rejection
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("content-type") && value == "application/json")
+    );
+    assert!(
+        !rejection
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("retry-after")),
+        "only admission errors advertise a retry delay"
+    );
+    let body = rejection_body(rejection);
+    validator.validate(&body).unwrap();
+    assert_eq!(
+        body["error"]["type"],
+        if status == 500 {
+            "server_error"
+        } else {
+            "invalid_request_error"
+        }
+    );
+    assert!(
+        !body.to_string().contains("SELECT"),
+        "backend details must stay private"
+    );
+}
+
+#[tokio::test]
+async fn conformance_conversations_declared_errors_match_pinned_contract_and_preserve_owners() {
+    #[derive(serde::Deserialize)]
+    struct Reference {
+        paths: BTreeMap<String, BTreeMap<String, Value>>,
+    }
+    let pinned: Reference =
+        serde_yaml::from_str(include_str!("../../../../docs/conformance/specs/openai-openapi.yaml")).unwrap();
+    let validator = pinned_error_validator();
+    let generated: Value = serde_json::from_str(&super::implementation_openapi_json().unwrap()).unwrap();
+    let (filter, store) = sqlite_harness().await;
+    let owner = crate::test_utils::test_owner("default");
+    let foreign = crate::test_utils::test_owner("other");
+    let id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({"keep": "original"})).await;
+    let mut item = race_item("item_private");
+    item.owner = owner.clone();
+    item.conversation_id.clone_from(&id);
+    store
+        .create_items_and_sync_messages(&owner, &id, &[item])
+        .await
+        .unwrap();
+    let original_history = store.conversation_history(&owner, &id).await.unwrap();
+    let mut checked = 0;
+    for operation in operation_specs() {
+        let method = operation.method().as_str().to_lowercase();
+        let responses = &pinned.paths[operation.spec_path][&method]["responses"];
+        let generated_responses = &generated["paths"][operation.spec_path][&method]["responses"];
+        assert_eq!(
+            responses
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+            generated_responses.as_object().unwrap().keys().collect()
+        );
+        for status in responses
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|status| matches!(status.as_str(), "400" | "404" | "500"))
+        {
+            let status = status.parse::<u16>().unwrap();
+            let mut path = operation
+                .runtime_path()
+                .replace("{conversation_id}", &id)
+                .replace("{item_id}", "item_private");
+            let mut body = br#"{"metadata":{},"items":[]}"#.as_slice();
+            if status == 400 {
+                match operation.operation {
+                    ConversationOperation::CreateConversation
+                    | ConversationOperation::UpdateConversation
+                    | ConversationOperation::CreateConversationItems => body = b"{",
+                    ConversationOperation::ListConversationItems => path.push_str("?limit=-1"),
+                    ConversationOperation::DeleteConversationItem => path = path.replace("item_private", "%FF"),
+                    _ => panic!("unexpected declared 400"),
+                }
+            }
+            let rejection = run_contract_request(
+                filter.as_ref(),
+                (status != 500).then_some(&store),
+                &make_request(
+                    Method::from_bytes(operation.method().as_str().as_bytes()).unwrap(),
+                    &path,
+                ),
+                body,
+                if status == 404 { foreign.clone() } else { owner.clone() },
+            )
+            .await;
+            assert_error_contract(&validator, &rejection, status);
+            if status == 404 {
+                // A missing resource and one owned by another caller must be indistinguishable.
+                let absent_path = path.replace(&id, "conv_absent");
+                let absent = run_contract_request(
+                    filter.as_ref(),
+                    Some(&store),
+                    &make_request(
+                        Method::from_bytes(operation.method().as_str().as_bytes()).unwrap(),
+                        &absent_path,
+                    ),
+                    body,
+                    foreign.clone(),
+                )
+                .await;
+                assert_error_contract(&validator, &absent, 404);
+                assert_eq!(
+                    rejection_body(&rejection)["error"]["type"],
+                    rejection_body(&absent)["error"]["type"]
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 16, "every pinned non-admission error must be exercised");
+    let unchanged = ConversationItemStore::get_conversation(store.as_ref(), &owner, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.metadata, serde_json::json!({"keep": "original"}));
+    assert_eq!(store.conversation_history(&owner, &id).await.unwrap(), original_history);
+    println!("PRAXIS_CONFORMANCE_OK conversations error_response_contract");
+}
+
+
+#[tokio::test]
+async fn conformance_conversations_storage_errors_roll_back_mutations() {
+    let validator = pinned_error_validator();
+    for (method, path, body, event, table) in [
+        (
+            Method::POST,
+            "/v1/conversations",
+            br#"{"items":[{"type":"message","role":"user","content":"rollback"}]}"#.as_slice(),
+            "INSERT",
+            "items",
+        ),
+        (
+            Method::POST,
+            "/v1/conversations/CONVERSATION",
+            br#"{"metadata":{"changed":"yes"}}"#,
+            "UPDATE",
+            "conversations",
+        ),
+        (
+            Method::POST,
+            "/v1/conversations/CONVERSATION/items",
+            br#"{"items":[{"type":"message","role":"user","content":"rollback"}]}"#,
+            "INSERT",
+            "items",
+        ),
+        (
+            Method::DELETE,
+            "/v1/conversations/CONVERSATION/items/item_private",
+            b"",
+            "DELETE",
+            "items",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", directory.path().join("atomic.db").display());
+        let store: Arc<dyn PersistedStateBackend> = Arc::new(
+            SqliteResponseStore::new(&url, "responses", "conversations", Some("items"), None, None)
+                .await
+                .unwrap(),
+        );
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        let filter = OpenaiConversationsFilter::default();
+        let owner = crate::test_utils::test_owner("default");
+        let id = create_test_conversation(&filter, &store, serde_json::json!({"keep":"original"})).await;
+        let mut item = race_item("item_private");
+        item.owner = owner.clone();
+        item.conversation_id.clone_from(&id);
+        store
+            .create_items_and_sync_messages(&owner, &id, &[item])
+            .await
+            .unwrap();
+        let original_history = store.conversation_history(&owner, &id).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TRIGGER fail_mutation AFTER {event} ON {table} BEGIN SELECT RAISE(ABORT, 'injected private database failure'); END")))
+            .execute(&pool).await.unwrap();
+        let rejection = run_contract_request(
+            &filter,
+            Some(&store),
+            &make_request(method, &path.replace("CONVERSATION", &id)),
+            body,
+            owner.clone(),
+        )
+        .await;
+        assert_error_contract(&validator, &rejection, 500);
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM conversations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "a rejected create leaves no parent");
+        assert_eq!(store.conversation_history(&owner, &id).await.unwrap(), original_history);
+        let record = ConversationItemStore::get_conversation(store.as_ref(), &owner, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.metadata, serde_json::json!({"keep":"original"}));
+        assert!(!rejection_body(&rejection).to_string().contains("injected private"));
+        pool.close().await;
+    }
+    println!("PRAXIS_CONFORMANCE_OK conversations storage_error_rollback");
 }

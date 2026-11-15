@@ -8,12 +8,9 @@ use std::ops::Deref;
 #[cfg(feature = "openai-conversations")]
 use serde_json::Value;
 #[cfg(feature = "openai-conversations")]
-use utoipa::{
-    PartialSchema,
-    openapi::{
-        RefOr,
-        schema::{ObjectBuilder, Schema, Type},
-    },
+use utoipa::openapi::{
+    RefOr,
+    schema::{ObjectBuilder, Schema, Type},
 };
 
 #[cfg(feature = "openai-conversations")]
@@ -25,8 +22,8 @@ use super::contracts::{
 use crate::openai::{
     include::IncludeField,
     operation::{
-        MediaTypeSpec, OwnedOperationContract, ParameterLocation, ParameterSpec, RequestBodySpec, ResponseHeaderSpec,
-        ResponseSpec, schema_binding,
+        MediaTypeSpec, OwnedOperationContract, RequestBodySpec, ResponseHeaderSpec, ResponseSpec, path_parameter,
+        query_parameter, schema_binding,
     },
 };
 #[cfg(feature = "openai-conversations")]
@@ -93,7 +90,11 @@ macro_rules! request_binding {
 }
 
 /// Convert a registry contract declaration into optional owned metadata.
-#[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
+#[cfg(any(
+    feature = "openai-conversations",
+    feature = "openai-files",
+    feature = "openai-responses-openapi"
+))]
 #[expect(
     unused_macro_rules,
     reason = "non-owning form is part of the registry API but current Conversations operations are all local"
@@ -106,7 +107,8 @@ macro_rules! operation_contract {
         owned {
             parameters: [$($parameter:expr),* $(,)?],
             request: $request:tt,
-            response: $response:ty $(,)?
+            response: $response:ty,
+            errors: [$($status:literal),* $(,)?] $(,)?
         }
     ) => {{
         #[cfg(feature = "openai-conversations")]
@@ -127,8 +129,13 @@ macro_rules! operation_contract {
                         description: "Minimum integer seconds to wait before retrying, when a delay can be computed.",
                         schema: super::rate_limit::retry_after_schema,
                     }],
-                    content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!(super::rate_limit::ErrorResponse))],
-                }],
+                    content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!(crate::openai::error::ErrorResponse<'static>))],
+                }, $(ResponseSpec {
+                    status: $status,
+                    description: "Conversations error",
+                    headers: &[],
+                    content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!(crate::openai::error::ErrorResponse<'static>))],
+                }),*],
             })
         }
         #[cfg(not(feature = "openai-conversations"))]
@@ -166,50 +173,23 @@ macro_rules! contract_request_body {
     (none {}) => {
         RequestBody::None
     };
-    (owned { parameters: [$($parameter:expr),* $(,)?],request: $request:tt,response: $response:ty $(,)? }) => {
+    (
+        owned {
+            parameters:
+            [$($parameter:expr),* $(,)?],request:
+            $request:tt,response:
+            $response:ty,errors:
+            [$($status:literal),* $(,)?] $(,)?
+        }
+    ) => {
         request_body_shape!($request)
-    };
-}
-
-/// Declare a required string path parameter.
-#[cfg(feature = "openai-conversations")]
-macro_rules! path_parameter {
-    ($name:literal, $description:literal) => {
-        ParameterSpec::new(
-            $name,
-            ParameterLocation::Path,
-            true,
-            $description,
-            <String as PartialSchema>::schema,
-        )
-    };
-}
-
-/// Declare an optional typed query parameter.
-///
-/// The `$schema:ty` form derives the schema from a type's [`PartialSchema`]
-/// impl. The `schema_fn = $path` form takes an explicit schema constructor for
-/// parameters whose emitted contract must match the official reference exactly.
-#[cfg(feature = "openai-conversations")]
-macro_rules! query_parameter {
-    ($name:literal, $schema:ty, $description:literal) => {
-        ParameterSpec::new(
-            $name,
-            ParameterLocation::Query,
-            false,
-            $description,
-            <$schema as PartialSchema>::schema,
-        )
-    };
-    ($name:literal,schema_fn = $schema_fn:path, $description:literal) => {
-        ParameterSpec::new($name, ParameterLocation::Query, false, $description, $schema_fn)
     };
 }
 
 /// Emit the `listConversationItems` `limit` query schema mandated by the
 /// official reference: `{type: integer, default: 20}`.
 ///
-/// The derived `<u32 as PartialSchema>::schema` would add `format: int32` and
+/// The derived `<u32 as utoipa::PartialSchema>::schema` would add `format: int32` and
 /// `minimum: 0` and omit the default, so the schema is hand-built to match the
 /// pinned OpenAI contract exactly. The default mirrors the runtime page size in
 /// [`DEFAULT_PAGE_LIMIT`], keeping the contract and handler in lockstep.
@@ -296,7 +276,7 @@ macro_rules! conversation_operations {
                             request_body: contract_request_body!($contract_kind $contract),
                         },
                         spec_path: $path,
-                        #[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
+                        #[cfg(any(feature = "openai-conversations", feature = "openai-files", feature = "openai-responses-openapi"))]
                         owned_contract: operation_contract!($contract_kind $contract),
                     },
                 },
@@ -315,6 +295,7 @@ conversation_operations! {
             parameters: [],
             request: [optional CreateConversationRequest],
             response: ConversationResource,
+            errors: ["400", "500"],
         },
     },
     GetConversation {
@@ -329,6 +310,7 @@ conversation_operations! {
             )],
             request: [none],
             response: ConversationResource,
+            errors: ["404"],
         },
     },
     UpdateConversation {
@@ -343,6 +325,7 @@ conversation_operations! {
             )],
             request: [required UpdateConversationRequest],
             response: ConversationResource,
+            errors: ["400", "404", "500"],
         },
     },
     DeleteConversation {
@@ -357,6 +340,7 @@ conversation_operations! {
             )],
             request: [none],
             response: DeletedConversationResource,
+            errors: ["404"],
         },
     },
     CreateConversationItems {
@@ -378,6 +362,7 @@ conversation_operations! {
             ],
             request: [required CreateConversationItemsRequest],
             response: ConversationItemList,
+            errors: ["400", "404", "500"],
         },
     },
     ListConversationItems {
@@ -402,6 +387,7 @@ conversation_operations! {
             ],
             request: [none],
             response: ConversationItemList,
+            errors: ["400", "404"],
         },
     },
     GetConversationItem {
@@ -424,6 +410,7 @@ conversation_operations! {
             ],
             request: [none],
             response: ConversationItem,
+            errors: ["404"],
         },
     },
     DeleteConversationItem {
@@ -441,6 +428,7 @@ conversation_operations! {
             ],
             request: [none],
             response: ConversationResource,
+            errors: ["400", "404", "500"],
         },
     },
 }

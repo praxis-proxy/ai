@@ -11,6 +11,8 @@
 pub(crate) mod api_client;
 pub(crate) mod chat_completions;
 pub(crate) mod conversations;
+#[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
+pub(crate) mod error;
 pub(crate) mod error_response_formatter;
 pub(crate) mod files;
 #[cfg(feature = "store")]
@@ -38,6 +40,8 @@ pub use conversations::{
 };
 #[cfg(feature = "openai-conversations")]
 pub use conversations::{OpenaiConversationsFilter, implementation_openapi_json as conversations_openapi_json};
+#[cfg(feature = "openai-files")]
+pub use files::implementation_openapi_json as files_openapi_json;
 pub use files::routes::{FilesOperation, FilesOperationSpec, operation_specs as files_operation_specs};
 pub use operation::OpenAiOperationSpec;
 #[cfg(feature = "openai-responses")]
@@ -50,6 +54,10 @@ pub use responses::CompactFilter;
 pub use responses::FileResolveFilter;
 #[cfg(feature = "openai-responses-openapi")]
 pub use responses::implementation_openapi_json as responses_openapi_json;
+/// Hidden entry points used by the workspace's Responses initialization benchmark.
+#[cfg(feature = "bench-responses-state")]
+#[doc(hidden)]
+pub use responses::initialization_benchmark as responses_state_benchmark;
 #[cfg(feature = "openai-responses")]
 pub use responses::{
     ClientToolCompatFilter, DocExtractFilter, FileSearchDispatchFilter, OpenaiResponsesRequestFilter,

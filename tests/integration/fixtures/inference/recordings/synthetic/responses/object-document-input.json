@@ -1,0 +1,113 @@
+{
+  "version": 1,
+  "scenario_id": "responses/object-document-input",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-doc-model",
+    "source_id": "responses/object-document-input"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "resp_document": "resp_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "object-document",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "synthetic-doc-model",
+              "input": {
+                "role": "user",
+                "content": [
+                  {
+                    "type": "input_file",
+                    "filename": "notes.txt",
+                    "file_data": "data:text/plain;base64,aGVsbG8="
+                  }
+                ]
+              },
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "id": "resp_recorded_0001",
+              "object": "response",
+              "status": "completed",
+              "output": []
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "synthetic-doc-model",
+              "input": {
+                "role": "user",
+                "content": [
+                  {
+                    "type": "input_text",
+                    "text": "[Source: notes.txt]\nhello"
+                  }
+                ]
+              },
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "id": "resp_recorded_0001",
+              "object": "response",
+              "status": "completed",
+              "output": []
+            }
+          }
+        }
+      }
+    }
+  ]
+}

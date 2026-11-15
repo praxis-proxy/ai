@@ -258,6 +258,8 @@ impl ModuleItems {
 /// Parsed enum metadata.
 #[derive(Clone)]
 struct EnumInfo {
+    /// YAML-facing source type for an enum deserialized through `try_from`.
+    try_from: Option<String>,
     /// YAML variant names.
     variants: Vec<String>,
     /// Whether serde tries variants by shape instead of by variant tag.
@@ -1194,6 +1196,7 @@ fn extract_enum_info(e: &syn::ItemEnum) -> EnumInfo {
     let fields = flatten_variant_fields_marking_one_of(variant_fields);
 
     EnumInfo {
+        try_from: e.attrs.iter().find_map(|attr| serde_lit_value(attr, "try_from")),
         variants,
         untagged,
         tag,
@@ -1550,6 +1553,13 @@ fn render_vec_type(segment: &syn::PathSegment, enums: &BTreeMap<String, EnumInfo
 
 /// Render an enum as its YAML-facing alternatives.
 fn render_enum_type(info: &EnumInfo, enums: &BTreeMap<String, EnumInfo>) -> String {
+    if let Some(ty) = info
+        .try_from
+        .as_ref()
+        .and_then(|name| syn::parse_str::<syn::Type>(name).ok())
+    {
+        return render_type(&ty, enums);
+    }
     if info.untagged {
         return render_union(
             info.variants
@@ -2358,6 +2368,26 @@ mod tests {
             render_type(&ty, &BTreeMap::new()),
             "object<string, string>",
             "maps should render as YAML object shapes"
+        );
+    }
+
+    #[test]
+    fn try_from_enum_documents_its_yaml_source_type() {
+        let source = r#"
+            #[derive(Deserialize)]
+            #[serde(try_from = "String")]
+            enum ApiVersion { V20230601, V20261021 }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct MyConfig { api_version: ApiVersion }
+        "#;
+        let file: syn::File = syn::parse_str(source).unwrap();
+        let mut items = ModuleItems::new();
+        parse_file_items(&file, &mut items);
+        let filter = build_filter(&items, "test", Some("MyConfig"));
+        assert_eq!(
+            filter.fields[0].type_str, "string",
+            "Rust variants are not accepted YAML values"
         );
     }
 

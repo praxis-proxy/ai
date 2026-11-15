@@ -1531,10 +1531,9 @@ fn include_action_sources(ctx: &HttpFilterContext<'_>) -> bool {
 /// into state.
 ///
 /// `bridge` is the backend-valid `function_call`/`function_call_output` pair.
-/// The per-element clone is required: `messages` and `persisted_messages` are
-/// distinct owners of the bridge messages. The public `output_item` is upserted
-/// so the placeholder accumulated during the response phase is replaced in
-/// place, never duplicated.
+/// When durable history is enabled, the per-element clone keeps the working and
+/// persisted histories independent. The public `output_item` is upserted so the
+/// placeholder accumulated during the response phase is replaced in place.
 fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge: [Value; 2], ids: &SearchCallIds<'_>) {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         let round_start = state
@@ -1553,10 +1552,7 @@ fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge:
             });
             return;
         }
-        let result_start = state.messages.len();
-        state.messages.extend(bridge.iter().cloned());
-        state.persisted_messages.extend(bridge);
-        state.mark_local_tool_results_from(result_start);
+        append_search_bridge(state, bridge);
         // Record execution provenance keyed on the item id `stream_events` reads:
         // this replaces the model's placeholder with an executed result, so only
         // now may the search's lifecycle be synthesized. A placeholder copied into
@@ -1568,6 +1564,26 @@ fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge:
             *slot = output_item;
         }
     }
+}
+
+/// Append backend bridge items to working history and, when enabled, its
+/// persistence mirror. Moving the pair is sufficient for store:false requests.
+fn append_search_bridge(state: &mut ResponsesState, bridge: [Value; 2]) {
+    let result_start = state.messages.len();
+    if state.captures_persistence_history() {
+        // Both histories retain the same immutable payloads; later mutation
+        // detaches only the changed item through MessageHistory's copy-on-write.
+        for item in bridge {
+            let item = Arc::new(item);
+            state.messages.push_shared(Arc::clone(&item));
+            if let Some(persisted) = state.persisted_messages_mut() {
+                persisted.push_shared(item);
+            }
+        }
+    } else {
+        state.messages.extend(bridge);
+    }
+    state.mark_local_tool_results_from(result_start);
 }
 
 /// Owned provider rows kept locally while a multi-query call is in flight.

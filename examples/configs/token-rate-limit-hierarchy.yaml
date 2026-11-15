@@ -42,6 +42,8 @@ filter_chains:
             password: "example-password"
 
       - filter: token_rate_limit
+        backend:
+          kind: memory
         hierarchy:
           - level: org
             identity_header: x-org-id

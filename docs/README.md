@@ -1,50 +1,95 @@
 # Praxis AI Documentation
 
-Praxis AI provides AI inference filters, agentic protocol support, and
-provider API integrations on top of [Praxis](https://github.com/praxis-proxy/praxis).
+Choose a client API and an upstream first, then add routing and policy.
+These pages describe **Development (current main)**. Build features and
+compatibility can differ from released v0.10.0; use the documentation snapshot
+matching your binary. See the [support audit](documentation-audit.md) for the
+reviewed revision and validation evidence.
 
-## Start here
+## Get started
 
-- [Quickstart](quickstart.md)
-- [Feature overview](features.md)
-- [Example configurations](../examples/README.md)
-- [Generated filter reference](filters/reference.md)
+- [Quickstart](quickstart.md): build, validate, and forward your first hosted request.
+- [Choose a client and provider](client-provider-paths.md): protocol, credentials,
+  feature selection, and compatibility limits in one table.
+- [Operator recipes](recipes/README.md): prerequisites, full configurations,
+  startup, requests, expected results, and cleanup.
 
-## Architecture
+## Client APIs
 
-- [AI inference](architecture/ai-inference.md)
-- [OpenAI Responses retained-payload budget](architecture/responses-retained-payload.md)
-- [Routing facts](architecture/routing-facts.md)
-- [Agentic protocols](architecture/agentic-protocols.md)
-- [Response store](architecture/response-store.md)
-- [PostgreSQL cryptographic boundary](architecture/postgres-cryptographic-boundary.md)
-- [Outbound callout security](architecture/outbound-callouts.md)
-- [Cryptographic operations inventory](architecture/cryptographic-inventory.md)
+- [Chat Completions](quickstart.md#chat-completions): native OpenAI-compatible forwarding.
+- [Anthropic Messages](anthropic-messages.md): native forwarding, translation,
+  SDK versions, and backend qualification.
+- [Responses](recipes/managed-responses.md): distinguish native passthrough
+  from experimental gateway-managed state and tool execution.
+- [Conversations](recipes/managed-responses.md#conversations-and-state): local
+  experimental CRUD, storage, and continuation boundaries.
+- [Translation compatibility](conformance/translation-matrix.md): supported,
+  lossy, rejected, and known-gap behavior by direction.
 
-## Provider guides
+## Connect providers and credentials
 
-- [Anthropic Messages](anthropic-messages.md)
-- [Anthropic Messages replay testing](anthropic-messages-replay-test-plan.md)
-- [AI filter overview](filters/README.md)
+- [Provider selection](client-provider-paths.md): OpenAI-compatible, Anthropic,
+  Azure, Vertex, and Bedrock paths.
+- [Credential boundaries](recipes/README.md#credentials): caller keys,
+  gateway authentication, backend secrets, and callout credentials.
+- [Hosted OpenAI](quickstart.md), [native or translated Anthropic](recipes/anthropic.md),
+  and [Azure, Vertex, and Bedrock adapters](recipes/providers.md).
 
-## Development
+## Route requests
 
-- [Development setup](developing/getting-started.md)
-- [Run your Code Harness through Praxis and vLLM](developing/cli-vllm-through-praxis.md)
-- [Run your Code Harness in OpenShell through Praxis and vLLM](developing/openshell-cli-vllm-through-praxis.md)
-- [Nightly GPU test suite](developing/gpu-nightly-suite.md)
-- [Adding filters](developing/adding-filters.md)
-- [Flow visualizers](developing/flow-visualizers.md)
-- [Type design](developing/type-design.md)
-- [FIPS tooling](developing/fips.md)
-- [Project management](developing/project-management.md)
-- [Proposal process](https://github.com/praxis-proxy/enhancements)
+- [Model aliases and provider routing](recipes/routing.md): start with a static
+  mapping, then choose dynamic selection, failover, or session affinity.
+- [Routing facts](architecture/routing-facts.md): which component owns each fact.
+- [Routing examples](../examples/README.md#general): complete YAML chains.
 
-## Operations and releases
+## Protect and control
 
-- [Capacity planning: file descriptors](capacity-planning.md)
-- [Release process](release.md)
-- [FIPS 140-3](fips.md)
-- [Migrating to 0.2.0](migrating-to-0.2.md)
-- [Security policy](../.github/SECURITY.md)
-- [Contributing](../CONTRIBUTING.md)
+- [Guardrails and token usage](recipes/guardrails-token-usage.md): external
+  screening, usage extraction, streaming limits, and metrics.
+- [Operator capability overview](filters/README.md): identity, token limits,
+  metering, credentials, and required filter order.
+- [Outbound callout security](architecture/outbound-callouts.md).
+
+## Tools and state
+
+- [Experimental managed Responses and tools](recipes/managed-responses.md).
+- [MCP and A2A](architecture/agentic-protocols.md): protocol routing and brokering
+  are distinct from model-driven execution.
+- [Files and stores](architecture/response-store.md),
+  [retained-payload budget](architecture/responses-retained-payload.md), and
+  [store migrations](store/schema-migration.md).
+
+## Operate
+
+- [Operations checklist and troubleshooting](operations.md): deployment,
+  configuration validation, observability, and upgrades.
+- [Capacity planning](capacity-planning.md): file descriptors and admission.
+- [FIPS deployment](fips.md) and [OpenTelemetry](architecture/opentelemetry.md).
+- [Security policy](../.github/SECURITY.md).
+
+## Reference and development
+
+- [Feature and build reference](features.md#cargo-features).
+- [Generated filter reference](filters/reference.md) and [example catalog](../examples/README.md).
+- [Development setup](developing/getting-started.md),
+  [adding filters](developing/adding-filters.md), and [embedding filters](developing/filter-hosts.md).
+- [CLI clients with vLLM](developing/cli-vllm-through-praxis.md),
+  [OpenShell](developing/openshell-cli-vllm-through-praxis.md),
+  [qualification](developing/vllm-qualification.md), and [GPU testing](developing/gpu-nightly-suite.md).
+
+### Conformance
+
+- [OpenAI conformance scope, report, and verification](conformance/README.md).
+- [OpenAI Responses state conformance](conformance/openai-responses-state-conformance.md).
+- [OpenResponses translation coverage](conformance/openresponses-translation.md).
+- [Provider translation compatibility matrix](conformance/translation-matrix.md).
+
+### Architecture
+
+- [AI inference architecture](architecture/ai-inference.md),
+  [flow visualizers](developing/flow-visualizers.md), and [type design](developing/type-design.md).
+- [Cryptographic inventory](architecture/cryptographic-inventory.md),
+  [PostgreSQL cryptographic boundary](architecture/postgres-cryptographic-boundary.md),
+  and [FIPS tooling](developing/fips.md).
+- [Release process](release.md), [legacy 0.2 migration](migrating-to-0.2.md),
+  [project management](developing/project-management.md), and [contributing](../CONTRIBUTING.md).

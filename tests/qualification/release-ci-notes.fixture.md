@@ -17,5 +17,5 @@ Selection: Newest exact-commit run and latest attempt; no older green fallback.
 - Job counts are not test counts; skipped steps remain visible.
 
 GPU evidence: **unavailable**. no completed Responses GPU attempt for this commit.
-To collect GPU evidence, dispatch `vllm-integration.yaml` with `run_live_vllm=true` on this release tag, wait for its summary, then rerun Release on the same tag.
+GPU evidence requires a complete successful ancestor nightly within 48 hours. Rerun Release to refresh this snapshot after the nightly completes.
 <!-- praxis:release-ci-qualification:end -->

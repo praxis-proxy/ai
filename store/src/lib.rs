@@ -44,6 +44,6 @@ pub use retained_payload::{
 pub use size::json_values_fit;
 pub use traits::{ConversationItemStore, PersistedStateBackend, ResponseStore};
 pub use types::{
-    BudgetedRecord, ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-    ResponseCasOutcome, ResponseEventRecord, ResponseRecord, StoreError, SweepStats,
+    BudgetedRecord, ConversationItemRecord, ConversationRecord, ConversationSnapshot, EventLogStatus,
+    PendingApprovalRecord, ResponseCasOutcome, ResponseEventRecord, ResponseRecord, StoreError, SweepStats,
 };

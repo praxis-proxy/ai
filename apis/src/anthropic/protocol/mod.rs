@@ -42,6 +42,15 @@ const ANTHROPIC_BETA_HEADER: &str = "anthropic-beta";
 /// Normalizes Anthropic Messages protocol headers for native
 /// backends.
 ///
+/// `default_version` applies only when the caller sends no
+/// `anthropic-version`; a caller-supplied version, such as the `2026-10-21`
+/// default of Anthropic SDK v2, is forwarded unchanged. The filter does not
+/// validate version-specific body rules, so under `2026-10-21` the backend
+/// owns rejecting `temperature`, `top_p`, `top_k`, assistant `document`
+/// blocks, and non-empty citations on user text blocks. It does not touch
+/// credentials: remove `x-api-key` and `authorization` separately when the
+/// gateway owns the upstream credential.
+///
 /// # YAML
 ///
 /// ```yaml
@@ -87,7 +96,13 @@ impl HttpFilter for AnthropicMessagesProtocolFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let has_version = ctx.request.headers.get(ANTHROPIC_VERSION_HEADER).is_some();
+        // A translated route may already own the version through a queued set.
+        // Do not append a native default that would override that contract.
+        let has_version = ctx.request.headers.get(ANTHROPIC_VERSION_HEADER).is_some()
+            || ctx
+                .request_headers_to_set
+                .iter()
+                .any(|(name, _)| name == ANTHROPIC_VERSION_HEADER);
 
         if !has_version && !restore_original_header(ctx, ANTHROPIC_VERSION_HEADER) {
             debug!(
