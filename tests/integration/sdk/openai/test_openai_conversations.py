@@ -1298,6 +1298,10 @@ class TestOpenAIConversations:
         finally:
             database.close()
 
+    @pytest.mark.skipif(
+        DATABASE_URL.startswith("postgres"),
+        reason="queued-status seeding rewrites the SQLite row directly",
+    )
     def test_response_cancel_transitions_queued_to_cancelled(
         self, chunked_response_store
     ):
@@ -1317,6 +1321,10 @@ class TestOpenAIConversations:
             "polling must observe the cancelled status"
         )
 
+    @pytest.mark.skipif(
+        DATABASE_URL.startswith("postgres"),
+        reason="queued-status seeding rewrites the SQLite row directly",
+    )
     def test_response_cancel_is_idempotent(self, chunked_response_store):
         """Repeated cancellation returns the stored response unchanged."""
         client, db_path, table = chunked_response_store
