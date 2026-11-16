@@ -372,19 +372,35 @@ class TestNativeGuardrails:
         for name, expected in _native_expected_headers(lane).items():
             assert headers.get(name) == expected, f"guardrails must preserve SDK {lane} header {name}"
 
-    @pytest.mark.parametrize("verdict, expected_status", [("blocked", 403), ("modified", 502)])
-    def test_unsafe_verdicts_prevent_model_calls(self, native_guardrails_client, verdict, expected_status):
+    @pytest.mark.parametrize("verdict, content, expected_status", [
+        ("blocked", "Contact alice@example.com", 403),
+        ("modified", [{"type": "text", "text": "Contact alice@"},
+                      {"type": "text", "text": "example.com"}], 502),
+    ])
+    def test_unsafe_verdicts_prevent_model_calls(self, native_guardrails_client, verdict, content, expected_status):
         NEMO_STATE.script(200, "application/json", {
             "status": verdict, "content": "masked", "rail": "pii",
         })
         with pytest.raises(APIStatusError) as error:
             native_guardrails_client.messages.create(
                 model=MODEL, max_tokens=64, system="Follow policy.",
-                messages=[{"role": "user", "content": "Contact alice@example.com"}],
+                messages=[{"role": "user", "content": content}],
             )
         assert error.value.status_code == expected_status, "the SDK must observe the guardrail rejection"
         assert len(NEMO_STATE.requests) == 1, "the rejection must follow a real provider call"
-        assert not NATIVE_STATE.requests, "blocked or modified native input must never reach the model"
+        assert not NATIVE_STATE.requests, "blocked or unsupported input must never reach the model"
+
+    def test_modified_text_reaches_model_masked(self, native_guardrails_client):
+        NEMO_STATE.script(200, "application/json", {"status": "modified", "content": "Contact <EMAIL_ADDRESS>"})
+        response = native_guardrails_client.messages.create(
+            model=MODEL, max_tokens=64, system="Follow policy.",
+            messages=[{"role": "user", "content": "Contact alice@example.com"}],
+        )
+        assert response.content[0].text == "hello", "the model response must parse through the SDK"
+        assert len(NEMO_STATE.requests) == 1, "the original input must be screened"
+        assert len(NATIVE_STATE.requests) == 1, "the masked input must reach the model once"
+        _, _, forwarded = NATIVE_STATE.requests[0]
+        assert forwarded["messages"][0]["content"] == "Contact <EMAIL_ADDRESS>", "only masked text may reach the model"
 
     def test_unchanged_modification_keeps_native_body(self, native_guardrails_client):
         NEMO_STATE.script(200, "application/json", {"status": "modified", "content": "Hello"})
