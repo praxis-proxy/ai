@@ -2507,7 +2507,9 @@ fn rewrite_request_body(
     let Some(obj) = parsed.as_object_mut() else {
         return Ok(None);
     };
-    let Some(serde_json::Value::Array(tools)) = obj.remove("tools") else {
+    // Keep the map slot while moving the owned array into the rewrite.
+    // Removing the member would otherwise permute unrelated request fields.
+    let Some(serde_json::Value::Array(tools)) = obj.get_mut("tools").map(serde_json::Value::take) else {
         return Ok(None);
     };
 
@@ -2577,21 +2579,20 @@ fn sanitize_deferred_connector_tool(tool: serde_json::Value) -> serde_json::Valu
         serde_json::Value::Object(obj) => obj,
         other => return other,
     };
-    let mut sanitized = serde_json::Map::new();
-    for key in [
-        "type",
-        "server_label",
-        "server_description",
-        "defer_loading",
-        "allowed_tools",
-        "allowed_callers",
-        "require_approval",
-    ] {
-        if let Some(value) = obj.remove(key) {
-            sanitized.insert(key.to_owned(), value);
-        }
-    }
-    serde_json::Value::Object(sanitized)
+    // Filter in place so removing private connector fields cannot reorder public ones.
+    obj.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "type"
+                | "server_label"
+                | "server_description"
+                | "defer_loading"
+                | "allowed_tools"
+                | "allowed_callers"
+                | "require_approval"
+        )
+    });
+    serde_json::Value::Object(obj)
 }
 
 /// Detect duplicate function names involving at least one
@@ -2627,17 +2628,17 @@ fn detect_name_collisions(tools: &[serde_json::Value], generated_names: &HashSet
 ///
 /// - **MCP selectors in `allowed_tools`**: expands each MCP selector to its generated function equivalents.
 ///
-/// The choice is removed from the request and consumed so unchanged fields
-/// and selectors can be moved back without cloning their JSON payloads.
+/// Consume the choice while retaining its map slot, so selectors can be moved
+/// back without cloning their JSON payloads or reordering unrelated fields.
 fn rewrite_tool_choice(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
     resolved_labels: &HashSet<String>,
 ) -> Result<(), ResolveError> {
-    let Some((choice_key, choice)) = obj.remove_entry("tool_choice") else {
+    let Some(choice_slot) = obj.get_mut("tool_choice") else {
         return Ok(());
     };
-    let rewritten = match choice {
+    let rewritten = match choice_slot.take() {
         serde_json::Value::Object(choice_obj)
             if choice_obj.get("type").and_then(serde_json::Value::as_str) == Some("mcp") =>
         {
@@ -2650,7 +2651,7 @@ fn rewrite_tool_choice(
         },
         choice => choice,
     };
-    obj.insert(choice_key, rewritten);
+    *choice_slot = rewritten;
     Ok(())
 }
 
@@ -2714,18 +2715,18 @@ fn rewrite_allowed_tools_choice(
     tool_map: &HashMap<(String, String), serde_json::Value>,
     resolved_labels: &HashSet<String>,
 ) -> Result<serde_json::Value, ResolveError> {
-    let Some((tools_key, tools)) = choice_obj.remove_entry("tools") else {
+    let Some(tools) = choice_obj.get_mut("tools").map(serde_json::Value::take) else {
         return Ok(serde_json::Value::Object(choice_obj));
     };
     let serde_json::Value::Array(tools_arr) = tools else {
-        choice_obj.insert(tools_key, tools);
+        choice_obj.insert("tools".to_owned(), tools);
         return Ok(serde_json::Value::Object(choice_obj));
     };
 
     let (new_tools, changed, dropped_label) = rebuild_allowed_tools_selectors(tools_arr, tool_map, resolved_labels);
 
     if !changed {
-        choice_obj.insert(tools_key, serde_json::Value::Array(new_tools));
+        choice_obj.insert("tools".to_owned(), serde_json::Value::Array(new_tools));
         return Ok(serde_json::Value::Object(choice_obj));
     }
 
@@ -2746,7 +2747,7 @@ fn rewrite_allowed_tools_choice(
         return Ok(serde_json::Value::String("none".to_owned()));
     }
 
-    choice_obj.insert(tools_key, serde_json::Value::Array(new_tools));
+    choice_obj.insert("tools".to_owned(), serde_json::Value::Array(new_tools));
     Ok(serde_json::Value::Object(choice_obj))
 }
 
@@ -3372,7 +3373,7 @@ fn expanded_request_body(
 ) -> serde_json::Value {
     let mut body = request_body.clone();
     if let Some(obj) = body.as_object_mut()
-        && let Some(serde_json::Value::Array(tools)) = obj.remove("tools")
+        && let Some(serde_json::Value::Array(tools)) = obj.get_mut("tools").map(serde_json::Value::take)
     {
         obj.insert(
             "tools".to_owned(),

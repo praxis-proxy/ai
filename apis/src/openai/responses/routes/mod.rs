@@ -90,7 +90,11 @@ macro_rules! request_binding {
 }
 
 /// Convert a registry contract declaration into optional owned metadata.
-#[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
+#[cfg(any(
+    feature = "openai-conversations",
+    feature = "openai-files",
+    feature = "openai-responses-openapi"
+))]
 macro_rules! operation_contract {
     (none {}) => {
         None
@@ -175,7 +179,7 @@ macro_rules! responses_operations {
                             request_body: request_body_shape!($body),
                         },
                         spec_path: $path,
-                        #[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
+                        #[cfg(any(feature = "openai-conversations", feature = "openai-files", feature = "openai-responses-openapi"))]
                         owned_contract: operation_contract!($contract_kind $contract),
                     },
                 },

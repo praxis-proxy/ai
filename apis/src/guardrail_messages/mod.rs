@@ -9,6 +9,9 @@
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
+mod redaction;
+pub use redaction::{GuardrailTextLocations, extract_with_locations, redact_native_body};
+
 use crate::{
     anthropic::routes::is_create_message,
     openai::{
@@ -64,15 +67,21 @@ pub enum GuardrailMessageExtractError {
 /// Returns [`GuardrailMessageExtractError`] when the operation is unsupported,
 /// the body is invalid JSON, or it does not satisfy its selected protocol
 /// contract.
-#[expect(
-    clippy::too_many_lines,
-    reason = "dispatches each direction through registry-owned operation predicates"
-)]
 pub fn extract_guardrail_messages(
     operation: AiOperationMatch,
     direction: GuardrailMessageDirection,
     body: &[u8],
 ) -> Result<Vec<Value>, GuardrailMessageExtractError> {
+    let mut json = parse_guardrail_body(operation, direction, body)?;
+    extract_parsed_guardrail_messages(operation, direction, &mut json)
+}
+
+/// Parse once after validating the trusted operation's transport.
+fn parse_guardrail_body(
+    operation: AiOperationMatch,
+    direction: GuardrailMessageDirection,
+    body: &[u8],
+) -> Result<Value, GuardrailMessageExtractError> {
     if operation.transport != Transport::Http {
         return Err(GuardrailMessageExtractError::UnsupportedOperation {
             protocol: operation.application_protocol.as_str(),
@@ -81,16 +90,25 @@ pub fn extract_guardrail_messages(
         });
     }
 
-    let json: Value = serde_json::from_slice(body).map_err(GuardrailMessageExtractError::InvalidJson)?;
+    serde_json::from_slice(body).map_err(GuardrailMessageExtractError::InvalidJson)
+}
+
+/// Borrow native fields so the same document can verify text locations.
+/// Chat extraction retains its existing ownership transfer.
+fn extract_parsed_guardrail_messages(
+    operation: AiOperationMatch,
+    direction: GuardrailMessageDirection,
+    json: &mut Value,
+) -> Result<Vec<Value>, GuardrailMessageExtractError> {
     if is_create_chat_completion(operation.application_protocol, operation.operation_id) {
         return match direction {
-            GuardrailMessageDirection::Request => extract_chat_request(json),
-            GuardrailMessageDirection::Response => extract_chat_response(json),
+            GuardrailMessageDirection::Request => extract_chat_request(std::mem::take(json)),
+            GuardrailMessageDirection::Response => extract_chat_response(std::mem::take(json)),
         };
     }
     if is_create_response(operation.application_protocol, operation.operation_id) {
         return match direction {
-            GuardrailMessageDirection::Request => extract_responses_request(&json),
+            GuardrailMessageDirection::Request => extract_responses_request(json),
             GuardrailMessageDirection::Response => extract_responses_response(json),
         };
     }
@@ -196,13 +214,13 @@ fn validate_text_guardrail_messages(
     clippy::too_many_lines,
     reason = "validates each supported OpenAI Responses output item in one pass"
 )]
-fn extract_responses_response(mut json: Value) -> Result<Vec<Value>, GuardrailMessageExtractError> {
-    let output =
-        json.get_mut("output")
-            .and_then(Value::as_array_mut)
-            .ok_or(GuardrailMessageExtractError::InvalidShape(
-                "OpenAI Responses response output",
-            ))?;
+fn extract_responses_response(json: &Value) -> Result<Vec<Value>, GuardrailMessageExtractError> {
+    let output = json
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or(GuardrailMessageExtractError::InvalidShape(
+            "OpenAI Responses response output",
+        ))?;
     if output.is_empty() {
         return Err(GuardrailMessageExtractError::InvalidShape(
             "OpenAI Responses response output",
@@ -210,7 +228,7 @@ fn extract_responses_response(mut json: Value) -> Result<Vec<Value>, GuardrailMe
     }
 
     let mut messages = Vec::new();
-    for item in output.iter() {
+    for item in output {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
         match item_type {
             "message" => {
@@ -308,79 +326,77 @@ fn extract_responses_text(content: Option<&Value>) -> Result<String, GuardrailMe
 }
 
 /// Extract text messages from an Anthropic Messages request.
-#[expect(
-    clippy::too_many_lines,
-    reason = "moves request content into canonical messages without copying strings"
-)]
-fn extract_anthropic_request(mut json: Value) -> Result<Vec<Value>, GuardrailMessageExtractError> {
+fn extract_anthropic_request(json: &Value) -> Result<Vec<Value>, GuardrailMessageExtractError> {
     let object = json
-        .as_object_mut()
+        .as_object()
         .ok_or(GuardrailMessageExtractError::InvalidShape("Anthropic request"))?;
     let mut messages = Vec::new();
-    if let Some(system) = object.remove("system") {
+    if let Some(system) = object.get("system") {
         let content = extract_anthropic_text(system)?;
         if !content.is_empty() {
             messages.push(canonical_text_message("system".to_owned(), content));
         }
     }
     let input = object
-        .remove("messages")
-        .and_then(|messages| match messages {
-            Value::Array(messages) => Some(messages),
-            _ => None,
-        })
+        .get("messages")
+        .and_then(Value::as_array)
         .ok_or(GuardrailMessageExtractError::InvalidShape("Anthropic request messages"))?;
     if input.is_empty() {
         return Err(GuardrailMessageExtractError::InvalidShape("Anthropic request messages"));
     }
-    for mut message in input {
-        let message = message
-            .as_object_mut()
-            .ok_or(GuardrailMessageExtractError::InvalidShape(
-                "Anthropic request message role",
-            ))?;
-        let role = take_required_string(message, "role", "Anthropic request message role")?;
+    for message in input {
+        let role = required_string(message, "role", "Anthropic request message role")?;
         let content = message
-            .remove("content")
+            .get("content")
             .ok_or(GuardrailMessageExtractError::InvalidShape("Anthropic text content"))?;
-        messages.push(canonical_text_message(role, extract_anthropic_text(content)?));
+        messages.push(canonical_text_message(
+            role.to_owned(),
+            extract_anthropic_text(content)?,
+        ));
     }
     Ok(messages)
 }
 
 /// Extract the assistant message from an Anthropic Messages response.
-fn extract_anthropic_response(mut json: Value) -> Result<Vec<Value>, GuardrailMessageExtractError> {
+fn extract_anthropic_response(json: &Value) -> Result<Vec<Value>, GuardrailMessageExtractError> {
     let object = json
-        .as_object_mut()
+        .as_object()
         .ok_or(GuardrailMessageExtractError::InvalidShape("Anthropic response"))?;
-    let role = take_required_string(object, "role", "Anthropic response role")?;
+    let role = required_string(json, "role", "Anthropic response role")?;
     if role != "assistant" {
         return Err(GuardrailMessageExtractError::InvalidShape("Anthropic response role"));
     }
     let content = object
-        .remove("content")
+        .get("content")
         .ok_or(GuardrailMessageExtractError::InvalidShape("Anthropic text content"))?;
     let content = extract_anthropic_text(content)?;
     if content.is_empty() {
         return Err(GuardrailMessageExtractError::InvalidShape("Anthropic response content"));
     }
-    Ok(vec![canonical_text_message(role, content)])
+    Ok(vec![canonical_text_message(role.to_owned(), content)])
 }
 
 /// Extract the textual content of an Anthropic Messages value.
-fn extract_anthropic_text(value: Value) -> Result<String, GuardrailMessageExtractError> {
+/// Canonical messages own their text while the native fields remain available
+/// for location verification, so string content is copied at this boundary.
+fn extract_anthropic_text(value: &Value) -> Result<String, GuardrailMessageExtractError> {
     let blocks = match value {
-        Value::String(text) => return Ok(text),
+        Value::String(text) => return Ok(text.to_owned()),
         Value::Array(blocks) => blocks,
         _ => return Err(GuardrailMessageExtractError::InvalidShape("Anthropic text content")),
     };
     let mut text = String::new();
-    for mut block in blocks {
+    for block in blocks {
         let block = block
-            .as_object_mut()
+            .as_object()
             .ok_or(GuardrailMessageExtractError::InvalidShape("Anthropic content block"))?;
         match block.get("type").and_then(Value::as_str) {
-            Some("text") => text.push_str(&take_required_string(block, "text", "Anthropic text block")?),
+            Some("text") => text.push_str(
+                block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or(GuardrailMessageExtractError::InvalidShape("Anthropic text block"))?,
+            ),
             Some(_) => return Err(GuardrailMessageExtractError::UnsupportedContent("Anthropic message")),
             None => return Err(GuardrailMessageExtractError::InvalidShape("Anthropic content block")),
         }
@@ -394,18 +410,6 @@ fn canonical_text_message(role: String, content: String) -> Value {
         ("role".to_owned(), Value::String(role)),
         ("content".to_owned(), Value::String(content)),
     ]))
-}
-
-/// Remove a required string field from an object.
-fn take_required_string(
-    object: &mut Map<String, Value>,
-    field: &'static str,
-    shape: &'static str,
-) -> Result<String, GuardrailMessageExtractError> {
-    match object.remove(field) {
-        Some(Value::String(value)) => Ok(value),
-        _ => Err(GuardrailMessageExtractError::InvalidShape(shape)),
-    }
 }
 
 /// Return a required string field or report the selected protocol shape.
@@ -435,6 +439,87 @@ mod tests {
             request_body: RequestBody::Json { required: true },
             path_parameters: PathParameterOffsets::default(),
         }
+    }
+
+    /// Native extraction must leave the parsed document intact for path verification.
+    fn assert_native_document_preserved(
+        operation: AiOperationMatch,
+        direction: GuardrailMessageDirection,
+        body: &Value,
+        expected: &[Value],
+    ) {
+        let bytes = serde_json::to_vec(body).unwrap();
+        let mut parsed = parse_guardrail_body(operation, direction, &bytes).unwrap();
+        let messages = extract_parsed_guardrail_messages(operation, direction, &mut parsed).unwrap();
+        assert_eq!(messages.as_slice(), expected);
+        assert_eq!(&parsed, body, "location checks must see the original native fields");
+        let (located, _) = extract_with_locations(operation, direction, &bytes).unwrap();
+        assert_eq!(located.as_slice(), expected);
+    }
+
+    #[test]
+    fn parsed_responses_request_preserves_cached_text_and_native_fields() {
+        assert_native_document_preserved(
+            operation("openai_responses", "createResponse"),
+            GuardrailMessageDirection::Request,
+            &json!({"instructions":"rules", "input":[{"role":"user","content":[{
+                "type":"input_text","text":"café","prompt_cache_breakpoint":{"mode":"explicit"}
+            }]}]}),
+            &[
+                json!({"role":"system","content":"rules"}),
+                json!({"role":"user","content":[{
+                    "type":"text","text":"café","prompt_cache_breakpoint":{"mode":"explicit"}
+                }]}),
+            ],
+        );
+    }
+
+    #[test]
+    fn parsed_responses_response_preserves_empty_output_refusal_and_reasoning() {
+        assert_native_document_preserved(
+            operation("openai_responses", "createResponse"),
+            GuardrailMessageDirection::Response,
+            &json!({"output":[
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":""}]},
+                {"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"refused"}]},
+                {"type":"reasoning","encrypted_content":"opaque"},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}
+            ]}),
+            &[
+                json!({"role":"assistant","content":"refused"}),
+                json!({"role":"assistant","content":"answer"}),
+            ],
+        );
+    }
+
+    #[test]
+    fn parsed_anthropic_request_preserves_strings_and_multiple_blocks() {
+        assert_native_document_preserved(
+            operation("anthropic_messages", "messages_post"),
+            GuardrailMessageDirection::Request,
+            &json!({"system":[{"type":"text","text":"rules"}], "messages":[
+                {"role":"user","content":"first"},
+                {"role":"assistant","content":[{"type":"text","text":"reply"}]},
+                {"role":"user","content":[{"type":"text","text":"sec"},{"type":"text","text":"ond"}]}
+            ]}),
+            &[
+                json!({"role":"system","content":"rules"}),
+                json!({"role":"user","content":"first"}),
+                json!({"role":"assistant","content":"reply"}),
+                json!({"role":"user","content":"second"}),
+            ],
+        );
+    }
+
+    #[test]
+    fn parsed_anthropic_response_preserves_text_metadata() {
+        assert_native_document_preserved(
+            operation("anthropic_messages", "messages_post"),
+            GuardrailMessageDirection::Response,
+            &json!({"role":"assistant","content":[{"type":"text","text":"café","citations":null}],
+                "stop_details":{"type":"refusal","category":"general_harms","explanation":"details"}}),
+            &[json!({"role":"assistant","content":"café"})],
+        );
     }
 
     #[test]

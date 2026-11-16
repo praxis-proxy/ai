@@ -1346,11 +1346,12 @@ impl ResponsesState {
         // translation) to reject. Cloning `MessageHistory` shares each item's
         // `Arc` payload, so the immutable snapshot and persistence view never
         // deep-copy the input; only `messages` detaches an item on later mutation.
+        // Input has a separate owner; removing it must not permute retained parameters.
         let input_form = InputForm::classify(body.get("input"));
         let messages = if input_is_normalizable(body.get("input")) {
             let value = body
                 .as_object_mut()
-                .and_then(|object| object.remove("input"))
+                .and_then(|object| object.shift_remove("input"))
                 .unwrap_or(serde_json::Value::Null);
             MessageHistory::from(normalize_input_owned(value))
         } else {
@@ -1431,7 +1432,7 @@ impl ResponsesState {
         if input_is_normalizable(params.get("input"))
             && let Some(object) = params.as_object_mut()
         {
-            object.remove("input");
+            object.shift_remove("input");
         }
         self.request_body = params;
     }
@@ -2272,6 +2273,19 @@ mod tests {
             "input must not be duplicated inside request_body"
         );
         assert_eq!(state.input[0]["content"], "hello", "the input is owned by state.input");
+    }
+
+    #[test]
+    fn extracting_input_preserves_parameter_member_order() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"model":"m","input":[{"role":"user","content":"hi"}],"metadata":{"z":"last","a":"first"},"store":false,"stream":false}"#,
+        )
+        .unwrap();
+        let mut state = ResponsesState::from_request_body(body.clone());
+        let expected = r#"{"model":"m","metadata":{"z":"last","a":"first"},"store":false,"stream":false}"#;
+        assert_eq!(state.request_body.to_string(), expected);
+        state.set_request_params(body);
+        assert_eq!(state.request_body.to_string(), expected);
     }
 
     #[test]

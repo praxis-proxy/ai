@@ -153,6 +153,41 @@ This calls native `/v1/responses`. The route also forwards
 upstream. Other provider protocols need their own configuration, as listed in
 [Client and provider paths](client-provider-paths.md).
 
+## Chat Completions
+
+Use the same prerequisites, standard release binary, credentials, full
+`praxis-ai.yaml`, validation, and startup commands above. This path forwards
+Chat Completions natively; no Responses feature is needed. With the proxy
+running, send:
+
+```console
+curl --fail-with-body http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -d "{\"model\":\"$OPENAI_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}"
+```
+
+Expect an upstream Chat Completions object with `choices[0].message.content`
+and provider-reported `usage`. A tool-using response can instead ask the client
+to run a function; this configuration does not execute it. For Python, replace
+the Responses call above with:
+
+```python
+completion = client.chat.completions.create(
+    model=os.environ["OPENAI_MODEL"],
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(completion.choices[0].message.content)
+```
+
+For SSE, add `"stream":true` to the curl JSON and `-N` to curl. Expect
+`data:` chunks and the provider's terminal `[DONE]`; use a streaming SDK parser
+rather than parsing the whole body as one JSON object. This ordinary forwarding
+chain does not translate events, aggregate usage, or screen output. For a local
+compatible backend, change the endpoint, Host/TLS settings, and credentials to
+match that backend; the hosted configuration above targets OpenAI specifically.
+Use the failure checks and cleanup below for either API.
+
 ## If the request fails
 
 - **Connection refused on port 8080:** check that Praxis AI is running and its
@@ -190,6 +225,6 @@ Remove `praxis-ai.yaml` if you no longer need the example.
 
 - [Example configs](../examples/README.md): working YAML for supported features
   and integration patterns.
-- [Filters](filters/README.md): AI filters and how to write your own.
+- [Filters](filters/README.md): operator capabilities and composition.
 - [Praxis core](https://github.com/praxis-proxy/praxis): listener, filter-chain,
   routing, and load-balancer configuration.

@@ -381,7 +381,8 @@ async fn skips_rehydration_when_history_already_restored() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn validates_previous_response_and_sets_metadata() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_validates_previous_response_and_sets_metadata() {
     let messages = json!([
         {"role": "user", "content": "Hello"},
         {"role": "assistant", "content": "Hi there"}
@@ -431,6 +432,7 @@ async fn validates_previous_response_and_sets_metadata() {
         "current input should be last"
     );
     assert_eq!(state.response_id.as_deref(), Some("resp_current"));
+    println!("PRAXIS_CONFORMANCE_OK responses rehydration_previous_response");
 }
 
 #[tokio::test]
@@ -1035,7 +1037,8 @@ async fn pipeline_validates_during_cold_request_body_pre_read() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn rejects_when_previous_response_not_found() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_rejects_when_previous_response_not_found() {
     let store = MockStore::empty();
     let registry = setup_registry(store);
 
@@ -1051,10 +1054,12 @@ async fn rejects_when_previous_response_not_found() {
         FilterAction::Reject(r) => assert_eq!(r.status, 400, "should reject with 400"),
         other => panic!("expected Reject, got {other:?}"),
     }
+    println!("PRAXIS_CONFORMANCE_OK responses rehydration_missing");
 }
 
 #[tokio::test]
-async fn body_first_previous_response_lookup_is_exact_owner_scoped() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_body_first_previous_response_lookup_is_exact_owner_scoped() {
     let owner = crate::test_utils::test_owner("default");
     let other = StateOwner::from_trusted_parts("default", owner.issuer(), "other-subject").unwrap();
     let registry = setup_registry(MockStore::with_status("resp_private", "completed"));
@@ -1082,10 +1087,12 @@ async fn body_first_previous_response_lookup_is_exact_owner_scoped() {
     let action = filter.on_request_body(&mut owner_ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Release));
     assert!(owner_ctx.extensions.get::<ResponsesState>().is_some());
+    println!("PRAXIS_CONFORMANCE_OK responses rehydration_owner_isolation");
 }
 
 #[tokio::test]
-async fn rejects_when_status_not_completed() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_rejects_when_status_not_completed() {
     let store = MockStore::with_status("resp_123", "in_progress");
     let registry = setup_registry(store);
 
@@ -1101,6 +1108,7 @@ async fn rejects_when_status_not_completed() {
         FilterAction::Reject(r) => assert_eq!(r.status, 400, "should reject non-completed status"),
         other => panic!("expected Reject, got {other:?}"),
     }
+    println!("PRAXIS_CONFORMANCE_OK responses rehydration_incomplete");
 }
 
 #[tokio::test]
@@ -2063,7 +2071,8 @@ async fn an_explicit_null_conversation_is_treated_as_absent() {
 }
 
 #[tokio::test]
-async fn rehydrates_from_conversation_string_id() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_rehydrates_from_conversation_string_id() {
     let messages = json!([
         {"role": "user", "content": "turn one"},
         {"role": "assistant", "content": "reply one"}
@@ -2106,10 +2115,12 @@ async fn rehydrates_from_conversation_string_id() {
         "persisted_messages should mirror messages for conversation rehydration"
     );
     assert_eq!(state.response_id.as_deref(), Some("resp_conversation"));
+    println!("PRAXIS_CONFORMANCE_OK responses rehydration_conversation");
 }
 
 #[tokio::test]
-async fn rehydrates_from_conversation_object_form() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_rehydrates_from_conversation_object_form() {
     let messages = json!([
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "hi"}
@@ -2146,6 +2157,7 @@ async fn rehydrates_from_conversation_object_form() {
         state.messages[2]["content"], "follow up",
         "current input should be last"
     );
+    println!("PRAXIS_CONFORMANCE_OK responses rehydration_conversation_object");
 }
 
 #[tokio::test]
@@ -2567,7 +2579,8 @@ fn json_ok_response() -> praxis_filter::Response {
 }
 
 #[tokio::test]
-async fn restores_previous_response_id_into_response_body() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_restores_previous_response_id_into_response_body() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut response = json_ok_response();
@@ -2609,6 +2622,7 @@ async fn restores_previous_response_id_into_response_body() {
     );
     assert_eq!(patched["id"], "resp_new", "other response fields should be preserved");
     assert_eq!(patched["status"], "completed", "status should be preserved");
+    println!("PRAXIS_CONFORMANCE_OK responses rehydration_restore_json");
 }
 
 #[tokio::test]
@@ -2818,7 +2832,8 @@ async fn restores_for_streaming_response() {
 }
 
 #[tokio::test]
-async fn restores_streaming_across_chunk_boundary() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_restores_streaming_across_chunk_boundary() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut response = sse_ok_response();
@@ -2869,6 +2884,7 @@ async fn restores_streaming_across_chunk_boundary() {
         data["response"]["previous_response_id"], "resp_prev",
         "a frame split across chunk boundaries must still have its id restored"
     );
+    println!("PRAXIS_CONFORMANCE_OK responses rehydration_restore_sse");
 }
 
 #[tokio::test]

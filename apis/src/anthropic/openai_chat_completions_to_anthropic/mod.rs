@@ -108,12 +108,10 @@ struct BufferedJsonResponse {
 /// filter converts event chunks incrementally, and OpenAI-compatible response
 /// chunks remain unchanged.
 ///
-/// Anthropic translation runs only when the filter's `api_translation_enabled`
-/// setting is true, as derived from the tenant's API translation permission.
+/// Installing this filter enables translation for selected Anthropic providers.
 ///
 /// ```yaml
 /// filter: openai_chat_completions_to_anthropic
-/// api_translation_enabled: true
 /// api_version: "2023-06-01"
 /// max_request_body_bytes: 2097152
 /// max_response_body_bytes: 1048576
@@ -123,7 +121,12 @@ struct BufferedJsonResponse {
 /// It defaults to `2023-06-01`. Supported sampling fields are preserved under
 /// either version; the backend owns version-specific parameter validation.
 /// Unknown versions fail configuration parsing. OpenAI-compatible candidates
-/// and native Messages passthrough are unaffected.
+/// and native Messages passthrough are unaffected. Translated requests carry
+/// only text, image, and tool blocks, so they never contain the assistant
+/// `document` blocks or user text citations that `2026-10-21` rejects.
+///
+/// Anthropic candidates have the caller's `authorization` and `x-api-key`
+/// removed; `credential_inject` installs the selected provider credential.
 ///
 /// The compatibility contract defaults an omitted token limit to 4096 and
 /// ignores `user`, `n`, `seed`,
@@ -255,13 +258,6 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
                 )));
             },
         };
-        if profile.api_format == "messages" && !self.config.api_translation_enabled {
-            return Ok(FilterAction::Reject(Self::openai_error_rejection(
-                503,
-                "api_translation_disabled",
-                "The platform administrator has forbidden translation to this provider's API.",
-            )));
-        }
         if let Err(error) = Self::bind_profile(ctx, &profile) {
             return Ok(FilterAction::Reject(Self::openai_error_rejection(
                 503,

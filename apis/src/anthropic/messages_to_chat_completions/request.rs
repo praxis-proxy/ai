@@ -497,7 +497,11 @@ fn validate_faithful_request(body: &Map<String, Value>) -> Result<(), String> {
     if let Some(system) = body.get("system") {
         match system {
             Value::String(_) | Value::Null => {},
-            Value::Array(blocks) if blocks.iter().all(text_block_is_supported) => {},
+            Value::Array(blocks) => {
+                if let Some(reason) = blocks.iter().find_map(text_block_rejection) {
+                    return Err(format!("`system` text block cannot be translated: {reason}"));
+                }
+            },
             _ => return Err("`system` must be a string or array of text blocks".to_owned()),
         }
     }
@@ -565,19 +569,32 @@ fn validate_faithful_request(body: &Map<String, Value>) -> Result<(), String> {
             if !tool.get("input_schema").is_some_and(Value::is_object) {
                 return Err("tool requires an `input_schema` object".to_owned());
             }
-            if tool.keys().any(|key| {
+            // `defer_loading` marks a Claude Code deferred-tool placeholder;
+            // the Chat backend cannot honor deferred loading, but the marker
+            // itself carries no translatable meaning, so it is dropped rather
+            // than rejected (a rejection costs the client two failed
+            // round-trips at every session start while it falls back).
+            if let Some(key) = tool.keys().map(String::as_str).find(|key| {
                 !matches!(
-                    key.as_str(),
-                    "type" | "name" | "description" | "input_schema" | "strict"
+                    *key,
+                    "type" | "name" | "description" | "input_schema" | "strict" | "defer_loading"
                 )
-            }) || tool
+            }) {
+                return Err(format!(
+                    "unsupported Anthropic tool field `{key}` for Chat Completions translation"
+                ));
+            }
+            if tool
                 .get("description")
                 .is_some_and(|value| !value.is_string() && !value.is_null())
                 || tool
                     .get("strict")
                     .is_some_and(|value| !value.is_boolean() && !value.is_null())
+                || tool
+                    .get("defer_loading")
+                    .is_some_and(|value| !value.is_boolean() && !value.is_null())
             {
-                return Err("unsupported Anthropic tool field for Chat Completions translation".to_owned());
+                return Err("tool `description`, `strict`, and `defer_loading` must be scalars or null".to_owned());
             }
         }
     }
@@ -630,7 +647,11 @@ fn validate_content_blocks(blocks: &[Value], role: &str) -> Result<(), String> {
         .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
-            Some("text") if text_block_is_supported(block) => {},
+            Some("text") => {
+                if let Some(reason) = text_block_rejection(block) {
+                    return Err(format!("text block cannot be translated: {reason}"));
+                }
+            },
             Some("image") if role == "user" && !has_tool_use => {
                 let source = block.get("source").ok_or("image block is missing `source`")?;
                 if !image_source_is_supported(source)
@@ -657,13 +678,13 @@ fn validate_content_blocks(blocks: &[Value], role: &str) -> Result<(), String> {
                 }
             },
             Some("tool_result") if role == "user" => {
-                let text_content = match block.get("content") {
-                    None | Some(Value::String(_)) => true,
-                    Some(Value::Array(parts)) => parts.iter().all(text_block_is_supported),
-                    _ => false,
+                let unsupported_content = match block.get("content") {
+                    None | Some(Value::String(_)) => None,
+                    Some(Value::Array(parts)) => parts.iter().find_map(text_block_rejection),
+                    Some(_) => Some("`content` must be a string or array of text blocks".to_owned()),
                 };
                 if !block.get("tool_use_id").is_some_and(Value::is_string)
-                    || !text_content
+                    || unsupported_content.is_some()
                     || block.get("is_error") == Some(&Value::Bool(true))
                     || block
                         .get("is_error")
@@ -682,6 +703,9 @@ fn validate_content_blocks(blocks: &[Value], role: &str) -> Result<(), String> {
                     || !null_or_absent(block, "toolset_name")
                     || !null_or_absent(block, "cache_control")
                 {
+                    if let Some(reason) = unsupported_content {
+                        return Err(format!("tool_result content cannot be translated: {reason}"));
+                    }
                     return Err("tool_result requires string `tool_use_id` and text `content`".to_owned());
                 }
             },
@@ -699,15 +723,38 @@ fn has_only_keys(value: &Value, keys: &[&str]) -> bool {
         .is_some_and(|fields| fields.keys().all(|key| keys.contains(&key.as_str())))
 }
 
-/// Null or empty citations carry no source information to preserve.
-fn text_block_is_supported(block: &Value) -> bool {
-    block.get("type").and_then(Value::as_str) == Some("text")
-        && block.get("text").is_some_and(Value::is_string)
-        && block
-            .get("citations")
-            .is_none_or(|citations| citations.is_null() || citations.as_array().is_some_and(Vec::is_empty))
-        && null_or_absent(block, "cache_control")
-        && has_only_keys(block, &["type", "text", "citations", "cache_control"])
+/// Why a text block cannot be faithfully translated, or `None` when it can.
+///
+/// Names the offending field so strict validation rejects with the actual
+/// cause — `cache_control` on a `system` block, non-empty `citations`, an
+/// unrecognized key — instead of the block's overall shape.
+fn text_block_rejection(block: &Value) -> Option<String> {
+    if block.get("type").and_then(Value::as_str) != Some("text") {
+        return Some("`type` must be \"text\"".to_owned());
+    }
+    if !block.get("text").is_some_and(Value::is_string) {
+        return Some("`text` must be a string".to_owned());
+    }
+    if block
+        .get("citations")
+        .is_some_and(|citations| !citations.is_null() && !citations.as_array().is_some_and(Vec::is_empty))
+    {
+        return Some("`citations` cannot be translated to Chat Completions".to_owned());
+    }
+    if !null_or_absent(block, "cache_control") {
+        return Some(
+            "Prompt caching (`cache_control`) is not supported by this endpoint. Remove the caching \
+             markers from your request, or contact your platform administrator if your client adds \
+             them automatically."
+                .to_owned(),
+        );
+    }
+    block
+        .as_object()?
+        .keys()
+        .map(String::as_str)
+        .find(|key| !matches!(*key, "type" | "text" | "citations" | "cache_control"))
+        .map(|key| format!("`{key}` is not a recognized text block field"))
 }
 
 /// Nullable request metadata has no effect when absent or null.
@@ -1632,6 +1679,93 @@ mod tests {
                 .extend(request.as_object().unwrap().clone());
             let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
             assert!(error.contains(field), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn strict_rejection_names_the_offending_system_block_field() {
+        // `cache_control` on a system block used to reject with the block's
+        // shape ("`system` must be a string or array of text blocks"),
+        // hiding the actual cause.
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "Hi"}]});
+        body["system"] = json!([{"type": "text", "text": "Be brief", "cache_control": {"type": "ephemeral"}}]);
+        let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+        assert!(error.contains("`cache_control`"), "{error}");
+        assert!(
+            error.contains("not supported by this endpoint"),
+            "must tell the client what to do: {error}"
+        );
+
+        body["system"] = json!([{"type": "text", "text": "Be brief", "citations": [{"cited_text": "x"}]}]);
+        let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+        assert!(error.contains("`citations`"), "{error}");
+
+        body["system"] = json!([{"type": "text", "text": "Be brief", "signed": "no"}]);
+        let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+        assert!(error.contains("`signed`"), "an unknown key must be named: {error}");
+    }
+
+    #[test]
+    fn strict_rejection_names_the_offending_content_block_field() {
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "Hi"}]});
+        body["messages"][0]["content"] =
+            json!([{"type": "text", "text": "Hi", "cache_control": {"type": "ephemeral"}}]);
+        let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+        assert!(
+            error.contains("`cache_control`"),
+            "message blocks name the field too: {error}"
+        );
+
+        body["messages"][0]["content"] = json!([
+            {"type": "tool_result", "tool_use_id": "c1", "content": [
+                {"type": "text", "text": "Sunny", "cache_control": {"type": "ephemeral"}}
+            ]}
+        ]);
+        let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+        assert!(
+            error.contains("`cache_control`"),
+            "tool_result content names the field too: {error}"
+        );
+    }
+
+    #[test]
+    fn unsupported_tool_field_is_named_in_rejection() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{"name": "lookup", "input_schema": {"type": "object"}, "signed": "no"}]
+        });
+        let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+        assert!(error.contains("`signed`"), "the offending key must be named: {error}");
+    }
+
+    #[test]
+    fn strict_translation_accepts_deferred_tool_placeholder() {
+        // Claude Code's first request of a session carries a placeholder
+        // tool with `defer_loading: true`; rejecting it costs the client
+        // two failed round-trips before it falls back to the flat list.
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [
+                {"name": "DeferredToolPlaceholder", "description": "placeholder",
+                 "input_schema": {"type": "object"}, "defer_loading": true},
+                {"name": "Bash", "description": "run", "input_schema": {"type": "object"}}
+            ]
+        });
+        let translated: Value = serde_json::from_slice(&transform_request(body).unwrap()).unwrap();
+        let tools = translated["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2, "both tools must be forwarded");
+        assert_eq!(tools[0]["function"]["name"], "DeferredToolPlaceholder");
+        for tool in tools {
+            assert!(
+                tool["function"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .all(|key| key != "defer_loading"),
+                "the deferred-loading marker carries no translatable meaning and is dropped"
+            );
         }
     }
 

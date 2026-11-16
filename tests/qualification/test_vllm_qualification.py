@@ -109,6 +109,60 @@ class QualificationTest(unittest.TestCase):
                 else:
                     self.assertEqual(selected["status"], "unavailable")
 
+    def test_exact_evidence_requires_a_verified_run_at_the_release_sha(self):
+        sha = "b" * 40
+
+        def run(identifier, run_sha=sha, status="completed"):
+            return {"id": identifier, "run_attempt": 2, "head_sha": run_sha,
+                    "status": status, "conclusion": "success",
+                    "created_at": "2026-11-10T00:00:00+00:00",
+                    "html_url": f"https://example.test/{identifier}"}
+
+        scenarios = {
+            # A nightly for a different commit is not this release's evidence.
+            "other_commit": (run(17, run_sha="c" * 40), report()),
+            "unfinished": (run(17, status="in_progress"), report()),
+            "verified": (run(17), report()),
+            # An artifact from another run id cannot be attributed to this run.
+            "stale_artifact": (run(17), {**report(), "workflow": {"run_id": 99, "attempt": 2}}),
+        }
+        for scenario, (selected_run, source) in scenarios.items():
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                source["gateway"]["checkout_sha"] = sha
+
+                def api(endpoint):
+                    return {"workflow_runs": [selected_run]}
+
+                def download(argv, **kwargs):
+                    path = Path(argv[argv.index("--dir") + 1])
+                    path.mkdir(parents=True)
+                    (path / "qualification.json").write_text(json.dumps(source))
+                    return SimpleNamespace(returncode=0)
+
+                with mock.patch.object(qualification, "gh_json", side_effect=api), \
+                     mock.patch.object(qualification.subprocess, "run", side_effect=download):
+                    qualification.exact_evidence(SimpleNamespace(
+                        repo="example/repo", sha=sha, output_dir=directory))
+
+                output = Path(directory) / "qualification.json"
+                if scenario == "verified":
+                    chosen = json.loads(output.read_text())
+                    self.assertEqual(chosen["release_context"]["selection"], "exact release commit")
+                    self.assertEqual(chosen["release_context"]["release_sha"], sha)
+                    self.assertEqual(chosen["gateway"]["checkout_sha"], sha)
+                else:
+                    self.assertFalse(output.exists())
+
+    def test_exact_evidence_reports_a_lookup_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(qualification, "gh_json", return_value=None):
+                qualification.exact_evidence(SimpleNamespace(
+                    repo="example/repo", sha="b" * 40, output_dir=directory))
+
+            chosen = json.loads((Path(directory) / "qualification.json").read_text())
+            self.assertEqual(chosen["status"], "unavailable")
+            self.assertIn("lookup failed", chosen["reason"])
+
     def test_capture_with_python3_only_container(self):
         # The pinned runtime image installs python3 without a python alias.
         # Execute the actual probe code with a tiny stand-in vllm package.

@@ -82,6 +82,7 @@ class RecordingBackend(BaseHTTPRequestHandler):
     tool_call_arguments = "{}"
     untranslatable_reply_once: str | None = None
     untranslatable_stream_once: str | None = None
+    fragmented_stream_once = False
     error_response_once = False
 
     def do_POST(self):
@@ -104,6 +105,22 @@ class RecordingBackend(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(reply)))
             self.end_headers()
             self.wfile.write(reply)
+            return
+        if body.get("stream") and RecordingBackend.fragmented_stream_once:
+            RecordingBackend.fragmented_stream_once = False
+            text = "é🌍" * 2048
+            event = {"id": "chatcmpl-stub", "model": MODEL,
+                     "choices": [{"index": 0, "delta": {"content": text},
+                                  "finish_reason": "stop"}]}
+            payload = ("data: " + json.dumps(event, ensure_ascii=False)
+                       + "\r\n\r\ndata: [DONE]\r\n\r\n").encode()
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            for offset in range(0, len(payload), 127):
+                self.wfile.write(payload[offset:offset + 127])
+                self.wfile.flush()
             return
         if body.get("stream"):
             if RecordingBackend.untranslatable_stream_once:
@@ -438,6 +455,86 @@ class TestRequestFieldHandling:
         assert "thinking" in str(excinfo.value)
         assert RecordingBackend.bodies == []
 
+    def test_cache_control_rejection_names_the_offending_field(self, anthropic_client):
+        """The 400 must name `cache_control`, not the block's overall shape."""
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                system=[{"type": "text", "text": "Be brief", "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+            )
+
+        assert excinfo.value.status_code == 400
+        assert "cache_control" in str(excinfo.value)
+        assert "not supported by this endpoint" in str(excinfo.value)
+        assert "Remove the caching markers" in str(excinfo.value)
+        assert RecordingBackend.bodies == []
+
+    def test_deferred_tool_placeholder_is_accepted(self, anthropic_client):
+        """Claude Code's first session request carries `defer_loading: true`.
+
+        Rejecting it costs the client two failed round-trips per session
+        while it falls back to the flattened tool list.
+        """
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[{"role": "user", "content": "Call lookup"}],
+            extra_body={
+                "tools": [
+                    {
+                        "name": "DeferredToolPlaceholder",
+                        "description": "placeholder",
+                        "input_schema": {"type": "object"},
+                        "defer_loading": True,
+                    },
+                    {
+                        "name": "lookup",
+                        "description": "Look up a value",
+                        "input_schema": {"type": "object"},
+                    },
+                ]
+            },
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tools = upstream["tools"]
+        assert len(tools) == 2, "both tools must be forwarded"
+        assert tools[0]["function"]["name"] == "DeferredToolPlaceholder"
+        for tool in tools:
+            assert "defer_loading" not in tool["function"], (
+                f"the deferred-loading marker is dropped: {tool}"
+            )
+
+    def test_unsupported_tool_field_rejection_names_the_field(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[{"role": "user", "content": "Call lookup"}],
+                extra_body={
+                    "tools": [
+                        {
+                            "name": "lookup",
+                            "input_schema": {"type": "object"},
+                            "signed": "no",
+                        }
+                    ]
+                },
+            )
+
+        assert excinfo.value.status_code == 400
+        assert "signed" in str(excinfo.value)
+        assert RecordingBackend.bodies == []
+
     def test_default_valued_rejected_field_is_dropped(self, anthropic_client):
         RecordingBackend.bodies.clear()
 
@@ -654,6 +751,20 @@ class TestResponseValidation:
 
 
 class TestStreamingResponseValidation:
+    def test_fragmented_utf8_crlf_stream(self, anthropic_client):
+        RecordingBackend.fragmented_stream_once = True
+        try:
+            with anthropic_client.messages.stream(
+                model=MODEL, max_tokens=8192,
+                messages=[{"role": "user", "content": "hello"}],
+            ) as stream:
+                text = "".join(stream.text_stream)
+                message = stream.get_final_message()
+            assert text == "é🌍" * 2048
+            assert message.stop_reason == "end_turn"
+        finally:
+            RecordingBackend.fragmented_stream_once = False
+
     def test_invalid_tool_id_aborts_incomplete_stream(self, anthropic_client):
         RecordingBackend.bodies.clear()
         events = []

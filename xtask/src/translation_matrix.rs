@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Praxis Contributors
 
 //! `cargo xtask translation-matrix` validates the translation support matrix
-//! manifest and regenerates (or verifies) `docs/conformance/translation-matrix.md`.
+//! manifest and regenerates (or verifies) `docs/conformance/translation-matrix.md`
+//! and its machine-readable sidecar `docs/conformance/translation-matrix.json`.
 //!
 //! The manifest is the published contract for what Praxis supports natively,
 //! what it translates, and what it refuses. Validation is the point of this
@@ -47,6 +48,12 @@ const MANIFEST_REL: &str = "docs/conformance/translation-matrix.yaml";
 /// Generated document, relative to the workspace root.
 const DOC_REL: &str = "docs/conformance/translation-matrix.md";
 
+/// Generated machine-readable sidecar, relative to the workspace root.
+///
+/// The release support report assembles its translation section from this file
+/// with the Python standard library, so it must not require a YAML parser.
+const JSON_REL: &str = "docs/conformance/translation-matrix.json";
+
 /// Manifest schema version this task understands.
 const SUPPORTED_VERSION: u32 = 1;
 
@@ -87,6 +94,19 @@ enum Status {
 }
 
 impl Status {
+    /// Manifest spelling, used by the machine-readable sidecar.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Passthrough => "passthrough",
+            Self::Translated => "translated",
+            Self::TranslatedLossy => "translated-lossy",
+            Self::Rejected => "rejected",
+            Self::Dropped => "dropped",
+            Self::NotApplicable => "n-a",
+        }
+    }
+
     /// Short label used in the rendered tables.
     const fn label(self) -> &'static str {
         match self {
@@ -265,7 +285,7 @@ pub(crate) fn run(args: &Args) {
         std::process::exit(1);
     }
 
-    emit(args, &checkout.root, &render_doc(&manifest));
+    emit(args, &checkout.root, &render_doc(&manifest), &render_json(&manifest));
 }
 
 /// Read and parse the manifest, reporting a schema mismatch and exiting.
@@ -286,17 +306,23 @@ fn load_manifest(path: &Path) -> Manifest {
     }
 }
 
-/// Write the rendered document, or verify the committed copy still matches.
-fn emit(args: &Args, root: &Path, content: &str) {
-    let doc_path = root.join(DOC_REL);
+/// Write the rendered document and sidecar, or verify both committed copies.
+fn emit(args: &Args, root: &Path, doc: &str, json: &str) {
+    emit_one(args, root, DOC_REL, doc);
+    emit_one(args, root, JSON_REL, json);
+}
+
+/// Write one generated file, or fail when its committed copy drifted.
+fn emit_one(args: &Args, root: &Path, rel: &str, content: &str) {
+    let path = root.join(rel);
 
     if args.fix {
-        fs::write(&doc_path, content).unwrap();
-        println!("wrote {}", doc_path.strip_prefix(root).unwrap_or(&doc_path).display());
-    } else if fs::read_to_string(&doc_path).unwrap_or_default() == content {
-        println!("{DOC_REL} is up to date");
+        fs::write(&path, content).unwrap();
+        println!("wrote {}", path.strip_prefix(root).unwrap_or(&path).display());
+    } else if fs::read_to_string(&path).unwrap_or_default() == content {
+        println!("{rel} is up to date");
     } else {
-        eprintln!("{DOC_REL} is stale");
+        eprintln!("{rel} is stale");
         eprintln!("\nrun: cargo xtask translation-matrix --fix");
         std::process::exit(1);
     }
@@ -559,6 +585,120 @@ fn check_citation(citation: &str, checkout: &Checkout) -> Result<(), String> {
 /// Collapse a folded-scalar note onto one line so it fits a table cell.
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Render the machine-readable sidecar consumed by the release support report.
+///
+/// The shape is deliberately explicit rather than a derive of the internal
+/// manifest structs: the report is assembled from committed files by a Python
+/// script, so this is a stable interface, not an implementation detail.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one explicit JSON object per report section is easier to audit than nested helpers"
+)]
+fn render_json(m: &Manifest) -> String {
+    let surfaces = m
+        .surfaces
+        .iter()
+        .map(|surface| {
+            let cells = m
+                .features
+                .iter()
+                .map(|feature| {
+                    let cell = surface.cell(&feature.id);
+                    serde_json::json!({
+                        "feature": feature.id,
+                        "label": feature.label,
+                        "status": cell.status.as_str(),
+                        "note": cell.note,
+                        "evidence": cell.evidence,
+                        "blocker": cell.blocker,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "id": surface.id,
+                "short": surface.short,
+                "client_api": surface.client_api,
+                "backend_api": surface.backend_api,
+                "filters": surface.filters,
+                "clean_rejection_requires": surface.clean_rejection_requires,
+                "unknown_field_policy": surface.unknown_field_policy,
+                "doc_gap": surface.doc_gap,
+                "cells": cells,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut totals = std::collections::BTreeMap::new();
+    for surface in &m.surfaces {
+        for feature in &m.features {
+            *totals.entry(surface.cell(&feature.id).status.as_str()).or_insert(0_u32) += 1;
+        }
+    }
+
+    let native_surfaces = m
+        .native_surfaces
+        .iter()
+        .map(|native| {
+            serde_json::json!({
+                "id": native.id,
+                "client_api": native.client_api,
+                "operations": native.operations,
+                "status": native.status.as_str(),
+                "note": native.note,
+                "evidence": native.evidence,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let preconditions = m
+        .preconditions
+        .iter()
+        .map(|precondition| {
+            serde_json::json!({
+                "id": precondition.id,
+                "summary": precondition.summary,
+                "evidence": precondition.evidence,
+                "detail": precondition.detail,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let gaps = m
+        .cross_surface_gaps
+        .iter()
+        .map(|gap| {
+            serde_json::json!({
+                "id": gap.id,
+                "affects": gap.affects,
+                "summary": gap.summary,
+                "blocker": gap.blocker,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let features = m
+        .features
+        .iter()
+        .map(|feature| serde_json::json!({"id": feature.id, "label": feature.label}))
+        .collect::<Vec<_>>();
+
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "source": MANIFEST_REL,
+        "conformance_claim_caveat": m.conformance_claim_caveat,
+        "preconditions": preconditions,
+        "features": features,
+        "native_surfaces": native_surfaces,
+        "surfaces": surfaces,
+        "cross_surface_gaps": gaps,
+        "status_totals": totals,
+    });
+
+    let mut rendered = serde_json::to_string_pretty(&document).expect("manifest is serializable");
+    rendered.push('\n');
+    rendered
 }
 
 /// Render the full `translation-matrix.md` document.

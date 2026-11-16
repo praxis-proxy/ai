@@ -9,6 +9,7 @@ on:
       - "examples/configs/openai/responses/responses-to-chat-completions.yaml"
       - "tests/conformance/openresponses/**"
       - "tests/integration/sdk/openai/test_responses_conformance.py"
+      - "tests/integration/sdk/openai/*responses_acceptance*.py"
       - ".github/actions/start-vllm/**"
       - ".github/actions/wait-vllm/**"
       - ".github/workflows/openresponses-conformance.yaml"
@@ -24,6 +25,7 @@ on:
       - "examples/configs/openai/responses/responses-to-chat-completions.yaml"
       - "tests/conformance/openresponses/**"
       - "tests/integration/sdk/openai/test_responses_conformance.py"
+      - "tests/integration/sdk/openai/*responses_acceptance*.py"
       - ".github/actions/start-vllm/**"
       - ".github/actions/wait-vllm/**"
       - ".github/workflows/openresponses-conformance.yaml"
@@ -68,6 +70,7 @@ jobs:
             'examples/configs/openai/responses/responses-to-chat-completions.yaml' \
             'tests/conformance/openresponses/' \
             'tests/integration/sdk/openai/test_responses_conformance.py' \
+            'tests/integration/sdk/openai/*responses_acceptance*.py' \
             '.github/actions/start-vllm/' \
             '.github/actions/wait-vllm/' \
             '.github/workflows/openresponses-conformance.yaml' \
@@ -84,7 +87,9 @@ jobs:
       always() &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    # A cold build took 18 minutes; CPU acceptance then passed in 3m39s,
+    # but the old 25-minute job cap cancelled post-job cache cleanup.
+    timeout-minutes: 35
     permissions:
       contents: read
     steps:
@@ -115,6 +120,13 @@ jobs:
 
       - name: Build Praxis
         run: cargo build -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-sqlite
+
+      - name: Check full-suite runner and controlled HTTP acceptance
+        env:
+          PRAXIS_AI_BIN: target/debug/praxis-ai
+        run: |
+          uv run tests/integration/sdk/openai/test_responses_acceptance_runner.py
+          uv run tests/integration/sdk/openai/test_responses_acceptance_gateway.py -k 'not live_image'
 
       - name: Wait for vLLM readiness
         uses: ./.github/actions/wait-vllm
