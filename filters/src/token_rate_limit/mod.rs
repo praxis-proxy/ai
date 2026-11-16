@@ -100,6 +100,11 @@
 )]
 mod tests;
 
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::too_many_lines, reason = "tests")]
+mod hierarchy_tests;
+
 mod backend;
 mod config;
 mod keys;
