@@ -79,14 +79,20 @@ use crate::{
     },
     state_owner::{StateOwner, require_state_owner},
     store::{
-        EventLogStatus, OwnerScopedResponseStore, PendingApprovalRecord, ResponseEventRecord, ResponseRecord,
-        ResponseStoreRegistry, StoreError,
+        EventLogStatus, OwnerScopedResponseStore, PendingApprovalRecord, ResponseCasOutcome, ResponseEventRecord,
+        ResponseRecord, ResponseStoreRegistry, StoreError,
     },
 };
 
 /// Number of replay-log events fetched from the store per streamed page. Bounds
 /// the memory a replay holds at once; the whole log is never loaded.
 pub(crate) const REPLAY_PAGE_LIMIT: u32 = 256;
+
+/// How many times a cancel re-reads a record whose status changed between the
+/// read and its compare-and-set claim. Each retry costs one store read, and a
+/// record losing every race is being written at least as fast as this handler
+/// observes it, so the bound only stops a pathological livelock.
+const CANCEL_CLAIM_ATTEMPTS: u32 = 8;
 
 /// Headroom added to the SSE decoder's line and record limits above the
 /// configured `max_event_bytes` payload budget.
@@ -198,6 +204,56 @@ impl ResponseStoreFilter {
             debug!(id, "response not found for delete");
             Ok(FilterAction::Reject(delete_not_found_rejection(id)))
         }
+    }
+
+    /// Intercept `POST /v1/responses/{id}/cancel`.
+    ///
+    /// Runs in [`Self::on_request`], before request-body validation, so the
+    /// route's documented empty POST body reaches the handler. Returns `None`
+    /// for every other request.
+    async fn try_handle_cancel(&self, ctx: &HttpFilterContext<'_>) -> Result<Option<FilterAction>, FilterError> {
+        if ctx.request.method != http::Method::POST {
+            return Ok(None);
+        }
+        let Some(id) = extract_cancel_response_id(ctx.request.uri.path()) else {
+            return Ok(None);
+        };
+        let owner = match require_state_owner(ctx) {
+            Ok(owner) => owner.clone(),
+            Err(action) => return Ok(Some(action)),
+        };
+        Ok(Some(self.handle_cancel(ctx, &owner, id).await?))
+    }
+
+    /// Handle `POST /v1/responses/{id}/cancel`.
+    ///
+    /// Serves the OpenAI cancel contract against stored state: `queued` and
+    /// `in_progress` atomically transition to `cancelled` via compare-and-set,
+    /// an already-`cancelled` response is returned unchanged (idempotent), and
+    /// any other status is terminal and rejected without changing the record.
+    /// Interception happens in [`Self::on_request`], before request-body
+    /// validation, so the documented empty POST body reaches the handler.
+    async fn handle_cancel(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        owner: &StateOwner,
+        id: &str,
+    ) -> Result<FilterAction, FilterError> {
+        let Some(store) = resolve_store(ctx, owner) else {
+            return Ok(FilterAction::Reject(reject_store_error()));
+        };
+
+        for _ in 0..CANCEL_CLAIM_ATTEMPTS {
+            if let Some(action) = try_cancel_once(&store, id).await {
+                return Ok(action);
+            }
+        }
+
+        // Every attempt lost the claim race: the record is being written at
+        // least as fast as this handler observes it. Report the store as
+        // unavailable rather than guessing a status.
+        warn!(response_id = id, "cancel lost every compare-and-set race");
+        Ok(FilterAction::Reject(reject_store_error()))
     }
 
     /// Return whether this exchange should release response body
@@ -669,6 +725,16 @@ pub(super) fn extract_response_id(path: &str) -> Option<&str> {
     (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
+/// Extract the response ID from a `/v1/responses/{id}/cancel` path.
+///
+/// Returns `None` if the path does not match the expected pattern.
+pub(super) fn extract_cancel_response_id(path: &str) -> Option<&str> {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let rest = path.strip_prefix("/v1/responses/")?;
+    let id = rest.strip_suffix("/cancel")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
 // -----------------------------------------------------------------------------
 // Persistence Arming
 // -----------------------------------------------------------------------------
@@ -718,6 +784,118 @@ fn delete_not_found_rejection(id: &str) -> Rejection {
         404,
         "invalid_request_error",
         &format!("No response found with id: '{id}'."),
+    )
+}
+
+// -----------------------------------------------------------------------------
+// Cancel Response Helpers
+// -----------------------------------------------------------------------------
+
+/// One cancel attempt: read the record, then act on its status.
+///
+/// Returns `None` when the compare-and-set claim lost a race and the caller
+/// should re-read, and `Some(action)` for every decided outcome.
+async fn try_cancel_once(store: &OwnerScopedResponseStore, id: &str) -> Option<FilterAction> {
+    let record = match load_for_cancel(store, id).await {
+        Ok(record) => record,
+        Err(action) => return Some(action),
+    };
+
+    let status = record
+        .response_object
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    match status {
+        "queued" | "in_progress" => try_claim_cancelled(store, id, record).await,
+        "cancelled" => {
+            debug!(
+                response_id = id,
+                "cancel is idempotent for an already-cancelled response"
+            );
+            Some(stored_response_rejection(&record.response_object))
+        },
+        other => {
+            debug!(
+                response_id = id,
+                status = other,
+                "cancel rejected for a terminal response"
+            );
+            Some(FilterAction::Reject(cancel_terminal_rejection(id, other)))
+        },
+    }
+}
+
+/// Load the record a cancel targets, mapping lookup failures to actions.
+async fn load_for_cancel(store: &OwnerScopedResponseStore, id: &str) -> Result<ResponseRecord, FilterAction> {
+    match store.get_response(id).await {
+        Ok(Some(record)) => Ok(record),
+        Ok(None) => {
+            debug!(response_id = id, "response not found for cancel");
+            Err(FilterAction::Reject(reject_not_found(id)))
+        },
+        Err(e) => {
+            warn!(response_id = id, error = %e, "response cancel lookup failed");
+            Err(FilterAction::Reject(reject_store_error()))
+        },
+    }
+}
+
+/// Atomically claim a cancellable record for cancellation.
+///
+/// The stored object is cloned because the compare-and-set boundary needs an
+/// owned replacement document; only the status field changes.
+async fn try_claim_cancelled(
+    store: &OwnerScopedResponseStore,
+    id: &str,
+    record: ResponseRecord,
+) -> Option<FilterAction> {
+    let mut cancelled = record.response_object.clone();
+    if let Some(object) = cancelled.as_object_mut() {
+        object.insert("status".to_owned(), Value::String("cancelled".to_owned()));
+    }
+
+    match store
+        .compare_and_swap_response_object(id, &record.response_object, &cancelled)
+        .await
+    {
+        Ok(ResponseCasOutcome::Applied) => {
+            debug!(response_id = id, "response cancelled");
+            Some(stored_response_rejection(&cancelled))
+        },
+        // A concurrent writer (a completing worker, another cancel) won the
+        // claim; the caller re-reads and acts on the new status.
+        Ok(ResponseCasOutcome::Mismatch) => None,
+        Ok(ResponseCasOutcome::NotFound) => {
+            debug!(response_id = id, "response vanished before cancel claim");
+            Some(FilterAction::Reject(reject_not_found(id)))
+        },
+        Err(e) => {
+            warn!(response_id = id, error = %e, "response cancel claim failed");
+            Some(FilterAction::Reject(reject_store_error()))
+        },
+    }
+}
+
+/// Build the 200 rejection returning a stored response object, unchanged.
+fn stored_response_rejection(object: &Value) -> FilterAction {
+    let body = serde_json::to_vec(object).unwrap_or_default();
+    FilterAction::Reject(
+        Rejection::status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body),
+    )
+}
+
+/// Build the 400 rejection for cancelling a terminal response.
+///
+/// The stored response is not modified.
+fn cancel_terminal_rejection(id: &str, status: &str) -> Rejection {
+    responses_error_rejection(
+        400,
+        "invalid_request_error",
+        &format!("Cannot cancel a response with status of '{status}'. (response id: '{id}')"),
     )
 }
 
@@ -1060,6 +1238,10 @@ impl HttpFilter for ResponseStoreFilter {
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if ctx.request.method == http::Method::GET {
             return self.handle_get_request(ctx).await;
+        }
+
+        if let Some(action) = self.try_handle_cancel(ctx).await? {
+            return Ok(action);
         }
 
         if is_responses_format(ctx) && !is_streaming_request(ctx) {

@@ -12,7 +12,7 @@ use std::{
 
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterEntry, FilterPipeline, HttpFilter as _, HttpFilterContext,
+    BodyAccess, BodyMode, FilterAction, FilterEntry, FilterPipeline, HttpFilter as _, HttpFilterContext, Rejection,
     StreamingTerminalResponse, parse_filter_config,
 };
 use serde_json::json;
@@ -4974,6 +4974,239 @@ async fn delete_uses_trusted_owner_context() {
     assert_eq!(rejection.status, 200, "delete with matching owner should return 200");
 }
 
+// -----------------------------------------------------------------------------
+// Cancel Response
+// -----------------------------------------------------------------------------
+
+/// Seed a store with one response whose stored object carries `status`.
+async fn init_store_and_seed_status(id: &str, tenant_id: &str, status: &str) -> ResponseStoreRegistry {
+    init_store_and_seed_owner_object(id, crate::test_utils::test_owner(tenant_id), status).await
+}
+
+/// Seed a store with one response owned by `owner` whose stored object carries
+/// `status`.
+async fn init_store_and_seed_owner_object(id: &str, owner: crate::StateOwner, status: &str) -> ResponseStoreRegistry {
+    let (registry, store) = empty_registry().await;
+    let record = ResponseRecord {
+        id: id.to_owned(),
+        owner,
+        created_at: 1000,
+        model: "gpt-4.1".to_owned(),
+        response_object: json!({"id": id, "object": "response", "status": status}),
+        input: json!([]),
+        messages: json!([{"role": "user", "content": "hello"}]),
+    };
+    store
+        .upsert_response(&record)
+        .await
+        .expect("seed response should succeed");
+    registry
+}
+
+/// Run one `POST /v1/responses/{id}/cancel` against `registry` and return the
+/// rejection. Cancels carry no body, so `on_request` decides the exchange.
+async fn run_cancel(registry: &ResponseStoreRegistry, id: &str) -> Rejection {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, &format!("/v1/responses/{id}/cancel"));
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+
+    expect_reject(filter.on_request(&mut ctx).await.unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_queued_transitions_to_cancelled() {
+    let registry = init_store_and_seed_status("resp_cq", "default", "queued").await;
+
+    let rejection = run_cancel(&registry, "resp_cq").await;
+    assert_eq!(rejection.status, 200, "cancelling a queued response should return 200");
+    assert_has_json_content_type(&rejection);
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().expect("body should be present"))
+        .expect("body should be valid JSON");
+    assert_eq!(body["status"], "cancelled", "body should report the cancelled status");
+    assert_eq!(body["id"], "resp_cq", "body should be the stored response object");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_in_progress_transitions_to_cancelled() {
+    let registry = init_store_and_seed_status("resp_ci", "default", "in_progress").await;
+
+    let rejection = run_cancel(&registry, "resp_ci").await;
+    assert_eq!(
+        rejection.status, 200,
+        "cancelling an in-progress response should return 200"
+    );
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().expect("body should be present"))
+        .expect("body should be valid JSON");
+    assert_eq!(body["status"], "cancelled", "body should report the cancelled status");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_is_idempotent_for_an_already_cancelled_response() {
+    let registry = init_store_and_seed_status("resp_cc", "default", "cancelled").await;
+
+    let rejection = run_cancel(&registry, "resp_cc").await;
+    assert_eq!(rejection.status, 200, "repeated cancellation should return 200");
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().expect("body should be present"))
+        .expect("body should be valid JSON");
+    assert_eq!(
+        body["status"], "cancelled",
+        "body should return the stored response unchanged"
+    );
+    assert_eq!(body["id"], "resp_cc", "body should be the stored response object");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_completed_response_returns_400_without_changing_the_record() {
+    let registry = init_store_and_seed_status("resp_cdone", "default", "completed").await;
+
+    let rejection = run_cancel(&registry, "resp_cdone").await;
+    assert_eq!(
+        rejection.status, 400,
+        "cancelling a terminal response should return 400"
+    );
+    assert_has_json_content_type(&rejection);
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().expect("body should be present"))
+        .expect("body should be valid JSON");
+    assert_eq!(
+        body["error"]["type"], "invalid_request_error",
+        "error type should be invalid_request_error"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Cannot cancel a response with status of 'completed'")),
+        "error message should name the terminal status, got: {}",
+        body["error"]["message"]
+    );
+
+    // The stored record is untouched by a rejected cancel.
+    let owner = crate::test_utils::test_owner("default");
+    let scoped = registry.get_scoped("default", &owner).expect("store should resolve");
+    let record = scoped
+        .get_response("resp_cdone")
+        .await
+        .expect("record should still exist")
+        .expect("record should still exist");
+    assert_eq!(
+        record.response_object["status"], "completed",
+        "a rejected cancel must not modify the stored response"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_nonexistent_response_returns_404() {
+    let registry = init_store_and_seed_status("resp_cmissing", "default", "queued").await;
+
+    let rejection = run_cancel(&registry, "resp_nope").await;
+    assert_eq!(rejection.status, 404, "cancelling a missing response should return 404");
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().expect("body should be present"))
+        .expect("body should be valid JSON");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("resp_nope")),
+        "error message should reference the missing id"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_cross_tenant_returns_404() {
+    let registry = init_store_and_seed_status("resp_ctenant", "tenant_a", "queued").await;
+
+    let rejection = run_cancel(&registry, "resp_ctenant").await;
+    assert_eq!(rejection.status, 404, "cancel from wrong tenant should return 404");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_rejects_when_store_unavailable() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/resp_nostore/cancel");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(
+        rejection.status, 500,
+        "cancel without a provisioned store must reject with 500"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_skips_unrelated_post_paths() {
+    let filter = make_filter();
+    for path in [
+        "/v1/responses",
+        "/v1/responses/resp_x/input_items",
+        "/v1/chat/completions",
+    ] {
+        let req = crate::test_utils::make_request(http::Method::POST, path);
+        let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "POST {path} should continue, not be treated as a cancel"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_accepts_trailing_slash() {
+    let registry = init_store_and_seed_status("resp_cslash", "default", "queued").await;
+
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/resp_cslash/cancel/");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+
+    let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
+    assert_eq!(rejection.status, 200, "a trailing slash should still cancel");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_after_a_completion_won_the_claim_reports_the_terminal_status() {
+    // A worker completes the response between this handler's read and its
+    // compare-and-set claim: the claim mismatches, the record is re-read, and
+    // the terminal status is reported instead of a silent overwrite.
+    let registry = init_store_and_seed_status("resp_race", "default", "in_progress").await;
+    let owner = crate::test_utils::test_owner("default");
+    let scoped = registry.get_scoped("default", &owner).expect("store should resolve");
+
+    // Complete the record out from under the cancel, simulating the worker's
+    // terminal write landing first.
+    let completed = json!({"id": "resp_race", "object": "response", "status": "completed"});
+    scoped
+        .upsert_response(&ResponseRecord {
+            id: "resp_race".to_owned(),
+            owner: owner.clone(),
+            created_at: 1000,
+            model: "gpt-4.1".to_owned(),
+            response_object: completed,
+            input: json!([]),
+            messages: json!([{"role": "user", "content": "hello"}]),
+        })
+        .await
+        .expect("worker completion should succeed");
+
+    let rejection = run_cancel(&registry, "resp_race").await;
+    assert_eq!(rejection.status, 400, "a completed response can no longer be cancelled");
+
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().expect("body should be present"))
+        .expect("body should be valid JSON");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("'completed'")),
+        "error message should report the terminal status"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_rejects_when_store_unavailable() {
     let filter = make_filter();
@@ -5010,32 +5243,6 @@ async fn delete_store_failure_returns_server_error_envelope() {
     let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(body["error"]["type"], "server_error");
     assert_eq!(body["error"]["message"], "Internal server error.");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancel_continues_when_store_unavailable() {
-    let filter = make_filter();
-
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/resp_abc/cancel");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "POST /cancel should continue on_request when store is unavailable"
-    );
-
-    let mut resp = crate::test_utils::make_response();
-    resp.headers
-        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
-    ctx.response_header = Some(&mut resp);
-
-    let action = filter.on_response(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "POST /cancel should continue on_response when store is unavailable"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6850,7 +7057,7 @@ async fn seed_response_with_events(
     registry
 }
 
-fn expect_reject(action: FilterAction) -> praxis_filter::Rejection {
+fn expect_reject(action: FilterAction) -> Rejection {
     match action {
         FilterAction::Reject(r) => r,
         other => panic!("expected Reject, got {other:?}"),
@@ -6879,7 +7086,7 @@ async fn drain_replay_body(mut streaming: Box<StreamingTerminalResponse>) -> Vec
     out
 }
 
-fn assert_has_json_content_type(rejection: &praxis_filter::Rejection) {
+fn assert_has_json_content_type(rejection: &Rejection) {
     let has_ct = rejection
         .headers
         .iter()
