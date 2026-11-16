@@ -242,8 +242,8 @@ surfaces:
           after the first non-system turn is folded into the single leading
           system message in encounter order and signalled, for backends whose
           chat templates reject a mid-conversation system message (vLLM "System
-          message must be at the beginning"); a leading system message is
-          never moved. The fold loses the original system message positions,
+          message must be at the beginning"); leading system messages join the
+          merged prompt first when a later message moves. The fold loses the original system message positions,
           which is why the cell is lossy.
         evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:801-804; apis/src/anthropic/messages_to_chat_completions/request.rs:532-701
       multimodal-image:

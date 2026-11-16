@@ -589,7 +589,7 @@ The `anthropic_messages_to_chat_completions` filter:
   which folds every `system` message that follows the
   first non-system turn into the single leading system
   message (in encounter order) and reports the
-  degradation; a leading `system` message is never moved
+  degradation; leading `system` messages join the merged prompt in encounter order when a later message moves
 - Transforms the response back to Anthropic format
 - Normalizes pre-stream upstream 4xx/5xx responses into
   Anthropic error envelopes for both streaming and

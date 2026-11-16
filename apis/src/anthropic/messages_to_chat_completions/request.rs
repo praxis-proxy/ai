@@ -513,7 +513,7 @@ const SYSTEM_SHAPE_ERROR: &str = "`system` must be a string or array of text blo
 /// appears after the first non-system turn is removed from its position and
 /// its text appended, in encounter order, to the top-level `system`, which
 /// [`hoist_system`] then emits as the single leading system message. A
-/// `system` message in the leading position needs no move and is left alone,
+/// leading `system` message is merged first when a later instruction moves,
 /// and a message whose content is not text-only is left for the strict
 /// validator to reject.
 ///
@@ -564,9 +564,32 @@ fn degrade_mid_conversation_system(body: &mut Map<String, Value>) -> Result<bool
         body.insert("messages".to_owned(), Value::Array(retained));
         return Ok(false);
     }
-    merge_mid_conversation_system(body, moved)?;
+    let groups = prepend_leading_system(&mut retained, moved);
+    merge_mid_conversation_system(body, groups)?;
     body.insert("messages".to_owned(), Value::Array(retained));
     Ok(true)
+}
+
+/// Include leading instructions before moved ones, retaining unsupported
+/// messages for strict validation.
+fn prepend_leading_system(retained: &mut Vec<Value>, moved: Vec<SystemParts>) -> Vec<SystemParts> {
+    // Once a later instruction moves, leading in-array instructions must join
+    // it first so hoisting cannot reverse their encounter order.
+    let leading_count = retained
+        .iter()
+        .take_while(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+        .count();
+    let remaining = retained.split_off(leading_count);
+    let leading = std::mem::replace(retained, remaining);
+    let mut groups = Vec::with_capacity(leading.len() + moved.len());
+    for message in leading {
+        match take_movable_system_content(message, true) {
+            Ok(group) => groups.push(group),
+            Err(message) => retained.insert(0, message),
+        }
+    }
+    groups.extend(moved);
+    groups
 }
 
 /// Consume a message into its text-only system content parts when it is a
@@ -3242,6 +3265,58 @@ mod tests {
         assert_eq!(messages[1], json!({"role": "user", "content": "one"}));
         assert_eq!(messages[2], json!({"role": "assistant", "content": "two"}));
         assert_eq!(messages[3], json!({"role": "user", "content": "three"}));
+    }
+
+    #[test]
+    fn mid_conversation_system_merges_leading_instructions_in_order() {
+        for system in [json!(null), json!("top")] {
+            let (translated, degraded) = degrade(
+                json!({
+                    "model": "m", "system": system,
+                    "messages": [
+                        {"role": "system", "content": "A"},
+                        {"role": "system", "content": "B"},
+                        {"role": "user", "content": "U"},
+                        {"role": "system", "content": "C"}
+                    ]
+                }),
+                MIDSYS,
+            )
+            .unwrap();
+            let expected = if system.is_null() {
+                "A\n\nB\n\nC"
+            } else {
+                "top\n\nA\n\nB\n\nC"
+            };
+            assert_eq!(
+                translated["messages"],
+                json!([
+                    {"role": "system", "content": expected},
+                    {"role": "user", "content": "U"}
+                ]),
+                "all instructions must keep encounter order"
+            );
+            assert!(degraded.mid_conversation_system);
+        }
+    }
+
+    #[test]
+    fn mid_conversation_system_preserves_leading_validation() {
+        for leading in [
+            json!({"role": "system", "content": "A", "name": "extra"}),
+            json!({"role": "system", "content": [{"type": "text", "text": "A", "citations": [{"url": "https://example.test"}]}]}),
+            json!({"role": "system", "content": [{"type": "text", "text": "A", "cache_control": {"type": "ephemeral"}}]}),
+        ] {
+            let error = degrade(
+                json!({
+                    "model": "m",
+                    "messages": [leading, {"role": "user", "content": "U"}, {"role": "system", "content": "B"}]
+                }),
+                MIDSYS,
+            )
+            .unwrap_err();
+            assert!(!error.is_empty(), "folding must retain strict validation");
+        }
     }
 
     #[test]

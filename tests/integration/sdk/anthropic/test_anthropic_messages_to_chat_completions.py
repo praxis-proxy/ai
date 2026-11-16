@@ -889,7 +889,8 @@ class TestOperatorApprovedDegradation:
         reported = raw.http_response.headers.get(DEGRADED_HEADER, "")
         assert "prompt_caching" in reported and "extended_thinking" in reported, reported
 
-    def test_mid_conversation_system_is_folded_and_reported(self, degrading_client):
+    @pytest.mark.parametrize("leading", [False, True])
+    def test_mid_conversation_system_is_folded_and_reported(self, degrading_client, leading):
         RecordingBackend.bodies.clear()
 
         # Claude Code sends a text-only `system` message after the first user
@@ -901,6 +902,7 @@ class TestOperatorApprovedDegradation:
             max_tokens=64,
             system="Be brief",
             messages=[
+                *([{"role": "system", "content": "Keep instruction order."}] if leading else []),
                 {"role": "user", "content": "What is 2+2?"},
                 {"role": "system", "content": "Answer tersely."},
             ],
@@ -914,7 +916,14 @@ class TestOperatorApprovedDegradation:
         [upstream] = RecordingBackend.bodies
         system_messages = [m for m in upstream["messages"] if m["role"] == "system"]
         assert system_messages == [
-            {"role": "system", "content": "Be brief\n\nAnswer tersely."}
+            {
+                "role": "system",
+                "content": (
+                    "Be brief\n\n"
+                    + ("Keep instruction order.\n\n" if leading else "")
+                    + "Answer tersely."
+                ),
+            }
         ], f"the fold must merge into one leading system message: {upstream['messages']}"
 
     def test_streaming_request_is_degraded_and_reported(self, degrading_client):
