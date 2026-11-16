@@ -77,7 +77,7 @@ use super::{
 };
 use crate::{
     classifier::is_responses_create,
-    json_body::{MAX_JSON_BODY_BYTES, serialize_json_body},
+    json_body::{MAX_JSON_BODY_BYTES, serialize_json_body, serialized_len},
 };
 
 /// Converts `input_file` content parts to `input_text` for backends
@@ -437,19 +437,21 @@ fn rewrite_body(
     max_rewritten_body_bytes: usize,
     filter_name: &'static str,
 ) -> Result<Option<FilterAction>, FilterError> {
-    let rewritten = serialize_json_body(parsed)
+    // Count into a discard-only writer before allocating the replacement. This
+    // also preserves the exact serialized length in the existing 413 response.
+    // Accepted bodies take a second pass; rejected bodies never allocate output.
+    let len = serialized_len(parsed)
         .map_err(|e| -> FilterError { format!("{filter_name}: failed to serialize body: {e}").into() })?;
-    if rewritten.len() > max_rewritten_body_bytes {
+    if len > max_rewritten_body_bytes {
         warn!(
-            actual = rewritten.len(),
+            actual = len,
             limit = max_rewritten_body_bytes,
             "rewritten request body exceeds configured limit"
         );
-        return Ok(Some(reject_rewritten_body_too_large(
-            rewritten.len(),
-            max_rewritten_body_bytes,
-        )));
+        return Ok(Some(reject_rewritten_body_too_large(len, max_rewritten_body_bytes)));
     }
+    let rewritten = serialize_json_body(parsed)
+        .map_err(|e| -> FilterError { format!("{filter_name}: failed to serialize body: {e}").into() })?;
     rewritten.commit(body, filter_name, "input");
     Ok(None)
 }
