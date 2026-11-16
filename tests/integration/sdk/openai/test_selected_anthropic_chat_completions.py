@@ -8,6 +8,7 @@
 import json
 import os
 import signal
+import errno
 import socket
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import tempfile
 import threading
 import time
 from collections import deque
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -27,10 +29,38 @@ FAILOVER_EXAMPLE = ROOT / "examples/configs/inference/fallback-with-provider-tra
 MODEL = "fixture-openai-model"
 
 
-def _port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+def _ports(count: int) -> tuple[int, ...]:
+    # Keep every socket bound until the whole group is chosen: releasing one
+    # before choosing the next allows the OS to return the same port twice.
+    with ExitStack() as stack:
+        sockets = [stack.enter_context(socket.socket()) for _ in range(count)]
+        for sock in sockets:
+            sock.bind(("127.0.0.1", 0))
+        return tuple(sock.getsockname()[1] for sock in sockets)
+
+
+@pytest.mark.parametrize("count", [2, 3])
+def test_port_group_prevents_immediate_reuse(monkeypatch, count):
+    """An allocator that immediately reuses released ports must stay distinct."""
+    socket_type = socket.socket
+    with socket_type() as probe:
+        probe.bind(("127.0.0.1", 0))
+        preferred_port = probe.getsockname()[1]
+
+    class ReusingSocket(socket_type):
+        def bind(self, address):
+            # Emulate a kernel preferring the last released port. If the
+            # group still owns it, a real bind fails and we choose another.
+            try:
+                super().bind((address[0], preferred_port))
+            except OSError as error:
+                if error.errno != errno.EADDRINUSE:
+                    raise
+                super().bind(address)
+
+    monkeypatch.setattr(socket, "socket", ReusingSocket)
+    ports = _ports(count)
+    assert len(set(ports)) == count, "proxy and mock backends must never share a port"
 
 
 def _binary() -> str:
@@ -160,7 +190,7 @@ def protocol_client(request):
 
 def _versioned_client(version, protocol_version=None, protocol_first=True):
     """Run a translated route with an optional native protocol filter."""
-    proxy_port, backend_port = _port(), _port()
+    proxy_port, backend_port = _ports(2)
     backend = ThreadingHTTPServer(("127.0.0.1", backend_port), _Handler)
     thread = threading.Thread(target=backend.serve_forever, daemon=True)
     thread.start()
@@ -201,9 +231,39 @@ def _versioned_client(version, protocol_version=None, protocol_first=True):
 
 
 @pytest.fixture
+def translation_disabled_client():
+    """OpenAI client for verifying the disabled server-side translation policy."""
+    proxy_port, backend_port = _ports(2)
+    with tempfile.TemporaryDirectory() as directory:
+        config = Path(directory) / "praxis.yaml"
+        config.write_text(json.dumps(_config(proxy_port, backend_port, api_translation_enabled=False)))
+        proc = subprocess.Popen([_binary(), "-c", str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                try:
+                    with socket.create_connection(("127.0.0.1", proxy_port), timeout=0.2):
+                        break
+                except OSError:
+                    time.sleep(0.1)
+            else:
+                raise TimeoutError("Praxis did not start")
+            with OpenAI(api_key="caller-only", base_url=f"http://127.0.0.1:{proxy_port}/v1",
+                        max_retries=0, timeout=10) as sdk:
+                yield sdk
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
+@pytest.fixture
 def failover_client():
     """OpenAI SDK client backed by the checked-in cross-provider failover example."""
-    proxy_port, primary_port, fallback_port = _port(), _port(), _port()
+    proxy_port, primary_port, fallback_port = _ports(3)
     primary = ThreadingHTTPServer(("127.0.0.1", primary_port), _Handler)
     fallback = ThreadingHTTPServer(("127.0.0.1", fallback_port), _Handler)
     primary_thread = threading.Thread(target=primary.serve_forever, daemon=True)
