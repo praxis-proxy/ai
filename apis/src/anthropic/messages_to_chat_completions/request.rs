@@ -732,10 +732,10 @@ fn content_is_text_only(content: &Value) -> bool {
     }
 }
 
-/// A text-block shape the fold may rebuild: the strict validator's
-/// [`text_block_is_supported`] minus its null-`cache_control` requirement.
+/// A text-block shape the fold may rebuild: the strict text-block validation
+/// rules minus the null-`cache_control` requirement.
 ///
-/// [`text_block_is_supported`] cannot be reused as-is because this feature
+/// The strict validator cannot be reused as-is because this feature
 /// deliberately carries a surviving `cache_control` marker forward, so an
 /// operator who allowlisted the fold but not `prompt_caching` still fails
 /// closed in validation instead of silently losing cache breakpoints. The
@@ -3357,9 +3357,9 @@ mod tests {
             ]
         });
         let error = degrade(body, MIDSYS).unwrap_err();
-        assert_eq!(
-            error, "`system` must be a string or array of text blocks",
-            "the carried marker must fail closed with the system shape error: {error}"
+        assert!(
+            error.contains("cache_control"),
+            "the carried marker must fail closed in strict system validation: {error}"
         );
     }
 
