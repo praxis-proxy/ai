@@ -23,7 +23,7 @@ use super::{
     config::{BackendOnFailure, TokenRateLimitConfig},
     keys::compile_key_spec,
 };
-use crate::token_usage::META_TOKEN_TOTAL;
+use crate::token_usage::{META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_TOTAL};
 
 /// Capacity of the user level, the hierarchy level these tests fill.
 const USER_CAPACITY: u64 = 1000;
@@ -84,10 +84,15 @@ fn filter(rule_body: &str) -> TokenRateLimitFilter {
     }
 }
 
-/// A request from one org, team and user.
+/// A request from alice, in one org and team.
 fn request() -> Request {
+    request_from("alice")
+}
+
+/// A request from `user`, in the same org and team as [`request`].
+fn request_from(user: &'static str) -> Request {
     let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    for (name, value) in [("x-org-id", "acme"), ("x-team-id", "eng"), ("x-user-id", "alice")] {
+    for (name, value) in [("x-org-id", "acme"), ("x-team-id", "eng"), ("x-user-id", user)] {
         req.headers.insert(name, http::HeaderValue::from_static(value));
     }
     req
@@ -105,9 +110,12 @@ async fn admit(filter: &TokenRateLimitFilter, req: &Request) -> FilterAction {
     filter.on_request(&mut context(req)).await.unwrap()
 }
 
-/// Finish an exchange whose response reported `total` tokens.
-fn complete(filter: &TokenRateLimitFilter, ctx: &mut HttpFilterContext<'_>, total: &str) {
-    ctx.set_metadata(META_TOKEN_TOTAL, total);
+/// Finish an exchange whose response reported `usage`, as `token.*`
+/// metadata keys and values.
+fn complete(filter: &TokenRateLimitFilter, ctx: &mut HttpFilterContext<'_>, usage: &[(&str, &str)]) {
+    for &(key, tokens) in usage {
+        ctx.set_metadata(key, tokens);
+    }
     let mut body = None;
     drop(filter.on_response_body(ctx, &mut body, true).unwrap());
 }
@@ -135,7 +143,7 @@ async fn hierarchy_holds_settle_against_actual_usage_at_end_of_stream() {
         filter.on_request(&mut ctx).await.unwrap(),
         FilterAction::Continue
     ));
-    complete(&filter, &mut ctx, "100");
+    complete(&filter, &mut ctx, &[(META_TOKEN_TOTAL, "100")]);
 
     // Settled at 100: 100 + 400 + 400 fits the user's 1000; a third 400 does not.
     assert!(matches!(admit(&filter, &req).await, FilterAction::Continue));
@@ -188,32 +196,44 @@ async fn rule_fail_open_releases_hierarchy_holds() {
 async fn soft_forward_keeps_hierarchy_holds_and_settles_them_by_the_rule() {
     let filter = filter(
         "    capacity: 400\n\
+         \x20   weights:\n\
+         \x20     output: 13.0\n\
          \x20   enforcement: soft\n\
          \x20   over_quota:\n\
          \x20     headers:\n\
          \x20       X-Over-Quota: \"true\"\n",
     );
-    let req = request();
-    assert!(matches!(admit(&filter, &req).await, FilterAction::Continue));
+    // Another user fills the rule, leaving alice's user level empty.
+    assert!(matches!(
+        admit(&filter, &request_from("bob")).await,
+        FilterAction::Continue
+    ));
 
-    // The rule is full and soft: forwarded without a rule reservation, but
-    // the hierarchy holds stay and settle at actual usage.
+    // The rule is full and soft: alice is forwarded without a rule
+    // reservation, but her hierarchy holds stay and settle at actual usage,
+    // priced by the rule's weights: 50 input + 50 output x 13 = 700.
+    let req = request();
     let mut ctx = context(&req);
     assert!(matches!(
         filter.on_request(&mut ctx).await.unwrap(),
         FilterAction::Continue
     ));
-    complete(&filter, &mut ctx, "100");
-
-    // User: 400 + 100 settled + 400 = 900 fits; another 400 does not.
-    assert!(
-        matches!(admit(&filter, &req).await, FilterAction::Continue),
-        "the soft-forwarded hold settled at actual usage, not at its 400 estimate"
+    complete(
+        &filter,
+        &mut ctx,
+        &[
+            (META_TOKEN_INPUT, "50"),
+            (META_TOKEN_OUTPUT, "50"),
+            (META_TOKEN_TOTAL, "100"),
+        ],
     );
+
+    // 700 + 400 exceeds alice's 1000. Settled at the raw total (100) or left
+    // at the 400 estimate, her next 400 would fit.
     assert_eq!(
         denied_by_limit(&admit(&filter, &req).await).as_deref(),
         Some("1000"),
-        "the user level enforces its budget"
+        "the soft-forwarded hold settled at its weighted cost, not the raw total or the estimate"
     );
 }
 
