@@ -5,11 +5,20 @@
 """Credential-free checks that acceptance evidence cannot silently omit tests."""
 
 import json
+import os
 import subprocess
 
 import pytest
 
 from run_responses_acceptance import configure_gateway, redact, run_template, summarize
+
+
+@pytest.mark.parametrize("profile", ["managed", "passthrough"])
+@pytest.mark.parametrize("uid", [0, 1000])
+def test_gateway_root_override_follows_runner_uid(monkeypatch, tmp_path, profile, uid):
+    monkeypatch.setattr(os, "geteuid", lambda: uid)
+    config = configure_gateway(profile, "http://127.0.0.1:8000", "model", 8081, tmp_path)
+    assert config["insecure_options"].get("allow_root", False) == (uid == 0)
 
 
 def test_https_backend_configuration_preserves_pipeline(tmp_path):
