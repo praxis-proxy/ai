@@ -135,6 +135,29 @@ mod tests {
     }
 
     #[test]
+    fn colonless_data_is_preserved_and_counted() -> Result<(), FramingError> {
+        let mut framing = Framing::new(4096);
+        let frames = framing.push(b"data: first\ndata\ndata: last\n\n", 0, WIDE_FRAMES)?;
+        assert_eq!(frames.len(), 1, "multiline data must dispatch one record");
+        assert_eq!(
+            frames[0].data, b"first\n\nlast",
+            "colonless data must contribute an empty line"
+        );
+        assert!(
+            matches!(
+                framing.push(b"data\n\n", 1, 1),
+                Err(FramingError::FrameLimit { count: 2, limit: 1 })
+            ),
+            "an empty data record must count against the frame limit"
+        );
+        assert!(
+            !framing.has_incomplete_frame(),
+            "a rejected complete record must leave no pending frame"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn reports_incomplete_frame_at_eof() {
         let mut framing = Framing::new(4096);
         framing.push(b"data: partial", 0, WIDE_FRAMES).unwrap();
