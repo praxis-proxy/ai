@@ -1278,6 +1278,83 @@ class TestOpenAIConversations:
 
         malformed_response_client.conversations.delete(conversation.id)
 
+    @staticmethod
+    def _set_stored_status(db_path, table, response_id, status):
+        """Overwrite the stored response object's status directly in SQLite."""
+        database = sqlite3.connect(db_path)
+        try:
+            row = database.execute(
+                f'SELECT response_object FROM "{table}" WHERE id = ?',
+                (response_id,),
+            ).fetchone()
+            assert row is not None, "the created response must be persisted"
+            stored = json.loads(row[0])
+            stored["status"] = status
+            database.execute(
+                f'UPDATE "{table}" SET response_object = ? WHERE id = ?',
+                (json.dumps(stored, separators=(",", ":")), response_id),
+            )
+            database.commit()
+        finally:
+            database.close()
+
+    def test_response_cancel_transitions_queued_to_cancelled(
+        self, chunked_response_store
+    ):
+        """Cancelling a queued response atomically transitions it."""
+        client, db_path, table = chunked_response_store
+        response = client.responses.create(model="gpt-4.1", input="Hello")
+        self._set_stored_status(db_path, table, response.id, "queued")
+
+        cancelled = client.responses.cancel(response.id)
+
+        assert cancelled.id == response.id
+        assert cancelled.status == "cancelled", (
+            "cancel must return the response object with status cancelled"
+        )
+        retrieved = client.responses.retrieve(response.id)
+        assert retrieved.status == "cancelled", (
+            "polling must observe the cancelled status"
+        )
+
+    def test_response_cancel_is_idempotent(self, chunked_response_store):
+        """Repeated cancellation returns the stored response unchanged."""
+        client, db_path, table = chunked_response_store
+        response = client.responses.create(model="gpt-4.1", input="Hello")
+        self._set_stored_status(db_path, table, response.id, "queued")
+
+        first = client.responses.cancel(response.id)
+        second = client.responses.cancel(response.id)
+
+        assert first.status == "cancelled"
+        assert second.status == "cancelled", (
+            "a second cancel must return the stored response, not an error"
+        )
+
+    def test_response_cancel_completed_returns_400(self, chunked_response_store):
+        """A terminal response can no longer be cancelled."""
+        client, _, _ = chunked_response_store
+        response = client.responses.create(model="gpt-4.1", input="Hello")
+        assert response.status == "completed"
+
+        with pytest.raises(BadRequestError) as exc_info:
+            client.responses.cancel(response.id)
+
+        assert exc_info.value.status_code == 400
+        message = exc_info.value.response.json()["error"]["message"]
+        assert "Cannot cancel a response with status of 'completed'" in message
+        retrieved = client.responses.retrieve(response.id)
+        assert retrieved.status == "completed", (
+            "a rejected cancel must not modify the stored response"
+        )
+
+    def test_response_cancel_unknown_id_returns_404(self, chunked_response_client):
+        """Cancelling a missing response is indistinguishable from no access."""
+        with pytest.raises(NotFoundError) as exc_info:
+            chunked_response_client.responses.cancel("resp_cancel_missing")
+
+        assert exc_info.value.status_code == 404
+
     def test_conversation_create_no_metadata(self, openai_client):
         conversation = openai_client.conversations.create()
 
