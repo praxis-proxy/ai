@@ -96,15 +96,17 @@ impl AnthropicMessagesToChatCompletionsStreamFilter {
         bytes: &Bytes,
         end_of_stream: bool,
     ) -> Result<Option<Bytes>, FilterError> {
+        let mut state = ctx.remove_filter_state::<StreamState>().unwrap_or_default();
+        state.stop_sequences.get_or_insert_with(|| client_stop_sequences(ctx));
         let result = decode_and_process_chunk(
-            ctx,
+            &mut state,
             bytes,
             end_of_stream,
             self.config.max_partial_event_bytes,
             self.config.max_tool_blocks,
         );
-        if result.is_err() || end_of_stream {
-            ctx.remove_filter_state::<StreamState>();
+        if result.is_ok() && !end_of_stream {
+            ctx.insert_filter_state(state);
         }
         result
     }
@@ -166,7 +168,7 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsStreamFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if is_stream_failed(ctx) {
+        if ctx.get_filter_state::<StreamState>().is_some_and(is_stream_failed) {
             if end_of_stream {
                 ctx.remove_filter_state::<StreamState>();
             }
@@ -206,16 +208,15 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsStreamFilter {
 /// the valid prefix, buffer any trailing incomplete sequence, and
 /// run SSE processing on the valid portion.
 fn decode_and_process_chunk(
-    ctx: &mut HttpFilterContext<'_>,
+    state: &mut StreamState,
     bytes: &Bytes,
     end_of_stream: bool,
     max_partial_event_bytes: usize,
     max_tool_blocks: usize,
 ) -> Result<Option<Bytes>, FilterError> {
-    let combined = combine_pending_utf8(ctx, bytes);
-    let Some(valid_up_to) = valid_utf8_prefix_len(ctx, combined.as_slice(), end_of_stream) else {
+    let combined = combine_pending_utf8(state, bytes);
+    let Some(valid_up_to) = valid_utf8_prefix_len(state, combined.as_slice(), end_of_stream) else {
         // Never mix raw upstream bytes into an Anthropic event stream.
-        state_mut(ctx).buffer = EventBuffer::default();
         return Err(FilterError::from(
             "anthropic_messages_to_chat_completions_stream: upstream SSE contains malformed UTF-8",
         ));
@@ -231,12 +232,19 @@ fn decode_and_process_chunk(
         return Ok(None);
     }
 
-    process_sse_chunk(ctx, chunk_str, end_of_stream, max_partial_event_bytes, max_tool_blocks).map(Some)
+    process_sse_chunk(
+        state,
+        chunk_str,
+        end_of_stream,
+        max_partial_event_bytes,
+        max_tool_blocks,
+    )
+    .map(Some)
 }
 
 /// Prefix any incomplete UTF-8 bytes retained from the previous chunk.
-fn combine_pending_utf8<'a>(ctx: &mut HttpFilterContext<'_>, bytes: &'a Bytes) -> CombinedUtf8Chunk<'a> {
-    let mut pending = std::mem::take(&mut state_mut(ctx).utf8);
+fn combine_pending_utf8<'a>(state: &mut StreamState, bytes: &'a Bytes) -> CombinedUtf8Chunk<'a> {
+    let mut pending = std::mem::take(&mut state.utf8);
     if pending.is_empty() {
         CombinedUtf8Chunk::Borrowed(bytes)
     } else {
@@ -246,7 +254,7 @@ fn combine_pending_utf8<'a>(ctx: &mut HttpFilterContext<'_>, bytes: &'a Bytes) -
 }
 
 /// Find the valid UTF-8 prefix and retain only a trailing incomplete suffix.
-fn valid_utf8_prefix_len(ctx: &mut HttpFilterContext<'_>, combined: &[u8], end_of_stream: bool) -> Option<usize> {
+fn valid_utf8_prefix_len(state: &mut StreamState, combined: &[u8], end_of_stream: bool) -> Option<usize> {
     match std::str::from_utf8(combined) {
         Ok(_) => Some(combined.len()),
         Err(e) if e.error_len().is_none() => {
@@ -258,7 +266,7 @@ fn valid_utf8_prefix_len(ctx: &mut HttpFilterContext<'_>, combined: &[u8], end_o
             if tail.len() > 3 {
                 return None;
             }
-            state_mut(ctx).utf8.extend_from_slice(tail);
+            state.utf8.extend_from_slice(tail);
             Some(valid)
         },
         Err(_) => None,
@@ -330,6 +338,8 @@ enum StreamProgress {
 struct StreamState {
     /// Incremental SSE framing state.
     buffer: EventBuffer,
+    /// Client stop sequences used to validate an upstream match.
+    stop_sequences: Option<Vec<String>>,
     /// Incomplete UTF-8 suffix, at most three bytes.
     utf8: Vec<u8>,
     /// Message and terminal-error progress.
@@ -354,16 +364,18 @@ struct StreamState {
     cache_read_tokens: Option<u64>,
 }
 
-/// Access initialized instance state during pipeline execution.
+/// Seed or access instance state in direct-hook tests.
+#[cfg(test)]
 #[expect(
     clippy::expect_used,
     reason = "pipeline assigns a filter ID and this filter owns its state slot"
 )]
-fn state_mut<'a>(ctx: &'a mut HttpFilterContext<'_>) -> &'a mut StreamState {
-    if ctx.get_filter_state::<StreamState>().is_none() {
-        ctx.insert_filter_state(StreamState::default());
+fn state_mut<'a>(state: &'a mut HttpFilterContext<'_>) -> &'a mut StreamState {
+    if state.get_filter_state::<StreamState>().is_none() {
+        state.insert_filter_state(StreamState::default());
     }
-    ctx.get_filter_state_mut::<StreamState>()
+    state
+        .get_filter_state_mut::<StreamState>()
         .expect("stream filter requires pipeline instance ID")
 }
 
@@ -375,13 +387,22 @@ fn state_mut<'a>(ctx: &'a mut HttpFilterContext<'_>) -> &'a mut StreamState {
 /// end-of-stream because it might be the first half of a `\r\n`
 /// pair split across chunks.
 fn process_sse_chunk(
-    ctx: &mut HttpFilterContext<'_>,
+    state: &mut StreamState,
     chunk_str: &str,
     end_of_stream: bool,
     max_partial_event_bytes: usize,
     max_tool_blocks: usize,
 ) -> Result<Bytes, FilterError> {
-    let mut buffer = std::mem::take(&mut state_mut(ctx).buffer);
+    if state.buffer.text.is_empty() && !state.buffer.pending_cr {
+        return process_unbuffered_chunk(
+            state,
+            chunk_str,
+            end_of_stream,
+            max_partial_event_bytes,
+            max_tool_blocks,
+        );
+    }
+    let mut buffer = std::mem::take(&mut state.buffer);
     buffer.append(chunk_str, end_of_stream);
     let mut output = Vec::new();
     let mut consumed = 0;
@@ -393,22 +414,47 @@ fn process_sse_chunk(
     {
         let end = buffer.scanned + offset;
         let block = buffer.text.get(consumed..end).ok_or("invalid SSE event boundary")?;
-        process_event_block(ctx, block, &mut output, max_tool_blocks)?;
+        process_event_block(state, block, &mut output, max_tool_blocks)?;
         consumed = end + 2;
         buffer.scanned = consumed;
-        if is_stream_failed(ctx) {
-            mark_stream_failed(ctx);
+        if is_stream_failed(state) {
             return Ok(Bytes::from(output));
         }
     }
-    store_event_buffer(ctx, buffer, consumed, end_of_stream, max_partial_event_bytes)?;
+    store_event_buffer(state, buffer, consumed, end_of_stream, max_partial_event_bytes)?;
+    Ok(Bytes::from(output))
+}
+
+/// Borrow complete incoming events and retain only an unfinished tail.
+fn process_unbuffered_chunk(
+    state: &mut StreamState,
+    chunk: &str,
+    end_of_stream: bool,
+    max_partial_event_bytes: usize,
+    max_tool_blocks: usize,
+) -> Result<Bytes, FilterError> {
+    let (text, pending_cr) = split_deferred_trailing_cr(chunk, end_of_stream);
+    let normalized = normalize_line_endings(text);
+    let mut remaining = normalized.as_ref();
+    let mut output = Vec::new();
+    while let Some((block, tail)) = remaining.split_once("\n\n") {
+        process_event_block(state, block, &mut output, max_tool_blocks)?;
+        if is_stream_failed(state) {
+            return Ok(Bytes::from(output));
+        }
+        remaining = tail;
+    }
+    let mut buffer = EventBuffer::default();
+    buffer.text.push_str(remaining);
+    buffer.pending_cr = pending_cr;
+    store_event_buffer(state, buffer, 0, end_of_stream, max_partial_event_bytes)?;
     Ok(Bytes::from(output))
 }
 
 /// Compact completed events once, enforce the partial-event limit, and retain
 /// the owned buffer until the next chunk or transport EOF.
 fn store_event_buffer(
-    ctx: &mut HttpFilterContext<'_>,
+    state: &mut StreamState,
     mut buffer: EventBuffer,
     consumed: usize,
     end_of_stream: bool,
@@ -424,7 +470,7 @@ fn store_event_buffer(
         ).into());
     }
     if !end_of_stream && (!buffer.text.is_empty() || buffer.pending_cr) {
-        state_mut(ctx).buffer = buffer;
+        state.buffer = buffer;
     }
     Ok(())
 }
@@ -462,9 +508,8 @@ fn is_armed(ctx: &HttpFilterContext<'_>) -> bool {
 }
 
 /// Whether a terminal error event has already ended the client-visible stream.
-fn is_stream_failed(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_filter_state::<StreamState>()
-        .is_some_and(|state| matches!(state.progress, StreamProgress::Failed))
+fn is_stream_failed(state: &StreamState) -> bool {
+    matches!(state.progress, StreamProgress::Failed)
 }
 
 /// Whether the filter should arm: streaming request, SSE Content-Type, success status.
@@ -528,7 +573,7 @@ fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
 /// silently discarded, which would erase their content from a stream that still
 /// reports success.
 fn process_event_block(
-    ctx: &mut HttpFilterContext<'_>,
+    state: &mut StreamState,
     block: &str,
     output: &mut Vec<u8>,
     max_tool_blocks: usize,
@@ -556,9 +601,9 @@ fn process_event_block(
 
     if let Some(data) = event_data {
         if data == OPENAI_DONE_SENTINEL {
-            emit_done(ctx, output);
+            emit_done(state, output);
         } else {
-            transform_data_event(ctx, &data, output, max_tool_blocks)?;
+            transform_data_event(state, &data, output, max_tool_blocks)?;
         }
     }
 
@@ -576,7 +621,7 @@ fn process_event_block(
 /// any text, tool call, finish reason, or usage it carried while the
 /// transformed stream still reports success.
 fn transform_data_event(
-    ctx: &mut HttpFilterContext<'_>,
+    state: &mut StreamState,
     data: &str,
     output: &mut Vec<u8>,
     max_tool_blocks: usize,
@@ -591,7 +636,7 @@ fn transform_data_event(
             "anthropic_messages_to_chat_completions_stream: upstream SSE data event is not a JSON object",
         ));
     }
-    transform_chunk(ctx, &chunk, output, max_tool_blocks)
+    transform_chunk(state, &chunk, output, max_tool_blocks)
 }
 
 // -----------------------------------------------------------------------------
@@ -600,46 +645,50 @@ fn transform_data_event(
 
 /// Transform a single `OpenAI` SSE chunk into Anthropic events.
 fn transform_chunk(
-    ctx: &mut HttpFilterContext<'_>,
+    state: &mut StreamState,
     chunk: &Value,
     output: &mut Vec<u8>,
     max_tool_blocks: usize,
 ) -> Result<(), FilterError> {
     let choice = extract_first_choice(chunk);
-    if choice.is_some_and(|choice| reject_untranslatable_choice(ctx, choice, output)) {
+    if choice.is_some_and(|choice| reject_untranslatable_choice(state, choice, output)) {
         return Ok(());
     }
 
-    let started = ctx
-        .get_filter_state::<StreamState>()
-        .is_some_and(|state| matches!(state.progress, StreamProgress::Started));
+    let started = matches!(state.progress, StreamProgress::Started);
 
     if !started {
-        emit_message_start(ctx, chunk, output);
+        emit_message_start(state, chunk, output);
     }
 
     if let Some(choice) = choice {
         if let Some(delta) = choice.get("delta") {
-            transform_delta(ctx, delta, output, max_tool_blocks)?;
+            transform_delta(state, delta, output, max_tool_blocks)?;
+            if is_stream_failed(state) {
+                return Ok(());
+            }
         }
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-            state_mut(ctx).finish_reason = Some(reason.to_owned());
+            state.finish_reason = Some(reason.to_owned());
         }
         // vLLM reports the matched stop string in a choice-level `stop_reason`;
         // only a client-provided sequence may be reported back as one.
         if let Some(matched) = choice.get("stop_reason").and_then(Value::as_str)
-            && client_stop_sequences(ctx).iter().any(|sequence| sequence == matched)
+            && state
+                .stop_sequences
+                .as_ref()
+                .is_some_and(|sequences| sequences.iter().any(|sequence| sequence == matched))
         {
-            state_mut(ctx).stop_sequence = Some(matched.to_owned());
+            state.stop_sequence = Some(matched.to_owned());
         }
     }
 
-    extract_usage_tokens(ctx, chunk);
+    extract_usage_tokens(state, chunk);
     Ok(())
 }
 
 /// Terminate when a valid Chat chunk carries output Anthropic cannot represent.
-fn reject_untranslatable_choice(ctx: &mut HttpFilterContext<'_>, choice: &Value, output: &mut Vec<u8>) -> bool {
+fn reject_untranslatable_choice(state: &mut StreamState, choice: &Value, output: &mut Vec<u8>) -> bool {
     let has_refusal = choice
         .get("delta")
         .and_then(|delta| delta.get("refusal"))
@@ -658,31 +707,31 @@ fn reject_untranslatable_choice(ctx: &mut HttpFilterContext<'_>, choice: &Value,
         was_content_filtered, "untranslatable upstream streaming outcome"
     );
     emit_upstream_transform_error(output);
-    mark_stream_failed(ctx);
+    mark_stream_failed(state);
     true
 }
 
 /// Retain typed token usage from a chunk.
-fn extract_usage_tokens(ctx: &mut HttpFilterContext<'_>, chunk: &Value) {
+fn extract_usage_tokens(state: &mut StreamState, chunk: &Value) {
     if let Some(usage) = chunk.get("usage") {
         if let Some(ot) = usage.get("completion_tokens").and_then(Value::as_u64) {
-            state_mut(ctx).output_tokens = ot;
+            state.output_tokens = ot;
         }
         if let Some(pt) = usage.get("prompt_tokens").and_then(Value::as_u64) {
-            state_mut(ctx).input_tokens = Some(pt);
+            state.input_tokens = Some(pt);
         }
         if let Some(ct) = usage
             .get("prompt_tokens_details")
             .and_then(|d| d.get("cached_tokens"))
             .and_then(Value::as_u64)
         {
-            state_mut(ctx).cache_read_tokens = Some(ct);
+            state.cache_read_tokens = Some(ct);
         }
     }
 }
 
 /// Emit the initial `message_start` event and mark the stream as started.
-fn emit_message_start(ctx: &mut HttpFilterContext<'_>, chunk: &Value, output: &mut Vec<u8>) {
+fn emit_message_start(state: &mut StreamState, chunk: &Value, output: &mut Vec<u8>) {
     let model = chunk.get("model").and_then(Value::as_str).unwrap_or("");
 
     emit_event(
@@ -704,7 +753,7 @@ fn emit_message_start(ctx: &mut HttpFilterContext<'_>, chunk: &Value, output: &m
             }
         }),
     );
-    state_mut(ctx).progress = StreamProgress::Started;
+    state.progress = StreamProgress::Started;
 }
 
 /// Extract the first choice from a Chat Completions streaming chunk.
@@ -730,20 +779,20 @@ fn generate_timestamp_id() -> u128 {
 
 /// Transform a delta object from a streaming chunk.
 fn transform_delta(
-    ctx: &mut HttpFilterContext<'_>,
+    state: &mut StreamState,
     delta: &Value,
     output: &mut Vec<u8>,
     max_tool_blocks: usize,
 ) -> Result<(), FilterError> {
     if let Some(content) = delta.get("content").and_then(Value::as_str) {
-        emit_text_delta(ctx, content, output);
+        emit_text_delta(state, content, output);
     }
 
     if let Some(Value::Array(tool_calls)) = delta.get("tool_calls") {
-        close_text_block_if_open(ctx, output);
+        close_text_block_if_open(state, output);
         for tc in tool_calls {
-            transform_tool_delta(ctx, tc, output, max_tool_blocks)?;
-            if is_stream_failed(ctx) {
+            transform_tool_delta(state, tc, output, max_tool_blocks)?;
+            if is_stream_failed(state) {
                 break;
             }
         }
@@ -753,9 +802,9 @@ fn transform_delta(
 }
 
 /// Emit a text content delta, opening a new block if needed.
-fn emit_text_delta(ctx: &mut HttpFilterContext<'_>, content: &str, output: &mut Vec<u8>) {
-    if !is_text_block_open(ctx) {
-        let idx = get_block_index(ctx);
+fn emit_text_delta(state: &mut StreamState, content: &str, output: &mut Vec<u8>) {
+    if !is_text_block_open(state) {
+        let idx = get_block_index(state);
         let content_block = ContentBlock::text("");
         emit_event(
             output,
@@ -766,10 +815,10 @@ fn emit_text_delta(ctx: &mut HttpFilterContext<'_>, content: &str, output: &mut 
                 "content_block": content_block
             }),
         );
-        state_mut(ctx).text_open = true;
+        state.text_open = true;
     }
 
-    let idx = get_block_index(ctx);
+    let idx = get_block_index(state);
     emit_event(
         output,
         "content_block_delta",
@@ -787,38 +836,38 @@ fn emit_text_delta(ctx: &mut HttpFilterContext<'_>, content: &str, output: &mut 
 
 /// Transform a tool call delta into Anthropic content block events.
 fn transform_tool_delta(
-    ctx: &mut HttpFilterContext<'_>,
+    state: &mut StreamState,
     tc: &Value,
     output: &mut Vec<u8>,
     max_tool_blocks: usize,
 ) -> Result<(), FilterError> {
     let tool_call_key = tool_call_key(tc);
 
-    if !is_tool_block_open(ctx, &tool_call_key)
-        && !emit_tool_block_start(ctx, &tool_call_key, tc, output, max_tool_blocks)?
+    if !is_tool_block_open(state, &tool_call_key)
+        && !emit_tool_block_start(state, &tool_call_key, tc, output, max_tool_blocks)?
     {
         return Ok(());
     }
 
-    emit_tool_arguments_delta(ctx, &tool_call_key, tc, output);
+    emit_tool_arguments_delta(state, &tool_call_key, tc, output);
 
     Ok(())
 }
 
 /// Close any open text content block and advance the block index.
-fn close_text_block_if_open(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) {
-    if !is_text_block_open(ctx) {
+fn close_text_block_if_open(state: &mut StreamState, output: &mut Vec<u8>) {
+    if !is_text_block_open(state) {
         return;
     }
 
-    let idx = get_block_index(ctx);
+    let idx = get_block_index(state);
     emit_event(
         output,
         "content_block_stop",
         &serde_json::json!({"type": "content_block_stop", "index": idx}),
     );
-    increment_block_index(ctx);
-    state_mut(ctx).text_open = false;
+    increment_block_index(state);
+    state.text_open = false;
 }
 
 /// Return the stable key used to associate OpenAI tool-call deltas.
@@ -836,13 +885,13 @@ fn tool_call_key(tc: &Value) -> String {
 /// `max_tool_blocks + 1`th block, bounding the per-response tool-call
 /// state that would otherwise grow with every unique upstream index.
 fn emit_tool_block_start(
-    ctx: &mut HttpFilterContext<'_>,
+    state: &mut StreamState,
     tool_call_key: &str,
     tc: &Value,
     output: &mut Vec<u8>,
     max_tool_blocks: usize,
 ) -> Result<bool, FilterError> {
-    let opened = get_tool_block_count(ctx);
+    let opened = get_tool_block_count(state);
     if opened >= max_tool_blocks {
         return Err(format!(
             "Streaming tool call count exceeds the limit set by the platform administrator (maximum {max_tool_blocks})."
@@ -850,8 +899,8 @@ fn emit_tool_block_start(
         .into());
     }
 
-    let idx = get_block_index(ctx);
-    let Some((id, name)) = extract_or_fail_tool_call(ctx, tc, output) else {
+    let idx = get_block_index(state);
+    let Some((id, name)) = extract_or_fail_tool_call(state, tc, output) else {
         return Ok(false);
     };
     let content_block = ContentBlock::tool_use(id, serde_json::Map::new(), name);
@@ -865,17 +914,17 @@ fn emit_tool_block_start(
             "content_block": content_block
         }),
     );
-    set_tool_block_index(ctx, tool_call_key, idx);
-    set_tool_block_open(ctx, tool_call_key, true);
-    increment_block_index(ctx);
-    state_mut(ctx).tool_count = opened + 1;
+    set_tool_block_index(state, tool_call_key, idx);
+    set_tool_block_open(state, tool_call_key, true);
+    increment_block_index(state);
+    state.tool_count = opened + 1;
 
     Ok(true)
 }
 
 /// Validate an upstream tool call or terminate the client-visible stream.
 fn extract_or_fail_tool_call<'a>(
-    ctx: &mut HttpFilterContext<'_>,
+    state: &mut StreamState,
     tc: &'a Value,
     output: &mut Vec<u8>,
 ) -> Option<(&'a str, &'a str)> {
@@ -884,15 +933,15 @@ fn extract_or_fail_tool_call<'a>(
         Err(error) => {
             debug!(%error, "invalid upstream streaming tool call");
             emit_upstream_transform_error(output);
-            mark_stream_failed(ctx);
+            mark_stream_failed(state);
             None
         },
     }
 }
 
 /// Discard parser state and suppress every event after a terminal stream error.
-fn mark_stream_failed(ctx: &mut HttpFilterContext<'_>) {
-    *state_mut(ctx) = StreamState {
+fn mark_stream_failed(state: &mut StreamState) {
+    *state = StreamState {
         progress: StreamProgress::Failed,
         ..StreamState::default()
     };
@@ -928,7 +977,7 @@ fn extract_tool_id_and_name(tc: &Value) -> Result<(&str, &str), FilterError> {
 }
 
 /// Emit an `input_json_delta` if the tool call has non-empty arguments.
-fn emit_tool_arguments_delta(ctx: &HttpFilterContext<'_>, tool_call_key: &str, tc: &Value, output: &mut Vec<u8>) {
+fn emit_tool_arguments_delta(state: &StreamState, tool_call_key: &str, tc: &Value, output: &mut Vec<u8>) {
     let Some(args) = tc
         .get("function")
         .and_then(|f| f.get("arguments"))
@@ -941,7 +990,7 @@ fn emit_tool_arguments_delta(ctx: &HttpFilterContext<'_>, tool_call_key: &str, t
         return;
     }
 
-    let idx = get_tool_block_index(ctx, tool_call_key).unwrap_or_else(|| get_block_index(ctx));
+    let idx = get_tool_block_index(state, tool_call_key).unwrap_or_else(|| get_block_index(state));
     emit_event(
         output,
         "content_block_delta",
@@ -954,12 +1003,12 @@ fn emit_tool_arguments_delta(ctx: &HttpFilterContext<'_>, tool_call_key: &str, t
 }
 
 /// Close a specific open tool content block.
-fn close_tool_block(ctx: &mut HttpFilterContext<'_>, tool_call_key: &str, output: &mut Vec<u8>) {
-    if !is_tool_block_open(ctx, tool_call_key) {
+fn close_tool_block(state: &mut StreamState, tool_call_key: &str, output: &mut Vec<u8>) {
+    if !is_tool_block_open(state, tool_call_key) {
         return;
     }
 
-    let Some(idx) = get_tool_block_index(ctx, tool_call_key) else {
+    let Some(idx) = get_tool_block_index(state, tool_call_key) else {
         return;
     };
 
@@ -968,7 +1017,7 @@ fn close_tool_block(ctx: &mut HttpFilterContext<'_>, tool_call_key: &str, output
         "content_block_stop",
         &serde_json::json!({"type": "content_block_stop", "index": idx}),
     );
-    set_tool_block_open(ctx, tool_call_key, false);
+    set_tool_block_open(state, tool_call_key, false);
 }
 
 // -----------------------------------------------------------------------------
@@ -981,45 +1030,42 @@ fn close_tool_block(ctx: &mut HttpFilterContext<'_>, tool_call_key: &str, output
 /// `message_start` is synthesized first so the terminal `message_delta` and
 /// `message_stop` never appear without the required opening event, yielding a
 /// structurally valid (empty) Anthropic stream instead of a malformed one.
-fn emit_done(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) {
-    if is_stream_failed(ctx) {
+fn emit_done(state: &mut StreamState, output: &mut Vec<u8>) {
+    if is_stream_failed(state) {
         return;
     }
 
-    let started = ctx
-        .get_filter_state::<StreamState>()
-        .is_some_and(|state| matches!(state.progress, StreamProgress::Started));
+    let started = matches!(state.progress, StreamProgress::Started);
     if !started {
-        emit_message_start(ctx, &Value::Null, output);
+        emit_message_start(state, &Value::Null, output);
     }
 
-    emit_final_block_stop(ctx, output);
-    emit_message_delta(ctx, output);
+    emit_final_block_stop(state, output);
+    emit_message_delta(state, output);
     emit_event(output, "message_stop", &serde_json::json!({"type": "message_stop"}));
     debug!("streaming transformation complete");
 }
 
 /// Close any open content block at end of stream.
-fn emit_final_block_stop(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) {
-    if is_text_block_open(ctx) {
-        close_text_block_if_open(ctx, output);
+fn emit_final_block_stop(state: &mut StreamState, output: &mut Vec<u8>) {
+    if is_text_block_open(state) {
+        close_text_block_if_open(state, output);
     }
-    for (_, tool_call_key) in open_tool_blocks(ctx) {
-        close_tool_block(ctx, &tool_call_key, output);
+    for (_, tool_call_key) in open_tool_blocks(state) {
+        close_tool_block(state, &tool_call_key, output);
     }
 }
 
 /// Emit the `message_delta` event with stop reason and usage.
-fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
-    let state = ctx.get_filter_state::<StreamState>();
-    let stop_sequence = state.and_then(|state| state.stop_sequence.as_ref());
-    let stop_reason = match state.and_then(|state| state.finish_reason.as_deref()) {
+fn emit_message_delta(state: &StreamState, output: &mut Vec<u8>) {
+    let stop_sequence = state.stop_sequence.as_ref();
+    let stop_reason = match state.finish_reason.as_deref() {
         Some("stop") if stop_sequence.is_some() => "stop_sequence",
         Some(reason) => map_stop_reason(reason),
         None => "end_turn",
     };
 
-    let usage = collect_delta_usage(ctx);
+    let usage = collect_delta_usage(state);
 
     emit_event(
         output,
@@ -1038,11 +1084,10 @@ fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
 }
 
 /// Build terminal delta usage from the retained typed counts.
-fn collect_delta_usage(ctx: &HttpFilterContext<'_>) -> MessageDeltaUsage {
-    let state = ctx.get_filter_state::<StreamState>();
-    let output_tokens = state.map_or(0, |state| state.output_tokens);
-    let prompt_tokens = state.and_then(|state| state.input_tokens);
-    let cache_read = state.and_then(|state| state.cache_read_tokens);
+fn collect_delta_usage(state: &StreamState) -> MessageDeltaUsage {
+    let output_tokens = state.output_tokens;
+    let prompt_tokens = state.input_tokens;
+    let cache_read = state.cache_read_tokens;
 
     let input_tokens = prompt_tokens.map(|pt| match cache_read {
         Some(cached) => pt.saturating_sub(cached),
@@ -1071,69 +1116,56 @@ fn map_stop_reason(reason: &str) -> &str {
 // -----------------------------------------------------------------------------
 
 /// Check whether a text content block is currently open.
-fn is_text_block_open(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_filter_state::<StreamState>()
-        .is_some_and(|state| state.text_open)
+fn is_text_block_open(state: &StreamState) -> bool {
+    state.text_open
 }
 
 /// Get the current block index.
-fn get_block_index(ctx: &HttpFilterContext<'_>) -> u32 {
-    ctx.get_filter_state::<StreamState>()
-        .map_or(0, |state| state.block_index)
+fn get_block_index(state: &StreamState) -> u32 {
+    state.block_index
 }
 
 /// Increment the block index.
-fn increment_block_index(ctx: &mut HttpFilterContext<'_>) {
-    let current = get_block_index(ctx);
-    state_mut(ctx).block_index = current + 1;
+fn increment_block_index(state: &mut StreamState) {
+    let current = get_block_index(state);
+    state.block_index = current + 1;
 }
 
 /// Return how many tool-call content blocks have opened this response.
-fn get_tool_block_count(ctx: &HttpFilterContext<'_>) -> usize {
-    ctx.get_filter_state::<StreamState>()
-        .map_or(0, |state| state.tool_count)
+fn get_tool_block_count(state: &StreamState) -> usize {
+    state.tool_count
 }
 
 /// Record the block index assigned to a tool call.
-fn set_tool_block_index(ctx: &mut HttpFilterContext<'_>, key: &str, idx: u32) {
-    state_mut(ctx).tools.entry(key.to_owned()).or_default().0 = idx;
+fn set_tool_block_index(state: &mut StreamState, key: &str, idx: u32) {
+    state.tools.entry(key.to_owned()).or_default().0 = idx;
 }
 
 /// Return the Anthropic index assigned to a tool call.
-fn get_tool_block_index(ctx: &HttpFilterContext<'_>, key: &str) -> Option<u32> {
-    ctx.get_filter_state::<StreamState>()?
-        .tools
-        .get(key)
-        .map(|block| block.0)
+fn get_tool_block_index(state: &StreamState, key: &str) -> Option<u32> {
+    state.tools.get(key).map(|block| block.0)
 }
 
 /// Update the open flag of an existing tool block.
-fn set_tool_block_open(ctx: &mut HttpFilterContext<'_>, key: &str, open: bool) {
-    if let Some(block) = state_mut(ctx).tools.get_mut(key) {
+fn set_tool_block_open(state: &mut StreamState, key: &str, open: bool) {
+    if let Some(block) = state.tools.get_mut(key) {
         block.1 = open;
     }
 }
 
 /// Whether an existing tool block is open.
-fn is_tool_block_open(ctx: &HttpFilterContext<'_>, key: &str) -> bool {
-    ctx.get_filter_state::<StreamState>()
-        .and_then(|state| state.tools.get(key))
-        .is_some_and(|block| block.1)
+fn is_tool_block_open(state: &StreamState, key: &str) -> bool {
+    state.tools.get(key).is_some_and(|block| block.1)
 }
 
 /// Return open blocks in Anthropic index order.
-fn open_tool_blocks(ctx: &HttpFilterContext<'_>) -> Vec<(u32, String)> {
-    let mut blocks = ctx
-        .get_filter_state::<StreamState>()
-        .map(|state| {
-            state
-                .tools
-                .iter()
-                .filter(|(_, block)| block.1)
-                .map(|(key, block)| (block.0, key.to_owned()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+fn open_tool_blocks(state: &StreamState) -> Vec<(u32, String)> {
+    let mut blocks = state
+        .tools
+        .iter()
+        .filter(|(_, block)| block.1)
+        .map(|(key, block)| (block.0, key.to_owned()))
+        .collect::<Vec<_>>();
     blocks.sort_by_key(|(idx, _)| *idx);
     blocks
 }
@@ -1191,6 +1223,20 @@ mod tests {
     use std::borrow::Cow;
 
     use super::*;
+
+    #[test]
+    fn complete_comment_event_borrows_incoming_chunk() {
+        let chunk = format!(":{}\n\n", "x".repeat(64 * 1024));
+        let mut state = StreamState::default();
+        let allocations = allocation_counter::measure(|| {
+            let output = process_sse_chunk(&mut state, &chunk, false, 1024, 10).unwrap();
+            assert!(output.is_empty(), "comments do not emit translated events");
+        });
+        assert_eq!(
+            allocations.bytes_total, 0,
+            "complete LF events must not copy incoming text"
+        );
+    }
 
     #[test]
     fn split_bare_cr_pair_emits_before_eof_at_partial_limit() {
@@ -1317,9 +1363,10 @@ mod tests {
             }
         });
         let (_, mut ctx) = make_filter_and_context();
+        let state = state_mut(&mut ctx);
         let incremental = allocation_counter::measure(|| {
             for chunk in &chunks {
-                process_sse_chunk(&mut ctx, std::str::from_utf8(chunk).unwrap(), false, 1024 * 1024, 10).unwrap();
+                process_sse_chunk(state, std::str::from_utf8(chunk).unwrap(), false, 1024 * 1024, 10).unwrap();
             }
         });
         eprintln!(
