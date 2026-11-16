@@ -15,6 +15,14 @@ static_resources:
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ingress_http
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "MCPDECISION method=%DYNAMIC_METADATA(mcp.ingress:rpc_method)% status=%RESPONSE_CODE%\n"
+
                 route_config:
                   name: local_route
                   virtual_hosts:
@@ -33,8 +41,8 @@ static_resources:
                   # strips x-mcp-authorized on the dispatch (tools/call) path and before
                   # Authorino replaces it, so a test can prove the SAME forwarded Bearer
                   # + x-mcp-authorized reach both discovery and dispatch. It captures a
-                  # one-way fingerprint of each into dynamic metadata; part 2 (after the
-                  # router, which sets x-mcp-method) logs them labeled by method.
+                  # one-way fingerprint and the original JSON-RPC method into dynamic
+                  # metadata. Part 2 logs them after the router.
                   # djb2 (not SHA-256) is deliberate: Envoy's inline Lua has no crypto
                   # stdlib, and a 32-bit fingerprint is enough to compare equality of two
                   # values from the SAME request while never exposing the raw credential.
@@ -56,6 +64,11 @@ static_resources:
                             local md = handle:streamInfo():dynamicMetadata()
                             md:set("mcp.ingress", "bearer", djb2(hdr:get("authorization")))
                             md:set("mcp.ingress", "wristband", djb2(hdr:get("x-mcp-authorized")))
+                            local body = handle:body()
+                            if body ~= nil then
+                              local method = string.match(body:getBytes(0, body:length()), '"method"%s*:%s*"([^"]+)"')
+                              handle:streamInfo():dynamicMetadata():set("mcp.ingress", "rpc_method", method or "?")
+                            end
                           end
                   - name: envoy.filters.http.ext_proc
                     typed_config:
@@ -74,9 +87,8 @@ static_resources:
                         response_trailer_mode: SKIP
                       grpc_service:
                         envoy_grpc: {cluster_name: router_grpc}
-                  # Ingress observer part 2 (item 7): runs AFTER the router sets
-                  # x-mcp-method, reads the pre-strip digests captured in dynamic
-                  # metadata, and logs them labeled by the JSON-RPC method.
+                  # Ingress observer part 2 (item 7): reads the original method and
+                  # pre-strip digests, including when routing rewrites headers.
                   - name: envoy.filters.http.lua
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
@@ -85,7 +97,7 @@ static_resources:
                           function envoy_on_request(handle)
                             local hdr = handle:headers()
                             local md = handle:streamInfo():dynamicMetadata():get("mcp.ingress") or {}
-                            handle:logWarn("MCPINGRESS method=" .. (hdr:get("x-mcp-method") or "?") ..
+                            handle:logWarn("MCPINGRESS method=" .. (md["rpc_method"] or "?") ..
                               " bearer=" .. (md["bearer"] or "0") ..
                               " wristband=" .. (md["wristband"] or "0"))
                           end

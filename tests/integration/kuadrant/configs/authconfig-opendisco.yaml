@@ -24,6 +24,7 @@ spec:
         # evaluator reads the resolved identity's stored OIDC config, which only
         # exists in issuerUrl mode (else "rule does not store openid configuration").
         issuerUrl: "http://jwks:8089"
+        issuer: "http://jwks:8089"
         audiences:
           - "mcp-gateway"
   authorization:

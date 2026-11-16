@@ -33,12 +33,20 @@ say(){ printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 die(){ printf '\033[31mFATAL: %s\033[0m\n' "$*" >&2; exit 1; }
 wait_ok(){ # url desc [maxtries]
   local url="$1" desc="$2" max="${3:-60}" i=0
-  while [ $i -lt "$max" ]; do curl -sk --max-time 3 "$url" >/dev/null 2>&1 && { echo "   ready: $desc"; return 0; }; sleep 1; i=$((i+1)); done
+  local -a auth=()
+  if [[ "$url" == https://127.0.0.1:6443/* ]]; then
+    auth=(--cert "$CP/client.crt" --key "$CP/client.key")
+  fi
+  while [ $i -lt "$max" ]; do curl "${auth[@]}" -fsk --max-time 3 "$url" >/dev/null 2>&1 && { echo "   ready: $desc"; return 0; }; sleep 1; i=$((i+1)); done
   die "timeout waiting for $desc ($url)"
 }
 
 say "0. clean slate (engine: $ENGINE)"
-"$ENGINE" rm -f envoy authorino kube-apiserver etcd mcp-broker weather-backend jwks >/dev/null 2>&1
+for name in envoy authorino kube-apiserver etcd mcp-broker weather-backend jwks; do
+  container="kuadrant-accept-$name"
+  owner=$("$ENGINE" inspect --format '{{index .Config.Labels "praxis.kuadrant-accept"}}' "$container" 2>/dev/null || true)
+  [ "$owner" != "$BASE" ] || "$ENGINE" rm -f "$container" >/dev/null
+done
 "$ENGINE" network rm "$NET" >/dev/null 2>&1
 "$ENGINE" network create "$NET" >/dev/null || die "network create"
 
@@ -61,20 +69,20 @@ KID=$(cat "$IDP/issuer_kid.txt")
 echo "   wristband kid=wristband-signing-key ; issuer kid=$KID"
 
 say "2. weather-backend (exec counter)"
-"$ENGINE" run -d --name weather-backend --network "$NET" -p 9001:9001 \
+"$ENGINE" run -d --name kuadrant-accept-weather-backend --network "$NET" --network-alias weather-backend --label "praxis.kuadrant-accept=$BASE" -p 9001:9001 \
   -e PORT=9001 -e MCP_RESPONSE_MODE=json -v "$SCRIPTS:/scripts:ro" \
   "$PY" python /scripts/fake_mcp_backend.py >/dev/null || die "weather-backend"
 wait_ok http://127.0.0.1:9001/stats "weather-backend /stats"
 
 say "3. jwks IdP"
-"$ENGINE" run -d --name jwks --network "$NET" -p 8089:8089 \
+"$ENGINE" run -d --name kuadrant-accept-jwks --network "$NET" --network-alias jwks --label "praxis.kuadrant-accept=$BASE" -p 8089:8089 \
   -e PORT=8089 -e JWKS_FILE=/idp/jwks.json -e ISSUER=http://jwks:8089 \
   -v "$SCRIPTS:/scripts:ro" -v "$IDP:/idp:ro" \
   "$PY" python /scripts/jwks_server.py >/dev/null || die "jwks"
 wait_ok http://127.0.0.1:8089/jwks "jwks /jwks"
 
 say "4. mcp-broker + router (private-host=envoy:8080, enforce-capability-filtering)"
-"$ENGINE" run -d --name mcp-broker --network "$NET" -p 8080:8080 -p 50051:50051 \
+"$ENGINE" run -d --name kuadrant-accept-mcp-broker --network "$NET" --network-alias mcp-broker --label "praxis.kuadrant-accept=$BASE" -p 8080:8080 -p 50051:50051 \
   -e GATEWAY_SIGNING_KEY="$(openssl rand -hex 32)" \
   -e TRUSTED_HEADER_PUBLIC_KEY="$(cat "$KEYS/pub.pem")" \
   -v "$CONF/broker-config.yaml:/config/config.yaml:ro" \
@@ -86,10 +94,10 @@ say "4. mcp-broker + router (private-host=envoy:8080, enforce-capability-filteri
     --enforce-capability-filtering --log-level=-4 >/dev/null || die "mcp-broker"
 
 say "5. etcd + kube-apiserver"
-"$ENGINE" run -d --name etcd --network "$NET" "$IMG_ETCD" /usr/local/bin/etcd \
+"$ENGINE" run -d --name kuadrant-accept-etcd --network "$NET" --network-alias etcd --label "praxis.kuadrant-accept=$BASE" "$IMG_ETCD" /usr/local/bin/etcd \
   --name etcd0 --data-dir /etcd-data \
   --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://etcd:2379 >/dev/null || die "etcd"
-"$ENGINE" run -d --name kube-apiserver --network "$NET" -p 6443:6443 -v "$CP:/pki:ro" \
+"$ENGINE" run -d --name kuadrant-accept-kube-apiserver --network "$NET" --network-alias kube-apiserver --label "praxis.kuadrant-accept=$BASE" -p 6443:6443 -v "$CP:/pki:ro" \
   --entrypoint kube-apiserver "$IMG_APISERVER" \
     --etcd-servers=http://etcd:2379 \
     --tls-cert-file=/pki/apiserver.crt --tls-private-key-file=/pki/apiserver.key \
@@ -124,7 +132,7 @@ kubectl --request-timeout=20s -n default create secret generic wristband-signing
 kubectl --request-timeout=20s apply -f "$CONF/authconfig-filtered.yaml" >/dev/null || die "authconfig"
 
 say "7. authorino"
-"$ENGINE" run -d --name authorino --network "$NET" -p 5001:5001 -p 8083:8083 -p 8081:8081 -p 50052:50051 \
+"$ENGINE" run -d --name kuadrant-accept-authorino --network "$NET" --network-alias authorino --label "praxis.kuadrant-accept=$BASE" -p 5001:5001 -p 8083:8083 -p 8081:8081 -p 50052:50051 \
   -e KUBECONFIG=/etc/authorino/kubeconfig -v "$CP/kubeconfig-authorino.yaml:/etc/authorino/kubeconfig:ro" \
   "$IMG_AUTHORINO" --log-level=debug --log-mode=development >/dev/null || die "authorino"
 wait_ok http://127.0.0.1:8081/readyz "authorino /readyz"
@@ -134,9 +142,9 @@ for i in $(seq 1 30); do
 done
 
 say "8. envoy (ext_proc -> ext_authz -> router)"
-"$ENGINE" run -d --name envoy --network "$NET" -p 8000:8080 -p 9901:9901 \
+"$ENGINE" run -d --name kuadrant-accept-envoy --network "$NET" --network-alias envoy --label "praxis.kuadrant-accept=$BASE" -p 8000:8080 -p 9901:9901 \
   -v "$CONF/envoy.yaml:/etc/envoy/envoy.yaml:ro" --entrypoint envoy \
-  "$IMG_ENVOY" -c /etc/envoy/envoy.yaml --log-level warning >/dev/null || die "envoy"
+  "$IMG_ENVOY" -c /etc/envoy/envoy.yaml --log-level warning --file-flush-interval-msec 100 >/dev/null || die "envoy"
 wait_ok http://127.0.0.1:9901/ready "envoy admin"
 
 say "9. emit .stack-env"

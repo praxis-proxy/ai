@@ -57,6 +57,8 @@ MCP_TOOL = {
 ROLES_AUTHORIZED = {"weather": {"roles": ["tool:get_forecast"]}}
 ROLES_NONE = {"weather": {"roles": []}}
 
+_POLICY_PROBE = None
+
 # A representative opaque x-mcp-authorized wristband forwarded by Praxis (the courier
 # the issue names). In Topology A the gateway's Authorino mints its own, so the value
 # is opaque to enforcement; it is forwarded unchanged and observed for item 7.
@@ -67,6 +69,10 @@ APPROVAL_TOOL = {**MCP_TOOL, "require_approval": "always"}
 
 
 # --- low-level helpers -------------------------------------------------------
+
+def _forced_count(port):
+    return httpx.get(f"http://127.0.0.1:{port}/stats", timeout=5).json()["forced_calls"]
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -133,12 +139,33 @@ def _backend_count(stack, tool):
 def _switch_authconfig(variant):
     """Apply an AuthConfig variant and wait for Authorino to reconcile it."""
     subprocess.run(["bash", str(SWITCH), variant], check=True)
+    assert _POLICY_PROBE is not None, "policy changes require a running Praxis probe"
+    stack, url = _POLICY_PROBE
+    user = "userB" if variant == "opendisco" else "userA"
+    roles = ROLES_NONE if user == "userB" else ROLES_AUTHORIZED
+    token = _mint(stack, user, roles)
+    predicate = _mcp_call_ok if variant == "filtered" else _mcp_call_error
+    result = _call_until(stack, url, user, token, predicate)
+    assert result is not None and predicate(result), f"policy {variant} not effective: {result}"
+    if variant == "filtered":
+        token = _mint(stack, "userB", ROLES_NONE)
+        predicate = lambda j: any(o.get("type") == "mcp_list_tools" and o.get("tools") == [] for o in j.get("output", []))
+        result = _call_until(stack, url, "userB", token, predicate)
+        assert result is not None and predicate(result), "filtered discovery not effective"
+
+
+
+def _digest(value):
+    result = 5381
+    for byte in value.encode():
+        result = (result * 33 + byte) % 4294967296
+    return f"{result:08x}"
 
 
 def _ingress_lines(stack):
     """Parse the Envoy ingress observer's one-way digests (item 7) from envoy logs."""
     engine = stack["KUADRANT_CONTAINER_ENGINE"]
-    out = subprocess.run([engine, "logs", "envoy"], capture_output=True, text=True)
+    out = subprocess.run([engine, "logs", "kuadrant-accept-envoy"], capture_output=True, text=True)
     text = (out.stdout or "") + (out.stderr or "")
     lines = []
     for ln in text.splitlines():
@@ -165,11 +192,13 @@ def _ingress_since(stack, before, predicate, tries=25):
 def _responses_stream(praxis_url, user, token, tools, input_text="What is the weather in NYC?"):
     """Drive a streaming Responses request; return (status, raw_sse_text)."""
     body = {"model": "scripted-model", "input": input_text, "store": False, "stream": True, "tools": tools}
+    before = _denial_count(_POLICY_PROBE[0])
     raw = ""
     with httpx.stream("POST", praxis_url + "/v1/responses", headers=_headers(user, token), json=body, timeout=90) as r:
         status = r.status_code
         for chunk in r.iter_text():
             raw += chunk
+    _verify_denial(before, {"output": _sse_final_output(raw)})
     return status, raw
 
 
@@ -190,14 +219,14 @@ def _sse_final_output(raw):
 
 def _sse_terminated_cleanly(raw):
     """A valid terminal SSE lifecycle: exactly one response.created and exactly one
-    terminal event (response.completed for success, or response.failed/error)."""
+    successful terminal event (response.completed), with no failure event."""
     created = raw.count("event: response.created")
     terminal = (
         raw.count("event: response.completed")
         + raw.count("event: response.failed")
         + raw.count("event: error")
     )
-    return created == 1 and terminal == 1
+    return created == 1 and terminal == 1 and raw.count("event: response.completed") == 1
 
 
 def _headers(user, token, wristband=WRISTBAND):
@@ -221,8 +250,11 @@ def _responses(praxis_url, user, token, tools, stream=False,
         "stream": stream,
         "tools": tools,
     }
-    return httpx.post(praxis_url + "/v1/responses", headers=_headers(user, token, wristband),
-                      json=body, timeout=90)
+    before = _denial_count(_POLICY_PROBE[0])
+    result = httpx.post(praxis_url + "/v1/responses", headers=_headers(user, token, wristband), json=body, timeout=90)
+    if result.status_code == 200:
+        _verify_denial(before, result.json())
+    return result
 
 
 def _discovered_tools(resp_json):
@@ -308,7 +340,11 @@ def _stop_process(proc):
 
 
 def _post(praxis_url, user, token, body):
-    return httpx.post(praxis_url + "/v1/responses", headers=_headers(user, token), json=body, timeout=90)
+    before = _denial_count(_POLICY_PROBE[0])
+    result = httpx.post(praxis_url + "/v1/responses", headers=_headers(user, token), json=body, timeout=90)
+    if result.status_code == 200:
+        _verify_denial(before, result.json())
+    return result
 
 
 def _call_until(stack, praxis_url, user, token, predicate, tries=8):
@@ -327,6 +363,22 @@ def _call_until(stack, praxis_url, user, token, predicate, tries=8):
 
 
 # --- fixtures ----------------------------------------------------------------
+
+def _denial_count(stack):
+    result = subprocess.run([stack["KUADRANT_CONTAINER_ENGINE"], "logs", "kuadrant-accept-envoy"], capture_output=True, text=True, check=True)
+    return (result.stdout + result.stderr).count("MCPDECISION method=tools/call status=403")
+
+
+def _verify_denial(before, output):
+    if not _mcp_call_error(output):
+        return
+    stack, _ = _POLICY_PROBE
+    for _ in range(150):
+        if _denial_count(stack) > before:
+            return
+        time.sleep(0.1)
+    pytest.fail("expected gateway tools/call authorization denial (403) for this request")
+
 
 @pytest.fixture(scope="session")
 def stack():
@@ -386,6 +438,7 @@ def passing_nemo():
 def praxis(stack, scripted_model, passing_nemo):
     """Real praxis-ai running the canonical full-flow config against the gateway,
     scripted model, and passing NeMo fixture (Topology A, store:false)."""
+    global _POLICY_PROBE
     proxy_port = _free_port()
     tmpdir = tempfile.TemporaryDirectory(prefix="praxis-kuadrant-")
     cfg_path = Path(tmpdir.name) / "config.yaml"
@@ -402,6 +455,7 @@ def praxis(stack, scripted_model, passing_nemo):
     )
     try:
         _wait_tcp(proxy_port, 30)
+        _POLICY_PROBE = (stack, f"http://127.0.0.1:{proxy_port}")
         yield f"http://127.0.0.1:{proxy_port}"
     finally:
         _stop_process(proc)
@@ -409,7 +463,7 @@ def praxis(stack, scripted_model, passing_nemo):
 
 
 @pytest.fixture(scope="session")
-def praxis_store(stack, scripted_model, passing_nemo):
+def praxis_store(stack, scripted_model, passing_nemo, praxis):
     """Full-flow Praxis process with its configured SQLite stores, so approval
     create/resume survives two client turns (items 5/6b)."""
     proxy_port = _free_port()
@@ -462,6 +516,7 @@ def test_item2_unauthorized_user_sees_empty_discovery(stack, praxis, scripted_mo
     r = _responses(praxis, "userB", token, [MCP_TOOL], stream=False)
     assert r.status_code == 200, r.text
     j = r.json()
+    assert any(o.get("type") == "mcp_list_tools" and o.get("tools") == [] for o in j.get("output", [])), j
     assert "weather_get_forecast" not in _discovered_tools(j), j
     assert _backend_count(stack, "get_forecast") == 0
 
@@ -470,6 +525,7 @@ def test_item3a_praxis_does_not_dispatch_undiscovered_tool(stack, praxis, script
     """Even when the model force-emits a call to a tool userB never discovered,
     Praxis does not dispatch it to the gateway (defense in depth): no successful MCP
     call, no backend execution."""
+    forced_before = _forced_count(scripted_model)
     token = _mint(stack, "userB", ROLES_NONE)
     _reset_backend(stack)
     r = _responses(
@@ -482,6 +538,8 @@ def test_item3a_praxis_does_not_dispatch_undiscovered_tool(stack, praxis, script
     # produced (distinguishes client-side non-dispatch from dispatched-then-denied).
     assert not any(o.get("type") == "mcp_call" for o in (j.get("output") or [])), j
     assert _backend_count(stack, "get_forecast") == 0
+
+    assert _forced_count(scripted_model) == forced_before + 1, "model must emit the forged call"
 
 
 def test_item3b_gateway_denies_discovered_but_forbidden_call(stack, praxis, scripted_model):
@@ -528,6 +586,7 @@ def test_item1_authorized_streaming(stack, praxis, scripted_model, passing_nemo)
 def test_item3a_undiscovered_streaming(stack, praxis, scripted_model):
     """Streaming item 3a: a force-emitted call to an undiscovered tool is not
     dispatched; the logical stream still completes cleanly with zero execution."""
+    forced_before = _forced_count(scripted_model)
     token = _mint(stack, "userB", ROLES_NONE)
     _reset_backend(stack)
     status, raw = _responses_stream(
@@ -537,6 +596,8 @@ def test_item3a_undiscovered_streaming(stack, praxis, scripted_model):
     assert _sse_terminated_cleanly(raw), raw
     assert not _mcp_call_ok({"output": _sse_final_output(raw)}), raw
     assert _backend_count(stack, "get_forecast") == 0
+
+    assert _forced_count(scripted_model) == forced_before + 1, "model must emit the forged call"
 
 
 def test_item3b_gateway_denial_streaming(stack, praxis, scripted_model):
@@ -573,8 +634,8 @@ def test_item7_same_forwarded_identity_reaches_discovery_and_dispatch(stack, pra
     lists = [ln for ln in new if ln["method"] == "tools/list"]
     calls = [ln for ln in new if ln["method"] == "tools/call"]
     assert lists and calls, new
-    assert lists[-1]["bearer"] == calls[-1]["bearer"] != "0", new
-    assert lists[-1]["wristband"] == calls[-1]["wristband"] != "0", new
+    assert lists[-1]["bearer"] == calls[-1]["bearer"] == _digest("Bearer " + token), new
+    assert lists[-1]["wristband"] == calls[-1]["wristband"] == _digest(WRISTBAND), new
 
 
 def test_item4a_invalid_bearer_rejected_at_gateway(stack, praxis, scripted_model):
@@ -693,12 +754,14 @@ def test_item5_approved_resume_still_denied_streaming(stack, praxis_store, scrip
             "model": "scripted-model", "previous_response_id": j1.get("id"), "store": True, "stream": True,
             "tools": [APPROVAL_TOOL],
             "input": [{"type": "mcp_approval_response", "approval_request_id": aid, "approve": True}]}
+        before = _denial_count(stack)
         raw = ""
         with httpx.stream("POST", praxis_store + "/v1/responses", headers=_headers("userB", token),
                           json=body, timeout=90) as r:
             assert r.status_code == 200, r.read()
             for chunk in r.iter_text():
                 raw += chunk
+        _verify_denial(before, {"output": _sse_final_output(raw)})
         assert _sse_terminated_cleanly(raw), raw
         assert _mcp_call_error({"output": _sse_final_output(raw)}), raw
         assert _backend_count(stack, "get_forecast") == 0
@@ -797,12 +860,14 @@ def test_item6b_revoke_resume_streaming(stack, praxis, praxis_store, scripted_mo
             "model": "scripted-model", "previous_response_id": j1.get("id"), "store": True, "stream": True,
             "tools": [APPROVAL_TOOL],
             "input": [{"type": "mcp_approval_response", "approval_request_id": aid, "approve": True}]}
+        before = _denial_count(stack)
         raw = ""
         with httpx.stream("POST", praxis_store + "/v1/responses", headers=_headers("userA", token),
                           json=body, timeout=90) as r:
             assert r.status_code == 200, r.read()
             for chunk in r.iter_text():
                 raw += chunk
+        _verify_denial(before, {"output": _sse_final_output(raw)})
         assert _sse_terminated_cleanly(raw), raw
         assert _mcp_call_error({"output": _sse_final_output(raw)}), raw
         assert _backend_count(stack, "get_forecast") == 0

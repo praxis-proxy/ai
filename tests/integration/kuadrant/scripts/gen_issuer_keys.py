@@ -30,7 +30,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
-    os.makedirs(args.out, exist_ok=True)
+    os.makedirs(args.out, mode=0o700, exist_ok=True)
+    os.chmod(args.out, 0o700)
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     kid = "issuer-" + uuid.uuid4().hex[:8]
@@ -40,7 +41,10 @@ def main():
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption(),
     )
-    with open(os.path.join(args.out, "issuer_priv.pem"), "wb") as f:
+    key_path = os.path.join(args.out, "issuer_priv.pem")
+    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "wb") as f:
         f.write(priv_pem)
     with open(os.path.join(args.out, "issuer_kid.txt"), "w") as f:
         f.write(kid)

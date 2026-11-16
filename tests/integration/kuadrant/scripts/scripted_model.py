@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("PORT", "3001"))
 SUBSTR = os.environ.get("CALL_TOOL_SUBSTR", "forecast")
+FORCED_CALLS = 0
 
 
 def log(*a):
@@ -50,6 +51,14 @@ def forced_tool(body):
     turn 1 regardless of whether it was discovered. Used to prove Praxis won't
     dispatch a model-generated call to a tool the user never discovered."""
     inp = body.get("input")
+    if isinstance(inp, list):
+        for item in inp:
+            if isinstance(item, dict) and item.get("role") == "user":
+                content = item.get("content")
+                if isinstance(content, str):
+                    inp = content
+                elif isinstance(content, list):
+                    inp = "".join(c.get("text", "") for c in content if isinstance(c, dict))
     if isinstance(inp, str) and inp.startswith("force-call:"):
         return inp.split(":", 1)[1].strip()
     return None
@@ -144,6 +153,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self):
+        global FORCED_CALLS
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length) if length else b""
         try:
@@ -157,7 +167,10 @@ class Handler(BaseHTTPRequestHandler):
             log(f"turn2 (tool result present) -> final message; stream={stream}; tools={ftools}")
             item = _msg_item("The weather in NYC is sunny, 21C. (final answer)")
         else:
-            name = forced_tool(body) or next((n for n in ftools if SUBSTR in n), None)
+            forced = forced_tool(body)
+            if forced:
+                FORCED_CALLS += 1
+            name = forced or next((n for n in ftools if SUBSTR in n), None)
             if name:
                 log(f"turn1 -> function_call {name}; stream={stream}; tools={ftools}")
                 item = _fc_item(name)
@@ -171,6 +184,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(base_response(body, [item]))
 
     def do_GET(self):
+        if self.path == "/stats":
+            self._send({"forced_calls": FORCED_CALLS})
+            return
         self.send_response(200); self.send_header("Content-Length","2"); self.end_headers(); self.wfile.write(b"ok")
 
     def log_message(self, fmt, *args):

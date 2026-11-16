@@ -76,3 +76,10 @@ All images are amd64-native and arm64-native. Generated PKI/keys/JWKS live under
 - `configs/authconfig-filtered.yaml` is the per-user discovery-filtering policy;
   `configs/authconfig-opendisco.yaml` exposes tools to all so per-call denial can be
   exercised independently (the "discovery ≠ enforcement" proof).
+
+Policy switches in the acceptance driver probe the expected discovery and call
+results before returning. `switch_authconfig.sh` alone only applies the resource
+and checks readiness; Authorino 0.28 does not publish an observed generation.
+Gateway access logs record the original JSON-RPC method and HTTP status, allowing
+denial cases to require a gateway `tools/call` 403 even though Praxis sanitizes
+the client-visible MCP error. Raw credentials are never included in these logs.
