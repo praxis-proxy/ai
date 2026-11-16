@@ -21,8 +21,10 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576; // 1 MiB
 ///
 /// Absent from the allowlist, each of these keeps the strict reject behavior:
 /// a request that uses the feature is answered with a 400 before any backend
-/// call. Listed, the translator removes the feature's wire markers (after
-/// validating their shape), reports the degradation to the operator, and
+/// call. Listed, the translator degrades the feature — most have their wire
+/// markers validated and then removed; `mid_conversation_system` instead
+/// folds mid-conversation `system` messages into the leading system message —
+/// reports the degradation to the operator, and
 /// completes the translation so an unmodified client can still drive the
 /// Chat Completions backend.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -38,6 +40,15 @@ pub(crate) enum LossyFeature {
     /// preserving the prompt and tool content; explicit cache breakpoints are
     /// not honored, so cost and latency may differ.
     PromptCaching,
+
+    /// Mid-conversation `system` messages inside the Anthropic `messages`
+    /// array. Chat Completions permits them anywhere, but backends with
+    /// strict chat templates (`vLLM`-hosted models, `LiteLLM` gateways in
+    /// front of them) reject a `system` message that follows a non-system
+    /// one. Degrading moves each mid-conversation system message's text into
+    /// the leading system message, in encounter order; message positions are
+    /// lost, which changes position-sensitive prompting semantics.
+    MidConversationSystem,
 }
 
 // -----------------------------------------------------------------------------
@@ -49,17 +60,23 @@ pub(crate) enum LossyFeature {
 /// A flat, `Copy` view of [`LossyFeature`] entries so the request translator
 /// can branch on each feature without re-scanning the configured list.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one flat flag per LossyFeature, mirroring the config enum"
+)]
 pub(crate) struct LossyFeatureAllowlist {
     /// Degrade Anthropic extended thinking (`thinking`, `context_management`).
     pub extended_thinking: bool,
     /// Degrade Anthropic prompt caching (`cache_control`).
     pub prompt_caching: bool,
+    /// Degrade mid-conversation `system` messages in the `messages` array.
+    pub mid_conversation_system: bool,
 }
 
 impl LossyFeatureAllowlist {
     /// Whether any lossy feature is allowed.
     pub(crate) fn any(self) -> bool {
-        self.extended_thinking || self.prompt_caching
+        self.extended_thinking || self.prompt_caching || self.mid_conversation_system
     }
 }
 
@@ -95,6 +112,7 @@ impl AnthropicMessagesToChatCompletionsConfig {
             match feature {
                 LossyFeature::ExtendedThinking => allow.extended_thinking = true,
                 LossyFeature::PromptCaching => allow.prompt_caching = true,
+                LossyFeature::MidConversationSystem => allow.mid_conversation_system = true,
             }
         }
         allow
@@ -138,12 +156,15 @@ mod tests {
 
     #[test]
     fn allowlist_resolves_each_feature() {
-        let cfg = parse("allow_lossy_features:\n  - prompt_caching\n  - extended_thinking").unwrap();
+        let cfg =
+            parse("allow_lossy_features:\n  - prompt_caching\n  - extended_thinking\n  - mid_conversation_system")
+                .unwrap();
         assert_eq!(
             cfg.allowlist(),
             LossyFeatureAllowlist {
                 prompt_caching: true,
                 extended_thinking: true,
+                mid_conversation_system: true,
             }
         );
     }
@@ -156,6 +177,7 @@ mod tests {
             LossyFeatureAllowlist {
                 prompt_caching: true,
                 extended_thinking: false,
+                mid_conversation_system: false,
             }
         );
     }
