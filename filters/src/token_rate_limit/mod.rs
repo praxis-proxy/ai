@@ -33,7 +33,7 @@
 //!   reserve/reconcile split this filter needs.
 //!
 //! Both sit behind the same pluggable [`backend`] trait, so either
-//! algorithm runs in-process (default) or against a shared Redis/Valkey
+//! algorithm runs in-process (`backend: {kind: memory}`) or against a shared Redis/Valkey
 //! backend (`backend: {kind: redis}` or `{kind: valkey}`) for state shared across gateway
 //! instances/replicas -- see `praxis-proxy/grid#83` for the fuller
 //! shared-backend spec this milestone is a narrower slice of.
@@ -254,7 +254,7 @@ const HEADER_RATELIMIT_RESET: &str = "X-RateLimit-Reset-Tokens";
 /// lazily connected Redis/Valkey transport (see [`ValkeyConnection`]'s doc
 /// comment for why this is built once and `Clone`d, not once per rule).
 enum BackendResource {
-    /// Every rule gets its own in-process ledger (the default).
+    /// Every rule gets its own explicitly selected in-process ledger.
     Memory,
     /// Every rule shares this one Redis/Valkey connection, differentiated by
     /// `namespace`/rule-name key hashing. Boxed: `ValkeyConnection` embeds
@@ -2086,10 +2086,10 @@ fn compile_rule(
 /// #   header: x-tenant-id
 /// #   missing: fallback
 /// max_keys: 100000                   # optional: per-rule cap on distinct budget keys
-/// backend:                           # optional: defaults to in-process state, shared by every rule
-///   kind: valkey                      # memory (default) | redis | valkey
-///   url: "${TOKEN_RATE_LIMIT_VALKEY_URL}"
-///   namespace: praxis:token_rate_limit
+/// backend:                           # required; one explicit backend shared by every rule
+///   kind: valkey                      # memory | redis | valkey
+///   url: "${TOKEN_RATE_LIMIT_VALKEY_URL}" # redis/valkey only
+///   namespace: praxis:token_rate_limit    # redis/valkey only
 /// default_weights:                   # optional: omitted types default to 1.0
 ///   input: 1.0
 ///   output: 1.0

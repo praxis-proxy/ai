@@ -100,7 +100,7 @@ macro_rules! chat_completions_operations {
                             request_body: request_body_shape!($body),
                         },
                         spec_path: $path,
-                        #[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
+                        #[cfg(any(feature = "openai-conversations", feature = "openai-files", feature = "openai-responses-openapi"))]
                         owned_contract: None,
                     },
                 },

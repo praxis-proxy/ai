@@ -105,6 +105,10 @@ pub(super) struct SupportedOperation {
 
     /// Code or test evidence for the support claim.
     pub(super) evidence: String,
+
+    /// Whether the runtime registry declares an `OpenAPI` contract for the
+    /// operation, even while it is not yet an owned mode.
+    pub(super) contract_declared: bool,
 }
 
 impl SupportedOperation {
@@ -199,11 +203,15 @@ impl CoverageReport {
         percent(self.covered.len(), self.considered.len())
     }
 
-    /// Operations whose contract is owned by Praxis.
-    pub(super) fn owned_operations(&self) -> Vec<SpecOperation> {
+    /// Operations compared against a generated contract: those with an owned
+    /// mode or a declared contract.
+    ///
+    /// Mirrors the generator gate, which emits every operation that declares a
+    /// contract regardless of mode.
+    pub(super) fn contract_operations(&self) -> Vec<SpecOperation> {
         self.covered
             .iter()
-            .filter(|covered| covered.support.mode.is_owned())
+            .filter(|covered| covered.support.mode.is_owned() || covered.support.contract_declared)
             .map(|covered| covered.operation.clone())
             .collect()
     }

@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / ".github/scripts"))
 import release_qualification as release
 import vllm_qualification as gpu
+from test_vllm_qualification import report as gpu_report
 
 
 REPO = "praxis-proxy/ai"
@@ -182,6 +183,34 @@ class ReleaseQualificationTest(unittest.TestCase):
             refreshed = (directory / "release-notes.md").read_text()
             self.assertEqual(refreshed.count(release.START), 1)
             self.assertEqual(refreshed.count(gpu.START), 1)
+            # The selector binds ancestor evidence to this release without
+            # changing the SHA of the checkout it actually tested.
+            ancestor = gpu_report()
+            ancestor["workflow"]["run_sha"] = "b" * 40
+            ancestor["gateway"]["checkout_sha"] = "b" * 40
+            ancestor["release_context"] = {
+                "release_sha": SHA,
+                "selection": "latest successful ancestor GPU nightly within 48 hours",
+                "tested_at": "2026-10-20T10:00:00+00:00", "newer_runs": [],
+            }
+            (directory / "gpu.json").write_text(json.dumps(ancestor))
+            accepted = subprocess.run(argv, env=environment, capture_output=True, text=True, timeout=30)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            report = json.loads((directory / "release-qualification.json").read_text())
+            self.assertEqual(report["release_sha"], SHA)
+            self.assertEqual(report["gpu"]["gateway"]["checkout_sha"], "b" * 40)
+            self.assertEqual(report["gpu"]["workflow"]["run_sha"], "b" * 40)
+            self.assertIn("b" * 40, (directory / "release-notes.md").read_text())
+            for invalid in (
+                    {**ancestor, "release_context": {"release_sha": "c" * 40}},
+                    {**ancestor, "gateway": {"checkout_sha": "c" * 40}},
+                    {**gpu.unavailable(SHA, "exact"), "release_context": {"release_sha": "c" * 40}},
+                    {**ancestor, "release_context": None},
+                    {**ancestor, "workflow": {}, "gateway": {}}):
+                (directory / "gpu.json").write_text(json.dumps(invalid))
+                rejected = subprocess.run(argv, env=environment, capture_output=True, text=True, timeout=30)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn("release commit", rejected.stderr)
             # Wrong-commit GPU evidence must not produce a release report.
             (directory / "gpu.json").write_text(json.dumps(gpu.unavailable("b" * 40, "wrong commit")))
             rejected = subprocess.run(argv, env=environment, capture_output=True, text=True, timeout=30)

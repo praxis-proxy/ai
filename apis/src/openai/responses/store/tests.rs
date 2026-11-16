@@ -427,7 +427,8 @@ async fn on_request_continues_for_previous_response_id_with_store_provisioned() 
 // -----------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_body_arms_persistence_for_persisted_response() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_on_request_body_arms_persistence_for_persisted_response() {
     // A Responses create that will persist its response must publish the
     // exchange-scoped persistence-armed marker so a downstream approval pause can
     // tell that THIS response will be stored, not merely that a store exists in
@@ -450,30 +451,55 @@ async fn on_request_body_arms_persistence_for_persisted_response() {
         ctx.extensions.get::<ResponsesState>().unwrap().store_persist_armed,
         "a persisted Responses create must arm persistence for this exchange"
     );
+    println!("PRAXIS_CONFORMANCE_OK responses persistence_default");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_body_does_not_arm_persistence_when_store_false() {
-    // store=false will not persist, so persistence must not be armed. mcp_dispatch
-    // rejects such an approval with a client-facing 400 before this point, but the
-    // marker must stay honest regardless.
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.extensions.insert(ResponsesState::default());
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
-    ctx.set_metadata("openai_responses_request.store", "false");
-    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi","store":false}"#));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "request body phase should continue"
-    );
-    assert!(
-        !ctx.extensions.get::<ResponsesState>().unwrap().store_persist_armed,
-        "store=false must not arm persistence"
-    );
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_on_request_body_does_not_arm_persistence_when_store_false() {
+    for stream in [false, true] {
+        let filter = make_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        let store = install_store(&mut ctx).await;
+        let response = json!({
+            "id": "resp_opt_out", "object": "response", "created_at": 1_719_900_000,
+            "model": "gpt-4.1", "status": "completed", "output": [],
+        });
+        ctx.extensions.insert(ResponsesState {
+            response_object: response.clone(),
+            ..Default::default()
+        });
+        ctx.set_metadata("openai_responses_request.format", "openai_responses");
+        ctx.set_metadata("openai_responses_request.store", "false");
+        ctx.set_metadata("openai_responses_request.stream", if stream { "true" } else { "false" });
+        assert!(matches!(
+            filter.on_request(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi","store":false}"#));
+        assert!(matches!(
+            filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+            FilterAction::Continue
+        ));
+        assert!(!ctx.extensions.get::<ResponsesState>().unwrap().store_persist_armed);
+        assert!(matches!(
+            filter.on_response(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ));
+        let raw = Bytes::from(serde_json::to_vec(&response).unwrap());
+        let mut body = Some(raw.clone());
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+        assert_eq!(body.as_ref(), Some(&raw));
+        assert!(
+            store
+                .get_response(&crate::test_utils::test_owner("default"), "resp_opt_out")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    println!("PRAXIS_CONFORMANCE_OK responses persistence_opt_out");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -716,7 +742,8 @@ async fn on_response_body_skips_streaming_persist_when_no_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_persists_streaming_response_at_eos() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_on_response_body_persists_streaming_response_at_eos() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
@@ -781,6 +808,7 @@ async fn on_response_body_persists_streaming_response_at_eos() {
         ]),
         "persisted messages should combine persisted input history with streamed output"
     );
+    println!("PRAXIS_CONFORMANCE_OK responses persistence_streamed");
 }
 
 // Record-assembly unit tests (null / missing-field / streaming-history cases)
@@ -1756,7 +1784,8 @@ async fn on_response_body_skips_when_model_field_missing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_persists_valid_response() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_on_response_body_persists_valid_response() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
@@ -1812,6 +1841,7 @@ async fn on_response_body_persists_valid_response() {
         ]),
         "persisted messages should preserve input before output for rehydration"
     );
+    println!("PRAXIS_CONFORMANCE_OK responses persistence_buffered");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1981,7 +2011,8 @@ async fn on_request_body_captures_input_from_state_without_reparsing_body() {
 // directly against plain values.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pipeline_persists_after_format_request_body_classification() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_pipeline_persists_after_format_request_body_classification() {
     let (db_url, db_path) = temp_sqlite_url("pipeline_persists_after_format_request_body_classification");
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
@@ -2096,6 +2127,7 @@ async fn pipeline_persists_after_format_request_body_classification() {
     drop(store);
     drop(pipeline);
     cleanup_sqlite_file(&db_path);
+    println!("PRAXIS_CONFORMANCE_OK responses persistence_pipeline");
 }
 
 #[cfg(feature = "openai-conversations")]
@@ -3900,7 +3932,8 @@ fn postgres_config_rejects_empty_host() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_response_returns_200_when_found() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_get_response_returns_200_when_found() {
     let filter = make_filter();
     let registry = init_store_and_seed("resp_found", "default", json!([{"id": "item_1", "type": "message"}])).await;
 
@@ -3918,10 +3951,12 @@ async fn get_response_returns_200_when_found() {
         body["status"], "completed",
         "body should contain the stored response_object"
     );
+    println!("PRAXIS_CONFORMANCE_OK responses lifecycle_retrieve");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_response_returns_404_when_not_found() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_get_response_returns_404_when_not_found() {
     let filter = make_filter();
     let registry = store_registry().await;
 
@@ -3939,6 +3974,7 @@ async fn get_response_returns_404_when_not_found() {
         body["error"]["type"], "invalid_request_error",
         "error type should be invalid_request_error"
     );
+    println!("PRAXIS_CONFORMANCE_OK responses lifecycle_missing");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3959,7 +3995,8 @@ async fn get_response_tenant_isolation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn response_endpoints_hide_same_tenant_cross_owner_resources() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_response_endpoints_hide_same_tenant_cross_owner_resources() {
     let filter = make_filter();
     let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
     let other = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
@@ -3989,6 +4026,7 @@ async fn response_endpoints_hide_same_tenant_cross_owner_resources() {
     ctx.extensions.insert(registry);
     let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
     assert_eq!(rejection.status, 200, "wrong-owner delete must not mutate the response");
+    println!("PRAXIS_CONFORMANCE_OK responses lifecycle_owner_isolation");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4139,7 +4177,8 @@ async fn get_response_no_query_still_returns_200() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replay_returns_events_in_order_ending_with_terminal() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_replay_returns_events_in_order_ending_with_terminal() {
     let filter = make_filter();
     let owner = crate::test_utils::test_owner("default");
     let registry = seed_response_with_events(
@@ -4182,6 +4221,7 @@ async fn replay_returns_events_in_order_ending_with_terminal() {
         text.contains("\"sequence_number\":2"),
         "the terminal event payload is replayed verbatim: {text}"
     );
+    println!("PRAXIS_CONFORMANCE_OK responses lifecycle_replay");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4229,7 +4269,8 @@ async fn replay_in_legacy_responses_format_pipeline_streams_not_buffers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replay_starting_after_skips_earlier_events() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_replay_starting_after_skips_earlier_events() {
     let filter = make_filter();
     let owner = crate::test_utils::test_owner("default");
     let registry = seed_response_with_events(
@@ -4258,6 +4299,7 @@ async fn replay_starting_after_skips_earlier_events() {
         vec!["response.completed"],
         "starting_after=1 returns only events with sequence_number > 1: {text}"
     );
+    println!("PRAXIS_CONFORMANCE_OK responses lifecycle_replay_cursor");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4306,7 +4348,8 @@ async fn replay_incomplete_log_returns_400() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replay_cross_owner_returns_404() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_replay_cross_owner_returns_404() {
     let filter = make_filter();
     let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
     let registry = seed_response_with_events(
@@ -4331,6 +4374,7 @@ async fn replay_cross_owner_returns_404() {
 
     let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
     assert_eq!(rejection.status, 404, "another owner's replay log must look absent");
+    println!("PRAXIS_CONFORMANCE_OK responses lifecycle_replay_owner");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4563,7 +4607,8 @@ async fn get_input_items_with_limit_and_order() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_input_items_with_cursor() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_get_input_items_with_cursor() {
     let filter = make_filter();
     let registry = init_store_and_seed(
         "resp_cursor",
@@ -4594,6 +4639,7 @@ async fn get_input_items_with_cursor() {
     assert_eq!(data[0]["id"], "item_3", "first item should be item_3 after item_2");
     assert_eq!(data[1]["id"], "item_4", "second item should be item_4");
     assert_eq!(body["has_more"], false, "should indicate no more items after this page");
+    println!("PRAXIS_CONFORMANCE_OK responses lifecycle_input_items");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4816,13 +4862,14 @@ async fn get_input_items_hides_compaction_items() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_existing_response_returns_200() {
+#[expect(clippy::print_stdout, reason = "sentinel output for xtask conformance verification")]
+async fn conformance_responses_delete_existing_response_returns_200() {
     let filter = make_filter();
     let registry = init_store_and_seed("resp_del1", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_del1");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.extensions.insert(registry);
+    ctx.extensions.insert(registry.clone());
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4837,6 +4884,18 @@ async fn delete_existing_response_returns_200() {
         "body should have object=response.deleted"
     );
     assert_eq!(body["deleted"], true, "body should have deleted=true");
+    for path in [
+        "/v1/responses/resp_del1",
+        "/v1/responses/resp_del1/input_items",
+        "/v1/responses/resp_del1?stream=true",
+    ] {
+        let req = crate::test_utils::make_request(http::Method::GET, path);
+        let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        ctx.extensions.insert(registry.clone());
+        let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
+        assert_eq!(rejection.status, 404, "deleted state must be unavailable at {path}");
+    }
+    println!("PRAXIS_CONFORMANCE_OK responses lifecycle_delete");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

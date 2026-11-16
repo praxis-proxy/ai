@@ -6,6 +6,48 @@ matching documentation and build features for a released binary. The linked
 references own configuration details and translation limitations. A listed
 adapter is not a guarantee that every provider operation or model is supported.
 
+## Decide by client and backend
+
+**Standard** below means `cargo build -p praxis-ai-proxy` for current main.
+Additional features are passed with `--features`; the passive `experimental`
+marker alone adds no capability. Native forwarding relies on the upstream's
+API implementation. Translation supports a bounded subset, not every operation
+under a provider URL. See [build groups](features.md#cargo-features).
+
+| Client API → upstream | Mode and guide/configuration | Build | Authentication and limits |
+| --- | --- | --- | --- |
+| Chat Completions → OpenAI or compatible Chat backend | Native; [complete hosted recipe](quickstart.md#chat-completions) | Standard | Caller bearer in hosted recipe; backend must serve the requested model and SSE for streaming |
+| Messages → native Anthropic or native vLLM | Native; [recipe](recipes/anthropic.md#native-messages), [hosted Anthropic YAML](anthropic-messages.md#passthrough-to-anthropic-api) | Standard; recipe adds `basic-auth-filter` | Hosted `x-api-key` or caller bearer; vLLM uses isolated backend bearer. Native backend determines operation support |
+| Messages → Chat backend | Translation; [recipe](recipes/anthropic.md#translated-messages) | Standard; isolated recipe adds `basic-auth-filter` | Strip caller Anthropic credentials, inject backend key; thinking/cache opt-ins are lossy; no count-tokens translation |
+| Chat Completions → Anthropic Messages | Selected-provider translation; [operator recipe](recipes/anthropic.md#chat-client-to-selected-messages-provider), [compatibility guide](developing/openai-anthropic-compatibility.md) | Standard | Projected selected-provider secret via `credential_inject`; explicit translation permission required; supported versions and ignored/rejected fields in [reference](filters/openai_chat_completions_to_anthropic.md) |
+| Chat Completions → Azure OpenAI | Adaptation; [provider recipe](recipes/providers.md#azure-openai-chat-completions), [reference](filters/openai_chat_completions_to_azureai_chat_completions.md) | Standard; Entra injection adds `azure-ad-filter` | Resource/deployment/API version plus API key or supported Entra client secret flow; safety annotation loss is a [known gap](conformance/translation-matrix.md#known-gaps) |
+| Chat Completions → Vertex Gemini | Translation; [provider recipe](recipes/providers.md#vertex-gemini-from-chat-completions), [reference](filters/openai_chat_completions_to_vertexai_gemini.md) | Standard; token acquisition adds `gcp-adc-filter` | Authorized GCP identity, project/location/model; schema strictness, reasoning/cache accounting gaps in [matrix](conformance/translation-matrix.md) |
+| Messages → Vertex Anthropic | Endpoint adaptation to `rawPredict`; [provider recipe](recipes/providers.md#vertex-anthropic-from-messages), [reference](filters/anthropic_messages_to_vertexai_anthropic.md) | `vertex-anthropic-filter`; add `gcp-adc-filter` for token acquisition | Authorized GCP identity and model access; selected cluster metadata and model/provider resolution required |
+| Chat Completions → Bedrock Converse | Translation; [provider recipe](recipes/providers.md#bedrock-converse-from-chat-completions), [compatibility matrix](conformance/translation-matrix.md) | Standard includes signer | AWS key/secret/region and model access; signing alone is not translation. History, reasoning and cache gaps remain; see [audit](documentation-audit.md) for reference gap |
+| Responses → native Responses backend | Native; [quickstart](quickstart.md), [passthrough example](../examples/configs/openai/responses/http-passthrough.yaml) | Standard | Caller key in quickstart; no local state, validation, or tool execution supplied by forwarding |
+| Responses → gateway-managed native Responses or translated Chat | Managed, experimental; [recipe](recipes/managed-responses.md) | `openai-responses`; recipe selects `openai-all,store-sqlite` | Backend and tool credentials are separate; managed restrictions and translation gaps apply |
+| Conversations → local gateway store | Managed, experimental; [state guide](recipes/managed-responses.md#conversations-and-state), [reference](filters/openai_conversations.md) | `openai-conversations,store-sqlite` or selected PostgreSQL backend | Explicit owner/auth boundary; local CRUD is distinct from forwarding upstream Conversations |
+
+The [cloud provider runbook](recipes/providers.md) completes the existing
+example configurations with credentials, endpoint/Host/TLS selection, validation,
+startup, requests, and cleanup. It assumes account permissions, regional model
+availability, and an authorized credential source are already established.
+The [recipe index](recipes/README.md) includes the prioritized native and managed paths.
+
+### Read compatibility status correctly
+
+- **Native:** bytes are forwarded without protocol conversion; the backend owns
+  semantics. A route matching `/v1` does not implement all `/v1` APIs locally.
+- **Translated:** only the documented mapping is implemented; finite and SSE
+  paths need separate evidence and filters.
+- **Lossy:** accepted input loses documented semantics. Enable only deliberate
+  opt-ins, and monitor degradation signals where provided.
+- **Rejected:** the adapter refuses an unrepresentable feature. For example,
+  Messages-to-Chat rejects document blocks and server-tool definitions.
+- **Known gap:** accepted behavior is incomplete or incorrect. Consult the
+  [generated matrix](conformance/translation-matrix.md) and its source evidence;
+  do not interpret a fixture as provider-wide qualification.
+
 ## Inference clients
 
 **Native OpenAI API, including `/v1/responses` or `/v1/chat/completions`, to OpenAI**

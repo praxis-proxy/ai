@@ -2797,6 +2797,38 @@ def test_configuration_update_controls_subsequent_inference(conversation_backend
     assert len(captured) == 5, "each of the five turns must reach the backend once"
 
 
+def test_rehydration_preserves_unrelated_parameter_order(conversation_backend):
+    """Moving input into history must not reorder the remaining parameters."""
+    client, captured, _, translated = conversation_backend
+    if translated:
+        pytest.skip("Parameter order applies to native Responses forwarding")
+    conversation = client.conversations.create(
+        items=[{"type": "configuration_update", "reasoning": {"effort": "low"}}]
+    )
+    sent = []
+
+    def capture_request(request):
+        sent.append(json.loads(request.content))
+
+    with httpx.Client(event_hooks={"request": [capture_request]}) as transport:
+        response = client.with_options(http_client=transport).responses.create(
+            model="test-model", conversation=conversation.id,
+            input=[{"role": "user", "content": "hello"}],
+            metadata={"z": "last", "a": "first"}, store=False,
+            extra_body={"extra": {"z": 1, "a": 2}},
+        )
+    assert response.status == "completed"
+    assert len(sent) == len(captured) == 1
+    before, (_, after) = sent[0], captured[0]
+    retained = set(before) - {"input", "conversation", "reasoning"}
+    assert [key for key in before if key in retained] == [
+        key for key in after if key in retained
+    ]
+    assert after["reasoning"] == {"effort": "low"}
+    assert list(after["metadata"]) == ["z", "a"]
+    assert list(after["extra"]) == ["z", "a"]
+
+
 @pytest.fixture(params=["/reasoning", "/reasoning/effort"], ids=["member", "effort"])
 def conversation_backend_reasoning_strip(request, tmp_path):
     """Native-lane proxy with a post-rehydrate filter removing reasoning."""

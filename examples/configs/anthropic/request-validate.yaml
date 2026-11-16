@@ -3,6 +3,12 @@
 # Rejects empty, malformed, or non-object JSON request bodies.
 # Anthropic API semantics such as required fields and parameter
 # ranges are left to the inference backend.
+#
+# API version and credentials: the chain sets no `anthropic-version` and
+# forwards the caller's version and credential unchanged (`x-api-key` from
+# Anthropic SDK v1, `Authorization: Bearer` from SDK v2). Version-specific
+# rules, such as `2026-10-21` rejecting sampling fields, are left to the
+# backend.
 
 listeners:
   - name: anthropic-gateway

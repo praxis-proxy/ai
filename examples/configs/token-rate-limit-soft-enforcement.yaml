@@ -42,6 +42,8 @@ filter_chains:
             cluster: backend
 
       - filter: token_rate_limit
+        backend:
+          kind: memory
         rules:
           # Soft: over-quota requests continue with annotation.
           - name: team-soft

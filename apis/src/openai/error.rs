@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Shared OpenAI error envelope for local Conversations failures.
+//! Shared OpenAI error envelope for Praxis-owned operation contracts.
 
 
 use serde::Serialize;
@@ -13,9 +13,10 @@ use utoipa::{
     },
 };
 
-/// JSON error envelope returned by Conversations handlers and admission.
+/// JSON error envelope returned by Conversations handlers and admission, and
+/// declared by the Files contract.
 #[derive(Serialize)]
-pub(super) struct ErrorResponse<'error> {
+pub(crate) struct ErrorResponse<'error> {
     /// Structured error information.
     error: Error<'error>,
 }
@@ -151,7 +152,14 @@ fn review_target_schema() -> RefOr<Schema> {
 
 impl<'error> ErrorResponse<'error> {
     /// Borrow error fields until serialization without copying request data.
-    pub(super) const fn new(
+    #[cfg_attr(
+        all(not(feature = "openai-conversations"), not(test)),
+        expect(
+            dead_code,
+            reason = "Files declares the envelope in its contract; local Files handlers construct it (#499-#501)"
+        )
+    )]
+    pub(crate) const fn new(
         message: &'error str,
         error_type: &'static str,
         code: Option<&'error str>,
@@ -194,6 +202,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "openai-conversations")]
     #[test]
     fn review_target_enforces_nullable_character_and_length_bounds() -> Result<(), Box<dyn std::error::Error>> {
         let schema = serde_json::to_value(review_target_schema())?;
@@ -244,7 +253,7 @@ mod tests {
     /// Extract only the relevant schema so unrelated upstream numbers need not fit JSON integers.
     fn pinned_review_target() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let reference: Reference =
-            serde_yaml::from_str(include_str!("../../../../docs/conformance/specs/openai-openapi.yaml"))?;
+            serde_yaml::from_str(include_str!("../../../docs/conformance/specs/openai-openapi.yaml"))?;
         let mut expected = reference
             .components
             .schemas

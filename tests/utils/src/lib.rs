@@ -16,6 +16,7 @@
 //! Shared test utilities for the Praxis workspace.
 
 pub mod agentic;
+pub mod body_contract;
 pub mod cli_process;
 pub mod error_shape;
 pub mod example_config;

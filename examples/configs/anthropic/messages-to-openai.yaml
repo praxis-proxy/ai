@@ -15,6 +15,17 @@
 # Response: content blocks, stop_reason, usage mapping back to
 # Anthropic format. Streaming responses are converted by
 # `anthropic_messages_to_chat_completions_stream`.
+#
+# API version: the translator removes `anthropic-version`, and the caller's
+# version does not change translation. Requests from Anthropic SDK v1
+# (`2023-06-01`) and SDK v2 (`2026-10-21`) are translated identically:
+# `temperature` and `top_p` are mapped and `top_k` is forwarded, while
+# `document` blocks and non-empty citations are rejected with a 400 because
+# Chat Completions cannot represent them.
+#
+# Credentials: this chain has no gateway authentication and injects no backend
+# token. Add `basic_auth` and `credential_injection` as in
+# `messages-to-openai-vllm.yaml` for a deployment.
 
 listeners:
   - name: anthropic-gateway

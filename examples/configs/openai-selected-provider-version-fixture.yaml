@@ -1,6 +1,12 @@
+# OpenAI Chat Completions -> Anthropic Messages 2026-10-21 Fixture
+#
 # Controlled inference-fixture replay for OpenAI Chat Completions to an
 # Anthropic Messages provider. The routing overlay is a checked-in synthetic
 # fixture and is resolved by the inference replay harness.
+#
+# API version: `api_version: "2026-10-21"` overrides caller headers and the
+# co-configured native `default_version`. The caller's `Authorization` is
+# removed and a dummy fixture key is injected as `x-api-key`.
 
 listeners:
   - name: proxy

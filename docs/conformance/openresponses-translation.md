@@ -35,7 +35,7 @@ backend only ever receives `POST /v1/chat/completions` (criterion f).
 
 ## Pins
 
-- Suite commit: `92c12d96d7b61d6d15e2214daa5e9c6000ab6e1c`
+- Suite commit: `dce9ddb91921427c2ba06901c7dfaf0cc7056799`
 - Runner: bun `1.3.12`, zod `3.25.76`
 - Backend: vLLM CPU, `Qwen/Qwen3-0.6B`
 

@@ -698,7 +698,7 @@ fn invalid_input_response_with(
 ) -> Result<Rejection, FilterError> {
     json_response(
         400,
-        &super::error::ErrorResponse::new(message, "invalid_request_error", code, param),
+        &crate::openai::error::ErrorResponse::new(message, "invalid_request_error", code, param),
     )
 }
 
@@ -725,7 +725,7 @@ fn classify_update_error(msg: &str) -> Result<Rejection, FilterError> {
 fn not_found_response(message: &str) -> Result<Rejection, FilterError> {
     json_response(
         404,
-        &super::error::ErrorResponse::new(message, "invalid_request_error", None, None),
+        &crate::openai::error::ErrorResponse::new(message, "invalid_request_error", None, None),
     )
 }
 
@@ -756,7 +756,7 @@ fn store_error_response(error: &StoreError) -> Result<Rejection, FilterError> {
     }
     json_response(
         500,
-        &super::error::ErrorResponse::new("Internal server error.", "server_error", None, None),
+        &crate::openai::error::ErrorResponse::new("Internal server error.", "server_error", None, None),
     )
 }
 

@@ -6723,3 +6723,89 @@ mod admission {
         );
     }
 }
+
+/// Taking tools and selectors must retain their original object slots.
+#[test]
+fn rewrite_preserves_request_and_choice_member_order() {
+    for choice in [
+        r#"{"type":"mcp","server_label":"server","name":"inspect"}"#,
+        r#"{"tools":[{"type":"function","name":"existing"},{"type":"mcp","server_label":"server","name":"inspect"}],"type":"allowed_tools","mode":"required","opaque":{"z":1,"a":2}}"#,
+    ] {
+        let mut body: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"tools":[{{"type":"mcp","server_label":"server","server_url":"http://localhost/mcp"}}],"tool_choice":{choice},"model":"test","input":"hello","metadata":{{"z":"last","a":"first"}}}}"#
+        )).unwrap();
+        let function = serde_json::json!({"type":"function","name":"server__inspect"});
+        let tool_map = HashMap::from([(("server".to_owned(), "inspect".to_owned()), function.clone())]);
+        let entries = extract_mcp_entries(&mut body);
+        let serialized = rewrite_request_body(
+            &mut body,
+            entries,
+            vec![EntryResolution::Resolved(vec![function])],
+            &tool_map,
+            &HashSet::from(["server".to_owned()]),
+        )
+        .unwrap()
+        .unwrap();
+        let actual: serde_json::Value = serde_json::from_slice(serialized.as_bytes()).unwrap();
+        assert_eq!(
+            actual
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["tools", "tool_choice", "model", "input", "metadata"]
+        );
+        assert_eq!(actual["metadata"].to_string(), r#"{"z":"last","a":"first"}"#);
+        if actual["tool_choice"]["type"] == "allowed_tools" {
+            assert_eq!(
+                actual["tool_choice"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["tools", "type", "mode", "opaque"]
+            );
+            assert_eq!(actual["tool_choice"]["tools"][0]["name"], "existing");
+            assert_eq!(actual["tool_choice"]["tools"][1]["name"], "server__inspect");
+        } else {
+            assert_eq!(actual["tool_choice"]["name"], "server__inspect");
+        }
+    }
+}
+
+/// Later deferred discovery follows the same request-order contract.
+#[test]
+fn deferred_expansion_preserves_request_member_order() {
+    let body: serde_json::Value = serde_json::from_str(
+        r#"{"tools":[{"type":"function","name":"existing"},{"type":"mcp","server_label":"server","defer_loading":true}],"model":"test","input":"hello","metadata":{"z":"last","a":"first"}}"#
+    ).unwrap();
+    let functions = vec![serde_json::json!({"type":"function","name":"server__inspect"})];
+    let actual = expanded_request_body(&body, &HashMap::from([("server", functions.as_slice())]));
+    assert_eq!(
+        actual
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["tools", "model", "input", "metadata"]
+    );
+    assert_eq!(actual["tools"][0]["name"], "existing");
+    assert_eq!(actual["tools"][1]["name"], "server__inspect");
+    assert_eq!(actual["metadata"].to_string(), r#"{"z":"last","a":"first"}"#);
+}
+
+/// Sanitization drops private fields without rebuilding the public envelope.
+#[test]
+fn deferred_sanitization_preserves_public_member_order() {
+    let tool = serde_json::from_str(
+        r#"{"type":"mcp","connector_id":"private","server_label":"drive","defer_loading":true,"server_description":"files","allowed_callers":["assistant"],"allowed_tools":["search"],"authorization":"secret","require_approval":"never"}"#,
+    ).unwrap();
+    let actual = sanitize_deferred_connector_tool(tool);
+    assert_eq!(
+        actual.to_string(),
+        r#"{"type":"mcp","server_label":"drive","defer_loading":true,"server_description":"files","allowed_callers":["assistant"],"allowed_tools":["search"],"require_approval":"never"}"#
+    );
+}
