@@ -302,9 +302,33 @@ struct EventBuffer {
     scanned: usize,
     /// A trailing CR may belong to a split CRLF pair.
     pending_cr: bool,
+    /// A normalized trailing CR still consumes a following LF from the wire.
+    emitted_cr: bool,
 }
 
 impl EventBuffer {
+    /// Find the next blank line without rescanning the retained prefix.
+    fn next_event_end(&self) -> Option<usize> {
+        self.text
+            .as_bytes()
+            .get(self.scanned..)?
+            .windows(2)
+            .position(|pair| pair == b"\n\n")
+            .map(|offset| self.scanned + offset)
+    }
+
+    /// Consume the LF half of a CRLF whose CR was already emitted.
+    fn skip_split_lf<'a>(&mut self, chunk: &'a str) -> &'a str {
+        if chunk.is_empty() {
+            return chunk;
+        }
+        if std::mem::take(&mut self.emitted_cr) {
+            chunk.strip_prefix('\n').unwrap_or(chunk)
+        } else {
+            chunk
+        }
+    }
+
     /// Append and normalize only incoming text, preserving a split CRLF pair.
     fn append(&mut self, chunk_str: &str, end_of_stream: bool) {
         let mut incoming = chunk_str;
@@ -316,6 +340,7 @@ impl EventBuffer {
         // including when the pair spans chunks.
         let flush_cr_pair = self.pending_cr && chunk_str == "\r";
         let (text, pending_cr) = split_deferred_trailing_cr(incoming, end_of_stream || flush_cr_pair);
+        self.emitted_cr = !pending_cr && text.ends_with('\r');
         self.pending_cr = pending_cr;
         self.text.push_str(&normalize_line_endings(text));
     }
@@ -393,6 +418,7 @@ fn process_sse_chunk(
     max_partial_event_bytes: usize,
     max_tool_blocks: usize,
 ) -> Result<Bytes, FilterError> {
+    let chunk_str = state.buffer.skip_split_lf(chunk_str);
     if state.buffer.text.is_empty() && !state.buffer.pending_cr {
         return process_unbuffered_chunk(
             state,
@@ -406,13 +432,7 @@ fn process_sse_chunk(
     buffer.append(chunk_str, end_of_stream);
     let mut output = Vec::new();
     let mut consumed = 0;
-    while let Some(offset) = buffer
-        .text
-        .as_bytes()
-        .get(buffer.scanned..)
-        .and_then(|tail| tail.windows(2).position(|pair| pair == b"\n\n"))
-    {
-        let end = buffer.scanned + offset;
+    while let Some(end) = buffer.next_event_end() {
         let block = buffer.text.get(consumed..end).ok_or("invalid SSE event boundary")?;
         process_event_block(state, block, &mut output, max_tool_blocks)?;
         consumed = end + 2;
@@ -447,6 +467,7 @@ fn process_unbuffered_chunk(
     let mut buffer = EventBuffer::default();
     buffer.text.push_str(remaining);
     buffer.pending_cr = pending_cr;
+    buffer.emitted_cr = !pending_cr && text.ends_with('\r');
     store_event_buffer(state, buffer, 0, end_of_stream, max_partial_event_bytes)?;
     Ok(Bytes::from(output))
 }
@@ -469,7 +490,7 @@ fn store_event_buffer(
             "Anthropic Messages stream event exceeds a size limit set by the platform administrator (maximum {max_partial_event_bytes} bytes)."
         ).into());
     }
-    if !end_of_stream && (!buffer.text.is_empty() || buffer.pending_cr) {
+    if !end_of_stream && (!buffer.text.is_empty() || buffer.pending_cr || buffer.emitted_cr) {
         state.buffer = buffer;
     }
     Ok(())
@@ -1223,6 +1244,47 @@ mod tests {
     use std::borrow::Cow;
 
     use super::*;
+
+    #[test]
+    fn empty_chunk_preserves_emitted_cr_marker() {
+        let mut buffer = EventBuffer {
+            emitted_cr: true,
+            ..EventBuffer::default()
+        };
+        assert_eq!(
+            buffer.skip_split_lf(""),
+            "",
+            "empty chunks leave the wire boundary unresolved"
+        );
+        assert!(buffer.emitted_cr, "retain the marker until a wire byte arrives");
+        assert_eq!(buffer.skip_split_lf("\n"), "", "consume the matching LF");
+        assert!(!buffer.emitted_cr, "consume only one LF after an emitted CR");
+    }
+
+    #[test]
+    fn emitted_bare_cr_consumes_split_lf_at_partial_limit() {
+        let (filter, mut ctx) = make_filter_and_context_from_yaml("max_partial_event_bytes: 9");
+        let mut outputs = Vec::new();
+        for chunk in ["data: {}\r", "\r", "", "\ndata: {}\r", "\r\n"] {
+            let mut body = Some(Bytes::copy_from_slice(chunk.as_bytes()));
+            drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+            outputs.push(String::from_utf8(body.unwrap().to_vec()).unwrap());
+        }
+        assert!(
+            outputs.get(1).unwrap().contains("message_start"),
+            "emit the first event before EOF"
+        );
+        assert!(
+            outputs.get(3).unwrap().is_empty(),
+            "the split LF must not dispatch an extra event"
+        );
+        let state = ctx.get_filter_state::<StreamState>().unwrap();
+        assert!(
+            state.buffer.text.is_empty(),
+            "both completed events leave no partial text"
+        );
+        assert!(!state.buffer.pending_cr, "the final CRLF is complete");
+    }
 
     #[test]
     fn complete_comment_event_borrows_incoming_chunk() {
