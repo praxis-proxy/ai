@@ -319,6 +319,8 @@ filter_chains:
             cluster: backend
       - filter: token_rate_limit
         use_token_quota: true
+        backend:
+          kind: memory
         rules:
           - name: default
             algorithm: sliding_window
