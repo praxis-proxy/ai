@@ -8,6 +8,13 @@ ignore = [
     # rustls-pemfile 2.2.0: unmaintained (via pingora-rustls)
     "RUSTSEC-2025-0134",
 
+    # RustSec marked these crates unmaintained; no safe upgrade is available
+    # for chrono-tz or humantime, and chrono is pulled in across the workspace.
+    # Track dependency migration in issue #2011.
+    "RUSTSEC-2026-0542", # humantime (via humantime-serde)
+    "RUSTSEC-2026-0543", # chrono (transitive)
+    "RUSTSEC-2026-0555", # chrono-tz (via cel / praxis-policy)
+
     # zstd 0.13.3 and zstd-safe 7.3.0, reached only through
     # quixotic-plecostomus-header-serde -> ...-cache -> ...-proxy ->
     # praxis-proxy-protocol. Fixed upstream in zstd 0.14.3 and
