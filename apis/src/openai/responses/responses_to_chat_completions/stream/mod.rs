@@ -219,7 +219,11 @@ impl From<FramingError> for ConvertError {
 struct MessageState {
     /// Responses output index for this message item.
     output_index: usize,
-    /// Stable message item id (`msg_{response_id}`).
+    /// Stable message item id.
+    ///
+    /// Prefer `msg_{response_id}_{chat_completion_id}` so IRR rounds stay
+    /// distinct; fall back to `msg_{response_id}` when the Chat completion
+    /// omits an id.
     item_id: String,
     /// Whether `response.output_item.added` was emitted.
     item_added: bool,
