@@ -17,8 +17,8 @@ use crate::hash::{self, Sha256};
 ///
 /// The Anthropic fields change behavior that the response would misreport:
 /// `wire.rs` hardcodes `service_tier`, `container` and `inference_geo` to
-/// null, and `mcp_servers` is a beta server-side feature
-/// (`mcp-client-2025-04-04`).
+/// null, and `mcp_servers` declares the MCP connector, which only
+/// Anthropic's servers execute (`mcp-client-2025-11-20` beta).
 ///
 /// The Chat Completions fields have no Anthropic counterpart, so no
 /// conforming client sends them, but forwarding would let them reach the
@@ -46,6 +46,13 @@ const UNREPRESENTABLE_FIELDS: [&str; 13] = [
     "web_search_options",
     "moderation",
 ];
+
+/// Client-facing reason for refusing the MCP connector in translation.
+///
+/// Names both connector surfaces so a client that sent either one learns the
+/// feature, not just the field, is unavailable on this route.
+const MCP_CONNECTOR_UNSUPPORTED: &str = "the MCP connector (`mcp_servers` and `mcp_toolset` tools) is not supported \
+                                         when translating Anthropic Messages to Chat Completions";
 
 /// Anthropic Messages fields without a Chat Completions equivalent.
 ///
@@ -843,6 +850,9 @@ fn validate_faithful_request(body: &Map<String, Value>) -> Result<(), String> {
             let tool = tool.as_object().ok_or("tool must be an object")?;
             let supported_type = match tool.get("type") {
                 None | Some(Value::Null) => true,
+                Some(Value::String(kind)) if kind == "mcp_toolset" => {
+                    return Err(MCP_CONNECTOR_UNSUPPORTED.to_owned());
+                },
                 Some(Value::String(kind)) => kind == "custom",
                 _ => false,
             };
@@ -1094,6 +1104,9 @@ fn reject_unrepresentable_fields(body: &mut Map<String, Value>) -> Result<(), St
             .remove(field)
             .is_some_and(|value| !value.is_null() && !is_default_value(field, &value))
         {
+            if field == "mcp_servers" {
+                return Err(MCP_CONNECTOR_UNSUPPORTED.to_owned());
+            }
             return Err(format!(
                 "`{field}` is not supported when translating Anthropic Messages to Chat Completions"
             ));
@@ -2983,6 +2996,21 @@ mod tests {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"tools":[{"type":"bash_20241022","name":"bash"},{"type":"text_editor_20241022","name":"text_editor"},{"type":"code_execution_20250522","name":"code_execution"},{"type":"computer_20250124","name":"computer","display_width_px":1024,"display_height_px":768},{"type":"future_server_tool_20270101","name":"future_server_tool"},{"type":42,"name":"invalid_type","input_schema":{"type":"object"}},{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{}}},{"type":"custom","name":"get_time","description":"Get time","input_schema":{"type":"object","properties":{}}}],"messages":[{"role":"user","content":"Hi"}]}"#;
         let error = transform_bytes(body).unwrap_err();
         assert!(error.contains("typed"), "{error}");
+    }
+
+    #[test]
+    fn mcp_toolset_is_rejected_as_the_mcp_connector() {
+        // An empty `mcp_servers` alone is accepted, so the toolset is what is refused.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"mcp_servers":[],"tools":[{"name":"get_weather","input_schema":{"type":"object"}},{"type":"mcp_toolset","mcp_server_name":"example"}],"messages":[{"role":"user","content":"Hi"}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert_eq!(error, MCP_CONNECTOR_UNSUPPORTED);
+    }
+
+    #[test]
+    fn mcp_servers_is_rejected_as_the_mcp_connector() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"mcp_servers":[{"type":"url","url":"https://mcp.example.com/sse","name":"example"}],"messages":[{"role":"user","content":"Hi"}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert_eq!(error, MCP_CONNECTOR_UNSUPPORTED);
     }
 
     #[test]
