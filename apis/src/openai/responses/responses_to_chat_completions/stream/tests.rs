@@ -165,9 +165,9 @@ fn text_path_emits_canonical_sequence() {
         assert_eq!(payload["sequence_number"], index as u64, "sequence number at {index}");
     }
 
-    // Stable message item id follows the finite convention.
+    // Stable message item id follows the finite convention (response + chat id).
     let added = &events[2].1;
-    assert_eq!(added["item"]["id"], "msg_resp_test");
+    assert_eq!(added["item"]["id"], "msg_resp_test_chatcmpl_1");
     assert_eq!(added["output_index"], 0);
 
     // Accumulated text and logprobs.
@@ -815,7 +815,7 @@ fn malformed_tool_after_partial_output_fails_with_empty_snapshot() {
         }
     }
     assert_eq!(
-        announced.get("msg_resp_test"),
+        announced.get("msg_resp_test_c1"),
         Some(&0),
         "the message claims output index 0 because the unidentified tool call never emits an item",
     );
@@ -927,7 +927,11 @@ fn tool_first_then_text_keeps_output_index_consistent() {
         }
     }
     assert_eq!(announced.get("fc_call_1"), Some(&0), "tool call streamed at index 0");
-    assert_eq!(announced.get("msg_resp_test"), Some(&1), "message streamed at index 1");
+    assert_eq!(
+        announced.get("msg_resp_test_c1"),
+        Some(&1),
+        "message streamed at index 1"
+    );
 
     let output = events.last().unwrap().1["response"]["output"]
         .as_array()

@@ -2418,9 +2418,9 @@ async fn successful_sse_chunks_translate_to_responses_events() {
         text.contains("event: response.completed\n"),
         "translated stream must end with response.completed: {text}"
     );
-    // The message item id follows the finite convention.
+    // The message item id follows the finite convention (response + chat id).
     assert!(
-        text.contains("\"item_id\":\"msg_resp_stream\""),
+        text.contains("\"item_id\":\"msg_resp_stream_chatcmpl_1\""),
         "translated message item id must follow the finite convention: {text}"
     );
 

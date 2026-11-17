@@ -4305,9 +4305,47 @@ mod tests {
 
         let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
 
-        assert_eq!(mapped["output"][0]["id"], "msg_resp_abc");
+        assert_eq!(mapped["output"][0]["id"], "msg_resp_abc_chatcmpl-1");
         assert_eq!(mapped["output"][0]["role"], "assistant");
         assert_eq!(mapped["output"][0]["status"], "completed");
+    }
+
+    #[test]
+    fn agentic_rounds_produce_distinct_message_item_ids() {
+        let request = json!({"model": "m", "input": "hi"});
+        let context =
+            super::chat_completions::ResponseContext::from_responses_request(&request, "resp_abc".to_owned(), 0);
+
+        let mut round_one = simple_chat_response("stop", "searching");
+        round_one["id"] = json!("chatcmpl-round-1");
+        let mut round_two = simple_chat_response("stop", "final answer");
+        round_two["id"] = json!("chatcmpl-round-2");
+
+        let first = super::chat_completions::chat_response_to_response_resource(&round_one, &context).unwrap();
+        let second = super::chat_completions::chat_response_to_response_resource(&round_two, &context).unwrap();
+
+        let first_id = first["output"][0]["id"].as_str().unwrap();
+        let second_id = second["output"][0]["id"].as_str().unwrap();
+
+        assert_eq!(first_id, "msg_resp_abc_chatcmpl-round-1");
+        assert_eq!(second_id, "msg_resp_abc_chatcmpl-round-2");
+        assert_ne!(
+            first_id, second_id,
+            "each agentic round must mint a distinct message item id"
+        );
+    }
+
+    #[test]
+    fn message_item_id_falls_back_when_chat_response_omits_id() {
+        let request = json!({"model": "m", "input": "hi"});
+        let context =
+            super::chat_completions::ResponseContext::from_responses_request(&request, "resp_abc".to_owned(), 0);
+        let mut response = simple_chat_response("stop", "no id");
+        response.as_object_mut().unwrap().remove("id");
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(mapped["output"][0]["id"], "msg_resp_abc");
     }
 
     // -------------------------------------------------------------------------
