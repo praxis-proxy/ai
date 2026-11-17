@@ -108,12 +108,10 @@ struct BufferedJsonResponse {
 /// filter converts event chunks incrementally, and OpenAI-compatible response
 /// chunks remain unchanged.
 ///
-/// Anthropic translation runs only when the filter's `api_translation_enabled`
-/// setting is true, as derived from the tenant's API translation permission.
+/// Installing this filter enables translation for selected Anthropic providers.
 ///
 /// ```yaml
 /// filter: openai_chat_completions_to_anthropic
-/// api_translation_enabled: true
 /// api_version: "2023-06-01"
 /// max_request_body_bytes: 2097152
 /// max_response_body_bytes: 1048576
@@ -260,13 +258,6 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
                 )));
             },
         };
-        if profile.api_format == "messages" && !self.config.api_translation_enabled {
-            return Ok(FilterAction::Reject(Self::openai_error_rejection(
-                503,
-                "api_translation_disabled",
-                "The platform administrator has forbidden translation to this provider's API.",
-            )));
-        }
         if let Err(error) = Self::bind_profile(ctx, &profile) {
             return Ok(FilterAction::Reject(Self::openai_error_rejection(
                 503,

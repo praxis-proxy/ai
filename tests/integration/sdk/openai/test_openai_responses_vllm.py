@@ -1077,6 +1077,7 @@ class ChatCaptureHandler(BaseHTTPRequestHandler):
 
     captured_bodies: ClassVar[list[dict]] = []
     stream_deltas: ClassVar[list[dict]] = []
+    raw_stream: ClassVar[bytes | None] = None
     # When set, replaces the default single-choice array of the finite
     # (non-streaming) response so a test can script alternative shapes.
     finite_choices: ClassVar[list[dict] | None] = None
@@ -1094,6 +1095,10 @@ class ChatCaptureHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Connection", "close")
             self.end_headers()
+            if type(self).raw_stream is not None:
+                self.wfile.write(type(self).raw_stream)
+                self.wfile.flush()
+                return
             for delta in type(self).stream_deltas:
                 chunk = {
                     "id": "chatcmpl_reasoning_capture", "object": "chat.completion.chunk",
@@ -2364,6 +2369,7 @@ def _reasoning_capture_session(
     ChatCaptureHandler.captured_bodies = []
     ChatCaptureHandler.stream_deltas = [{"reasoning": "I picked "}, {"reasoning_content": "42."}]
     ChatCaptureHandler.finite_choices = None
+    ChatCaptureHandler.raw_stream = None
     captured = ChatCaptureHandler.captured_bodies
     backend_port = _free_port()
     server = HTTPServer(("127.0.0.1", backend_port), ChatCaptureHandler)
@@ -2461,6 +2467,27 @@ def _reasoning_capture_session(
 def reasoning_capture_client(tmp_path_factory, request):
     """Function-scoped reasoning proxy with a capturing mock Chat backend."""
     yield from _reasoning_capture_session(tmp_path_factory, request)
+
+
+@pytest.mark.parametrize("ending", [b"\n", b"\r", b"\r\n"], ids=["lf", "cr", "crlf"])
+def test_colonless_data_frame_fails_closed_through_sdk(reasoning_capture_client, ending):
+    """An empty data frame is decoded, then rejected as non-JSON, not discarded."""
+    client, _ = reasoning_capture_client
+    chunk = json.dumps({
+        "id": "chatcmpl_colonless", "object": "chat.completion.chunk",
+        "model": VLLM_MODEL,
+        "choices": [{"index": 0, "delta": {"content": "hello"}}],
+    }).encode()
+    ChatCaptureHandler.raw_stream = ending.join([
+        b"data: " + chunk, b"", b"data", b"", b"data: [DONE]", b"", b"",
+    ])
+    events = _collect_stream(client.responses.create(
+        model=CHAT_TRANSLATION_MODEL, input="Hello", stream=True, store=False,
+    ))
+    assert events[-1].type == "response.failed"
+    assert events[-1].response.error.code == "server_error"
+    assert "malformed streaming chunk" in events[-1].response.error.message
+    assert not any(event.type == "response.completed" for event in events)
 
 
 @pytest.fixture()
@@ -9655,10 +9682,26 @@ class TestAgenticLoopVLLM:
         # narration the model streams before it calls the tool.
         text_deltas = []
         final_response = None
+        terminal_events = []
+        event_types = []
 
         for position, event in enumerate(stream):
             sequence_numbers.append(event.sequence_number)
             etype = event.type
+            event_types.append(etype)
+            # Keep terminal status/error evidence without retaining text deltas
+            # or request headers. An incomplete/failed response is different
+            # from a stream that closed without any terminal event.
+            if etype in ("response.completed", "response.incomplete", "response.failed"):
+                response = event.response
+                terminal_events.append({
+                    "type": etype,
+                    "status": response.status,
+                    "error": response.error,
+                    "incomplete_details": response.incomplete_details,
+                })
+            elif etype == "error":
+                terminal_events.append(event.model_dump())
             if etype == "response.output_item.added":
                 item = event.item.model_dump()
                 added.append(
@@ -9687,7 +9730,9 @@ class TestAgenticLoopVLLM:
                 final_response = event.response
 
         assert final_response is not None, (
-            "stream must terminate with a response.completed event"
+            "stream must terminate with a response.completed event; "
+            f"terminal_events={terminal_events!r}, event_types={event_types!r}, "
+            f"added={added!r}, done={done!r}, web_search_progress={ws_progress!r}"
         )
         assert all(isinstance(number, int) for number in sequence_numbers), sequence_numbers
         assert sequence_numbers == sorted(set(sequence_numbers)), sequence_numbers

@@ -33,6 +33,10 @@
               "max_tokens": 2048,
               "messages": [
                 {
+                  "role": "system",
+                  "content": "Keep instruction order."
+                },
+                {
                   "content": [
                     {
                       "cache_control": {
@@ -43,6 +47,10 @@
                     }
                   ],
                   "role": "user"
+                },
+                {
+                  "role": "system",
+                  "content": "Answer tersely."
                 }
               ],
               "model": "synthetic-degrade-features-model",
@@ -118,7 +126,7 @@
               "max_completion_tokens": 2048,
               "messages": [
                 {
-                  "content": "Be brief.",
+                  "content": "Be brief.\nKeep instruction order.\nAnswer tersely.",
                   "role": "system"
                 },
                 {

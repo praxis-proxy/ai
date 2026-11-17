@@ -430,6 +430,11 @@ async fn run_live_codex_apply_patch_workflow(
         stderr = output.stderr
     );
 
+    // Preserve the client trace even when a later workspace or wire assertion fails.
+    eprintln!(
+        "Codex live apply_patch stdout:\n{}\nstderr:\n{}",
+        output.stdout, output.stderr
+    );
     observer.assert_http_only();
     // Check the client-visible tool lifecycle and workspace result before the wire
     // observer assertion. If the model completes without returning a client-tool
@@ -517,6 +522,16 @@ async fn run_live_codex_compaction_workflow(
         },
     )
     .await;
+
+    // Wire assertions can fail before the completion checks that include this
+    // output. Keep the captured client evidence in the uploaded test log too.
+    eprintln!(
+        "Codex live compaction: exit={:?}, timed_out={}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        output.timed_out,
+        output.stdout,
+        output.stderr,
+    );
 
     // HARD, always enforced (independent of model capability): the pinned client
     // performed its own inline auto-compaction, a post-compaction request carrying

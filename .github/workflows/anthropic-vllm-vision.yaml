@@ -184,10 +184,7 @@ jobs:
         run: cargo build -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-sqlite
 
       - name: Install pinned OpenResponses runner
-        run: |
-          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
-            https://bun.sh/install | bash -s "bun-v1.3.12"
-          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+        uses: ./.github/actions/setup-openresponses-bun
 
       - name: Wait for vLLM readiness
         uses: ./.github/actions/wait-vllm
