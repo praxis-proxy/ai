@@ -51,8 +51,9 @@ fn hint_location(crate_name: &str) -> &'static str {
         },
         "sha2" => {
             "sqlx-core's 'migrate' feature, which sqlx always enables (store, store-sqlite, store-postgres, \
-             openai-conversations, openai-compact, openai-mcp-tools); praxis-policy (policy-engine); aws-sigv4 \
-             outside dev-dependencies (aws_sigv4_sign signs through OpenSSL and only tests against aws-sigv4)"
+             openai-compact, openai-mcp-tools); praxis-policy (policy-engine); aws-sigv4 \
+             outside dev-dependencies (aws_sigv4_sign signs through OpenSSL and only tests against aws-sigv4); \
+             openai-conversations is clean with store-postgres-cert-auth"
         },
         "hmac" => {
             "sqlx-postgres SCRAM (store-postgres); policy 'oauth' builtin; aws-sigv4 outside dev-dependencies \
