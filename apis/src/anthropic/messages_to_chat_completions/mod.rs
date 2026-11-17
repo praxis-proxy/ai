@@ -94,6 +94,11 @@ const DEGRADED_FEATURES_KEY: &str = "anthropic_messages_to_chat_completions.degr
 /// the client.
 const DEGRADED_FEATURES_HEADER: &str = "x-degraded-features";
 
+/// Client-facing message when the selected backend is not configured for images.
+const IMAGE_INPUT_REJECTION: &str = "Image content is not supported by the selected backend. Remove the image \
+                                     blocks from your request, or contact your platform administrator to enable \
+                                     image input for this backend.";
+
 // -----------------------------------------------------------------------------
 // AnthropicMessagesToChatCompletionsFilter
 // -----------------------------------------------------------------------------
@@ -139,6 +144,19 @@ const DEGRADED_FEATURES_HEADER: &str = "x-degraded-features";
 /// positions (Chat Completions represents them directly) and the backend
 /// decides whether to accept that ordering.
 ///
+/// Image input follows the cluster the router selected. `image_input_providers`
+/// lists the `http.application_provider` values whose clusters may receive
+/// images; the list is empty by default. A request carrying an Anthropic `image`
+/// block, in message content or nested in `tool_result` content, is rejected
+/// with a 400 `invalid_request_error` before any backend call unless the selected
+/// cluster declares a listed provider. A cluster without a provider, or with an
+/// unlisted one, fails closed, so a text-only backend such as the default vLLM
+/// example never receives `image_url` content. For a listed provider, `base64`
+/// sources become data URLs and `url` sources are forwarded unchanged for the
+/// backend to fetch; Praxis never fetches them. Images nested in `tool_result`
+/// content are still rejected for every provider, because a Chat Completions
+/// tool message cannot carry them.
+///
 /// Translation ends the Anthropic wire contract, so the filter removes
 /// `anthropic-version` and both Anthropic credential forms (`x-api-key` from
 /// SDK v1 and `authorization: Bearer` from SDK v2) before the request reaches
@@ -161,6 +179,8 @@ const DEGRADED_FEATURES_HEADER: &str = "x-degraded-features";
 /// allow_lossy_features:
 ///   - prompt_caching
 ///   - extended_thinking
+/// image_input_providers:
+///   - openai
 /// ```
 pub struct AnthropicMessagesToChatCompletionsFilter {
     /// Parsed and validated configuration.
@@ -186,6 +206,16 @@ impl AnthropicMessagesToChatCompletionsFilter {
             );
         }
         Ok(Box::new(Self { config: validated }))
+    }
+
+    /// Whether the cluster selected for this exchange may receive image content.
+    ///
+    /// Only a cluster declaring an `application_provider` listed in
+    /// `image_input_providers` qualifies; a missing or unlisted provider fails
+    /// closed.
+    fn selected_backend_accepts_images(&self, ctx: &HttpFilterContext<'_>) -> bool {
+        ctx.selected_application_provider()
+            .is_some_and(|provider| self.config.image_input_providers.iter().any(|p| p == provider))
     }
 
     /// Accumulate a streaming request's non-2xx error round and transform it once.
@@ -334,6 +364,13 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
         let transformed = match serde_json::from_slice::<serde_json::Value>(bytes) {
             Ok(value) => {
                 extract_request_metadata(ctx, Some(&value));
+                if request::contains_image(&value) && !self.selected_backend_accepts_images(ctx) {
+                    debug!(
+                        selected_provider = ctx.selected_application_provider(),
+                        "selected backend is not configured for image input"
+                    );
+                    return Ok(transform_request_body(body, Err(IMAGE_INPUT_REJECTION.to_owned())));
+                }
                 match request::transform_request_degrading(value, allow) {
                     Ok(output) => {
                         record_degraded_features(ctx, output.degraded);
@@ -1249,6 +1286,169 @@ mod tests {
         assert_eq!(parsed["error"]["type"], "invalid_request_error");
         assert!(parsed.get("request_id").is_some());
         assert!(parsed["request_id"].is_null());
+    }
+
+    // --- selected-cluster image policy ---
+
+    /// Message image blocks for both supported Anthropic source types.
+    const MESSAGE_IMAGE_BODIES: [(&str, &str); 2] = [
+        (
+            "base64 message image",
+            r#"{"model":"m","max_tokens":8,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo"}},{"type":"text","text":"What is this?"}]}]}"#,
+        ),
+        (
+            "url message image",
+            r#"{"model":"m","max_tokens":8,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://images.example.test/cat.png"}},{"type":"text","text":"What is this?"}]}]}"#,
+        ),
+    ];
+
+    /// `tool_result` blocks nesting images of both supported source types.
+    const TOOL_RESULT_IMAGE_BODIES: [(&str, &str); 2] = [
+        (
+            "base64 tool_result image",
+            r#"{"model":"m","max_tokens":8,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"chart"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo"}}]}]}]}"#,
+        ),
+        (
+            "url tool_result image",
+            r#"{"model":"m","max_tokens":8,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"chart"},{"type":"image","source":{"type":"url","url":"https://images.example.test/chart.png"}}]}]}]}"#,
+        ),
+    ];
+
+    #[test]
+    fn image_policy_rejects_images_for_untrusted_selected_providers() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        for provider in [None, Some("vllm"), Some("unknown")] {
+            for (case, raw) in MESSAGE_IMAGE_BODIES.iter().chain(&TOOL_RESULT_IMAGE_BODIES) {
+                let (outcome, body) =
+                    runtime.block_on(run_image_policy("image_input_providers: [openai]", provider, raw));
+                let SelectedUpstreamBodyOutcome::Reject(rejection) = outcome else {
+                    panic!("{case} must be rejected for provider {provider:?}");
+                };
+                assert_eq!(rejection.status, 400, "{case}");
+                let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+                assert_eq!(error["type"], "error", "{case}");
+                assert_eq!(error["error"]["type"], "invalid_request_error", "{case}");
+                assert_eq!(error["error"]["message"], IMAGE_INPUT_REJECTION, "{case}");
+                assert_eq!(
+                    body.as_deref(),
+                    Some(raw.as_bytes()),
+                    "{case}: a rejected request must not be translated"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn image_policy_rejects_by_default_even_for_tagged_providers() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let (_, raw) = MESSAGE_IMAGE_BODIES[0];
+        let (outcome, _) = runtime.block_on(run_image_policy("{}", Some("openai"), raw));
+        assert!(
+            matches!(outcome, SelectedUpstreamBodyOutcome::Reject(_)),
+            "an empty image_input_providers list must trust no provider"
+        );
+    }
+
+    #[test]
+    fn image_policy_preserves_message_images_for_trusted_selected_provider() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        for ((case, raw), expected_url) in MESSAGE_IMAGE_BODIES.iter().zip([
+            "data:image/png;base64,iVBORw0KGgo",
+            "https://images.example.test/cat.png",
+        ]) {
+            let (outcome, body) = runtime.block_on(run_image_policy(
+                "image_input_providers: [vllm, openai]",
+                Some("openai"),
+                raw,
+            ));
+            assert!(
+                matches!(outcome, SelectedUpstreamBodyOutcome::Continue),
+                "{case} must be translated for a trusted provider"
+            );
+            let chat: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+            let part = &chat["messages"][0]["content"][0];
+            assert_eq!(part["type"], "image_url", "{case}");
+            assert_eq!(part["image_url"]["url"], expected_url, "{case}");
+        }
+    }
+
+    #[test]
+    fn image_policy_keeps_tool_result_image_fidelity_rejection_for_trusted_provider() {
+        // Chat Completions tool messages cannot carry images, so nested images
+        // remain an unrepresentable payload even for an image-capable backend.
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        for (case, raw) in TOOL_RESULT_IMAGE_BODIES {
+            let (outcome, _) =
+                runtime.block_on(run_image_policy("image_input_providers: [openai]", Some("openai"), raw));
+            let SelectedUpstreamBodyOutcome::Reject(rejection) = outcome else {
+                panic!("{case} must be rejected as unrepresentable");
+            };
+            let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+            let message = error["error"]["message"].as_str().unwrap();
+            assert!(message.contains("tool_result"), "{case}: {message}");
+        }
+    }
+
+    #[test]
+    fn image_policy_ignores_text_only_requests_without_selected_provider() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let raw = r#"{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"Describe an image."}]}"#;
+        let (outcome, body) = runtime.block_on(run_image_policy("{}", None, raw));
+        assert!(matches!(outcome, SelectedUpstreamBodyOutcome::Continue));
+        let chat: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+        assert_eq!(chat["messages"][0]["content"], "Describe an image.");
+    }
+
+    #[test]
+    fn image_policy_rejection_logs_no_image_content() {
+        let marker = "https://marker-7f3a.example.test/secret.png";
+        let raw = format!(
+            r#"{{"model":"m","max_tokens":8,"messages":[{{"role":"user","content":[{{"type":"image","source":{{"type":"url","url":"{marker}"}}}}]}}]}}"#
+        );
+        let logs = crate::test_utils::capture_log_output(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let (outcome, _) = runtime.block_on(run_image_policy("{}", Some("vllm"), &raw));
+            assert!(matches!(outcome, SelectedUpstreamBodyOutcome::Reject(_)));
+        });
+        assert!(
+            logs.contains("vllm"),
+            "rejection should log the bounded provider: {logs}"
+        );
+        assert!(
+            !logs.contains("marker-7f3a"),
+            "image content must not be logged: {logs}"
+        );
+    }
+
+    /// Run the selected-upstream body phase after a real load balancer selects
+    /// a cluster declaring `provider`.
+    async fn run_image_policy(
+        config: &str,
+        provider: Option<&str>,
+        raw: &str,
+    ) -> (SelectedUpstreamBodyOutcome, Option<Bytes>) {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(config).unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        let http = provider.map_or_else(String::new, |provider| {
+            format!("\n    http: {{application_provider: {provider}}}")
+        });
+        let balancer_config = serde_yaml::from_str(&format!(
+            "clusters:\n  - name: target{http}\n    endpoints: [127.0.0.1:3000]"
+        ))
+        .unwrap();
+        let balancer = praxis_filter::LoadBalancerFilter::from_config(&balancer_config).unwrap();
+        ctx.cluster = Some("target".into());
+        drop(balancer.on_request(&mut ctx).await.unwrap());
+        assert_eq!(ctx.selected_application_provider(), provider, "selected provider");
+
+        let mut body = Some(Bytes::from(raw.to_owned()));
+        let outcome = filter
+            .on_selected_upstream_request_body(&mut ctx, &mut body)
+            .await
+            .unwrap();
+        (outcome, body)
     }
 
     // --- should_transform_response ---

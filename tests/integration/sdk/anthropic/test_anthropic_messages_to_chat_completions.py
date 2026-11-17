@@ -314,7 +314,9 @@ class RecordingBackend(BaseHTTPRequestHandler):
         pass
 
 
-def _write_config(proxy_port: int, backend_port: int, allow_lossy: bool = False) -> str:
+def _write_config(
+    proxy_port: int, backend_port: int, allow_lossy: bool = False, text_only: bool = False
+) -> str:
     with open(CONFIG_PATH) as f:
         config = f.read()
     for old, new in [
@@ -338,17 +340,26 @@ def _write_config(proxy_port: int, backend_port: int, allow_lossy: bool = False)
         replaced = config.replace(marker, replacement)
         assert replaced != config, f"example drift: translation filter block not found in {CONFIG_PATH}"
         config = replaced
+    if text_only:
+        # Retag the same cluster with a provider absent from
+        # image_input_providers, so the routed pipeline is text-only.
+        marker = "              application_provider: openai\n"
+        replaced = config.replace(marker, "              application_provider: vllm\n")
+        assert replaced != config, f"example drift: cluster provider not found in {CONFIG_PATH}"
+        config = replaced
     fd, path = tempfile.mkstemp(suffix=".yaml")
     with os.fdopen(fd, "w") as f:
         f.write(config)
     return path
 
 
-def _start_client(*, allow_lossy: bool, process_holder=None) -> Iterator[Anthropic]:
+def _start_client(*, allow_lossy: bool, text_only: bool = False, process_holder=None) -> Iterator[Anthropic]:
     """Start a backend + proxy and yield an Anthropic client plus the proxy port.
 
     `allow_lossy` selects the strict example config (the default) or the same
     config with operator-approved degradation enabled on the translation filter.
+    `text_only` retags the example's image-capable cluster with an unlisted
+    provider so image content fails closed.
     When `process_holder` is supplied, the live proxy subprocess is published
     under its ``"proxy"`` key so tests can assert the proxy stays up (e.g. a
     connection abort must come from a committed-body reset, not a crash).
@@ -358,7 +369,7 @@ def _start_client(*, allow_lossy: bool, process_holder=None) -> Iterator[Anthrop
     threading.Thread(target=backend.serve_forever, daemon=True).start()
 
     proxy_port = _free_port()
-    config_path = _write_config(proxy_port, backend_port, allow_lossy=allow_lossy)
+    config_path = _write_config(proxy_port, backend_port, allow_lossy=allow_lossy, text_only=text_only)
     proc = subprocess.Popen(
         [_find_binary(), "-c", config_path],
         stdout=subprocess.DEVNULL,
@@ -401,6 +412,11 @@ def anthropic_client(proxy_process):
 @pytest.fixture(scope="module")
 def degrading_client():
     yield from _start_client(allow_lossy=True)
+
+
+@pytest.fixture(scope="module")
+def text_only_client():
+    yield from _start_client(allow_lossy=False, text_only=True)
 
 
 class TestRequestFieldHandling:
@@ -1134,6 +1150,104 @@ class TestOperatorApprovedDegradation:
         assert excinfo.value.status_code == 400
         assert "context_management" in str(excinfo.value)
         assert RecordingBackend.bodies == [], "a malformed edit must not reach the backend"
+
+
+
+IMAGE_SOURCES = {
+    "base64": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="},
+    "url": {"type": "url", "url": "https://images.example.test/chart.png"},
+}
+EXPECTED_IMAGE_URLS = {
+    "base64": "data:image/png;base64,iVBORw0KGgo=",
+    "url": "https://images.example.test/chart.png",
+}
+
+
+def _message_image(source: dict) -> list[dict]:
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "source": source},
+                {"type": "text", "text": "Describe the chart."},
+            ],
+        }
+    ]
+
+
+def _tool_result_image(source: dict) -> list[dict]:
+    return [
+        {"role": "user", "content": "Plot the data."},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "call_1", "name": "plot", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": [
+                        {"type": "text", "text": "chart rendered"},
+                        {"type": "image", "source": source},
+                    ],
+                }
+            ],
+        },
+    ]
+
+
+class TestSelectedClusterImagePolicy:
+    """Image handling follows the routed cluster's declared application_provider."""
+
+    @pytest.mark.parametrize("source", IMAGE_SOURCES)
+    def test_image_capable_cluster_receives_translated_image(self, anthropic_client, source):
+        RecordingBackend.bodies.clear()
+
+        anthropic_client.messages.create(
+            model=MODEL, max_tokens=16, messages=_message_image(IMAGE_SOURCES[source])
+        )
+
+        assert len(RecordingBackend.bodies) == 1
+        part = RecordingBackend.bodies[0]["messages"][0]["content"][0]
+        assert part == {"type": "image_url", "image_url": {"url": EXPECTED_IMAGE_URLS[source]}}
+
+    @pytest.mark.parametrize("source", IMAGE_SOURCES)
+    def test_image_capable_cluster_still_rejects_tool_result_images(self, anthropic_client, source):
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as caught:
+            anthropic_client.messages.create(
+                model=MODEL, max_tokens=16, messages=_tool_result_image(IMAGE_SOURCES[source])
+            )
+
+        assert caught.value.body["error"]["type"] == "invalid_request_error"
+        assert "tool_result" in caught.value.body["error"]["message"]
+        assert RecordingBackend.bodies == [], "an unrepresentable tool_result image must not reach the backend"
+
+    @pytest.mark.parametrize("location", ["message", "tool_result"])
+    @pytest.mark.parametrize("source", IMAGE_SOURCES)
+    def test_text_only_cluster_rejects_images_before_backend(self, text_only_client, location, source):
+        RecordingBackend.bodies.clear()
+        build = _message_image if location == "message" else _tool_result_image
+
+        with pytest.raises(BadRequestError) as caught:
+            text_only_client.messages.create(model=MODEL, max_tokens=16, messages=build(IMAGE_SOURCES[source]))
+
+        assert caught.value.body["type"] == "error"
+        assert caught.value.body["error"]["type"] == "invalid_request_error"
+        assert "selected backend" in caught.value.body["error"]["message"]
+        assert RecordingBackend.bodies == [], "a rejected image request must not reach the backend"
+
+    def test_text_only_cluster_serves_text_requests(self, text_only_client):
+        RecordingBackend.bodies.clear()
+
+        text_only_client.messages.create(
+            model=MODEL, max_tokens=16, messages=[{"role": "user", "content": "Describe a chart."}]
+        )
+
+        assert len(RecordingBackend.bodies) == 1
 
 
 if __name__ == "__main__":

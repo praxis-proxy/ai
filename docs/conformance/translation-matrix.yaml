@@ -249,9 +249,13 @@ surfaces:
       multimodal-image:
         status: translated
         note: >-
-          User messages only. An image in an assistant message, or in any
-          message that also carries tool_use, is rejected 400.
-        evidence: apis/src/anthropic/messages_to_chat_completions/request.rs:627-641; apis/src/anthropic/messages_to_chat_completions/request.rs:688
+          User messages only, and only when the selected cluster declares an
+          application_provider listed in image_input_providers (empty by
+          default); a missing or unlisted provider rejects any image, including
+          one nested in tool_result, with 400 before the backend call. An image
+          in an assistant message, in any message that also carries tool_use,
+          or nested in tool_result is rejected 400 for every provider.
+        evidence: apis/src/anthropic/messages_to_chat_completions/mod.rs:216-219; apis/src/anthropic/messages_to_chat_completions/mod.rs:367-373; apis/src/anthropic/messages_to_chat_completions/request.rs:941-948; apis/src/anthropic/messages_to_chat_completions/request.rs:1064-1080
       multimodal-audio:
         status: n-a
       documents-files:

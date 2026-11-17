@@ -938,3 +938,30 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.request.image_input
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/image-input
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.request.image_text_only_rejection
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/image-text-only
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.request.tool_result_image_rejection
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/tool-result-image
+    providers:
+      synthetic:
+        status: synthetic_only

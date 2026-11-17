@@ -9,8 +9,8 @@
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    Backend, Recording, free_port, http_send, json_post, parse_body, parse_header, parse_status,
-    start_backend_with_shutdown, start_proxy,
+    Backend, Recording, StatefulCapturingBackend, free_port, http_send, json_post, parse_body, parse_header,
+    parse_status, start_backend_with_shutdown, start_proxy,
 };
 
 /// A minimal streaming Anthropic Messages request body shared by the
@@ -677,6 +677,142 @@ fn proxy_failure_does_not_format_anthropic_error_for_unclassified_request() {
 // Test Utilities
 // -----------------------------------------------------------------------------
 
+#[test]
+fn one_pipeline_applies_selected_cluster_image_policy() {
+    let chat_response = r#"{"id":"chatcmpl-1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+    let responses = || vec![(200, chat_response.to_owned()); 4];
+    let vision = StatefulCapturingBackend::new(responses()).start_with_shutdown();
+    let text = StatefulCapturingBackend::new(responses()).start_with_shutdown();
+    let proxy_port = free_port();
+    let config = Config::from_yaml(&image_policy_yaml(proxy_port, vision.port(), text.port())).unwrap();
+    let proxy = start_proxy(&config);
+
+    let image_request = |source: &str| {
+        format!(
+            r#"{{"model":"m","max_tokens":8,"messages":[{{"role":"user","content":[{{"type":"image","source":{source}}},{{"type":"text","text":"Describe it."}}]}}]}}"#
+        )
+    };
+    let tool_result_request = |source: &str| {
+        format!(
+            r#"{{"model":"m","max_tokens":8,"messages":[{{"role":"user","content":"Plot it."}},{{"role":"assistant","content":[{{"type":"tool_use","id":"call_1","name":"plot","input":{{}}}}]}},{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call_1","content":[{{"type":"image","source":{source}}}]}}]}}]}}"#
+        )
+    };
+    let sources = [
+        (
+            r#"{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}"#,
+            "data:image/png;base64,iVBORw0KGgo=",
+        ),
+        (
+            r#"{"type":"url","url":"https://images.example.test/chart.png"}"#,
+            "https://images.example.test/chart.png",
+        ),
+    ];
+
+    for (source, expected_url) in sources {
+        // Image-capable cluster: message images are translated to image_url.
+        let raw = http_send(
+            proxy.addr(),
+            &anthropic_post_with_header("/v1/messages", &image_request(source), "x-backend: vision"),
+        );
+        assert_eq!(parse_status(&raw), 200, "vision cluster should accept {source}");
+
+        // Text-only cluster: every image location fails closed before transport.
+        for body in [image_request(source), tool_result_request(source)] {
+            let raw = http_send(
+                proxy.addr(),
+                &anthropic_post_with_header("/v1/messages", &body, "x-backend: text"),
+            );
+            assert_eq!(parse_status(&raw), 400, "text-only cluster must reject {body}");
+            let error: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+        }
+
+        let forwarded = vision.requests();
+        let last: serde_json::Value = serde_json::from_str(
+            &forwarded
+                .iter()
+                .rev()
+                .find(|request| request.method == "POST")
+                .expect("vision backend should receive the image request")
+                .body,
+        )
+        .unwrap();
+        assert_eq!(last["messages"][0]["content"][0]["type"], "image_url");
+        assert_eq!(last["messages"][0]["content"][0]["image_url"]["url"], expected_url);
+    }
+
+    assert!(
+        text.requests().iter().all(|request| request.method != "POST"),
+        "no image request may reach the text-only cluster"
+    );
+
+    // Text requests still reach the text-only cluster through the same pipeline.
+    let raw = http_send(
+        proxy.addr(),
+        &anthropic_post_with_header(
+            "/v1/messages",
+            r#"{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"Hello"}]}"#,
+            "x-backend: text",
+        ),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "text request should reach the text-only cluster"
+    );
+    assert_eq!(
+        text.requests()
+            .iter()
+            .filter(|request| request.method == "POST")
+            .count(),
+        1,
+        "only the text request should reach the text-only cluster"
+    );
+}
+
+/// One pipeline routing by header to an image-capable and a text-only cluster.
+fn image_policy_yaml(proxy_port: u16, vision_port: u16, text_port: u16) -> String {
+    format!(
+        r#"
+listeners:
+  - name: test
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [transform]
+
+filter_chains:
+  - name: transform
+    filters:
+      - filter: anthropic_messages_request
+        on_invalid: continue
+      - filter: anthropic_messages_to_chat_completions
+        image_input_providers: [openai]
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            headers:
+              x-backend: vision
+            cluster: vision
+          - path_prefix: "/"
+            cluster: text
+      - filter: load_balancer
+        clusters:
+          - name: vision
+            http:
+              application_provider: openai
+            endpoints:
+              - "127.0.0.1:{vision_port}"
+          - name: text
+            http:
+              application_provider: vllm
+            endpoints:
+              - "127.0.0.1:{text_port}"
+
+insecure_options:
+  allow_private_endpoints: true
+"#
+    )
+}
+
 fn error_formatter_yaml(proxy_port: u16, backend_port: u16) -> String {
     format!(
         r#"
@@ -794,6 +930,20 @@ fn anthropic_post(path: &str, body: &str) -> String {
          Host: localhost\r\n\
          Content-Type: application/json\r\n\
          anthropic-version: 2023-06-01\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n\
+         {body}",
+        body.len()
+    )
+}
+
+fn anthropic_post_with_header(path: &str, body: &str, header: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Content-Type: application/json\r\n\
+         anthropic-version: 2023-06-01\r\n\
+         {header}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n\
          {body}",

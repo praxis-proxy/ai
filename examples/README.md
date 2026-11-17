@@ -95,6 +95,7 @@ for how these are authored and regenerated.
 | [messages-native-vllm.yaml](configs/anthropic/messages-native-vllm.yaml) | Routes native Anthropic Messages API traffic (`/v1/messages` and `/v1/messages/count_tokens`) to a vLLM backend that natively serves the Anthropic Messages API, WITHOUT any request or response body translation |
 | [messages-protocol.yaml](configs/anthropic/messages-protocol.yaml) | Routes Anthropic Messages API requests to a native `/v1/messages` backend |
 | [messages-to-openai-degrade-fixture.yaml](configs/anthropic/messages-to-openai-degrade-fixture.yaml) | Fixture-only variant of `messages-to-openai.yaml` that opts prompt caching, extended thinking, and mid-conversation system instructions into approved degradation |
+| [messages-to-openai-text-only-fixture.yaml](configs/anthropic/messages-to-openai-text-only-fixture.yaml) | Fixture-only variant of `messages-to-openai.yaml` whose selected cluster is text-only |
 | [messages-to-openai-vllm.yaml](configs/anthropic/messages-to-openai-vllm.yaml) | Translates native Anthropic Messages API traffic into OpenAI Chat Completions for a vLLM backend that serves `/v1/chat/completions`, with the same three-boundary credential isolation as the native passthrough config |
 | [messages-to-openai.yaml](configs/anthropic/messages-to-openai.yaml) | Transforms Anthropic Messages API requests and responses for Chat Completions-compatible inference backends |
 | [request-validate.yaml](configs/anthropic/request-validate.yaml) | Rejects empty, malformed, or non-object JSON request bodies |
