@@ -2,15 +2,39 @@
 // Copyright (c) 2026 Praxis Contributors
 
 //! OpenAI Files API family.
+//!
+//! With `openai-files`, this module also exposes the service, metadata
+//! registry, and byte-store contracts used by the local implementation.
 
 #[cfg(feature = "openai-files")]
 pub(crate) mod contracts;
 #[cfg(feature = "openai-files")]
+mod model;
+#[cfg(feature = "openai-files")]
 mod openapi;
+#[cfg(feature = "openai-files")]
+mod registry;
 pub(crate) mod routes;
+#[cfg(feature = "openai-files")]
+mod service;
+#[cfg(feature = "openai-files")]
+mod store;
 
 #[cfg(feature = "openai-files")]
+pub use contracts::{FilePurpose, InvalidField, ListOrder as FileListOrder, UploadPurpose};
+#[cfg(feature = "openai-files")]
+pub use model::{
+    FileCleanupCandidate, FileExpiration, FileInfo, FileList, FilePage, FileState, FileStream, FileUpload,
+    FileUploadStream, PendingFile, StoredFile,
+};
+#[cfg(feature = "openai-files")]
 pub use openapi::implementation_openapi_json;
+#[cfg(feature = "openai-files")]
+pub use registry::{FileRegistry, FileRegistryError};
+#[cfg(feature = "openai-files")]
+pub use service::{FileDownload, FileService, FileServiceError};
+#[cfg(feature = "openai-files")]
+pub use store::{FileStore, FileStoreError};
 
 #[cfg(test)]
 #[cfg(feature = "openai-files")]

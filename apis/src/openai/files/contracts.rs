@@ -3,9 +3,10 @@
 
 //! Wire contracts for the OpenAI Files API.
 //!
-//! These are wire types only: the Files service domain model maps to and from
-//! them. Component names match the pinned OpenAI specification so drift checks
-//! compare like with like. Deliberate deviations from the pinned reference:
+//! Response and request DTOs stay here, while the purpose and list-order enums
+//! are also shared with the Files service model. Component names match the
+//! pinned OpenAI specification so drift checks compare like with like.
+//! Deliberate deviations from the pinned reference:
 //!
 //! - `OpenAIFile.purpose` accepts `evals`, so an upload round-trips.
 //!
@@ -47,7 +48,7 @@ pub(crate) const MAX_LIST_LIMIT: u32 = 10_000;
 
 /// A request field that violates the Files contract.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct InvalidField {
+pub struct InvalidField {
     /// Offending field name.
     pub(crate) field: &'static str,
     /// Why the value was rejected.
@@ -78,7 +79,7 @@ impl Error for InvalidField {}
 
 /// Purposes accepted when uploading a file.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ToSchema)]
-pub(crate) enum UploadPurpose {
+pub enum UploadPurpose {
     /// Used by the Assistants API.
     #[serde(rename = "assistants")]
     Assistants,
@@ -102,7 +103,7 @@ pub(crate) enum UploadPurpose {
 impl UploadPurpose {
     /// Wire value.
     #[must_use]
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Assistants => "assistants",
             Self::Batch => "batch",
@@ -133,7 +134,7 @@ impl FromStr for UploadPurpose {
 
 /// Purposes reported on stored files: the upload values plus output purposes.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
-pub(crate) enum FilePurpose {
+pub enum FilePurpose {
     /// Used by the Assistants API.
     #[serde(rename = "assistants")]
     Assistants,
@@ -215,7 +216,7 @@ pub(crate) enum ExpirationAnchor {
 /// Sort order for file listings.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ListOrder {
+pub enum ListOrder {
     /// Oldest first.
     Asc,
     /// Newest first.
