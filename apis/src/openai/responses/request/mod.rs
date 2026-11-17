@@ -96,6 +96,8 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// `responses.response_id` (`resp_` + 32 hex chars, CSPRNG),
 /// `responses.conversation_id`, `responses.store`, `responses.background`, and
 /// `responses.stream`.
+/// Structured image/audio input is published as `modality` metadata and a
+/// branch result; it is never promoted to an HTTP header.
 pub struct OpenaiResponsesRequestFilter {
     /// Classification, promotion, and state configuration.
     config: ResponsesRequestConfig,
