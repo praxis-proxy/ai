@@ -24,8 +24,8 @@ mod store;
 pub use contracts::{FilePurpose, InvalidField, ListOrder as FileListOrder, UploadPurpose};
 #[cfg(feature = "openai-files")]
 pub use model::{
-    FileCleanupCandidate, FileExpiration, FileInfo, FileList, FilePage, FileState, FileStream, FileUpload,
-    FileUploadStream, PendingFile, StoredFile,
+    FileCleanupCandidate, FileCleanupState, FileExpiration, FileInfo, FileList, FilePage, FileState, FileStream,
+    FileUpload, FileUploadStream, PendingFile, StoredFile,
 };
 #[cfg(feature = "openai-files")]
 pub use openapi::implementation_openapi_json;

@@ -78,17 +78,25 @@ pub struct FilePage {
     pub has_more: bool,
 }
 
-/// Durable registry states. Only `Ready` is visible to HTTP reads and lists.
+/// Registry states eligible for physical cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileCleanupState {
+    /// A failed upload that may need physical cleanup.
+    Failed,
+    /// A hidden file awaiting physical cleanup.
+    DeletionPending,
+}
+
+/// Durable registry state for a file's lifecycle.
+/// Only `Ready` is visible to HTTP reads and lists.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileState {
     /// Metadata is committed and the byte stream is still being written.
     Pending,
     /// The byte write and metadata completion both succeeded.
     Ready,
-    /// The byte write or metadata completion failed; the reaper may clean bytes.
-    Failed,
-    /// A delete or expiration hid the file; the reaper still owes byte deletion.
-    DeletionPending,
+    /// A failed upload or hidden file awaits physical cleanup.
+    Cleanup(FileCleanupState),
 }
 
 /// Metadata inserted before any upload bytes are written.
@@ -128,6 +136,6 @@ pub struct FileCleanupCandidate {
     pub owner: StateOwner,
     /// Immutable byte-store key to delete.
     pub storage_key: String,
-    /// Either [`FileState::Failed`] or [`FileState::DeletionPending`].
-    pub state: FileState,
+    /// Cleanup state used for the conditional registry purge.
+    pub state: FileCleanupState,
 }
