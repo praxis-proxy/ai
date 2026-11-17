@@ -113,6 +113,47 @@ pub(crate) mod test_utils {
         }
     }
 
+    /// Run `f` and return every tracing event it emits on this thread, at
+    /// every level, rendered as `name=value` fields.
+    ///
+    /// Installs a thread-local subscriber, so parallel tests sharing the
+    /// process-wide subscriber are unaffected. Use it to assert that request
+    /// or response content never reaches logs.
+    #[cfg(feature = "openai-responses")]
+    pub(crate) fn capture_log_output<F: FnOnce()>(f: F) -> String {
+        use std::{
+            fmt::Write as _,
+            sync::{Arc, Mutex},
+        };
+
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        struct Capture(Arc<Mutex<String>>);
+
+        struct FieldWriter<'a>(&'a mut String);
+
+        impl tracing::field::Visit for FieldWriter<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                write!(self.0, " {}={value:?}", field.name()).expect("writing to a String cannot fail");
+            }
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+                let mut line = event.metadata().level().to_string();
+                event.record(&mut FieldWriter(&mut line));
+                let mut out = self.0.lock().expect("log capture lock");
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+
+        let output = Arc::new(Mutex::new(String::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&output)));
+        tracing::subscriber::with_default(subscriber, f);
+        std::mem::take(&mut *output.lock().expect("log capture lock"))
+    }
+
     /// Build a minimal filter context for unit tests.
     #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
     #[allow(
