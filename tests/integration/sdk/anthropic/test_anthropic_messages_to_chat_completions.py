@@ -84,6 +84,7 @@ class RecordingBackend(BaseHTTPRequestHandler):
     untranslatable_stream_once: str | None = None
     fragmented_stream_once = False
     error_response_once = False
+    named_tool_finish_gate = threading.Event()
 
     def do_POST(self):
         """Record a request and return the configured Chat Completions response."""
@@ -295,14 +296,18 @@ class RecordingBackend(BaseHTTPRequestHandler):
                 "choices": [{"index": 0, **chunk}],
             }
             wire_chunks.append(f"data: {json.dumps(payload)}\n\n")
-        wire = "".join(wire_chunks) + "data: [DONE]\n\n"
-        encoded = wire.encode()
+        terminal = (wire_chunks[1] + "data: [DONE]\n\n").encode()
+        tool_call = wire_chunks[0].encode()
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("cache-control", "no-cache")
-        self.send_header("content-length", str(len(encoded)))
+        self.send_header("content-length", str(len(tool_call) + len(terminal)))
         self.end_headers()
-        self.wfile.write(encoded)
+        self.wfile.write(tool_call)
+        self.wfile.flush()
+        if not RecordingBackend.named_tool_finish_gate.wait(timeout=10):
+            return
+        self.wfile.write(terminal)
         self.wfile.flush()
 
     def log_message(self, format, *args):
@@ -811,6 +816,7 @@ class TestStreamingResponseValidation:
     ):
         """Preserve named-tool semantics when the upstream terminates with stop."""
         RecordingBackend.bodies.clear()
+        RecordingBackend.named_tool_finish_gate.clear()
         RecordingBackend.untranslatable_stream_once = "tool_use_stop"
         try:
             with anthropic_client.messages.stream(
@@ -824,8 +830,33 @@ class TestStreamingResponseValidation:
                 }],
                 tool_choice={"type": "tool", "name": "get_weather"},
             ) as stream:
-                events = list(stream)
+                events = []
+                tool_received = threading.Event()
+
+                def collect_stream() -> None:
+                    """Collect SDK events and signal when the tool block arrives."""
+                    for event in stream:
+                        events.append(event)
+                        if (
+                            event.type == "content_block_start"
+                            and event.content_block.type == "tool_use"
+                        ):
+                            tool_received.set()
+
+                consumer = threading.Thread(target=collect_stream, daemon=True)
+                consumer.start()
+                delivered_before_finish = tool_received.wait(timeout=5)
+                RecordingBackend.named_tool_finish_gate.set()
+                consumer.join(timeout=5)
+
+                assert delivered_before_finish, (
+                    "the SDK must receive the tool block before upstream completion"
+                )
+                assert not consumer.is_alive(), (
+                    "the SDK stream must complete after the terminal events are released"
+                )
         finally:
+            RecordingBackend.named_tool_finish_gate.set()
             RecordingBackend.untranslatable_stream_once = None
 
         tool_use = next(
