@@ -97,7 +97,9 @@ impl AnthropicMessagesToChatCompletionsStreamFilter {
         end_of_stream: bool,
     ) -> Result<Option<Bytes>, FilterError> {
         let mut state = ctx.remove_filter_state::<StreamState>().unwrap_or_default();
-        state.stop_sequences.get_or_insert_with(|| client_stop_sequences(ctx));
+        state
+            .stop_sequences
+            .get_or_insert_with(|| client_stop_sequences(ctx).into_owned());
         let result = decode_and_process_chunk(
             &mut state,
             bytes,
