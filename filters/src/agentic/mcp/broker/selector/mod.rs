@@ -8,8 +8,13 @@
 //! each server's top-level cluster. The broker stages the target cluster as a
 //! typed request extension; this filter copies it into `ctx.cluster` so the
 //! generated `load_balancer` dials that cluster.
+//!
+//! A backend session lives on one endpoint, so the selector also pins the
+//! exchange to a staged endpoint (`notifications/initialized` and `DELETE`
+//! follow the `initialize` that created the session) and reports the endpoint
+//! the `load_balancer` dialed back to the broker.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config};
@@ -19,9 +24,27 @@ use serde::Deserialize;
 // Staged Cluster
 // -----------------------------------------------------------------------------
 
-/// Cluster staged by the broker for one handshake subrequest.
+/// Destination staged by the broker for one handshake subrequest.
 #[derive(Clone, Debug)]
-pub(crate) struct BrokerBackendCluster(pub(crate) Arc<str>);
+pub(crate) struct BrokerBackendCluster {
+    /// Top-level cluster to dial.
+    pub(crate) cluster: Arc<str>,
+    /// Endpoint the exchange must reach, when a session already lives there.
+    pub(crate) pinned_endpoint: Option<Arc<str>>,
+    /// Receives the endpoint address the `load_balancer` dialed.
+    pub(crate) dialed: Arc<OnceLock<Arc<str>>>,
+}
+
+impl BrokerBackendCluster {
+    /// Stage `cluster`, optionally pinned to `endpoint`.
+    pub(crate) fn new(cluster: Arc<str>, pinned_endpoint: Option<Arc<str>>) -> Self {
+        Self {
+            cluster,
+            pinned_endpoint,
+            dialed: Arc::new(OnceLock::new()),
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // McpBrokerBackendSelectorFilter
@@ -90,10 +113,19 @@ impl HttpFilter for McpBrokerBackendSelectorFilter {
         let Some(staged) = ctx.extensions.get::<BrokerBackendCluster>() else {
             return Err(format!("{}: no broker backend cluster staged on this request", Self::NAME).into());
         };
-        let Some(cluster) = self.clusters.iter().find(|c| c.as_ref() == staged.0.as_ref()) else {
+        let Some(cluster) = self.clusters.iter().find(|c| c.as_ref() == staged.cluster.as_ref()) else {
             return Err(format!("{}: staged cluster is not configured", Self::NAME).into());
         };
+        let pinned = staged.pinned_endpoint.clone();
         ctx.cluster = Some(Arc::clone(cluster));
+        ctx.pinned_endpoint_address = pinned;
+        Ok(FilterAction::Continue)
+    }
+
+    async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if let (Some(staged), Some(upstream)) = (ctx.extensions.get::<BrokerBackendCluster>(), ctx.upstream.as_ref()) {
+            let _already_set = staged.dialed.set(Arc::clone(&upstream.address));
+        }
         Ok(FilterAction::Continue)
     }
 }
@@ -138,7 +170,8 @@ mod tests {
         let filter = selector();
         let req = crate::test_utils::make_request(http::Method::POST, "/mcp");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.extensions.insert(BrokerBackendCluster(Arc::from("calendar-mcp")));
+        ctx.extensions
+            .insert(BrokerBackendCluster::new(Arc::from("calendar-mcp"), None));
 
         let action = filter.on_request(&mut ctx).await.unwrap();
 
@@ -147,6 +180,65 @@ mod tests {
             ctx.cluster.as_deref(),
             Some("calendar-mcp"),
             "staged cluster must be selected"
+        );
+    }
+
+    #[tokio::test]
+    async fn pins_staged_endpoint() {
+        let filter = selector();
+        let req = crate::test_utils::make_request(http::Method::POST, "/mcp");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.extensions.insert(BrokerBackendCluster::new(
+            Arc::from("weather-mcp"),
+            Some(Arc::from("10.0.0.2:3001")),
+        ));
+
+        let _action = filter.on_request(&mut ctx).await.unwrap();
+
+        assert_eq!(
+            ctx.pinned_endpoint_address.as_deref(),
+            Some("10.0.0.2:3001"),
+            "the session's endpoint must be pinned for the load balancer"
+        );
+    }
+
+    #[tokio::test]
+    async fn unpinned_exchange_leaves_endpoint_choice_to_load_balancer() {
+        let filter = selector();
+        let req = crate::test_utils::make_request(http::Method::POST, "/mcp");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.extensions
+            .insert(BrokerBackendCluster::new(Arc::from("weather-mcp"), None));
+
+        let _action = filter.on_request(&mut ctx).await.unwrap();
+
+        assert!(ctx.pinned_endpoint_address.is_none(), "no endpoint may be pinned");
+    }
+
+    #[tokio::test]
+    async fn reports_dialed_endpoint() {
+        use praxis_core::connectivity::{ConnectionOptions, Upstream};
+
+        let filter = selector();
+        let req = crate::test_utils::make_request(http::Method::POST, "/mcp");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let staged = BrokerBackendCluster::new(Arc::from("weather-mcp"), None);
+        let dialed = Arc::clone(&staged.dialed);
+        ctx.extensions.insert(staged);
+        ctx.upstream = Some(Upstream {
+            address: Arc::from("10.0.0.3:3001"),
+            authority: None,
+            base_path: None,
+            tls: None,
+            connection: Arc::new(ConnectionOptions::default()),
+        });
+
+        let _action = filter.on_response(&mut ctx).await.unwrap();
+
+        assert_eq!(
+            dialed.get().map(AsRef::as_ref),
+            Some("10.0.0.3:3001"),
+            "the dialed endpoint must reach the broker"
         );
     }
 
@@ -165,7 +257,8 @@ mod tests {
         let filter = selector();
         let req = crate::test_utils::make_request(http::Method::POST, "/mcp");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.extensions.insert(BrokerBackendCluster(Arc::from("other")));
+        ctx.extensions
+            .insert(BrokerBackendCluster::new(Arc::from("other"), None));
 
         assert!(filter.on_request(&mut ctx).await.is_err(), "unknown cluster must fail");
         assert!(ctx.cluster.is_none(), "no cluster may be selected");

@@ -235,6 +235,7 @@ mod tests {
             init: BackendInit {
                 protocol_version: Box::from("2025-06-18"),
                 session_id: Some(HeaderValue::from_str(session).unwrap()),
+                endpoint: None,
             },
         }
     }

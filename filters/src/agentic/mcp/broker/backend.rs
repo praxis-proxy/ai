@@ -94,6 +94,10 @@ pub(crate) struct BackendInit {
     pub protocol_version: Box<str>,
     /// Backend `Mcp-Session-Id`; `None` for a backend that issues no session.
     pub session_id: Option<HeaderValue>,
+    /// Endpoint address that created the session. Later exchanges and the
+    /// forwarded calls are pinned to it, because a backend session exists
+    /// only on the endpoint that issued it. `None` when unknown.
+    pub endpoint: Option<Arc<str>>,
 }
 
 /// Structured backend lifecycle failure.
@@ -210,7 +214,8 @@ impl FilteredMcpBackendClient {
         }
     }
 
-    /// Run one exchange and return the bounded buffered response.
+    /// Run one exchange, pinned to `pinned_endpoint` when set, and return the
+    /// bounded buffered response with the endpoint address that served it.
     #[expect(
         clippy::large_stack_frames,
         reason = "filtered subrequest executor futures are inherently large"
@@ -220,9 +225,12 @@ impl FilteredMcpBackendClient {
         target: BackendTarget<'_>,
         request: SubRequest,
         callout: &BackendCallout,
-    ) -> Result<SubResponse, McpBackendError> {
+        pinned_endpoint: Option<&Arc<str>>,
+    ) -> Result<(SubResponse, Option<Arc<str>>), McpBackendError> {
+        let staged = BrokerBackendCluster::new(Arc::clone(target.cluster), pinned_endpoint.cloned());
+        let dialed = Arc::clone(&staged.dialed);
         let mut extensions = RequestExtensions::default();
-        extensions.insert(BrokerBackendCluster(Arc::clone(target.cluster)));
+        extensions.insert(staged);
         if let Some(trace_context) = callout.trace_context.as_ref() {
             extensions.insert(trace_context.clone());
         }
@@ -236,7 +244,7 @@ impl FilteredMcpBackendClient {
         );
         let outcome = Box::pin(executor.run_classified(&self.pipeline, &request, extensions, callout.deadline)).await;
         match outcome {
-            Ok(CalloutOutcome::Response(CalloutResponse::Buffered(response))) => Ok(response),
+            Ok(CalloutOutcome::Response(CalloutResponse::Buffered(response))) => Ok((response, dialed.get().cloned())),
             Ok(CalloutOutcome::ResponseTooLarge { limit, .. }) => Err(McpBackendError::ResponseTooLarge { limit }),
             Ok(_) => Err(McpBackendError::Transport),
             Err(error) => {
@@ -260,8 +268,10 @@ impl McpBackendClient for FilteredMcpBackendClient {
         callout: &BackendCallout,
     ) -> Result<BackendInit, McpBackendError> {
         let request = post_request(target, initialize_body(protocol_version), callout, None)?;
-        let response = self.exchange(target, request, callout).await?;
-        parse_initialize_response(&response)
+        let (response, endpoint) = self.exchange(target, request, callout, None).await?;
+        let mut init = parse_initialize_response(&response)?;
+        init.endpoint = endpoint;
+        Ok(init)
     }
 
     async fn send_initialized(
@@ -272,7 +282,9 @@ impl McpBackendClient for FilteredMcpBackendClient {
     ) -> Result<(), McpBackendError> {
         let body = Bytes::from_static(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
         let request = post_request(target, body, callout, Some(session))?;
-        let response = self.exchange(target, request, callout).await?;
+        let (response, _endpoint) = self
+            .exchange(target, request, callout, session.endpoint.as_ref())
+            .await?;
         expect_success(response.status)
     }
 
@@ -294,7 +306,9 @@ impl McpBackendClient for FilteredMcpBackendClient {
             headers,
             body: Bytes::new(),
         };
-        let response = self.exchange(target, request, callout).await?;
+        let (response, _endpoint) = self
+            .exchange(target, request, callout, session.endpoint.as_ref())
+            .await?;
         // 404 and 405 mean the backend already forgot the session or does not
         // support client-initiated termination; both leave nothing to clean up.
         if matches!(response.status, 404 | 405) {
@@ -397,6 +411,7 @@ pub(crate) fn parse_initialize_response(response: &SubResponse) -> Result<Backen
     Ok(BackendInit {
         protocol_version,
         session_id,
+        endpoint: None,
     })
 }
 
