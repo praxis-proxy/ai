@@ -82,6 +82,7 @@ class RecordingBackend(BaseHTTPRequestHandler):
     tool_call_arguments = "{}"
     untranslatable_reply_once: str | None = None
     untranslatable_stream_once: str | None = None
+    fragmented_stream_once = False
     error_response_once = False
 
     def do_POST(self):
@@ -104,6 +105,22 @@ class RecordingBackend(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(reply)))
             self.end_headers()
             self.wfile.write(reply)
+            return
+        if body.get("stream") and RecordingBackend.fragmented_stream_once:
+            RecordingBackend.fragmented_stream_once = False
+            text = "é🌍" * 2048
+            event = {"id": "chatcmpl-stub", "model": MODEL,
+                     "choices": [{"index": 0, "delta": {"content": text},
+                                  "finish_reason": "stop"}]}
+            payload = ("data: " + json.dumps(event, ensure_ascii=False)
+                       + "\r\n\r\ndata: [DONE]\r\n\r\n").encode()
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            for offset in range(0, len(payload), 127):
+                self.wfile.write(payload[offset:offset + 127])
+                self.wfile.flush()
             return
         if body.get("stream"):
             if RecordingBackend.untranslatable_stream_once:
@@ -271,6 +288,7 @@ def _write_config(proxy_port: int, backend_port: int, allow_lossy: bool = False)
             + "        allow_lossy_features:\n"
             + "          - prompt_caching\n"
             + "          - extended_thinking\n"
+            + "          - mid_conversation_system\n"
         )
         replaced = config.replace(marker, replacement)
         assert replaced != config, f"example drift: translation filter block not found in {CONFIG_PATH}"
@@ -734,6 +752,20 @@ class TestResponseValidation:
 
 
 class TestStreamingResponseValidation:
+    def test_fragmented_utf8_crlf_stream(self, anthropic_client):
+        RecordingBackend.fragmented_stream_once = True
+        try:
+            with anthropic_client.messages.stream(
+                model=MODEL, max_tokens=8192,
+                messages=[{"role": "user", "content": "hello"}],
+            ) as stream:
+                text = "".join(stream.text_stream)
+                message = stream.get_final_message()
+            assert text == "é🌍" * 2048
+            assert message.stop_reason == "end_turn"
+        finally:
+            RecordingBackend.fragmented_stream_once = False
+
     def test_invalid_tool_id_aborts_incomplete_stream(self, anthropic_client):
         RecordingBackend.bodies.clear()
         events = []
@@ -856,6 +888,43 @@ class TestOperatorApprovedDegradation:
         assert raw.http_response.status_code == 200
         reported = raw.http_response.headers.get(DEGRADED_HEADER, "")
         assert "prompt_caching" in reported and "extended_thinking" in reported, reported
+
+    @pytest.mark.parametrize("leading", [False, True])
+    def test_mid_conversation_system_is_folded_and_reported(self, degrading_client, leading):
+        RecordingBackend.bodies.clear()
+
+        # Claude Code sends a text-only `system` message after the first user
+        # turn; vLLM chat templates reject it ("System message must be at the
+        # beginning"), so the allowlisted fold moves it into the single
+        # leading system message.
+        raw = degrading_client.messages.with_raw_response.create(
+            model=MODEL,
+            max_tokens=64,
+            system="Be brief",
+            messages=[
+                *([{"role": "system", "content": "Keep instruction order."}] if leading else []),
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "system", "content": "Answer tersely."},
+            ],
+        )
+
+        assert raw.http_response.status_code == 200
+        assert "mid_conversation_system" in raw.http_response.headers.get(DEGRADED_HEADER, "")
+        message = raw.parse()
+        assert message.content[0].text == "4"
+
+        [upstream] = RecordingBackend.bodies
+        system_messages = [m for m in upstream["messages"] if m["role"] == "system"]
+        assert system_messages == [
+            {
+                "role": "system",
+                "content": (
+                    "Be brief\n\n"
+                    + ("Keep instruction order.\n\n" if leading else "")
+                    + "Answer tersely."
+                ),
+            }
+        ], f"the fold must merge into one leading system message: {upstream['messages']}"
 
     def test_streaming_request_is_degraded_and_reported(self, degrading_client):
         RecordingBackend.bodies.clear()

@@ -64,7 +64,7 @@ fn supported_sampling_values_are_preserved() {
 #[tokio::test]
 async fn configured_version_overrides_caller_version() {
     for version in ["2023-06-01", "2026-10-21"] {
-        let config = serde_yaml::from_str(&format!("api_translation_enabled: true\napi_version: '{version}'")).unwrap();
+        let config = serde_yaml::from_str(&format!("api_version: '{version}'")).unwrap();
         let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
         let mut request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
         request
@@ -479,7 +479,7 @@ fn maps_anthropic_errors_to_openai_error_envelope() {
 
 #[tokio::test]
 async fn preserves_upstream_error_status_across_response_callbacks() {
-    let config: serde_yaml::Value = serde_yaml::from_str("api_translation_enabled: true").unwrap();
+    let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut response = json_response();
@@ -510,8 +510,7 @@ async fn preserves_upstream_error_status_across_response_callbacks() {
 
 #[tokio::test]
 async fn request_profile_stays_pinned_through_response_after_route_metadata_changes() {
-    let config: serde_yaml::Value =
-        serde_yaml::from_str("api_translation_enabled: true\nmax_body_bytes: 4096").unwrap();
+    let config: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 4096").unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions?trace=1");
     let mut response = Response {
@@ -572,27 +571,28 @@ async fn request_profile_stays_pinned_through_response_after_route_metadata_chan
 }
 
 #[tokio::test]
-async fn stale_anthropic_profile_fails_closed_when_tenant_permission_is_off() {
+async fn default_config_translates_selected_anthropic_request() {
     let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&request);
     selected_profile_metadata(&mut ctx);
 
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(&action, FilterAction::Reject(_)),
-        "disabled tenant permission must reject a stale Anthropic profile"
-    );
-    let FilterAction::Reject(rejection) = action else {
-        return;
-    };
-    assert_eq!(rejection.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(
-        String::from_utf8_lossy(rejection.body.as_deref().unwrap())
-            .contains("platform administrator has forbidden translation")
-    );
-    assert!(ctx.request_headers_to_set.is_empty());
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"client-model","messages":[{"role":"user","content":"hi"}],"max_tokens":20}"#,
+    ));
+    let outcome = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SelectedUpstreamBodyOutcome::Continue));
+    let translated: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(translated["messages"][0]["content"][0]["text"], "hi");
+    assert_eq!(translated["max_tokens"], 20);
 }
 
 #[tokio::test]
@@ -624,8 +624,7 @@ async fn openai_candidate_rewrites_only_the_selected_target_model() {
 #[tokio::test]
 #[expect(clippy::panic, reason = "tests assert that unsupported requests are rejected")]
 async fn selected_request_body_limit_rejects_before_json_parsing() {
-    let config: serde_yaml::Value =
-        serde_yaml::from_str("api_translation_enabled: true\nmax_request_body_bytes: 1").unwrap();
+    let config: serde_yaml::Value = serde_yaml::from_str("max_request_body_bytes: 1").unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&request);
@@ -658,9 +657,7 @@ async fn selected_request_body_limit_rejects_before_json_parsing() {
 async fn split_request_limit_accepts_boundary_and_rejects_one_byte_over() {
     let valid = br#"{"model":"client-model","messages":[{"role":"user","content":"hi"}],"max_tokens":20}"#;
     let max_request_body_bytes = valid.len() + 2;
-    let yaml = format!(
-        "api_translation_enabled: true\nmax_request_body_bytes: {max_request_body_bytes}\nmax_response_body_bytes: 1"
-    );
+    let yaml = format!("max_request_body_bytes: {max_request_body_bytes}\nmax_response_body_bytes: 1");
     let config: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
 
@@ -705,8 +702,7 @@ async fn split_request_limit_accepts_boundary_and_rejects_one_byte_over() {
 
 #[tokio::test]
 async fn translates_json_response_split_across_streamed_chunks() {
-    let config: serde_yaml::Value =
-        serde_yaml::from_str("api_translation_enabled: true\nmax_body_bytes: 4096").unwrap();
+    let config: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 4096").unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut response = json_response();
@@ -756,8 +752,7 @@ async fn translates_json_response_split_across_streamed_chunks() {
     reason = "tests assert that over-limit provider responses are rejected"
 )]
 async fn rejects_json_response_that_exceeds_accumulation_limit() {
-    let config: serde_yaml::Value =
-        serde_yaml::from_str("api_translation_enabled: true\nmax_response_body_bytes: 128").unwrap();
+    let config: serde_yaml::Value = serde_yaml::from_str("max_response_body_bytes: 128").unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut response = json_response();
@@ -805,9 +800,7 @@ async fn rejects_json_response_that_exceeds_accumulation_limit() {
 async fn split_response_limit_is_enforced_after_a_larger_request_limit_accepts() {
     let upstream = anthropic_json_response();
     let response_limit = upstream.len();
-    let yaml = format!(
-        "api_translation_enabled: true\nmax_request_body_bytes: 4096\nmax_response_body_bytes: {response_limit}"
-    );
+    let yaml = format!("max_request_body_bytes: 4096\nmax_response_body_bytes: {response_limit}");
     let config: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
 
@@ -834,7 +827,7 @@ async fn split_response_limit_is_enforced_after_a_larger_request_limit_accepts()
     assert!(serde_json::from_slice::<Value>(body.as_ref().unwrap()).is_ok());
 
     let yaml = format!(
-        "api_translation_enabled: true\nmax_request_body_bytes: 4096\nmax_response_body_bytes: {}",
+        "max_request_body_bytes: 4096\nmax_response_body_bytes: {}",
         response_limit - 1
     );
     let config: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
@@ -866,7 +859,7 @@ async fn split_response_limit_is_enforced_after_a_larger_request_limit_accepts()
 #[tokio::test]
 #[expect(clippy::panic, reason = "tests assert that invalid provider JSON is rejected")]
 async fn rejects_invalid_provider_json_with_a_downstream_502() {
-    let config: serde_yaml::Value = serde_yaml::from_str("api_translation_enabled: true").unwrap();
+    let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
     let filter = OpenaiChatCompletionsToAnthropicFilter::from_config(&config).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut response = json_response();

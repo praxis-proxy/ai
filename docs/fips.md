@@ -27,7 +27,8 @@ Responses, stores or the agentic loop by default:
 | `aws_sigv4_sign` filter (AWS request signing) | yes | yes: SHA-256 and HMAC-SHA256 through OpenSSL |
 | `policy` filter (policy engine) | yes | no: its dependencies carry their own cryptography |
 | PostgreSQL Responses store | experimental opt-in | experimental opt-in: certificate-only SQLx profile through system OpenSSL |
-| SQLite store, Conversations API, context compaction, MCP tools | experimental opt-in | no: their additional dependency boundaries have not been cleared for this profile |
+| Conversations API | experimental opt-in | experimental opt-in: certificate-only SQLx profile through system OpenSSL |
+| SQLite store, context compaction, MCP tools | experimental opt-in | no: their additional dependency boundaries have not been cleared for this profile |
 | `openai_file_resolve` | experimental opt-in | experimental opt-in: uses the shared subrequest transport |
 | `azure_ad`, `gcp_adc`, MCP tool dispatch | experimental opt-in | no: their dependency boundaries have not been cleared for this profile |
 | Base image | Alpine, praxis-ai built with upstream Rust | `ubi9/ubi-minimal`, praxis-ai built with Red Hat's `rust-toolset` on `ubi9/ubi`, both pinned by digest and signature-verified |
@@ -48,8 +49,9 @@ protocol engine and the OpenSSL bindings that delegate every primitive to the
 system library; the rest of the crypto-adjacent crates in the image are
 listed in the exemption table at the end of this page.
 
-For the experimental Responses/certificate-authenticated store profile, use
-`make release-fips FIPS_FEATURES=aws-sigv4-filter,openai-responses,openai-file-resolve-filter,store-postgres-cert-auth`
+For the experimental Responses and Conversations certificate-authenticated
+store profile, use
+`make release-fips FIPS_FEATURES=aws-sigv4-filter,openai-responses,openai-file-resolve-filter,openai-conversations,store-postgres-cert-auth`
 or pass the same list as `--build-arg CARGO_FEATURES=...` to `Containerfile.fips`.
 The agentic loop additionally requires `openai-agentic-loop`.
 
@@ -249,7 +251,8 @@ Every crypto-adjacent component in the FIPS image, and why it is compliant:
 | policy engine (`policy` filter) | JWT, OAuth, Valkey builtins carry aws-lc, sha2 and hmac | not in the FIPS build |
 | `aws_sigv4_sign` filter | SHA-256 and HMAC-SHA256 for `SigV4` through OpenSSL (`praxis_ai_apis::hash`) | compliant; the `aws-sigv4` crate (RustCrypto `hmac`/`sha2`) is a test-only dependency |
 | PostgreSQL Responses store | SQL transport and client-certificate authentication | compliant through system OpenSSL; migrations, password authentication, and advisory-lock hashing are not compiled |
-| SQLite store, Conversations, compaction, MCP tools | sqlx's sha2 (migration checksums), sqlx-postgres' md-5/hmac/sha2/hkdf/rsa (SCRAM) | not in the FIPS build |
+| Conversations API | Conversations state in PostgreSQL through the certificate-only SQLx profile | compliant through system OpenSSL; the store uses `store-postgres-cert-auth` (no migrations, no password authentication) |
+| SQLite store, compaction, MCP tools | sqlx's sha2 (migration checksums), sqlx-postgres' md-5/hmac/sha2/hkdf/rsa (SCRAM) | not in the FIPS build |
 | `openai_file_resolve`, `azure_ad`, MCP tool dispatch | reqwest over rustls with no bundled provider (TLS through the installed OpenSSL-backed provider); MCP tool dispatch additionally requires the store | not in the FIPS build |
 | `gcp_adc` filter | shared subrequest transport (TLS through the installed OpenSSL-backed provider); the `key_file` source signs its `RS256` assertion through OpenSSL's EVP signing API | not in the FIPS build (experimental) |
 | `basic_auth` filter (praxis core) | password hashing through OpenSSL's SHA-256 (EVP) | compliant; experimental in praxis-ai and off in every build unless enabled |
@@ -262,3 +265,11 @@ Every crypto-adjacent component in the FIPS image, and why it is compliant:
 The report and Red Hat's scanner both confirm the last row on every build:
 the embedded crate manifest lists none of the denied crates, and the binary
 defines no symbol of a bundled crypto backend.
+
+## Release readiness
+
+The [release checklist](release.md#pre-release-checklist) includes
+FIPS-specific items. The release workflow's `fips-proof` job blocks
+publication unless a successful `fips-host` run exists for the release
+commit. The release CI evidence table records the FIPS workflow outcome
+alongside every other tracked workflow.

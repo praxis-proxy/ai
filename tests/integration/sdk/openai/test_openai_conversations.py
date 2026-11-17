@@ -3645,3 +3645,43 @@ def test_conversations_database_error_rolls_back_mutation(legacy_sqlite_record_c
         database.execute("DROP TRIGGER fail_mutation")
     assert client.conversations.retrieve(conversation.id).metadata == {"keep": "original"}
     assert [row.id for row in client.conversations.items.list(conversation.id).data] == [item.id]
+
+
+@pytest.fixture(params=[False, True], ids=["native", "translated"])
+def conversation_backend_doc_extract_capped(request, tmp_path):
+    yield from _run_conversation_proxy(tmp_path, request.param, [{
+        "filter": "openai_doc_extract",
+        "allow_pre_security_callout": True,
+        "max_rewritten_body_bytes": 1024,
+    }])
+
+
+def test_document_extraction_rejects_json_escaping_expansion(conversation_backend_doc_extract_capped):
+    import base64
+
+    client, captured, _, _ = conversation_backend_doc_extract_capped
+    # The decoded text and base64 input fit the cap, but JSON escapes each NUL
+    # into six bytes. The rejection must happen before forwarding to inference.
+    with pytest.raises(openai.APIStatusError) as exc_info:
+        client.responses.create(model="test-model", input=[{
+            "role": "user",
+            "content": [{
+                "type": "input_file",
+                "filename": "notes.txt",
+                "file_data": "data:text/plain;base64," + base64.b64encode(b"\0" * 256).decode(),
+            }],
+        }])
+    assert exc_info.value.status_code == 413
+    assert exc_info.value.body["type"] == "invalid_request_error"
+    assert not captured, "oversized document must never reach the backend"
+    response = client.responses.create(model="test-model", input=[{
+        "role": "user",
+        "content": [{
+            "type": "input_file",
+            "filename": "notes.txt",
+            "file_data": "data:text/plain;base64," + base64.b64encode(b"small document").decode(),
+        }],
+    }])
+    assert response.status == "completed"
+    assert "small document" in json.dumps(captured[-1][1])
+    assert "file_data" not in json.dumps(captured[-1][1])
