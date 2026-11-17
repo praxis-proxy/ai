@@ -1901,7 +1901,13 @@ fn extract_u32(body: &serde_json::Value, field: &str) -> Option<u32> {
     let raw = body.get(field)?;
     let result = raw.as_u64().and_then(|v| u32::try_from(v).ok());
     if result.is_none() {
-        tracing::debug!(field, %raw, "ignoring non-u32 value");
+        // Log only the JSON type: a non-numeric value here is client-supplied
+        // body content and must not reach logs.
+        tracing::debug!(
+            field,
+            json_type = crate::openai::translation::chat_completions::json_type_name(raw),
+            "ignoring non-u32 value"
+        );
     }
     result
 }
@@ -1928,6 +1934,25 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn non_numeric_u32_field_logs_type_not_value() {
+        let secret = "PRAXIS-SECRET-7f3a91";
+        let body = json!({ "max_tool_calls": secret });
+
+        let logs = crate::test_utils::capture_log_output(|| {
+            assert_eq!(extract_u32(&body, "max_tool_calls"), None, "string is not a u32");
+        });
+
+        assert!(
+            logs.contains("json_type=\"string\""),
+            "JSON type should be logged: {logs}"
+        );
+        assert!(
+            !logs.contains(secret),
+            "client-supplied value must not reach logs: {logs}"
+        );
+    }
 
     #[test]
     fn from_request_body_extracts_string_input() {

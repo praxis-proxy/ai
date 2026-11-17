@@ -7490,3 +7490,64 @@ async fn apply_patch_stream_fails_closed_on_malformed_patch() {
         "no successful custom input is emitted for a malformed patch: {emitted}",
     );
 }
+
+/// Marker standing in for user content that a provider echoes in an error.
+const ECHOED_SECRET: &str = "PRAXIS-SECRET-7f3a91";
+
+#[test]
+fn streaming_error_event_logs_classification_without_message() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let filter = make_filter_from("");
+    let mut state = filter.new_round_state(0, 0);
+    let mut event = crate::openai::sse::responses::ResponsesEvent::Error(json!({
+        "type": "error",
+        "code": "invalid_prompt",
+        "param": "input",
+        "message": format!("Invalid prompt: '{ECHOED_SECRET}' was flagged"),
+        "sequence_number": 3,
+    }));
+
+    let logs = crate::test_utils::capture_log_output(|| {
+        super::accumulate_event(&mut ctx, &mut state, &mut event);
+    });
+
+    assert!(
+        logs.contains("streaming error event received"),
+        "error event should still be logged: {logs}"
+    );
+    assert!(logs.contains("invalid_prompt"), "error code should be logged: {logs}");
+    assert!(logs.contains("param=\"input\""), "param should be logged: {logs}");
+    assert!(
+        !logs.contains(ECHOED_SECRET),
+        "provider error message must not reach logs: {logs}"
+    );
+}
+
+#[test]
+fn streaming_error_event_reads_nested_error_and_bounds_fields() {
+    let long_code = format!("{}{ECHOED_SECRET}", "é".repeat(64));
+    let payload = json!({
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "code": long_code,
+            "message": ECHOED_SECRET,
+        },
+    });
+
+    let logs = crate::test_utils::capture_log_output(|| super::accumulator::log_error_event(&payload));
+
+    assert!(
+        logs.contains("error_type=\"invalid_request_error\""),
+        "nested error type should be logged: {logs}"
+    );
+    assert!(
+        logs.contains(&format!("code=\"{}\"", "é".repeat(64))),
+        "code should be cut to 64 chars on a char boundary: {logs}"
+    );
+    assert!(
+        !logs.contains(ECHOED_SECRET),
+        "content beyond the field bound or in message must not reach logs: {logs}"
+    );
+}
