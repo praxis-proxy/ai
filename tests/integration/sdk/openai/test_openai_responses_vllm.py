@@ -7042,6 +7042,65 @@ class TestClientToolCompatVLLM:
         echoed = [getattr(t, "name", None) for t in response.tools]
         assert "mcp__codex_tui" in echoed, response.tools
 
+    @pytest.mark.parametrize(
+        "description",
+        ["", "   "],
+        ids=["empty", "whitespace"],
+    )
+    def test_blank_namespace_description_is_accepted(
+        self, client_tool_compat_client, description
+    ):
+        """Pinned ``NamespaceToolParam.description`` is a required string with no
+        ``minLength``, so empty and whitespace-only values must round-trip through
+        ``openai_client_tool_compat`` rather than failing closed with HTTP 400.
+
+        Asserts only filter-guaranteed, model-independent invariants: reaching a
+        completed response (no BadRequestError) and echoing the original namespace
+        without leaking a private lowered wire name.
+        """
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say hi. /no_think",
+            tools=[
+                {
+                    "type": "namespace",
+                    "name": "utils",
+                    "description": description,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "ping",
+                            "description": "Return ok.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": False,
+                            },
+                        }
+                    ],
+                }
+            ],
+            temperature=0,
+            store=False,
+            max_output_tokens=2048,
+        )
+
+        assert response.status == "completed", (
+            "blank namespace descriptions must be accepted; got "
+            f"{response.status}: {response}"
+        )
+        leaked = [
+            name
+            for name in (getattr(item, "name", None) for item in response.output)
+            if isinstance(name, str) and name.startswith("agentic_ns__")
+        ]
+        assert not leaked, f"lowered namespace wire name leaked: {leaked}"
+        echoed = [getattr(t, "name", None) for t in response.tools]
+        assert "utils" in echoed, (
+            "original utils namespace must be echoed in response.tools; "
+            f"got {response.tools}"
+        )
+
     def test_single_round_declared_and_discovered_tools_lower_without_leaking(
         self, client_tool_compat_client
     ):

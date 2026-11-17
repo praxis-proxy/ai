@@ -1286,8 +1286,9 @@ fn folded_description(value: Option<&Value>) -> String {
 /// - a `custom` tool/member folds a *trimmed, dropped-when-empty* description into its prose
 ///   ([`custom_model_visible_description`]), so `null`/absent/empty/whitespace collapse to omission and a
 ///   trailing-space delta collapses to the trimmed value.
-/// - a `namespace` tool *trims* its (required) description before folding it into every member ([`namespace_header`]),
-///   so a trailing-space delta collapses.
+/// - a `namespace` tool *trims* a present string description before folding it into every member
+///   ([`namespace_header`]), so a trailing-space or blank-only delta collapses. Missing / `null` / non-string values
+///   stay distinct: they reject on lower, so they must not share identity with a schema-valid empty string.
 /// - a `shell` tool *ignores* its `description` entirely (only `environment.skills` is folded, per
 ///   [`shell_model_visible_description`]), so it never distinguishes two listings.
 /// - a `tool_search` tool uses its `description` *verbatim* (or a default when empty, per
@@ -1304,10 +1305,11 @@ fn normalize_identity_description(map: &mut Map<String, Value>) {
             }
         },
         Some("namespace") => {
-            map.insert(
-                "description".to_owned(),
-                json!(folded_description(map.get("description"))),
-            );
+            // Keep reject-worthy shapes (absent / null / non-string) out of the blank-string
+            // identity so a would-reject twin cannot silently dedup behind `""`.
+            if let Some(Value::String(description)) = map.get("description") {
+                map.insert("description".to_owned(), json!(description.trim()));
+            }
         },
         Some("shell") => {
             map.remove("description");
@@ -1997,30 +1999,26 @@ impl Lowering {
 struct NamespaceContext<'a> {
     /// The namespace's non-empty `name`, prefixed to each member's flat wire name.
     name: &'a str,
-    /// The namespace's required model-visible `description`, folded into each member.
+    /// The namespace's required model-visible `description` (may be empty after trim),
+    /// folded into each member.
     description: &'a str,
 }
 
 /// Validate a `namespace` declaration's required fields, returning its
 /// model-visible context and members.
 ///
-/// `NamespaceToolParam` requires a non-empty `name`, a non-empty `description`
-/// (`minLength: 1`, shown to the model), and a non-empty `tools` array
-/// (`minItems: 1`). Each is schema-invalid when missing, so a request that omits
-/// one fails closed rather than lowering members that drop the namespace's
-/// model-visible contract or silently dropping the whole declaration.
+/// `NamespaceToolParam` requires a non-empty `name` (`minLength: 1`), a string
+/// `description` (required, but with no `minLength`, so empty/whitespace are
+/// schema-valid), and a non-empty `tools` array (`minItems: 1`). Omitting
+/// `description` or giving a non-string still fails closed; a present blank
+/// string is accepted and trimmed before folding.
 fn namespace_header(tool: &Value) -> Result<(NamespaceContext<'_>, &[Value]), FilterAction> {
     let Some(name) = tool.get("name").and_then(Value::as_str).filter(|name| !name.is_empty()) else {
         return Err(reject_bad_request("namespace tool requires a non-empty name"));
     };
-    let Some(description) = tool
-        .get("description")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|description| !description.is_empty())
-    else {
+    let Some(description) = tool.get("description").and_then(Value::as_str).map(str::trim) else {
         return Err(reject_bad_request(&format!(
-            "namespace '{name}' requires a non-empty description"
+            "namespace '{name}' requires a string description"
         )));
     };
     let Some(members) = tool
@@ -2040,9 +2038,13 @@ fn namespace_header(tool: &Value) -> Result<(NamespaceContext<'_>, &[Value]), Fi
 /// A flattened member loses its `namespace` grouping on the wire, so the
 /// namespace's required description is folded into each member's description to
 /// keep the model-visible tool contract intact. An empty member body yields just
-/// the namespace context.
+/// the namespace context; a blank namespace description still records the grouping.
 fn prepend_namespace_context(namespace: &str, namespace_description: &str, body: &str) -> String {
-    let prefix = format!("Belongs to the `{namespace}` tool namespace: {namespace_description}");
+    let prefix = if namespace_description.is_empty() {
+        format!("Belongs to the `{namespace}` tool namespace.")
+    } else {
+        format!("Belongs to the `{namespace}` tool namespace: {namespace_description}")
+    };
     let body = body.trim();
     if body.is_empty() {
         prefix
