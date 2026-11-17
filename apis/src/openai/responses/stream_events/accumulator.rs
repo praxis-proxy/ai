@@ -53,9 +53,7 @@ pub(super) fn accumulate_event(
         },
         ResponsesEvent::FunctionCallArgumentsDone(payload) => handle_function_call_done(ctx, filter_state, payload),
 
-        ResponsesEvent::Error(payload) => {
-            warn!(error = %payload, "streaming error event received");
-        },
+        ResponsesEvent::Error(payload) => log_error_event(payload),
 
         ResponsesEvent::Unknown { event_type, .. } => {
             debug!(event_type, "unknown SSE event type (forward-compat)");
@@ -115,6 +113,38 @@ pub(super) fn accumulate_response_object(
 
     debug!(status, "complete response received, ResponsesState updated");
     had_prior_usage
+}
+
+/// Longest `type`, `code`, or `param` value logged from a provider error event.
+const MAX_LOGGED_ERROR_FIELD_CHARS: usize = 64;
+
+/// Log a provider `error` event without its free-text `message`.
+///
+/// Provider error messages can quote request content, so only the bounded
+/// classification fields are recorded. Fields are read from a nested `error`
+/// object when present, otherwise from the event itself.
+pub(super) fn log_error_event(payload: &Value) {
+    let error = payload.get("error").filter(|e| e.is_object()).unwrap_or(payload);
+    let field = |name: &str| {
+        error
+            .get(name)
+            .and_then(Value::as_str)
+            .map(|s| truncate_chars(s, MAX_LOGGED_ERROR_FIELD_CHARS))
+    };
+    warn!(
+        error_type = field("type"),
+        code = field("code"),
+        param = field("param"),
+        "streaming error event received"
+    );
+}
+
+/// Borrow at most `max_chars` characters of `s`, cutting on a char boundary.
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    s.char_indices()
+        .nth(max_chars)
+        .and_then(|(end, _)| s.get(..end))
+        .unwrap_or(s)
 }
 
 /// Push a new output item to the incremental accumulator.

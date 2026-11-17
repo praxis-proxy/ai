@@ -207,6 +207,13 @@ which existing filters were considered and why extending them is unsuitable.
 - **Validate only proxy-needed fields**: let the
   backend handle parameter ranges, model
   availability, and role ordering.
+- **Log metadata, never content**: tracing fields
+  carry sizes, counts, JSON types, IDs, and bounded
+  classification fields (`type`, `code`). Request,
+  response, tool-argument, and provider error
+  `message` text stays out of logs, since providers
+  echo user input in errors. Prove it with
+  `test_utils::capture_log_output` and a marker string.
 
 ## Filter Organization
 
