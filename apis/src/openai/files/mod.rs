@@ -32,7 +32,7 @@ pub use openapi::implementation_openapi_json;
 #[cfg(feature = "openai-files")]
 pub use registry::{FileRegistry, FileRegistryError};
 #[cfg(feature = "openai-files")]
-pub use service::{FileDownload, FileService, FileServiceError};
+pub use service::{DefaultFileService, FileDownload, FileService, FileServiceError};
 #[cfg(feature = "openai-files")]
 pub use store::{FileStore, FileStoreError};
 

@@ -3,7 +3,10 @@
 
 //! Handler-facing Files operations.
 
+mod default;
+
 use async_trait::async_trait;
+pub use default::DefaultFileService;
 use praxis_ai_store::StateOwner;
 
 use super::{
