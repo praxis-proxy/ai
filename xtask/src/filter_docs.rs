@@ -1327,7 +1327,7 @@ fn has_from_config_method(imp: &syn::ItemImpl) -> bool {
 
 /// Extract the config type name from `let cfg: T = parse_filter_config(...)`.
 ///
-/// Scans the filter factory (`from_config` or `from_config_with_binding`)
+/// Scans the filter factories (`from_config` and `from_config_with_binding`)
 /// first. When the factory delegates to a private helper (e.g. `build`), the
 /// `parse_filter_config` call lives there instead, so we fall back to scanning
 /// other methods in the same impl block.
@@ -1338,8 +1338,12 @@ fn extract_config_type_name(imp: &syn::ItemImpl) -> Option<String> {
         .filter_map(|item| if let syn::ImplItem::Fn(m) = item { Some(m) } else { None })
         .collect();
 
-    if let Some(factory) = methods.iter().find(|m| is_factory_method(m))
-        && let Some(name) = scan_method_for_config_type(factory)
+    // A filter may expose both factories, with `from_config` delegating to
+    // `from_config_with_binding`; scan every factory before helper methods.
+    if let Some(name) = methods
+        .iter()
+        .filter(|m| is_factory_method(m))
+        .find_map(|m| scan_method_for_config_type(m))
     {
         return Some(name);
     }

@@ -93,16 +93,61 @@ Client --> MCP Broker Filter
              +-- tools/list:  aggregated catalog
              |                from all servers
              +-- ping:        local response (current profile only)
-             +-- tools/call:  stateless routes by
-             |                configured catalog tool
-             |                current profile returns -32601
-             +-- DELETE:      session termination
+             +-- tools/call:  routes by configured
+             |                catalog tool; current profile
+             |                needs backend_sessions, else
+             |                returns -32601
+             +-- DELETE:      session termination (and
+                              backend session cleanup)
 ```
 
 Each server entry specifies a name, upstream cluster,
 path prefix, tool prefix (for namespace isolation),
 and tool list. The broker aggregates tools from all
 configured servers into a single catalog response.
+
+### Current-Profile Backend Sessions
+
+Stateful MCP backends reject `tools/call` without a
+prior `initialize` on a backend session. With
+`backend_sessions` configured, the broker maps each
+`(gateway Mcp-Session-Id, server)` pair to one backend
+session:
+
+```text
+tools/call (gateway session G, tool weather_x)
+  |
+  +-- mapping (G, weather) missing?
+  |     initialize            --> weather cluster
+  |     capture Mcp-Session-Id B
+  |     notifications/initialized (B) --> weather cluster
+  |
+  +-- forward tools/call with Mcp-Session-Id B
+  |   through the main chain (streams, policies apply)
+  |
+  +-- backend 404 --> drop (G, weather); the next call
+                      runs a fresh handshake
+```
+
+The handshake runs as a filtered subrequest through a
+generated outbound chain: the `mcp_broker_backend`
+selector, any `outbound_filters`, and a `load_balancer`
+that references each server cluster by name, so server
+clusters must be declared in top-level `clusters:`.
+Each exchange is bounded by `handshake_timeout_ms` and
+`max_response_bytes`; oversized or chunked replies are
+rejected before the full body is retained.
+
+Concurrent first calls for one pair share a single
+handshake. A mapping is bound to a SHA-256 fingerprint
+of the forwarded credential headers, so a different
+credential on the same gateway session runs its own
+handshake. A gateway `DELETE` terminates only the
+backend sessions created with the caller's own
+credentials. The map is in memory, per filter instance,
+capped by `max_sessions` (least recently used entries
+are evicted) and expired after `idle_timeout_ms`.
+Distributed session storage is tracked separately.
 
 ### Filter Results
 

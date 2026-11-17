@@ -17,7 +17,7 @@ Writes `mcp.*` and `json_rpc.*` entries to the filter result set for branch chai
 
 In the stateless profile, `tools/call` routes to the configured backend cluster by exposed tool name, stripping the public prefix from `params.name` and repairing the forwarded `Mcp-Name` header before forwarding.
 
-In the current profile, `tools/call` returns `-32601` because current-profile routing requires session infrastructure not implemented here.
+In the current profile, `tools/call` returns `-32601` unless `backend_sessions` is configured. With it, the broker lazily runs the backend `initialize` / `notifications/initialized` handshake once per `(Mcp-Session-Id, server)` pair through a generated outbound chain that dials the server's top-level cluster, then forwards the call to that cluster with the backend `Mcp-Session-Id`. A backend `404` drops the mapping so the next call reinitializes. Server clusters must be declared in top-level `clusters:` so the handshake chain can reference them.
 
 Supports two protocol profiles: `current` (session-based, default) and `stateless` (MCP 2026-07-28, configurable). Version and cache fields are derived from the selected profile when omitted.
 
@@ -36,6 +36,13 @@ Supports two protocol profiles: `current` (session-based, default) and `stateles
 | `headers.session_present` | string | no | Header name for MCP session presence (e.g. `x-praxis-mcp-session-present`). |
 | `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer`. |
 | `on_invalid` | `continue` \| `reject` \| `error` | no | Invalid input handling behavior. |
+| `backend_sessions` | object | no | Current-profile backend session management. Requires `protocol_profile: current`. |
+| `backend_sessions.forward_headers` | string[] | no | Request headers copied from the client request onto the handshake. |
+| `backend_sessions.idle_timeout_ms` | integer | no | Idle lifetime of one backend session mapping, in milliseconds. |
+| `backend_sessions.handshake_timeout_ms` | integer | no | Deadline for one handshake exchange, in milliseconds. |
+| `backend_sessions.max_sessions` | integer | no | Maximum retained backend session mappings. |
+| `backend_sessions.max_response_bytes` | integer | no | Response body ceiling for each handshake exchange, in bytes. |
+| `backend_sessions.outbound_filters` | FilterEntry[] | no | Extra filters run on each handshake subrequest before the broker's generated `load_balancer` (for example credential injection). |
 | `cache_scope` | `public` \| `private` | no | Cache scope for stateless responses. Requires `protocol_profile: stateless`. |
 | `cache_ttl_ms` | integer | no | Cache TTL in milliseconds for stateless responses. Requires `protocol_profile: stateless`. |
 | `default_version` | string | no | Fallback MCP protocol version. When omitted, derived from the profile. |
