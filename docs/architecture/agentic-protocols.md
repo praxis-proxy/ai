@@ -138,6 +138,18 @@ Each exchange is bounded by `handshake_timeout_ms` and
 `max_response_bytes`; oversized or chunked replies are
 rejected before the full body is retained.
 
+A backend session exists only on the endpoint that
+issued it, so the broker records the endpoint the
+handshake's `load_balancer` dialed and pins
+`notifications/initialized`, session `DELETE`, and
+every forwarded call to it through core's
+`pinned_endpoint_address` (the cluster's TLS and
+connection settings still apply). Clusters with
+several endpoints therefore keep each session on one
+replica. A `502` from the pinned endpoint drops the
+mapping like a `404`. Sessionless backends are not
+pinned.
+
 Concurrent first calls for one pair share a single
 handshake. A mapping is bound to a SHA-256 fingerprint
 of the forwarded credential headers, so a different

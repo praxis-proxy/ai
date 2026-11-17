@@ -158,6 +158,59 @@ fn current_profile_backend_404_reinitializes_on_next_call() {
 }
 
 #[test]
+fn current_profile_pins_backend_session_to_its_endpoint() {
+    // Two replicas of the weather server behind one cluster. Each replica only
+    // knows the sessions it minted, so a handshake or call that lands on the
+    // other replica gets a 404. Round-robin would alternate between them.
+    let replica_a = start_session_backend("get_weather");
+    let replica_b = start_session_backend("get_weather");
+    let calendar = start_session_backend("create_event");
+    let yaml = session_broker_yaml(&replica_a, &calendar, "").replacen(
+        &format!("endpoints: [\"{}\"]", replica_a.endpoint()),
+        &format!(
+            "endpoints: [\"{}\", \"{}\"]",
+            replica_a.endpoint(),
+            replica_b.endpoint()
+        ),
+        1,
+    );
+    let proxy = start_proxy(&Config::from_yaml(&yaml).unwrap());
+    let gateway = initialize_gateway(proxy.addr());
+
+    for id in 1..=4 {
+        let raw = http_send(proxy.addr(), &tools_call(&gateway, id, "weather_get_weather"));
+        assert_eq!(
+            parse_status(&raw),
+            200,
+            "call {id} must reach the session's replica: {raw}"
+        );
+    }
+
+    let (owner, other) = if replica_a.sessions_minted() == 1 {
+        (&replica_a, &replica_b)
+    } else {
+        (&replica_b, &replica_a)
+    };
+    assert_eq!(owner.sessions_minted(), 1, "exactly one backend session must exist");
+    assert_eq!(other.sessions_minted(), 0, "the other replica must not be initialized");
+    assert_eq!(
+        owner.method_count("notifications/initialized"),
+        1,
+        "notifications/initialized must reach the replica that minted the session"
+    );
+    assert_eq!(
+        owner.tool_call_count("get_weather"),
+        4,
+        "every call must reach the replica that owns the session"
+    );
+    assert_eq!(
+        other.received_requests().len(),
+        0,
+        "nothing may reach the replica without the session"
+    );
+}
+
+#[test]
 fn current_profile_rejects_oversized_chunked_handshake() {
     let weather = start_mcp_mock_server_with_config(McpMockConfig {
         enforce_sessions: true,

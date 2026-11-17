@@ -145,6 +145,13 @@ struct ForwardedCall {
     key: BackendSessionKey,
     /// Backend session id sent upstream.
     session_id: http::HeaderValue,
+    /// Endpoint the backend session lives on.
+    ///
+    /// The broker resolves the session in the request-body phase, but core
+    /// rebuilds `pinned_endpoint_address` empty for every phase, so the pin is
+    /// carried here and applied in the header phase that runs the
+    /// `load_balancer`.
+    endpoint: Option<Arc<str>>,
 }
 
 // -----------------------------------------------------------------------------
@@ -455,9 +462,7 @@ impl McpBrokerFilter {
         };
 
         forward_current_tools_call(ctx, value, body, tool, &init);
-        if let Some(session_id) = init.session_id {
-            ctx.insert_filter_state(ForwardedCall { key, session_id });
-        }
+        record_forwarded_call(ctx, key, init);
         FilterAction::Release
     }
 
@@ -716,7 +721,18 @@ impl HttpFilter for McpBrokerFilter {
         }
 
         match ctx.request.method {
-            http::Method::POST => Ok(FilterAction::Continue),
+            http::Method::POST => {
+                // With a pre-read body the body phase already resolved the
+                // backend session; pin its endpoint for the load_balancer that
+                // runs later in this phase.
+                let pinned = ctx
+                    .get_filter_state::<ForwardedCall>()
+                    .and_then(|call| call.endpoint.clone());
+                if pinned.is_some() {
+                    ctx.pinned_endpoint_address = pinned;
+                }
+                Ok(FilterAction::Continue)
+            },
             http::Method::DELETE => Ok(self.handle_delete(ctx).await),
             _ => Ok(FilterAction::Reject(Rejection::status(405))),
         }
@@ -769,13 +785,17 @@ impl HttpFilter for McpBrokerFilter {
             return Ok(FilterAction::Continue);
         };
         let status = ctx.response_header.as_ref().map(|response| response.status);
-        if status == Some(http::StatusCode::NOT_FOUND)
-            && let Some(backend) = self.backend.as_ref()
+        // 404: the backend forgot the session. 502: the pinned endpoint is
+        // unreachable, and the session cannot be served anywhere else.
+        if matches!(
+            status,
+            Some(http::StatusCode::NOT_FOUND | http::StatusCode::BAD_GATEWAY)
+        ) && let Some(backend) = self.backend.as_ref()
             && backend.store.invalidate(&call.key, &call.session_id)
         {
             debug!(
                 server = call.key.server,
-                "mcp backend session expired; mapping invalidated"
+                "mcp backend session expired or unreachable; mapping invalidated"
             );
         }
         Ok(FilterAction::Continue)
@@ -980,6 +1000,18 @@ fn forward_current_tools_call(
     }
     if let Ok(version) = http::HeaderValue::from_str(&init.protocol_version) {
         ctx.request_headers_to_set.push((MCP_PROTOCOL_VERSION, version));
+    }
+}
+
+/// Record a forwarded session-bearing call so the header phase can pin its
+/// endpoint and the response can invalidate an expired or unreachable session.
+fn record_forwarded_call(ctx: &mut HttpFilterContext<'_>, key: BackendSessionKey, init: BackendInit) {
+    if let Some(session_id) = init.session_id {
+        ctx.insert_filter_state(ForwardedCall {
+            key,
+            session_id,
+            endpoint: init.endpoint,
+        });
     }
 }
 

@@ -85,6 +85,7 @@ impl McpBackendClient for MockBackend {
         Ok(BackendInit {
             protocol_version: Box::from("2025-06-18"),
             session_id: (!self.sessionless).then(|| HeaderValue::from_str(&format!("backend-{n}")).unwrap()),
+            endpoint: Some(Arc::from(format!("10.0.0.{n}:3001"))),
         })
     }
 
@@ -177,6 +178,7 @@ struct Routed {
     path: Option<String>,
     set_headers: Vec<(String, String)>,
     removed_headers: Vec<String>,
+    pinned_endpoint: Option<String>,
 }
 
 async fn route(filter: &McpBrokerFilter, req: &praxis_filter::Request, tool: &str) -> Routed {
@@ -184,6 +186,16 @@ async fn route(filter: &McpBrokerFilter, req: &praxis_filter::Request, tool: &st
     ctx.current_filter_id = Some(0);
     let mut body = Some(call_body(tool));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    // Core runs a pre-read body before the header phase and rebuilds
+    // `pinned_endpoint_address` empty for it; emulate both.
+    ctx.pinned_endpoint_address = None;
+    if matches!(action, FilterAction::Release) {
+        let header_action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(header_action, FilterAction::Continue),
+            "header phase must continue"
+        );
+    }
     Routed {
         action,
         body,
@@ -199,6 +211,7 @@ async fn route(filter: &McpBrokerFilter, req: &praxis_filter::Request, tool: &st
             .iter()
             .map(|n| n.as_str().to_owned())
             .collect(),
+        pinned_endpoint: ctx.pinned_endpoint_address.as_deref().map(str::to_owned),
     }
 }
 
@@ -366,6 +379,47 @@ async fn backend_404_invalidates_and_next_call_reinitializes() {
 }
 
 #[tokio::test]
+async fn forwarded_calls_are_pinned_to_the_session_endpoint() {
+    let mock = Arc::new(MockBackend::default());
+    let filter = broker_with(Arc::clone(&mock));
+    let req = call_request(Some("gw-1"), None);
+
+    let first = route(&filter, &req, "weather_get_weather").await;
+    let second = route(&filter, &req, "weather_get_weather").await;
+
+    assert_eq!(
+        first.pinned_endpoint.as_deref(),
+        Some("10.0.0.1:3001"),
+        "the call must reach the endpoint that created the backend session"
+    );
+    assert_eq!(
+        second.pinned_endpoint, first.pinned_endpoint,
+        "reused sessions must stay on the same endpoint"
+    );
+}
+
+#[tokio::test]
+async fn backend_502_invalidates_and_next_call_reinitializes() {
+    let mock = Arc::new(MockBackend::default());
+    let filter = broker_with(Arc::clone(&mock));
+    let req = call_request(Some("gw-1"), None);
+
+    route_with_response(&filter, &req, "weather_get_weather", http::StatusCode::BAD_GATEWAY).await;
+    let next = route(&filter, &req, "weather_get_weather").await;
+
+    assert_eq!(
+        mock.count("initialize"),
+        2,
+        "an unreachable pinned endpoint must force a fresh handshake"
+    );
+    assert_eq!(
+        next.pinned_endpoint.as_deref(),
+        Some("10.0.0.2:3001"),
+        "the new session's endpoint must be pinned"
+    );
+}
+
+#[tokio::test]
 async fn successful_response_keeps_mapping() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
@@ -467,6 +521,10 @@ async fn sessionless_backend_strips_gateway_session_header() {
     assert!(
         routed.removed_headers.iter().any(|n| n == "mcp-session-id"),
         "the gateway session id must never reach the backend"
+    );
+    assert!(
+        routed.pinned_endpoint.is_none(),
+        "a sessionless backend holds no endpoint state, so the load balancer chooses freely"
     );
 }
 
