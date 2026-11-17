@@ -12,7 +12,6 @@ contract from trusted configuration, independently of caller headers:
 
 ```yaml
 filter: openai_chat_completions_to_anthropic
-api_translation_enabled: true
 api_version: "2026-10-21"
 ```
 

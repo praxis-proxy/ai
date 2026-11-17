@@ -12,9 +12,13 @@
 Install the development-only Cargo tools used by the Make targets:
 
 ```console
-cargo install cargo-audit cargo-deny cargo-machete
+cargo install cargo-audit cargo-deny
+cargo install cargo-machete --version 0.9.2 --locked
 rustup toolchain install nightly --component rustfmt
 ```
+
+`cargo-machete` is pinned to match CI: version 0.10.1 uses
+`Path::is_empty`, which is unstable on Rust 1.96.
 
 ## Conventions
 

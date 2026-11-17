@@ -253,7 +253,12 @@ impl SseFrameParser {
             return None;
         }
 
-        let colon_pos = self.line_buf.iter().position(|&b| b == b':')?;
+        // A colonless line names a field with an empty value (WHATWG SSE).
+        let colon_pos = self
+            .line_buf
+            .iter()
+            .position(|&b| b == b':')
+            .unwrap_or(self.line_buf.len());
 
         let field = &self.line_buf[..colon_pos];
         let value_start = if self.line_buf.get(colon_pos + 1) == Some(&b' ') {
@@ -738,12 +743,91 @@ mod tests {
     }
 
     #[test]
-    fn line_without_colon_ignored() {
+    fn unknown_line_without_colon_ignored() {
         let mut parser = SseFrameParser::new(MAX_BUF);
         let chunk = b"justtext\ndata: hello\n\n";
         let frames = parser.parse_chunk(chunk).unwrap();
         assert_eq!(frames.len(), 1, "line without colon should be ignored");
         assert_eq!(frames[0].data, b"hello", "frame data should match");
+    }
+
+    /// Assert the multiline record and empty record produced by colonless fields.
+    fn assert_colonless_frames(frames: &[SseFrame]) {
+        assert_eq!(
+            frames.len(),
+            2,
+            "multiline data and empty data must each dispatch a record"
+        );
+        assert_eq!(
+            frames[0].event_type.as_deref(),
+            Some(""),
+            "colonless event must reset the type"
+        );
+        assert_eq!(
+            frames[0].data, b"first\n\nlast",
+            "colonless data must contribute an empty line"
+        );
+        assert_eq!(frames[1].event_type, None, "event type must reset between records");
+        assert!(
+            frames[1].data.is_empty(),
+            "a lone colonless data field must dispatch empty data"
+        );
+    }
+
+    #[test]
+    fn colonless_fields_across_chunk_splits_and_line_endings() -> Result<(), SseParseError> {
+        for ending in ["\n", "\r", "\r\n"] {
+            let wire = [
+                "event: old",
+                "event",
+                "data: first",
+                "data",
+                "unknown",
+                "data: last",
+                "",
+                "data",
+                "",
+                "",
+            ]
+            .join(ending);
+            for first in 0..=wire.len() {
+                for second in first..=wire.len() {
+                    let mut parser = SseFrameParser::new(MAX_BUF);
+                    let mut frames = parser.parse_chunk(&wire.as_bytes()[..first])?;
+                    frames.extend(parser.parse_chunk(&wire.as_bytes()[first..second])?);
+                    frames.extend(parser.parse_chunk(&wire.as_bytes()[second..])?);
+                    assert_colonless_frames(&frames);
+                    assert!(
+                        !parser.has_incomplete_frame(),
+                        "complete records must leave no pending frame"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn colonless_data_obeys_frame_and_buffer_limits() {
+        let mut parser = SseFrameParser::new(MAX_BUF);
+        assert!(
+            matches!(
+                parser.parse_chunk_with_event_limit(b"data\n\ndata\n\n", 0, 1),
+                Err(SseParseError::EventLimitExceeded { count: 2, limit: 1 })
+            ),
+            "empty colonless data records must count against the event limit"
+        );
+        let mut parser = SseFrameParser::new(8);
+        assert!(
+            matches!(
+                parser.parse_chunk(b"data: x\ndata\ndata\ndata\ndata\ndata\n"),
+                Err(SseParseError::BufferOverflow {
+                    buffered_bytes: 9,
+                    limit: 8
+                })
+            ),
+            "newlines from empty data fields must count against the buffer limit"
+        );
     }
 
     #[test]

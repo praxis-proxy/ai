@@ -40,6 +40,10 @@ def configure_gateway(profile: str, upstream_url: str, model: str, port: int, di
         raise ValueError("upstream URL must be HTTP(S), with optional /v1 and no credentials")
     source = REPO_ROOT / f"tests/conformance/openresponses/{profile}.yaml"
     config = yaml.safe_load(source.read_text())
+    # Ephemeral GPU runners execute the test gateway as root. Limit the
+    # override to the generated local config rather than the checked-in profile.
+    if os.geteuid() == 0:
+        config.setdefault("insecure_options", {})["allow_root"] = True
     config["listeners"][0]["address"] = f"127.0.0.1:{port}"
 
     def patch(value):

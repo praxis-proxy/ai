@@ -920,3 +920,12 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.request.degrade_mid_conversation_system
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/degrade-features
+    providers:
+      synthetic:
+        status: synthetic_only
