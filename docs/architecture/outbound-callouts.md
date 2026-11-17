@@ -59,6 +59,15 @@ A new filter that opens an outbound HTTP connection must:
 
 1. Classify the target as operator-configured, request-derived, or
    protocol-owned.
+   An operator-configured target is a `cluster` name resolved against
+   top-level `clusters:`, never a URL field: the cluster supplies endpoints,
+   load balancing, TLS (pinned CA, client certificate, SNI), timeouts,
+   private-address policy, and `credential_injection`. A filtered subrequest
+   reaches it through a `load_balancer` in its outbound chain, as the IRR
+   inference step does. Request-derived and protocol-owned targets stay URLs
+   and follow the steps below. Operator URL fields in the inventory above
+   predate this rule and are being migrated
+   ([#2014](https://github.com/praxis-proxy/ai/issues/2014)).
 2. Reuse the shared target/address policy, or document why a stricter dedicated
    policy is required.
 3. Default to public addresses and expose a narrowly named private-address
