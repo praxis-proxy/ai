@@ -5,6 +5,7 @@
 
 pub(crate) mod converse;
 pub(crate) mod eventstream;
+pub mod routes;
 pub(crate) mod wire;
 
 pub use converse::OpenaiChatCompletionsToBedrockConverseFilter;

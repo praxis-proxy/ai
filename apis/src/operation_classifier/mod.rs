@@ -59,6 +59,8 @@ use tracing::debug;
 use self::config::{OperationClassifierConfig, ValidatedConfig, build_config};
 use crate::{
     anthropic::routes as anthropic_messages_routes,
+    bedrock::routes as bedrock_routes,
+    gemini::routes as gemini_routes,
     openai::{
         chat_completions::routes as chat_completions_routes, conversations::routes as conversations_routes,
         files::routes as files_routes, responses::routes as responses_routes,
@@ -277,9 +279,10 @@ fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: AiOperationMatch) -> 
 ///
 /// Registered path spaces do not overlap — OpenAI serves `/v1/responses`,
 /// `/v1/conversations`, `/v1/chat/completions`, `/v1/files`, and
-/// `/v1/vector_stores` while Anthropic serves `/v1/messages` — so at most one
-/// registry can match one head, and the order below does not decide between
-/// protocols.
+/// `/v1/vector_stores`, Anthropic serves `/v1/messages`, Gemini serves
+/// `/v1{,beta}/models/{model}:{action}`, and Bedrock serves
+/// `/model/{model_id}/{action}` — so at most one registry can match one head,
+/// and the order below does not decide between protocols.
 pub(crate) fn classify(method: &str, path: &str, transport: Transport) -> Option<AiOperationMatch> {
     let http_match = (transport == Transport::Http).then(|| {
         classify_conversation(method, path)
@@ -287,6 +290,8 @@ pub(crate) fn classify(method: &str, path: &str, transport: Transport) -> Option
             .or_else(|| classify_files(method, path))
             .or_else(|| classify_vector_stores(method, path))
             .or_else(|| classify_anthropic_messages(method, path))
+            .or_else(|| classify_gemini(method, path))
+            .or_else(|| classify_bedrock(method, path))
     });
     http_match
         .flatten()
@@ -306,6 +311,16 @@ fn classify_chat_completions(method: &str, path: &str) -> Option<AiOperationMatc
 /// Match one Anthropic Messages operation.
 fn classify_anthropic_messages(method: &str, path: &str) -> Option<AiOperationMatch> {
     anthropic_messages_routes::match_route(method, path).and_then(|route| classified(route.spec, route.params, path))
+}
+
+/// Match one Gemini operation.
+fn classify_gemini(method: &str, path: &str) -> Option<AiOperationMatch> {
+    gemini_routes::match_route(method, path).and_then(|route| classified(route.spec, route.params, path))
+}
+
+/// Match one Bedrock operation.
+fn classify_bedrock(method: &str, path: &str) -> Option<AiOperationMatch> {
+    bedrock_routes::match_route(method, path).and_then(|route| classified(route.spec, route.params, path))
 }
 
 /// Match one Files operation.

@@ -56,7 +56,7 @@ preconditions:
       rejections carry their own bodies and bypass this formatting path.
     evidence: praxis-proxy-protocol-0.8.0/src/http/pingora/handler/fail_to_proxy.rs:288-307
     detail:
-      - "Installers: ai_operation (apis/src/operation_classifier/mod.rs:233-246, picks the
+      - "Installers: ai_operation (apis/src/operation_classifier/mod.rs:235-248, picks the
          OpenAI or Anthropic formatter from the matched protocol),
          openai_responses_request (apis/src/openai/responses/request/mod.rs:575 via
          apis/src/openai/responses/mod.rs:452-460),

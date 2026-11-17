@@ -14,7 +14,7 @@
       "summary": "Errors handled by fail_to_proxy's formatter are provider-shaped only when a matching filter installed a formatter. Otherwise that path emits RFC 9457 application/problem+json. Explicit filter and body-limit rejections carry their own bodies and bypass this formatting path.",
       "evidence": "praxis-proxy-protocol-0.8.0/src/http/pingora/handler/fail_to_proxy.rs:288-307",
       "detail": [
-        "Installers: ai_operation (apis/src/operation_classifier/mod.rs:233-246, picks the OpenAI or Anthropic formatter from the matched protocol), openai_responses_request (apis/src/openai/responses/request/mod.rs:575 via apis/src/openai/responses/mod.rs:452-460), anthropic_messages_request (apis/src/anthropic/messages_request/mod.rs:275-279).",
+        "Installers: ai_operation (apis/src/operation_classifier/mod.rs:235-248, picks the OpenAI or Anthropic formatter from the matched protocol), openai_responses_request (apis/src/openai/responses/request/mod.rs:575 via apis/src/openai/responses/mod.rs:452-460), anthropic_messages_request (apis/src/anthropic/messages_request/mod.rs:275-279).",
         "Example configurations do not necessarily install one of these formatters; inspect the selected pipeline before assuming provider-shaped errors."
       ]
     },
