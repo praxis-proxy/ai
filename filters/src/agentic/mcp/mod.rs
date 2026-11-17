@@ -34,6 +34,7 @@ use praxis_filter::{
 };
 use tracing::{trace, warn};
 
+pub use self::broker::McpBrokerBackendSelectorFilter;
 use self::{
     config::{McpConfig, MismatchBehavior, MissingHeaderBehavior, build_config},
     envelope::{McpEnvelope, extract_mcp_envelope},
@@ -99,8 +100,28 @@ impl McpFilter {
     ///
     /// [`FilterError`]: praxis_filter::FilterError
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        Self::from_config_with_binding(config, None, None)
+    }
+
+    /// Create a filter with a chain-binding context, which the static catalog
+    /// broker needs to bind its `backend_sessions` handshake chain.
+    ///
+    /// `fallback_client` is used for handshakes when the request context
+    /// exposes no shared sub-request client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the YAML config is invalid or the broker's
+    /// handshake chain cannot be bound.
+    ///
+    /// [`FilterError`]: praxis_filter::FilterError
+    pub fn from_config_with_binding(
+        config: &serde_yaml::Value,
+        binding: Option<&praxis_filter::ChainBindingContext<'_>>,
+        fallback_client: Option<praxis_core::subrequest::SubRequestClient>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
         if broker::McpBrokerFilter::matches_config(config) {
-            return broker::McpBrokerFilter::from_config(config);
+            return broker::McpBrokerFilter::from_config_with_binding(config, binding, fallback_client);
         }
 
         let cfg: McpConfig = parse_filter_config("mcp", config)?;
