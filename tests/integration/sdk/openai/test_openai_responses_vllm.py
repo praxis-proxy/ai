@@ -9629,10 +9629,26 @@ class TestAgenticLoopVLLM:
         # narration the model streams before it calls the tool.
         text_deltas = []
         final_response = None
+        terminal_events = []
+        event_types = []
 
         for position, event in enumerate(stream):
             sequence_numbers.append(event.sequence_number)
             etype = event.type
+            event_types.append(etype)
+            # Keep terminal status/error evidence without retaining text deltas
+            # or request headers. An incomplete/failed response is different
+            # from a stream that closed without any terminal event.
+            if etype in ("response.completed", "response.incomplete", "response.failed"):
+                response = event.response
+                terminal_events.append({
+                    "type": etype,
+                    "status": response.status,
+                    "error": response.error,
+                    "incomplete_details": response.incomplete_details,
+                })
+            elif etype == "error":
+                terminal_events.append(event.model_dump())
             if etype == "response.output_item.added":
                 item = event.item.model_dump()
                 added.append(
@@ -9661,7 +9677,9 @@ class TestAgenticLoopVLLM:
                 final_response = event.response
 
         assert final_response is not None, (
-            "stream must terminate with a response.completed event"
+            "stream must terminate with a response.completed event; "
+            f"terminal_events={terminal_events!r}, event_types={event_types!r}, "
+            f"added={added!r}, done={done!r}, web_search_progress={ws_progress!r}"
         )
         assert all(isinstance(number, int) for number in sequence_numbers), sequence_numbers
         assert sequence_numbers == sorted(set(sequence_numbers)), sequence_numbers
