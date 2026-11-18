@@ -36,7 +36,7 @@ def matrix(cell_status="translated"):
                 {"feature": "text-chat", "label": "Plain text", "status": cell_status,
                  "note": None, "evidence": "f.rs:3", "blocker": None},
                 {"feature": "reasoning", "label": "Reasoning", "status": "dropped",
-                 "note": "Silently dropped", "evidence": "f.rs:4", "blocker": "TODO-ISSUE fix"},
+                 "note": "Silently dropped", "evidence": "f.rs:4", "blocker": "https://github.com/praxis-proxy/ai/issues/1"},
             ],
         }],
         "cross_surface_gaps": [],
@@ -335,7 +335,7 @@ class SupportReportTest(unittest.TestCase):
             previous.write_text(json.dumps(first), encoding="utf-8")
 
             changed = matrix(cell_status="dropped")
-            changed["surfaces"][0]["cells"][0]["blocker"] = "TODO-ISSUE now a gap"
+            changed["surfaces"][0]["cells"][0]["blocker"] = "https://github.com/praxis-proxy/praxis/issues/2"
             write_fixtures(directory, matrix_value=changed)
             report, markdown = generate(arguments(
                 directory, previous=str(previous)))
@@ -345,6 +345,21 @@ class SupportReportTest(unittest.TestCase):
                 {"surface": "anthropic-to-chat", "feature": "text-chat",
                  "from": "translated", "to": "dropped"}])
             self.assertIn("### Changes since v0.10.0", markdown)
+
+    def test_gap_without_issue_blocker_is_refused(self):
+        for blocker in ("TODO-ISSUE fix", None, "https://github.com/praxis-proxy/ai/pull/1"):
+            with self.subTest(blocker=blocker), tempfile.TemporaryDirectory() as directory:
+                untracked = matrix()
+                untracked["surfaces"][0]["cells"][1]["blocker"] = blocker
+                untracked["cross_surface_gaps"] = [{"id": "shared", "affects": ["anthropic-to-chat"],
+                                                    "summary": "s", "blocker": "TODO-ISSUE shared"}]
+                write_fixtures(directory, matrix_value=untracked)
+
+                with self.assertRaises(SystemExit) as raised:
+                    generate(arguments(directory))
+                self.assertIn("Anthropic -> CC/reasoning", str(raised.exception))
+                self.assertIn("shared", str(raised.exception))
+                self.assertFalse(Path(directory, "out").exists())
 
     def test_verify_rejects_wrong_commit_and_missing_markers(self):
         with tempfile.TemporaryDirectory() as directory:

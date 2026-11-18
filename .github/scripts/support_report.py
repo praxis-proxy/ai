@@ -27,6 +27,7 @@ are out of scope and named as such in the output.
 import argparse
 import json
 from pathlib import Path
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -34,6 +35,9 @@ VERSION = 1
 PROFILE = "praxis-ai-release-support"
 START = "<!-- praxis:support-report:start -->"
 END = "<!-- praxis:support-report:end -->"
+# Release notes publish each translation gap's blocker verbatim, so it must
+# name a tracking issue rather than placeholder text.
+BLOCKER_ISSUE = re.compile(r"https://github\.com/praxis-proxy/(ai|praxis)/issues/[1-9][0-9]*")
 
 TRANSLATION_STATUSES = {
     "native", "passthrough", "translated", "translated-lossy",
@@ -338,6 +342,12 @@ def known_gaps(translation, live):
     return gaps
 
 
+def untracked_gaps(gaps):
+    return [gap.get("id") or "(unnamed)" for gap in gaps
+            if gap.get("source") == "translation"
+            and not BLOCKER_ISSUE.fullmatch(gap.get("blocker") or "")]
+
+
 def cell_status_map(report):
     result = {}
     for surface in (report.get("translation") or {}).get("surfaces") or []:
@@ -416,6 +426,9 @@ def build(args):
         "ci_evidence": ci_evidence(release_qualification, args.sha),
     }
     report["known_gaps"] = known_gaps(translation, live)
+    untracked = untracked_gaps(report["known_gaps"])
+    if untracked:
+        raise SystemExit("translation gaps without a tracking issue blocker: " + ", ".join(untracked))
     report["previous"] = previous_diff(previous, report)
     # A nonempty workflow list is not evidence by itself: releases routinely
     # record workflows that never ran or could not be queried at this commit.
