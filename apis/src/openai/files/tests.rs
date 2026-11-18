@@ -71,13 +71,6 @@ fn file_service_error_mapping_keeps_backend_causes() {
             .as_deref(),
         Some("read failed")
     );
-
-    let input = FileServiceError::from(FileStoreError::Input(Box::new(io::Error::other("body read failed"))));
-    assert!(matches!(&input, FileServiceError::Stream(_)));
-    assert_eq!(
-        input.source().map(ToString::to_string).as_deref(),
-        Some("body read failed")
-    );
 }
 
 /// Generated Files document as JSON.

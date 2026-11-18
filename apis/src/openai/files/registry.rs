@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use praxis_ai_store::StateOwner;
 
-use super::{FileCleanupCandidate, FileInfo, FileList, FilePage, PendingFile, StoredFile};
+use super::{FileCleanupCandidate, FileCompletion, FileInfo, FileList, FilePage, PendingFile, StoredFile};
 
 /// Failures at the durable metadata boundary.
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +34,7 @@ pub enum FileRegistryError {
 #[async_trait]
 pub trait FileRegistry: Send + Sync {
     /// Insert metadata in the pending state before any bytes are written.
+    /// Purpose and expiration may arrive later in the multipart form.
     /// IDs and storage keys must not be reused, including after cleanup.
     ///
     /// # Errors
@@ -42,19 +43,24 @@ pub trait FileRegistry: Send + Sync {
     /// key, or another [`FileRegistryError`] on persistence failure.
     async fn create_pending(&self, file: &PendingFile) -> Result<(), FileRegistryError>;
 
-    /// Atomically transition a pending file to ready and record actual bytes.
-    /// Retrying after an ambiguous commit returns the existing ready file when
-    /// its byte count matches. This is where a backend can enforce a
-    /// project-wide byte quota without racing other uploads. The resulting
-    /// metadata is safe to expose.
+    /// Atomically transition a pending file to ready and record its validated
+    /// purpose, expiration, and actual byte count. Retrying after an ambiguous
+    /// commit returns the existing ready file only when all completion fields
+    /// match. This is where a backend can enforce a project-wide byte quota
+    /// without racing other uploads. The resulting metadata is safe to expose.
     ///
     /// # Errors
     ///
     /// Returns [`FileRegistryError::Conflict`] when the file is neither pending
-    /// nor ready with the same byte count, [`FileRegistryError::QuotaExceeded`]
-    /// if the project has no room, or another [`FileRegistryError`] on
-    /// persistence failure.
-    async fn complete_upload(&self, owner: &StateOwner, id: &str, bytes: u64) -> Result<FileInfo, FileRegistryError>;
+    /// nor ready with the same completion fields,
+    /// [`FileRegistryError::QuotaExceeded`] if the project has no room, or
+    /// another [`FileRegistryError`] on persistence failure.
+    async fn complete_upload(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        completion: FileCompletion,
+    ) -> Result<FileInfo, FileRegistryError>;
 
     /// Transition a pending upload to failed after a stream, store, or
     /// completion error. A repeated failure transition is idempotent; a ready

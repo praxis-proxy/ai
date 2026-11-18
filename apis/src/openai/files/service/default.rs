@@ -6,8 +6,8 @@
 use async_trait::async_trait;
 use praxis_ai_store::StateOwner;
 
-use super::{FileDownload, FileService, FileServiceError};
-use crate::openai::files::{FileInfo, FileList, FilePage, FileUpload, FileUploadStream};
+use super::{FileDownload, FileService, FileServiceError, FileUploadSession};
+use crate::openai::files::{FileInfo, FileList, FilePage};
 
 /// Default implementation of the Files service.
 pub struct DefaultFileService;
@@ -15,12 +15,11 @@ pub struct DefaultFileService;
 #[expect(clippy::unimplemented, reason = "the Files service is a placeholder")]
 #[async_trait]
 impl FileService for DefaultFileService {
-    async fn upload(
+    async fn begin_upload(
         &self,
         _owner: &StateOwner,
-        _file: FileUpload,
-        _content: FileUploadStream,
-    ) -> Result<FileInfo, FileServiceError> {
+        _filename: String,
+    ) -> Result<Box<dyn FileUploadSession + 'static>, FileServiceError> {
         unimplemented!()
     }
 

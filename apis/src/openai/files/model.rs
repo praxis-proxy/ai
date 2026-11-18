@@ -14,10 +14,6 @@ use super::contracts::{FilePurpose, ListOrder as FileListOrder, UploadPurpose};
 /// stream owns its state so it can cross async trait-object boundaries.
 pub type FileStream<E> = BoxStream<'static, Result<Bytes, E>>;
 
-/// Incoming upload chunks. The handler boxes its body-read errors so the
-/// service and byte store can accept streams from any HTTP transport.
-pub type FileUploadStream = FileStream<Box<dyn std::error::Error + Send + Sync>>;
-
 /// Expiration measured from file creation. The service rejects `seconds`
 /// outside 3600..=2592000.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,11 +22,10 @@ pub struct FileExpiration {
     pub seconds: u32,
 }
 
-/// Fields supplied with a new upload, apart from its byte stream.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FileUpload {
-    /// Original client filename; never used as a storage key.
-    pub filename: String,
+/// Upload metadata supplied separately from the file bytes.
+/// These fields may arrive after the file part and are consumed at completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileUploadMetadata {
     /// Intended purpose.
     pub purpose: UploadPurpose,
     /// Requested expiration policy. Batch uploads default to 30 days when absent.
@@ -100,6 +95,7 @@ pub enum FileState {
 }
 
 /// Metadata inserted before any upload bytes are written.
+/// Purpose and expiration are recorded only when the upload completes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingFile {
     /// New public file identifier, unique across all owners.
@@ -110,12 +106,19 @@ pub struct PendingFile {
     pub storage_key: String,
     /// Creation timestamp in seconds since the Unix epoch.
     pub created_at: i64,
-    /// Expiration timestamp in seconds since the Unix epoch, if any.
-    pub expires_at: Option<i64>,
     /// Original client filename.
     pub filename: String,
-    /// Recorded purpose.
+}
+
+/// Final metadata and actual byte count committed with a completed upload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileCompletion {
+    /// Bytes persisted in the file store.
+    pub bytes: u64,
+    /// Validated purpose of the uploaded file.
     pub purpose: FilePurpose,
+    /// Expiration timestamp in seconds since the Unix epoch, if any.
+    pub expires_at: Option<i64>,
 }
 
 /// A ready file and the private location of its byte stream.

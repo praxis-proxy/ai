@@ -24,17 +24,17 @@ mod store;
 pub use contracts::{FilePurpose, InvalidField, ListOrder as FileListOrder, UploadPurpose};
 #[cfg(feature = "openai-files")]
 pub use model::{
-    FileCleanupCandidate, FileCleanupState, FileExpiration, FileInfo, FileList, FilePage, FileState, FileStream,
-    FileUpload, FileUploadStream, PendingFile, StoredFile,
+    FileCleanupCandidate, FileCleanupState, FileCompletion, FileExpiration, FileInfo, FileList, FilePage, FileState,
+    FileStream, FileUploadMetadata, PendingFile, StoredFile,
 };
 #[cfg(feature = "openai-files")]
 pub use openapi::implementation_openapi_json;
 #[cfg(feature = "openai-files")]
 pub use registry::{FileRegistry, FileRegistryError};
 #[cfg(feature = "openai-files")]
-pub use service::{DefaultFileService, FileDownload, FileService, FileServiceError};
+pub use service::{DefaultFileService, FileDownload, FileService, FileServiceError, FileUploadSession};
 #[cfg(feature = "openai-files")]
-pub use store::{FileStore, FileStoreError};
+pub use store::{FileStore, FileStoreError, FileStoreWriter};
 
 #[cfg(test)]
 #[cfg(feature = "openai-files")]
