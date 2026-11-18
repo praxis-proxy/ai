@@ -1940,6 +1940,155 @@ fn full_flow_agentic_web_search_result_passes_guardrail_before_reentry() {
 }
 
 #[test]
+fn full_flow_agentic_web_search_enforces_domain_filters() {
+    // Regression for issue #1768: the provider returns one result outside the
+    // client's `filters.allowed_domains` and one on a blocked subdomain. Neither
+    // may reach the guardrail, the second inference round, or the public
+    // `action.sources`.
+    let first_model_response = json!({
+        "id": "resp_web_search_domains",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_full_flow_domains",
+            "status": "completed",
+            "action": {"type": "search", "query": "Praxis proxy"}
+        }],
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+    });
+    let final_model_response = json!({
+        "id": "resp_web_search_domains_final",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "id": "msg_web_search_domains_final",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Praxis is a proxy.", "annotations": []}]
+        }],
+        "usage": {"input_tokens": 20, "output_tokens": 7, "total_tokens": 27}
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first_model_response.to_string()),
+        (200, final_model_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let search = StatefulCapturingBackend::new(vec![(
+        200,
+        json!({
+            "web": {"results": [
+                {"title": "Outside", "url": "https://outside.example/result", "description": "Disallowed."},
+                {"title": "Blocked", "url": "https://docs.praxis-proxy.github.io/private", "description": "Blocked."},
+                {"title": "Praxis proxy", "url": "https://praxis-proxy.github.io/", "description": "Allowed."}
+            ]}
+        })
+        .to_string(),
+    )])
+    .start_with_shutdown();
+    let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"safe"}"#.to_owned())])
+        .start_with_shutdown();
+
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_agentic_web_search_domains");
+    let path = example_config_path("openai/responses/full-flow-agentic.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db.url()).replace(
+        "env_var: WEB_SEARCH_API_KEY",
+        &format!(
+            "value: test-key\n                base_url: http://127.0.0.1:{}",
+            search.port()
+        ),
+    );
+    let patched = patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model.port()), ("127.0.0.1:3003", nemo.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let request = json!({
+        "model": "gpt-4.1",
+        "input": "Search for Praxis proxy",
+        "include": ["web_search_call.action.sources"],
+        "tools": [{"type": "web_search", "filters": {
+            "allowed_domains": ["github.io"],
+            "blocked_domains": ["docs.praxis-proxy.github.io"],
+        }}]
+    });
+    let request = json_post("/v1/responses", &request.to_string()).replacen(
+        "Content-Type: application/json",
+        "x-user-brave-key: test-key\r\nContent-Type: application/json",
+        1,
+    );
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(parse_status(&raw), 200, "web-search round trip failed: {raw}");
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    let sources: Vec<&str> = response["output"]
+        .as_array()
+        .and_then(|output| output.iter().find(|item| item["type"] == "web_search_call"))
+        .and_then(|call| call["action"]["sources"].as_array())
+        .expect("web_search_call should carry included sources")
+        .iter()
+        .filter_map(|source| source["url"].as_str())
+        .collect();
+    assert_eq!(
+        sources,
+        ["https://praxis-proxy.github.io/"],
+        "only permitted results may be public sources: {response:#}"
+    );
+    assert_eq!(search.requests().len(), 1, "the web-search dispatcher should run once");
+    let model_requests = model.requests();
+    assert_eq!(model_requests.len(), 2, "the filtered result should reach round two");
+    // Assert on the tool output rather than the whole body: round two echoes the
+    // client's `tools`, whose filters name the domains the results must not have.
+    let second_input = serde_json::from_str::<Value>(&model_requests[1].body).expect("second inference JSON");
+    let tool_outputs: Vec<&str> = second_input["input"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item["type"] == "function_call_output")
+                .filter_map(|item| item["output"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        tool_outputs.len(),
+        1,
+        "round two should carry one web-search tool output: {second_input:#}"
+    );
+    assert!(
+        tool_outputs[0].contains("https://praxis-proxy.github.io/"),
+        "the permitted result should reach inference round two: {second_input:#}"
+    );
+    let nemo_requests = nemo.requests();
+    assert_eq!(nemo_requests.len(), 1, "NeMo should check the web-search result once");
+    let check: Value = serde_json::from_str(&nemo_requests[0].body).expect("NeMo request JSON");
+    let checked = check["messages"][0]["content"].as_str().unwrap_or_default();
+    assert!(
+        checked.contains("https://praxis-proxy.github.io/"),
+        "NeMo should receive the permitted result: {check:#}"
+    );
+    for rejected in [
+        "https://outside.example/result",
+        "https://docs.praxis-proxy.github.io/private",
+    ] {
+        assert!(
+            !tool_outputs[0].contains(rejected),
+            "a filtered result ({rejected}) must not reach inference round two: {second_input:#}"
+        );
+        assert!(
+            !checked.contains(rejected),
+            "a filtered result ({rejected}) must not reach the guardrail: {check:#}"
+        );
+    }
+}
+
+#[test]
 fn full_flow_agentic_file_search_round_trip() {
     let first_model_response = json!({
         "id": "resp_search",
