@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    free_port, http_send, json_post, parse_body, parse_status, start_echo_backend, start_header_echo_backend,
-    start_proxy,
+    StatefulCapturingBackend, free_port, http_send, json_post, parse_body, parse_status, start_echo_backend,
+    start_header_echo_backend, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -128,7 +128,7 @@ fn llmisvc_passes_non_publisher_model_through() {
 
 #[test]
 fn llmisvc_rejects_repeated_publisher_model_before_backend() {
-    let backend_guard = start_echo_backend();
+    let backend_guard = StatefulCapturingBackend::new(vec![(200, "backend-response".to_owned())]).start_with_shutdown();
     let backend_port = backend_guard.port();
     let proxy_port = free_port();
 
@@ -151,5 +151,9 @@ fn llmisvc_rejects_repeated_publisher_model_before_backend() {
         parse_status(&raw),
         400,
         "a repeated model must be refused before the body is rewritten or forwarded"
+    );
+    assert!(
+        backend_guard.requests().is_empty(),
+        "the backend must not see an ambiguous model"
     );
 }
