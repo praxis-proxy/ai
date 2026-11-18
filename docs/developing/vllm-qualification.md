@@ -87,6 +87,11 @@ append is tracked by
 [#410](https://github.com/praxis-proxy/ai/issues/410); background,
 WebSockets, and multimodal models are excluded.
 
+The report's top-level backend, model, and configuration describe the Responses
+suite. To reproduce a client acceptance case, use the run in `workflow.url` and
+consult the [GPU job and pin guide](gpu-nightly-suite.md#jobs-in-the-main-suite-vllm-integrationyaml)
+at the workflow revision recorded in `workflow.run_sha`.
+
 ## Local reproduction
 
 On a GPU host with the same vLLM image, PostgreSQL, OGX, and configuration as
