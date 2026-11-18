@@ -1303,6 +1303,95 @@ async fn an_unclassifiable_body_follows_on_invalid_reject() {
     }
 }
 
+/// A repeated top-level `model` is refused before any routing fact, on the
+/// pre-routing facts publisher and the managed owner alike, whatever
+/// `on_invalid` says.
+#[tokio::test]
+async fn a_repeated_top_level_model_is_refused_before_any_fact() {
+    for yaml in [
+        "{}",
+        "on_invalid: reject\n",
+        "on_invalid: continue\n",
+        "initialize_state: false\n",
+    ] {
+        for raw in [
+            r#"{"model":"gpt-4.1","input":"hi","model":"gpt-4o"}"#,
+            r#"{"model":"gpt-4.1","model":"gpt-4.1","input":"hi"}"#,
+        ] {
+            let filter = filter(yaml);
+            let request = create_request();
+            let mut ctx = classified_context(&request).await;
+            let mut body = Some(Bytes::from_static(raw.as_bytes()));
+
+            let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+            assert_duplicate_model_rejection(&action, yaml);
+            assert_no_body_facts(&ctx, yaml);
+        }
+    }
+}
+
+/// Assert an OpenAI-shaped 400 for a repeated top-level `model`.
+fn assert_duplicate_model_rejection(action: &FilterAction, label: &str) {
+    let FilterAction::Reject(rejection) = action else {
+        unreachable!("{label}: repeated model must be refused, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400, "{label}: client error");
+    let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        error.pointer("/error/type").and_then(serde_json::Value::as_str),
+        Some("invalid_request_error"),
+        "{label}: OpenAI error shape"
+    );
+}
+
+/// Assert no body-derived routing fact, cached parse, or state was published.
+fn assert_no_body_facts(ctx: &HttpFilterContext<'_>, label: &str) {
+    assert!(
+        !ctx.filter_metadata
+            .keys()
+            .any(|key| key.starts_with("openai_responses_request.") || key.starts_with("responses.")),
+        "{label}: no classification or state metadata is published: {:?}",
+        ctx.filter_metadata
+    );
+    assert!(
+        !ctx.request_headers_to_set
+            .iter()
+            .any(|(name, _)| name == "x-praxis-ai-model" || name == "x-praxis-ai-format"),
+        "{label}: no body-derived routing header is promoted: {:?}",
+        ctx.request_headers_to_set
+    );
+    assert!(
+        ctx.extensions.get::<CachedRequestParse>().is_none(),
+        "{label}: no parse is cached for a later pass"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "{label}: no state is built"
+    );
+}
+
+/// `model` keys inside `input` items or tools are not repeats.
+#[tokio::test]
+async fn nested_model_keys_do_not_count_as_repeats() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = classified_context(&request).await;
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":[{"role":"user","content":"hi","model":"x"}],"metadata":{"model":"y"}}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Release));
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_request.model")
+            .map(String::as_str),
+        Some("gpt-4.1")
+    );
+}
+
 #[tokio::test]
 async fn store_and_background_defaults_follow_the_specification() {
     let filter = default_filter();

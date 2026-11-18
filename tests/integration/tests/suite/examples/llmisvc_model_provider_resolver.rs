@@ -125,3 +125,31 @@ fn llmisvc_passes_non_publisher_model_through() {
         "non-publisher model must not be rewritten"
     );
 }
+
+#[test]
+fn llmisvc_rejects_repeated_publisher_model_before_backend() {
+    let backend_guard = start_echo_backend();
+    let backend_port = backend_guard.port();
+    let proxy_port = free_port();
+
+    let config = super::load_example_config(
+        "llmisvc-model-provider-resolver.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3000", backend_port)]),
+    );
+
+    let proxy = start_proxy(&config);
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/chat/completions",
+            r#"{"model":"publishers/rhoai/models/granite-3.1-8b","messages":[],"model":"publishers/rhoai/models/other"}"#,
+        ),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "a repeated model must be refused before the body is rewritten or forwarded"
+    );
+}

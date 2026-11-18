@@ -62,6 +62,27 @@ fn model_to_header_continues_without_model_field() {
     assert_eq!(body, "default-response", "missing model should fall through to default");
 }
 
+#[test]
+fn model_to_header_rejects_repeated_model_before_routing() {
+    let port_a_guard = start_backend_with_shutdown("model-a-response");
+    let port_a = port_a_guard.port();
+    let port_default_guard = start_backend_with_shutdown("default-response");
+    let port_default = port_default_guard.port();
+    let proxy_port = free_port();
+    let yaml = make_yaml(proxy_port, "mistral-large-latest", port_a, port_default);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+    for body in [
+        r#"{"model":"unknown","messages":[],"model":"mistral-large-latest"}"#,
+        r#"{"model":"mistral-large-latest","model":"mistral-large-latest"}"#,
+    ] {
+        let (status, response) = http_post(proxy.addr(), "/v1/chat", body);
+        assert_eq!(status, 400, "a repeated model must be refused: {body}");
+        assert_ne!(response, "model-a-response", "no backend may answer: {body}");
+        assert_ne!(response, "default-response", "no backend may answer: {body}");
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------

@@ -6,10 +6,13 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderName;
-use praxis_ai_apis::RecordAiMetadata as _;
+use praxis_ai_apis::{
+    RecordAiMetadata as _,
+    model_field::{self, ModelScan},
+};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, builtins::JsonBodyFieldFilter,
-    parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    builtins::JsonBodyFieldFilter, parse_filter_config,
 };
 use serde::Deserialize;
 
@@ -50,6 +53,11 @@ fn default_header() -> String {
 /// The promoted value is also published to `model_to_header.model` metadata for
 /// downstream consumers (e.g. the `llm_metrics` model label), so those readers
 /// use the server-validated value instead of a client-supplied request header.
+///
+/// A body whose top-level `model` occurs more than once, including identical
+/// repeats, is refused with HTTP 400 before anything is promoted. The
+/// delegated core extractor keeps the last occurrence, while a backend reading
+/// the forwarded bytes could honor another.
 ///
 /// Promotion is deferred until end-of-stream so a later body-writing filter
 /// (for example `llmisvc_model_provider_resolver`) can observe the pending
@@ -172,6 +180,14 @@ impl HttpFilter for ModelToHeaderFilter {
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
+        }
+        // The core extractor collapses repeated keys, so count them first.
+        if body
+            .as_deref()
+            .is_some_and(|raw| matches!(model_field::scan(raw), ModelScan::Duplicate))
+        {
+            tracing::debug!("model_to_header: refusing a repeated top-level model");
+            return Ok(FilterAction::Reject(Rejection::status(400)));
         }
         if !ctx.request_headers_to_remove.contains(&self.header) {
             ctx.request_headers_to_remove.push(self.header.clone());
@@ -428,6 +444,48 @@ mod tests {
             ctx.extra_request_headers.is_empty(),
             "no headers when model field absent"
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_repeated_top_level_model_before_promotion() {
+        let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        for json in [
+            br#"{"model":"a","model":"b"}"#.as_slice(),
+            br#"{"model":"a","prompt":"hi","model":"a"}"#,
+            br#"{"model":"a","mo\u0064el":"b"}"#,
+        ] {
+            let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+            let mut ctx = crate::test_utils::make_filter_context(&req);
+            let mut body = Some(Bytes::copy_from_slice(json));
+
+            let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+            let json = String::from_utf8_lossy(json);
+            assert!(
+                matches!(&action, FilterAction::Reject(r) if r.status == 400),
+                "repeated model must be refused: {json}"
+            );
+            assert!(ctx.extra_request_headers.is_empty(), "nothing is promoted: {json}");
+            assert!(
+                ctx.filter_metadata.get(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL)
+                    .is_none(),
+                "no model metadata is published: {json}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn promotes_single_top_level_model_beside_nested_models() {
+        let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let json = br#"{"model":"top","metadata":{"model":"nested"},"tools":[{"model":"x"}]}"#;
+        let mut body = Some(Bytes::from_static(json));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(matches!(action, FilterAction::BodyDone), "single model promotes");
+        assert_eq!(ctx.extra_request_headers[0].1, "top", "the top-level model is promoted");
     }
 
     #[tokio::test]
