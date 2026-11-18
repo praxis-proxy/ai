@@ -1151,7 +1151,10 @@ mod tests {
             Arc::ptr_eq(&first, &second),
             "extension reads should share the retained stop-sequence allocation"
         );
-        assert!(!ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY));
+        assert!(
+            !ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY),
+            "typed stop-sequence storage should not use routing metadata"
+        );
     }
 
     #[test]
@@ -1163,8 +1166,15 @@ mod tests {
 
         extract_request_metadata(&mut ctx, Some(&value));
 
-        assert_eq!(client_stop_sequences(&ctx).as_ref(), &[sequence]);
-        assert!(!ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY));
+        assert_eq!(
+            client_stop_sequences(&ctx).as_ref(),
+            &[sequence],
+            "typed stop-sequence storage should preserve values above the metadata limit"
+        );
+        assert!(
+            !ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY),
+            "long stop sequences should not use size-limited routing metadata"
+        );
     }
 
     #[test]

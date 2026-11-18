@@ -911,6 +911,10 @@ class TestStreamingResponseValidation:
 
         assert message.stop_reason == "stop_sequence"
         assert message.stop_sequence == stop_sequence
+        [upstream] = RecordingBackend.bodies
+        assert upstream["stop"] == [stop_sequence], (
+            "the streaming request must forward the client stop sequence upstream"
+        )
 
     def test_named_tool_with_stop_finish_reason_reports_tool_use(
         self, anthropic_client
@@ -994,10 +998,32 @@ class TestStreamingResponseValidation:
         finally:
             RecordingBackend.many_tool_calls_stream_once = False
 
-        starts = [event for event in events if event.type == "content_block_start"]
-        stops = [event for event in events if event.type == "content_block_stop"]
-        assert len(starts) == 64
-        assert len(stops) == 64
+        start_indices = [
+            event.index for event in events if event.type == "content_block_start"
+        ]
+        stop_indices = [
+            event.index for event in events if event.type == "content_block_stop"
+        ]
+        expected_indices = list(range(64))
+        assert start_indices == expected_indices, (
+            "all 64 tool blocks must start once in block-index order"
+        )
+        assert stop_indices == expected_indices, (
+            "all 64 tool blocks must stop once in block-index order"
+        )
+        block_stop_positions = [
+            index for index, event in enumerate(events)
+            if event.type == "content_block_stop"
+        ]
+        message_stop_positions = [
+            index for index, event in enumerate(events) if event.type == "message_stop"
+        ]
+        assert len(message_stop_positions) == 1, (
+            "a completed stream must emit exactly one message_stop"
+        )
+        assert max(block_stop_positions) < message_stop_positions[0], (
+            "message_stop must follow every content_block_stop"
+        )
 
     def test_invalid_tool_id_aborts_incomplete_stream(self, anthropic_client):
         RecordingBackend.bodies.clear()

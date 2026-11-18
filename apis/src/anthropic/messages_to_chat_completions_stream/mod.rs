@@ -1675,11 +1675,10 @@ mod tests {
             "stream state should share the request extension allocation"
         );
 
-        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
-        let delta = event_data(&out, "message_delta").get("delta").unwrap().clone();
-        assert_eq!(delta.get("stop_reason").and_then(Value::as_str), Some("stop_sequence"));
-        let reported = delta.get("stop_sequence").and_then(Value::as_str);
-        assert_eq!(reported, Some(stop_sequence.as_str()));
+        let out = std::str::from_utf8(body.as_deref().unwrap()).unwrap();
+        let event = event_data(out, "message_delta");
+        let delta = event.get("delta").unwrap();
+        assert_stop_sequence_delta(delta, stop_sequence.as_str(), "long matched client stop");
     }
 
     #[test]
@@ -2049,11 +2048,15 @@ mod tests {
         let mut body3 = Some(Bytes::from("data: [DONE]\n\n"));
         drop(filter.on_response_body(&mut ctx, &mut body3, false).unwrap());
 
-        let out = String::from_utf8(body3.unwrap().to_vec()).unwrap();
-        assert_eq!(out.matches("event: content_block_stop").count(), 1);
-        let delta = event_data(&out, "message_delta").get("delta").unwrap().clone();
-        assert_eq!(delta.get("stop_reason").and_then(Value::as_str), Some("stop_sequence"));
-        assert_eq!(delta.get("stop_sequence").and_then(Value::as_str), Some(","));
+        let out = std::str::from_utf8(body3.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            out.matches("event: content_block_stop").count(),
+            1,
+            "DONE should close the tool block retained across the matched stop"
+        );
+        let event = event_data(out, "message_delta");
+        let delta = event.get("delta").unwrap();
+        assert_stop_sequence_delta(delta, ",", "matched client stop");
     }
 
     #[test]
@@ -2173,15 +2176,15 @@ mod tests {
         let mut body = Some(Bytes::from(format!("data: {chunk}\n\n")));
         drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
         let first_output = String::from_utf8(body.take().unwrap().to_vec()).unwrap();
-        assert_eq!(first_output.matches("event: content_block_start").count(), 64);
+        assert_many_tool_block_indices(&first_output, "content_block_start", "start");
         let state = ctx.get_filter_state::<StreamState>().unwrap();
-        assert_eq!(state.tools.len(), 64);
-        assert_eq!(open_tool_blocks(state).len(), 64);
+        assert_tool_state_counts(state, 64, "before DONE");
 
         let mut done = Some(Bytes::from("data: [DONE]\n\n"));
         drop(filter.on_response_body(&mut ctx, &mut done, false).unwrap());
         let out = String::from_utf8(done.unwrap().to_vec()).unwrap();
-        assert_eq!(out.matches("event: content_block_stop").count(), 64);
+        assert_many_tool_block_indices(&out, "content_block_stop", "stop");
+        assert_message_stop_follows_blocks(&out);
     }
 
     #[test]
@@ -2197,20 +2200,17 @@ mod tests {
         ctx.current_filter_id = Some(1);
         ctx.insert_filter_state(StreamState::default());
         let state = ctx.get_filter_state_mut::<StreamState>().unwrap();
-        assert_eq!(get_tool_block_count(state), 0);
-        assert!(open_tool_blocks(state).is_empty());
+        assert_tool_state_counts(state, 0, "new filter ID");
         set_tool_block_index(state, "second", 0);
         set_tool_block_open(state, "second", true);
         state.tool_count = 1;
 
         ctx.current_filter_id = Some(0);
         let state = ctx.get_filter_state::<StreamState>().unwrap();
-        assert_eq!(get_tool_block_count(state), 1);
-        assert_eq!(open_tool_blocks(state), vec![(0, "first".to_owned())]);
+        assert_single_open_tool(state, "first", "filter ID 0");
         ctx.current_filter_id = Some(1);
         let state = ctx.get_filter_state::<StreamState>().unwrap();
-        assert_eq!(get_tool_block_count(state), 1);
-        assert_eq!(open_tool_blocks(state), vec![(0, "second".to_owned())]);
+        assert_single_open_tool(state, "second", "filter ID 1");
     }
 
     const INVALID_TOOL_CALL_CASES: [(&str, &str, &str); 5] = [
@@ -3016,6 +3016,71 @@ mod tests {
     }
 
     // Test Utilities
+
+    fn assert_many_tool_block_indices(output: &str, event_type: &str, action: &str) {
+        assert_eq!(
+            event_indices(output, event_type),
+            (0..64).collect::<Vec<_>>(),
+            "all 64 tool blocks should {action} once in block-index order"
+        );
+    }
+
+    fn assert_message_stop_follows_blocks(output: &str) {
+        assert_eq!(
+            output.matches("event: message_stop").count(),
+            1,
+            "DONE should emit exactly one terminal message_stop"
+        );
+        let last_block_stop = output.rfind("event: content_block_stop");
+        let message_stop = output.find("event: message_stop");
+        assert!(
+            matches!(
+                (last_block_stop, message_stop),
+                (Some(block_stop_position), Some(message_stop_position))
+                    if block_stop_position < message_stop_position
+            ),
+            "message_stop should follow every content_block_stop"
+        );
+    }
+
+    fn assert_single_open_tool(state: &StreamState, expected_name: &str, label: &str) {
+        assert_eq!(
+            get_tool_block_count(state),
+            1,
+            "{label} should retain its tracked tool block"
+        );
+        assert_eq!(
+            open_tool_blocks(state),
+            vec![(0, expected_name.to_owned())],
+            "{label} should retain only its own open block"
+        );
+    }
+
+    fn assert_stop_sequence_delta(delta: &Value, expected: &str, label: &str) {
+        assert_eq!(
+            delta.get("stop_reason").and_then(Value::as_str),
+            Some("stop_sequence"),
+            "{label} should report the stop_sequence reason"
+        );
+        assert_eq!(
+            delta.get("stop_sequence").and_then(Value::as_str),
+            Some(expected),
+            "{label} should remain intact in the terminal delta"
+        );
+    }
+
+    fn assert_tool_state_counts(state: &StreamState, expected: usize, label: &str) {
+        assert_eq!(
+            state.tools.len(),
+            expected,
+            "{label} should have {expected} tracked tool blocks"
+        );
+        assert_eq!(
+            open_tool_blocks(state).len(),
+            expected,
+            "{label} should have {expected} open tool blocks"
+        );
+    }
 
     fn event_data(output: &str, event_type: &str) -> Value {
         let marker = format!("event: {event_type}\n");
