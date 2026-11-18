@@ -3509,6 +3509,8 @@ class TestOpenAIResponsesVLLM:
             ({"search_domain_filter": ["example.com"]}, "unsupported_parameter"),
             ({"allowed_domains": ["example.com/path"]}, "invalid_value"),
             ({"allowed_domains": ["*.example.com"]}, "invalid_value"),
+            ({"allowed_domains": ["%2a.example.com"]}, "invalid_value"),
+            ({"allowed_domains": ["example.com.."]}, "invalid_value"),
             ({"blocked_domains": ["https://example.com/path"]}, "invalid_value"),
             ({"blocked_domains": ["*.example.com"]}, "invalid_value"),
         ]

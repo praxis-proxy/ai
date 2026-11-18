@@ -3586,6 +3586,7 @@ async fn on_request_body_drops_unverifiable_results_on_blocked_domains() {
         "web": {"results": [
             {"title": "Scheme relative", "url": "//outside.example/result", "description": "no scheme"},
             {"title": "Malformed", "url": "not a url", "description": "unparseable"},
+            {"title": "Opaque scheme", "url": "custom://EXAMPLE.ORG/result", "description": "case-preserving host"},
             {"title": "Inside", "url": "https://www.example.org/praxis", "description": "verifiable"},
         ]}
     })
@@ -3628,7 +3629,9 @@ async fn on_request_body_drops_unverifiable_results_on_blocked_domains() {
     for (label, messages) in [("messages", &state.messages), ("persisted", &state.persisted_messages)] {
         let continuation = serde_json::to_string(messages).unwrap();
         assert!(
-            !continuation.contains("outside.example") && !continuation.contains("not a url"),
+            !continuation.contains("outside.example")
+                && !continuation.contains("not a url")
+                && !continuation.contains("custom://"),
             "unverifiable results must not enter the {label} continuation: {continuation}"
         );
         assert!(
@@ -3649,11 +3652,14 @@ async fn preflight_rejects_unenforceable_filters() {
         serde_json::json!({"allowed_domains": [1]}),
         serde_json::json!({"allowed_domains": ["example.org/path"]}),
         serde_json::json!({"allowed_domains": ["*.example.org"]}),
+        serde_json::json!({"allowed_domains": ["%2a.example.org"]}),
+        serde_json::json!({"allowed_domains": ["example.org.."]}),
         serde_json::json!({"allowed_domains": too_many}),
         serde_json::json!({"blocked_domains": "example.org"}),
         serde_json::json!({"blocked_domains": [null]}),
         serde_json::json!({"blocked_domains": ["example.org/path"]}),
         serde_json::json!({"blocked_domains": ["example.*"]}),
+        serde_json::json!({"blocked_domains": ["%2a.example.org"]}),
         serde_json::json!({"blocked_domains": too_many}),
     ];
     for filters in invalid {

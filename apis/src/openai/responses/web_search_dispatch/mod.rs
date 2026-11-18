@@ -166,18 +166,25 @@ const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before 
 /// are enforced by the proxy on every provider result, so a result outside the
 /// allow-list (or under a blocked domain) never reaches the model or
 /// `action.sources`. Malformed, unsupported, or conflicting `filters` are
-/// rejected with HTTP 400 before the first inference round.
+/// rejected with HTTP 400 before the first inference round whenever the
+/// request's `tool_choice` leaves a web-search tool eligible; a request that
+/// forbids every hosted search with `"none"` is not validated because no search
+/// can run. `filters` is accepted on every web-search tool type this filter
+/// executes, including the `web_search_preview` variants whose pinned schema
+/// does not declare it.
 ///
 /// Domain handling matches hosted OpenAI where hosted documents it: each list
 /// accepts up to 100 bare domains (no scheme), both match subdomains, and an
 /// absent, null, or empty list restricts nothing. A wildcard entry such as
-/// `*.example.org` is rejected rather than stored literally, and while either
-/// list is active a result whose URL has no absolute host is dropped. Hosted
-/// does not document how the two lists combine; dispatch applies the allow-list
-/// and then removes blocked domains, so a host matching both is blocked.
-/// Requests whose web-search tools declare different `filters` are rejected
-/// because dispatch applies one filter to every search in the request; hosted
-/// behavior for that disagreement is undocumented.
+/// `*.example.org` (including percent-encoded spellings) and an entry with an
+/// empty label are rejected rather than stored literally, and while either list
+/// is active a result whose URL is not an absolute `http`/`https` URL with a
+/// verifiable host is dropped. Hosted does not document how the two lists
+/// combine; dispatch applies the allow-list and then removes blocked domains,
+/// so a host matching both is blocked. Requests whose web-search tools declare
+/// different `filters` are rejected because dispatch applies one filter to
+/// every search in the request; hosted behavior for that disagreement is
+/// undocumented.
 ///
 /// # YAML
 ///

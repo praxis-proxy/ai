@@ -125,9 +125,10 @@ impl DomainFilters {
 
     /// Whether `url` is permitted by the declared filters.
     ///
-    /// Any restriction requires a verifiable result host: a URL that does not
-    /// parse as an absolute URL with a host is dropped, so a block-list-only
-    /// request cannot retain a malformed or scheme-relative provider URL.
+    /// Any restriction requires a verifiable result host: a URL that is not an
+    /// absolute `http`/`https` URL with a matchable host is dropped, so a
+    /// block-list-only request cannot retain a malformed, scheme-relative, or
+    /// opaque-scheme provider URL.
     pub(crate) fn permits_url(&self, url: &str) -> bool {
         let Self::Restricted { allowed, blocked } = self else {
             return matches!(self, Self::Unrestricted);
@@ -135,10 +136,15 @@ impl DomainFilters {
         let Ok(parsed) = Url::parse(url) else {
             return false;
         };
-        let Some(host) = parsed.host() else {
+        // A non-web scheme keeps the raw host spelling (for example
+        // `custom://EXAMPLE.ORG`), so it cannot be compared reliably against a
+        // normalized list entry.
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return false;
+        }
+        let Some(host) = parsed.host().and_then(normalized_host) else {
             return false;
         };
-        let host = normalized_host(host);
         allowed.as_ref().is_none_or(|allowed| allowed.contains_host(&host))
             && !blocked.as_ref().is_some_and(|blocked| blocked.contains_host(&host))
     }
@@ -151,34 +157,39 @@ fn parse_host(entry: &str) -> Result<Host<String>, InvalidDomainEntry> {
         .or_else(|| strip_prefix_ignore_ascii_case(entry, "http://"))
         .unwrap_or(entry);
     let entry = entry.strip_suffix('/').unwrap_or(entry);
-    // A wildcard would be stored literally and never match a URL host, so
-    // reject the spelling instead of silently enforcing nothing.
-    if entry.is_empty() || entry.contains('*') {
-        return Err(InvalidDomainEntry);
-    }
     match Host::parse(entry).map_err(|_parse_error| InvalidDomainEntry)? {
         Host::Domain(mut domain) => {
             // IDNA conversion and percent-decoding happen during parsing, so
             // the root dot can only be removed afterwards.
-            domain.truncate(domain.trim_end_matches('.').len());
-            if domain.is_empty() {
-                return Err(InvalidDomainEntry);
-            }
+            let normalized = normalize_domain(&domain).ok_or(InvalidDomainEntry)?;
+            domain.truncate(normalized.len());
             Ok(Host::Domain(domain))
         },
         host @ (Host::Ipv4(_) | Host::Ipv6(_)) => Ok(host),
     }
 }
 
-/// Drop the root label from a parsed result host.
-///
-/// `Url` preserves a trailing `example.org.` host, while list entries are
-/// normalized without it, so both sides must agree before matching.
-fn normalized_host(host: Host<&str>) -> Host<&str> {
+/// Normalize a parsed result host for comparison with list entries.
+fn normalized_host(host: Host<&str>) -> Option<Host<&str>> {
     match host {
-        Host::Domain(domain) => Host::Domain(domain.trim_end_matches('.')),
-        host @ (Host::Ipv4(_) | Host::Ipv6(_)) => host,
+        Host::Domain(domain) => normalize_domain(domain).map(Host::Domain),
+        host @ (Host::Ipv4(_) | Host::Ipv6(_)) => Some(host),
     }
+}
+
+/// Remove the root label from a parsed domain, rejecting spellings that no
+/// result host can enforce.
+///
+/// Parsing happens first because it performs IDNA conversion and decodes
+/// percent-encoded dots and wildcards. Only one trailing root dot is valid; an
+/// empty label, a leftover trailing dot, or a wildcard is not a domain this
+/// matcher can compare against a URL host.
+fn normalize_domain(domain: &str) -> Option<&str> {
+    let domain = domain.strip_suffix('.').unwrap_or(domain);
+    if domain.is_empty() || domain.contains('*') || domain.split('.').any(str::is_empty) {
+        return None;
+    }
+    Some(domain)
 }
 
 /// Strip an ASCII `prefix` from `value`, ignoring ASCII case.
@@ -324,10 +335,19 @@ mod tests {
             "a b.example",
             "user@example.org",
             // A wildcard stored literally would never match a URL host, so it
-            // must be rejected instead of silently enforcing nothing.
+            // must be rejected instead of silently enforcing nothing. Parsing
+            // decodes percent escapes, so the encoded spelling must not slip
+            // past the raw check.
             "*.example.org",
             "example.*",
             "*",
+            "%2a.example.org",
+            "%2A.example.org",
+            // Only one root-label dot is valid; empty labels cannot match.
+            "example.org..",
+            "example..org",
+            ".",
+            "..",
         ] {
             assert!(
                 DomainList::parse(std::iter::once(entry)).is_err(),
@@ -362,19 +382,37 @@ mod tests {
             list(&["example.org"]),
             "the encoded spelling normalizes to the same list"
         );
+        assert_eq!(
+            list(&["example.org."]),
+            list(&["example.org"]),
+            "a single trailing root dot is valid"
+        );
+        assert!(
+            DomainList::parse(std::iter::once("example.org..")).is_err(),
+            "a repeated trailing root dot leaves an empty label"
+        );
     }
 
     #[test]
     fn restricted_filters_drop_unverifiable_hosts() {
         // A block-list-only request must not retain a URL whose host cannot be
-        // verified: an unparseable or scheme-relative provider URL would
-        // otherwise pass the "not blocked" check.
+        // verified: an unparseable, scheme-relative, or opaque-scheme provider
+        // URL would otherwise pass the "not blocked" check.
         for url in [
             "not a url",
             "//example.org/result",
             "/relative/path",
             "mailto:a@example.org",
             "https://",
+            // A non-web scheme keeps the raw host case, so it cannot be compared
+            // against a normalized entry.
+            "custom://EXAMPLE.ORG/result",
+            "custom://example.org/result",
+            "ftp://example.org/result",
+            // A repeated root dot or wildcard cannot identify a result host.
+            "https://example.org../result",
+            "https://*.example.org/result",
+            "https://./result",
         ] {
             assert!(
                 !permitted(None, Some(&["example.org"]), url),
