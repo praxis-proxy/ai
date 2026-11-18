@@ -508,6 +508,8 @@ fn build_buffered_record(
 ) -> Option<ResponseRecord> {
     let mut json = decode_response_body(bytes)?;
     let state = ctx.extensions.get::<ResponsesState>();
+    // Only the gateway writes the citation key; never store one from upstream.
+    strip_stored_citation_files(&mut json);
     if let Some(state) = state {
         persist_citation_files(&mut json, &state.citation_files);
     }
