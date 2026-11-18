@@ -338,8 +338,10 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         }
 
         // Compact owns its parse and retained-payload ledger, so the managed
-        // owner must not mint a second unmetered request state for it. Only the
-        // state-building instance short-circuits here; the facts-only classifier
+        // owner must not mint a second unmetered request state for it. Its parse
+        // also refuses a repeated top-level model, so releasing before the
+        // duplicate check below cannot bypass that rule. Only the state-building
+        // instance short-circuits here; the facts-only classifier
         // (`initialize_state: false`) must still classify compact so it promotes
         // the routing format header the binding router needs.
         if self.config.initialize_state

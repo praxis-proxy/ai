@@ -286,7 +286,7 @@ mod tests {
         br#"{"model":"a","messages":[],"model":"a"}"#,
         br#"{"model":null,"model":"a"}"#,
         br#"{"model":"a","model":42}"#,
-        br#"{"model":"a","model":"a"}"#,
+        br#"{"model":"a","m\u006fdel":"b"}"#,
         br#"{"model":"a","model":"b","model":"c"}"#,
     ];
 
@@ -372,7 +372,7 @@ mod tests {
             Some(Cow::Borrowed("plain"))
         ));
         assert_eq!(
-            scan(br#"{"model":"plain"}"#).as_str().as_deref(),
+            scan(br#"{"m\u006fdel":"pl\u0061in"}"#).as_str().as_deref(),
             Some("plain"),
             "escaped keys and values decode"
         );

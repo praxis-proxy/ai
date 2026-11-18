@@ -72,6 +72,7 @@ use crate::{
     RecordAiMetadata as _,
     callout_policy::OnFailure,
     json_body::MAX_JSON_BODY_BYTES,
+    model_field::{self, DUPLICATE_MODEL_MESSAGE, ParseError},
     state_owner::{StateOwner, require_state_owner},
     store::{OwnerScopedResponseStore, ResponseRecord, ResponseStoreRegistry, StoreError},
     subrequest::{self, SubRequest, SubRequestClient},
@@ -856,10 +857,7 @@ fn parse_compact_request_body(body: &Option<Bytes>) -> Result<ExplicitCompactReq
         .as_ref()
         .filter(|b| !b.is_empty())
         .ok_or_else(|| reject_compact(400, "invalid_request_error", "request body is empty"))?;
-    let mut parsed: Value = serde_json::from_slice(bytes).map_err(|e| {
-        debug!(error = %e, "compact request body parse failed");
-        reject_compact(400, "invalid_request_error", "invalid JSON body")
-    })?;
+    let mut parsed = parse_compact_object(bytes)?;
     let model = parsed
         .get("model")
         .and_then(Value::as_str)
@@ -876,6 +874,25 @@ fn parse_compact_request_body(body: &Option<Bytes>) -> Result<ExplicitCompactReq
         previous_response_id,
         instructions,
     })
+}
+
+/// Parse a compact body, refusing a repeated top-level `model`.
+///
+/// Compact owns its parse, including the budgeted handoff where the request
+/// filter releases before its duplicate-model check. Refuse a repeat here rather
+/// than collapsing it to the last occurrence. A non-object cannot carry the
+/// required `model`, so it maps to [`Value::Null`] and the caller reports the
+/// field as missing.
+fn parse_compact_object(bytes: &[u8]) -> Result<Value, FilterAction> {
+    match model_field::parse_object(bytes) {
+        Ok(object) => Ok(Value::Object(object)),
+        Err(ParseError::DuplicateModel) => Err(reject_compact(400, "invalid_request_error", DUPLICATE_MODEL_MESSAGE)),
+        Err(ParseError::Json(error)) => {
+            debug!(error = %error, "compact request body parse failed");
+            Err(reject_compact(400, "invalid_request_error", "invalid JSON body"))
+        },
+        Err(ParseError::NotObject) => Ok(Value::Null),
+    }
 }
 
 /// Validate and own the optional `instructions` field.

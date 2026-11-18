@@ -437,7 +437,7 @@ fn repeated_model_rejected_in_continue_mode_on_both_endpoints() {
     let echo_guard = start_echo_backend();
     let proxy_port = free_port();
 
-    let config = Config::from_yaml(&rewrite_yaml(proxy_port, echo_guard.port())).unwrap();
+    let config = Config::from_yaml(&rewrite_without_request_classifier_yaml(proxy_port, echo_guard.port())).unwrap();
     let proxy = start_proxy(&config);
 
     for (path, body) in [
@@ -469,7 +469,7 @@ fn repeated_model_never_reaches_an_effective_model_route() {
     let default_guard = start_backend_with_shutdown("default-backend");
     let proxy_port = free_port();
 
-    let config = Config::from_yaml(&effective_model_routing_yaml(
+    let config = Config::from_yaml(&effective_model_routing_without_request_classifier_yaml(
         proxy_port,
         llama_guard.port(),
         qwen_guard.port(),
@@ -489,6 +489,20 @@ fn repeated_model_never_reaches_an_effective_model_route() {
     for backend in ["llama-backend", "qwen-backend", "default-backend"] {
         assert_ne!(response, backend, "{backend} must not answer an ambiguous model");
     }
+
+    // Control: the same route configuration still serves an unambiguous model.
+    let body = r#"{"model":"gpt-4.1-mini","input":"control"}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "an unambiguous model must still reach its route"
+    );
+    assert_eq!(
+        parse_body(&raw),
+        "qwen-backend",
+        "the control request must route through the effective model header"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -561,6 +575,18 @@ filter_chains:
 insecure_options:
   allow_private_endpoints: true
 "#
+    )
+}
+
+/// Rewrite-only config: no earlier `openai_responses_request` classifier.
+///
+/// The model-rewrite filter checks method and path directly, so the duplicate
+/// rejection tests must exercise it without an earlier body classifier that
+/// would reject the same request first.
+fn rewrite_without_request_classifier_yaml(proxy_port: u16, backend_port: u16) -> String {
+    rewrite_yaml(proxy_port, backend_port).replace(
+        "      - filter: openai_responses_request\n        initialize_state: false\n",
+        "",
     )
 }
 
@@ -642,5 +668,18 @@ filter_chains:
 insecure_options:
   allow_private_endpoints: true
 "#
+    )
+}
+
+/// Effective-model routing config with no earlier request classifier.
+fn effective_model_routing_without_request_classifier_yaml(
+    proxy_port: u16,
+    llama_port: u16,
+    qwen_port: u16,
+    default_port: u16,
+) -> String {
+    effective_model_routing_yaml(proxy_port, llama_port, qwen_port, default_port).replace(
+        "      - filter: openai_responses_request\n        initialize_state: false\n",
+        "",
     )
 }

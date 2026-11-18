@@ -3077,6 +3077,46 @@ class TestOpenAIResponsesVLLM:
             )
         assert exc_info.value.status_code == 400, "invalid input item must return 400"
 
+    def test_repeated_top_level_model_is_rejected_before_backend(
+        self, openai_client
+    ):
+        """A raw body can repeat ``model`` where the SDK's dict serialization
+        cannot, and routing must refuse it instead of picking one occurrence."""
+        model = VLLM_MODEL.encode()
+        duplicate_body = (
+            b'{"model":"' + model + b'","input":"hi","model":"' + model + b'"}'
+        )
+        recorded_request_count = len(SimulatorBackendHandler.recorded_requests)
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.post(
+                "/responses",
+                cast_to=dict,
+                content=duplicate_body,
+                options={"headers": {"Content-Type": "application/json"}},
+            )
+
+        assert exc_info.value.status_code == 400
+        error = exc_info.value.response.json()["error"]
+        assert error["type"] == "invalid_request_error", error
+        assert "more than one top-level 'model' field" in error["message"], error
+        if VLLM_TEST_BACKEND == "simulator":
+            assert (
+                len(SimulatorBackendHandler.recorded_requests)
+                == recorded_request_count
+            ), "a repeated model must not be forwarded to the backend"
+
+        # Control: the same client and route still serve one unambiguous model.
+        control = openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say exactly: ONE-MODEL /no_think",
+            temperature=0,
+            store=False,
+            max_output_tokens=64,
+        )
+        assert control.status == "completed"
+        assert "ONE-MODEL" in control.output_text
+
     @pytest.mark.critical_vllm
     @requires_real_inference
     def test_rehydrated_second_turn(self, openai_client):
