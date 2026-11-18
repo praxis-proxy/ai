@@ -14,8 +14,11 @@
 //! reconciles each call in place (status, results, citations, and a private
 //! model-context bridge for the next round). It never parses the response body
 //! and never decides whether another round runs. Search context remains private
-//! to the model round trip; completed call items and citations are assembled by
-//! the owner into the final public Responses API object.
+//! to the model: clients see it only through the opt-in
+//! `file_search_call.results` include, while stored responses retain the private
+//! bridge so `previous_response_id` continuations and compaction replay it
+//! (#2036). Completed call items and citations are assembled by the owner into
+//! the final public Responses API object.
 
 pub(crate) mod citations;
 pub(crate) mod client;
@@ -78,8 +81,10 @@ const MAX_QUERIES_PER_CALL: usize = 64;
 /// Maximum formatted context retained across one continuation execution.
 ///
 /// This remains well below the 64 MiB proxy request ceiling after bridge
-/// metadata is added. Synthetic bridge messages are used only for the next
-/// inference round and are not persisted into rehydration history.
+/// metadata is added. Synthetic bridge messages feed the next inference round
+/// and, when the exchange is stored, share their payloads with the durable
+/// rehydration history, so this cap also bounds the context each stored
+/// response retains.
 const MAX_TOTAL_MODEL_CONTEXT_BYTES: usize = 2_097_152;
 
 /// Wire, decoder, decoded result, and formatting owners can overlap during
@@ -282,12 +287,9 @@ impl FileSearchDispatchFilter {
         // function_call_output pairs) to `messages`. The loop owner already routed
         // this round's reasoning items into `messages`; a hosted file_search_call
         // is not valid OpenResponses input (issue #808), so no output item is
-        // replayed here. Bridges are next-round-only and never persisted (see
-        // `MAX_TOTAL_MODEL_CONTEXT_BYTES`).
+        // replayed here.
         for bridge in bridges {
-            let result_start = state.messages.len();
-            state.messages.extend(bridge);
-            state.mark_local_tool_results_from(result_start);
+            append_search_bridge(state, bridge);
         }
         Ok(retained_charge)
     }
@@ -1513,6 +1515,31 @@ fn ensure_pending_file_search_call_ids(state: &mut ResponsesState, plan: &Search
             ensure_public_file_search_call_id(object, output_index, response_identity_hash);
         }
     }
+}
+
+/// Append one private bridge to working history and, when this exchange
+/// retains durable history, to its persistence mirror.
+///
+/// The persisted pair lands after the round's collected reasoning and
+/// `file_search_call`, so a `previous_response_id` continuation and a later
+/// compaction replay the same reasoning/call/result prefix the next inference
+/// round received (#2036). Both histories share one immutable payload per item,
+/// so persistence adds no copy of the retrieved context; later working-history
+/// edits detach through `MessageHistory`'s copy-on-write.
+fn append_search_bridge(state: &mut ResponsesState, bridge: [Value; 2]) {
+    let result_start = state.messages.len();
+    if state.captures_persistence_history() {
+        for item in bridge {
+            let item = Arc::new(item);
+            state.messages.push_shared(Arc::clone(&item));
+            if let Some(persisted) = state.persisted_messages_mut() {
+                persisted.push_shared(item);
+            }
+        }
+    } else {
+        state.messages.extend(bridge);
+    }
+    state.mark_local_tool_results_from(result_start);
 }
 
 /// Build the standard Responses bridge carrying private model context.

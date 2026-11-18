@@ -54,6 +54,7 @@ use super::{
     canonical_openresponses_replay_item,
     error::responses_error_rejection,
     extract_conversation_id,
+    file_search_dispatch::citations::restore_citation_files,
     history::MessageHistory,
     is_canonical_openresponses_replay_type,
     state::{LOCAL_COMPACTION_MARKER, ResponsesState, strip_local_compaction_marker},
@@ -227,11 +228,15 @@ impl RehydrateFilter {
         #[cfg(feature = "openai-mcp-tools")]
         bind_previous_tools_to_owner(&mut previous_tools, &owner);
         let previous_usage = record.response_object.get("usage").filter(|u| !u.is_null()).cloned();
+        // A follow-up may cite a passage an earlier turn retrieved without
+        // searching again, so restore the gateway-recorded file names (#2036).
+        let citation_files = restore_citation_files(&record.response_object);
         let stored = stored_messages_for_response(record);
-        let state = match resolve_rehydrated_state(ctx, body, source, stored, previous_tools, previous_usage) {
+        let mut state = match resolve_rehydrated_state(ctx, body, source, stored, previous_tools, previous_usage) {
             Ok(state) => state,
             Err(action) => return Ok(action),
         };
+        state.citation_files.extend(citation_files);
         install_rehydrated_state(ctx, state);
         debug!(previous_response_id = %prev_id, "previous response validated, state populated");
         ctx.set_metadata("responses.previous_response_id", prev_id);
