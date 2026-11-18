@@ -73,6 +73,36 @@ metering_url: "http://metering:8080"
 }
 
 #[test]
+fn config_parses_identity_claims() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+identity_username_claim: "preferred_username"
+identity_group_claim: "groups"
+"#,
+    )
+    .unwrap();
+    let filter = build_filter(&yaml).unwrap();
+
+    assert_eq!(filter.identity_username_claim.as_deref(), Some("preferred_username"));
+    assert_eq!(filter.identity_group_claim.as_deref(), Some("groups"));
+}
+
+#[test]
+fn config_without_identity_claims_leaves_them_unset() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+"#,
+    )
+    .unwrap();
+    let filter = build_filter(&yaml).unwrap();
+
+    assert!(filter.identity_username_claim.is_none());
+    assert!(filter.identity_group_claim.is_none());
+}
+
+#[test]
 fn config_defaults_to_public_only_endpoint_policy() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
@@ -541,7 +571,7 @@ fn captures_tenant_headers_with_default_prefix() {
     req.headers.insert("x-tenant-cost-center", "cc-7".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.username, "alice");
     assert_eq!(state.group, "engineering");
@@ -560,7 +590,7 @@ fn strips_identity_and_auth_headers() {
     req.headers.insert("x-tenant-cost-center", "cc-7".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let _state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let _state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     let removed: Vec<&str> = ctx.request_headers_to_remove.iter().map(HeaderName::as_str).collect();
     assert!(removed.contains(&"x-tenant-username"));
@@ -571,12 +601,39 @@ fn strips_identity_and_auth_headers() {
 }
 
 #[test]
+fn identity_claims_configured_but_no_extension_falls_through_to_headers() {
+    // Tier 0 is only consulted when a policy/auth filter published an
+    // AuthenticatedIdentity. With the claims configured but no such extension
+    // (the common case for a request the policy engine did not authenticate),
+    // capture must fall through to the lower tiers rather than yielding an
+    // empty identity. End-to-end tier-0 resolution is covered by the
+    // external_metering_policy_engine integration test, since the extension's
+    // constructor is private to Praxis core.
+    let mut req = make_request(http::Method::POST, "/v1/chat/completions");
+    req.headers.insert("x-tenant-username", "alice".parse().unwrap());
+
+    let mut ctx = make_filter_context(&req);
+    let state = capture_identity(
+        &mut ctx,
+        "x-tenant-",
+        "identity",
+        Some("preferred_username"),
+        Some("groups"),
+    );
+
+    assert_eq!(
+        state.username, "alice",
+        "header identity must survive when no extension is present"
+    );
+}
+
+#[test]
 fn custom_prefix_captures_correctly() {
     let mut req = make_request(http::Method::POST, "/v1/chat/completions");
     req.headers.insert("x-myco-username", "bob".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let state = capture_identity(&mut ctx, "x-myco-", "identity");
+    let state = capture_identity(&mut ctx, "x-myco-", "identity", None, None);
 
     assert_eq!(state.username, "bob");
 }
@@ -585,7 +642,7 @@ fn custom_prefix_captures_correctly() {
 fn missing_username_returns_empty() {
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert!(state.username.is_empty());
 }
@@ -610,7 +667,7 @@ fn verified_identity_ignores_forged_headers_and_guard_metadata() {
     ctx.filter_metadata
         .insert("identity.x-tenant-model".to_owned(), "model-forged".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.username, "alice");
     assert_eq!(state.group, "engineering");
@@ -643,7 +700,7 @@ fn verified_billing_identity_ignores_forged_org_and_cost_center() {
     ctx.filter_metadata
         .insert("identity.x-tenant-cost-center".to_owned(), "cc-forged".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.organization_id, "org-verified");
     assert_eq!(state.cost_center, "cc-verified");
@@ -662,7 +719,7 @@ fn guard_metadata_supplies_identity_without_verified_claims() {
     ctx.filter_metadata
         .insert("identity.x-tenant-model".to_owned(), "claude-3".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.username, "bob");
     assert_eq!(state.group, "ml");
@@ -684,7 +741,7 @@ fn partial_verified_identity_blocks_lower_tiers() {
     ctx.filter_metadata
         .insert("identity.x-tenant-subscription".to_owned(), "sub-forged".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.group, "engineering", "verified group must survive");
     assert!(
@@ -705,7 +762,7 @@ fn custom_namespace_supplies_guard_identity() {
     ctx.filter_metadata
         .insert("tenant-meta.x-tenant-username".to_owned(), "bob".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-", "tenant-meta");
+    let state = capture_identity(&mut ctx, "x-tenant-", "tenant-meta", None, None);
 
     assert_eq!(state.username, "bob", "configured namespace must resolve tier 2");
 }
@@ -717,7 +774,7 @@ fn multi_value_identity_header_is_fully_stripped() {
     req.headers.append("x-tenant-username", "mallory".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.username, "alice", "first value wins during capture");
     let removed: Vec<&str> = ctx.request_headers_to_remove.iter().map(HeaderName::as_str).collect();
@@ -738,7 +795,7 @@ fn guard_identity_blocks_raw_header_fallback() {
     ctx.filter_metadata
         .insert("identity.x-tenant-username".to_owned(), "bob".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.username, "bob");
     assert!(
@@ -763,7 +820,7 @@ fn guard_group_only_blocks_raw_header_username() {
     ctx.filter_metadata
         .insert("identity.x-tenant-group".to_owned(), "ml".to_owned());
 
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.group, "ml", "guard group must survive");
     assert!(
@@ -779,7 +836,7 @@ fn group_falls_back_to_subscription() {
     req.headers.insert("x-tenant-subscription", "sub-99".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     assert_eq!(state.group, "sub-99");
 }
@@ -792,7 +849,7 @@ fn strips_accept_encoding_to_keep_response_readable() {
         .insert("accept-encoding", "gzip, deflate, br".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    let _state = capture_identity(&mut ctx, "x-tenant-", "identity");
+    let _state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
     let removed: Vec<&str> = ctx.request_headers_to_remove.iter().map(HeaderName::as_str).collect();
     assert!(removed.contains(&"accept-encoding"));
