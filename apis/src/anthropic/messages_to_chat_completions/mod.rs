@@ -17,6 +17,8 @@ mod config;
 pub(crate) mod request;
 pub(crate) mod response;
 
+use std::sync::{Arc, LazyLock};
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use metrics::counter;
@@ -77,6 +79,16 @@ struct StreamingErrorBuffer {
 /// choice-level `stop_reason`; the response phase needs the client's list to
 /// report it back truthfully as `stop_reason: stop_sequence`.
 pub(crate) const STOP_SEQUENCES_KEY: &str = "anthropic_messages_to_chat_completions.stop_sequences";
+
+/// Request-scoped client stop sequences used by both translation phases.
+///
+/// This is stored in typed extensions rather than bounded routing metadata:
+/// Anthropic does not impose the metadata value limit on stop sequences.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ClientStopSequences(pub(crate) Arc<[String]>);
+
+/// Shared empty list for requests that do not carry client stop sequences.
+static EMPTY_CLIENT_STOP_SEQUENCES: LazyLock<Arc<[String]>> = LazyLock::new(Arc::default);
 
 /// Metadata key carrying the comma-separated degraded-feature labels from the
 /// request-body phase to the response-header phase.
@@ -427,7 +439,9 @@ fn transform_buffered_response(
             .map_or("", String::as_str);
         let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY);
         let stop_sequences = client_stop_sequences(ctx);
-        if let Some(finish_reason) = transform_non_streaming_body(body, request_model, request_id, &stop_sequences) {
+        if let Some(finish_reason) =
+            transform_non_streaming_body(body, request_model, request_id, stop_sequences.as_ref())
+        {
             ctx.set_metadata("openai.finish_reason", finish_reason);
             FilterAction::Continue
         } else {
@@ -468,9 +482,14 @@ fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, value: Option<&serd
 
     if let Some(stop_sequences) = value
         .get("stop_sequences")
-        .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+        .and_then(serde_json::Value::as_array)
+        .filter(|stop_sequences| !stop_sequences.is_empty())
+        && let Some(stop_sequences) = stop_sequences
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
     {
-        ctx.set_metadata(STOP_SEQUENCES_KEY, stop_sequences.to_string());
+        ctx.extensions.insert(ClientStopSequences(stop_sequences.into()));
     }
 }
 
@@ -479,11 +498,16 @@ fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, value: Option<&serd
 /// A list that is not all strings is invalid Anthropic input the backend
 /// rejects on its own; treating it as empty keeps the response at
 /// `end_turn` rather than failing the translation.
-pub(crate) fn client_stop_sequences(ctx: &HttpFilterContext<'_>) -> Vec<String> {
+pub(crate) fn client_stop_sequences(ctx: &HttpFilterContext<'_>) -> Arc<[String]> {
+    if let Some(stop_sequences) = ctx.extensions.get::<ClientStopSequences>() {
+        return Arc::clone(&stop_sequences.0);
+    }
+
     ctx.filter_metadata
         .get(STOP_SEQUENCES_KEY)
-        .and_then(|value| serde_json::from_str(value).ok())
-        .unwrap_or_default()
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .filter(|stop_sequences| !stop_sequences.is_empty())
+        .map_or_else(|| Arc::clone(&EMPTY_CLIENT_STOP_SEQUENCES), Arc::from)
 }
 
 /// Record degraded features as operator signals.
@@ -1119,9 +1143,39 @@ mod tests {
         extract_request_metadata(&mut ctx, value.as_ref());
 
         assert_eq!(
-            ctx.filter_metadata.get(STOP_SEQUENCES_KEY).unwrap(),
-            r#"[",","END"]"#,
+            client_stop_sequences(&ctx).as_ref(),
+            &[",".to_owned(), "END".to_owned()],
             "client stop sequences are retained for the response phase"
+        );
+        let first = client_stop_sequences(&ctx);
+        let second = client_stop_sequences(&ctx);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "extension reads should share the retained stop-sequence allocation"
+        );
+        assert!(
+            !ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY),
+            "typed stop-sequence storage should not use routing metadata"
+        );
+    }
+
+    #[test]
+    fn extract_request_metadata_retains_stop_sequences_longer_than_metadata_limit() {
+        let sequence = "s".repeat(300);
+        let value = serde_json::json!({"model": "gpt-4", "stop_sequences": [sequence]});
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+
+        extract_request_metadata(&mut ctx, Some(&value));
+
+        assert_eq!(
+            client_stop_sequences(&ctx).as_ref(),
+            &[sequence],
+            "typed stop-sequence storage should preserve values above the metadata limit"
+        );
+        assert!(
+            !ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY),
+            "long stop sequences should not use size-limited routing metadata"
         );
     }
 
@@ -1136,6 +1190,12 @@ mod tests {
         assert!(
             !ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY),
             "empty stop_sequences should not be retained"
+        );
+        let first = client_stop_sequences(&ctx);
+        let second = client_stop_sequences(&ctx);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "empty stop-sequence reads should share the process-wide allocation"
         );
     }
 
