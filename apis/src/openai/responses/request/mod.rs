@@ -64,6 +64,7 @@ use crate::{
     RecordAiMetadata as _,
     classifier::{AiRequestFormat, ClassifiedRequest, classify_object, empty_result},
     json_body::MAX_JSON_BODY_BYTES,
+    model_field::{self, DUPLICATE_MODEL_MESSAGE, ParseError},
     operation::RequestBody,
     operation_classifier::AiOperationMatch,
 };
@@ -83,7 +84,10 @@ const PREVIOUS_INPUT_MESSAGES: &str = "previous_input_messages";
 /// which operations carry a body worth parsing: create, compact, and input
 /// token counts. Bodyless operations — fetch, delete, cancel, list input items,
 /// and the `WebSocket` handshake — are released untouched, as is Conversations
-/// API traffic. `on_invalid` governs only bodies that fail to parse.
+/// API traffic. `on_invalid` governs only bodies that fail to parse. A body
+/// that repeats its top-level `model` is refused with a 400 on every entry,
+/// before any routing fact is published, because no single model exists for
+/// routing to act on.
 ///
 /// On managed paths, rejects `code_interpreter`, `background=true`, and non-null
 /// `prompt` with a 400 because the gateway does not implement them. The
@@ -218,7 +222,15 @@ impl OpenaiResponsesRequestFilter {
         // A body that cannot be classified follows `on_invalid` instead.
         let (parsed, classified) = match parse_and_classify_create_body(body) {
             Ok(pair) => pair,
-            Err(format) => return handle_unclassifiable(ctx, format, &self.config.shared),
+            Err(Unclassifiable::Format(format)) => return handle_unclassifiable(ctx, format, &self.config.shared),
+            Err(Unclassifiable::DuplicateModel) => {
+                debug!("refusing Responses request with a repeated top-level model");
+                return Ok(FilterAction::Reject(responses_error_rejection(
+                    400,
+                    "invalid_request_error",
+                    DUPLICATE_MODEL_MESSAGE,
+                )));
+            },
         };
 
         // Routing facts are published for every entry, in whichever phase it
@@ -703,6 +715,14 @@ fn publish_bodyless_operation(
     Ok(FilterAction::Release)
 }
 
+/// Why a create body produced no classification.
+enum Unclassifiable {
+    /// The body is not a JSON object; `on_invalid` decides with this format.
+    Format(AiRequestFormat),
+    /// The object repeats its top-level `model`; always refused.
+    DuplicateModel,
+}
+
 /// Parse a create body once and extract its routing facts.
 ///
 /// Returns the parsed value alongside its classification so the caller holds
@@ -712,20 +732,19 @@ fn publish_bodyless_operation(
 ///
 /// # Errors
 ///
-/// Returns the format to publish when the body cannot be classified.
+/// Returns why the body cannot be classified: the format to publish, or a
+/// repeated top-level `model`.
 fn parse_and_classify_create_body(
     body: &Option<Bytes>,
-) -> Result<(serde_json::Value, ClassifiedRequest), AiRequestFormat> {
+) -> Result<(serde_json::Value, ClassifiedRequest), Unclassifiable> {
     let bytes: &[u8] = body.as_deref().unwrap_or(&[]);
-    let parsed = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|_ignored| {
-        if bytes.is_empty() {
-            AiRequestFormat::NonJson
-        } else {
-            AiRequestFormat::InvalidJson
-        }
+    let object = model_field::parse_object(bytes).map_err(|error| match error {
+        ParseError::DuplicateModel => Unclassifiable::DuplicateModel,
+        ParseError::Json(_) if bytes.is_empty() => Unclassifiable::Format(AiRequestFormat::NonJson),
+        ParseError::Json(_) | ParseError::NotObject => Unclassifiable::Format(AiRequestFormat::InvalidJson),
     })?;
-    let classified = classify_matched_operation(parsed.as_object().ok_or(AiRequestFormat::InvalidJson)?);
-    Ok((parsed, classified))
+    let classified = classify_matched_operation(&object);
+    Ok((serde_json::Value::Object(object), classified))
 }
 
 /// Reject requests that select both supported sources of conversation history.

@@ -429,6 +429,69 @@ fn malformed_json_continues_in_continue_mode() {
 }
 
 // -----------------------------------------------------------------------------
+// Repeated Model Rejection
+// -----------------------------------------------------------------------------
+
+#[test]
+fn repeated_model_rejected_in_continue_mode_on_both_endpoints() {
+    let echo_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let config = Config::from_yaml(&rewrite_yaml(proxy_port, echo_guard.port())).unwrap();
+    let proxy = start_proxy(&config);
+
+    for (path, body) in [
+        (
+            "/v1/responses",
+            r#"{"model":"codex-mini-latest","input":"hi","model":"gpt-4.1-mini"}"#,
+        ),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"codex-mini-latest","model":"codex-mini-latest","messages":[]}"#,
+        ),
+    ] {
+        let raw = http_send(proxy.addr(), &json_post(path, body));
+
+        assert_eq!(parse_status(&raw), 400, "{path}: a repeated model must be refused");
+        let error_body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+        assert_eq!(
+            error_body["error"]["type"].as_str(),
+            Some("invalid_request_error"),
+            "{path}: rejection should have structured error type"
+        );
+    }
+}
+
+#[test]
+fn repeated_model_never_reaches_an_effective_model_route() {
+    let llama_guard = start_backend_with_shutdown("llama-backend");
+    let qwen_guard = start_backend_with_shutdown("qwen-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let config = Config::from_yaml(&effective_model_routing_yaml(
+        proxy_port,
+        llama_guard.port(),
+        qwen_guard.port(),
+        default_guard.port(),
+    ))
+    .unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1-mini","input":"ambiguous","model":"codex-mini-2026-06-24"}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "a repeated model must be refused before routing"
+    );
+    let response = parse_body(&raw);
+    for backend in ["llama-backend", "qwen-backend", "default-backend"] {
+        assert_ne!(response, backend, "{backend} must not answer an ambiguous model");
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 

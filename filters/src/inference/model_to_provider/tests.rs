@@ -246,20 +246,19 @@ async fn mapping_defers_partial_bodies_until_end_of_stream() {
 }
 
 #[tokio::test]
-async fn mapping_preserves_last_model_and_decodes_escaped_names() {
+async fn mapping_decodes_escaped_names() {
     let filter = build_filter(vertex_config());
     for raw in [
         r#"{"mo\u0064el":"claude-sonnet-4-5"}"#,
         r#"{"model":"claude-sonnet-4-\u0035"}"#,
-        r#"{"model":42,"model":"claude-sonnet-4-5"}"#,
-        r#"{"model":"unknown","model":"claude-sonnet-4-5"}"#,
+        r#"{"input":{"model":"unknown"},"model":"claude-sonnet-4-5"}"#,
     ] {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = context(&request);
         let mut body = Some(Bytes::copy_from_slice(raw.as_bytes()));
         assert_continue(&filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
         assert_continue(&filter.on_request(&mut ctx).await.unwrap());
-        assert_eq!(ctx.cluster.as_deref(), Some("vertex"), "last model selects: {raw}");
+        assert_eq!(ctx.cluster.as_deref(), Some("vertex"), "top-level model selects: {raw}");
         let public_model = ctx.filter_metadata.get(MODEL_PROVIDER_CLIENT_MODEL_METADATA);
         assert_eq!(
             public_model,
@@ -278,8 +277,7 @@ async fn mapping_preserves_last_model_and_decodes_escaped_names() {
 async fn invalid_or_unmatched_models_preserve_original_body_and_selection() {
     let filter = build_filter(vertex_config());
     for raw in [
-        br#"{"model":"claude-sonnet-4-5","model":42}"#.as_slice(),
-        br#"{"model":"claude-sonnet-4-5","model":"unknown"}"#,
+        br#"{"model":42}"#.as_slice(),
         br#"{"model":"claude-sonnet-4-5"} trailing"#,
         br#"{"model":"claude-sonnet-4-5","ignored":1e999}"#,
         b"{\"model\":\"claude-sonnet-4-5\",\"ignored\":\"\xff\"}",
@@ -299,7 +297,7 @@ async fn invalid_or_unmatched_models_preserve_original_body_and_selection() {
 #[tokio::test]
 async fn unchanged_target_preserves_bytes_and_still_validates_entire_body() {
     let filter = build_filter(&vertex_config().replace("claude-sonnet-4-5@20250929", "claude-sonnet-4-5"));
-    let original = Bytes::from_static(br#"{ "model": "unknown", "model": "claude-sonnet-4-5", "messages": [] }"#);
+    let original = Bytes::from_static(br#"{ "model":  "claude-sonnet-4-5", "messages": [] }"#);
     let mut body = Some(original.clone());
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = context(&request);
@@ -310,11 +308,7 @@ async fn unchanged_target_preserves_bytes_and_still_validates_entire_body() {
         Some("vertex"),
         "an unchanged target still selects its cluster"
     );
-    assert_eq!(
-        body,
-        Some(original),
-        "no rewrite must preserve whitespace and duplicate members"
-    );
+    assert_eq!(body, Some(original), "no rewrite must preserve whitespace");
     assert_eq!(
         ctx.filter_metadata.get(MODEL_PROVIDER_CLIENT_MODEL_METADATA),
         Some("claude-sonnet-4-5"),
@@ -323,27 +317,60 @@ async fn unchanged_target_preserves_bytes_and_still_validates_entire_body() {
     assert_passthrough(filter.as_ref(), br#"{"model":"claude-sonnet-4-5","ignored":1e999}"#).await;
 }
 
-#[test]
-fn model_preflight_borrows_plain_names_and_decodes_only_selected_strings() {
+#[tokio::test]
+async fn repeated_top_level_model_is_refused_before_selection() {
+    let filter = build_filter(&format!("{}\nfallback_upstream: fallback", vertex_config()));
+    for raw in [
+        br#"{"model":"claude-sonnet-4-5","model":"claude-sonnet-4-5"}"#.as_slice(),
+        br#"{"model":"unknown","model":"claude-sonnet-4-5"}"#,
+        br#"{"model":"claude-sonnet-4-5","model":42}"#,
+        br#"{"model":"claude-sonnet-4-5","mo\u0064el":"unknown"}"#,
+    ] {
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = context(&request);
+        ctx.cluster = Some(Arc::from("existing"));
+        let original = Bytes::copy_from_slice(raw);
+        let mut body = Some(original.clone());
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        let raw = String::from_utf8_lossy(raw);
+        assert!(
+            matches!(&action, FilterAction::Reject(r) if r.status == 400),
+            "repeated model must be refused: {raw}"
+        );
+        assert_eq!(body, Some(original), "a refused body is not rewritten: {raw}");
+        assert_nothing_selected(&ctx, &raw);
+    }
+}
+
+/// Ensure a refused request staged no mapping, selected no cluster, and published no public model.
+fn assert_nothing_selected(ctx: &HttpFilterContext<'_>, raw: &str) {
     assert!(
-        matches!(
-            model::peek(br#"{"model":"plain","messages":[{"content":"long"}]}"#),
-            Some(std::borrow::Cow::Borrowed("plain"))
-        ),
-        "plain model identities must borrow the input"
+        ctx.get_filter_state::<ResolvedUpstream>().is_none(),
+        "no mapping is staged: {raw}"
     );
     assert_eq!(
-        model::peek(br#"{"model":42,"mo\u0064el":"p\u006cain"}"#).as_deref(),
-        Some("plain"),
-        "escaped keys and the final escaped model must decode"
+        ctx.cluster.as_deref(),
+        Some("existing"),
+        "neither a mapping nor the fallback is selected: {raw}"
     );
     assert!(
-        model::peek(br#"{"model":"plain","model":false}"#).is_none(),
-        "the final non-string model must replace an earlier string"
+        ctx.filter_metadata.get(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none(),
+        "no public model is published: {raw}"
     );
-    assert!(
-        model::peek(br#"{"model":"plain"} {}"#).is_none(),
-        "trailing JSON must invalidate a candidate"
+}
+
+#[tokio::test]
+async fn repeated_model_on_unmapped_path_keeps_path_fallback() {
+    let filter = build_filter(&format!("{}\nfallback_upstream: fallback", vertex_config()));
+    let request = make_request(Method::POST, "/v1/embeddings");
+    let mut ctx = context(&request);
+    let mut body = Some(Bytes::from_static(br#"{"model":"a","model":"b"}"#));
+    assert_continue(&filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+    assert_continue(&filter.on_request(&mut ctx).await.unwrap());
+    assert_eq!(
+        ctx.cluster.as_deref(),
+        Some("fallback"),
+        "paths without a mapping select by path, not by the body model"
     );
 }
 

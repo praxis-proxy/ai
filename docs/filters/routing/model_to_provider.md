@@ -9,6 +9,8 @@ Maps stable client-facing model IDs to existing upstream clusters and provider-s
 
 An exact model/path match rewrites the JSON body model and records the client ID for metering and provider response adapters. During the request phase, the filter selects the mapping's `upstream` cluster. A following `load_balancer` owns endpoint selection, health checks, and retries; no header-matching `router` or provider registry is needed.
 
+A body on a configured path whose top-level `model` occurs more than once is refused with HTTP 400, including identical repeats, so neither a mapping nor `fallback_upstream` is selected from an ambiguous model.
+
 Unknown models and paths keep their bodies unchanged and select `fallback_upstream` when configured. Without it, this filter leaves cluster selection unchanged; a load balancer still needs a selected cluster to forward the request. Do not combine this selector with a competing router before the same load balancer.
 
 The normal server pipeline validation checks mapped and fallback cluster names against the load balancers on startup and reload. Cluster application metadata is optional for routing. Provider adapters can read `selected_application_provider()` after load balancing and must separately declare any application metadata they require on those clusters.

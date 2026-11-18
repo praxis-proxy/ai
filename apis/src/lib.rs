@@ -50,6 +50,7 @@ pub mod mcp_session {
         McpStreamingRequested,
     };
 }
+pub mod model_field;
 pub mod openai;
 pub mod operation;
 pub mod operation_classifier;

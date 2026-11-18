@@ -137,6 +137,54 @@ async fn create_request_without_model_publishes_format_only() {
     );
 }
 
+#[tokio::test]
+async fn repeated_top_level_model_is_rejected_before_any_fact() {
+    for body in [
+        r#"{"model":"gpt-4","messages":[],"model":"gpt-4o"}"#,
+        r#"{"model":"gpt-4","model":"gpt-4"}"#,
+    ] {
+        let (ctx, action) = run_filter(Method::POST, "/v1/chat/completions", body).await;
+
+        let FilterAction::Reject(rejection) = action else {
+            panic!("repeated model must be rejected: {body}");
+        };
+        assert_eq!(rejection.status, 400, "repeated model is a client error: {body}");
+        let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(error["error"]["type"], "invalid_request_error", "OpenAI error shape");
+        assert!(
+            !ctx.filter_metadata
+                .contains_key("openai_chat_completions_request.model"),
+            "no model fact is published: {body}"
+        );
+        assert!(
+            !ctx.filter_results.contains_key("openai_chat_completions_request"),
+            "no filter results are published: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn nested_model_keys_do_not_count_as_repeats() {
+    let (ctx, action) = run_filter(
+        Method::POST,
+        "/v1/chat/completions",
+        r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hi","model":"x"}],"metadata":{"model":"y"}}"#,
+    )
+    .await;
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "single top-level model releases"
+    );
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_chat_completions_request.model")
+            .map(String::as_str),
+        Some("gpt-4"),
+        "the top-level model is published"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Non-Create / Unmatched: No Fact
 // -----------------------------------------------------------------------------
