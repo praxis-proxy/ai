@@ -1345,8 +1345,8 @@ fn example_config_token_rate_limit_soft_enforcement() {
     );
 }
 
-/// Over-quota traffic continues with the llm-d sheddable priority class.
-/// Inside quota the header is absent.
+/// Inside quota continues with the llm-d critical priority class.
+/// Over quota continues with sheddable.
 #[test]
 fn example_config_token_rate_limit_priority_class() {
     let backend = StatefulCapturingBackend::new(vec![
@@ -1380,8 +1380,12 @@ fn example_config_token_rate_limit_priority_class() {
     assert_eq!(parse_status(&first), 200, "inside quota must be admitted");
     let first_upstream = backend.requests()[0].headers.to_ascii_lowercase();
     assert!(
-        !first_upstream.contains("x-llm-d-inference-priority-class:"),
-        "inside quota must not forward a client-supplied sheddable header: {first_upstream}"
+        first_upstream.contains("x-llm-d-inference-priority-class: critical"),
+        "inside quota must stamp critical: {first_upstream}"
+    );
+    assert!(
+        !first_upstream.contains("x-llm-d-inference-priority-class: sheddable"),
+        "inside quota must replace a client-supplied sheddable header: {first_upstream}"
     );
 
     let second = http_send(&proxy_addr, &json_post("/v1/chat/completions", "{}"));

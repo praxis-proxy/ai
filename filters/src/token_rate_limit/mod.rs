@@ -1133,6 +1133,9 @@ struct CompiledRule {
     /// denies a reservation for budget exhaustion (`ai#1241`).
     enforcement: EnforcementMode,
 
+    /// Headers set on an admitted reservation. Empty means no within-quota annotation.
+    within_quota: Vec<(HeaderName, http::HeaderValue)>,
+
     /// Soft over-quota request annotation, when configured.
     over_quota: Option<CompiledOverQuota>,
 }
@@ -1991,12 +1994,18 @@ fn compile_rule(
     let tiers = compile_tiers(&rule.name, rule.tiers, capacity)?;
     reject_deny_tier_with_soft_enforcement(&rule.name, rule.enforcement, &tiers)?;
     let mut inject_header_names = collect_inject_header_names(&tiers);
+    let within_quota = compile_within_quota(&rule.name, rule.within_quota, &inject_header_names)?;
     let over_quota = compile_over_quota(&rule.name, rule.enforcement, rule.over_quota, &inject_header_names)?;
     if let Some(over_quota) = &over_quota {
         for name in &over_quota.strip_names {
             if !inject_header_names.contains(name) {
                 inject_header_names.push(name.clone());
             }
+        }
+    }
+    for (name, _) in &within_quota {
+        if !inject_header_names.contains(name) {
+            inject_header_names.push(name.clone());
         }
     }
 
@@ -2009,8 +2018,38 @@ fn compile_rule(
         tiers,
         inject_header_names,
         enforcement: rule.enforcement,
+        within_quota,
         over_quota,
     })
+}
+
+/// Compile optional headers written when a reservation is admitted.
+///
+/// The same header name may also appear in `over_quota`, because those
+/// paths are mutually exclusive. A name shared with an S1 inject tier is
+/// rejected: both would write it on admission.
+fn compile_within_quota(
+    rule_name: &str,
+    within_quota: Option<config::WithinQuotaConfig>,
+    tier_header_names: &[HeaderName],
+) -> Result<Vec<(HeaderName, http::HeaderValue)>, FilterError> {
+    let Some(cfg) = within_quota else {
+        return Ok(Vec::new());
+    };
+    if cfg.headers.is_empty() {
+        return Err(format!("token_rate_limit: rule '{rule_name}': within_quota must set at least one header").into());
+    }
+    let headers = compile_request_headers(rule_name, "within_quota", &cfg.headers)?;
+    for (name, _) in &headers {
+        if tier_header_names.contains(name) {
+            return Err(format!(
+                "token_rate_limit: rule '{rule_name}': within_quota header '{name}' \
+                 collides with an inject tier header"
+            )
+            .into());
+        }
+    }
+    Ok(headers)
 }
 
 // -----------------------------------------------------------------------------
@@ -2535,6 +2574,8 @@ impl TokenRateLimitFilter {
             },
         );
         ctx.set_metadata(META_ESTIMATE, request_estimate.to_string());
+        let ordered = !ctx.pre_read_mutations.is_empty();
+        Self::queue_tier_headers(ctx, &rule.within_quota, ordered);
         Self::evaluate_tiers(ctx, rule, usage_after);
         record_admission_span(ctx, rule, request_estimate, "admitted");
         FilterAction::Continue
@@ -3476,6 +3517,7 @@ mod backend_injection_tests {
             tiers: Vec::new(),
             inject_header_names: Vec::new(),
             enforcement: super::EnforcementMode::Hard,
+            within_quota: Vec::new(),
             over_quota: None,
         }
     }

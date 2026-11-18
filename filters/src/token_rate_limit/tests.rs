@@ -4631,6 +4631,9 @@ fn priority_class_soft_yaml() -> serde_yaml::Value {
         \x20   capacity: 100\n\
         \x20   reserved_tokens: 60\n\
         \x20   enforcement: soft\n\
+        \x20   within_quota:\n\
+        \x20     headers:\n\
+        \x20       x-llm-d-inference-priority-class: critical\n\
         \x20   over_quota:\n\
         \x20     headers:\n\
         \x20       x-llm-d-inference-priority-class: sheddable\n";
@@ -4657,8 +4660,8 @@ async fn soft_over_quota_sets_llm_d_priority_class_sheddable() {
     );
     assert_eq!(
         header_value(&first_ctx, PRIORITY_CLASS_HEADER),
-        None,
-        "inside quota must not stamp sheddable; a missing header is critical"
+        Some("critical"),
+        "inside quota must stamp critical"
     );
 
     let mut second_ctx = filter_context(&req);
@@ -4672,7 +4675,14 @@ async fn soft_over_quota_sets_llm_d_priority_class_sheddable() {
     assert_eq!(
         header_value(&second_ctx, PRIORITY_CLASS_HEADER),
         Some("sheddable"),
-        "over quota must stamp the llm-d priority class"
+        "over quota must stamp sheddable"
+    );
+    assert!(
+        second_ctx
+            .request_headers_to_set
+            .iter()
+            .all(|(_, value)| value.to_str().ok() != Some("critical")),
+        "over quota must not also stamp critical"
     );
 }
 
@@ -4694,7 +4704,11 @@ async fn soft_over_quota_strips_client_priority_class() {
             .any(|name| name.as_str() == PRIORITY_CLASS_HEADER),
         "a client-supplied priority class must be stripped while inside quota"
     );
-    assert_eq!(header_value(&first_ctx, PRIORITY_CLASS_HEADER), None);
+    assert_eq!(
+        header_value(&first_ctx, PRIORITY_CLASS_HEADER),
+        Some("critical"),
+        "inside quota replaces a client-supplied sheddable with critical"
+    );
 }
 
 #[tokio::test]

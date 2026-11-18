@@ -1,10 +1,10 @@
 # Token Rate Limiting -- llm-d priority class on soft over-quota
 #
-# When Praxis is the front door, an over-quota request continues and carries
-# `x-llm-d-inference-priority-class: sheddable` for the Endpoint Picker.
-# Inside quota the header is absent, which the picker treats as critical.
-# A client-supplied copy of the header is stripped, so the quota result is
-# the only writer. Protective denials still return 429.
+# When Praxis is the front door, a request inside quota continues with
+# `x-llm-d-inference-priority-class: critical`, and an over-quota request
+# continues with `sheddable`. A missing header is also critical at the
+# Endpoint Picker. A client-supplied copy is stripped, so the quota result
+# is the only writer. Protective denials still return 429.
 #
 # Usage:
 #   cargo run -p praxis-ai-proxy --features token-rate-limit-filter -- \
@@ -37,6 +37,9 @@ filter_chains:
             capacity: 100000
             reserved_tokens: 500
             enforcement: soft
+            within_quota:
+              headers:
+                x-llm-d-inference-priority-class: critical
             over_quota:
               headers:
                 x-llm-d-inference-priority-class: sheddable
