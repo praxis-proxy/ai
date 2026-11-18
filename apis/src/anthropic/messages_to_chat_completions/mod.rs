@@ -17,7 +17,7 @@ mod config;
 pub(crate) mod request;
 pub(crate) mod response;
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -86,6 +86,9 @@ pub(crate) const STOP_SEQUENCES_KEY: &str = "anthropic_messages_to_chat_completi
 /// Anthropic does not impose the metadata value limit on stop sequences.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ClientStopSequences(pub(crate) Arc<[String]>);
+
+/// Shared empty list for requests that do not carry client stop sequences.
+static EMPTY_CLIENT_STOP_SEQUENCES: LazyLock<Arc<[String]>> = LazyLock::new(Arc::default);
 
 /// Metadata key carrying the comma-separated degraded-feature labels from the
 /// request-body phase to the response-header phase.
@@ -500,12 +503,11 @@ pub(crate) fn client_stop_sequences(ctx: &HttpFilterContext<'_>) -> Arc<[String]
         return Arc::clone(&stop_sequences.0);
     }
 
-    Arc::from(
-        ctx.filter_metadata
-            .get(STOP_SEQUENCES_KEY)
-            .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
-            .unwrap_or_default(),
-    )
+    ctx.filter_metadata
+        .get(STOP_SEQUENCES_KEY)
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .filter(|stop_sequences| !stop_sequences.is_empty())
+        .map_or_else(|| Arc::clone(&EMPTY_CLIENT_STOP_SEQUENCES), Arc::from)
 }
 
 /// Record degraded features as operator signals.
@@ -1188,6 +1190,12 @@ mod tests {
         assert!(
             !ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY),
             "empty stop_sequences should not be retained"
+        );
+        let first = client_stop_sequences(&ctx);
+        let second = client_stop_sequences(&ctx);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "empty stop-sequence reads should share the process-wide allocation"
         );
     }
 

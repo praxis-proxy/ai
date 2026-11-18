@@ -998,15 +998,19 @@ class TestStreamingResponseValidation:
         finally:
             RecordingBackend.many_tool_calls_stream_once = False
 
-        start_indices = [
-            event.index for event in events if event.type == "content_block_start"
+        start_events = [
+            event for event in events if event.type == "content_block_start"
         ]
+        start_indices = [event.index for event in start_events]
         stop_indices = [
             event.index for event in events if event.type == "content_block_stop"
         ]
         expected_indices = list(range(64))
         assert start_indices == expected_indices, (
             "all 64 tool blocks must start once in block-index order"
+        )
+        assert all(event.content_block.type == "tool_use" for event in start_events), (
+            "all 64 started content blocks must be tool_use blocks"
         )
         assert stop_indices == expected_indices, (
             "all 64 tool blocks must stop once in block-index order"
@@ -1018,11 +1022,18 @@ class TestStreamingResponseValidation:
         message_stop_positions = [
             index for index, event in enumerate(events) if event.type == "message_stop"
         ]
+        message_delta_positions = [
+            index for index, event in enumerate(events) if event.type == "message_delta"
+        ]
         assert len(message_stop_positions) == 1, (
             "a completed stream must emit exactly one message_stop"
         )
-        assert max(block_stop_positions) < message_stop_positions[0], (
-            "message_stop must follow every content_block_stop"
+        assert message_delta_positions, "a completed stream must emit message_delta"
+        assert max(block_stop_positions) < message_delta_positions[0], (
+            "every content_block_stop must precede the first message_delta"
+        )
+        assert message_delta_positions[-1] < message_stop_positions[0], (
+            "message_stop must follow the last message_delta"
         )
 
     def test_invalid_tool_id_aborts_incomplete_stream(self, anthropic_client):

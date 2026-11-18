@@ -2040,6 +2040,10 @@ mod tests {
         let tool_start = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},\"index\":0}]}\n\n";
         let mut body1 = Some(Bytes::from(tool_start));
         drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+        let start_indices = event_indices(
+            std::str::from_utf8(body1.as_deref().unwrap()).unwrap(),
+            "content_block_start",
+        );
 
         let matched_stop = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\",\"stop_reason\":\",\"}]}\n\n";
         let mut body2 = Some(Bytes::from(matched_stop));
@@ -2050,8 +2054,8 @@ mod tests {
 
         let out = std::str::from_utf8(body3.as_deref().unwrap()).unwrap();
         assert_eq!(
-            out.matches("event: content_block_stop").count(),
-            1,
+            event_indices(out, "content_block_stop"),
+            start_indices,
             "DONE should close the tool block retained across the matched stop"
         );
         let event = event_data(out, "message_delta");
@@ -2175,16 +2179,18 @@ mod tests {
         });
         let mut body = Some(Bytes::from(format!("data: {chunk}\n\n")));
         drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
-        let first_output = String::from_utf8(body.take().unwrap().to_vec()).unwrap();
-        assert_many_tool_block_indices(&first_output, "content_block_start", "start");
+        let first_output = body.take().unwrap();
+        let first_output = std::str::from_utf8(&first_output).unwrap();
+        assert_many_tool_block_indices(first_output, "content_block_start", "start");
         let state = ctx.get_filter_state::<StreamState>().unwrap();
         assert_tool_state_counts(state, 64, "before DONE");
 
         let mut done = Some(Bytes::from("data: [DONE]\n\n"));
         drop(filter.on_response_body(&mut ctx, &mut done, false).unwrap());
-        let out = String::from_utf8(done.unwrap().to_vec()).unwrap();
-        assert_many_tool_block_indices(&out, "content_block_stop", "stop");
-        assert_message_stop_follows_blocks(&out);
+        let output = done.unwrap();
+        let output = std::str::from_utf8(&output).unwrap();
+        assert_many_tool_block_indices(output, "content_block_stop", "stop");
+        assert_message_stop_follows_blocks(output);
     }
 
     #[test]
