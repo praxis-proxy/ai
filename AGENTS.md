@@ -96,6 +96,44 @@ server (praxis-ai-proxy)
 and `praxis-tls` for TLS. Use `make patch-praxis` only when testing a
 local sibling checkout at `../praxis`.
 
+## Core or AI
+
+Praxis core owns proxy mechanisms; this repository owns the AI meaning
+layered on them. Decide where a change lands before writing it, and state
+the decision in the PR description.
+
+Apply the **AI-removal test**: describe the mechanism without naming a
+model, provider, prompt, token count, or AI protocol (OpenAI, Anthropic,
+MCP, A2A). If the description still makes sense to a non-AI Praxis user,
+the mechanism belongs in core. Typical core mechanisms: outbound
+transport and URL resolution, address classification and SSRF policy,
+HTTP header hygiene, DNS, TLS, retries, generic limiters, credential
+injection, cluster and listener config, and filter lifecycle hooks.
+Typical AI responsibilities: provider API types, request classification,
+token usage, provider SSE event semantics, response and conversation
+state.
+
+When a feature spans both, split it. Land the generic mechanism in core
+first, develop against it with `make patch-praxis`, then bump the core
+version here and add a **thin surface**: the AI filter that derives AI
+facts and hands them to the core mechanism. When core lacks a hook the AI
+filter needs, add the hook in core rather than wrapping or shadowing
+core types here. Precedent: #1665 deleted roughly 900 lines of bespoke
+subrequest transport in favor of core `UrlResolutionPolicy`, and #1527
+replaced duplicated IP range tables with core's classifier.
+
+When release timing forces an interim copy here, keep it minimal, link the
+core issue in a module comment, and treat it as migration debt rather than
+precedent.
+
+## Behavior shared across application protocols
+
+When a change starts in one protocol, identify the underlying operation and trace where else Praxis performs it. Follow execution paths as well as field names. OpenAI Responses and Anthropic Messages, for example, can both trigger a proxy-executed web search through different tool declarations.
+
+- Compare the contracts of the affected protocols. Put common behavior in the module that owns the operation, and keep request parsing, validation, and error responses in each protocol adapter.
+- Apply the shared behavior to every existing path whose contract requires it. Check that each path can use the implementation with its own feature flags. If a related path is outside the change, explain why in the PR.
+- Test the common behavior once at its owner, then test each affected protocol through its normal entry point. For web-search domain restrictions, verify which results reach the model through each adapter.
+
 ## Conventions
 
 Follows the same conventions as
@@ -155,7 +193,8 @@ truthful provider, model, and provenance metadata.
 
 ## Adding a Filter
 
-Before creating a filter, inspect existing filters in `apis/src/` and
+Before creating a filter, settle the [Core or AI](#core-or-ai) split, then
+inspect existing filters in `apis/src/` and
 `filters/src/` for overlapping responsibilities, including filters that
 already parse the same protocol or derive related routing facts. Prefer
 extending the filter that owns that behavior and reusing its parsed data.
