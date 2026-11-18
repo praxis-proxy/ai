@@ -17,7 +17,7 @@ mod config;
 pub(crate) mod request;
 pub(crate) mod response;
 
-use std::borrow::Cow;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -85,7 +85,7 @@ pub(crate) const STOP_SEQUENCES_KEY: &str = "anthropic_messages_to_chat_completi
 /// This is stored in typed extensions rather than bounded routing metadata:
 /// Anthropic does not impose the metadata value limit on stop sequences.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ClientStopSequences(pub(crate) Vec<String>);
+pub(crate) struct ClientStopSequences(pub(crate) Arc<[String]>);
 
 /// Metadata key carrying the comma-separated degraded-feature labels from the
 /// request-body phase to the response-header phase.
@@ -479,10 +479,14 @@ fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, value: Option<&serd
 
     if let Some(stop_sequences) = value
         .get("stop_sequences")
-        .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
-        && let Ok(stop_sequences) = serde_json::from_value::<Vec<String>>(stop_sequences.clone())
+        .and_then(serde_json::Value::as_array)
+        .filter(|stop_sequences| !stop_sequences.is_empty())
+        && let Some(stop_sequences) = stop_sequences
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
     {
-        ctx.extensions.insert(ClientStopSequences(stop_sequences));
+        ctx.extensions.insert(ClientStopSequences(stop_sequences.into()));
     }
 }
 
@@ -491,15 +495,15 @@ fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, value: Option<&serd
 /// A list that is not all strings is invalid Anthropic input the backend
 /// rejects on its own; treating it as empty keeps the response at
 /// `end_turn` rather than failing the translation.
-pub(crate) fn client_stop_sequences<'a>(ctx: &'a HttpFilterContext<'_>) -> Cow<'a, [String]> {
+pub(crate) fn client_stop_sequences(ctx: &HttpFilterContext<'_>) -> Arc<[String]> {
     if let Some(stop_sequences) = ctx.extensions.get::<ClientStopSequences>() {
-        return Cow::Borrowed(&stop_sequences.0);
+        return Arc::clone(&stop_sequences.0);
     }
 
-    Cow::Owned(
+    Arc::from(
         ctx.filter_metadata
             .get(STOP_SEQUENCES_KEY)
-            .and_then(|value| serde_json::from_str(value).ok())
+            .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
             .unwrap_or_default(),
     )
 }
@@ -1137,11 +1141,16 @@ mod tests {
         extract_request_metadata(&mut ctx, value.as_ref());
 
         assert_eq!(
-            client_stop_sequences(&ctx),
-            vec![",".to_owned(), "END".to_owned()],
+            client_stop_sequences(&ctx).as_ref(),
+            &[",".to_owned(), "END".to_owned()],
             "client stop sequences are retained for the response phase"
         );
-        assert!(matches!(client_stop_sequences(&ctx), Cow::Borrowed(_)));
+        let first = client_stop_sequences(&ctx);
+        let second = client_stop_sequences(&ctx);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "extension reads should share the retained stop-sequence allocation"
+        );
         assert!(!ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY));
     }
 
@@ -1154,7 +1163,7 @@ mod tests {
 
         extract_request_metadata(&mut ctx, Some(&value));
 
-        assert_eq!(client_stop_sequences(&ctx), vec![sequence]);
+        assert_eq!(client_stop_sequences(&ctx).as_ref(), &[sequence]);
         assert!(!ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY));
     }
 

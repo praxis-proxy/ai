@@ -9,7 +9,7 @@
 
 mod config;
 
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -97,9 +97,7 @@ impl AnthropicMessagesToChatCompletionsStreamFilter {
         end_of_stream: bool,
     ) -> Result<Option<Bytes>, FilterError> {
         let mut state = ctx.remove_filter_state::<StreamState>().unwrap_or_default();
-        state
-            .stop_sequences
-            .get_or_insert_with(|| client_stop_sequences(ctx).into_owned());
+        state.stop_sequences.get_or_insert_with(|| client_stop_sequences(ctx));
         let result = decode_and_process_chunk(
             &mut state,
             bytes,
@@ -366,7 +364,7 @@ struct StreamState {
     /// Incremental SSE framing state.
     buffer: EventBuffer,
     /// Client stop sequences used to validate an upstream match.
-    stop_sequences: Option<Vec<String>>,
+    stop_sequences: Option<Arc<[String]>>,
     /// Incomplete UTF-8 suffix, at most three bytes.
     utf8: Vec<u8>,
     /// Message and terminal-error progress.
@@ -1654,9 +1652,10 @@ mod tests {
     fn message_delta_preserves_long_matched_stop_sequence() {
         let (filter, mut ctx) = make_filter_and_context();
         let stop_sequence = "s".repeat(300);
+        let client_stop_sequences = Arc::<[String]>::from(vec![stop_sequence.clone()]);
         ctx.extensions
             .insert(crate::anthropic::messages_to_chat_completions::ClientStopSequences(
-                vec![stop_sequence.clone()],
+                Arc::clone(&client_stop_sequences),
             ));
         let chunk = serde_json::json!({
             "id": "c1",
@@ -1670,14 +1669,17 @@ mod tests {
         });
         let mut body = Some(Bytes::from(format!("data: {chunk}\n\ndata: [DONE]\n\n")));
         drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let stream_state = ctx.get_filter_state::<StreamState>().unwrap();
+        assert!(
+            Arc::ptr_eq(stream_state.stop_sequences.as_ref().unwrap(), &client_stop_sequences),
+            "stream state should share the request extension allocation"
+        );
 
         let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
         let delta = event_data(&out, "message_delta").get("delta").unwrap().clone();
         assert_eq!(delta.get("stop_reason").and_then(Value::as_str), Some("stop_sequence"));
-        assert_eq!(
-            delta.get("stop_sequence").and_then(Value::as_str),
-            Some(stop_sequence.as_str())
-        );
+        let reported = delta.get("stop_sequence").and_then(Value::as_str);
+        assert_eq!(reported, Some(stop_sequence.as_str()));
     }
 
     #[test]
@@ -2033,7 +2035,7 @@ mod tests {
         let (filter, mut ctx) = make_filter_and_context();
         ctx.extensions
             .insert(crate::anthropic::messages_to_chat_completions::ClientStopSequences(
-                vec![",".to_owned()],
+                vec![",".to_owned()].into(),
             ));
 
         let tool_start = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},\"index\":0}]}\n\n";
