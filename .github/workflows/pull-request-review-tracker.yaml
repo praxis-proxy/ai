@@ -41,7 +41,7 @@ permissions: {}
 
 jobs:
   track:
-    uses: praxis-proxy/conventions/.github/workflows/pr-review-tracker.yaml@13eaa03339ce872434489fd8e02c30d6f0a1d7e4 # unreleased, after v0.5.0
+    uses: praxis-proxy/conventions/.github/workflows/pr-review-tracker.yaml@5925567b3cd1c3f97ac6c5f8862db988e6321b55 # unreleased, after v0.5.0
     with:
       # On a schedule these resolve to a live run with both opt-ins on. On a
       # dispatch they resolve to whatever was checked, so the toggles in the
