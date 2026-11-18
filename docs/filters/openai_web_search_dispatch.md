@@ -13,7 +13,7 @@ Each provider request is executed through the shared filtered-subrequest executo
 
 A client's web-search `filters.allowed_domains` and `filters.blocked_domains` are enforced by the proxy on every provider result, so a result outside the allow-list (or under a blocked domain) never reaches the model or `action.sources`. Malformed, unsupported, or conflicting `filters` are rejected with HTTP 400 before the first inference round.
 
-Domain handling matches hosted OpenAI where hosted documents it: each list accepts up to 100 bare domains (no scheme), both match subdomains, and an absent, null, or empty list restricts nothing. Hosted does not document how the two lists combine; dispatch applies the allow-list and then removes blocked domains, so a host matching both is blocked. Requests whose web-search tools declare different `filters` are rejected because dispatch applies one filter to every search in the request; hosted behavior for that disagreement is undocumented.
+Domain handling matches hosted OpenAI where hosted documents it: each list accepts up to 100 bare domains (no scheme), both match subdomains, and an absent, null, or empty list restricts nothing. A wildcard entry such as `*.example.org` is rejected rather than stored literally, and while either list is active a result whose URL has no absolute host is dropped. Hosted does not document how the two lists combine; dispatch applies the allow-list and then removes blocked domains, so a host matching both is blocked. Requests whose web-search tools declare different `filters` are rejected because dispatch applies one filter to every search in the request; hosted behavior for that disagreement is undocumented.
 
 ## Configuration
 

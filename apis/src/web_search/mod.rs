@@ -4,7 +4,6 @@
 //! Protocol-neutral web-search provider support.
 
 pub(crate) mod config;
-#[cfg(feature = "openai-responses")]
 pub(crate) mod domains;
 pub(crate) mod provider;
 
@@ -13,8 +12,6 @@ use std::fmt::Write as _;
 #[cfg(feature = "openai-responses")]
 pub(crate) use config::OpenAiWebSearchConfig;
 pub(crate) use config::{SearchContextSize, ValidatedConfig, WebSearchFilterConfig, build_config};
-#[cfg(feature = "openai-responses")]
-pub(crate) use domains::{DomainField, DomainFilters, DomainList};
 #[cfg(test)]
 use praxis_filter::FilterError;
 pub(crate) use provider::{CalloutContext, SearchClient, SearchOutcome, SearchResult};

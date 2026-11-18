@@ -3508,7 +3508,9 @@ class TestOpenAIResponsesVLLM:
         cases = [
             ({"search_domain_filter": ["example.com"]}, "unsupported_parameter"),
             ({"allowed_domains": ["example.com/path"]}, "invalid_value"),
+            ({"allowed_domains": ["*.example.com"]}, "invalid_value"),
             ({"blocked_domains": ["https://example.com/path"]}, "invalid_value"),
+            ({"blocked_domains": ["*.example.com"]}, "invalid_value"),
         ]
         for filters, code in cases:
             with pytest.raises(BadRequestError) as exc_info:

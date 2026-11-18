@@ -57,10 +57,13 @@ use crate::{
     callout_policy::MISSING_CALLOUT_CONTEXT,
     json_body::MAX_JSON_BODY_BYTES,
     web_search::{
-        CalloutContext, DomainField, DomainFilters, DomainList, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE,
-        SearchClient, SearchContextSize, SearchOutcome, SearchQueryValidation, SearchResult, build_config,
-        config::MAX_CALLS_PER_ROUND, format_search_results, is_web_search_tool_type,
-        provider::MAX_SEARCH_RESPONSE_BYTES, validate_search_query,
+        CalloutContext, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome,
+        SearchQueryValidation, SearchResult, build_config,
+        config::MAX_CALLS_PER_ROUND,
+        domains::{DomainFilters, DomainList},
+        format_search_results, is_web_search_tool_type,
+        provider::MAX_SEARCH_RESPONSE_BYTES,
+        validate_search_query,
     },
 };
 
@@ -77,6 +80,33 @@ const MAX_QUERY_METADATA: &str = "responses.web_search_max_query_bytes";
 
 /// Include value that gates `action.sources` in the output item.
 const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
+
+/// Maximum entries accepted in one `filters.allowed_domains` or
+/// `filters.blocked_domains` list.
+///
+/// Matches the hosted OpenAI limit per list and bounds the per-result matching
+/// work a client can request. The protocol-neutral
+/// [`crate::web_search::domains::DomainList`] itself accepts any length.
+const MAX_DOMAINS_PER_LIST: usize = 100;
+
+/// One client-declared web-search `filters` domain list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DomainField {
+    /// `filters.allowed_domains`: only these hosts and their subdomains are permitted.
+    Allowed,
+    /// `filters.blocked_domains`: these hosts and their subdomains are never permitted.
+    Blocked,
+}
+
+impl DomainField {
+    /// The JSON member name, used in client-facing messages.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed_domains",
+            Self::Blocked => "blocked_domains",
+        }
+    }
+}
 
 /// Server-side hard cap on search queries dispatched in one continuation.
 ///
@@ -140,12 +170,14 @@ const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before 
 ///
 /// Domain handling matches hosted OpenAI where hosted documents it: each list
 /// accepts up to 100 bare domains (no scheme), both match subdomains, and an
-/// absent, null, or empty list restricts nothing. Hosted does not document how
-/// the two lists combine; dispatch applies the allow-list and then removes
-/// blocked domains, so a host matching both is blocked. Requests whose
-/// web-search tools declare different `filters` are rejected because dispatch
-/// applies one filter to every search in the request; hosted behavior for that
-/// disagreement is undocumented.
+/// absent, null, or empty list restricts nothing. A wildcard entry such as
+/// `*.example.org` is rejected rather than stored literally, and while either
+/// list is active a result whose URL has no absolute host is dropped. Hosted
+/// does not document how the two lists combine; dispatch applies the allow-list
+/// and then removes blocked domains, so a host matching both is blocked.
+/// Requests whose web-search tools declare different `filters` are rejected
+/// because dispatch applies one filter to every search in the request; hosted
+/// behavior for that disagreement is undocumented.
 ///
 /// # YAML
 ///
@@ -1372,12 +1404,25 @@ fn tool_domain_filters(tool: &Value) -> Result<DomainFilters, Rejection> {
 }
 
 /// Parse one `filters` domain list from its JSON member.
+///
+/// This adapter owns the hosted entry cap and the client-facing message; the
+/// shared [`DomainList`] owns host parsing and matching.
 fn domain_list(value: Option<&Value>, field: DomainField) -> Result<Option<DomainList>, Rejection> {
     match value {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Array(entries)) if entries.iter().all(Value::is_string) => {
-            DomainList::parse(field, entries.iter().filter_map(Value::as_str))
-                .map_err(|message| invalid_filters(&message))
+            if entries.len() > MAX_DOMAINS_PER_LIST {
+                return Err(invalid_filters(&format!(
+                    "filters.{} accepts at most {MAX_DOMAINS_PER_LIST} domains.",
+                    field.as_str()
+                )));
+            }
+            DomainList::parse(entries.iter().filter_map(Value::as_str)).map_err(|_entry_error| {
+                invalid_filters(&format!(
+                    "filters.{} entries must be bare domain names such as `example.com`.",
+                    field.as_str()
+                ))
+            })
         },
         Some(_) => Err(invalid_filters(&format!(
             "filters.{} must be an array of strings or null.",

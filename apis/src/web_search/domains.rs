@@ -1,59 +1,50 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Domain filters enforced on proxy-executed web-search results.
+//! Protocol-neutral domain filters for proxy-executed web-search results.
 //!
 //! Search providers differ in whether and how they accept a domain
-//! restriction, so the proxy enforces the client's `filters.allowed_domains`
-//! and `filters.blocked_domains` itself on every provider result before it can
-//! reach the model or a public source list (issue #1768).
+//! restriction, so the proxy enforces the client's allow-list and block-list
+//! itself on every provider result before it can reach the model or a public
+//! source list (issue #1768). Protocol adapters own the wire spelling, list
+//! size limits, and rejection responses; this module owns URL parsing and host
+//! matching so every web-search protocol enforces the same semantics.
 
-use url::Host;
+// The OpenAI Responses adapter is the only consumer today, but any web-search
+// protocol adapter may use this matcher without enabling that feature.
+#![cfg_attr(
+    all(not(feature = "openai-responses"), not(test)),
+    expect(
+        dead_code,
+        reason = "shared matcher: the OpenAI Responses adapter is the only consumer today"
+    )
+)]
+
+use url::{Host, Url};
 
 // -----------------------------------------------------------------------------
-// Constants
+// InvalidDomainEntry
 // -----------------------------------------------------------------------------
 
-/// Maximum entries accepted in one `filters` domain list.
+/// A declared domain entry that is not a bare host name.
 ///
-/// Matches the hosted OpenAI limit per list (`allowed_domains` or
-/// `blocked_domains`) and bounds the per-result matching work a client can
-/// request.
-pub(crate) const MAX_DOMAINS_PER_LIST: usize = 100;
-
-// -----------------------------------------------------------------------------
-// DomainField
-// -----------------------------------------------------------------------------
-
-/// One client-declared `filters` domain list.
+/// Adapters map this to their protocol's rejection response; the error carries
+/// no client-supplied text so it can never be echoed back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DomainField {
-    /// `filters.allowed_domains`: only these hosts and their subdomains are permitted.
-    Allowed,
-    /// `filters.blocked_domains`: these hosts and their subdomains are never permitted.
-    Blocked,
-}
-
-impl DomainField {
-    /// The JSON member name, used in client-facing messages.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Allowed => "allowed_domains",
-            Self::Blocked => "blocked_domains",
-        }
-    }
-}
+pub(crate) struct InvalidDomainEntry;
 
 // -----------------------------------------------------------------------------
 // DomainList
 // -----------------------------------------------------------------------------
 
-/// A normalized, non-empty host list from one `filters` member.
+/// A normalized, non-empty host list from one declared allow-list or block-list.
 ///
 /// A host matches when it equals an entry or is a subdomain of a domain entry.
 /// Entries and result hosts share the same WHATWG/IDNA host parsing, so
 /// `HTTPS://Example.ORG/` and `example.org` name the same domain; IP entries
-/// match their exact address only.
+/// match their exact address only. Wildcard entries are rejected: a stored
+/// `*.example.org` would never match a URL host, so accepting it would silently
+/// enforce nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DomainList {
     /// Parsed hosts, sorted and deduplicated so equal lists compare equal.
@@ -65,59 +56,30 @@ impl DomainList {
     ///
     /// Each entry may carry an optional `http://`/`https://` prefix, a trailing
     /// `/`, or a trailing root `.`; the remainder must be a bare host. Returns
-    /// `Ok(None)` for an empty list, which restricts nothing.
+    /// `Ok(None)` for an empty list, which restricts nothing. Protocol adapters
+    /// enforce their own entry cap before calling this.
     ///
     /// # Errors
     ///
-    /// Returns a client-facing message naming `field` when the list exceeds
-    /// [`MAX_DOMAINS_PER_LIST`] or an entry is not a bare host.
-    pub(crate) fn parse<S: AsRef<str>>(
-        field: DomainField,
-        entries: impl Iterator<Item = S>,
-    ) -> Result<Option<Self>, String> {
-        // Parse at most one entry past the cap so an oversized list is rejected
-        // without normalizing every entry first.
+    /// Returns [`InvalidDomainEntry`] when an entry is not a bare host or
+    /// contains a wildcard.
+    pub(crate) fn parse<S: AsRef<str>>(entries: impl Iterator<Item = S>) -> Result<Option<Self>, InvalidDomainEntry> {
         let mut hosts = entries
-            .take(MAX_DOMAINS_PER_LIST.saturating_add(1))
-            .map(|entry| {
-                parse_host(entry.as_ref()).ok_or_else(|| {
-                    format!(
-                        "filters.{} entries must be bare domain names such as `example.com`.",
-                        field.as_str()
-                    )
-                })
-            })
+            .map(|entry| parse_host(entry.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
-        if hosts.len() > MAX_DOMAINS_PER_LIST {
-            return Err(format!(
-                "filters.{} accepts at most {MAX_DOMAINS_PER_LIST} domains.",
-                field.as_str()
-            ));
-        }
         hosts.sort();
         hosts.dedup();
         Ok((!hosts.is_empty()).then_some(Self { hosts }))
     }
 
-    /// Whether `url`'s host equals an entry or is a subdomain of a domain entry.
-    ///
-    /// A URL that does not parse or has no host never matches.
-    pub(crate) fn contains_url(&self, url: &str) -> bool {
-        let Ok(parsed) = url::Url::parse(url) else {
-            return false;
-        };
-        match parsed.host() {
-            Some(Host::Domain(host)) => {
-                let host = host.strip_suffix('.').unwrap_or(host);
-                self.hosts.iter().any(|entry| match entry {
-                    Host::Domain(domain) => is_same_or_subdomain(host, domain),
-                    Host::Ipv4(_) | Host::Ipv6(_) => false,
-                })
-            },
-            Some(Host::Ipv4(ip)) => self.hosts.contains(&Host::Ipv4(ip)),
-            Some(Host::Ipv6(ip)) => self.hosts.contains(&Host::Ipv6(ip)),
-            None => false,
-        }
+    /// Whether an already-parsed result host matches this list.
+    fn contains_host(&self, host: &Host<&str>) -> bool {
+        self.hosts.iter().any(|entry| match (entry, host) {
+            (Host::Domain(domain), Host::Domain(host)) => is_same_or_subdomain(host, domain),
+            (Host::Ipv4(entry), Host::Ipv4(host)) => entry == host,
+            (Host::Ipv6(entry), Host::Ipv6(host)) => entry == host,
+            _ => false,
+        })
     }
 }
 
@@ -162,30 +124,61 @@ impl DomainFilters {
     }
 
     /// Whether `url` is permitted by the declared filters.
+    ///
+    /// Any restriction requires a verifiable result host: a URL that does not
+    /// parse as an absolute URL with a host is dropped, so a block-list-only
+    /// request cannot retain a malformed or scheme-relative provider URL.
     pub(crate) fn permits_url(&self, url: &str) -> bool {
-        match self {
-            Self::Unrestricted => true,
-            Self::DenyAll => false,
-            Self::Restricted { allowed, blocked } => {
-                allowed.as_ref().is_none_or(|allowed| allowed.contains_url(url))
-                    && !blocked.as_ref().is_some_and(|blocked| blocked.contains_url(url))
-            },
-        }
+        let Self::Restricted { allowed, blocked } = self else {
+            return matches!(self, Self::Unrestricted);
+        };
+        let Ok(parsed) = Url::parse(url) else {
+            return false;
+        };
+        let Some(host) = parsed.host() else {
+            return false;
+        };
+        let host = normalized_host(host);
+        allowed.as_ref().is_none_or(|allowed| allowed.contains_host(&host))
+            && !blocked.as_ref().is_some_and(|blocked| blocked.contains_host(&host))
     }
 }
 
 /// Parse one allow-list or block-list entry into a normalized host.
-fn parse_host(entry: &str) -> Option<Host<String>> {
+fn parse_host(entry: &str) -> Result<Host<String>, InvalidDomainEntry> {
     let entry = entry.trim();
     let entry = strip_prefix_ignore_ascii_case(entry, "https://")
         .or_else(|| strip_prefix_ignore_ascii_case(entry, "http://"))
         .unwrap_or(entry);
     let entry = entry.strip_suffix('/').unwrap_or(entry);
-    let entry = entry.strip_suffix('.').unwrap_or(entry);
-    if entry.is_empty() {
-        return None;
+    // A wildcard would be stored literally and never match a URL host, so
+    // reject the spelling instead of silently enforcing nothing.
+    if entry.is_empty() || entry.contains('*') {
+        return Err(InvalidDomainEntry);
     }
-    Host::parse(entry).ok()
+    match Host::parse(entry).map_err(|_parse_error| InvalidDomainEntry)? {
+        Host::Domain(mut domain) => {
+            // IDNA conversion and percent-decoding happen during parsing, so
+            // the root dot can only be removed afterwards.
+            domain.truncate(domain.trim_end_matches('.').len());
+            if domain.is_empty() {
+                return Err(InvalidDomainEntry);
+            }
+            Ok(Host::Domain(domain))
+        },
+        host @ (Host::Ipv4(_) | Host::Ipv6(_)) => Ok(host),
+    }
+}
+
+/// Drop the root label from a parsed result host.
+///
+/// `Url` preserves a trailing `example.org.` host, while list entries are
+/// normalized without it, so both sides must agree before matching.
+fn normalized_host(host: Host<&str>) -> Host<&str> {
+    match host {
+        Host::Domain(domain) => Host::Domain(domain.trim_end_matches('.')),
+        host @ (Host::Ipv4(_) | Host::Ipv6(_)) => host,
+    }
 }
 
 /// Strip an ASCII `prefix` from `value`, ignoring ASCII case.
@@ -212,7 +205,7 @@ mod tests {
     use super::*;
 
     fn list(entries: &[&str]) -> DomainList {
-        DomainList::parse(DomainField::Allowed, entries.iter().copied())
+        DomainList::parse(entries.iter().copied())
             .unwrap()
             .expect("non-empty list")
     }
@@ -223,56 +216,39 @@ mod tests {
 
     #[test]
     fn permits_exact_host_and_subdomains() {
-        let domains = list(&["example.org"]);
-        assert!(domains.contains_url("https://example.org/a"), "exact host is allowed");
-        assert!(
-            domains.contains_url("https://docs.example.org/a"),
-            "subdomain is allowed"
-        );
-        assert!(
-            domains.contains_url("http://a.b.example.org"),
-            "nested subdomain is allowed"
-        );
-        assert!(
-            domains.contains_url("https://example.org./a"),
-            "root-dot host is allowed"
-        );
+        let permits = |url: &str| permitted(Some(&["example.org"]), None, url);
+        assert!(permits("https://example.org/a"), "exact host is allowed");
+        assert!(permits("https://docs.example.org/a"), "subdomain is allowed");
+        assert!(permits("http://a.b.example.org"), "nested subdomain is allowed");
+        assert!(permits("https://example.org./a"), "root-dot host is allowed");
     }
 
     #[test]
     fn rejects_lookalike_and_unrelated_hosts() {
-        let domains = list(&["example.org"]);
+        let permits = |url: &str| permitted(Some(&["example.org"]), None, url);
+        assert!(!permits("https://outside.example/result"), "unrelated host");
+        assert!(!permits("https://badexample.org/"), "suffix without a label boundary");
         assert!(
-            !domains.contains_url("https://outside.example/result"),
-            "unrelated host"
-        );
-        assert!(
-            !domains.contains_url("https://badexample.org/"),
-            "suffix without a label boundary"
-        );
-        assert!(
-            !domains.contains_url("https://example.org.evil.test/"),
+            !permits("https://example.org.evil.test/"),
             "allowed domain as a left-hand label"
         );
-        assert!(
-            !domains.contains_url("https://user@evil.test/example.org"),
-            "path is not the host"
-        );
-        assert!(!domains.contains_url("not a url"), "unparseable URL");
-        assert!(!domains.contains_url("mailto:a@example.org"), "URL without a host");
+        assert!(!permits("https://user@evil.test/example.org"), "path is not the host");
+        assert!(!permits("not a url"), "unparseable URL");
+        assert!(!permits("mailto:a@example.org"), "URL without a host");
     }
 
     #[test]
     fn normalizes_entries_like_result_hosts() {
-        let domains = list(&[" HTTPS://Example.ORG/ ", "bücher.example."]);
+        let entries = [" HTTPS://Example.ORG/ ", "bücher.example."];
         assert!(
-            domains.contains_url("https://www.example.org/"),
+            permitted(Some(&entries), None, "https://www.example.org/"),
             "case and scheme are normalized"
         );
         assert!(
-            domains.contains_url("https://xn--bcher-kva.example/"),
+            permitted(Some(&entries), None, "https://xn--bcher-kva.example/"),
             "IDN entry matches its punycode host"
         );
+        let domains = list(&entries);
         assert_eq!(
             domains,
             list(&["bücher.example", "example.org", "example.org"]),
@@ -282,18 +258,16 @@ mod tests {
 
     #[test]
     fn ip_hosts_match_exactly() {
-        let domains = list(&["192.0.2.1", "[2001:db8::1]"]);
-        assert!(domains.contains_url("http://192.0.2.1/x"), "exact IPv4");
-        assert!(domains.contains_url("http://[2001:db8::1]/x"), "exact IPv6");
-        assert!(!domains.contains_url("http://192.0.2.2/x"), "different IPv4");
+        let entries = ["192.0.2.1", "[2001:db8::1]"];
+        assert!(permitted(Some(&entries), None, "http://192.0.2.1/x"), "exact IPv4");
+        assert!(permitted(Some(&entries), None, "http://[2001:db8::1]/x"), "exact IPv6");
+        assert!(!permitted(Some(&entries), None, "http://192.0.2.2/x"), "different IPv4");
     }
 
     #[test]
     fn empty_list_is_unrestricted_and_deny_all_permits_nothing() {
         assert!(
-            DomainList::parse(DomainField::Allowed, std::iter::empty::<&str>())
-                .unwrap()
-                .is_none(),
+            DomainList::parse(std::iter::empty::<&str>()).unwrap().is_none(),
             "an empty client list means no restriction"
         );
         assert_eq!(
@@ -340,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_malformed_entries_and_oversized_lists() {
+    fn rejects_malformed_and_wildcard_entries() {
         for entry in [
             "",
             " ",
@@ -349,35 +323,75 @@ mod tests {
             "example.org:443",
             "a b.example",
             "user@example.org",
+            // A wildcard stored literally would never match a URL host, so it
+            // must be rejected instead of silently enforcing nothing.
+            "*.example.org",
+            "example.*",
+            "*",
         ] {
-            for field in [DomainField::Allowed, DomainField::Blocked] {
-                assert!(
-                    DomainList::parse(field, std::iter::once(entry)).is_err(),
-                    "{field:?} entry {entry:?} must be rejected"
-                );
-            }
-        }
-        let many: Vec<String> = (0..=MAX_DOMAINS_PER_LIST).map(|i| format!("d{i}.example")).collect();
-        for field in [DomainField::Allowed, DomainField::Blocked] {
             assert!(
-                DomainList::parse(field, many.iter().map(String::as_str)).is_err(),
-                "{field:?} lists over the cap must be rejected"
+                DomainList::parse(std::iter::once(entry)).is_err(),
+                "entry {entry:?} must be rejected"
             );
         }
     }
 
     #[test]
-    fn rejection_messages_name_the_offending_field() {
-        let error = DomainList::parse(DomainField::Blocked, std::iter::once("a b")).unwrap_err();
+    fn normalizes_root_dots_after_idna_conversion() {
+        // `Host::parse` decodes percent-encoded dots, so the root dot has to be
+        // removed after parsing or an escaped entry stores `example.org.` and
+        // matches nothing.
         assert!(
-            error.contains("filters.blocked_domains"),
-            "the message names blocked_domains: {error}"
+            permitted(Some(&["example.org%2e"]), None, "https://example.org/"),
+            "encoded root dot matches the root domain"
         );
-        let many: Vec<String> = (0..=MAX_DOMAINS_PER_LIST).map(|i| format!("d{i}.example")).collect();
-        let error = DomainList::parse(DomainField::Blocked, many.iter().map(String::as_str)).unwrap_err();
         assert!(
-            error.contains("filters.blocked_domains"),
-            "the cap message names blocked_domains: {error}"
+            permitted(Some(&["example.org%2e"]), None, "https://docs.example.org/"),
+            "encoded root dot matches subdomains"
+        );
+        assert!(
+            !permitted(None, Some(&["example.org%2e"]), "https://example.org/"),
+            "an encoded root dot in the block-list still blocks the root domain"
+        );
+        assert!(
+            !permitted(None, Some(&["example.org%2e"]), "https://docs.example.org/"),
+            "an encoded root dot in the block-list still blocks subdomains"
+        );
+        assert_eq!(
+            list(&["example.org%2e"]),
+            list(&["example.org"]),
+            "the encoded spelling normalizes to the same list"
+        );
+    }
+
+    #[test]
+    fn restricted_filters_drop_unverifiable_hosts() {
+        // A block-list-only request must not retain a URL whose host cannot be
+        // verified: an unparseable or scheme-relative provider URL would
+        // otherwise pass the "not blocked" check.
+        for url in [
+            "not a url",
+            "//example.org/result",
+            "/relative/path",
+            "mailto:a@example.org",
+            "https://",
+        ] {
+            assert!(
+                !permitted(None, Some(&["example.org"]), url),
+                "a block-list-only restriction must drop unverifiable URL {url:?}"
+            );
+            assert!(
+                !permitted(Some(&["example.org"]), None, url),
+                "an allow-list restriction must drop unverifiable URL {url:?}"
+            );
+        }
+        assert!(
+            permitted(None, Some(&["example.org"]), "https://outside.example/"),
+            "a verifiable URL outside the block-list is permitted"
+        );
+        assert!(
+            DomainFilters::Unrestricted.permits_url("not a url"),
+            "an unrestricted request passes provider results through unchanged"
         );
     }
 }
