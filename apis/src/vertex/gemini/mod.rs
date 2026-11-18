@@ -25,23 +25,6 @@ use tracing::{debug, warn};
 use self::config::{FILTER_NAME, VertexGeminiConfig, build_config};
 use crate::{is_event_stream_content_type, openai::sse::SseFrameParser, vertex::wire};
 
-/// Metadata key: response transform mode (sse / error / success).
-const RESPONSE_TRANSFORM_KEY: &str = "vertex_gemini.response_transform";
-/// Response transform marker: SSE streaming.
-const RESPONSE_TRANSFORM_SSE: &str = "sse";
-/// Response transform marker: upstream error.
-const RESPONSE_TRANSFORM_ERROR: &str = "error";
-/// Response transform marker: non-streaming success.
-const RESPONSE_TRANSFORM_SUCCESS: &str = "success";
-
-/// Metadata key: upstream HTTP status for the body phase.
-const RESPONSE_STATUS_KEY: &str = "vertex_gemini.response_status";
-/// Metadata key: model name from the request.
-const REQUEST_MODEL_KEY: &str = "vertex_gemini.model";
-/// OpenAI `stream_options.include_usage` — Vertex has no equivalent.
-const REQUEST_INCLUDE_USAGE_KEY: &str = "vertex_gemini.include_usage";
-/// Number of terminal streaming candidates expected for this request.
-const REQUEST_CANDIDATE_COUNT_KEY: &str = "vertex_gemini.candidate_count";
 /// Prefix for a generated response ID when Vertex omits `responseId`.
 ///
 /// The random suffix is minted in `response.rs` once per logical response and
@@ -51,6 +34,68 @@ pub(super) const FALLBACK_RESPONSE_ID_PREFIX: &str = "chatcmpl-vertex-";
 // -----------------------------------------------------------------------------
 // Filter State
 // -----------------------------------------------------------------------------
+
+/// This filter's state for one exchange, kept in `filter_state` from the
+/// translated request until the response body ends.
+struct Exchange {
+    /// What the response side needs from the request.
+    request: TranslatedRequest,
+    /// How the response body is translated, once its headers arrive.
+    response: Option<ResponseTranslation>,
+}
+
+/// The parts of a translated Chat Completions request that shape its
+/// response.
+struct TranslatedRequest {
+    /// Model named by the request, reported in every response.
+    model: String,
+    /// OpenAI `stream_options.include_usage` — Vertex has no equivalent.
+    include_usage: bool,
+    /// Number of terminal streaming candidates expected for this request.
+    candidate_count: u64,
+}
+
+impl Default for TranslatedRequest {
+    /// A request this filter did not translate: its response reports an
+    /// `unknown` model, and a stream needs one candidate and no usage chunk.
+    fn default() -> Self {
+        Self {
+            model: "unknown".to_owned(),
+            include_usage: false,
+            candidate_count: 1,
+        }
+    }
+}
+
+/// How a response body is translated, chosen from its headers.
+enum ResponseTranslation {
+    /// A Vertex error, normalized to the OpenAI envelope with this status.
+    Error(http::StatusCode),
+    /// An SSE stream, translated frame by frame. Its state starts with the
+    /// first chunk.
+    Sse(Option<Box<StreamState>>),
+    /// A non-streaming success body.
+    Success,
+}
+
+impl ResponseTranslation {
+    /// Select the translation while response headers are available.
+    fn for_response(ctx: &HttpFilterContext<'_>) -> Self {
+        let status = ctx.response_header.as_ref().map(|r| r.status);
+        let is_sse = ctx
+            .response_header
+            .as_ref()
+            .and_then(|r| r.headers.get(http::header::CONTENT_TYPE))
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(is_event_stream_content_type);
+
+        match status {
+            Some(status) if status.is_client_error() || status.is_server_error() => Self::Error(status),
+            _ if is_sse => Self::Sse(None),
+            _ => Self::Success,
+        }
+    }
+}
 
 /// Per-request state for tracking SSE streaming progress.
 struct StreamState {
@@ -124,6 +169,26 @@ impl OpenaiChatCompletionsToVertexaiGeminiFilter {
             region = self.config.region,
         )
     }
+
+    /// Install a translated request: the upstream path, the state the
+    /// response side reads, and the rewritten body.
+    fn apply_translated(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        result: request::TransformResult,
+    ) {
+        ctx.rewritten_path = Some(self.vertex_path(&result.model, result.stream));
+        ctx.insert_filter_state(Exchange {
+            request: TranslatedRequest {
+                model: result.model,
+                include_usage: result.include_usage,
+                candidate_count: result.candidate_count,
+            },
+            response: None,
+        });
+        *body = Some(Bytes::from(result.body));
+    }
 }
 
 #[async_trait]
@@ -181,13 +246,7 @@ impl HttpFilter for OpenaiChatCompletionsToVertexaiGeminiFilter {
                     "transformed Chat Completions request to Gemini format"
                 );
 
-                ctx.rewritten_path = Some(self.vertex_path(&result.model, result.stream));
-                ctx.set_metadata(REQUEST_MODEL_KEY, result.model);
-                if result.include_usage {
-                    ctx.set_metadata(REQUEST_INCLUDE_USAGE_KEY, "true".to_owned());
-                }
-                ctx.set_metadata(REQUEST_CANDIDATE_COUNT_KEY, result.candidate_count.to_string());
-                *body = Some(Bytes::from(result.body));
+                self.apply_translated(ctx, body, result);
 
                 Ok(FilterAction::Continue)
             },
@@ -199,27 +258,25 @@ impl HttpFilter for OpenaiChatCompletionsToVertexaiGeminiFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let transform = response_transform(ctx);
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, transform);
+        let translation = ResponseTranslation::for_response(ctx);
 
-        if transform == RESPONSE_TRANSFORM_ERROR {
-            let status = ctx.response_header.as_ref().map_or(500, |r| r.status.as_u16());
-            ctx.set_metadata(RESPONSE_STATUS_KEY, status.to_string());
-
-            // Buffer the full error body for normalization.
-            ctx.set_response_body_mode(BodyMode::StreamBuffer {
-                max_bytes: Some(self.config.max_body_bytes),
-            });
-            prepare_response_headers(ctx, "application/json");
-        } else if transform == RESPONSE_TRANSFORM_SUCCESS {
-            // Buffer the full success body for translation.
-            ctx.set_response_body_mode(BodyMode::StreamBuffer {
-                max_bytes: Some(self.config.max_body_bytes),
-            });
-            prepare_response_headers(ctx, "application/json");
-        } else {
+        if matches!(translation, ResponseTranslation::Sse(_)) {
             // SSE: stream chunks, translate each frame inline.
             prepare_response_headers(ctx, "text/event-stream");
+        } else {
+            // Buffer the full error or success body for translation.
+            ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                max_bytes: Some(self.config.max_body_bytes),
+            });
+            prepare_response_headers(ctx, "application/json");
+        }
+
+        match ctx.get_filter_state_mut::<Exchange>() {
+            Some(exchange) => exchange.response = Some(translation),
+            None => ctx.insert_filter_state(Exchange {
+                request: TranslatedRequest::default(),
+                response: Some(translation),
+            }),
         }
 
         Ok(FilterAction::Continue)
@@ -231,46 +288,26 @@ impl HttpFilter for OpenaiChatCompletionsToVertexaiGeminiFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        match ctx.get_metadata(RESPONSE_TRANSFORM_KEY) {
-            Some(RESPONSE_TRANSFORM_SSE) => {
-                translate_sse_chunk(ctx, body, end_of_stream, self.config.max_body_bytes);
+        let Some(Exchange { request, response }) = ctx.get_filter_state_mut::<Exchange>() else {
+            return Ok(FilterAction::Continue);
+        };
+        let rejection = match response {
+            Some(ResponseTranslation::Sse(stream)) => {
+                translate_sse_chunk(stream, request, body, end_of_stream, self.config.max_body_bytes);
+                None
             },
-            Some(RESPONSE_TRANSFORM_ERROR) if end_of_stream => {
-                translate_error_body(ctx, body);
+            Some(ResponseTranslation::Error(status)) if end_of_stream => {
+                translate_error_body(*status, body);
+                None
             },
-            Some(RESPONSE_TRANSFORM_SUCCESS) if end_of_stream => {
-                if let Some(rejection) = translate_success_body(ctx, body) {
-                    return Ok(FilterAction::Reject(rejection));
-                }
-            },
-            _ => {},
+            Some(ResponseTranslation::Success) if end_of_stream => translate_success_body(&request.model, body),
+            Some(ResponseTranslation::Error(_) | ResponseTranslation::Success) | None => None,
+        };
+        if end_of_stream {
+            ctx.remove_filter_state::<Exchange>();
         }
 
-        Ok(FilterAction::Continue)
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Response Mode Selection
-// -----------------------------------------------------------------------------
-
-/// Determine the response transformation mode from headers.
-fn response_transform(ctx: &HttpFilterContext<'_>) -> &'static str {
-    let status = ctx.response_header.as_ref().map(|r| r.status);
-    let is_error = status.is_some_and(|s| s.is_client_error() || s.is_server_error());
-    let is_sse = ctx
-        .response_header
-        .as_ref()
-        .and_then(|r| r.headers.get(http::header::CONTENT_TYPE))
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(is_event_stream_content_type);
-
-    if is_error {
-        RESPONSE_TRANSFORM_ERROR
-    } else if is_sse {
-        RESPONSE_TRANSFORM_SSE
-    } else {
-        RESPONSE_TRANSFORM_SUCCESS
+        Ok(rejection.map_or(FilterAction::Continue, FilterAction::Reject))
     }
 }
 
@@ -316,8 +353,12 @@ fn build_request_rejection(message: &str) -> Rejection {
 const SSE_DONE: &[u8] = b"data: [DONE]\n\n";
 
 /// Translate SSE streaming chunks from Gemini to Chat Completions format.
+///
+/// The stream state starts with the first chunk that carries bytes or ends
+/// the stream.
 fn translate_sse_chunk(
-    ctx: &mut HttpFilterContext<'_>,
+    stream: &mut Option<Box<StreamState>>,
+    request: &TranslatedRequest,
     body: &mut Option<Bytes>,
     end_of_stream: bool,
     max_body_bytes: usize,
@@ -329,19 +370,15 @@ fn translate_sse_chunk(
         return;
     }
 
-    let mut state = ctx
-        .remove_filter_state::<StreamState>()
-        .unwrap_or_else(|| new_stream_state(ctx, max_body_bytes));
+    let state = stream.get_or_insert_with(|| Box::new(new_stream_state(request, max_body_bytes)));
 
     let mut output = match bytes {
-        Some(b) => translate_sse_frames(ctx, &mut state, b),
+        Some(b) => translate_sse_frames(&request.model, state, b),
         None => Vec::new(),
     };
 
     if end_of_stream {
-        finish_sse_stream(ctx, &mut state, &mut output);
-    } else {
-        ctx.insert_filter_state(state);
+        finish_sse_stream(&request.model, state, &mut output);
     }
 
     *body = Some(if output.is_empty() {
@@ -351,15 +388,11 @@ fn translate_sse_chunk(
     });
 }
 
-/// Create a new stream state, extracting `include_usage` from request metadata.
-fn new_stream_state(ctx: &HttpFilterContext<'_>, max_body_bytes: usize) -> StreamState {
+/// Create a new stream state for the translated request.
+fn new_stream_state(request: &TranslatedRequest, max_body_bytes: usize) -> StreamState {
     let mut translate = response::StreamTranslateState::new();
-    translate.set_include_usage(ctx.get_metadata(REQUEST_INCLUDE_USAGE_KEY) == Some("true"));
-    let candidate_count = ctx
-        .get_metadata(REQUEST_CANDIDATE_COUNT_KEY)
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(1);
-    translate.set_expected_candidate_count(candidate_count);
+    translate.set_include_usage(request.include_usage);
+    translate.set_expected_candidate_count(request.candidate_count);
     StreamState {
         parser: SseFrameParser::new(max_body_bytes),
         translate,
@@ -374,20 +407,19 @@ fn new_stream_state(ctx: &HttpFilterContext<'_>, max_body_bytes: usize) -> Strea
 /// incomplete frame at EOF, or when not every requested candidate reached a
 /// finish reason. Successful streams append usage (if requested) and `[DONE]`.
 /// Failed streams end with the error frame and never emit a success sentinel.
-fn finish_sse_stream(ctx: &HttpFilterContext<'_>, state: &mut StreamState, output: &mut Vec<u8>) {
+fn finish_sse_stream(model: &str, state: &mut StreamState, output: &mut Vec<u8>) {
     let truncated = !state.translate.is_complete() && !state.had_error;
     if state.had_error || state.parser.has_incomplete_frame() || truncated {
         append_stream_error_frame(output);
         return;
     }
 
-    append_stream_usage_frame(ctx, state, output);
+    append_stream_usage_frame(model, state, output);
     output.extend_from_slice(SSE_DONE);
 }
 
 /// Append the final usage chunk to the output if `include_usage` is set and usage data exists.
-fn append_stream_usage_frame(ctx: &HttpFilterContext<'_>, state: &mut StreamState, output: &mut Vec<u8>) {
-    let model = ctx.get_metadata(REQUEST_MODEL_KEY).unwrap_or("unknown");
+fn append_stream_usage_frame(model: &str, state: &mut StreamState, output: &mut Vec<u8>) {
     if let Some(usage) = response::take_stream_usage_chunk(&mut state.translate, model) {
         output.extend_from_slice(b"data: ");
         output.extend_from_slice(&usage);
@@ -402,13 +434,11 @@ fn append_stream_usage_frame(ctx: &HttpFilterContext<'_>, state: &mut StreamStat
 /// discards the entire chunk, including any frames that completed before
 /// the overflow. This is intentional: partial recovery from a corrupted
 /// byte stream risks emitting truncated JSON to the client.
-fn translate_sse_frames(ctx: &HttpFilterContext<'_>, state: &mut StreamState, bytes: &Bytes) -> Vec<u8> {
+fn translate_sse_frames(model: &str, state: &mut StreamState, bytes: &Bytes) -> Vec<u8> {
     // Sticky error: suppress all subsequent chunks once an error is set.
     if state.had_error {
         return Vec::new();
     }
-
-    let model = ctx.get_metadata(REQUEST_MODEL_KEY).unwrap_or("unknown");
 
     match state.parser.parse_chunk(bytes) {
         Ok(frames) => render_sse_frames(&frames, model, state),
@@ -471,14 +501,8 @@ fn append_stream_error_frame(output: &mut Vec<u8>) {
 }
 
 /// Normalize a Vertex AI error response to the OpenAI error envelope.
-fn translate_error_body(ctx: &HttpFilterContext<'_>, body: &mut Option<Bytes>) {
+fn translate_error_body(status: http::StatusCode, body: &mut Option<Bytes>) {
     let bytes = body.as_deref().unwrap_or_default();
-
-    let status = ctx
-        .get_metadata(RESPONSE_STATUS_KEY)
-        .and_then(|v| v.parse::<u16>().ok())
-        .and_then(|v| http::StatusCode::from_u16(v).ok())
-        .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
 
     let normalized = wire::normalize_error_response(bytes, status);
     debug!(
@@ -498,10 +522,8 @@ fn translate_error_body(ctx: &HttpFilterContext<'_>, body: &mut Option<Bytes>) {
 /// misleading HTTP 200 status. An HTTP 200 carrying an OpenAI error
 /// envelope confuses SDK clients that key on the status code to decide
 /// whether to raise.
-fn translate_success_body(ctx: &HttpFilterContext<'_>, body: &mut Option<Bytes>) -> Option<Rejection> {
+fn translate_success_body(model: &str, body: &mut Option<Bytes>) -> Option<Rejection> {
     let bytes = body.as_deref().unwrap_or_default();
-
-    let model = ctx.get_metadata(REQUEST_MODEL_KEY).unwrap_or("unknown");
 
     match response::transform_response(bytes, model) {
         Ok(translated) => {
@@ -545,6 +567,7 @@ fn build_server_error_rejection(message: &str) -> Rejection {
 mod tests {
     use bytes::Bytes;
     use http::{Method, StatusCode};
+    use praxis_filter::Request;
 
     use super::*;
     use crate::test_utils::{make_filter_context, make_request, make_response};
@@ -555,6 +578,35 @@ mod tests {
         let cfg: VertexGeminiConfig = parse_filter_config(FILTER_NAME, &yaml).unwrap();
         let validated = build_config(cfg).unwrap();
         OpenaiChatCompletionsToVertexaiGeminiFilter { config: validated }
+    }
+
+    /// A filter context with a filter ID, as in a pipeline.
+    fn filter_context(req: &Request) -> HttpFilterContext<'_> {
+        let mut ctx = make_filter_context(req);
+        ctx.current_filter_id = Some(0);
+        ctx
+    }
+
+    /// The exchange state this filter keeps in `ctx`.
+    fn exchange<'a>(ctx: &'a HttpFilterContext<'_>) -> &'a Exchange {
+        ctx.get_filter_state::<Exchange>().unwrap()
+    }
+
+    /// Record a request translated for `model`, as `on_request_body` does,
+    /// with the response `translation` already selected, if any.
+    fn translated(ctx: &mut HttpFilterContext<'_>, model: &str, translation: Option<ResponseTranslation>) {
+        ctx.insert_filter_state(Exchange {
+            request: TranslatedRequest {
+                model: model.to_owned(),
+                ..TranslatedRequest::default()
+            },
+            response: translation,
+        });
+    }
+
+    /// Select the response `translation`, as `on_response` does.
+    fn respond(ctx: &mut HttpFilterContext<'_>, translation: ResponseTranslation) {
+        ctx.get_filter_state_mut::<Exchange>().unwrap().response = Some(translation);
     }
 
     // --- from_config ---
@@ -606,29 +658,35 @@ mod tests {
     #[test]
     fn response_transform_error_on_4xx() {
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
         let mut resp = make_response();
         resp.status = StatusCode::BAD_REQUEST;
         ctx.response_header = Some(&mut resp);
 
-        assert_eq!(response_transform(&ctx), RESPONSE_TRANSFORM_ERROR);
+        assert!(matches!(
+            ResponseTranslation::for_response(&ctx),
+            ResponseTranslation::Error(StatusCode::BAD_REQUEST)
+        ));
     }
 
     #[test]
     fn response_transform_error_on_5xx() {
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
         let mut resp = make_response();
         resp.status = StatusCode::INTERNAL_SERVER_ERROR;
         ctx.response_header = Some(&mut resp);
 
-        assert_eq!(response_transform(&ctx), RESPONSE_TRANSFORM_ERROR);
+        assert!(matches!(
+            ResponseTranslation::for_response(&ctx),
+            ResponseTranslation::Error(StatusCode::INTERNAL_SERVER_ERROR)
+        ));
     }
 
     #[test]
     fn response_transform_sse_on_event_stream() {
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
         let mut resp = make_response();
         resp.headers.insert(
             http::header::CONTENT_TYPE,
@@ -636,13 +694,16 @@ mod tests {
         );
         ctx.response_header = Some(&mut resp);
 
-        assert_eq!(response_transform(&ctx), RESPONSE_TRANSFORM_SSE);
+        assert!(matches!(
+            ResponseTranslation::for_response(&ctx),
+            ResponseTranslation::Sse(None)
+        ));
     }
 
     #[test]
     fn response_transform_success_on_json() {
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
         let mut resp = make_response();
         resp.headers.insert(
             http::header::CONTENT_TYPE,
@@ -650,7 +711,10 @@ mod tests {
         );
         ctx.response_header = Some(&mut resp);
 
-        assert_eq!(response_transform(&ctx), RESPONSE_TRANSFORM_SUCCESS);
+        assert!(matches!(
+            ResponseTranslation::for_response(&ctx),
+            ResponseTranslation::Success
+        ));
     }
 
     // --- on_request ---
@@ -660,7 +724,7 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
 
         drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -677,7 +741,7 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: my-proj\nregion: us-central1").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
 
         let mut body = Some(Bytes::from(
             br#"{"model":"gemini-2.0-flash","messages":[{"role":"user","content":"Hi"}]}"#.to_vec(),
@@ -692,7 +756,7 @@ mod tests {
             ),
             "non-streaming path should use generateContent"
         );
-        assert_eq!(ctx.get_metadata(REQUEST_MODEL_KEY), Some("gemini-2.0-flash"),);
+        assert_eq!(exchange(&ctx).request.model, "gemini-2.0-flash");
 
         let parsed: serde_json::Value = serde_json::from_slice(body.unwrap().as_ref()).unwrap();
         assert!(
@@ -706,7 +770,7 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p\nregion: r").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
 
         let mut body = Some(Bytes::from(
             br#"{"model":"gemini-2.0-flash","stream":true,"messages":[{"role":"user","content":"Hi"}]}"#.to_vec(),
@@ -720,7 +784,7 @@ mod tests {
                 .ends_with(":streamGenerateContent?alt=sse"),
             "streaming path should use streamGenerateContent?alt=sse"
         );
-        assert_eq!(ctx.get_metadata(REQUEST_CANDIDATE_COUNT_KEY), Some("1"));
+        assert_eq!(exchange(&ctx).request.candidate_count, 1);
     }
 
     #[tokio::test]
@@ -728,7 +792,7 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
         let mut body = Some(Bytes::from_static(b"not json"));
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -746,7 +810,7 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
         let mut body = Some(Bytes::from_static(b"partial"));
 
         let action = filter.on_request_body(&mut ctx, &mut body, false).await.unwrap();
@@ -760,7 +824,7 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
         let mut body = Some(Bytes::new());
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -778,7 +842,7 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
         let mut resp = make_response();
         resp.status = StatusCode::NOT_FOUND;
         resp.headers.insert(
@@ -814,8 +878,8 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", None);
 
         let mut resp = make_response();
         resp.headers.insert(
@@ -864,9 +928,8 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SUCCESS.to_owned());
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", Some(ResponseTranslation::Success));
 
         let mut body = Some(Bytes::from_static(b"not json"));
         let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
@@ -888,8 +951,8 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", None);
 
         let mut resp = make_response();
         resp.headers.insert(
@@ -900,7 +963,7 @@ mod tests {
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
-        assert_eq!(ctx.get_metadata(RESPONSE_TRANSFORM_KEY), Some(RESPONSE_TRANSFORM_SSE));
+        assert!(matches!(exchange(&ctx).response, Some(ResponseTranslation::Sse(None))));
         ctx.response_header = None;
 
         // First SSE chunk with a complete Gemini frame.
@@ -924,10 +987,8 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", Some(ResponseTranslation::Sse(None)));
 
         // First deliver a content frame with finishReason so the stream is
         // considered complete. Gemini doesn't send [DONE] — the proxy appends
@@ -955,10 +1016,8 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", Some(ResponseTranslation::Sse(None)));
 
         // Valid JSON frame, no parse error — but no finishReason.
         let mut body = Some(Bytes::from_static(
@@ -983,14 +1042,13 @@ mod tests {
     async fn sse_eof_requires_every_requested_candidate_to_finish() {
         let filter = make_filter("project: p");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
 
         let mut body = Some(Bytes::from_static(
             br#"{"model":"gemini-2.0-flash","n":2,"stream":true,"messages":[{"role":"user","content":"Hi"}]}"#,
         ));
         drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE);
+        respond(&mut ctx, ResponseTranslation::Sse(None));
 
         // Candidate zero finishes, but candidate one never arrives.
         let mut body = Some(Bytes::from_static(
@@ -1010,10 +1068,8 @@ mod tests {
     async fn upstream_done_is_deferred_until_stream_validation() {
         let filter = make_filter("project: p");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash");
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE);
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", Some(ResponseTranslation::Sse(None)));
 
         let mut body = Some(Bytes::from_static(
             b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}]}}]}\n\ndata: [DONE]\n\n",
@@ -1035,10 +1091,8 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", Some(ResponseTranslation::Sse(None)));
 
         // Chunk 1: invalid JSON frame — sets had_error.
         let mut body = Some(Bytes::from_static(b"data: not-json-at-all\n\n"));
@@ -1071,10 +1125,8 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", Some(ResponseTranslation::Sse(None)));
 
         // Final chunk with data AND end_of_stream=true: should
         // translate the frame AND append [DONE].
@@ -1093,14 +1145,13 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
 
         let mut body = Some(Bytes::from_static(
             br#"{"model":"gemini-2.0-flash","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"Hi"}]}"#,
         ));
         drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
+        respond(&mut ctx, ResponseTranslation::Sse(None));
 
         let mut body = Some(Bytes::from_static(
             b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"!\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":1,\"totalTokenCount\":4}}\n\n",
@@ -1126,15 +1177,14 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
 
-        // Request — sets REQUEST_MODEL_KEY and REQUEST_INCLUDE_USAGE_KEY in ctx.
+        // Request — records the model and include_usage for the response.
         let mut body = Some(Bytes::from_static(
             br#"{"model":"gemini-2.0-flash","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"Hi"}]}"#,
         ));
         drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
+        respond(&mut ctx, ResponseTranslation::Sse(None));
 
         // First chunk — content frame without usageMetadata, not end-of-stream.
         let mut body = Some(Bytes::from_static(
@@ -1195,10 +1245,8 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", Some(ResponseTranslation::Sse(None)));
 
         let mut body = Some(Bytes::from_static(
             b"data: {\"responseId\":\"resp-s\",\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{}}}]}}]}\n\n",
@@ -1226,10 +1274,8 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", Some(ResponseTranslation::Sse(None)));
 
         let mut body = Some(Bytes::from_static(
             b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"fc-keep\",\"name\":\"search\"}}]}}]}\n\n",
@@ -1263,10 +1309,8 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p\nmax_body_bytes: 64").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", Some(ResponseTranslation::Sse(None)));
 
         // 100 bytes exceeds the 64-byte parser buffer → BufferOverflow.
         let overflow = "x".repeat(100);
@@ -1299,10 +1343,8 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", Some(ResponseTranslation::Sse(None)));
 
         // Valid SSE frame wrapping invalid JSON — transform_stream_chunk returns Err.
         let mut body = Some(Bytes::from_static(b"data: not-json-at-all\n\n"));
@@ -1328,10 +1370,8 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", Some(ResponseTranslation::Sse(None)));
 
         // Two SSE frames in one chunk: bad JSON first, then a valid candidate.
         let chunk = b"data: not-valid-json\n\ndata: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}],\"role\":\"model\"}}]}\n\n";
@@ -1357,10 +1397,8 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", Some(ResponseTranslation::Sse(None)));
 
         // Send a partial SSE frame (no blank-line terminator).
         let mut body = Some(Bytes::from_static(
@@ -1385,10 +1423,8 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", Some(ResponseTranslation::Sse(None)));
 
         let sse_data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}],\"role\":\"model\"},\"finishReason\":\"STOP\"}]}\n\n";
         let mut body = Some(Bytes::from(sse_data.to_vec()));
@@ -1411,10 +1447,8 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", Some(ResponseTranslation::Sse(None)));
 
         // First chunk: valid frame.
         let sse_data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}],\"role\":\"model\"},\"finishReason\":\"STOP\"}]}\n\n";
@@ -1449,10 +1483,8 @@ mod tests {
         let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
-        ctx.current_filter_id = Some(0);
+        let mut ctx = filter_context(&req);
+        translated(&mut ctx, "gemini-2.0-flash", Some(ResponseTranslation::Sse(None)));
 
         // Vertex sends promptFeedback with no candidates when the prompt is blocked.
         let mut body = Some(Bytes::from_static(
@@ -1474,7 +1506,7 @@ mod tests {
     #[test]
     fn prepare_response_headers_sets_content_type() {
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = filter_context(&req);
         let mut resp = make_response();
         resp.headers
             .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("42"));

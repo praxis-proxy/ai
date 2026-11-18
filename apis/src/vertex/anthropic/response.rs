@@ -88,12 +88,14 @@ fn patch_model_field(obj: &mut Map<String, Value>, user_model: &str) -> Option<(
 const MESSAGE_START: &[u8] = b"message_start";
 
 /// Restore message-start models while forwarding every other wire frame unchanged.
-pub(crate) fn rebuild_sse_frames(frames: &[Vec<u8>], user_model: Option<&str>, initial_frame: bool) -> Vec<u8> {
+pub(crate) fn rebuild_sse_frames(frames: &[Vec<u8>], user_model: &str, initial_frame: bool) -> Vec<u8> {
     let mut output = Vec::new();
     for (index, raw) in frames.iter().enumerate() {
-        let patched = user_model
-            .filter(|_| raw.windows(MESSAGE_START.len()).any(|bytes| bytes == MESSAGE_START))
-            .and_then(|model| patch_wire_frame(raw, model, initial_frame && index == 0));
+        let patched = if raw.windows(MESSAGE_START.len()).any(|bytes| bytes == MESSAGE_START) {
+            patch_wire_frame(raw, user_model, initial_frame && index == 0)
+        } else {
+            None
+        };
         output.extend_from_slice(patched.as_deref().unwrap_or(raw));
     }
     output
@@ -245,7 +247,7 @@ mod tests {
                 .to_vec();
         let multiline_json = b"event: content_block_delta\ndata: {\ndata: \"type\":\"content_block_delta\",\ndata: \"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}\ndata: }\n\n".to_vec();
         let frames = vec![start, unchanged.clone(), multiline_json.clone()];
-        let out = rebuild_sse_frames(&frames, Some("vertex/model"), true);
+        let out = rebuild_sse_frames(&frames, "vertex/model", true);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\"model\":\"vertex/model\""));
         assert!(text.starts_with(": start\nid: first\nretry: 1000\n"));
@@ -258,20 +260,19 @@ mod tests {
     #[test]
     fn sse_rebuild_preserves_delta_payloads_containing_the_candidate_marker() {
         let raw = b"event: content_block_delta\r\ndata: {\"delta\":{\"text\":\"message_start\"},\"model\":\"snapshot\"}\r\n\r\n";
-        assert_eq!(rebuild_sse_frames(&[raw.to_vec()], Some("public-model"), true), raw);
+        assert_eq!(rebuild_sse_frames(&[raw.to_vec()], "public-model", true), raw);
     }
 
     #[test]
     fn sse_rebuild_keeps_malformed_or_unmapped_message_start_unchanged() {
         let frames = vec![b"event: message_start\ndata: {not json\n\n".to_vec()];
-        assert_eq!(rebuild_sse_frames(&frames, Some("vertex/x"), true), frames.concat());
-        assert_eq!(rebuild_sse_frames(&frames, None, true), frames.concat());
+        assert_eq!(rebuild_sse_frames(&frames, "vertex/x", true), frames.concat());
     }
 
     #[test]
     fn sse_rebuild_handles_bom_and_data_before_message_start_event() {
         let raw = b"\xEF\xBB\xBFdata: {\"message\":{\"model\":\"snapshot\"}}\nid: first\nevent: message_start\n\n";
-        let output = rebuild_sse_frames(&[raw.to_vec()], Some("vertex/client-model"), true);
+        let output = rebuild_sse_frames(&[raw.to_vec()], "vertex/client-model", true);
         let frames = SseFrameParser::new(1024).parse_chunk(&output).unwrap();
         assert_eq!(frames.len(), 1, "rewritten SSE must contain a single event");
         let value: Value = serde_json::from_slice(&frames[0].data).unwrap();
@@ -282,9 +283,6 @@ mod tests {
     #[test]
     fn sse_rebuild_does_not_strip_a_bom_after_stream_start() {
         let raw = b"\xEF\xBB\xBFdata: {\"message\":{\"model\":\"snapshot\"}}\nevent: message_start\n\n";
-        assert_eq!(
-            rebuild_sse_frames(&[raw.to_vec()], Some("vertex/client-model"), false),
-            raw
-        );
+        assert_eq!(rebuild_sse_frames(&[raw.to_vec()], "vertex/client-model", false), raw);
     }
 }
