@@ -4618,6 +4618,85 @@ async fn hard_enforcement_still_rejects_when_over_quota() {
     );
 }
 
+const PRIORITY_CLASS_HEADER: &str = "x-llm-d-inference-priority-class";
+
+fn priority_class_soft_yaml() -> serde_yaml::Value {
+    let yaml = "\
+        backend:\n\
+        \x20 kind: memory\n\
+        rules:\n\
+        \x20 - name: default\n\
+        \x20   algorithm: sliding_window\n\
+        \x20   window: 1h\n\
+        \x20   capacity: 100\n\
+        \x20   reserved_tokens: 60\n\
+        \x20   enforcement: soft\n\
+        \x20   over_quota:\n\
+        \x20     headers:\n\
+        \x20       x-llm-d-inference-priority-class: sheddable\n";
+    parse_filter_yaml(yaml).unwrap()
+}
+
+fn header_value<'a>(ctx: &'a praxis_filter::HttpFilterContext<'_>, name: &str) -> Option<&'a str> {
+    ctx.request_headers_to_set
+        .iter()
+        .find(|(header, _)| header.as_str() == name)
+        .and_then(|(_, value)| value.to_str().ok())
+}
+
+#[tokio::test]
+async fn soft_over_quota_sets_llm_d_priority_class_sheddable() {
+    let yaml = priority_class_soft_yaml();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    let mut first_ctx = filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut first_ctx).await.unwrap(), FilterAction::Continue),
+        "inside quota must continue"
+    );
+    assert_eq!(
+        header_value(&first_ctx, PRIORITY_CLASS_HEADER),
+        None,
+        "inside quota must not stamp sheddable; a missing header is critical"
+    );
+
+    let mut second_ctx = filter_context(&req);
+    assert!(
+        matches!(
+            filter.on_request(&mut second_ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "over quota must continue instead of 429"
+    );
+    assert_eq!(
+        header_value(&second_ctx, PRIORITY_CLASS_HEADER),
+        Some("sheddable"),
+        "over quota must stamp the llm-d priority class"
+    );
+}
+
+#[tokio::test]
+async fn soft_over_quota_strips_client_priority_class() {
+    let yaml = priority_class_soft_yaml();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = make_request_with_header(PRIORITY_CLASS_HEADER, "sheddable");
+
+    let mut first_ctx = filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut first_ctx).await.unwrap(), FilterAction::Continue),
+        "inside quota must continue"
+    );
+    assert!(
+        first_ctx
+            .request_headers_to_remove
+            .iter()
+            .any(|name| name.as_str() == PRIORITY_CLASS_HEADER),
+        "a client-supplied priority class must be stripped while inside quota"
+    );
+    assert_eq!(header_value(&first_ctx, PRIORITY_CLASS_HEADER), None);
+}
+
 #[tokio::test]
 async fn soft_enforcement_strips_spoofed_over_quota_headers() {
     let yaml = soft_enforcement_yaml("");
