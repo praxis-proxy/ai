@@ -29,9 +29,9 @@ pub mod hash;
 mod history_allocation_tests;
 pub mod http_hop;
 pub mod json_body;
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 pub(crate) mod mcp_client;
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 pub(crate) mod mcp_core;
 pub mod openai;
 pub mod operation;
@@ -135,7 +135,7 @@ pub(crate) mod test_utils {
     /// Installs a thread-local subscriber, so parallel tests sharing the
     /// process-wide subscriber are unaffected. Use it to assert that request
     /// or response content never reaches logs.
-    #[cfg(feature = "openai-responses")]
+    #[cfg(any(feature = "openai-responses", feature = "anthropic-mcp-connector"))]
     pub(crate) fn capture_log_output<F: FnOnce()>(f: F) -> String {
         use std::{
             fmt::Write as _,

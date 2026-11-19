@@ -86,6 +86,32 @@ model server, so vLLM cannot honor it. When the selected cluster declares
 `application_provider: anthropic`, or an untagged cluster, forwards the
 connector unchanged. The Chat Completions translation always refuses it.
 
+To serve the connector on these backends, add the experimental
+[`anthropic_mcp_connector`](filters/anthropic_mcp_connector.md) filter
+(cargo feature `anthropic-mcp-connector-filter`) first in the inference step
+of an `iterative_request_router`. Praxis then runs the connector itself:
+
+- On the first round it lists each declared server's tools, keeps the ones
+  the `mcp_toolset` enables (`default_config` and per-tool `configs`), and
+  sends them to the model as plain tools named `{server}__{tool}`. It drops
+  `mcp_servers` and the `mcp-client-*` beta token, so the refusal above no
+  longer applies.
+- When the model calls one of those tools, Praxis runs it over MCP and
+  re-enters inference. The final response carries Anthropic's
+  `mcp_tool_use` and `mcp_tool_result` blocks for every call, followed by the
+  model's answer. Usage is summed over all rounds.
+- `mcp_tool_use` / `mcp_tool_result` history replayed in a later turn is
+  converted into ordinary `tool_use` / `tool_result` turns for the backend.
+- A client server runs only when its `url` matches an operator connector's
+  `server_url`; any other URL is rejected with a 400 unless the operator sets
+  `allow_client_servers: true`.
+- Both the native Messages route and the Chat Completions translation are
+  supported. Streaming (`stream: true`) requests that use the connector, a
+  toolset's `defer_loading: true`, and pinned tool lists are rejected with a
+  400 for now.
+
+See [`examples/configs/anthropic/mcp-connector.yaml`](../examples/configs/anthropic/mcp-connector.yaml).
+
 Claude Code is unaffected: it runs MCP servers itself and sends their tools
 as ordinary client tools, which every route serves.
 
@@ -581,7 +607,9 @@ The `anthropic_messages_to_chat_completions` filter:
   `output_format`) to a strict `response_format`; any
   other `output_config` key is rejected with a 400
 - Rejects the MCP connector (`mcp_servers` or any
-  `mcp_toolset` tool) with a 400 that names it
+  `mcp_toolset` tool) with a 400 that names it, unless
+  `anthropic_mcp_connector` resolved it earlier in the
+  step (see [MCP connector](#mcp-connector))
 - Rejects `service_tier`, `container`, `inference_geo`
   and `mcp_servers` with a 400, because the translated
   response cannot report their effect truthfully; the
@@ -689,7 +717,7 @@ forwarded unchanged. No body transformation, version-specific validation,
 or credential handling. See [API version compatibility](#api-version-compatibility).
 Placed after `load_balancer`, it also refuses the
 [MCP connector](#mcp-connector) for a cluster whose `application_provider`
-is not `anthropic`.
+is not `anthropic`, unless `anthropic_mcp_connector` resolved it first.
 
 ```yaml
 filter: anthropic_messages_protocol

@@ -31,7 +31,10 @@ use praxis_filter::{
 use tracing::debug;
 
 use self::config::{AnthropicMessagesProtocolConfig, build_config};
-use super::{messages_request::MCP_CONNECTOR_METADATA_KEY, wire};
+use super::{
+    messages_request::{MCP_CONNECTOR_METADATA_KEY, MCP_CONNECTOR_RESOLVED},
+    wire,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -42,6 +45,9 @@ const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
 
 /// Anthropic beta feature header name.
 const ANTHROPIC_BETA_HEADER: &str = "anthropic-beta";
+
+/// `anthropic-beta` token prefix that negotiates the MCP connector.
+const MCP_CLIENT_BETA_PREFIX: &str = "mcp-client-";
 
 /// The `application_provider` that executes the MCP connector natively.
 const ANTHROPIC_PROVIDER: &str = "anthropic";
@@ -148,7 +154,8 @@ impl HttpFilter for AnthropicMessagesProtocolFilter {
         }
 
         if ctx.request.headers.get(ANTHROPIC_BETA_HEADER).is_none() {
-            restore_original_header(ctx, ANTHROPIC_BETA_HEADER);
+            let connector_resolved = ctx.get_metadata(MCP_CONNECTOR_METADATA_KEY) == Some(MCP_CONNECTOR_RESOLVED);
+            restore_beta_header(ctx, connector_resolved);
         }
 
         Ok(FilterAction::Continue)
@@ -157,6 +164,46 @@ impl HttpFilter for AnthropicMessagesProtocolFilter {
     async fn on_response(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         Ok(FilterAction::Continue)
     }
+}
+
+/// Restore the caller's `anthropic-beta` header on an iterative request.
+///
+/// Once Praxis has resolved the MCP connector the backend no longer receives
+/// it, so the connector's beta tokens are dropped from the restored value.
+fn restore_beta_header(ctx: &mut HttpFilterContext<'_>, connector_resolved: bool) {
+    let Some(value) = ctx
+        .extensions
+        .get::<IterationState>()
+        .and_then(|state| state.original_request.headers.get(ANTHROPIC_BETA_HEADER))
+        .and_then(|value| value.to_str().ok())
+    else {
+        return;
+    };
+    let value = match connector_resolved.then(|| strip_mcp_client_betas(value)).flatten() {
+        Some(stripped) if stripped.is_empty() => return,
+        Some(stripped) => stripped,
+        None => value.to_owned(),
+    };
+    ctx.extra_request_headers
+        .push((Cow::Borrowed(ANTHROPIC_BETA_HEADER), value));
+}
+
+/// Remove MCP connector tokens from an `anthropic-beta` value.
+///
+/// Returns `None` when the value carries no MCP connector token. Otherwise
+/// returns the remaining comma-separated tokens, which may be empty.
+pub(crate) fn strip_mcp_client_betas(value: &str) -> Option<String> {
+    let mut stripped = false;
+    let kept: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|token| {
+            let mcp = token.starts_with(MCP_CLIENT_BETA_PREFIX);
+            stripped |= mcp;
+            !mcp && !token.is_empty()
+        })
+        .collect();
+    stripped.then(|| kept.join(","))
 }
 
 /// Restore a caller-supplied Anthropic protocol header when an
