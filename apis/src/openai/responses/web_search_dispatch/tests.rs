@@ -3409,13 +3409,10 @@ fn bound_streamed_search_action_is_noop_without_dispatcher_bound() {
 fn search_bridge_shares_payloads_and_detaches_on_mutation() {
     let mut state = ResponsesState::from_request_body(serde_json::json!({"input": "hello"}));
     let start = state.messages.len();
-    append_search_bridge(
-        &mut state,
-        [
-            serde_json::json!({"type": "function_call", "call_id": "bridge"}),
-            serde_json::json!({"type": "function_call_output", "call_id": "bridge", "output": "results"}),
-        ],
-    );
+    state.append_local_tool_results([
+        serde_json::json!({"type": "function_call", "call_id": "bridge"}),
+        serde_json::json!({"type": "function_call_output", "call_id": "bridge", "output": "results"}),
+    ]);
     for index in start..start + 2 {
         assert!(
             state.messages.shares_item_with(index, &state.persisted_messages, index),

@@ -1724,7 +1724,7 @@ fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge:
             });
             return;
         }
-        append_search_bridge(state, bridge);
+        state.append_local_tool_results(bridge);
         // Record execution provenance keyed on the item id `stream_events` reads:
         // this replaces the model's placeholder with an executed result, so only
         // now may the search's lifecycle be synthesized. A placeholder copied into
@@ -1736,26 +1736,6 @@ fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge:
             *slot = output_item;
         }
     }
-}
-
-/// Append backend bridge items to working history and, when enabled, its
-/// persistence mirror. Moving the pair is sufficient for store:false requests.
-fn append_search_bridge(state: &mut ResponsesState, bridge: [Value; 2]) {
-    let result_start = state.messages.len();
-    if state.captures_persistence_history() {
-        // Both histories retain the same immutable payloads; later mutation
-        // detaches only the changed item through MessageHistory's copy-on-write.
-        for item in bridge {
-            let item = Arc::new(item);
-            state.messages.push_shared(Arc::clone(&item));
-            if let Some(persisted) = state.persisted_messages_mut() {
-                persisted.push_shared(item);
-            }
-        }
-    } else {
-        state.messages.extend(bridge);
-    }
-    state.mark_local_tool_results_from(result_start);
 }
 
 /// Owned provider rows kept locally while a multi-query call is in flight.

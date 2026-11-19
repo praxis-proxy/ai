@@ -32,7 +32,7 @@ use crate::{
     callout_policy::OnFailure,
     openai::responses::{
         agentic_loop::budget::SimpleBudget,
-        state::{CollectedRound, FileSearchAssignment, SynthesisKind},
+        state::{CollectedRound, FileSearchAssignment, MAX_CITATION_FILES, SynthesisKind},
     },
     subrequest::{SubRequestClient, SubRequestError, SubResponse},
 };
@@ -505,6 +505,73 @@ async fn no_state_or_pending_calls_is_a_noop() {
     ctx.extensions.insert(state_with(&["vs-a"], vec![]));
     assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn completed_search_bridge_is_mirrored_into_durable_history() {
+    let server = MockServer::json(200, &one_result("file-a", "report.pdf", 0.95, "PASSAGE-MARKER-2036"));
+    let filter = make_filter(server.port, "");
+    let state = state_with(
+        &["vs-a"],
+        vec![json!({"type":"file_search_call","id":"fs-1","status":"searching","queries":["revenue"]})],
+    );
+    let persisted_start = state.persisted_messages.len();
+    let working_start = state.messages.len();
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    // Without `include`, the public item stays result-free; only the private
+    // bridge carries the passage into durable history (#2036).
+    assert!(state.accumulated_output[0].get("results").is_none());
+    let persisted = state
+        .persisted_messages
+        .iter()
+        .skip(persisted_start)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        persisted
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["function_call", "function_call_output"],
+        "the private model-context pair must reach durable history"
+    );
+    assert_eq!(
+        persisted[0]["call_id"], persisted[1]["call_id"],
+        "correlation id preserved"
+    );
+    assert!(
+        persisted[1]["output"].as_str().unwrap().contains("PASSAGE-MARKER-2036"),
+        "retrieved passage must be replayable on continuation"
+    );
+    for offset in 0..2 {
+        assert!(
+            state.messages.shares_item_with(
+                working_start + offset,
+                &state.persisted_messages,
+                persisted_start + offset
+            ),
+            "durable history must share, not deep-copy, the bridge payload"
+        );
+    }
+}
+
+#[tokio::test]
+async fn completed_search_bridge_skips_durable_history_when_not_persisting() {
+    let server = MockServer::json(200, &one_result("file-a", "report.pdf", 0.95, "PASSAGE"));
+    let filter = make_filter(server.port, "");
+    let mut state = state_with(
+        &["vs-a"],
+        vec![json!({"type":"file_search_call","id":"fs-1","status":"searching","queries":["revenue"]})],
+    );
+    state.persistence_history_enabled = false;
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.persisted_messages.is_empty());
+    assert_eq!(state.messages.len(), 2, "the next round still receives the bridge");
 }
 
 #[tokio::test]

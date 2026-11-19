@@ -503,14 +503,7 @@ impl McpDispatchFilter {
             return;
         };
         for result in results {
-            let result_start = state.messages.len();
-            if state.captures_persistence_history() {
-                state.messages.push(result.message.clone());
-                state.push_persisted_message(result.message);
-            } else {
-                state.messages.push(result.message);
-            }
-            state.mark_local_tool_results_from(result_start);
+            state.append_local_tool_results([result.message]);
             // Record execution provenance keyed on the item id `stream_events`
             // reads, so only this locally executed `mcp_call` gains a synthesized
             // lifecycle.
