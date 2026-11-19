@@ -8,17 +8,15 @@ mod default;
 use async_trait::async_trait;
 use bytes::Bytes;
 pub use default::DefaultFileService;
-use praxis_ai_store::StateOwner;
+use praxis_ai_store::{CatalogError, StateOwner};
 
-use super::{
-    FileInfo, FileList, FilePage, FileStream, FileUploadMetadata, registry::FileRegistryError, store::FileStoreError,
-};
+use super::{FileInfo, FileList, FilePage, FileStream, FileUploadMetadata, store::FileStoreError};
 
 /// Failures exposed by the Files service to its handler.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FileServiceError {
-    /// No ready file exists in the authorized owner scope.
+    /// No ready file exists in the authorized tenant scope.
     #[error("file not found")]
     NotFound,
     /// A request field is invalid.
@@ -43,12 +41,12 @@ pub enum FileServiceError {
     Store(#[source] FileStoreError),
 }
 
-impl From<FileRegistryError> for FileServiceError {
-    fn from(error: FileRegistryError) -> Self {
+impl From<CatalogError> for FileServiceError {
+    fn from(error: CatalogError) -> Self {
         match error {
-            FileRegistryError::QuotaExceeded => Self::QuotaExceeded,
-            FileRegistryError::InvalidCursor => Self::InvalidInput("invalid `after` cursor".to_owned()),
-            other => Self::Registry(other),
+            CatalogError::QuotaExceeded => Self::QuotaExceeded,
+            CatalogError::InvalidCursor => Self::InvalidInput("invalid `after` cursor".to_owned()),
+            other => Self::Catalog(other),
         }
     }
 }
@@ -119,7 +117,10 @@ pub trait FileUploadSession: Send {
     async fn abort(self: Box<Self>) -> Result<(), FileServiceError>;
 }
 
-/// Coordinates the metadata registry and byte store for HTTP handlers.
+/// Coordinates the metadata catalog and byte store for HTTP handlers.
+///
+/// Scoping is per tenant: any subject in a tenant can retrieve, list, download
+/// and delete that tenant's files, and all subjects share one quota.
 ///
 /// An upload first inserts a pending registry entry and atomically reserves
 /// `R = min(max_file_size, remaining_quota)` without purpose or expiration.
@@ -153,22 +154,23 @@ pub trait FileService: Send + Sync {
         &self,
         owner: &StateOwner,
         filename: String,
+        size_hint: Option<u64>,
     ) -> Result<Box<dyn FileUploadSession + 'static>, FileServiceError>;
 
-    /// Retrieve completed file metadata for this exact owner.
+    /// Retrieve completed file metadata for this tenant.
     ///
     /// # Errors
     ///
     /// Returns [`FileServiceError::NotFound`] for missing, hidden, or
-    /// differently owned files, or another [`FileServiceError`] on registry
+    /// other tenants' files, or another [`FileServiceError`] on catalog
     /// failure.
     async fn retrieve(&self, owner: &StateOwner, id: &str) -> Result<FileInfo, FileServiceError>;
 
-    /// List completed files for this exact owner.
+    /// List completed files for this tenant.
     ///
     /// # Errors
     ///
-    /// Returns [`FileServiceError`] when the query or registry operation fails.
+    /// Returns [`FileServiceError`] when the query or catalog operation fails.
     async fn list(&self, owner: &StateOwner, options: &FileList) -> Result<FilePage, FileServiceError>;
 
     /// Open a completed file as a stream. Errors can also occur while the
@@ -190,7 +192,7 @@ pub trait FileService: Send + Sync {
     /// # Errors
     ///
     /// Returns [`FileServiceError::NotFound`] for missing, hidden, or
-    /// differently owned files, or another [`FileServiceError`] on registry
+    /// other tenants' files, or another [`FileServiceError`] on catalog
     /// failure.
     async fn delete(&self, owner: &StateOwner, id: &str) -> Result<(), FileServiceError>;
 }

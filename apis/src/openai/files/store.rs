@@ -64,7 +64,7 @@ pub trait FileStoreWriter: Send {
 
 /// Byte storage independent of file metadata and HTTP transport.
 ///
-/// Keys come from trusted pending registry entries, never client filenames.
+/// Keys come from trusted pending catalog entries, never client filenames.
 /// A store implementation may use temporary objects or multipart upload
 /// internally; the writer commits them only on successful completion.
 #[async_trait]

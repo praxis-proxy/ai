@@ -19,6 +19,7 @@ impl FileService for DefaultFileService {
         &self,
         _owner: &StateOwner,
         _filename: String,
+        _size_hint: Option<u64>,
     ) -> Result<Box<dyn FileUploadSession + 'static>, FileServiceError> {
         unimplemented!()
     }

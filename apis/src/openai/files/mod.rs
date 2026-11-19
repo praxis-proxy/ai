@@ -10,11 +10,11 @@
 #[cfg(feature = "openai-files")]
 pub(crate) mod contracts;
 #[cfg(feature = "openai-files")]
+mod mapping;
+#[cfg(feature = "openai-files")]
 mod model;
 #[cfg(feature = "openai-files")]
 mod openapi;
-#[cfg(feature = "openai-files")]
-mod registry;
 pub(crate) mod routes;
 #[cfg(feature = "openai-files")]
 mod service;
@@ -31,7 +31,7 @@ pub use model::{
 #[cfg(feature = "openai-files")]
 pub use openapi::implementation_openapi_json;
 #[cfg(feature = "openai-files")]
-pub use registry::{FileRegistry, FileRegistryError};
+pub use praxis_ai_store::{CatalogError, FileCatalog};
 #[cfg(feature = "openai-files")]
 pub use service::{DefaultFileService, FileDownload, FileService, FileServiceError, FileUploadSession};
 #[cfg(feature = "openai-files")]
