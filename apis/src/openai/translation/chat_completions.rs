@@ -417,15 +417,6 @@ fn translate_responses_request(
         .ok_or(TranslationError::ExpectedObject("Responses request"))?;
     validate_input_container(obj.get("input"))?;
     validate_representable_parameters(obj)?;
-    if let Some(value) = request.pointer("/stream_options/include_obfuscation")
-        && !value.is_boolean()
-    {
-        return Err(TranslationError::UnrepresentableRequestParameter {
-            parameter: "stream_options.include_obfuscation",
-            value: json_type_name(value),
-            supported: "a boolean",
-        });
-    }
 
     let mut chat = Map::new();
     map_request_parameters(obj, &mut chat);
@@ -514,6 +505,17 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
 /// reported back as the default.
 #[expect(clippy::too_many_lines, reason = "sequential validation of request parameters")]
 fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), TranslationError> {
+    if let Some(value) = obj
+        .get("stream_options")
+        .and_then(|options| options.get("include_obfuscation"))
+        && !value.is_boolean()
+    {
+        return Err(TranslationError::UnrepresentableRequestParameter {
+            parameter: "stream_options.include_obfuscation",
+            value: json_type_name(value),
+            supported: "a boolean",
+        });
+    }
     // Access program selection cannot be honored by the Chat backend. Keep
     // this check at translation so native Responses passthrough is unaffected.
     if let Some(access_programs) = obj.get("access_programs") {

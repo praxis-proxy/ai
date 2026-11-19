@@ -34,7 +34,10 @@ fn pad_payload(payload: &mut Value, framing_len: usize) -> Result<(), ConvertErr
     let frame_len = framing_len + serialized_json_len(payload)?;
     let padding_len = BUCKET_BYTES - frame_len % BUCKET_BYTES;
     let mut random = [0; BUCKET_BYTES];
-    rand_bytes(&mut random).map_err(|_| ConvertError::ObfuscationRandomness)?;
+    rand_bytes(&mut random).map_err(|error| {
+        tracing::warn!(%error, "failed to generate Responses stream padding");
+        ConvertError::ObfuscationRandomness
+    })?;
     let padding = random
         .iter()
         .take(padding_len)
