@@ -131,6 +131,4 @@ pub struct CleanupClaim {
     pub storage_key: String,
     /// Cleanup state, checked again by the conditional purge.
     pub state: CleanupState,
-    /// Failed cleanup attempts so far, exposed for logging and alerting.
-    pub attempts: u32,
 }
