@@ -48,7 +48,7 @@ impl praxis_filter::HttpFilter for FinalMessageOnly {
     }
 
     fn response_body_access(&self) -> praxis_filter::BodyAccess {
-        praxis_filter::BodyAccess::ReadWrite
+        praxis_filter::BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn on_response_body(
@@ -5801,26 +5801,26 @@ fn web_search_provider_failure_continues_loop_with_failed_result() {
     );
 }
 
-#[test]
-fn streaming_web_search_round_trip_resumes_one_logical_response() {
+/// Script a search round that omits `output_item.done` so Praxis synthesizes the lifecycle.
+fn web_search_stream_round(response_id: &str, item_id: &str, query: &str) -> Vec<String> {
     let search_call = serde_json::json!({
         "type": "web_search_call",
-        "id": "ws_stream_1",
+        "id": item_id,
         "status": "completed",
-        "action": {"type": "search", "query": "Rust 2025 edition"}
+        "action": {"type": "search", "query": query}
     });
-    let first_response = vec![
+    vec![
         sse_event(
             "response.created",
             serde_json::json!({
-                "response": {"id": "resp_ws_stream_1", "object": "response", "status": "in_progress", "output": []},
+                "response": {"id": response_id, "object": "response", "status": "in_progress", "output": []},
                 "sequence_number": 0
             }),
         ),
         sse_event(
             "response.output_item.added",
             serde_json::json!({
-                "response_id": "resp_ws_stream_1",
+                "response_id": response_id,
                 "output_index": 0,
                 "item": search_call,
                 "sequence_number": 1
@@ -5830,7 +5830,7 @@ fn streaming_web_search_round_trip_resumes_one_logical_response() {
             "response.completed",
             serde_json::json!({
                 "response": {
-                    "id": "resp_ws_stream_1",
+                    "id": response_id,
                     "object": "response",
                     "status": "completed",
                     "output": [search_call],
@@ -5839,7 +5839,12 @@ fn streaming_web_search_round_trip_resumes_one_logical_response() {
                 "sequence_number": 2
             }),
         ),
-    ];
+    ]
+}
+
+#[test]
+fn streaming_web_search_round_trip_resumes_one_logical_response() {
+    let first_response = web_search_stream_round("resp_ws_stream_1", "ws_stream_1", "Rust 2025 edition");
     let final_message = serde_json::json!({
         "type": "message",
         "id": "msg_ws_stream_2",
@@ -6085,6 +6090,72 @@ fn streaming_web_search_round_trip_resumes_one_logical_response() {
         Some(bridge_call_id),
         "bridge function_call_output must reuse the bridge function_call call_id: {input:?}"
     );
+}
+
+#[test]
+fn streaming_web_search_emits_one_progress_lifecycle_per_round() {
+    let (model_port, _, model_thread) = start_streaming_model(vec![
+        web_search_stream_round("resp_first", "ws_first", "Rust release"),
+        web_search_stream_round("resp_second", "ws_second", "Rust release notes"),
+        vec![sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_final",
+                    "object": "response",
+                    "status": "completed",
+                    "output": []
+                },
+                "sequence_number": 0
+            }),
+        )],
+    ]);
+    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    let search_calls = spawn_search_mock(search_listener);
+    let proxy_port = free_port();
+    let config = load_web_search_config(proxy_port, model_port, search_port);
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Find the Rust release and release notes",
+        "stream": true,
+        "store": false,
+        "tools": [{"type": "web_search"}]
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    assert_eq!(parse_status(&raw), 200, "{raw}");
+
+    let body = parse_body(&raw);
+    let frames = assert_logical_stream_conformance(&body, "resp_first");
+    let progress: Vec<_> = frames
+        .iter()
+        .filter(|frame| frame.event_type.starts_with("response.web_search_call."))
+        .map(|frame| {
+            (
+                frame.event_type.as_str(),
+                frame.data["item_id"].as_str(),
+                frame.data["output_index"].as_u64(),
+            )
+        })
+        .collect();
+    let lifecycle = [
+        "response.web_search_call.in_progress",
+        "response.web_search_call.searching",
+        "response.web_search_call.completed",
+    ];
+    let expected: Vec<_> = [(0, "ws_first"), (1, "ws_second")]
+        .into_iter()
+        .flat_map(|(index, id)| lifecycle.map(|event| (event, Some(id), Some(index))))
+        .collect();
+    assert_eq!(progress, expected, "{body}");
+
+    let output = terminal_output(&frames);
+    assert_eq!(output.len(), 2, "{body}");
+    assert_eq!(output[0]["id"], "ws_first", "{body}");
+    assert_eq!(output[1]["id"], "ws_second", "{body}");
+    assert_eq!(search_calls.load(Ordering::SeqCst), 2);
+    model_thread.join().expect("streaming model thread should finish");
 }
 
 #[test]

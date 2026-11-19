@@ -41,7 +41,7 @@ impl UsageCounts {
             cache_read: parse_u64_meta(ctx, META_TOKEN_CACHE_READ),
             cache_write: parse_u64_meta(ctx, META_TOKEN_CACHE_WRITE),
             reasoning: parse_u64_meta(ctx, META_TOKEN_REASONING),
-            overflow: ctx.get_metadata(META_TOKEN_STATUS) == Some(TOKEN_STATUS_OVERFLOW),
+            overflow: ctx.filter_metadata.get(META_TOKEN_STATUS) == Some(TOKEN_STATUS_OVERFLOW),
         }
     }
 
@@ -113,7 +113,7 @@ impl UsageCounts {
 
 /// Parse metadata as `u64`, preserving missing or unusable values as `None`.
 pub(crate) fn parse_u64_meta(ctx: &HttpFilterContext<'_>, key: &str) -> Option<u64> {
-    ctx.get_metadata(key).and_then(|value| value.parse::<u64>().ok())
+    ctx.filter_metadata.get(key).and_then(|value| value.parse::<u64>().ok())
 }
 
 /// Whether a usable usage input exists for this request.

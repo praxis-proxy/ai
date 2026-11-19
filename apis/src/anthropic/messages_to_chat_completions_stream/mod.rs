@@ -127,7 +127,7 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsStreamFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -1246,6 +1246,7 @@ mod tests {
     use std::borrow::Cow;
 
     use super::*;
+    use crate::RecordAiMetadata as _;
 
     #[test]
     fn empty_chunk_preserves_emitted_cr_marker() {
@@ -1622,7 +1623,7 @@ mod tests {
     #[test]
     fn message_delta_reports_matched_stop_sequence() {
         let (filter, mut ctx) = make_filter_and_context();
-        ctx.set_metadata(
+        ctx.record_ai_metadata(
             crate::anthropic::messages_to_chat_completions::STOP_SEQUENCES_KEY,
             r#"[","]"#,
         );
@@ -1684,7 +1685,7 @@ mod tests {
     #[test]
     fn message_delta_ignores_stop_reason_outside_client_sequences() {
         let (filter, mut ctx) = make_filter_and_context();
-        ctx.set_metadata(
+        ctx.record_ai_metadata(
             crate::anthropic::messages_to_chat_completions::STOP_SEQUENCES_KEY,
             r#"[","]"#,
         );
@@ -1830,7 +1831,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_messages_request.stream", "true".to_owned());
+        ctx.record_ai_metadata("anthropic_messages_request.stream", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1856,7 +1857,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream; charset=utf-8"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1878,7 +1879,7 @@ mod tests {
             http::HeaderValue::from_static("Text/Event-Stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1922,7 +1923,7 @@ mod tests {
             http::HeaderValue::from_static("application/json"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1954,7 +1955,7 @@ mod tests {
         resp.headers
             .insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static("gzip"));
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1983,7 +1984,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_messages_request.stream", "true".to_owned());
+        ctx.record_ai_metadata("anthropic_messages_request.stream", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -2129,7 +2130,7 @@ mod tests {
     #[test]
     fn message_delta_prefers_matched_stop_sequence_over_tool_use() {
         let (filter, mut ctx) = make_filter_and_context();
-        ctx.set_metadata(
+        ctx.record_ai_metadata(
             crate::anthropic::messages_to_chat_completions::STOP_SEQUENCES_KEY,
             r#"[","]"#,
         );
@@ -2333,7 +2334,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 

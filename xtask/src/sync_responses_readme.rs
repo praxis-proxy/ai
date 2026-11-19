@@ -631,7 +631,7 @@ mod tests {
                 fn name(&self) -> &'static str { "fake_filter" }
                 async fn on_request(&self, ctx: &mut Ctx) -> Result<()> { Ok(()) }
                 async fn on_request_body(&self, ctx: &mut BodyCtx) -> Result<()> { Ok(()) }
-                fn request_body_access(&self) -> BodyAccess { BodyAccess::ReadWrite }
+                fn request_body_access(&self) -> BodyAccess { BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional) }
                 fn request_body_mode(&self) -> BodyMode { BodyMode::StreamBuffer { max_bytes: 1024 } }
             }
         "#,
@@ -662,8 +662,8 @@ mod tests {
                 fn name(&self) -> &'static str { "phased_filter" }
                 async fn on_bound_upstream_request_body(&self, ctx: &mut BodyCtx) -> Result<()> { Ok(()) }
                 async fn on_selected_upstream_request_body(&self, ctx: &mut BodyCtx) -> Result<()> { Ok(()) }
-                fn bound_upstream_request_body_access(&self) -> BodyAccess { BodyAccess::ReadOnly }
-                fn selected_upstream_request_body_access(&self) -> BodyAccess { BodyAccess::ReadWrite }
+                fn bound_upstream_request_body_access(&self) -> BodyAccess { BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional) }
+                fn selected_upstream_request_body_access(&self) -> BodyAccess { BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional) }
                 fn request_body_mode(&self) -> BodyMode { BodyMode::StreamBuffer { max_bytes: 1024 } }
             }
         "#,
@@ -704,10 +704,12 @@ mod tests {
 
     #[test]
     fn body_access_read_write_matched_before_read_only() {
-        let rw: syn::Block = syn::parse_str("{ BodyAccess::ReadWrite }").unwrap();
+        let rw: syn::Block =
+            syn::parse_str("{ BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional) }").unwrap();
         assert_eq!(extract_body_access_value(&rw), "ReadWrite");
 
-        let ro: syn::Block = syn::parse_str("{ BodyAccess::ReadOnly }").unwrap();
+        let ro: syn::Block =
+            syn::parse_str("{ BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional) }").unwrap();
         assert_eq!(extract_body_access_value(&ro), "ReadOnly");
 
         let none: syn::Block = syn::parse_str("{ BodyAccess::None }").unwrap();

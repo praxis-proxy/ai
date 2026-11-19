@@ -41,7 +41,7 @@ use http::header::HeaderName;
 use metrics::counter;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use praxis_ai_apis::{
-    MODEL_PROVIDER_CLIENT_MODEL_METADATA,
+    MODEL_PROVIDER_CLIENT_MODEL_METADATA, RecordAiMetadata as _,
     callout_target::AddressPolicy,
     credential_source::{self, CredentialSource, DiagnosticContext, SecretHandle, WatchHandle},
     subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
@@ -485,11 +485,11 @@ impl ExternalMeteringFilter {
         if !state.model.is_empty() {
             return state.model.clone();
         }
-        if let Some(model) = ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA) {
+        if let Some(model) = ctx.filter_metadata.get(MODEL_PROVIDER_CLIENT_MODEL_METADATA) {
             return model.to_owned();
         }
         if let Some(model) = ctx.filter_metadata.get(META_METERING_MODEL) {
-            return model.clone();
+            return model.to_owned();
         }
         self.default_model.clone().unwrap_or_default()
     }
@@ -555,7 +555,7 @@ impl HttpFilter for ExternalMeteringFilter {
             self.identity_group_claim.as_deref(),
         );
         if state.model.is_empty()
-            && let Some(model) = ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
+            && let Some(model) = ctx.filter_metadata.get(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
         {
             state.model = model.to_owned();
         }
@@ -569,8 +569,7 @@ impl HttpFilter for ExternalMeteringFilter {
         }
 
         if !state.model.is_empty() {
-            ctx.filter_metadata
-                .insert(META_METERING_MODEL.to_owned(), state.model.clone());
+            ctx.record_ai_metadata(META_METERING_MODEL.to_owned(), state.model.clone());
         }
 
         let action = self.check_balance(&state).await;
@@ -580,7 +579,7 @@ impl HttpFilter for ExternalMeteringFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -601,7 +600,7 @@ impl HttpFilter for ExternalMeteringFilter {
             .filter(|_| unresolved)
             .and_then(|chunk| extract_model_from_bytes(chunk))
         {
-            ctx.filter_metadata.insert(META_METERING_MODEL.to_owned(), model);
+            ctx.record_ai_metadata(META_METERING_MODEL.to_owned(), model);
         }
 
         Ok(FilterAction::Release)
@@ -624,7 +623,7 @@ impl HttpFilter for ExternalMeteringFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {

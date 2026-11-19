@@ -118,6 +118,8 @@ struct EmitState {
     sequence_number: u64,
     /// Count of events emitted so far.
     events_emitted: usize,
+    /// Add padding to generated delta events.
+    include_obfuscation: bool,
 }
 
 /// Errors produced while translating a stream.
@@ -125,6 +127,8 @@ struct EmitState {
 enum ConvertError {
     /// Serializing a Responses event failed; surfaces as a [`FilterError`].
     Serialize(serde_json::Error),
+    /// The random source failed while generating stream padding.
+    ObfuscationRandomness,
     /// A Chat chunk was not valid JSON.
     MalformedJson,
     /// Accumulated stream state could not form a valid terminal response.
@@ -401,6 +405,11 @@ pub(super) struct StreamConverter {
 }
 
 impl StreamConverter {
+    /// Set the effective client preference before emitting any events.
+    pub(super) fn set_include_obfuscation(&mut self, enabled: bool) {
+        self.emit.include_obfuscation = enabled;
+    }
+
     /// Create a converter for a streaming response.
     #[expect(clippy::too_many_lines, reason = "initializes every converter field")]
     pub(super) fn new(
@@ -418,6 +427,7 @@ impl StreamConverter {
             emit: EmitState {
                 sequence_number: 0,
                 events_emitted: 0,
+                include_obfuscation: true,
             },
             lifecycle_started: false,
             initial_metadata_checked: false,
@@ -1965,11 +1975,11 @@ fn emit_event(
         return Err(ConvertError::EventLimit);
     }
     let start = out.len();
-    if let Err(error) = events::encode(event, emit.sequence_number, out) {
+    if let Err(error) = events::encode(event, emit.sequence_number, emit.include_obfuscation, out) {
         // Drop any partially written frame so a failed encode leaves `out`
         // byte-for-byte as it was before this call.
         out.truncate(start);
-        return Err(ConvertError::Serialize(error));
+        return Err(error);
     }
     if out.len().saturating_sub(start) > limits.max_emitted_sse_frame_bytes {
         // The complete encoded frame exceeds the emitted-frame ceiling. Roll it
@@ -1995,7 +2005,7 @@ fn is_done_sentinel(frame: &framing::Frame) -> bool {
 /// cost nothing.
 fn logprobs_byte_cost(logprobs: &Value) -> usize {
     match logprobs {
-        Value::Array(items) if !items.is_empty() => serde_json::to_vec(logprobs).map_or(0, |bytes| bytes.len()),
+        Value::Array(items) if !items.is_empty() => crate::json_body::serialized_len(logprobs).unwrap_or(0),
         _ => 0,
     }
 }
@@ -2083,20 +2093,7 @@ fn mark_failed(resource: &mut Value, message: &str) {
 /// ceiling; counting into a sink avoids buffering a second full copy alongside
 /// the one `emit_event` serializes.
 fn serialized_json_len(value: &Value) -> Result<usize, ConvertError> {
-    struct Counter(usize);
-    impl std::io::Write for Counter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(buf.len());
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter(0);
-    serde_json::to_writer(&mut counter, value).map_err(ConvertError::Serialize)?;
-    Ok(counter.0)
+    crate::json_body::serialized_len(value).map_err(ConvertError::Serialize)
 }
 
 /// Return whether `reason` is a finish reason the converter can translate.
@@ -2148,6 +2145,7 @@ fn failure_message(error: &ConvertError) -> &'static str {
         ConvertError::MissingFinishReason => "upstream stream ended without a finish reason",
         ConvertError::UnknownFinishReason => "upstream stream used an unrecognized finish reason",
         ConvertError::IncompleteFrame => "upstream stream ended with an incomplete frame",
+        ConvertError::ObfuscationRandomness => "could not generate stream padding",
         ConvertError::Serialize(_) => "internal serialization error",
     }
 }

@@ -31,6 +31,8 @@ pub mod http_hop;
 pub mod json_body;
 #[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_client;
+#[cfg(feature = "openai-mcp-tools")]
+pub(crate) mod mcp_core;
 pub mod openai;
 pub mod operation;
 pub mod operation_classifier;
@@ -54,6 +56,20 @@ pub use callout_identity::credential_authority;
 pub use praxis_ai_store::{StateOwner, StateOwnerError};
 pub use project_state_owner_headers::ProjectStateOwnerHeadersFilter;
 pub use state_owner::{StateOwnerFilter, project_state_owner};
+
+/// Best-effort AI request metadata shared by the API and filter crates.
+pub trait RecordAiMetadata {
+    /// Record a routing or response fact, logging rejected writes through Core.
+    fn record_ai_metadata(&mut self, key: impl Into<String>, value: impl Into<String>);
+}
+
+impl RecordAiMetadata for praxis_filter::HttpFilterContext<'_> {
+    fn record_ai_metadata(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.filter_metadata
+            .insert(key, value)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    }
+}
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
 /// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.
@@ -177,7 +193,8 @@ pub(crate) mod test_utils {
             extra_request_headers: Vec::new(),
             request_headers_to_remove: Vec::new(),
             request_headers_to_set: Vec::new(),
-            filter_metadata: std::collections::HashMap::new(),
+            request_header_mutations: Vec::new(),
+            filter_metadata: praxis_filter::FilterMetadata::default(),
             pre_read_mutations: Vec::new(),
             prior_pre_read_mutations: Vec::new(),
             structured_metadata: std::collections::HashMap::new(),

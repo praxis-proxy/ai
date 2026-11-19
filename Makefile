@@ -450,6 +450,8 @@ lint-xtask: lint-license-headers
 	cargo xtask check-anthropic-messages-registry
 	cargo xtask openresponses-coverage
 	cargo xtask translation-matrix
+	python3 .github/scripts/hosted_translation_docs.py --check
+	python3 .github/scripts/hosted_passthrough_docs.py --check
 
 # Rust sources in this workspace use Apache-2.0. Catch accidental MIT headers
 # before the xtask lints; git grep limits the check to tracked Rust source files.
@@ -940,25 +942,25 @@ patch-praxis:
 		echo "ERROR: ../praxis not found — clone praxis core as a sibling directory first"; \
 		exit 1; \
 	fi
-	@if grep -q '\[patch\.crates-io\]' Cargo.toml; then \
+	@if grep -q '\[patch\."https://github\.com/praxis-proxy/praxis"\]' Cargo.toml; then \
 		echo "Already patched — run 'make unpatch-praxis' first"; \
 		exit 1; \
 	fi
-	@printf '\n[patch.crates-io]\n\
-	praxis-proxy-core = { path = "../praxis/core" }\n\
-	praxis-proxy-filter = { path = "../praxis/filter" }\n\
-	praxis-proxy-protocol = { path = "../praxis/protocol" }\n\
-	praxis-proxy-tls = { path = "../praxis/tls" }\n\
-	praxis-proxy = { path = "../praxis/server" }\n' >> Cargo.toml
+	@printf '\n[patch."https://github.com/praxis-proxy/praxis"]\n\
+	praxis-proxy-core = { path = "../praxis/crates/core" }\n\
+	praxis-proxy-filter = { path = "../praxis/crates/filter" }\n\
+	praxis-proxy-protocol = { path = "../praxis/crates/protocol" }\n\
+	praxis-proxy-tls = { path = "../praxis/crates/tls" }\n\
+	praxis-proxy = { path = "../praxis/crates/server" }\n' >> Cargo.toml
 	@echo "Patched Cargo.toml to use ../praxis path dependencies"
 
 unpatch-praxis:
-	@if ! grep -q '\[patch\.crates-io\]' Cargo.toml; then \
+	@if ! grep -q '\[patch\."https://github\.com/praxis-proxy/praxis"\]' Cargo.toml; then \
 		echo "Nothing to unpatch"; \
 		exit 0; \
 	fi
-	@sed -i.bak '/^\[patch\.crates-io\]/,$$d' Cargo.toml && rm -f Cargo.toml.bak
-	@echo "Removed [patch.crates-io] from Cargo.toml"
+	@sed -i.bak '\@^\[patch\."https://github\.com/praxis-proxy/praxis"\]@,$$d' Cargo.toml && rm -f Cargo.toml.bak
+	@echo "Removed the Praxis path overrides from Cargo.toml"
 
 # -------------------------------------------------------------------
 # Dev Setup
@@ -1065,5 +1067,5 @@ help:
 	@echo "  fips-version           the version the FIPS image is tagged with"
 	@echo ""
 	@echo "Praxis override:"
-	@echo "  patch-praxis         use ../praxis path deps instead of crates.io"
+	@echo "  patch-praxis         use ../praxis path deps instead of the pinned git revision"
 	@echo "  unpatch-praxis       restore the pinned Praxis git dependencies"

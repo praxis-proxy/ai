@@ -23,8 +23,6 @@ use bytes::Bytes;
 #[cfg(any(test, feature = "openai-agentic-loop"))]
 use praxis_filter::FilterAction;
 
-#[cfg(feature = "openai-mcp-tools")]
-use super::mcp_classify::ApprovalFloor;
 #[cfg(any(test, feature = "openai-agentic-loop"))]
 use super::{bounded_json_size, error::responses_error_rejection, file_search_dispatch::citations::annotate_response};
 use super::{
@@ -32,6 +30,8 @@ use super::{
 };
 #[cfg(any(test, feature = "openai-agentic-loop"))]
 use crate::json_body::MAX_JSON_BODY_BYTES;
+#[cfg(feature = "openai-mcp-tools")]
+use crate::mcp_core::classify::ApprovalFloor;
 
 /// Internal persisted field identifying a Praxis-generated compaction item.
 ///
@@ -560,14 +560,14 @@ pub(crate) struct ResponsesState {
     /// fields, cached definitions, and restored history never supply admission
     /// authority. Defaults to advisory (empty, no enforcement).
     #[cfg(feature = "openai-mcp-tools")]
-    pub mcp_admission: super::mcp_admission::McpAdmissionDecisions,
+    pub mcp_admission: crate::mcp_core::admission::McpAdmissionDecisions,
 
     /// Operator approval floor published by `openai_mcp_dispatch` during the
     /// request phase for the `openai_agentic_loop` owner to apply when it
     /// partitions approvals in the response phase of the same IRR iteration.
     ///
     /// Carried as typed request state (not step metadata) because the floor is a
-    /// security control that must never be silently dropped: `set_metadata` caps
+    /// security control that must never be silently dropped: `FilterMetadata::insert` caps
     /// at a fixed number of entries and drops a new key once full, so a saturated
     /// metadata map could silently disable the floor and let a client
     /// `require_approval: "never"` call execute automatically. A struct field has
@@ -1067,7 +1067,7 @@ pub(crate) struct DeferredMcpConnector {
     /// to the resolver's connector configuration, so the policy is carried here —
     /// operator-owned and never derived from server, cached, or client data.
     #[cfg(feature = "openai-mcp-tools")]
-    pub tool_policy: super::mcp_admission::ConnectorToolPolicy,
+    pub tool_policy: crate::mcp_core::admission::ConnectorToolPolicy,
 }
 
 /// Request-scoped slot policy bound to configured MCP connector state.
@@ -1146,7 +1146,7 @@ impl Default for ResponsesState {
             #[cfg(feature = "openai-mcp-tools")]
             mcp_connector_context_policy: McpConnectorContextPolicy::default(),
             #[cfg(feature = "openai-mcp-tools")]
-            mcp_admission: super::mcp_admission::McpAdmissionDecisions::default(),
+            mcp_admission: crate::mcp_core::admission::McpAdmissionDecisions::default(),
             #[cfg(feature = "openai-mcp-tools")]
             mcp_operator_approval_floor: ApprovalFloor::None,
             max_tool_calls: None,

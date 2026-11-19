@@ -77,7 +77,7 @@ use super::{
 };
 use crate::{
     classifier::is_responses_create,
-    json_body::{MAX_JSON_BODY_BYTES, serialize_json_body, serialized_len},
+    json_body::{BoundedJsonBody, MAX_JSON_BODY_BYTES, serialize_json_body_within},
 };
 
 /// Converts `input_file` content parts to `input_text` for backends
@@ -127,11 +127,11 @@ impl HttpFilter for DocExtractFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -162,7 +162,7 @@ impl HttpFilter for DocExtractFilter {
             return Ok(FilterAction::Release);
         }
 
-        if ctx.get_metadata("openai_responses_request.format") != Some("openai_responses") {
+        if ctx.filter_metadata.get("openai_responses_request.format") != Some("openai_responses") {
             trace!("skipping non-responses request");
             return Ok(FilterAction::Release);
         }
@@ -437,23 +437,24 @@ fn rewrite_body(
     max_rewritten_body_bytes: usize,
     filter_name: &'static str,
 ) -> Result<Option<FilterAction>, FilterError> {
-    // Count into a discard-only writer before allocating the replacement. This
-    // also preserves the exact serialized length in the existing 413 response.
-    // Accepted bodies take a second pass; rejected bodies never allocate output.
-    let len = serialized_len(parsed)
-        .map_err(|e| -> FilterError { format!("{filter_name}: failed to serialize body: {e}").into() })?;
-    if len > max_rewritten_body_bytes {
-        warn!(
-            actual = len,
-            limit = max_rewritten_body_bytes,
-            "rewritten request body exceeds configured limit"
-        );
-        return Ok(Some(reject_rewritten_body_too_large(len, max_rewritten_body_bytes)));
+    // Measure before allocating so the 413 keeps the exact serialized length;
+    // rejected bodies never allocate output and accepted ones are capped.
+    match serialize_json_body_within(parsed, max_rewritten_body_bytes)
+        .map_err(|e| -> FilterError { format!("{filter_name}: failed to serialize body: {e}").into() })?
+    {
+        BoundedJsonBody::Fits(rewritten) => {
+            rewritten.commit(body, filter_name, "input");
+            Ok(None)
+        },
+        BoundedJsonBody::TooLarge { actual } => {
+            warn!(
+                actual,
+                limit = max_rewritten_body_bytes,
+                "rewritten request body exceeds configured limit"
+            );
+            Ok(Some(reject_rewritten_body_too_large(actual, max_rewritten_body_bytes)))
+        },
     }
-    let rewritten = serialize_json_body(parsed)
-        .map_err(|e| -> FilterError { format!("{filter_name}: failed to serialize body: {e}").into() })?;
-    rewritten.commit(body, filter_name, "input");
-    Ok(None)
 }
 
 /// Sync converted content back into [`ResponsesState`] after a body

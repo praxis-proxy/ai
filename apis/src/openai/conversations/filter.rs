@@ -96,6 +96,7 @@ use crate::{
 ///   items_table: conversation_items
 ///   allow_private_database_url: true
 ///   rate_limit:
+///     scope: local
 ///     mode: global
 ///     rate: 100
 ///     burst: 200
@@ -185,8 +186,12 @@ impl OpenaiConversationsFilter {
         validate_config(&cfg)?;
         let rate_limit = cfg
             .rate_limit
-            .as_ref()
-            .map(praxis_filter::builtins::RateLimitFilter::from_config)
+            .map(|mut limiter| {
+                if let Some(fields) = limiter.as_mapping_mut() {
+                    fields.entry("scope".into()).or_insert_with(|| "local".into());
+                }
+                praxis_filter::builtins::RateLimitFilter::from_config(&limiter)
+            })
             .transpose()?;
         Ok(Box::new(Self { rate_limit }))
     }
@@ -456,15 +461,15 @@ impl HttpFilter for OpenaiConversationsFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -726,14 +731,14 @@ impl HttpFilter for OpenaiConversationsFilter {
 /// Whether this request should trigger conversation append-back on
 /// the response path.
 fn should_append_back(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_request.has_conversation") == Some("true")
-        && ctx.get_metadata("responses.conversation_id").is_some()
-        && ctx.get_metadata("openai_responses_request.background") != Some("true")
+    ctx.filter_metadata.get("openai_responses_request.has_conversation") == Some("true")
+        && ctx.filter_metadata.get("responses.conversation_id").is_some()
+        && ctx.filter_metadata.get("openai_responses_request.background") != Some("true")
 }
 
 /// Whether the classified Responses request selected streamed delivery.
 fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_request.stream") == Some("true")
+    ctx.filter_metadata.get("openai_responses_request.stream") == Some("true")
 }
 
 /// Whether the stream composer placed its canonical terminal in this chunk.
@@ -939,7 +944,7 @@ fn extract_append_back_items(
     let Some(bytes) = body.as_ref().filter(|b| !b.is_empty()) else {
         return Ok(None);
     };
-    let Some(conv_id) = ctx.get_metadata("responses.conversation_id").map(str::to_owned) else {
+    let Some(conv_id) = ctx.filter_metadata.get("responses.conversation_id").map(str::to_owned) else {
         return Ok(None);
     };
 
@@ -961,7 +966,7 @@ fn extract_streaming_append_back_items(ctx: &HttpFilterContext<'_>, owner: State
     if state.response_object.get("status").and_then(Value::as_str) != Some("completed") {
         return None;
     }
-    let conv_id = ctx.get_metadata("responses.conversation_id")?.to_owned();
+    let conv_id = ctx.filter_metadata.get("responses.conversation_id")?.to_owned();
     // The canonical resource remains available to response-store and terminal
     // handling, so its output must be copied at this durable item boundary.
     let mut all_items: Vec<Value> = state.input.iter().cloned().collect();

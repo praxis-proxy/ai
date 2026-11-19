@@ -167,24 +167,30 @@ impl RouteContext {
     fn from_context(ctx: &HttpFilterContext<'_>) -> Self {
         Self {
             route: ctx
-                .get_metadata("intelligent_route.name")
+                .filter_metadata
+                .get("intelligent_route.name")
                 .or(ctx.metrics_route.as_deref())
                 .unwrap_or("")
                 .to_owned(),
             backend: ctx.cluster_name().unwrap_or("").to_owned(),
             provider: ctx
-                .get_metadata("provider_route.provider_id")
-                .or_else(|| ctx.get_metadata("intelligent_route.api_format"))
+                .filter_metadata
+                .get("provider_route.provider_id")
+                .or_else(|| ctx.filter_metadata.get("intelligent_route.api_format"))
                 .unwrap_or("")
                 .to_owned(),
             model: ctx
-                .get_metadata("provider_route.model")
-                .or_else(|| ctx.get_metadata("intelligent_route.target_model"))
-                .or_else(|| ctx.get_metadata("openai_responses_model_rewrite.effective_model"))
-                .or_else(|| ctx.get_metadata("openai_responses_request.model"))
-                .or_else(|| ctx.get_metadata("openai_chat_completions_request.model"))
-                .or_else(|| ctx.get_metadata("anthropic_messages_request.model"))
-                .or_else(|| ctx.get_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL))
+                .filter_metadata
+                .get("provider_route.model")
+                .or_else(|| ctx.filter_metadata.get("intelligent_route.target_model"))
+                .or_else(|| {
+                    ctx.filter_metadata
+                        .get("openai_responses_model_rewrite.effective_model")
+                })
+                .or_else(|| ctx.filter_metadata.get("openai_responses_request.model"))
+                .or_else(|| ctx.filter_metadata.get("openai_chat_completions_request.model"))
+                .or_else(|| ctx.filter_metadata.get("anthropic_messages_request.model"))
+                .or_else(|| ctx.filter_metadata.get(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL))
                 .unwrap_or("")
                 .to_owned(),
         }

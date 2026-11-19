@@ -1,0 +1,21 @@
+# Opt-in OpenAI Chat Completions SDK test backend.
+# The listener is local to the test runner. The SDK supplies the upstream key.
+listeners:
+  - name: gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [openai]
+filter_chains:
+  - name: openai
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: /v1/chat/completions
+            cluster: openai
+      - filter: load_balancer
+        clusters:
+          - name: openai
+            endpoints: ["api.openai.com:443"]
+            http:
+              authority: api.openai.com
+            tls:
+              sni: api.openai.com

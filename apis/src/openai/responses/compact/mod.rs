@@ -44,7 +44,7 @@ pub(super) mod config;
 )]
 mod tests;
 
-use std::{borrow::Cow, io, time::Duration};
+use std::{borrow::Cow, time::Duration};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -69,6 +69,7 @@ use super::{
     state::{ResponsesState, mark_local_compaction_item},
 };
 use crate::{
+    RecordAiMetadata as _,
     callout_policy::OnFailure,
     json_body::MAX_JSON_BODY_BYTES,
     state_owner::{StateOwner, require_state_owner},
@@ -567,26 +568,7 @@ fn compaction_response_limit(budget: Option<SimpleBudget>) -> Result<usize, Filt
 
 /// Count already parsed JSON without building another serialized payload.
 fn count_json_bytes<T: serde::Serialize>(value: &T) -> Option<usize> {
-    let mut counter = JsonByteCounter(0);
-    serde_json::to_writer(&mut counter, value).ok()?;
-    Some(counter.0)
-}
-
-/// Counts encoded JSON bytes without retaining the serialized payload.
-struct JsonByteCounter(usize);
-
-impl io::Write for JsonByteCounter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0 = self
-            .0
-            .checked_add(buf.len())
-            .ok_or_else(|| io::Error::other("compaction JSON size overflow"))?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+    praxis_filter::json_size::serialized_len(value).ok()
 }
 
 /// Budget failures always terminate the request, including fail-open callouts.
@@ -605,7 +587,7 @@ impl HttpFilter for CompactFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     /// Also offer the bound-upstream phase so a chain may defer compaction until
@@ -620,7 +602,7 @@ impl HttpFilter for CompactFilter {
     /// minted once the body is bound. A standalone chain with no such condition
     /// still runs the pre-read hook.
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -676,7 +658,7 @@ impl HttpFilter for CompactFilter {
             Err(action) => return Ok(action),
         };
         self.apply_compaction(ctx, &summary);
-        ctx.set_metadata("responses.compacted", "true");
+        ctx.record_ai_metadata("responses.compacted", "true");
         Ok(FilterAction::Release)
     }
 
@@ -829,7 +811,7 @@ fn previous_usage_total(state: &ResponsesState) -> Option<u64> {
 
 /// Check whether this is an OpenAI Responses API request.
 fn is_responses_request(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_request.format") == Some("openai_responses")
+    ctx.filter_metadata.get("openai_responses_request.format") == Some("openai_responses")
 }
 
 // -----------------------------------------------------------------------------

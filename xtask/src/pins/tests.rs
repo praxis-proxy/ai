@@ -265,7 +265,8 @@ mod bump {
     use serde_json::json;
 
     use super::super::{
-        bump::{checklist, display_version, names_version},
+        Repo,
+        bump::{carry_codex_recording, checklist, display_version, names_version},
         sites::{Pin, Site},
         upstream::{
             is_stable, newest_in_series, newest_release, parse_claude_checksum, parse_hub_digest, parse_release,
@@ -406,11 +407,90 @@ mod bump {
     }
 
     #[test]
-    fn codex_checklist_requires_a_new_recording() {
-        let items = checklist(Pin::Codex, "0.164.0");
+    fn codex_checklist_names_the_carried_recording() {
+        let items = checklist(Pin::Codex, "0.163.0", "0.164.0");
         assert!(
-            items.iter().any(|item| item.contains("websocket-codex-0.164.0.json")),
+            items
+                .iter()
+                .any(|item| item.contains("websocket-codex-0.164.0.json") && item.contains("`0.163.0`")),
             "{items:#?}"
+        );
+    }
+
+    /// The pinned Codex version, its recording, and that recording carried
+    /// to `9.9.9`.
+    fn carried_pinned_recording() -> (String, String, String) {
+        let repo = Repo::new(super::workspace_root());
+        let manifests = super::Manifests::load(&repo).expect("manifests should parse");
+        let old = Pin::Codex
+            .current(&manifests)
+            .expect("codex pin should load")
+            .to_owned();
+        let original = repo
+            .read(&format!(
+                "tests/integration/fixtures/openai/responses/websocket-codex-{old}.json"
+            ))
+            .expect("the pinned recording should exist");
+        let carried = carry_codex_recording(&original, &old, "9.9.9", "2099-01-02").expect("recording should carry");
+        (old, original, carried)
+    }
+
+    /// The string at `pointer` in `json`.
+    fn metadata_str<'a>(json: &'a serde_json::Value, pointer: &str) -> Option<&'a str> {
+        json.pointer(pointer).and_then(serde_json::Value::as_str)
+    }
+
+    #[test]
+    fn codex_recording_metadata_names_the_new_version_and_its_source() {
+        let (old, _, carried) = carried_pinned_recording();
+        let after: serde_json::Value = serde_json::from_str(&carried).expect("carried should parse");
+        assert_eq!(metadata_str(&after, "/metadata/codex_cli_version"), Some("9.9.9"));
+        assert_eq!(metadata_str(&after, "/metadata/created_at"), Some("2099-01-02"));
+        let source = metadata_str(&after, "/metadata/wire_protocol_source").expect("source should be a string");
+        assert!(
+            source.contains(&format!("carried unchanged from the {old} recording")) && source.contains("rust-v9.9.9"),
+            "provenance should name both versions: {source}"
+        );
+    }
+
+    #[test]
+    fn codex_recording_wire_shapes_are_carried_unchanged() {
+        let (_, original, carried) = carried_pinned_recording();
+        let before: serde_json::Value = serde_json::from_str(&original).expect("original should parse");
+        let after: serde_json::Value = serde_json::from_str(&carried).expect("carried should parse");
+        for key in ["client", "server_messages"] {
+            assert_eq!(after.get(key), before.get(key), "{key} must be carried unchanged");
+        }
+        assert_eq!(
+            after.pointer("/metadata/sanitization"),
+            before.pointer("/metadata/sanitization")
+        );
+        assert_eq!(
+            carried.lines().count(),
+            original.lines().count(),
+            "formatting should be preserved"
+        );
+    }
+
+    #[test]
+    fn codex_recording_carry_fails_on_a_mismatched_version() {
+        let recording =
+            r#"{"metadata": {"codex_cli_version": "1.0.0", "created_at": "x", "wire_protocol_source": "y"}}"#;
+        let error = carry_codex_recording(recording, "0.9.0", "1.1.0", "2099-01-02")
+            .expect_err("a recording for another version should not carry");
+        assert!(error.contains("codex_cli_version"), "{error}");
+    }
+
+    #[test]
+    fn codex_recording_carry_escapes_the_provenance() {
+        let recording = r#"{"metadata": {"codex_cli_version": "1.0.0", "created_at": "x", "wire_protocol_source": "has \"quotes\""}}"#;
+        let carried = carry_codex_recording(recording, "1.0.0", "1.1.0", "2099-01-02").expect("recording should carry");
+        let parsed: serde_json::Value = serde_json::from_str(&carried).expect("carried should parse");
+        assert_eq!(
+            parsed
+                .pointer("/metadata/codex_cli_version")
+                .and_then(serde_json::Value::as_str),
+            Some("1.1.0")
         );
     }
 }

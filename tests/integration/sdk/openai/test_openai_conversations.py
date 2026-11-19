@@ -3426,9 +3426,12 @@ def rate_limited_conversation_clients(request):
             config = json.load(config_file)
         control_chain = json.loads(json.dumps(config["filter_chains"][0]))
         control_chain["name"] = "control"
-        config["filter_chains"][0]["filters"][-1]["rate_limit"] = {
-            "mode": "global", "rate": getattr(request, "param", 0.000001), "burst": 1,
-        }
+        rate_limit = {"mode": "global", "rate": getattr(request, "param", 0.000001), "burst": 1}
+        # The recovery test uses explicit Core scope. The contract matrix
+        # exercises older configurations that omit it.
+        if hasattr(request, "param"):
+            rate_limit["scope"] = "local"
+        config["filter_chains"][0]["filters"][-1]["rate_limit"] = rate_limit
         config["filter_chains"].append(control_chain)
         config["listeners"].append({
             "name": "control", "address": f"127.0.0.1:{control_port}",

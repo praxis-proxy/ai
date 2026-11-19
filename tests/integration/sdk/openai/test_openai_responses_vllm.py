@@ -3699,8 +3699,12 @@ class TestOpenAIResponsesVLLM:
             if stream is not None:
                 stream.close()
 
+    @pytest.mark.parametrize("continuation", [
+        "Continue after provider compaction.",
+        'Continue: café 東京 🦀 \n\t "quoted" \\ path',
+    ])
     def test_sdk_replays_provider_compaction_on_previous_response_id(
-        self, provider_compaction_client
+        self, provider_compaction_client, continuation
     ):
         """Native provider compaction survives SDK-driven local rehydration."""
         client, forwarded = provider_compaction_client
@@ -3711,7 +3715,7 @@ class TestOpenAIResponsesVLLM:
         )
         second = client.responses.create(
             model=VLLM_MODEL,
-            input="Continue after provider compaction.",
+            input=continuation,
             previous_response_id=first.id,
             store=True,
         )
@@ -3719,6 +3723,15 @@ class TestOpenAIResponsesVLLM:
         assert second.status == "completed"
         assert len(forwarded) == 2, forwarded
         replayed = forwarded[1]
+        assert any(
+            item.get("content") == continuation
+            or any(
+                part.get("text") == continuation
+                for part in item.get("content", [])
+                if isinstance(part, dict)
+            )
+            for item in replayed.get("input", [])
+        ), replayed
         assert replayed.get("previous_response_id") is None, replayed
         assert any(
             item.get("type") == "compaction"
@@ -4224,6 +4237,7 @@ class TestOpenAIResponsesVLLM:
         # rewrite never touches, so before the fix the stored response echoed the
         # backend's null even though the streamed terminal carried first.id.
         retrieved = _retrieve_with_retry(openai_client, final_response.id)
+        assert retrieved.model == final_response.model
         assert retrieved.previous_response_id == first.id, (
             "the stored streaming response must persist the caller's "
             "previous_response_id, matching the terminal frame the client saw; "
@@ -9085,12 +9099,20 @@ class TestAgenticLoopVLLM:
         assert len(BraveSearchHandler.request_paths) == request_count + 1
 
     @requires_vllm_compat
+    @pytest.mark.parametrize("parallel", [True, False], ids=["parallel", "sequential"])
     def test_batched_mcp_tools_honor_parallel_tool_calls(
         self,
         agentic_client,
         agentic_proxy,
+        parallel,
     ):
-        """Two MCP calls emitted in one model round both complete."""
+        """Two MCP calls both complete, each paired with its own tool's output.
+
+        The stub returns a distinct text per tool, so a result attached to the
+        wrong call fails the pairing assertion. With ``parallel_tool_calls``
+        disabled the model may split the calls across rounds; the pairing
+        contract holds either way.
+        """
 
         response = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -9108,17 +9130,22 @@ class TestAgenticLoopVLLM:
                     "require_approval": "never",
                 }
             ],
-            parallel_tool_calls=True,
+            parallel_tool_calls=parallel,
             store=False,
             max_output_tokens=512,
         )
 
         mcp_calls = [item for item in response.output if item.type == "mcp_call"]
         assert len(mcp_calls) == 2, (
-            "both calls from the batched model round must execute exactly "
-            f"once; got: {[item.type for item in response.output]}"
+            "both calls must execute exactly once; "
+            f"got: {[item.type for item in response.output]}"
         )
-        assert {item.name for item in mcp_calls} == {"get_weather", "get_time"}
+        outputs = {item.name: item.output or "" for item in mcp_calls}
+        assert set(outputs) == {"get_weather", "get_time"}
+        assert "72F and sunny" in outputs["get_weather"], (
+            "get_weather must carry its own result"
+        )
+        assert "12:00 PM" in outputs["get_time"], "get_time must carry its own result"
 
     @requires_vllm_compat
     def test_mcp_approval_batch_resume_executes_multiple_approved_tools(
@@ -9810,16 +9837,18 @@ class TestAgenticLoopVLLM:
         output_item.added -> web_search_call.in_progress -> searching ->
         completed -> output_item.done sequence exactly once per call (no
         re-emission across IRR rounds), with ids and output indices that agree
-        with the terminal snapshot. The live model may make multiple searches.
+        with the terminal snapshot. The assertions expect exactly one search item
+        because the request sets max_tool_calls=1.
         """
         stream = translated_agentic_client.responses.create(
             model=CHAT_TRANSLATION_MODEL,
             input=(
-                "Search the web for the latest Rust release, then answer. "
-                "You MUST use the web search tool. Do not answer directly. "
+                "Search the web once for the latest Rust release, then report the result title. "
                 "/no_think"
             ),
-            tools=[{"type": "web_search_preview"}],
+            tools=[{"type": "web_search"}],
+            tool_choice={"type": "web_search"},
+            max_tool_calls=1,
             store=False,
             stream=True,
             max_output_tokens=512,
@@ -9898,16 +9927,12 @@ class TestAgenticLoopVLLM:
         # one incremental output_item.added. Without the synthesis they appear
         # only in the terminal snapshot and never here.
         ws_added = [a for a in added if a[1] == "web_search_call"]
-        assert ws_added, (
-            "locally executed web_search_calls should surface as incremental "
-            f"response.output_item.added; got incremental added items: {added}"
+        assert len(ws_added) == 1, (
+            "expected exactly one incremental web_search_call with "
+            f"max_tool_calls=1; got {len(ws_added)}: {ws_added}"
         )
         ws_ids = [item_id for _, _, item_id, _ in ws_added]
         assert all(ws_ids), f"every synthesized web_search_call must carry an id; got: {ws_added}"
-        assert len(ws_ids) == len(set(ws_ids)), (
-            "each locally executed search must be announced once with a unique id; "
-            f"got: {ws_ids}"
-        )
 
         # Each id must have exactly one matching output_item.done, proving the
         # item is not re-emitted across IRR rounds and that every pair closes.
@@ -11752,6 +11777,54 @@ def test_null_tool_choice_succeeds_sdk(chat_streaming_client):
                 },
             }
         ]
+
+
+@pytest.mark.skipif(
+    VLLM_TEST_BACKEND != "simulator",
+    reason="uses the simulator's scripted Chat stream",
+)
+@pytest.mark.parametrize("include_obfuscation", [None, True, False])
+def test_translated_stream_obfuscation(chat_streaming_client, include_obfuscation):
+    options = (
+        {} if include_obfuscation is None
+        else {"stream_options": {"include_obfuscation": include_obfuscation}}
+    )
+    with chat_streaming_client.responses.with_streaming_response.create(
+        model=CHAT_TRANSLATION_MODEL,
+        input="STREAM-SERVICE-TIER-1549",
+        store=False,
+        stream=True,
+        **options,
+    ) as stream:
+        wire = b"".join(stream.iter_bytes())
+
+    events = []
+    for frame in wire.split(b"\n\n"):
+        for line in frame.splitlines():
+            if line.startswith(b"data: "):
+                events.append((json.loads(line.removeprefix(b"data: ")), len(frame) + 2))
+
+    assert events[-1][0]["type"] == "response.completed"
+    deltas = [(event, size) for event, size in events if event["type"] == "response.output_text.delta"]
+    assert deltas
+    for event, size in deltas:
+        if include_obfuscation is False:
+            assert "obfuscation" not in event
+        else:
+            assert 1 <= len(event["obfuscation"]) <= 64
+            assert size % 64 == 0
+    assert all("obfuscation" not in event for event, _ in events if not event["type"].endswith(".delta"))
+
+
+def test_translated_stream_rejects_non_boolean_obfuscation(chat_streaming_client):
+    with pytest.raises(openai.BadRequestError, match=r"stream_options\.include_obfuscation"):
+        chat_streaming_client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="STREAM-SERVICE-TIER-1549",
+            store=False,
+            stream=True,
+            extra_body={"stream_options": {"include_obfuscation": "false"}},
+        )
 
 
 @pytest.mark.skipif(

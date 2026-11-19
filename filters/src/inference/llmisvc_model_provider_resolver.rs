@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderName;
-use praxis_ai_apis::json_body::replace_json_body;
+use praxis_ai_apis::{RecordAiMetadata as _, json_body::replace_json_body};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, PendingHeaderResult, Rejection,
     builtins::http::payload_processing::config_validation::validate_max_body_bytes, parse_filter_config,
@@ -169,7 +169,7 @@ impl LlmisvcModelProviderResolverFilter {
         match rewrite_publisher_body_model(body, short_name, self.name())? {
             PublisherBodyRewrite::Noop => {},
             PublisherBodyRewrite::Matched { rewritten } => {
-                ctx.set_metadata(META_PUBLISHER_ID, model_name.as_str());
+                ctx.record_ai_metadata(META_PUBLISHER_ID, model_name.as_str());
                 if rewritten {
                     debug!(
                         original = %model_name,
@@ -195,7 +195,7 @@ impl HttpFilter for LlmisvcModelProviderResolverFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -417,7 +417,7 @@ bogus_field: true
         let filter = filter_default();
         assert_eq!(
             filter.request_body_access(),
-            BodyAccess::ReadWrite,
+            BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional),
             "must mutate the request body"
         );
         assert!(
@@ -485,7 +485,7 @@ bogus_field: true
         let parsed: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
         assert_eq!(parsed["model"].as_str(), Some("granite-3.1-8b"));
         assert_eq!(
-            ctx.filter_metadata.get(META_PUBLISHER_ID).map(String::as_str),
+            ctx.filter_metadata.get(META_PUBLISHER_ID),
             Some("publishers/rhoai/models/granite-3.1-8b"),
         );
         assert!(ctx.extra_request_headers.is_empty());
@@ -552,7 +552,7 @@ bogus_field: true
         let parsed: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
         assert_eq!(parsed["model"].as_str(), Some("from-header"));
         assert_eq!(
-            ctx.filter_metadata.get(META_PUBLISHER_ID).map(String::as_str),
+            ctx.filter_metadata.get(META_PUBLISHER_ID),
             Some("publishers/ns/models/from-header"),
         );
     }

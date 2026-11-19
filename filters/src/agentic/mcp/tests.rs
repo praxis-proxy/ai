@@ -133,12 +133,12 @@ async fn tools_call_extracts_method_and_name() {
 
     assert!(matches!(action, FilterAction::Release), "tools/call should release");
     assert_eq!(
-        ctx.get_metadata("mcp.method"),
+        ctx.filter_metadata.get("mcp.method"),
         Some("tools/call"),
         "method should be tools/call"
     );
     assert_eq!(
-        ctx.get_metadata("mcp.name"),
+        ctx.filter_metadata.get("mcp.name"),
         Some("get_weather"),
         "name should be get_weather"
     );
@@ -156,12 +156,12 @@ async fn initialize_extracts_protocol_version() {
 
     assert!(matches!(action, FilterAction::Release), "initialize should release");
     assert_eq!(
-        ctx.get_metadata("mcp.method"),
+        ctx.filter_metadata.get("mcp.method"),
         Some("initialize"),
         "method should be initialize"
     );
     assert_eq!(
-        ctx.get_metadata("mcp.protocol_version"),
+        ctx.filter_metadata.get("mcp.protocol_version"),
         Some("2025-03-26"),
         "protocol version should be extracted"
     );
@@ -183,7 +183,7 @@ async fn session_id_detected() {
         "should release with session id"
     );
     assert_eq!(
-        ctx.get_metadata("mcp.session_id"),
+        ctx.filter_metadata.get("mcp.session_id"),
         Some("gw-123"),
         "session id should be detected"
     );
@@ -201,12 +201,12 @@ async fn resources_read_extracts_uri() {
 
     assert!(matches!(action, FilterAction::Release), "resources/read should release");
     assert_eq!(
-        ctx.get_metadata("mcp.method"),
+        ctx.filter_metadata.get("mcp.method"),
         Some("resources/read"),
         "method should be resources/read"
     );
     assert_eq!(
-        ctx.get_metadata("mcp.name"),
+        ctx.filter_metadata.get("mcp.name"),
         Some("file:///data.csv"),
         "URI should be extracted as name"
     );
@@ -269,7 +269,7 @@ fn body_access_is_read_only() {
     let filter = make_default_filter();
     assert_eq!(
         filter.request_body_access(),
-        praxis_filter::body::BodyAccess::ReadOnly,
+        praxis_filter::body::BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional),
         "MCP filter should use ReadOnly body access"
     );
 }
@@ -377,12 +377,12 @@ async fn notification_sets_kind() {
 
     assert!(matches!(action, FilterAction::Release), "notification should release");
     assert_eq!(
-        ctx.get_metadata("json_rpc.kind"),
+        ctx.filter_metadata.get("json_rpc.kind"),
         Some("notification"),
         "kind should be notification"
     );
     assert_eq!(
-        ctx.get_metadata("mcp.method"),
+        ctx.filter_metadata.get("mcp.method"),
         Some("notifications/initialized"),
         "method should be notifications/initialized"
     );
@@ -561,7 +561,7 @@ async fn control_char_method_skips_all_promotions() {
     );
 
     assert_eq!(
-        ctx.get_metadata("mcp.method"),
+        ctx.filter_metadata.get("mcp.method"),
         None,
         "method with control chars should not be set in durable metadata"
     );
@@ -586,12 +586,12 @@ async fn matching_headers_succeed() {
         "matching headers should release"
     );
     assert_eq!(
-        ctx.get_metadata("mcp.method"),
+        ctx.filter_metadata.get("mcp.method"),
         Some("tools/call"),
         "method should be extracted"
     );
     assert_eq!(
-        ctx.get_metadata("mcp.name"),
+        ctx.filter_metadata.get("mcp.name"),
         Some("get_weather"),
         "name should be extracted"
     );
@@ -628,7 +628,7 @@ async fn missing_headers_ignored_by_default() {
         "missing headers should be ignored by default"
     );
     assert_eq!(
-        ctx.get_metadata("mcp.method"),
+        ctx.filter_metadata.get("mcp.method"),
         Some("tools/call"),
         "method should still be extracted"
     );
@@ -1039,7 +1039,7 @@ async fn initialize_promotes_protocol_version_header_and_result() {
     assert!(matches!(action, FilterAction::Release), "initialize should release");
 
     assert_eq!(
-        ctx.get_metadata("mcp.protocol_version"),
+        ctx.filter_metadata.get("mcp.protocol_version"),
         Some("2025-03-26"),
         "protocol version should be in metadata"
     );
@@ -1175,7 +1175,7 @@ async fn non_initialize_promotes_protocol_version_from_header() {
     assert!(matches!(action, FilterAction::Release), "tools/list should release");
 
     assert_eq!(
-        ctx.get_metadata("mcp.protocol_version"),
+        ctx.filter_metadata.get("mcp.protocol_version"),
         Some("2025-03-26"),
         "protocol version should be in metadata"
     );
@@ -1215,7 +1215,7 @@ async fn protocol_version_with_control_chars_not_promoted() {
     );
 
     assert_eq!(
-        ctx.get_metadata("mcp.protocol_version"),
+        ctx.filter_metadata.get("mcp.protocol_version"),
         None,
         "protocol version with control chars should not be in metadata"
     );
@@ -1251,7 +1251,7 @@ async fn null_protocol_version_header_skips_header_promotion() {
     assert!(matches!(action, FilterAction::Release), "should release");
 
     assert_eq!(
-        ctx.get_metadata("mcp.protocol_version"),
+        ctx.filter_metadata.get("mcp.protocol_version"),
         Some("2025-03-26"),
         "metadata should still be set even when header promotion is disabled"
     );
@@ -1280,12 +1280,12 @@ async fn null_protocol_version_header_skips_header_promotion() {
 
 fn assert_dynamic_values_omitted(ctx: &praxis_filter::HttpFilterContext<'_>) {
     assert_eq!(
-        ctx.get_metadata("mcp.session_id"),
+        ctx.filter_metadata.get("mcp.session_id"),
         None,
         "257-byte session ID should be omitted from metadata"
     );
     assert_eq!(
-        ctx.get_metadata("mcp.protocol_version"),
+        ctx.filter_metadata.get("mcp.protocol_version"),
         None,
         "257-byte protocol version should be omitted from metadata"
     );
@@ -1319,12 +1319,12 @@ fn assert_dynamic_values_promoted(
     protocol_version: &str,
 ) {
     assert_eq!(
-        ctx.get_metadata("mcp.session_id"),
+        ctx.filter_metadata.get("mcp.session_id"),
         Some(session_id),
         "256-byte session ID should be in metadata"
     );
     assert_eq!(
-        ctx.get_metadata("mcp.protocol_version"),
+        ctx.filter_metadata.get("mcp.protocol_version"),
         Some(protocol_version),
         "256-byte protocol version should be in metadata"
     );
@@ -1355,7 +1355,7 @@ fn assert_oversized_value_is_omitted(
     result_key: &str,
 ) {
     assert_eq!(
-        ctx.get_metadata(metadata_key),
+        ctx.filter_metadata.get(metadata_key),
         None,
         "oversized value should be omitted from metadata"
     );
