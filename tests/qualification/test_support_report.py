@@ -11,6 +11,8 @@ import unittest
 
 
 SCRIPT = Path(__file__).resolve().parents[2] / ".github/scripts/support_report.py"
+# The translation matrix published at v0.11.0, which release recovery reads.
+V0_11_0_MATRIX = Path(__file__).resolve().parent / "translation-matrix-v0.11.0.fixture.json"
 spec = importlib.util.spec_from_file_location("support_report", SCRIPT)
 support = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(support)
@@ -36,7 +38,7 @@ def matrix(cell_status="translated"):
                 {"feature": "text-chat", "label": "Plain text", "status": cell_status,
                  "note": None, "evidence": "f.rs:3", "blocker": None},
                 {"feature": "reasoning", "label": "Reasoning", "status": "dropped",
-                 "note": "Silently dropped", "evidence": "f.rs:4", "blocker": "TODO-ISSUE fix"},
+                 "note": "Silently dropped", "evidence": "f.rs:4", "blocker": "https://github.com/praxis-proxy/ai/issues/1"},
             ],
         }],
         "cross_surface_gaps": [],
@@ -335,7 +337,7 @@ class SupportReportTest(unittest.TestCase):
             previous.write_text(json.dumps(first), encoding="utf-8")
 
             changed = matrix(cell_status="dropped")
-            changed["surfaces"][0]["cells"][0]["blocker"] = "TODO-ISSUE now a gap"
+            changed["surfaces"][0]["cells"][0]["blocker"] = "https://github.com/praxis-proxy/praxis/issues/2"
             write_fixtures(directory, matrix_value=changed)
             report, markdown = generate(arguments(
                 directory, previous=str(previous)))
@@ -345,6 +347,35 @@ class SupportReportTest(unittest.TestCase):
                 {"surface": "anthropic-to-chat", "feature": "text-chat",
                  "from": "translated", "to": "dropped"}])
             self.assertIn("### Changes since v0.10.0", markdown)
+
+    def test_gap_without_issue_blocker_is_refused(self):
+        for blocker in ("TODO-ISSUE fix", None, "https://github.com/praxis-proxy/ai/pull/1"):
+            with self.subTest(blocker=blocker), tempfile.TemporaryDirectory() as directory:
+                untracked = matrix()
+                untracked["surfaces"][0]["cells"][1]["blocker"] = blocker
+                untracked["cross_surface_gaps"] = [{"id": "shared", "affects": ["anthropic-to-chat"],
+                                                    "summary": "s", "blocker": "TODO-ISSUE shared"}]
+                write_fixtures(directory, matrix_value=untracked)
+
+                with self.assertRaises(SystemExit) as raised:
+                    generate(arguments(directory))
+                self.assertIn("Anthropic -> CC/reasoning", str(raised.exception))
+                self.assertIn("shared", str(raised.exception))
+                self.assertFalse(Path(directory, "out").exists())
+
+    def test_v0_11_0_placeholders_resolve_to_filed_issues(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tagged = json.loads(V0_11_0_MATRIX.read_text(encoding="utf-8"))
+            write_fixtures(directory, matrix_value=tagged)
+            report, markdown = generate(arguments(directory, tag="v0.11.0"))
+
+        gaps = [gap for gap in report["known_gaps"] if gap["source"] == "translation"]
+        self.assertEqual(len(gaps), 22)
+        for gap in gaps:
+            self.assertRegex(gap["blocker"], support.BLOCKER_ISSUE)
+        self.assertNotIn("TODO-ISSUE", json.dumps(report))
+        self.assertNotIn("TODO-ISSUE", markdown)
+        self.assertIn("https://github.com/praxis-proxy/praxis/issues/1564", markdown)
 
     def test_verify_rejects_wrong_commit_and_missing_markers(self):
         with tempfile.TemporaryDirectory() as directory:
