@@ -1,3 +1,4 @@
+# Live provider calls are billable. Results apply to the tested checkout.
 name: Hosted Translation Nightly
 
 on:
@@ -5,12 +6,17 @@ on:
     - cron: "53 5 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
 
 jobs:
   messages-to-openai:
     name: Anthropic Messages to OpenAI Chat Completions
+    if: github.repository == 'praxis-proxy/ai' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -69,12 +75,10 @@ jobs:
           {
             echo "### Anthropic Messages to OpenAI Chat Completions"
             echo "- Gateway commit: $(git rev-parse HEAD)"
-            echo "- Anthropic Python SDK: 1.17.0"
-            echo "- OpenAI model: gpt-4.1-mini-2025-04-14"
             echo "- Configuration: tests/integration/fixtures/anthropic/messages-to-openai-live.yaml"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          env -u OPENAI_API_KEY uv run --with pytest==8.4.2 --with anthropic==1.17.0 pytest \
+          env -u OPENAI_API_KEY uv run --script \
             tests/integration/sdk/anthropic/test_anthropic_messages_to_openai_live.py \
             --junitxml="$RUNNER_TEMP/hosted-messages-to-openai-junit.xml" --tb=line
 
@@ -83,5 +87,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: hosted-messages-to-openai-results
-          path: ${{ runner.temp }}/hosted-messages-to-openai-junit.xml
+          path: |
+            ${{ runner.temp }}/hosted-messages-to-openai-junit.xml
+            ${{ runner.temp }}/hosted-messages-to-openai-praxis.log
           if-no-files-found: ignore

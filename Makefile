@@ -451,6 +451,7 @@ lint-xtask: lint-license-headers
 	cargo xtask openresponses-coverage
 	cargo xtask translation-matrix
 	python3 .github/scripts/hosted_translation_docs.py --check
+	python3 .github/scripts/hosted_passthrough_docs.py --check
 
 # Rust sources in this workspace use Apache-2.0. Catch accidental MIT headers
 # before the xtask lints; git grep limits the check to tracked Rust source files.
