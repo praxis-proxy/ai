@@ -399,7 +399,7 @@ pub(crate) async fn run_ddl(connection: &mut sqlx::PgConnection, ddl: &[String])
 /// validation has already rejected any password embedded in the URL and
 /// the `PGPASSWORD` environment variable, so the effective password is
 /// `None`.
-fn pg_connect_options(database_url: &str, tls: &PgTlsConfig<'_>) -> Result<PgConnectOptions, StoreError> {
+pub(crate) fn pg_connect_options(database_url: &str, tls: &PgTlsConfig<'_>) -> Result<PgConnectOptions, StoreError> {
     let parsed: PgConnectOptions = database_url
         .parse()
         .map_err(|e: sqlx::Error| StoreError::Database(e.to_string()))?;

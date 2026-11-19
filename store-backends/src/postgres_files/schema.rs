@@ -56,7 +56,7 @@ const FILES_TABLE: ExpectedTable = ExpectedTable {
 };
 
 /// Derive the schema version table name from the files table name.
-fn version_table(files: &str) -> String {
+pub(crate) fn version_table(files: &str) -> String {
     format!("{files}{VERSION_SUFFIX}")
 }
 
