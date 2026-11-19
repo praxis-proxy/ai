@@ -5265,6 +5265,310 @@ fn all_three_dispatchers_execute_in_one_irr_continuation() {
     );
 }
 
+// -----------------------------------------------------------------------------
+// Round-Trip: File-Search Context Across Stored Continuations (#2036)
+// -----------------------------------------------------------------------------
+//
+// A gateway-executed file search feeds the next inference round a private
+// `function_call`/`function_call_output` bridge. The answer need not repeat the
+// retrieved passage, so a `previous_response_id` continuation and a later
+// reactive compaction must replay that bridge from the store.
+// https://github.com/praxis-proxy/ai/issues/2036
+
+/// Unique passage marker the follow-up answers deliberately never repeat.
+const FILE_SEARCH_MARKER: &str = "FILE-SEARCH-PASSAGE-MARKER-2036";
+
+/// Model round that reasons, then asks the gateway for a hosted file search.
+fn file_search_reasoning_round(response_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": 1_760_000_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [
+            {"type": "reasoning", "id": "rs_fs_2036", "summary": [{"type": "summary_text", "text": "Search the policy."}]},
+            {"type": "file_search_call", "id": "fs_2036", "status": "searching", "queries": ["policy details"]}
+        ]
+    })
+}
+
+/// Assistant answer that intentionally omits [`FILE_SEARCH_MARKER`].
+fn file_search_answer(response_id: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": 1_760_000_001,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "id": format!("msg_{response_id}"),
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text}]
+        }]
+    })
+}
+
+/// Return the `[reasoning, function_call, function_call_output]` file-search
+/// prefix a model request received, asserting order and correlation.
+fn file_search_prefix(input: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let start = input
+        .iter()
+        .position(|item| item["type"] == "reasoning" && item["id"] == "rs_fs_2036")
+        .unwrap_or_else(|| panic!("request must carry the search round's reasoning: {input:#?}"));
+    let prefix = input
+        .get(start..start + 3)
+        .expect("reasoning, call, and result")
+        .to_vec();
+    assert_eq!(
+        prefix.iter().map(output_item_type).collect::<Vec<_>>(),
+        ["reasoning", "function_call", "function_call_output"],
+        "file-search context must keep reasoning/call/result order: {input:#?}"
+    );
+    assert_eq!(
+        prefix[1]["call_id"], prefix[2]["call_id"],
+        "correlation id must survive"
+    );
+    assert!(
+        prefix[2]["output"]
+            .as_str()
+            .is_some_and(|output| output.contains(FILE_SEARCH_MARKER)),
+        "the private result must carry the retrieved passage: {prefix:#?}"
+    );
+    assert!(
+        input.iter().all(|item| item["type"] != "file_search_call"),
+        "a hosted file_search_call is never valid inference input: {input:#?}"
+    );
+    prefix
+}
+
+/// Answer text that cites the earlier passage without a fresh search.
+const CITING_FOLLOW_UP: &str = "Still documented <|file-42|>.";
+
+/// Private stored-response key the gateway uses for restored citations.
+const STORED_CITATION_KEY: &str = "_praxis_file_search_citation_files";
+
+/// Assert a continuation answer resolved its restored citation marker into a
+/// public `file_citation` annotation with cleaned text.
+fn assert_restored_citation(response: &serde_json::Value) {
+    let message = response["output"]
+        .as_array()
+        .and_then(|output| output.iter().find(|item| item["type"] == "message"))
+        .unwrap_or_else(|| panic!("continuation must return an assistant message: {response}"));
+    let part = &message["content"][0];
+    let text = part["text"].as_str().expect("output text");
+    assert!(
+        !text.contains("<|file-") && text.starts_with("Still documented"),
+        "the restored citation marker must be removed from the answer: {text:?}"
+    );
+    let annotations = part["annotations"].as_array().expect("annotations array");
+    assert!(
+        annotations
+            .iter()
+            .any(|annotation| annotation["type"] == "file_citation"
+                && annotation["file_id"] == "file-42"
+                && annotation["filename"] == "handbook.txt"),
+        "a continuation citing an earlier passage must carry its file_citation: {annotations:#?}"
+    );
+    assert!(
+        response.get(STORED_CITATION_KEY).is_none(),
+        "the private citation map must never reach the client: {response}"
+    );
+}
+
+#[test]
+fn file_search_context_survives_stored_continuation_and_compaction() {
+    // Pad the passage past the minimum compaction threshold so the follow-up
+    // turn's reactive compaction is driven by the retrieved context itself.
+    let passage = format!("{FILE_SEARCH_MARKER} {}", "Retained policy clause. ".repeat(600));
+    let summary = r#"{"id":"chatcmpl-fs","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Summary."},"finish_reason":"stop"}],"usage":{"prompt_tokens":50,"completion_tokens":5,"total_tokens":55}}"#;
+    let model = StatefulCapturingBackend::new(vec![
+        (200, file_search_reasoning_round("resp_fs_round_1").to_string()),
+        (
+            200,
+            file_search_answer("resp_fs_turn_1", "The policy is documented.").to_string(),
+        ),
+        (200, file_search_answer("resp_fs_turn_2", CITING_FOLLOW_UP).to_string()),
+        (200, summary.to_owned()),
+        (
+            200,
+            file_search_answer("resp_fs_turn_3", "Compacted answer.").to_string(),
+        ),
+    ])
+    .start_with_shutdown();
+    let vector_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let vector_port = vector_listener.local_addr().unwrap().port();
+    let vector_calls = spawn_vector_store_mock_with_text(vector_listener, &passage);
+    let db = TempSqlite::new("file_search_continuation");
+    let config = load_file_search_store_config(free_port(), model.port(), vector_port, db.url());
+    let proxy = start_proxy(&config);
+
+    let first = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What does the policy say?",
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_policy"]}]
+    });
+    let first_raw = http_send(proxy.addr(), &json_post("/v1/responses", &first.to_string()));
+    assert_eq!(parse_status(&first_raw), 200, "searched turn: {first_raw}");
+    let first_body: serde_json::Value = serde_json::from_str(&parse_body(&first_raw)).unwrap();
+    assert_eq!(vector_calls.load(Ordering::SeqCst), 1, "one vector-store callout");
+    assert!(
+        first_body["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "file_search_call")
+            .all(|item| item.get("results").is_none_or(serde_json::Value::is_null)),
+        "public results stay opt-in: {first_body}"
+    );
+    assert!(
+        !first_body.to_string().contains(FILE_SEARCH_MARKER),
+        "marker is private"
+    );
+
+    let continuation = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "And what else?",
+        "previous_response_id": first_body["id"],
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_policy"]}]
+    });
+    let continuation_raw = http_send(proxy.addr(), &json_post("/v1/responses", &continuation.to_string()));
+    assert_eq!(parse_status(&continuation_raw), 200, "continuation: {continuation_raw}");
+    let continuation_body: serde_json::Value = serde_json::from_str(&parse_body(&continuation_raw)).unwrap();
+    assert_restored_citation(&continuation_body);
+    for id in [&first_body["id"], &continuation_body["id"]] {
+        let (status, stored) = http_get(proxy.addr(), &format!("/v1/responses/{}", id.as_str().unwrap()), None);
+        assert_eq!(status, 200, "stored response must be retrievable: {stored}");
+        assert!(
+            !stored.contains(STORED_CITATION_KEY),
+            "retrieval must strip the private citation map: {stored}"
+        );
+    }
+
+    // Branch compaction from the searched turn: compaction fails closed on the
+    // continuation's non-empty citation annotations, which its text-only
+    // summary cannot represent; the search turn's stored bridge is the source
+    // under test here.
+    let compacting = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Summarize everything.",
+        "previous_response_id": first_body["id"],
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}]
+    });
+    let compacting_raw = http_send(proxy.addr(), &json_post("/v1/responses", &compacting.to_string()));
+    assert_eq!(parse_status(&compacting_raw), 200, "compacting turn: {compacting_raw}");
+
+    let requests = model.requests();
+    assert_eq!(
+        requests.len(),
+        5,
+        "two search rounds, one continuation, one summarizer, one compacted inference"
+    );
+    let live_input = request_input(&requests[1].body);
+    let continuation_input = request_input(&requests[2].body);
+    assert_eq!(
+        file_search_prefix(&continuation_input),
+        file_search_prefix(&live_input),
+        "continuation must replay the exact file-search prefix the live round received"
+    );
+    assert_eq!(
+        vector_calls.load(Ordering::SeqCst),
+        1,
+        "continuation must not search again"
+    );
+    assert!(
+        requests[3].uri.ends_with("/chat/completions") && requests[3].body.contains(FILE_SEARCH_MARKER),
+        "the compaction summarizer must see the retrieved passage: {}",
+        requests[3].uri
+    );
+}
+
+#[test]
+fn streaming_file_search_context_survives_stored_continuation() {
+    let round = file_search_reasoning_round("resp_fs_stream_1");
+    let answer = file_search_answer("resp_fs_stream_2", "The policy is documented.");
+    let follow_up = file_search_answer("resp_fs_stream_3", CITING_FOLLOW_UP);
+    let as_stream = |response: &serde_json::Value| {
+        let id = response["id"].as_str().unwrap();
+        let mut events = vec![sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": id, "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        )];
+        let output = response["output"].as_array().unwrap();
+        for (index, item) in output.iter().enumerate() {
+            events.push(sse_event(
+                "response.output_item.added",
+                serde_json::json!({"response_id": id, "output_index": index, "item": item, "sequence_number": events.len()}),
+            ));
+            events.push(sse_event(
+                "response.output_item.done",
+                serde_json::json!({"response_id": id, "output_index": index, "item": item, "sequence_number": events.len()}),
+            ));
+        }
+        let mut completed = response.clone();
+        completed["usage"] = usage_json((8, 2, 10));
+        events.push(sse_event(
+            "response.completed",
+            serde_json::json!({"response": completed, "sequence_number": events.len()}),
+        ));
+        events
+    };
+    let (model_port, model_requests, model_thread) =
+        start_streaming_model(vec![as_stream(&round), as_stream(&answer), as_stream(&follow_up)]);
+    let vector_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let vector_port = vector_listener.local_addr().unwrap().port();
+    let vector_calls = spawn_vector_store_mock_with_text(vector_listener, FILE_SEARCH_MARKER);
+    let db = TempSqlite::new("file_search_stream_continuation");
+    let config = load_file_search_store_config(free_port(), model_port, vector_port, db.url());
+    let proxy = start_proxy(&config);
+
+    let first = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What does the policy say?",
+        "stream": true,
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_policy"]}]
+    });
+    let first_raw = http_send(proxy.addr(), &json_post("/v1/responses", &first.to_string()));
+    assert_eq!(parse_status(&first_raw), 200, "streamed search turn: {first_raw}");
+    let first_id = completed_response_id(&parse_body(&first_raw));
+    assert_eq!(vector_calls.load(Ordering::SeqCst), 1, "one vector-store callout");
+
+    let continuation = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "And what else?",
+        "stream": true,
+        "previous_response_id": first_id,
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_policy"]}]
+    });
+    let continuation_raw = http_send(proxy.addr(), &json_post("/v1/responses", &continuation.to_string()));
+    assert_eq!(
+        parse_status(&continuation_raw),
+        200,
+        "streamed continuation: {continuation_raw}"
+    );
+    assert_restored_citation(&extract_completed_response(&parse_body(&continuation_raw)));
+    drop(proxy);
+    model_thread.join().expect("streaming model should finish");
+
+    let requests = model_requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3, "two search rounds and one continuation");
+    assert_eq!(
+        file_search_prefix(&request_input(&requests[2])),
+        file_search_prefix(&request_input(&requests[1])),
+        "streamed continuation must replay the exact live file-search prefix"
+    );
+    assert_eq!(
+        vector_calls.load(Ordering::SeqCst),
+        1,
+        "continuation must not search again"
+    );
+}
+
 #[test]
 fn web_search_batch_respects_response_wide_max_tool_calls() {
     let first_response = serde_json::json!({
@@ -6621,13 +6925,18 @@ fn spawn_capturing_search_mock(listener: TcpListener) -> Arc<Mutex<Vec<String>>>
 /// can assert exactly how many vector-store callouts the file-search dispatcher
 /// issued across an agentic-loop continuation.
 fn spawn_vector_store_mock(listener: TcpListener) -> Arc<AtomicUsize> {
+    spawn_vector_store_mock_with_text(listener, "The answer is 42.")
+}
+
+/// [`spawn_vector_store_mock`] returning one chunk with caller-chosen text.
+fn spawn_vector_store_mock_with_text(listener: TcpListener, text: &str) -> Arc<AtomicUsize> {
     use std::io::{Read as _, Write as _};
     let body = serde_json::json!({
         "data": [{
             "file_id": "file-42",
             "filename": "handbook.txt",
             "score": 0.98,
-            "content": [{"type": "text", "text": "The answer is 42."}],
+            "content": [{"type": "text", "text": text}],
             "attributes": null
         }]
     })
@@ -9973,6 +10282,28 @@ fn load_agentic_config_with_budget_and_store(
     );
     let yaml = patch_web_search_api_key(&yaml);
     praxis_core::config::Config::from_yaml(&yaml).expect("parse bounded agentic-loop config with Store")
+}
+
+/// Agentic-loop example with a temporary Store and the model and vector-store
+/// endpoints retargeted at loopback mocks; the compaction summarizer shares
+/// the model endpoint.
+fn load_file_search_store_config(
+    proxy_port: u16,
+    model_port: u16,
+    vector_port: u16,
+    db_url: &str,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let original = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let with_store = original.replace("sqlite://responses.db?mode=rwc", db_url);
+    assert_ne!(with_store, original, "expected the example's SQLite URL");
+    let yaml = patch_yaml(
+        &with_store,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model_port), ("127.0.0.1:8001", vector_port)]),
+    );
+    let yaml = patch_web_search_api_key(&yaml);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse file-search agentic-loop config with Store")
 }
 
 fn load_agentic_config_without_stream_events(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {

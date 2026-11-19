@@ -952,12 +952,15 @@ class BraveSearchHandler(BaseHTTPRequestHandler):
     request_count = 0
     response_code = 200
     successful_requests_remaining: ClassVar[int | None] = None
+    #: Results served after the canned result, e.g. off-domain URLs.
+    extra_results: ClassVar[list[dict[str, str]]] = []
 
     @classmethod
     def reset(cls):
         cls.request_count = 0
         cls.response_code = 200
         cls.successful_requests_remaining = None
+        cls.extra_results = []
         cls.request_paths.clear()
 
     request_paths: ClassVar[list[str]] = []
@@ -986,7 +989,8 @@ class BraveSearchHandler(BaseHTTPRequestHandler):
                             "title": "Mock Search Result",
                             "url": "https://example.com/mock",
                             "description": "A mock search result for testing",
-                        }
+                        },
+                        *BraveSearchHandler.extra_results,
                     ]
                 }
             }
@@ -3380,6 +3384,153 @@ class TestOpenAIResponsesVLLM:
             ]
         finally:
             client.conversations.delete(conversation.id)
+
+    def test_hosted_web_search_enforces_allowed_domains(self, witness_tool_client):
+        """Native hosted search drops provider results outside ``allowed_domains`` (#1768).
+
+        The Brave mock returns one result inside and one outside the allow-list.
+        Only the allowed result may reach the model re-entry or the public
+        ``action.sources``; the provider cannot be trusted to apply the filter.
+        """
+        client, forwarded = witness_tool_client
+        BraveSearchHandler.reset()
+        BraveSearchHandler.extra_results = [
+            {
+                "title": "Outside Domain Result",
+                "url": "https://outside.example/result",
+                "description": "A result outside the allowed domains",
+            }
+        ]
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-tool-stream",
+                input="DOMAIN-FILTER-1768",
+                tools=[{"type": "web_search", "filters": {"allowed_domains": ["example.com"]}}],
+                include=["web_search_call.action.sources"],
+                max_tool_calls=1,
+                store=False,
+                extra_headers={"x-user-brave-key": "controlled-test-only"},
+            )
+            assert response.status == "completed", (
+                "the filtered response should complete: "
+                f"{getattr(response, 'error', None)}"
+            )
+            assert [item.type for item in response.output] == ["web_search_call", "message"], (
+                "a filtered search should still produce a call and a message"
+            )
+            assert BraveSearchHandler.request_count == 1, (
+                "the dispatcher should issue exactly one provider request"
+            )
+            sources = response.output[0].model_dump()["action"]["sources"]
+            assert [source["url"] for source in sources] == ["https://example.com/mock"], (
+                "only allowed-domain results may be public sources"
+            )
+            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
+            reentry = json.dumps(forwarded[1]["input"])
+            assert "Mock Search Result" in reentry, (
+                "the allowed result must reach the model"
+            )
+            assert "outside.example" not in reentry, (
+                "an off-domain result must not reach the model"
+            )
+        finally:
+            BraveSearchHandler.reset()
+
+    def test_hosted_web_search_enforces_blocked_domains(self, witness_tool_client):
+        """Native hosted search drops provider results on ``blocked_domains`` (#1768).
+
+        The Brave mock returns a result on a blocked host and one on a blocked
+        subdomain of an allowed domain. Only the result inside the allow-list
+        and outside the block-list may reach the model re-entry or the public
+        ``action.sources``.
+        """
+        client, forwarded = witness_tool_client
+        BraveSearchHandler.reset()
+        BraveSearchHandler.extra_results = [
+            {
+                "title": "Blocked Domain Result",
+                "url": "https://outside.example/result",
+                "description": "A result on a blocked domain",
+            },
+            {
+                "title": "Blocked Subdomain Result",
+                "url": "https://docs.example.com/private",
+                "description": "A result on a blocked subdomain",
+            },
+        ]
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-tool-stream",
+                input="DOMAIN-FILTER-BLOCKED-1768",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "filters": {
+                            "allowed_domains": ["example.com"],
+                            "blocked_domains": ["outside.example", "docs.example.com"],
+                        },
+                    }
+                ],
+                include=["web_search_call.action.sources"],
+                max_tool_calls=1,
+                store=False,
+                extra_headers={"x-user-brave-key": "controlled-test-only"},
+            )
+            assert response.status == "completed", (
+                "the filtered response should complete: "
+                f"{getattr(response, 'error', None)}"
+            )
+            assert BraveSearchHandler.request_count == 1, (
+                "the dispatcher should issue exactly one provider request"
+            )
+            sources = response.output[0].model_dump()["action"]["sources"]
+            assert [source["url"] for source in sources] == ["https://example.com/mock"], (
+                "blocked domains must not be public sources"
+            )
+            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
+            reentry = json.dumps(forwarded[1]["input"])
+            assert "Mock Search Result" in reentry, (
+                "the permitted result must reach the model"
+            )
+            assert "outside.example" not in reentry, (
+                "a blocked-domain result must not reach the model"
+            )
+            assert "docs.example.com" not in reentry, (
+                "a blocked subdomain result must not reach the model"
+            )
+        finally:
+            BraveSearchHandler.reset()
+
+    def test_hosted_web_search_rejects_unenforceable_filters(self, witness_tool_client):
+        """Unenforceable web-search ``filters`` fail closed before any round (#1768)."""
+        client, forwarded = witness_tool_client
+        BraveSearchHandler.reset()
+        cases = [
+            ({"search_domain_filter": ["example.com"]}, "unsupported_parameter"),
+            ({"allowed_domains": ["example.com/path"]}, "invalid_value"),
+            ({"allowed_domains": ["*.example.com"]}, "invalid_value"),
+            ({"allowed_domains": ["%2a.example.com"]}, "invalid_value"),
+            ({"allowed_domains": ["example.com.."]}, "invalid_value"),
+            ({"blocked_domains": ["https://example.com/path"]}, "invalid_value"),
+            ({"blocked_domains": ["*.example.com"]}, "invalid_value"),
+        ]
+        for filters, code in cases:
+            with pytest.raises(BadRequestError) as exc_info:
+                client.responses.create(
+                    model="sdk-conversation-tool-stream",
+                    input="DOMAIN-FILTER-REJECT-1768",
+                    tools=[{"type": "web_search", "filters": filters}],
+                    store=False,
+                    extra_headers={"x-user-brave-key": "controlled-test-only"},
+                )
+            assert exc_info.value.status_code == 400, (
+                f"preflight should reject {filters} with 400"
+            )
+            assert exc_info.value.body["code"] == code, (
+                f"preflight should reject {filters} with {code}: {exc_info.value.body}"
+            )
+        assert BraveSearchHandler.request_count == 0, "preflight must precede any callout"
+        assert forwarded == [], "preflight must precede any inference round"
 
     @qualification_profile("supporting")
     @pytest.mark.parametrize("replay_limited", [False, True], ids=["default", "replay-limit"])
@@ -7042,6 +7193,65 @@ class TestClientToolCompatVLLM:
         echoed = [getattr(t, "name", None) for t in response.tools]
         assert "mcp__codex_tui" in echoed, response.tools
 
+    @pytest.mark.parametrize(
+        "description",
+        ["", "   "],
+        ids=["empty", "whitespace"],
+    )
+    def test_blank_namespace_description_is_accepted(
+        self, client_tool_compat_client, description
+    ):
+        """Pinned ``NamespaceToolParam.description`` is a required string with no
+        ``minLength``, so empty and whitespace-only values must round-trip through
+        ``openai_client_tool_compat`` rather than failing closed with HTTP 400.
+
+        Asserts only filter-guaranteed, model-independent invariants: reaching a
+        completed response (no BadRequestError) and echoing the original namespace
+        without leaking a private lowered wire name.
+        """
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say hi. /no_think",
+            tools=[
+                {
+                    "type": "namespace",
+                    "name": "utils",
+                    "description": description,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "ping",
+                            "description": "Return ok.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": False,
+                            },
+                        }
+                    ],
+                }
+            ],
+            temperature=0,
+            store=False,
+            max_output_tokens=2048,
+        )
+
+        assert response.status == "completed", (
+            "blank namespace descriptions must be accepted; got "
+            f"{response.status}: {response}"
+        )
+        leaked = [
+            name
+            for name in (getattr(item, "name", None) for item in response.output)
+            if isinstance(name, str) and name.startswith("agentic_ns__")
+        ]
+        assert not leaked, f"lowered namespace wire name leaked: {leaked}"
+        echoed = [getattr(t, "name", None) for t in response.tools]
+        assert "utils" in echoed, (
+            "original utils namespace must be echoed in response.tools; "
+            f"got {response.tools}"
+        )
+
     def test_single_round_declared_and_discovered_tools_lower_without_leaking(
         self, client_tool_compat_client
     ):
@@ -10648,6 +10858,78 @@ class TestFileSearchChatCompletionsVLLM:
                 recorded_request_count,
                 tool_name="file_search",
             )
+
+    @requires_simulator
+    def test_file_search_result_survives_previous_response_id_continuation(
+        self, file_search_chat_client, vector_store
+    ):
+        """Issue #2036: a stored continuation replays the private search result.
+
+        The gateway feeds the retrieved passage to the next round as a private
+        tool call/result pair. A ``previous_response_id`` follow-up must replay
+        that exact pair from the store, not just the public file_search_call.
+        """
+        store_id, marker = vector_store
+        tools = [{"type": "file_search", "vector_store_ids": [store_id]}]
+        recorded_start = len(SimulatorBackendHandler.recorded_requests)
+        first = file_search_chat_client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="Find the Praxis marker with file_search. /no_think",
+            tools=tools,
+            max_output_tokens=512,
+        )
+        assert first.status == "completed", f"first turn: {first.status}"
+        assert any(item.type == "file_search_call" for item in first.output)
+
+        continuation_start = len(SimulatorBackendHandler.recorded_requests)
+        second = file_search_chat_client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="What else does the report say? /no_think",
+            previous_response_id=first.id,
+            tools=tools,
+            max_output_tokens=512,
+        )
+        assert second.status == "completed", f"continuation: {second.status}"
+        continuation_end = len(SimulatorBackendHandler.recorded_requests)
+
+        def search_pairs(start: int, end: int):
+            """Return (assistant tool_calls, tool results) per Chat request."""
+            pairs = []
+            for path, body in SimulatorBackendHandler.recorded_requests[start:end]:
+                if not path.rstrip("/").endswith("/v1/chat/completions"):
+                    continue
+                messages = body.get("messages", [])
+                calls = [
+                    call
+                    for message in messages
+                    if message.get("role") == "assistant"
+                    for call in message.get("tool_calls") or []
+                    if call.get("function", {}).get("name") == "file_search"
+                ]
+                results = [
+                    message for message in messages if message.get("role") == "tool"
+                ]
+                pairs.append((calls, results))
+            return pairs
+
+        live = [pair for pair in search_pairs(recorded_start, continuation_start) if pair[1]]
+        assert len(live) == 1, f"one live re-entry carries the search result: {live}"
+        replayed = search_pairs(continuation_start, continuation_end)
+        assert len(replayed) == 1, f"one continuation inference: {replayed}"
+        live_calls, live_results = live[0]
+        replayed_calls, replayed_results = replayed[0]
+        assert replayed_calls == live_calls, (
+            "the continuation must replay the live private file_search call"
+        )
+        assert replayed_results == live_results, (
+            "the continuation must replay the live private file_search result"
+        )
+        assert any(marker in (result.get("content") or "") for result in replayed_results), (
+            "the replayed tool result must carry the retrieved passage"
+        )
+        assert {result.get("tool_call_id") for result in replayed_results} == {
+            call.get("id") for call in replayed_calls
+        }, "replayed call and result must keep their correlation id"
 
 
 # ---------------------------------------------------------------------------
