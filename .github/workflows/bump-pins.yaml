@@ -6,14 +6,14 @@ name: Bump Pins
 # Runs `cargo xtask bump-pins`, which moves the pinned coding clients (Claude
 # Code, OpenCode 1.x/2.x, pi, Codex) and the vLLM GPU image to their latest
 # upstream releases, rewrites every site from the manifests, swaps the checksum
-# fixtures, and validates the result with `check-pins` (see
-# xtask/src/pins/bump.rs).
+# fixtures, carries the Codex WebSocket recording forward, and validates the
+# result with `check-pins` (see xtask/src/pins/bump.rs).
 #
-# The weekly run opens a draft PR from `bot/bump-pins` whose body
-# is the re-validation checklist. It never auto-merges: behavioral pins (tool
-# lists, exit codes, xfails, replay recordings, "verified against" claims) are
-# re-validated by a person, and the GPU acceptance lanes (`vllm-full-suite`
-# label) are the ready-for-review gate.
+# The weekly run opens a draft PR from the `bot/bump-pins` branch whose body
+# is the re-validation checklist. It never auto-merges: lane-tested claims are
+# updated and re-proved by CI, other behavioral pins (tool lists, exit codes,
+# xfails, claims no lane exercises) are re-validated by a person, and the GPU
+# acceptance lanes (`vllm-full-suite` label) are the ready-for-review gate.
 #
 # The daily run opens a PR from `bot/bump-praxis-core` only when core main moves.
 #

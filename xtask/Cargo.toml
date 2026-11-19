@@ -18,6 +18,7 @@ publish = false
 default = ["dev"]
 dev = [
     "pins",
+    "dep:chrono",
     "dep:praxis-ai",
     "dep:praxis-ai-apis",
     "dep:praxis-core",
@@ -59,6 +60,7 @@ workspace = true
 
 [dependencies]
 base64 = { workspace = true }
+chrono = { workspace = true, optional = true }
 clap = { workspace = true }
 flate2 = { workspace = true }
 object = { workspace = true }
