@@ -380,6 +380,9 @@ async fn pinned_codex_compaction_crosses_context_window_over_http() {
     run_live_codex_compaction_workflow(&live, proxy_port, config).await;
 }
 
+/// Run the same verifier with default permissions in both live workflows.
+const LIVE_VERIFY_INSTRUCTION: &str = "Run exactly `./verify.sh` with default permissions, omit the sandbox_permissions argument, and confirm it exits 0.";
+
 /// Drive a pinned-Codex apply_patch task through one live Praxis pipeline.
 async fn run_live_codex_apply_patch_workflow(
     live: &CodexLiveConfig,
@@ -400,8 +403,7 @@ async fn run_live_codex_apply_patch_workflow(
         "You MUST use the apply_patch tool exactly once with this exact patch to add result.txt:\n\
          *** Begin Patch\n*** Add File: result.txt\n+{}\n*** End Patch\n\n\
          Do not use exec_command or another tool to write or edit files.\n\
-         After apply_patch succeeds, use exec_command only to run exactly `./verify.sh` with default permissions.\n\
-         Omit the sandbox_permissions argument.\n\
+         After apply_patch succeeds, use exec_command only for verification. {LIVE_VERIFY_INSTRUCTION}\n\
          Do not answer before verification succeeds. Then summarize what changed. /no_think",
         workspace.expected_content(),
     );
@@ -499,7 +501,7 @@ async fn run_live_codex_compaction_workflow(
 2. Read every ballast chapter one at a time (a separate cat command per file, no more than one file per command), in this exact order: {chapter_list}. After each file, briefly acknowledge it before reading the next.
 3. Only after all chapters are read, re-read the token by running exactly: cat secret.txt
 4. Write the token printed in step 3 (and nothing else) into result.txt with exactly: printf '%s' '<TOKEN>' > result.txt  — substitute the exact token you just saw.
-5. Run ./verify.sh and confirm it exits 0.
+5. {LIVE_VERIFY_INSTRUCTION}
 6. Summarize what you changed. /no_think"#
     );
     let proxy_base_url = format!("http://{}:{}", live.listen_address, observer.port());
@@ -2186,6 +2188,7 @@ async fn run_codex(codex_bin: &OsStr, options: CodexRunOptions<'_>) -> CodexOutp
     let config = format!(
         r#"model = "{model}"
 model_provider = "praxis"
+approval_policy = "never"
 web_search = "disabled"
 {compaction_keys}
 [features]

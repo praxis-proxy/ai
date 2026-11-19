@@ -9810,7 +9810,8 @@ class TestAgenticLoopVLLM:
         output_item.added -> web_search_call.in_progress -> searching ->
         completed -> output_item.done sequence exactly once per call (no
         re-emission across IRR rounds), with ids and output indices that agree
-        with the terminal snapshot. The request bounds the live model to one search.
+        with the terminal snapshot. The assertions expect exactly one search item
+        because the request sets max_tool_calls=1.
         """
         stream = translated_agentic_client.responses.create(
             model=CHAT_TRANSLATION_MODEL,
@@ -9899,16 +9900,12 @@ class TestAgenticLoopVLLM:
         # one incremental output_item.added. Without the synthesis they appear
         # only in the terminal snapshot and never here.
         ws_added = [a for a in added if a[1] == "web_search_call"]
-        assert ws_added, (
-            "locally executed web_search_calls should surface as incremental "
-            f"response.output_item.added; got incremental added items: {added}"
+        assert len(ws_added) == 1, (
+            "expected exactly one incremental web_search_call with "
+            f"max_tool_calls=1; got {len(ws_added)}: {ws_added}"
         )
         ws_ids = [item_id for _, _, item_id, _ in ws_added]
         assert all(ws_ids), f"every synthesized web_search_call must carry an id; got: {ws_added}"
-        assert len(ws_ids) == len(set(ws_ids)), (
-            "each locally executed search must be announced once with a unique id; "
-            f"got: {ws_ids}"
-        )
 
         # Each id must have exactly one matching output_item.done, proving the
         # item is not re-emitted across IRR rounds and that every pair closes.

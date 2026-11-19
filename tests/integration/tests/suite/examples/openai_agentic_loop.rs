@@ -5497,6 +5497,7 @@ fn web_search_provider_failure_continues_loop_with_failed_result() {
     );
 }
 
+/// Script a search round that omits `output_item.done` so Praxis synthesizes the lifecycle.
 fn web_search_stream_round(response_id: &str, item_id: &str, query: &str) -> Vec<String> {
     let search_call = serde_json::json!({
         "type": "web_search_call",
@@ -5788,7 +5789,7 @@ fn streaming_web_search_round_trip_resumes_one_logical_response() {
 }
 
 #[test]
-fn streaming_web_search_emits_each_rounds_progress_once() {
+fn streaming_web_search_emits_one_progress_lifecycle_per_round() {
     let (model_port, _, model_thread) = start_streaming_model(vec![
         web_search_stream_round("resp_first", "ws_first", "Rust release"),
         web_search_stream_round("resp_second", "ws_second", "Rust release notes"),
