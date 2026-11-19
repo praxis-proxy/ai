@@ -403,6 +403,13 @@ impl ResponsesToChatCompletionsFilter {
             self.config.stream_limits(),
             self.config.reasoning,
         );
+        converter.set_include_obfuscation(
+            ctx.extensions
+                .get::<ResponsesState>()
+                .and_then(|state| state.request_body.pointer("/stream_options/include_obfuscation"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
+        );
         converter.budget_output_allowance = output_allowance;
         resume_stream(ctx, Box::new(converter));
         Ok(FilterAction::Continue)

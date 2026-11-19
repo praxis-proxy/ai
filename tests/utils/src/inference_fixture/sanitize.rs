@@ -472,7 +472,15 @@ impl<'a> Sanitizer<'a> {
     fn sanitize_response_json_document(&mut self, value: &mut Value) -> Result<(), FixtureError> {
         if let Value::Object(object) = value
             && (object.get("object").and_then(Value::as_str) == Some("chat.completion.chunk")
-                || object.get("type").and_then(Value::as_str) == Some("response.output_text.delta"))
+                || matches!(
+                    object.get("type").and_then(Value::as_str),
+                    Some(
+                        "response.output_text.delta"
+                            | "response.refusal.delta"
+                            | "response.function_call_arguments.delta"
+                            | "response.reasoning_text.delta"
+                    )
+                ))
         {
             object.remove("obfuscation");
         }

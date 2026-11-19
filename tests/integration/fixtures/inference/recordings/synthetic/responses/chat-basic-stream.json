@@ -34,7 +34,10 @@
               "input": "Say hello in one sentence.",
               "model": "synthetic-chat-model",
               "store": false,
-              "stream": true
+              "stream": true,
+              "stream_options": {
+                "include_obfuscation": true
+              }
             }
           }
         },
@@ -134,6 +137,7 @@
               "model": "synthetic-chat-model",
               "stream": true,
               "stream_options": {
+                "include_obfuscation": true,
                 "include_usage": true
               }
             }

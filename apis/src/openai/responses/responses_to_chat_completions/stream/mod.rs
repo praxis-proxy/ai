@@ -118,6 +118,8 @@ struct EmitState {
     sequence_number: u64,
     /// Count of events emitted so far.
     events_emitted: usize,
+    /// Add padding to generated delta events.
+    include_obfuscation: bool,
 }
 
 /// Errors produced while translating a stream.
@@ -401,6 +403,11 @@ pub(super) struct StreamConverter {
 }
 
 impl StreamConverter {
+    /// Set the effective client preference before emitting any events.
+    pub(super) fn set_include_obfuscation(&mut self, enabled: bool) {
+        self.emit.include_obfuscation = enabled;
+    }
+
     /// Create a converter for a streaming response.
     #[expect(clippy::too_many_lines, reason = "initializes every converter field")]
     pub(super) fn new(
@@ -418,6 +425,7 @@ impl StreamConverter {
             emit: EmitState {
                 sequence_number: 0,
                 events_emitted: 0,
+                include_obfuscation: true,
             },
             lifecycle_started: false,
             initial_metadata_checked: false,
@@ -1958,11 +1966,14 @@ fn emit_event(
     emit: &mut EmitState,
     limits: &StreamLimits,
     capped: bool,
-    event: StreamEvent,
+    mut event: StreamEvent,
     out: &mut Vec<u8>,
 ) -> Result<(), ConvertError> {
     if capped && emit.events_emitted.saturating_add(1) >= limits.max_stream_events {
         return Err(ConvertError::EventLimit);
+    }
+    if emit.include_obfuscation {
+        event.add_obfuscation()?;
     }
     let start = out.len();
     if let Err(error) = events::encode(event, emit.sequence_number, out) {

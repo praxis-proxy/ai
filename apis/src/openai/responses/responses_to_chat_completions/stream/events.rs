@@ -7,7 +7,10 @@
 //! `type` and `sequence_number` fields; [`encode`] injects both at emission
 //! time so the state machine owns sequencing centrally.
 
+use openssl::rand::rand_bytes;
 use serde_json::{Value, json};
+
+use super::{ConvertError, serialized_json_len};
 
 /// A Responses streaming event ready for sequencing and encoding.
 pub(super) struct StreamEvent {
@@ -21,6 +24,33 @@ impl StreamEvent {
     /// Construct an event from its type and partial payload.
     fn new(event_type: &'static str, payload: Value) -> Self {
         Self { event_type, payload }
+    }
+
+    /// Round the serialized delta length up in 64 byte steps using fresh
+    /// ASCII padding. One Chat chunk can produce multiple Responses events,
+    /// so upstream padding cannot normalize the generated events.
+    pub(super) fn add_obfuscation(&mut self) -> Result<(), ConvertError> {
+        const BUCKET_BYTES: usize = 64;
+        if !self.event_type.ends_with(".delta") {
+            return Ok(());
+        }
+        let Value::Object(payload) = &mut self.payload else {
+            return Ok(());
+        };
+        let Some(delta) = payload.get("delta") else {
+            return Ok(());
+        };
+        let padding_len = BUCKET_BYTES - serialized_json_len(delta)? % BUCKET_BYTES;
+        let mut random = [0; BUCKET_BYTES];
+        rand_bytes(&mut random)
+            .map_err(|error| ConvertError::Serialize(serde_json::Error::io(std::io::Error::other(error))))?;
+        let padding = random
+            .iter()
+            .take(padding_len)
+            .map(|byte| char::from(b'a' + byte % 26))
+            .collect();
+        payload.insert("obfuscation".to_owned(), Value::String(padding));
+        Ok(())
     }
 }
 
@@ -262,6 +292,19 @@ mod tests {
         assert_eq!(parsed["sequence_number"], 4);
         assert_eq!(parsed["delta"], "hi");
         assert_eq!(parsed["item_id"], "msg_1");
+    }
+
+    #[test]
+    fn padding_normalizes_serialized_delta_lengths() {
+        for delta in ["a", "hello", "é\n"] {
+            let mut event = output_text_delta("msg_1", 0, 0, delta, &json!([]));
+            event.add_obfuscation().unwrap();
+            let padding = event.payload["obfuscation"].as_str().unwrap();
+            assert_eq!(
+                serialized_json_len(&event.payload["delta"]).unwrap() + padding.len(),
+                64
+            );
+        }
     }
 
     #[test]

@@ -248,8 +248,13 @@ fn arbitrary_byte_splits_produce_identical_events() {
     }
     finish(&mut conv, &body, &mut raw);
 
-    let split = parse_events(&raw);
-    let whole = run_stream(&chunks, wide_limits());
+    let mut split = parse_events(&raw);
+    let mut whole = run_stream(&chunks, wide_limits());
+    for (_, payload) in split.iter_mut().chain(&mut whole) {
+        if let Some(padding) = payload.get_mut("obfuscation") {
+            *padding = json!(padding.as_str().unwrap().len());
+        }
+    }
     assert_eq!(split, whole);
 }
 
@@ -1416,6 +1421,28 @@ fn empty_callback_after_terminal_is_tolerated() {
         .push(b"", &inputs)
         .expect("an empty trailing callback must be tolerated");
     assert!(result.is_none(), "an empty trailing callback must emit nothing");
+}
+
+#[test]
+fn delta_padding_counts_toward_the_emitted_frame_limit() {
+    let event = || events::function_call_arguments_delta("call_1", 0, "{}");
+    let mut emit = converter(wide_limits()).emit;
+    let mut unpadded = Vec::new();
+    events::encode(event(), 0, &mut unpadded).unwrap();
+    let limits = StreamLimits {
+        max_emitted_sse_frame_bytes: unpadded.len(),
+        ..wide_limits()
+    };
+    let mut out = Vec::new();
+    assert!(matches!(
+        emit_event(&mut emit, &limits, true, event(), &mut out),
+        Err(ConvertError::FrameSizeLimit)
+    ));
+    assert!(out.is_empty());
+    assert_eq!(emit.sequence_number, 0);
+    emit.include_obfuscation = false;
+    emit_event(&mut emit, &limits, true, event(), &mut out).unwrap();
+    assert_eq!(out, unpadded);
 }
 
 #[test]

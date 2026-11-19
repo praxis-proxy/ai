@@ -11757,6 +11757,41 @@ def test_null_tool_choice_succeeds_sdk(chat_streaming_client):
 
 @pytest.mark.skipif(
     VLLM_TEST_BACKEND != "simulator",
+    reason="uses the simulator's scripted Chat stream",
+)
+@pytest.mark.parametrize("include_obfuscation", [None, True, False])
+def test_translated_stream_obfuscation(chat_streaming_client, include_obfuscation):
+    options = (
+        {} if include_obfuscation is None
+        else {"stream_options": {"include_obfuscation": include_obfuscation}}
+    )
+    with chat_streaming_client.responses.create(
+        model=CHAT_TRANSLATION_MODEL,
+        input="STREAM-SERVICE-TIER-1549",
+        store=False,
+        stream=True,
+        **options,
+    ) as stream:
+        events = list(stream)
+
+    assert events[-1].type == "response.completed"
+    deltas = [event for event in events if event.type == "response.output_text.delta"]
+    assert deltas
+    for event in deltas:
+        padding = event.model_dump().get("obfuscation")
+        if include_obfuscation is False:
+            assert padding is None
+        else:
+            assert isinstance(padding, str) and 1 <= len(padding) <= 64
+    assert all(
+        event.model_dump().get("obfuscation") is None
+        for event in events
+        if not event.type.endswith(".delta")
+    )
+
+
+@pytest.mark.skipif(
+    VLLM_TEST_BACKEND != "simulator",
     reason="the service-tier provider response is deterministically scripted",
 )
 def test_streaming_service_tier_snapshot_uses_provider_value(chat_streaming_client):

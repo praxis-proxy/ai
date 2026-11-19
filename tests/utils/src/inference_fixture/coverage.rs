@@ -1330,6 +1330,7 @@ mod tests {
                 vec!["responses_native_passthrough"],
                 vec!["responses_agentic_loop"],
                 vec!["messages_to_chat_completions"],
+                vec!["openai_responses_to_chat_completions"],
             ]
         );
         assert_eq!(
@@ -1438,9 +1439,10 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 99, "manifest feature inventory count");
+        assert_eq!(report.features_total, 100, "manifest feature inventory count");
         assert_eq!(report.scenarios_total, 76, "manifest scenario inventory count");
         assert_eq!(report.recordings_total, 81, "manifest recording inventory count");
         assert_eq!(
@@ -1524,7 +1526,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 99, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 100, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1977,6 +1979,10 @@ mod tests {
                     &"messages.request.degrade_mid_conversation_system".to_owned(),
                     &vec!["messages/degrade-features".to_owned()]
                 ),
+                (
+                    &"responses.chat.stream_obfuscation".to_owned(),
+                    &vec!["responses/chat-basic-stream".to_owned()]
+                ),
             ]
         );
         for feature in &manifest.features[0..2] {
@@ -2147,7 +2153,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)],
         );
-        for feature in &manifest.features[63..99] {
+        for feature in &manifest.features[63..100] {
             assert_eq!(
                 feature
                     .providers
@@ -2665,7 +2671,7 @@ mod tests {
         assert_eq!(responses_chat_stream.id, "responses/chat-basic-stream");
         assert_eq!(
             responses_chat_stream.description,
-            "Streaming OpenAI Responses request translated to Chat Completions SSE."
+            "Streaming OpenAI Responses request translated to Chat Completions SSE with obfuscation enabled."
         );
         assert_eq!(responses_chat_stream.protocol, InferenceProtocol::OpenaiResponses);
         assert_eq!(
@@ -2675,7 +2681,11 @@ mod tests {
         assert_eq!(responses_chat_stream.upstream_authority, "127.0.0.1:3001");
         assert_eq!(
             responses_chat_stream.features,
-            ["responses.chat.request", "responses.chat.response.text"]
+            [
+                "responses.chat.request",
+                "responses.chat.response.text",
+                "responses.chat.stream_obfuscation"
+            ]
         );
         assert_eq!(responses_chat_stream.turns.len(), 1);
         let turn = &responses_chat_stream.turns[0];
@@ -2693,7 +2703,8 @@ mod tests {
         assert_eq!(value["input"], "Say hello in one sentence.");
         assert_eq!(value["store"], false);
         assert_eq!(value["stream"], true);
-        assert_eq!(value.as_object().map(serde_json::Map::len), Some(4));
+        assert_eq!(value["stream_options"]["include_obfuscation"], true);
+        assert_eq!(value.as_object().map(serde_json::Map::len), Some(5));
         assert_eq!(
             turn.expect.client_sse_events,
             [
