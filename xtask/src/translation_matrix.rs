@@ -350,12 +350,18 @@ impl Checkout {
                 .map(|found| found[1].to_owned())
                 .collect();
 
-        let cargo = fs::read_to_string(root.join("Cargo.toml")).expect("failed to read workspace Cargo.toml");
-        let version = regex::Regex::new(r#"praxis-protocol\s*=\s*\{[^}]*version\s*=\s*"([^"]+)""#)
-            .expect("dependency pattern is valid")
-            .captures(&cargo)
-            .expect("workspace Cargo.toml pins praxis-protocol")[1]
-            .to_owned();
+        let lock = fs::read_to_string(root.join("Cargo.lock")).expect("failed to read workspace Cargo.lock");
+        let lock: toml::Table = toml::from_str(&lock).expect("failed to parse workspace Cargo.lock");
+        let version = lock
+            .get("package")
+            .and_then(toml::Value::as_array)
+            .and_then(|packages| {
+                packages
+                    .iter()
+                    .find(|package| package.get("name").and_then(toml::Value::as_str) == Some(PROTOCOL_CRATE))
+            })
+            .and_then(|package| package.get("version").and_then(toml::Value::as_str))
+            .expect("workspace Cargo.lock pins praxis-proxy-protocol");
 
         Self {
             root,
