@@ -269,8 +269,8 @@ mod tests {
         let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
         assert_eq!(
             filter.request_body_access(),
-            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional),
-            "body access should delegate to inner"
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Required),
+            "body access should delegate to the required body inspector"
         );
         assert_eq!(
             filter.request_body_mode(),
