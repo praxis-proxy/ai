@@ -177,9 +177,7 @@ async fn nested_model_keys_do_not_count_as_repeats() {
         "single top-level model releases"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_chat_completions_request.model")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_chat_completions_request.model"),
         Some("gpt-4"),
         "the top-level model is published"
     );

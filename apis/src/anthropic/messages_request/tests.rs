@@ -279,9 +279,7 @@ async fn nested_model_keys_do_not_count_as_repeats() {
     let (action, ctx) = run_with(filter.as_ref(), &request, Some(&raw)).await;
     assert!(matches!(action, FilterAction::Release));
     assert_eq!(
-        ctx.filter_metadata
-            .get("anthropic_messages_request.model")
-            .map(String::as_str),
+        ctx.filter_metadata.get("anthropic_messages_request.model"),
         Some("claude-opus-4-8")
     );
 }

@@ -1593,9 +1593,7 @@ async fn nested_model_keys_do_not_count_as_repeats() {
 
     assert!(matches!(action, FilterAction::Release));
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_request.model")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_request.model"),
         Some("gpt-4.1")
     );
 }
