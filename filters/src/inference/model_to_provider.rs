@@ -19,8 +19,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_ai_apis::{
-    MODEL_PROVIDER_CLIENT_MODEL_METADATA,
-    RecordAiMetadata as _,
+    MODEL_PROVIDER_CLIENT_MODEL_METADATA, RecordAiMetadata as _,
     json_body::replace_json_body,
     model_field::{self, ModelScan},
 };

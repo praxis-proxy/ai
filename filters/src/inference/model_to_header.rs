@@ -467,7 +467,8 @@ mod tests {
             );
             assert!(ctx.extra_request_headers.is_empty(), "nothing is promoted: {json}");
             assert!(
-                ctx.filter_metadata.get(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL)
+                ctx.filter_metadata
+                    .get(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL)
                     .is_none(),
                 "no model metadata is published: {json}"
             );
