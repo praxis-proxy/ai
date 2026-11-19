@@ -38,9 +38,11 @@ fn file_service_error_mapping_keeps_client_outcomes() {
         FileServiceError::from(FileRegistryError::InvalidCursor),
         FileServiceError::InvalidInput(message) if message.contains("after")
     ));
+    // A store limit error has no reservation context. The upload session
+    // classifies its bound before passing the chunk to the writer.
     assert!(matches!(
         FileServiceError::from(FileStoreError::UploadTooLarge),
-        FileServiceError::UploadTooLarge
+        FileServiceError::Store(FileStoreError::UploadTooLarge)
     ));
 
     // A registry state conflict is internal until the service decides otherwise.

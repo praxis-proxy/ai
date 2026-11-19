@@ -4,7 +4,8 @@
 //! OpenAI Files API family.
 //!
 //! With `openai-files`, this module also exposes the service, metadata
-//! registry, and byte-store contracts used by the local implementation.
+//! registry, and byte-store contracts for a local implementation. The default
+//! service is currently a placeholder.
 
 #[cfg(feature = "openai-files")]
 pub(crate) mod contracts;
@@ -25,7 +26,7 @@ pub use contracts::{FilePurpose, InvalidField, ListOrder as FileListOrder, Uploa
 #[cfg(feature = "openai-files")]
 pub use model::{
     FileCleanupCandidate, FileCleanupState, FileCompletion, FileExpiration, FileInfo, FileList, FilePage, FileState,
-    FileStream, FileUploadMetadata, PendingFile, StoredFile,
+    FileStream, FileUploadLimits, FileUploadMetadata, PendingFile, StoredFile,
 };
 #[cfg(feature = "openai-files")]
 pub use openapi::implementation_openapi_json;

@@ -32,6 +32,16 @@ pub struct FileUploadMetadata {
     pub expires_after: Option<FileExpiration>,
 }
 
+/// Limits used when atomically reserving capacity for a new upload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileUploadLimits {
+    /// Maximum bytes allowed for one file.
+    pub max_file_size: u64,
+    /// Maximum bytes charged to the owner's project, including pending
+    /// reservations and all files whose physical bytes have not been deleted.
+    pub project_quota: u64,
+}
+
 /// Metadata of a completed, client-visible file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileInfo {
@@ -76,9 +86,9 @@ pub struct FilePage {
 /// Registry states eligible for physical cleanup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileCleanupState {
-    /// A failed upload that may need physical cleanup.
+    /// A failed upload whose reservation remains charged until cleanup.
     Failed,
-    /// A hidden file awaiting physical cleanup.
+    /// A hidden file whose actual bytes remain charged until cleanup.
     DeletionPending,
 }
 
@@ -86,16 +96,19 @@ pub enum FileCleanupState {
 /// Only `Ready` is visible to HTTP reads and lists.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileState {
-    /// Metadata is committed and the byte stream is still being written.
+    /// Metadata and a byte reservation are committed; bytes may still be written.
     Pending,
-    /// The byte write and metadata completion both succeeded.
+    /// The byte write and metadata completion succeeded; actual bytes are charged.
     Ready,
-    /// A failed upload or hidden file awaits physical cleanup.
+    /// A failed upload or hidden file retains its charge until registry cleanup
+    /// commits after physical deletion.
     Cleanup(FileCleanupState),
 }
 
 /// Metadata inserted before any upload bytes are written.
 /// Purpose and expiration are recorded only when the upload completes.
+/// [`super::FileRegistry::create_pending`] persists a reservation alongside
+/// this metadata and returns its byte limit to the upload session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingFile {
     /// New public file identifier, unique across all owners.
@@ -111,6 +124,7 @@ pub struct PendingFile {
 }
 
 /// Final metadata and actual byte count committed with a completed upload.
+/// The byte count must not exceed the pending file's reservation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileCompletion {
     /// Bytes persisted in the file store.
@@ -130,7 +144,9 @@ pub struct StoredFile {
     pub storage_key: String,
 }
 
-/// A durable cleanup task returned to a background reaper.
+/// A durable cleanup task returned to a background reaper. Its reservation or
+/// actual-byte charge is released only after byte deletion and a successful
+/// [`super::FileRegistry::complete_cleanup`] transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileCleanupCandidate {
     /// Public file identifier.

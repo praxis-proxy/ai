@@ -24,10 +24,11 @@ pub enum FileServiceError {
     /// A request field is invalid.
     #[error("invalid file request: {0}")]
     InvalidInput(String),
-    /// The upload exceeded the per-file size limit.
+    /// The upload crossed its reserved bound at the per-file size limit.
     #[error("file exceeds the upload size limit")]
     UploadTooLarge,
-    /// The owner's project has no remaining file capacity.
+    /// No capacity could be reserved, or the upload crossed a reservation
+    /// smaller than the per-file size limit.
     #[error("project file storage limit exceeded")]
     QuotaExceeded,
     /// Reading the incoming HTTP upload body failed.
@@ -36,7 +37,8 @@ pub enum FileServiceError {
     /// A metadata operation failed.
     #[error("file registry error")]
     Registry(#[source] FileRegistryError),
-    /// A byte-store operation failed.
+    /// A byte-store operation failed or rejected its writer bound. The upload
+    /// session classifies expected bound violations using its reservation.
     #[error("file store error")]
     Store(#[source] FileStoreError),
 }
@@ -53,10 +55,7 @@ impl From<FileRegistryError> for FileServiceError {
 
 impl From<FileStoreError> for FileServiceError {
     fn from(error: FileStoreError) -> Self {
-        match error {
-            FileStoreError::UploadTooLarge => Self::UploadTooLarge,
-            other => Self::Store(other),
-        }
+        Self::Store(error)
     }
 }
 
@@ -70,33 +69,49 @@ pub struct FileDownload {
 }
 
 /// An upload whose file bytes can arrive before its other multipart fields.
-/// The session owns the pending file until completion or abandonment.
+/// The session owns the pending file and its durable reservation until
+/// completion or abandonment.
 #[async_trait]
 pub trait FileUploadSession: Send {
-    /// Move one file chunk to the byte-store writer. The writer applies
-    /// backpressure and enforces the upload size limit as chunks arrive.
+    /// Before passing a chunk to the byte-store writer, reject it if the
+    /// cumulative byte count would exceed the reservation `R`. Return
+    /// [`FileServiceError::QuotaExceeded`] when `R < max_file_size`, otherwise
+    /// [`FileServiceError::UploadTooLarge`]. This classification depends on the
+    /// reserved bound even if one chunk crosses both limits. Never forward a
+    /// chunk that exceeds `R`; the writer also enforces `R` as a safety bound
+    /// and applies backpressure. When `R < max_file_size`, earlier chunks may
+    /// already have been written before a later chunk reaches the quota bound.
     ///
     /// # Errors
     ///
-    /// Returns [`FileServiceError`] for an oversized upload or a byte-store
-    /// failure. The pending file must remain eligible for cleanup on failure.
+    /// Returns the bound-specific error described above or
+    /// [`FileServiceError::Store`] for a byte-store failure. Body-read failures
+    /// remain [`FileServiceError::Stream`] at the handler boundary. On failure,
+    /// stop the writer and arrange byte deletion while retaining the registry
+    /// reservation until cleanup is confirmed.
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), FileServiceError>;
 
-    /// Validate metadata, finish the byte write, and commit the file with its
-    /// actual byte count. The handler calls this after parsing all form fields.
-    /// Batch uploads without an explicit expiration default to 30 days from
-    /// the pending file's creation time.
+    /// Validate the complete form, finish the byte write, then commit the
+    /// file with the writer's actual byte count `A <= R`. The registry replaces
+    /// the reservation `R` with `A` without a new quota decision. The handler
+    /// calls this after parsing all form fields. Batch uploads without an
+    /// explicit expiration default to 30 days from the pending file's creation
+    /// time.
     ///
     /// # Errors
     ///
     /// Returns [`FileServiceError`] for invalid metadata or a failed byte or
-    /// registry operation. An unsuccessful upload must remain eligible for
-    /// cleanup. Ambiguous registry completion must be reconciled before
-    /// marking the pending file failed.
+    /// registry operation. On failure, stop the writer where possible and
+    /// arrange byte deletion. Retain the reservation until cleanup is
+    /// confirmed. Ambiguous registry completion must be reconciled before
+    /// marking the pending file failed; a successful retry returns the ready
+    /// file when all completion fields match.
     async fn finish(self: Box<Self>, metadata: FileUploadMetadata) -> Result<FileInfo, FileServiceError>;
 
-    /// Abandon an upload after a malformed form or body-read error. A session
-    /// dropped on cancellation can instead be recovered by the reaper.
+    /// Abandon an upload after a malformed form or body-read error. Stop the
+    /// writer, arrange byte deletion, and retain the reservation until cleanup
+    /// is confirmed. A session dropped on cancellation can instead be
+    /// recovered by the reaper.
     ///
     /// # Errors
     ///
@@ -106,26 +121,34 @@ pub trait FileUploadSession: Send {
 
 /// Coordinates the metadata registry and byte store for HTTP handlers.
 ///
-/// An upload first inserts a pending registry entry without purpose or
-/// expiration, streams file bytes to the byte store, then atomically records
-/// validated metadata and the actual byte count or marks the entry failed.
-/// Pending and failed entries are never returned by read methods. A delete
-/// only makes the registry marker durable and may signal a reaper; it does not
-/// wait for physical byte deletion.
+/// An upload first inserts a pending registry entry and atomically reserves
+/// `R = min(max_file_size, remaining_quota)` without purpose or expiration.
+/// It opens a byte-store writer limited to `R`, checks each chunk against that
+/// bound before writing, then atomically replaces `R` with the actual byte
+/// count after the writer publishes the file. Pending and failed entries are
+/// never returned by read methods. Failed uploads and hidden or expired files
+/// keep their quota charge until their bytes are deleted. A delete only makes
+/// the registry marker durable and may signal a reaper; it does not wait for
+/// physical byte deletion.
 /// Implementations must bound the time an upload can remain active so a
 /// scheduled reaper can safely recover abandoned pending entries.
 #[async_trait]
 pub trait FileService: Send + Sync {
     /// Start an upload before all multipart fields are known. The filename
     /// comes from the file part's headers and is never used as a storage key.
+    /// Pass the configured per-file and project limits to the registry and
+    /// retain its durable reservation `R` in the returned session. Reject
+    /// zero capacity before opening a writer; otherwise open it with `R` as
+    /// its limit.
     ///
     /// # Errors
     ///
-    /// Returns [`FileServiceError`] for invalid input or a registry or store
-    /// failure while creating the pending upload. If opening the store writer
-    /// fails after the pending entry is inserted, mark that entry failed. The
-    /// returned session owns its state so the handler can retain it across body
-    /// callbacks.
+    /// Returns [`FileServiceError::QuotaExceeded`] if no capacity can be
+    /// reserved, or another [`FileServiceError`] for invalid input or a
+    /// registry or store failure. If opening the store writer fails after the
+    /// pending entry is inserted, mark that entry failed and arrange byte
+    /// deletion; retain its reservation until cleanup is confirmed. The
+    /// returned session owns its state across body callbacks.
     async fn begin_upload(
         &self,
         owner: &StateOwner,
@@ -157,7 +180,8 @@ pub trait FileService: Send + Sync {
     /// another [`FileServiceError`] if metadata or byte storage is unavailable.
     async fn content(&self, owner: &StateOwner, id: &str) -> Result<FileDownload, FileServiceError>;
 
-    /// Mark a completed file for asynchronous deletion.
+    /// Mark a completed file for asynchronous deletion. Its actual bytes stay
+    /// charged to the project until physical deletion is confirmed.
     ///
     /// Returns only after the marker is durable. The caller may then return a
     /// successful delete response; a signal can wake the reaper, while a
