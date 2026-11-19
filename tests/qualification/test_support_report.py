@@ -11,6 +11,8 @@ import unittest
 
 
 SCRIPT = Path(__file__).resolve().parents[2] / ".github/scripts/support_report.py"
+# The translation matrix published at v0.11.0, which release recovery reads.
+V0_11_0_MATRIX = Path(__file__).resolve().parent / "translation-matrix-v0.11.0.fixture.json"
 spec = importlib.util.spec_from_file_location("support_report", SCRIPT)
 support = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(support)
@@ -360,6 +362,20 @@ class SupportReportTest(unittest.TestCase):
                 self.assertIn("Anthropic -> CC/reasoning", str(raised.exception))
                 self.assertIn("shared", str(raised.exception))
                 self.assertFalse(Path(directory, "out").exists())
+
+    def test_v0_11_0_placeholders_resolve_to_filed_issues(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tagged = json.loads(V0_11_0_MATRIX.read_text(encoding="utf-8"))
+            write_fixtures(directory, matrix_value=tagged)
+            report, markdown = generate(arguments(directory, tag="v0.11.0"))
+
+        gaps = [gap for gap in report["known_gaps"] if gap["source"] == "translation"]
+        self.assertEqual(len(gaps), 22)
+        for gap in gaps:
+            self.assertRegex(gap["blocker"], support.BLOCKER_ISSUE)
+        self.assertNotIn("TODO-ISSUE", json.dumps(report))
+        self.assertNotIn("TODO-ISSUE", markdown)
+        self.assertIn("https://github.com/praxis-proxy/praxis/issues/1564", markdown)
 
     def test_verify_rejects_wrong_commit_and_missing_markers(self):
         with tempfile.TemporaryDirectory() as directory:

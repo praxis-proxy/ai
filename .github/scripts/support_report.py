@@ -38,6 +38,46 @@ END = "<!-- praxis:support-report:end -->"
 # Release notes publish each translation gap's blocker verbatim, so it must
 # name a tracking issue rather than placeholder text.
 BLOCKER_ISSUE = re.compile(r"https://github\.com/praxis-proxy/(ai|praxis)/issues/[1-9][0-9]*")
+# Migration debt: v0.11.0 was tagged with these placeholders before the issues
+# were filed. Release recovery runs this script against the tagged matrix, so
+# resolve exactly these strings to their filed issues. Do not extend this table:
+# `cargo xtask translation-matrix` rejects placeholders in newer matrices.
+V0_11_0_PLACEHOLDER_BLOCKERS = {
+    "TODO-ISSUE add a per-message field allowlist to the Bedrock translator":
+        "https://github.com/praxis-proxy/ai/issues/2053",
+    "TODO-ISSUE converge on one OpenAI error envelope builder":
+        "https://github.com/praxis-proxy/ai/issues/2056",
+    "TODO-ISSUE emit terminal events at end-of-stream":
+        "https://github.com/praxis-proxy/ai/issues/2044",
+    "TODO-ISSUE format the 413 produced by the body-limit filter":
+        "https://github.com/praxis-proxy/praxis/issues/1564",
+    "TODO-ISSUE map Bedrock cache token counters":
+        "https://github.com/praxis-proxy/ai/issues/2054",
+    "TODO-ISSUE map Gemini cachedContentTokenCount":
+        "https://github.com/praxis-proxy/ai/issues/2051",
+    "TODO-ISSUE map Gemini thoughtsTokenCount":
+        "https://github.com/praxis-proxy/ai/issues/1755",
+    "TODO-ISSUE pick one max-tokens precedence across translators":
+        "https://github.com/praxis-proxy/ai/issues/2057",
+    "TODO-ISSUE populate or null message_start usage":
+        "https://github.com/praxis-proxy/ai/issues/2046",
+    "TODO-ISSUE preserve or document Azure content-filter metadata":
+        "https://github.com/praxis-proxy/ai/issues/2052",
+    "TODO-ISSUE preserve or reject hosted-tool history on continuation":
+        "https://github.com/praxis-proxy/ai/issues/2048",
+    "TODO-ISSUE reject or honor response_format.json_schema.strict":
+        "https://github.com/praxis-proxy/ai/issues/2050",
+    "TODO-ISSUE reject or surface Bedrock reasoningContent and citations":
+        "https://github.com/praxis-proxy/ai/issues/2055",
+    "TODO-ISSUE reject or surface reasoning_content":
+        "https://github.com/praxis-proxy/ai/issues/2047",
+    "TODO-ISSUE reject untranslatable Responses operations at the edge":
+        "https://github.com/praxis-proxy/ai/issues/2049",
+    "TODO-ISSUE surface mid-stream upstream error objects":
+        "https://github.com/praxis-proxy/ai/issues/2045",
+    "TODO-ISSUE systematic handling of reasoning and cache tokens across translators":
+        "https://github.com/praxis-proxy/ai/issues/2058",
+}
 
 TRANSLATION_STATUSES = {
     "native", "passthrough", "translated", "translated-lossy",
@@ -149,6 +189,16 @@ def harness_pins(root):
         rows.append({"client": client, "api": api, "version": version,
                      "manifest": str(manifest.relative_to(root))})
     return rows
+
+
+def resolve_placeholder_blockers(matrix):
+    gaps = list(matrix.get("cross_surface_gaps") or [])
+    for surface in matrix.get("surfaces") or []:
+        gaps.extend(surface.get("cells") or [])
+    for gap in gaps:
+        blocker = gap.get("blocker")
+        if blocker in V0_11_0_PLACEHOLDER_BLOCKERS:
+            gap["blocker"] = V0_11_0_PLACEHOLDER_BLOCKERS[blocker]
 
 
 def translation_section(matrix):
@@ -396,6 +446,7 @@ def build(args):
     if missing:
         raise SystemExit("support report inputs missing or invalid: " + ", ".join(missing))
 
+    resolve_placeholder_blockers(matrix)
     translation = translation_section(matrix)
     live = live_validation(qualification, args.sha)
     # A qualification report from another checkout describes that checkout, not
