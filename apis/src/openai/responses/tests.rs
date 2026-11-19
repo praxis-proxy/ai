@@ -7,6 +7,7 @@
 //! managed-path policy) is covered in `request/tests.rs`, the module that owns
 //! that logic.
 
+#[cfg(feature = "openai-responses")]
 use bytes::Bytes;
 
 #[cfg(feature = "openai-responses")]

@@ -202,6 +202,7 @@ pub use tool_parse::ToolParseFilter;
 )]
 mod tests;
 
+#[cfg(feature = "openai-responses")]
 use std::borrow::Cow;
 #[cfg(feature = "openai-responses")]
 use std::io;
