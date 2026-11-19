@@ -382,3 +382,84 @@ async fn the_endpoint_decides_the_published_format() {
         Some("anthropic_messages")
     );
 }
+
+// -----------------------------------------------------------------------------
+// MCP Connector Detection
+// -----------------------------------------------------------------------------
+
+/// Run a body that extends [`anthropic_body`] with `extra` and return whether
+/// the MCP connector fact was published, asserting its three forms agree.
+async fn mcp_connector_published(extra: serde_json::Value) -> bool {
+    let filter = default_filter();
+    let request = create_request();
+    let mut body = anthropic_body();
+    for (key, value) in extra.as_object().unwrap() {
+        body[key] = value.clone();
+    }
+    let body = serde_json::to_vec(&body).unwrap();
+    let (action, ctx) = run_with(filter.as_ref(), &request, Some(&body)).await;
+    assert!(
+        matches!(action, FilterAction::Release),
+        "detection must not change the action"
+    );
+
+    let metadata = ctx.get_metadata(MCP_CONNECTOR_METADATA_KEY) == Some("true");
+    let result = ctx
+        .filter_results
+        .get("anthropic_messages_request")
+        .and_then(|results| results.get("mcp_connector"))
+        == Some("true");
+    let state = ctx
+        .extensions
+        .get::<AnthropicMessagesState>()
+        .unwrap()
+        .uses_mcp_connector;
+    assert_eq!(metadata, state, "metadata and state must agree");
+    assert_eq!(result, state, "filter result and state must agree");
+    state
+}
+
+#[tokio::test]
+async fn detects_non_empty_mcp_servers() {
+    assert!(
+        mcp_connector_published(json!({
+            "mcp_servers": [{"type": "url", "url": "https://mcp.example.com/sse", "name": "example"}],
+        }))
+        .await
+    );
+}
+
+#[tokio::test]
+async fn detects_mcp_toolset_tool() {
+    assert!(
+        mcp_connector_published(json!({
+            "tools": [
+                {"name": "lookup", "input_schema": {"type": "object"}},
+                {"type": "mcp_toolset", "mcp_server_name": "example"},
+            ],
+        }))
+        .await
+    );
+}
+
+#[tokio::test]
+async fn detects_malformed_mcp_servers_as_connector_intent() {
+    assert!(mcp_connector_published(json!({"mcp_servers": {"name": "example"}})).await);
+}
+
+#[tokio::test]
+async fn empty_or_null_mcp_servers_is_not_the_connector() {
+    assert!(!mcp_connector_published(json!({"mcp_servers": []})).await);
+    assert!(!mcp_connector_published(json!({"mcp_servers": null})).await);
+}
+
+#[tokio::test]
+async fn ordinary_tools_are_not_the_connector() {
+    assert!(
+        !mcp_connector_published(json!({
+            "tools": [{"name": "mcp__example__lookup", "input_schema": {"type": "object"}}],
+        }))
+        .await,
+        "a client-side tool named like an MCP tool (Claude Code) is an ordinary tool"
+    );
+}

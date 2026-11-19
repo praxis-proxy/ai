@@ -1684,3 +1684,86 @@ async fn object_input_extracts_and_synchronizes_both_histories() {
         "the client snapshot must stay unchanged"
     );
 }
+
+#[tokio::test]
+async fn escaped_document_output_limit_preserves_body_and_budget_state() {
+    for budgeted in [false, true] {
+        let text = format!("{}\n\"quoted\"\t\\café ☕", "\u{0000}".repeat(256));
+        let original = responses_body(&serde_json::json!([
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_file", "filename": "notes.txt", "file_data": text_file_data(&text)}
+            ]}
+        ]));
+        let mut expected = original.clone();
+        expected["input"][0]["content"][0] = serde_json::json!({
+            "type": "input_text", "text": format!("[Source: notes.txt]\n{text}")
+        });
+        let expected_bytes = serde_json::to_vec(&expected).unwrap();
+        let raw = Bytes::from(serde_json::to_vec(&original).unwrap());
+        assert!(
+            expected_bytes.len() > raw.len(),
+            "JSON escaping must expand the extracted document"
+        );
+        for limit in [expected_bytes.len() - 1, expected_bytes.len(), expected_bytes.len() + 1] {
+            let mut filter = make_filter();
+            filter.config.max_rewritten_body_bytes = limit;
+            let req = make_request(Method::POST, "/v1/responses");
+            let mut ctx = make_filter_context(&req);
+            set_responses_metadata(&mut ctx);
+            if budgeted {
+                install_document_budget(&mut ctx, &original, 1_048_576);
+            }
+            let initial_budget = ctx.extensions.get::<ResponsesState>().and_then(|s| s.simple_budget);
+            let mut body = Some(raw.clone());
+            let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+            if limit < expected_bytes.len() {
+                let FilterAction::Reject(rejection) = action else {
+                    panic!("oversized escaped output must reject");
+                };
+                assert_eq!(rejection.status, 413);
+                let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+                assert_eq!(error["error"]["type"], "invalid_request_error");
+                assert_eq!(
+                    error["error"]["message"],
+                    format!(
+                        "rewritten request body ({} bytes) exceeds maximum ({limit} bytes)",
+                        expected_bytes.len()
+                    )
+                );
+                assert_eq!(body.as_ref().unwrap(), &raw);
+                if budgeted {
+                    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+                    assert_eq!(
+                        state.simple_budget.unwrap().remaining_bytes().unwrap(),
+                        initial_budget.unwrap().remaining_bytes().unwrap()
+                    );
+                    assert_eq!(state.messages[0]["content"], original["input"][0]["content"]);
+                }
+            } else {
+                assert!(matches!(action, FilterAction::Continue));
+                assert_eq!(body.as_ref().unwrap().as_ref(), expected_bytes);
+            }
+        }
+    }
+}
+
+#[test]
+fn oversized_document_rewrite_does_not_allocate_serialized_output() {
+    let parsed = serde_json::json!({"input": "\u{0000}".repeat(1_048_576)});
+    let original = Bytes::from_static(b"original body");
+    let mut body = Some(original.clone());
+    // Exercise the production rewrite boundary. A post-allocation size check
+    // allocates megabytes here; the preflight only allocates the small error.
+    let allocations = allocation_counter::measure(|| {
+        let action = rewrite_body(&mut body, &parsed, 1024, "openai_doc_extract").unwrap();
+        let Some(FilterAction::Reject(rejection)) = action else {
+            panic!("oversized rewrite must reject");
+        };
+        assert_eq!(rejection.status, 413);
+    });
+    assert!(
+        allocations.bytes_total < 16_384,
+        "oversized output was allocated: {allocations:?}"
+    );
+    assert_eq!(body.unwrap(), original);
+}

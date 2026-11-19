@@ -1,0 +1,192 @@
+{
+  "version": 1,
+  "scenario_id": "messages/named-tool-stop-stream",
+  "protocol": "anthropic_messages",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-named-tool-stop-model",
+    "source_id": "controlled-named-tool-stop-stream"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "call_1": "call_recorded_0002",
+      "chatcmpl-named-tool-stop": "chatcmpl-recorded-0003",
+      "msg_18e704e4efef1a81": "msg_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 64,
+              "messages": [
+                {
+                  "content": "Use the weather tool.",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-named-tool-stop-model",
+              "stream": true,
+              "tool_choice": {
+                "name": "get_weather",
+                "type": "tool"
+              },
+              "tools": [
+                {
+                  "description": "Get the weather for a city.",
+                  "input_schema": {
+                    "properties": {},
+                    "type": "object"
+                  },
+                  "name": "get_weather"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": "message_start",
+                "data": "{\"message\":{\"container\":null,\"content\":[],\"id\":\"msg_recorded_0001\",\"model\":\"synthetic-named-tool-stop-model\",\"role\":\"assistant\",\"stop_details\":null,\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"cache_creation\":null,\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":null,\"inference_geo\":null,\"input_tokens\":0,\"output_tokens\":0,\"output_tokens_details\":null,\"server_tool_use\":null,\"service_tier\":null}},\"type\":\"message_start\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_start",
+                "data": "{\"content_block\":{\"caller\":{\"type\":\"direct\"},\"id\":\"call_recorded_0002\",\"input\":{},\"name\":\"get_weather\",\"type\":\"tool_use\"},\"index\":0,\"type\":\"content_block_start\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"partial_json\":\"{}\",\"type\":\"input_json_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_stop",
+                "data": "{\"index\":0,\"type\":\"content_block_stop\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "message_delta",
+                "data": "{\"delta\":{\"container\":null,\"stop_details\":null,\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"type\":\"message_delta\",\"usage\":{\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":null,\"input_tokens\":10,\"output_tokens\":5,\"output_tokens_details\":null,\"server_tool_use\":null}}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "message_stop",
+                "data": "{\"type\":\"message_stop\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": false
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_completion_tokens": 64,
+              "messages": [
+                {
+                  "content": "Use the weather tool.",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-named-tool-stop-model",
+              "stream": true,
+              "stream_options": {
+                "include_usage": true
+              },
+              "tool_choice": {
+                "function": {
+                  "name": "get_weather"
+                },
+                "type": "function"
+              },
+              "tools": [
+                {
+                  "function": {
+                    "description": "Get the weather for a city.",
+                    "name": "get_weather",
+                    "parameters": {
+                      "properties": {},
+                      "type": "object"
+                    }
+                  },
+                  "type": "function"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"arguments\":\"{}\",\"name\":\"get_weather\"},\"id\":\"call_recorded_0002\",\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0003\",\"model\":\"synthetic-named-tool-stop-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"created\":0,\"id\":\"chatcmpl-recorded-0003\",\"model\":\"synthetic-named-tool-stop-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-recorded-0003\",\"model\":\"synthetic-named-tool-stop-model\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":5,\"prompt_tokens\":10,\"total_tokens\":15}}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": true
+          }
+        }
+      }
+    }
+  ]
+}

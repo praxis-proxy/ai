@@ -14,8 +14,11 @@
 //! reconciles each call in place (status, results, citations, and a private
 //! model-context bridge for the next round). It never parses the response body
 //! and never decides whether another round runs. Search context remains private
-//! to the model round trip; completed call items and citations are assembled by
-//! the owner into the final public Responses API object.
+//! to the model: clients see it only through the opt-in
+//! `file_search_call.results` include, while stored responses retain the private
+//! bridge so `previous_response_id` continuations and compaction replay it
+//! (#2036). Completed call items and citations are assembled by the owner into
+//! the final public Responses API object.
 
 pub(crate) mod citations;
 pub(crate) mod client;
@@ -56,7 +59,7 @@ use crate::{
         responses::{
             bounded_json_size,
             error::responses_error_rejection,
-            state::{DispatchFailure, FileSearchAssignment, MAX_CITATION_FILES, ResponsesState},
+            state::{DispatchFailure, FileSearchAssignment, ResponsesState},
         },
         translation::chat_completions::{
             TranslationError, responses_file_search_tool_choice_lowering, synthesized_file_search_tool_responses,
@@ -78,8 +81,10 @@ const MAX_QUERIES_PER_CALL: usize = 64;
 /// Maximum formatted context retained across one continuation execution.
 ///
 /// This remains well below the 64 MiB proxy request ceiling after bridge
-/// metadata is added. Synthetic bridge messages are used only for the next
-/// inference round and are not persisted into rehydration history.
+/// metadata is added. Synthetic bridge messages feed the next inference round
+/// and, when the exchange is stored, share their payloads with the durable
+/// rehydration history, so this cap also bounds the context each stored
+/// response retains.
 const MAX_TOTAL_MODEL_CONTEXT_BYTES: usize = 2_097_152;
 
 /// Wire, decoder, decoded result, and formatting owners can overlap during
@@ -213,7 +218,7 @@ impl FileSearchDispatchFilter {
                 truncated,
             } = BridgeBudget {
                 known_citation_files: &state.citation_files,
-                max_new_citation_files: MAX_CITATION_FILES.saturating_sub(state.citation_files.len()),
+                max_new_citation_files: state.new_citation_file_slots(),
                 remaining_model_bytes,
                 source_item,
                 output_index: call.output_index,
@@ -282,12 +287,9 @@ impl FileSearchDispatchFilter {
         // function_call_output pairs) to `messages`. The loop owner already routed
         // this round's reasoning items into `messages`; a hosted file_search_call
         // is not valid OpenResponses input (issue #808), so no output item is
-        // replayed here. Bridges are next-round-only and never persisted (see
-        // `MAX_TOTAL_MODEL_CONTEXT_BYTES`).
+        // replayed here.
         for bridge in bridges {
-            let result_start = state.messages.len();
-            state.messages.extend(bridge);
-            state.mark_local_tool_results_from(result_start);
+            state.append_local_tool_results(bridge);
         }
         Ok(retained_charge)
     }

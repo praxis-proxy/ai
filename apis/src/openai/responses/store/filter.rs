@@ -64,7 +64,10 @@ use tracing::{debug, trace, warn};
 
 use super::{
     super::{
-        DEFAULT_STORE_NAME, bound_body_outcome, error::responses_error_rejection, request_input::input_echo_value,
+        DEFAULT_STORE_NAME, bound_body_outcome,
+        error::responses_error_rejection,
+        file_search_dispatch::citations::{persist_citation_files, strip_stored_citation_files},
+        request_input::input_echo_value,
         state::ResponsesState,
     },
     config::{ResponseStoreConfig, validate_config},
@@ -476,7 +479,12 @@ fn build_streaming_record(
     request_input: Option<Value>,
 ) -> Option<ResponseRecord> {
     let state = ctx.extensions.get::<ResponsesState>()?;
-    let response_object = state.response_object.clone();
+    let mut response_object = state.response_object.clone();
+    persist_citation_files(
+        &mut response_object,
+        &state.citation_files,
+        &state.restored_citation_file_ids,
+    );
     // The durable record owns independent JSON. Materialize shared values only
     // at this persistence boundary, not while reading or projecting history.
     let state_messages = (state.captures_persistence_history() && !state.persisted_messages.is_empty())
@@ -502,8 +510,13 @@ fn build_buffered_record(
     owner: StateOwner,
     request_input: Option<Value>,
 ) -> Option<ResponseRecord> {
-    let json = decode_response_body(bytes)?;
+    let mut json = decode_response_body(bytes)?;
     let state = ctx.extensions.get::<ResponsesState>();
+    // Only the gateway writes the citation key; never store one from upstream.
+    strip_stored_citation_files(&mut json);
+    if let Some(state) = state {
+        persist_citation_files(&mut json, &state.citation_files, &state.restored_citation_file_ids);
+    }
     // The durable record owns independent JSON. Materialize shared values only
     // at this persistence boundary, not while reading or projecting history.
     let state_messages = state
@@ -1272,7 +1285,7 @@ impl ResponseStoreFilter {
     ///
     /// With `stream=true` this serves an incremental SSE replay of the stored
     /// event log ([`serve_replay`]); otherwise it returns the stored response
-    /// object as JSON, unchanged.
+    /// object as JSON, minus gateway-private continuation metadata.
     async fn handle_get_response(&self, ctx: &HttpFilterContext<'_>, id: &str) -> FilterAction {
         let parsed = match parse_get_response_query(ctx.request.uri.query()) {
             Ok(parsed) => parsed,
@@ -1298,11 +1311,13 @@ impl ResponseStoreFilter {
         }
     }
 
-    /// Serve the stored response object as JSON, unchanged.
+    /// Serve the stored response object as JSON, minus gateway-private
+    /// continuation metadata.
     async fn serve_stored_json(store: &OwnerScopedResponseStore, id: &str) -> FilterAction {
         debug!(response_id = id, "retrieving stored response");
         match store.get_response(id).await {
-            Ok(Some(record)) => {
+            Ok(Some(mut record)) => {
+                strip_stored_citation_files(&mut record.response_object);
                 let body = serde_json::to_vec(&record.response_object).unwrap_or_default();
                 FilterAction::Reject(
                     Rejection::status(200)

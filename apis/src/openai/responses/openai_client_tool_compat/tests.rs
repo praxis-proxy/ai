@@ -2496,9 +2496,9 @@ fn namespace_description_is_folded_into_flattened_members() {
 
 #[test]
 fn namespace_without_description_is_rejected() {
-    // `NamespaceToolParam.description` is required (`minLength: 1`). A flattened
-    // member cannot recover the namespace grouping without it, so a namespace that
-    // omits its model-visible description fails closed rather than dropping it.
+    // `NamespaceToolParam.description` is required (no default). A flattened
+    // member cannot recover the namespace grouping without the field, so a
+    // namespace that omits it fails closed rather than dropping it.
     let mut state = ResponsesState::from_request_body(json!({
         "tools": [{
             "type": "namespace",
@@ -2522,21 +2522,47 @@ fn namespace_without_description_is_rejected() {
 }
 
 #[test]
-fn namespace_with_blank_description_is_rejected() {
-    // A whitespace-only description is not model-visible content and is treated the
-    // same as an omitted one.
-    let mut state = ResponsesState::from_request_body(json!({
-        "tools": [{
-            "type": "namespace",
-            "name": "git",
-            "description": "   ",
-            "tools": [{"type": "function", "name": "commit"}]
-        }],
-    }));
-    let action = filter()
-        .lower_request(&mut state, false, false)
-        .expect_err("a blank namespace description must fail closed");
-    assert_eq!(reject_parts(&action).0, 400);
+fn namespace_with_blank_description_lowers() {
+    // The pinned schema requires `description` as a string with no `minLength`,
+    // so empty and whitespace-only values are schema-valid. Lowering trims them
+    // and still folds the namespace grouping into each member.
+    for description in ["", "   "] {
+        let mut state = ResponsesState::from_request_body(json!({
+            "tools": [{
+                "type": "namespace",
+                "name": "git",
+                "description": description,
+                "tools": [{
+                    "type": "function",
+                    "name": "commit",
+                    "description": "Record changes.",
+                    "parameters": {"type": "object"}
+                }]
+            }],
+        }));
+        filter()
+            .lower_request(&mut state, false, false)
+            .unwrap_or_else(|_| panic!("blank description {description:?} must lower"));
+        let member = state.request_body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|tool| tool["name"] == "agentic_ns__git__commit")
+            .expect("function member");
+        let folded = member["description"].as_str().expect("description");
+        assert!(
+            folded.contains("Belongs to the `git` tool namespace."),
+            "blank namespace description still records the grouping: {folded}"
+        );
+        assert!(
+            folded.contains("Record changes."),
+            "the member's own description is retained: {folded}"
+        );
+        assert!(
+            !folded.contains("namespace: "),
+            "a blank namespace blurb must not leave an empty `: ` suffix: {folded}"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -5840,7 +5866,7 @@ fn discovered_custom_equivalent_descriptions_are_hoisted_once() {
 fn discovered_namespace_description_equivalent_is_hoisted_once() {
     // Fix B (namespace top-level): `namespace_header` trims the required description
     // before folding it into each member, so listings differing only by trailing
-    // whitespace on the namespace description lower identically and hoist once.
+    // whitespace — or by empty vs whitespace-only — lower identically and hoist once.
     assert_discovery_hoisted_once(
         json!({"type": "namespace", "name": "git", "description": "Git tools. ",
                "tools": [{"type": "function", "name": "commit", "parameters": {"type": "object"}}]}),
@@ -5848,6 +5874,24 @@ fn discovered_namespace_description_equivalent_is_hoisted_once() {
                "tools": [{"type": "function", "name": "commit", "parameters": {"type": "object"}}]}),
         "agentic_ns__git__commit",
         "namespace-description-trailing-space",
+    );
+    assert_discovery_hoisted_once(
+        json!({"type": "namespace", "name": "git", "description": "",
+               "tools": [{"type": "function", "name": "commit", "parameters": {"type": "object"}}]}),
+        json!({"type": "namespace", "name": "git", "description": "   ",
+               "tools": [{"type": "function", "name": "commit", "parameters": {"type": "object"}}]}),
+        "agentic_ns__git__commit",
+        "namespace-description-blank-equivalent",
+    );
+    // A schema-valid blank string must not share identity with a missing description:
+    // the missing twin rejects on lower, so silent dedup would depend on listing order.
+    assert_discovery_conflicts_both_orders(
+        json!({"type": "namespace", "name": "git", "description": "",
+               "tools": [{"type": "function", "name": "commit", "parameters": {"type": "object"}}]}),
+        json!({"type": "namespace", "name": "git",
+               "tools": [{"type": "function", "name": "commit", "parameters": {"type": "object"}}]}),
+        "git",
+        "namespace-blank-vs-missing-description",
     );
 }
 

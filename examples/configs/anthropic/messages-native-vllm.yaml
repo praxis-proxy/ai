@@ -44,6 +44,15 @@
 # header (for example `default_headers={"Authorization": "Basic ..."}`); the
 # SDK then sends it in place of its Bearer key.
 #
+# MCP connector: vLLM cannot execute Anthropic's server-side MCP connector
+# (`mcp_servers` and `mcp_toolset` tools), so the cluster declares
+# `application_provider: vllm` and `anthropic_messages_protocol`, placed after
+# `load_balancer` so it sees that selected cluster, refuses such requests with
+# an Anthropic `invalid_request_error` instead of forwarding them. Claude Code
+# is unaffected: it runs MCP servers itself and sends their tools as ordinary
+# client tools. A cluster tagged `application_provider: anthropic`, or an
+# untagged one, forwards the connector unchanged.
+#
 # API version: `default_version: "2023-06-01"` applies only to callers that
 # send no `anthropic-version`. A caller's version passes through unchanged:
 # `2023-06-01` from SDK v1, `2026-10-21` from SDK v2. Request bodies are not
@@ -89,18 +98,6 @@ filter_chains:
       - filter: anthropic_messages_request
         on_invalid: reject
 
-      # Supply a default `anthropic-version` header for internal or
-      # non-SDK callers that omit it. Real Claude Code always sends one,
-      # so this is a no-op for it. Scoped to `/v1/messages` for the same
-      # reason `anthropic_validate` is: `anthropic-version` is meaningless
-      # on the OpenAI Chat Completions path OpenCode uses, and injecting it
-      # there would put a wrong header on the wire.
-      - filter: anthropic_messages_protocol
-        default_version: "2023-06-01"
-        conditions:
-          - when:
-              path_prefix: "/v1/messages"
-
       # Strip the client's native Anthropic auth header so it never
       # reaches the backend. `credential_injection` below handles
       # `Authorization`.
@@ -141,8 +138,26 @@ filter_chains:
       - filter: load_balancer
         clusters:
           - name: "vllm-backend"
+            # Declares the backend so provider-aware filters can tell vLLM
+            # from Anthropic; it gates the MCP connector refusal below.
+            http:
+              application_provider: vllm
             endpoints:
               - "127.0.0.1:8000"
+
+      # Supply a default `anthropic-version` header for internal or
+      # non-SDK callers that omit it. Real Claude Code always sends one,
+      # so this is a no-op for it. Scoped to `/v1/messages` for the same
+      # reason `anthropic_validate` is: `anthropic-version` is meaningless
+      # on the OpenAI Chat Completions path OpenCode uses, and injecting it
+      # there would put a wrong header on the wire. Placed after
+      # `load_balancer` so it can refuse the MCP connector for the selected
+      # vLLM cluster.
+      - filter: anthropic_messages_protocol
+        default_version: "2023-06-01"
+        conditions:
+          - when:
+              path_prefix: "/v1/messages"
 
 insecure_options:
   allow_private_endpoints: true # example proxies to a local vLLM backend

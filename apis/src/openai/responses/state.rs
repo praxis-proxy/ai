@@ -426,6 +426,14 @@ pub(crate) struct ResponsesState {
     pub(crate) simple_budget: Option<super::agentic_loop::budget::SimpleBudget>,
     /// Maps file IDs to filenames for citation annotation extraction.
     pub citation_files: HashMap<String, String>,
+    /// File IDs in [`Self::citation_files`] restored from a stored
+    /// `previous_response_id` record rather than retrieved by this exchange.
+    ///
+    /// Restored entries do not consume this exchange's [`MAX_CITATION_FILES`]
+    /// budget for newly retrieved files, so a long continuation chain keeps
+    /// rendering fresh results; persistence prefers this exchange's entries
+    /// when the combined map exceeds the cap.
+    pub(crate) restored_citation_file_ids: HashSet<String>,
 
     /// Truncation strategy for managing context window limits.
     ///
@@ -1120,6 +1128,7 @@ impl Default for ResponsesState {
         Self {
             simple_budget: None,
             citation_files: HashMap::new(),
+            restored_citation_file_ids: HashSet::new(),
             context_management: None,
             conversation: None,
             include: Vec::new(),
@@ -1442,6 +1451,30 @@ impl ResponsesState {
         self.request_body_rebuild = RequestBodyRebuild::Required;
     }
 
+    /// Citation-file slots left for files this exchange retrieves.
+    ///
+    /// Counts only entries this exchange added, so files restored from a
+    /// stored continuation never starve a fresh search of citation metadata.
+    pub(crate) fn new_citation_file_slots(&self) -> usize {
+        let fresh = self
+            .citation_files
+            .len()
+            .saturating_sub(self.restored_citation_file_ids.len());
+        MAX_CITATION_FILES.saturating_sub(fresh)
+    }
+
+    /// Restore a stored continuation's citation map without charging it
+    /// against this exchange's new-file budget.
+    #[cfg(feature = "store")]
+    pub(crate) fn restore_citation_files(&mut self, restored: HashMap<String, String>) {
+        for (file_id, filename) in restored {
+            if !self.citation_files.contains_key(&file_id) {
+                self.restored_citation_file_ids.insert(file_id.clone());
+                self.citation_files.insert(file_id, filename);
+            }
+        }
+    }
+
     /// Mark a suffix containing newly appended local tool results.
     ///
     /// Multiple dispatchers run before the guardrail filter, so retain the
@@ -1509,6 +1542,30 @@ impl ResponsesState {
     /// Borrow the durable history only when the request can persist it.
     pub(crate) fn persisted_messages_mut(&mut self) -> Option<&mut MessageHistory> {
         self.persistence_history_enabled.then_some(&mut self.persisted_messages)
+    }
+
+    /// Append locally executed tool-result items to the working history and,
+    /// when this exchange persists, to the durable history, then mark them for
+    /// the local-tool guardrail.
+    ///
+    /// The items land after the round's collected output, so a
+    /// `previous_response_id` continuation and a later compaction replay the
+    /// same call/result prefix the next inference round received (#2036). Both
+    /// histories share one immutable payload per item, so persistence adds no
+    /// copy; later working-history edits detach through `MessageHistory`'s
+    /// copy-on-write. A non-persisting exchange moves the items unchanged.
+    pub(crate) fn append_local_tool_results(&mut self, items: impl IntoIterator<Item = serde_json::Value>) {
+        let result_start = self.messages.len();
+        if self.persistence_history_enabled {
+            for item in items {
+                let item = std::sync::Arc::new(item);
+                self.messages.push_shared(std::sync::Arc::clone(&item));
+                self.persisted_messages.push_shared(item);
+            }
+        } else {
+            self.messages.extend(items);
+        }
+        self.mark_local_tool_results_from(result_start);
     }
 
     /// Append a persistence-only item when durable history capture is enabled.
@@ -1901,7 +1958,13 @@ fn extract_u32(body: &serde_json::Value, field: &str) -> Option<u32> {
     let raw = body.get(field)?;
     let result = raw.as_u64().and_then(|v| u32::try_from(v).ok());
     if result.is_none() {
-        tracing::debug!(field, %raw, "ignoring non-u32 value");
+        // Log only the JSON type: a non-numeric value here is client-supplied
+        // body content and must not reach logs.
+        tracing::debug!(
+            field,
+            json_type = crate::openai::translation::chat_completions::json_type_name(raw),
+            "ignoring non-u32 value"
+        );
     }
     result
 }
@@ -1928,6 +1991,25 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn non_numeric_u32_field_logs_type_not_value() {
+        let secret = "PRAXIS-SECRET-7f3a91";
+        let body = json!({ "max_tool_calls": secret });
+
+        let logs = crate::test_utils::capture_log_output(|| {
+            assert_eq!(extract_u32(&body, "max_tool_calls"), None, "string is not a u32");
+        });
+
+        assert!(
+            logs.contains("json_type=\"string\""),
+            "JSON type should be logged: {logs}"
+        );
+        assert!(
+            !logs.contains(secret),
+            "client-supplied value must not reach logs: {logs}"
+        );
+    }
 
     #[test]
     fn from_request_body_extracts_string_input() {
@@ -2876,6 +2958,28 @@ mod tests {
             1,
             "nothing is moved when there is nothing to finalize"
         );
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn restored_citation_files_leave_new_file_slots_untouched() {
+        let mut state = ResponsesState::default();
+        state.restore_citation_files(
+            (0..MAX_CITATION_FILES)
+                .map(|index| (format!("file-{index}"), "old.txt".to_owned()))
+                .collect(),
+        );
+        assert_eq!(state.citation_files.len(), MAX_CITATION_FILES);
+        assert_eq!(
+            state.new_citation_file_slots(),
+            MAX_CITATION_FILES,
+            "a full restored map must not starve this exchange's search"
+        );
+
+        state
+            .citation_files
+            .insert("file-fresh".to_owned(), "fresh.txt".to_owned());
+        assert_eq!(state.new_citation_file_slots(), MAX_CITATION_FILES - 1);
     }
 
     #[test]

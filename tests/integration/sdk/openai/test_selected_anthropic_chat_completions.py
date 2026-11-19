@@ -8,6 +8,7 @@
 import json
 import os
 import signal
+import errno
 import socket
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import tempfile
 import threading
 import time
 from collections import deque
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -27,10 +29,38 @@ FAILOVER_EXAMPLE = ROOT / "examples/configs/inference/fallback-with-provider-tra
 MODEL = "fixture-openai-model"
 
 
-def _port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+def _ports(count: int) -> tuple[int, ...]:
+    # Keep every socket bound until the whole group is chosen: releasing one
+    # before choosing the next allows the OS to return the same port twice.
+    with ExitStack() as stack:
+        sockets = [stack.enter_context(socket.socket()) for _ in range(count)]
+        for sock in sockets:
+            sock.bind(("127.0.0.1", 0))
+        return tuple(sock.getsockname()[1] for sock in sockets)
+
+
+@pytest.mark.parametrize("count", [2, 3])
+def test_port_group_prevents_immediate_reuse(monkeypatch, count):
+    """An allocator that immediately reuses released ports must stay distinct."""
+    socket_type = socket.socket
+    with socket_type() as probe:
+        probe.bind(("127.0.0.1", 0))
+        preferred_port = probe.getsockname()[1]
+
+    class ReusingSocket(socket_type):
+        def bind(self, address):
+            # Emulate a kernel preferring the last released port. If the
+            # group still owns it, a real bind fails and we choose another.
+            try:
+                super().bind((address[0], preferred_port))
+            except OSError as error:
+                if error.errno != errno.EADDRINUSE:
+                    raise
+                super().bind(address)
+
+    monkeypatch.setattr(socket, "socket", ReusingSocket)
+    ports = _ports(count)
+    assert len(set(ports)) == count, "proxy and mock backends must never share a port"
 
 
 def _binary() -> str:
@@ -97,7 +127,7 @@ def _message(content: list[dict], usage: dict, stop_reason: str = "end_turn") ->
     }
 
 
-def _config(proxy_port: int, backend_port: int, api_translation_enabled: bool = True) -> dict:
+def _config(proxy_port: int, backend_port: int) -> dict:
     return {
         "listeners": [{"name": "proxy", "address": f"127.0.0.1:{proxy_port}", "filter_chains": ["main"]}],
         "filter_chains": [{
@@ -108,7 +138,7 @@ def _config(proxy_port: int, backend_port: int, api_translation_enabled: bool = 
                  "clusters": ["anthropic-backend"], "reload": {"enabled": False}},
                 {"filter": "openai_chat_completions_to_anthropic_stream", "max_partial_event_bytes": 1048576,
                  "max_tool_blocks": 256},
-                {"filter": "openai_chat_completions_to_anthropic", "api_translation_enabled": api_translation_enabled,
+                {"filter": "openai_chat_completions_to_anthropic",
                  "max_request_body_bytes": 2097152, "max_response_body_bytes": 1048576},
                 {"filter": "credential_inject", "credentials": [{
                     "name": "anthropic-fixture-secret", "namespace": "grid-fixture", "key": "api-key",
@@ -160,7 +190,7 @@ def protocol_client(request):
 
 def _versioned_client(version, protocol_version=None, protocol_first=True):
     """Run a translated route with an optional native protocol filter."""
-    proxy_port, backend_port = _port(), _port()
+    proxy_port, backend_port = _ports(2)
     backend = ThreadingHTTPServer(("127.0.0.1", backend_port), _Handler)
     thread = threading.Thread(target=backend.serve_forever, daemon=True)
     thread.start()
@@ -203,7 +233,7 @@ def _versioned_client(version, protocol_version=None, protocol_first=True):
 @pytest.fixture
 def translation_disabled_client():
     """OpenAI client for verifying the disabled server-side translation policy."""
-    proxy_port, backend_port = _port(), _port()
+    proxy_port, backend_port = _ports(2)
     with tempfile.TemporaryDirectory() as directory:
         config = Path(directory) / "praxis.yaml"
         config.write_text(json.dumps(_config(proxy_port, backend_port, api_translation_enabled=False)))
@@ -233,7 +263,7 @@ def translation_disabled_client():
 @pytest.fixture
 def failover_client():
     """OpenAI SDK client backed by the checked-in cross-provider failover example."""
-    proxy_port, primary_port, fallback_port = _port(), _port(), _port()
+    proxy_port, primary_port, fallback_port = _ports(3)
     primary = ThreadingHTTPServer(("127.0.0.1", primary_port), _Handler)
     fallback = ThreadingHTTPServer(("127.0.0.1", fallback_port), _Handler)
     primary_thread = threading.Thread(target=primary.serve_forever, daemon=True)
@@ -495,19 +525,6 @@ def test_provider_error_preserves_status(client: OpenAI, status: int) -> None:
     body = caught.value.response.json()
     assert body["error"]["code"] == status, "OpenAI error code must retain provider status"
     assert body["error"]["type"] == ("rate_limit_error" if status == 429 else "server_error"), "OpenAI error type must match provider status"
-
-
-def test_disabled_translation_names_platform_administrator(translation_disabled_client: OpenAI) -> None:
-    with pytest.raises(APIStatusError) as caught:
-        translation_disabled_client.chat.completions.create(
-            model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16,
-        )
-
-    assert caught.value.status_code == 503
-    error = caught.value.response.json()["error"]
-    assert error["code"] == "api_translation_disabled"
-    assert "platform administrator has forbidden translation" in error["message"]
-    assert not STATE.requests, "disabled translation must reject before contacting the provider"
 
 
 @pytest.mark.parametrize("field,value", [

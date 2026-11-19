@@ -46,8 +46,8 @@ use crate::openai::{
     translation::{
         chat_completions::{
             ResponseContext, chat_response_to_response_resource, context_has_web_search,
-            function_call_output_item_from_parts, in_progress_response_resource_with_service_tier, message_output_item,
-            output_text_item, refusal_item, web_search_call_output_item_from_parts,
+            function_call_output_item_from_parts, in_progress_response_resource_with_service_tier, message_item_id,
+            message_output_item, output_text_item, refusal_item, web_search_call_output_item_from_parts,
         },
         reasoning::{ReasoningOptions, reasoning_item_id},
     },
@@ -219,7 +219,11 @@ impl From<FramingError> for ConvertError {
 struct MessageState {
     /// Responses output index for this message item.
     output_index: usize,
-    /// Stable message item id (`msg_{response_id}`).
+    /// Stable message item id.
+    ///
+    /// Prefer `msg_{response_id}_{chat_completion_id}` so IRR rounds stay
+    /// distinct; fall back to `msg_{response_id}` when the Chat completion
+    /// omits an id.
     item_id: String,
     /// Whether `response.output_item.added` was emitted.
     item_added: bool,
@@ -995,11 +999,12 @@ impl StreamConverter {
             return Ok(());
         }
         let output_index = self.alloc_output_index();
-        // Matches the finite translation `msg_{response_id}` item-id convention.
-        let item_id = format!("msg_{}", self.response_id);
+        // Matches the finite translation: include the Chat completion id so each
+        // agentic/IRR round under one logical response_id gets a distinct message item.
+        let item_id = message_item_id(&self.response_id, self.chat_id.as_deref());
         self.message = Some(MessageState::new(output_index, item_id));
         let context = self.response_context(inputs, None);
-        let item = message_output_item(&context, "in_progress", Vec::new());
+        let item = message_output_item(&context, "in_progress", Vec::new(), self.chat_id.as_deref());
         emit_event(
             &mut self.emit,
             &self.limits,
@@ -1412,7 +1417,7 @@ impl StreamConverter {
         // mutating `self.emit`, so the context's `&self` borrow is released first.
         let item = {
             let context = self.response_context(inputs, None);
-            message_output_item(&context, status, content_items)
+            message_output_item(&context, status, content_items, self.chat_id.as_deref())
         };
         emit_event(
             &mut self.emit,

@@ -1,8 +1,9 @@
 # Anthropic Messages to Chat Completions (operator-approved degradation)
 #
-# Fixture-only variant of `messages-to-openai.yaml` that opts prompt caching
-# and extended thinking into operator-approved degradation. The translator
-# validates and strips `cache_control` and `thinking` markers so an unmodified
+# Fixture-only variant of `messages-to-openai.yaml` that opts prompt caching,
+# extended thinking, and mid-conversation system instructions into approved
+# degradation. The translator folds system instructions and validates and
+# strips `cache_control` and `thinking` markers so an unmodified
 # client (for example Claude Code) can still drive a Chat Completions backend,
 # and reports each degradation. See `messages-to-openai.yaml` for the strict
 # (reject) variant and `docs/anthropic-messages.md` for the trade-offs.
@@ -28,6 +29,7 @@ filter_chains:
         allow_lossy_features:
           - prompt_caching
           - extended_thinking
+          - mid_conversation_system
 
       - filter: anthropic_messages_to_chat_completions_stream
         max_partial_event_bytes: 10485760

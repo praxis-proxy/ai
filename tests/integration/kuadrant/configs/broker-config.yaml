@@ -1,0 +1,9 @@
+# mcp-gateway standalone broker+router config (Milestone 1).
+# Schema: internal/config/types.go MCPServer. NOTE: the field is `state`
+# (Enabled/Disabled); the sample's `enabled: true` is silently ignored.
+servers:
+  - name: weather
+    url: http://weather-backend:9001/mcp
+    hostname: weather.local
+    prefix: "weather_"
+    state: Enabled

@@ -1,0 +1,18 @@
+name: Install OpenResponses Bun runner
+description: Install the pinned Linux x64 Bun binary without requiring HOME.
+runs:
+  using: composite
+  steps:
+    - name: Download and verify Bun
+      shell: bash
+      run: |
+        set -euo pipefail
+        bun_dir="$RUNNER_TEMP/openresponses-bun"
+        mkdir -p "$bun_dir"
+        curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+          --output "$bun_dir/bun.zip" \
+          https://github.com/oven-sh/bun/releases/download/bun-v1.3.12/bun-linux-x64.zip
+        echo "11dc3ee11bc1695e149737c6ca3d5619302cf4346e6b8a6ec7988967ef01ddc5  $bun_dir/bun.zip" | sha256sum --check
+        unzip -oq "$bun_dir/bun.zip" -d "$bun_dir"
+        test "$("$bun_dir/bun-linux-x64/bun" --version)" = '1.3.12'
+        echo "$bun_dir/bun-linux-x64" >> "$GITHUB_PATH"

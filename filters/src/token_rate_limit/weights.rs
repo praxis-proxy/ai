@@ -23,7 +23,7 @@
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
-pub(super) use crate::token_usage::normalized::{UsageCounts, parse_u64_meta};
+pub(super) use crate::token_usage::normalized::UsageCounts;
 use crate::token_usage::normalized::{UsageInput, weighted_cost as normalized_weighted_cost};
 
 /// Operator-facing per-type weights. Omitted keys stay `None` so a rule

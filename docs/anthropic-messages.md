@@ -38,9 +38,6 @@ filter_chains:
       - filter: anthropic_messages_request
         on_invalid: continue
 
-      - filter: anthropic_messages_protocol
-        default_version: "2023-06-01"
-
       - filter: router
         routes:
           - path_prefix: "/"
@@ -49,8 +46,15 @@ filter_chains:
       - filter: load_balancer
         clusters:
           - name: vllm
+            http:
+              application_provider: vllm
             endpoints:
               - "127.0.0.1:8000"
+
+      # After load_balancer so it can refuse the MCP connector for the
+      # selected vLLM cluster (see "MCP connector" below).
+      - filter: anthropic_messages_protocol
+        default_version: "2023-06-01"
 
 insecure_options:
   allow_private_endpoints: true # local development backend
@@ -69,6 +73,21 @@ curl http://localhost:8080/v1/messages \
     "messages": [{"role": "user", "content": "Hi"}]
   }'
 ```
+
+### MCP connector
+
+Anthropic's server-side MCP connector (`mcp_servers` plus `mcp_toolset`
+tools, beta `mcp-client-2025-11-20`) is executed by Anthropic, not by the
+model server, so vLLM cannot honor it. When the selected cluster declares
+`application_provider` with any value other than `anthropic`,
+`anthropic_messages_protocol` refuses such a request with a 400
+`invalid_request_error` instead of forwarding it. The filter must run after
+`load_balancer` to see the selected cluster. A cluster tagged
+`application_provider: anthropic`, or an untagged cluster, forwards the
+connector unchanged. The Chat Completions translation always refuses it.
+
+Claude Code is unaffected: it runs MCP servers itself and sends their tools
+as ordinary client tools, which every route serves.
 
 ### Committed example with credential isolation
 
@@ -110,24 +129,33 @@ and the response, so vLLM only ever sees OpenAI Chat Completions.
 
 Chat Completions cannot represent the Anthropic-only features an unmodified
 Claude Code client always sends — prompt caching (`cache_control` markers) and
-extended thinking (`thinking`). The example enables **operator-approved
-degradation** on the translation filter so those requests succeed instead of
-failing closed with a 400:
+extended thinking (`thinking`) — and backends whose chat templates reject a
+mid-conversation `system` message (some vLLM-hosted models) additionally
+refuse the one Claude Code sends after its first user turn. The example enables
+**operator-approved degradation** on the translation filter so those requests
+succeed instead of failing closed with a 400:
 
 ```yaml
 - filter: anthropic_messages_to_chat_completions
   allow_lossy_features:
     - prompt_caching
     - extended_thinking
+    - mid_conversation_system
 ```
 
-Each listed feature's wire markers are validated and then stripped, and the
+Each listed feature is validated and then degraded as described below, and the
 degradation is reported to the operator — one `WARN` log per request, a
 `praxis_anthropic_messages_to_chat_completions_degraded_total` counter per
 feature, and an `x-degraded-features` response header. `prompt_caching`
 preserves all prompt and tool content but does not honor explicit cache
 breakpoints, so cost and latency may differ; `extended_thinking` means the
-translated response carries no thinking blocks. Remove an entry to make that
+translated response carries no thinking blocks; `mid_conversation_system`
+folds each eligible text-only `system` message with exactly `role` and
+`content` fields that appears after the first non-system turn into
+the single leading system message (real OpenAI accepts mid-array `system`
+messages; whether a vLLM-hosted backend accepts one depends on the model's
+chat template — some answer "System message must be at the beginning", others
+render it in place). Remove an entry to make that
 feature fail closed again. Malformed markers, other `context_management` edits,
 and every feature not listed are still rejected with a 400. Leaving the
 allowlist empty (the default of [`messages-to-openai.yaml`](../examples/configs/anthropic/messages-to-openai.yaml))
@@ -552,6 +580,8 @@ The `anthropic_messages_to_chat_completions` filter:
   `output_config.format` (or the deprecated
   `output_format`) to a strict `response_format`; any
   other `output_config` key is rejected with a 400
+- Rejects the MCP connector (`mcp_servers` or any
+  `mcp_toolset` tool) with a 400 that names it
 - Rejects `service_tier`, `container`, `inference_geo`
   and `mcp_servers` with a 400, because the translated
   response cannot report their effect truthfully; the
@@ -574,6 +604,13 @@ The `anthropic_messages_to_chat_completions` filter:
   unless `prompt_caching` is in `allow_lossy_features`,
   which strips `cache_control` markers (preserving the
   prompt and tool content) and reports the degradation
+- Preserves a text-only `system` message inside the
+  `messages` array in its original position, unless
+  `mid_conversation_system` is in `allow_lossy_features`,
+  which folds every `system` message that follows the
+  first non-system turn into the single leading system
+  message (in encounter order) and reports the
+  degradation; leading `system` messages join the merged prompt in encounter order when a later message moves
 - Transforms the response back to Anthropic format
 - Normalizes pre-stream upstream 4xx/5xx responses into
   Anthropic error envelopes for both streaming and
@@ -650,6 +687,9 @@ Injects `anthropic-version` header if absent.
 A caller-supplied version, including the SDK v2 default `2026-10-21`, is
 forwarded unchanged. No body transformation, version-specific validation,
 or credential handling. See [API version compatibility](#api-version-compatibility).
+Placed after `load_balancer`, it also refuses the
+[MCP connector](#mcp-connector) for a cluster whose `application_provider`
+is not `anthropic`.
 
 ```yaml
 filter: anthropic_messages_protocol
