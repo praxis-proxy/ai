@@ -898,12 +898,26 @@ pub(super) struct RuleConfig {
     #[serde(default)]
     pub enforcement: EnforcementMode,
 
+    /// Request headers set when the algorithm admits the reservation.
+    /// The names are stripped from the client request first, then written
+    /// by this filter. A missing block leaves those headers unset.
+    #[serde(default)]
+    pub within_quota: Option<WithinQuotaConfig>,
+
     /// Request-header annotation applied when [`enforcement`](Self::enforcement)
     /// is [`EnforcementMode::Soft`] and the algorithm denies the reservation
     /// for budget exhaustion. Required for `soft` (at least one static header
     /// and/or `include_remaining` / `include_used`). Rejected for `hard`.
     #[serde(default)]
     pub over_quota: Option<OverQuotaConfig>,
+}
+
+/// Annotation surface for an admitted reservation.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WithinQuotaConfig {
+    /// Static headers set on the upstream request when the reservation is admitted.
+    pub headers: BTreeMap<String, String>,
 }
 
 /// Per-rule action when the admission algorithm denies a reservation.

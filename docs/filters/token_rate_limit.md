@@ -99,6 +99,8 @@ Admissions, denials, reconciliations, and backend failures also emit structured 
 | `rules[].tiers[].action.type` | `inject` \| `deny` | yes | Whether to continue with injected headers or hard-reject. |
 | `rules[].tiers[].action.headers` | object<string, string> | no | Headers to inject on the upstream request (required for `inject`, ignored for `deny`). |
 | `rules[].enforcement` | `hard` \| `soft` | no | What happens when the algorithm denies a reservation because the token budget is exhausted (`ai#1241`). Defaults to [`EnforcementMode::Hard`] (429). Soft forwards with [`over_quota`](Self::over_quota) annotation. |
+| `rules[].within_quota` | object | no | Request headers set when the algorithm admits the reservation. The names are stripped from the client request first, then written by this filter. A missing block leaves those headers unset. |
+| `rules[].within_quota.headers` | object<string, string> | yes | Static headers set on the upstream request when the reservation is admitted. |
 | `rules[].over_quota` | object | no | Request-header annotation applied when [`enforcement`](Self::enforcement) is [`EnforcementMode::Soft`] and the algorithm denies the reservation for budget exhaustion. Required for `soft` (at least one static header and/or `include_remaining` / `include_used`). Rejected for `hard`. |
 | `rules[].over_quota.headers` | object<string, string> | no | Static headers set on the upstream request when over quota. Required to be non-empty unless `include_remaining` or `include_used` is true. |
 | `rules[].over_quota.include_remaining` | bool | no | When true, also set the remaining-quota header from the backend snapshot at denial time (tokens still available in the window / bucket — often `0` when the estimate no longer fits). |

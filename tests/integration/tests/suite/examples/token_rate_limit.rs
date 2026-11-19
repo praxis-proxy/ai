@@ -1345,6 +1345,58 @@ fn example_config_token_rate_limit_soft_enforcement() {
     );
 }
 
+/// Inside quota continues with the llm-d critical priority class.
+/// Over quota continues with sheddable.
+#[test]
+fn example_config_token_rate_limit_priority_class() {
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, PLAIN_TEXT_BODY.to_owned()),
+        (200, PLAIN_TEXT_BODY.to_owned()),
+    ])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+
+    let path = example_config_path("token-rate-limit-priority-class.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let yaml = yaml
+        .replace("capacity: 100000", "capacity: 100")
+        .replace("reserved_tokens: 500", "reserved_tokens: 60");
+    let patched = patch_yaml(
+        &allow_loopback_endpoints(&yaml),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3000", backend.port())]),
+    );
+    let _proxy = PraxisProcess::spawn(&patched, &proxy_addr);
+
+    let first = http_send(
+        &proxy_addr,
+        &json_post_with_headers(
+            "/v1/chat/completions",
+            "{}",
+            &[("x-llm-d-inference-priority-class", "sheddable")],
+        ),
+    );
+    assert_eq!(parse_status(&first), 200, "inside quota must be admitted");
+    let first_upstream = backend.requests()[0].headers.to_ascii_lowercase();
+    assert!(
+        first_upstream.contains("x-llm-d-inference-priority-class: critical"),
+        "inside quota must stamp critical: {first_upstream}"
+    );
+    assert!(
+        !first_upstream.contains("x-llm-d-inference-priority-class: sheddable"),
+        "inside quota must replace a client-supplied sheddable header: {first_upstream}"
+    );
+
+    let second = http_send(&proxy_addr, &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(parse_status(&second), 200, "over quota must continue");
+    let second_upstream = backend.requests()[1].headers.to_ascii_lowercase();
+    assert!(
+        second_upstream.contains("x-llm-d-inference-priority-class: sheddable"),
+        "over quota must stamp sheddable: {second_upstream}"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Hierarchy quota tests (issue #125)
 // -----------------------------------------------------------------------------
