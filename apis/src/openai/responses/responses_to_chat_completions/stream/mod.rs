@@ -127,6 +127,8 @@ struct EmitState {
 enum ConvertError {
     /// Serializing a Responses event failed; surfaces as a [`FilterError`].
     Serialize(serde_json::Error),
+    /// The random source failed while generating stream padding.
+    ObfuscationRandomness,
     /// A Chat chunk was not valid JSON.
     MalformedJson,
     /// Accumulated stream state could not form a valid terminal response.
@@ -1966,21 +1968,18 @@ fn emit_event(
     emit: &mut EmitState,
     limits: &StreamLimits,
     capped: bool,
-    mut event: StreamEvent,
+    event: StreamEvent,
     out: &mut Vec<u8>,
 ) -> Result<(), ConvertError> {
     if capped && emit.events_emitted.saturating_add(1) >= limits.max_stream_events {
         return Err(ConvertError::EventLimit);
     }
-    if emit.include_obfuscation {
-        event.add_obfuscation()?;
-    }
     let start = out.len();
-    if let Err(error) = events::encode(event, emit.sequence_number, out) {
+    if let Err(error) = events::encode(event, emit.sequence_number, emit.include_obfuscation, out) {
         // Drop any partially written frame so a failed encode leaves `out`
         // byte-for-byte as it was before this call.
         out.truncate(start);
-        return Err(ConvertError::Serialize(error));
+        return Err(error);
     }
     if out.len().saturating_sub(start) > limits.max_emitted_sse_frame_bytes {
         // The complete encoded frame exceeds the emitted-frame ceiling. Roll it
@@ -2159,6 +2158,7 @@ fn failure_message(error: &ConvertError) -> &'static str {
         ConvertError::MissingFinishReason => "upstream stream ended without a finish reason",
         ConvertError::UnknownFinishReason => "upstream stream used an unrecognized finish reason",
         ConvertError::IncompleteFrame => "upstream stream ended with an incomplete frame",
+        ConvertError::ObfuscationRandomness => "could not generate stream padding",
         ConvertError::Serialize(_) => "internal serialization error",
     }
 }

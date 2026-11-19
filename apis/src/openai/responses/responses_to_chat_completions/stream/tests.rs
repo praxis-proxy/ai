@@ -1428,7 +1428,7 @@ fn delta_padding_counts_toward_the_emitted_frame_limit() {
     let event = || events::function_call_arguments_delta("call_1", 0, "{}");
     let mut emit = converter(wide_limits()).emit;
     let mut unpadded = Vec::new();
-    events::encode(event(), 0, &mut unpadded).unwrap();
+    events::encode(event(), 0, false, &mut unpadded).unwrap();
     let limits = StreamLimits {
         max_emitted_sse_frame_bytes: unpadded.len(),
         ..wide_limits()

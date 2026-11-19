@@ -938,12 +938,3 @@ features:
     providers:
       synthetic:
         status: synthetic_only
-  - id: responses.chat.stream_obfuscation
-    scopes:
-      - openai_responses_to_chat_completions
-    status: synthetic_only
-    scenarios:
-      - responses/chat-basic-stream
-    providers:
-      synthetic:
-        status: synthetic_only

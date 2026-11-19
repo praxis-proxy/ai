@@ -11765,29 +11765,42 @@ def test_translated_stream_obfuscation(chat_streaming_client, include_obfuscatio
         {} if include_obfuscation is None
         else {"stream_options": {"include_obfuscation": include_obfuscation}}
     )
-    with chat_streaming_client.responses.create(
+    with chat_streaming_client.responses.with_streaming_response.create(
         model=CHAT_TRANSLATION_MODEL,
         input="STREAM-SERVICE-TIER-1549",
         store=False,
         stream=True,
         **options,
     ) as stream:
-        events = list(stream)
+        wire = b"".join(stream.iter_bytes())
 
-    assert events[-1].type == "response.completed"
-    deltas = [event for event in events if event.type == "response.output_text.delta"]
+    events = []
+    for frame in wire.split(b"\n\n"):
+        for line in frame.splitlines():
+            if line.startswith(b"data: "):
+                events.append((json.loads(line.removeprefix(b"data: ")), len(frame) + 2))
+
+    assert events[-1][0]["type"] == "response.completed"
+    deltas = [(event, size) for event, size in events if event["type"] == "response.output_text.delta"]
     assert deltas
-    for event in deltas:
-        padding = event.model_dump().get("obfuscation")
+    for event, size in deltas:
         if include_obfuscation is False:
-            assert padding is None
+            assert "obfuscation" not in event
         else:
-            assert isinstance(padding, str) and 1 <= len(padding) <= 64
-    assert all(
-        event.model_dump().get("obfuscation") is None
-        for event in events
-        if not event.type.endswith(".delta")
-    )
+            assert 1 <= len(event["obfuscation"]) <= 64
+            assert size % 64 == 0
+    assert all("obfuscation" not in event for event, _ in events if not event["type"].endswith(".delta"))
+
+
+def test_translated_stream_rejects_non_boolean_obfuscation(chat_streaming_client):
+    with pytest.raises(openai.BadRequestError, match=r"stream_options\.include_obfuscation"):
+        chat_streaming_client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="STREAM-SERVICE-TIER-1549",
+            store=False,
+            stream=True,
+            extra_body={"stream_options": {"include_obfuscation": "false"}},
+        )
 
 
 @pytest.mark.skipif(
