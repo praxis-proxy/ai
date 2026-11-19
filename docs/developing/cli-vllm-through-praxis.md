@@ -718,8 +718,8 @@ the way the environment variable does.
 ## 5. Connect OpenCode
 
 OpenCode 1.x and 2.x need different setups. Check your version with
-`opencode --version`: 1.x prints a bare version such as `1.19.3`, and 2.x
-prints `opencode v2.1.2`. The two majors ship as different npm packages
+`opencode --version`: 1.x prints a bare version such as `1.19.6`, and 2.x
+prints `opencode v2.3.2`. The two majors ship as different npm packages
 (`opencode-ai` for 1.x, `@opencode/cli` for 2.x) and use different
 configuration schemas, so a 1.x configuration does not carry over to 2.x.
 
@@ -1061,9 +1061,9 @@ host. The `headers` map has no such check and sends the token wherever
 
 ## 6. Connect pi
 
-These steps are verified against pi 1.4.0. Install that version from the
-[upstream release](https://github.com/earendil-works/pi/releases/tag/v1.4.0),
-or with `npm install -g @earendil-works/pi-coding-agent@1.4.0` (Node 22.19 or
+These steps are verified against pi 1.5.2. Install that version from the
+[upstream release](https://github.com/earendil-works/pi/releases/tag/v1.5.2),
+or with `npm install -g @earendil-works/pi-coding-agent@1.5.2` (Node 22.19 or
 later), and check it with `pi --version`.
 
 pi reaches custom endpoints through providers declared in
@@ -1111,7 +1111,7 @@ Then launch pi from that shell. pi does not need `VLLM_API_KEY`:
 pi --model "praxis/$VLLM_MODEL"
 ```
 
-Notes on this configuration, verified against pi 1.4.0:
+Notes on this configuration, verified against pi 1.5.2:
 
 - **`apiKey` is a placeholder, but it must be set.** With no `apiKey`, pi
   reports `No API key found for praxis.` and sends nothing. The configured
