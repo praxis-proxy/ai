@@ -109,22 +109,14 @@ async fn publishes_routing_metadata_and_filter_results() {
     .unwrap();
     let (_, ctx) = run_with(filter.as_ref(), &request, Some(&body)).await;
 
-    assert_eq!(
-        ctx.filter_metadata.get("anthropic_messages_request.model"),
-        Some("claude-opus-4-8")
-    );
-    assert_eq!(
-        ctx.filter_metadata.get("anthropic_messages_request.stream"),
-        Some("true")
-    );
-    assert_eq!(
-        ctx.filter_metadata.get("anthropic_messages_request.max_tokens"),
-        Some("64")
-    );
-    assert_eq!(
-        ctx.filter_metadata.get("anthropic_messages_request.has_tools"),
-        Some("true")
-    );
+    for (key, value) in [
+        ("anthropic_messages_request.model", "claude-opus-4-8"),
+        ("anthropic_messages_request.stream", "true"),
+        ("anthropic_messages_request.max_tokens", "64"),
+        ("anthropic_messages_request.has_tools", "true"),
+    ] {
+        assert_eq!(ctx.filter_metadata.get(key), Some(value), "{key}");
+    }
 
     let results = ctx
         .filter_results
