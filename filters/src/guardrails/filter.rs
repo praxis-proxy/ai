@@ -13,7 +13,7 @@ use praxis_ai_apis::{
     guardrail_messages::{
         GuardrailMessageDirection, GuardrailTextLocations, extract_with_locations, redact_native_body,
     },
-    json_body::{MAX_JSON_BODY_BYTES, replace_json_body, serialize_json_body},
+    json_body::{MAX_JSON_BODY_BYTES, replace_json_body, serialize_json_body_capped},
     openai::{ChatCompletionsOperation, chat_completions_operation_specs},
     operation::Transport,
     operation_classifier::AiOperationMatch,
@@ -764,8 +764,8 @@ fn apply_native_redaction(
         )
     });
     match rewritten {
-        Ok(value) => match serialize_json_body(&value) {
-            Ok(serialized) if serialized.len() <= DEFAULT_MAX_BODY_BYTES => {
+        Ok(value) => match serialize_json_body_capped(&value, DEFAULT_MAX_BODY_BYTES) {
+            Ok(serialized) => {
                 if phase == GuardPhase::Request {
                     serialized.commit(body, "ai_guardrails", "content");
                 } else {

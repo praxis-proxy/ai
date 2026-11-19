@@ -44,7 +44,7 @@ pub(super) mod config;
 )]
 mod tests;
 
-use std::{borrow::Cow, io, time::Duration};
+use std::{borrow::Cow, time::Duration};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -568,26 +568,7 @@ fn compaction_response_limit(budget: Option<SimpleBudget>) -> Result<usize, Filt
 
 /// Count already parsed JSON without building another serialized payload.
 fn count_json_bytes<T: serde::Serialize>(value: &T) -> Option<usize> {
-    let mut counter = JsonByteCounter(0);
-    serde_json::to_writer(&mut counter, value).ok()?;
-    Some(counter.0)
-}
-
-/// Counts encoded JSON bytes without retaining the serialized payload.
-struct JsonByteCounter(usize);
-
-impl io::Write for JsonByteCounter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0 = self
-            .0
-            .checked_add(buf.len())
-            .ok_or_else(|| io::Error::other("compaction JSON size overflow"))?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+    praxis_filter::json_size::serialized_len(value).ok()
 }
 
 /// Budget failures always terminate the request, including fail-open callouts.

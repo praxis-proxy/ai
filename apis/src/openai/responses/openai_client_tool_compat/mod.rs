@@ -170,7 +170,7 @@ use super::{
 };
 use crate::{
     RecordAiMetadata as _,
-    json_body::{SerializedJson, serialize_json_body},
+    json_body::{BoundedJsonBody, SerializedJson, serialize_json_body_within},
 };
 
 // -----------------------------------------------------------------------------
@@ -478,16 +478,14 @@ impl ClientToolCompatFilter {
 
         restore_snapshot_tools(&mut response, state.client_tool_echo.as_ref());
 
-        let serialized = serialize_json_body(&response).map_err(|error| {
-            FilterAction::Reject(responses_error_rejection(502, "server_error", &error.to_string()))
-        })?;
-        if serialized.len() > self.max_rewritten_body_bytes {
-            return Err(reject_rewritten_body_too_large(
-                serialized.len(),
-                self.max_rewritten_body_bytes,
-            ));
+        match serialize_json_body_within(&response, self.max_rewritten_body_bytes)
+            .map_err(|error| FilterAction::Reject(responses_error_rejection(502, "server_error", &error.to_string())))?
+        {
+            BoundedJsonBody::Fits(serialized) => Ok(Some(serialized)),
+            BoundedJsonBody::TooLarge { actual } => {
+                Err(reject_rewritten_body_too_large(actual, self.max_rewritten_body_bytes))
+            },
         }
-        Ok(Some(serialized))
     }
 
     /// Ratchet the upstream response to a bounded `StreamBuffer` and strip the
