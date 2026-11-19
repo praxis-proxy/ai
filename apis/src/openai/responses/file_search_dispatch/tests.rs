@@ -1547,7 +1547,7 @@ async fn exhausted_file_response_allowance_stops_before_paid_fanout() {
     );
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.dispatch_failure.as_ref().map(|failure| failure.status), Some(502));
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
 }
 
 #[tokio::test]
@@ -1567,7 +1567,7 @@ async fn request_budget_body_overflow_is_terminal_even_with_fail_open() {
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.dispatch_failure.as_ref().map(|failure| failure.status), Some(502));
     assert_eq!(state.accumulated_output[0], pending);
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
     let requests = server.requests();
     assert!(
         !requests.is_empty(),
@@ -2112,7 +2112,9 @@ fn make_context_with_request_headers(
     }
     let request = Box::leak(Box::new(request));
     let mut ctx = crate::test_utils::make_filter_context(request);
-    ctx.set_metadata("openai_responses_request.stream", "false");
+    ctx.filter_metadata
+        .insert("openai_responses_request.stream", "false")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     if let Some(state) = state {
         ctx.extensions.insert(state);
     }

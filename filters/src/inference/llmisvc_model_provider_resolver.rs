@@ -169,7 +169,9 @@ impl LlmisvcModelProviderResolverFilter {
         match rewrite_publisher_body_model(body, short_name, self.name())? {
             PublisherBodyRewrite::Noop => {},
             PublisherBodyRewrite::Matched { rewritten } => {
-                ctx.set_metadata(META_PUBLISHER_ID, model_name.as_str());
+                ctx.filter_metadata
+                    .insert(META_PUBLISHER_ID, model_name.as_str())
+                    .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
                 if rewritten {
                     debug!(
                         original = %model_name,
@@ -195,7 +197,7 @@ impl HttpFilter for LlmisvcModelProviderResolverFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -417,7 +419,7 @@ bogus_field: true
         let filter = filter_default();
         assert_eq!(
             filter.request_body_access(),
-            BodyAccess::ReadWrite,
+            BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional),
             "must mutate the request body"
         );
         assert!(
@@ -485,7 +487,7 @@ bogus_field: true
         let parsed: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
         assert_eq!(parsed["model"].as_str(), Some("granite-3.1-8b"));
         assert_eq!(
-            ctx.filter_metadata.get(META_PUBLISHER_ID).map(String::as_str),
+            ctx.filter_metadata.get(META_PUBLISHER_ID),
             Some("publishers/rhoai/models/granite-3.1-8b"),
         );
         assert!(ctx.extra_request_headers.is_empty());
@@ -552,7 +554,7 @@ bogus_field: true
         let parsed: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
         assert_eq!(parsed["model"].as_str(), Some("from-header"));
         assert_eq!(
-            ctx.filter_metadata.get(META_PUBLISHER_ID).map(String::as_str),
+            ctx.filter_metadata.get(META_PUBLISHER_ID),
             Some("publishers/ns/models/from-header"),
         );
     }

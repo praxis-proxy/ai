@@ -109,7 +109,9 @@ pub(super) fn accumulate_response_object(
         state.local_completion_response_template = Value::Null;
         had_prior_usage
     };
-    ctx.set_metadata("responses.status", status.clone());
+    ctx.filter_metadata
+        .insert("responses.status", status.clone())
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
     debug!(status, "complete response received, ResponsesState updated");
     had_prior_usage

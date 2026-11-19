@@ -605,7 +605,7 @@ impl HttpFilter for CompactFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     /// Also offer the bound-upstream phase so a chain may defer compaction until
@@ -620,7 +620,7 @@ impl HttpFilter for CompactFilter {
     /// minted once the body is bound. A standalone chain with no such condition
     /// still runs the pre-read hook.
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -676,7 +676,9 @@ impl HttpFilter for CompactFilter {
             Err(action) => return Ok(action),
         };
         self.apply_compaction(ctx, &summary);
-        ctx.set_metadata("responses.compacted", "true");
+        ctx.filter_metadata
+            .insert("responses.compacted", "true")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         Ok(FilterAction::Release)
     }
 
@@ -829,7 +831,7 @@ fn previous_usage_total(state: &ResponsesState) -> Option<u64> {
 
 /// Check whether this is an OpenAI Responses API request.
 fn is_responses_request(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_request.format") == Some("openai_responses")
+    ctx.filter_metadata.get("openai_responses_request.format") == Some("openai_responses")
 }
 
 // -----------------------------------------------------------------------------

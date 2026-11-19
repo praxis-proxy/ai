@@ -429,9 +429,9 @@ impl HttpFilter for AiGuardrailsFilter {
 
     fn request_body_access(&self) -> BodyAccess {
         if self.phase.request {
-            BodyAccess::ReadWrite
+            BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
         } else if self.phase.response || self.phase.tool_results {
-            BodyAccess::ReadOnly
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
         } else {
             BodyAccess::None
         }
@@ -541,7 +541,7 @@ impl HttpFilter for AiGuardrailsFilter {
 
     fn response_body_access(&self) -> BodyAccess {
         if self.phase.response {
-            BodyAccess::ReadWrite
+            BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
         } else {
             BodyAccess::None
         }

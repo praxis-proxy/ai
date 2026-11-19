@@ -68,7 +68,7 @@ impl HttpFilter for McpStreamingSelectorFilter {
     /// which would re-arm an opaque inner transport limiter and defeat
     /// streaming. `ReadOnly` keeps the response body streamed through untouched.
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     /// Stream the response body (do not buffer).
@@ -105,7 +105,7 @@ mod tests {
         assert!(!filter.produces_terminal_response());
         assert_eq!(
             filter.response_body_access(),
-            BodyAccess::ReadOnly,
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional),
             "ReadOnly keeps clamp_body_mode from downgrading Stream to a buffered limit"
         );
         assert!(matches!(filter.response_body_mode(), BodyMode::Stream));

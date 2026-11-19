@@ -4224,6 +4224,7 @@ class TestOpenAIResponsesVLLM:
         # rewrite never touches, so before the fix the stored response echoed the
         # backend's null even though the streamed terminal carried first.id.
         retrieved = _retrieve_with_retry(openai_client, final_response.id)
+        assert retrieved.model == final_response.model
         assert retrieved.previous_response_id == first.id, (
             "the stored streaming response must persist the caller's "
             "previous_response_id, matching the terminal frame the client saw; "

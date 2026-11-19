@@ -100,11 +100,11 @@ impl HttpFilter for TokenUsageHeadersFilter {
 /// response headers. No-op when response headers are absent or
 /// no token data has been written by upstream filters.
 fn inject_usage_headers(ctx: &mut HttpFilterContext<'_>) {
-    let status = ctx.get_metadata(META_TOKEN_STATUS).map(str::to_owned);
+    let status = ctx.filter_metadata.get(META_TOKEN_STATUS).map(str::to_owned);
     let counts = match (
-        ctx.get_metadata(META_TOKEN_INPUT).map(str::to_owned),
-        ctx.get_metadata(META_TOKEN_OUTPUT).map(str::to_owned),
-        ctx.get_metadata(META_TOKEN_TOTAL).map(str::to_owned),
+        ctx.filter_metadata.get(META_TOKEN_INPUT).map(str::to_owned),
+        ctx.filter_metadata.get(META_TOKEN_OUTPUT).map(str::to_owned),
+        ctx.filter_metadata.get(META_TOKEN_TOTAL).map(str::to_owned),
     ) {
         (Some(input), Some(output), Some(total)) => Some((input, output, total)),
         _ => None,
@@ -160,9 +160,15 @@ mod tests {
     use super::*;
 
     fn set_token_metadata(ctx: &mut HttpFilterContext<'_>, input: &str, output: &str, total: &str) {
-        ctx.set_metadata(META_TOKEN_INPUT, input.to_owned());
-        ctx.set_metadata(META_TOKEN_OUTPUT, output.to_owned());
-        ctx.set_metadata(META_TOKEN_TOTAL, total.to_owned());
+        ctx.filter_metadata
+            .insert(META_TOKEN_INPUT, input.to_owned())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert(META_TOKEN_OUTPUT, output.to_owned())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert(META_TOKEN_TOTAL, total.to_owned())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
 
     #[tokio::test]
@@ -215,7 +221,9 @@ mod tests {
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
-        ctx.set_metadata(META_TOKEN_INPUT, "200".to_owned());
+        ctx.filter_metadata
+            .insert(META_TOKEN_INPUT, "200".to_owned())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
         let mut resp = crate::test_utils::make_response();
         ctx.response_header = Some(&mut resp);
@@ -279,9 +287,15 @@ mod tests {
         let filter = TokenUsageHeadersFilter;
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.set_metadata(META_TOKEN_INPUT, "100".to_owned());
-        ctx.set_metadata(META_TOKEN_OUTPUT, "bad\nvalue".to_owned());
-        ctx.set_metadata(META_TOKEN_TOTAL, "200".to_owned());
+        ctx.filter_metadata
+            .insert(META_TOKEN_INPUT, "100".to_owned())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert(META_TOKEN_OUTPUT, "bad\nvalue".to_owned())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert(META_TOKEN_TOTAL, "200".to_owned())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
         let mut resp = crate::test_utils::make_response();
         ctx.response_header = Some(&mut resp);
@@ -307,7 +321,9 @@ mod tests {
         let filter = TokenUsageHeadersFilter;
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.set_metadata(META_TOKEN_STATUS, "overflow".to_owned());
+        ctx.filter_metadata
+            .insert(META_TOKEN_STATUS, "overflow".to_owned())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
         let mut resp = crate::test_utils::make_response();
         ctx.response_header = Some(&mut resp);

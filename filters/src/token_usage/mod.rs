@@ -194,15 +194,23 @@ struct StreamingTokens {
 fn set_token_usage(ctx: &mut HttpFilterContext<'_>, input: u64, output: u64, total: Option<u64>) {
     let total = total.unwrap_or_else(|| input.saturating_add(output));
 
-    ctx.set_metadata(META_TOKEN_INPUT, input.to_string());
-    ctx.set_metadata(META_TOKEN_OUTPUT, output.to_string());
-    ctx.set_metadata(META_TOKEN_TOTAL, total.to_string());
+    ctx.filter_metadata
+        .insert(META_TOKEN_INPUT, input.to_string())
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.filter_metadata
+        .insert(META_TOKEN_OUTPUT, output.to_string())
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.filter_metadata
+        .insert(META_TOKEN_TOTAL, total.to_string())
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 }
 
 /// Marks token usage as unavailable due to exceeding the capture limit,
 /// distinguishable from a genuine zero-usage response.
 fn set_token_status_overflow(ctx: &mut HttpFilterContext<'_>) {
-    ctx.set_metadata(META_TOKEN_STATUS, TOKEN_STATUS_OVERFLOW.to_owned());
+    ctx.filter_metadata
+        .insert(META_TOKEN_STATUS, TOKEN_STATUS_OVERFLOW.to_owned())
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 }
 
 /// Stores the prompt cache breakdown of the input tokens.
@@ -229,6 +237,8 @@ fn set_reasoning_token_usage(ctx: &mut HttpFilterContext<'_>, reasoning: Option<
 /// Writes one optional count; skips the key when the provider omitted it.
 fn set_optional_count(ctx: &mut HttpFilterContext<'_>, key: &str, value: Option<u64>) {
     if let Some(value) = value {
-        ctx.set_metadata(key, value.to_string());
+        ctx.filter_metadata
+            .insert(key, value.to_string())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
 }

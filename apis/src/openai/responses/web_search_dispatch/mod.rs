@@ -665,7 +665,7 @@ impl HttpFilter for WebSearchDispatchFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -678,7 +678,7 @@ impl HttpFilter for WebSearchDispatchFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -702,8 +702,12 @@ impl HttpFilter for WebSearchDispatchFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
-        ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
-        ctx.set_metadata(MAX_QUERY_METADATA, self.max_query_bytes.to_string());
+        ctx.filter_metadata
+            .insert(MAX_CALLS_METADATA, self.max_calls_per_round.to_string())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert(MAX_QUERY_METADATA, self.max_query_bytes.to_string())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
@@ -747,7 +751,8 @@ impl HttpFilter for WebSearchDispatchFilter {
             .max_tool_calls
             .map(|_| current_round_tool_call_admissions(state, &selected_values));
         let context_size = ctx
-            .get_metadata("tool_parse.search_context_size")
+            .filter_metadata
+            .get("tool_parse.search_context_size")
             .or_else(|| web_search_context_size_from_state(state))
             .map_or(self.default_context_size, SearchContextSize::from_str_or_default);
 
@@ -849,7 +854,7 @@ impl HttpFilter for WebSearchDispatchFilter {
 /// Return the response fan-out cap this dispatcher published for the owner.
 #[cfg(feature = "openai-agentic-loop")]
 pub(crate) fn configured_max_calls_per_round(ctx: &HttpFilterContext<'_>) -> Option<usize> {
-    ctx.get_metadata(MAX_CALLS_METADATA)?.parse().ok()
+    ctx.filter_metadata.get(MAX_CALLS_METADATA)?.parse().ok()
 }
 
 /// Replace the action of a model-streamed `web_search_call` that can never
@@ -866,7 +871,8 @@ pub(crate) fn bound_streamed_search_action(ctx: &HttpFilterContext<'_>, item: &m
         return;
     }
     let Some(max_query_bytes) = ctx
-        .get_metadata(MAX_QUERY_METADATA)
+        .filter_metadata
+        .get(MAX_QUERY_METADATA)
         .and_then(|value| value.parse::<usize>().ok())
     else {
         return;
@@ -1780,7 +1786,9 @@ fn record_web_search_budget_failure(ctx: &mut HttpFilterContext<'_>) {
             message: "Web search exceeds a processing limit set by the platform administrator.".to_owned(),
         });
     }
-    ctx.set_metadata("responses.skip_persist", "true");
+    ctx.filter_metadata
+        .insert("responses.skip_persist", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 }
 
 // -----------------------------------------------------------------------------

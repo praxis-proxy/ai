@@ -679,10 +679,10 @@ struct SelectedCredential {
 /// Absence of all four fields means that the selected route requires no
 /// credential. Any partial or unsupported reference fails closed.
 fn selected_credential_ref(ctx: &HttpFilterContext<'_>) -> Option<Result<SelectedCredential, ()>> {
-    let strategy = ctx.get_metadata(CREDENTIAL_STRATEGY);
-    let name = ctx.get_metadata(CREDENTIAL_NAME);
-    let namespace = ctx.get_metadata(CREDENTIAL_NAMESPACE);
-    let key = ctx.get_metadata(CREDENTIAL_KEY);
+    let strategy = ctx.filter_metadata.get(CREDENTIAL_STRATEGY);
+    let name = ctx.filter_metadata.get(CREDENTIAL_NAME);
+    let namespace = ctx.filter_metadata.get(CREDENTIAL_NAMESPACE);
+    let key = ctx.filter_metadata.get(CREDENTIAL_KEY);
 
     if strategy.is_none() && name.is_none() && namespace.is_none() && key.is_none() {
         return None;
@@ -2221,8 +2221,12 @@ mod tests {
         let f = make_filter_with_value("sec", "ns", "key", "tok");
         let req = crate::test_utils::make_request(Method::POST, "/chat");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.set_metadata(CREDENTIAL_STRATEGY, STRATEGY_BEARER_TOKEN);
-        ctx.set_metadata(CREDENTIAL_NAME, "sec");
+        ctx.filter_metadata
+            .insert(CREDENTIAL_STRATEGY, STRATEGY_BEARER_TOKEN)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert(CREDENTIAL_NAME, "sec")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(
@@ -2351,9 +2355,17 @@ mod tests {
         namespace: &str,
         key: &str,
     ) {
-        ctx.set_metadata(CREDENTIAL_STRATEGY, strategy);
-        ctx.set_metadata(CREDENTIAL_NAME, name);
-        ctx.set_metadata(CREDENTIAL_NAMESPACE, namespace);
-        ctx.set_metadata(CREDENTIAL_KEY, key);
+        ctx.filter_metadata
+            .insert(CREDENTIAL_STRATEGY, strategy)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert(CREDENTIAL_NAME, name)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert(CREDENTIAL_NAMESPACE, namespace)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert(CREDENTIAL_KEY, key)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
 }

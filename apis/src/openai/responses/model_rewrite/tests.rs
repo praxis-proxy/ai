@@ -295,7 +295,7 @@ fn body_access_is_read_write() {
     let filter = make_filter(ALIAS_CONFIG);
     assert_eq!(
         filter.request_body_access(),
-        BodyAccess::ReadWrite,
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional),
         "model rewrite must use ReadWrite body access"
     );
 }
@@ -464,8 +464,7 @@ async fn trailing_slash_treated_as_create() {
     );
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_model_rewrite.effective_model")
-            .map(String::as_str),
+            .get("openai_responses_model_rewrite.effective_model"),
         Some("llama-3.3-70b"),
         "model should be rewritten for trailing-slash create"
     );
@@ -510,9 +509,7 @@ async fn chat_completions_alias_rewrites_model() {
         "chat completions messages should be preserved"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_model_rewrite.original_model")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_model_rewrite.original_model"),
         Some("codex-mini-latest"),
         "original model should be promoted to metadata"
     );
@@ -667,22 +664,17 @@ async fn known_alias_rewrites_model() {
     );
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_model_rewrite.effective_model")
-            .map(String::as_str),
+            .get("openai_responses_model_rewrite.effective_model"),
         Some("llama-3.3-70b"),
         "effective model metadata"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_model_rewrite.original_model")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_model_rewrite.original_model"),
         Some("codex-mini-latest"),
         "original model metadata"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_model_rewrite.rewritten")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_model_rewrite.rewritten"),
         Some("true"),
         "rewritten flag"
     );
@@ -764,16 +756,12 @@ async fn wildcard_alias_rewrites_model() {
         "wildcard alias should rewrite matching model"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_model_rewrite.original_model")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_model_rewrite.original_model"),
         Some("codex-mini-2026-06-24"),
         "original model metadata should preserve wildcard-matched client model"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_model_rewrite.rewritten")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_model_rewrite.rewritten"),
         Some("true"),
         "wildcard rewrite should set rewritten flag"
     );
@@ -792,8 +780,7 @@ async fn exact_alias_beats_wildcard_alias() {
     );
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_model_rewrite.effective_model")
-            .map(String::as_str),
+            .get("openai_responses_model_rewrite.effective_model"),
         Some("llama-exact"),
         "effective model metadata should use exact alias target"
     );
@@ -857,8 +844,7 @@ async fn missing_model_injects_default() {
     );
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_model_rewrite.default_injected")
-            .map(String::as_str),
+            .get("openai_responses_model_rewrite.default_injected"),
         Some("true"),
         "default_injected flag"
     );
@@ -881,8 +867,7 @@ async fn null_model_injects_default() {
     );
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_model_rewrite.default_injected")
-            .map(String::as_str),
+            .get("openai_responses_model_rewrite.default_injected"),
         Some("true"),
         "default_injected flag"
     );
@@ -900,8 +885,7 @@ async fn unknown_model_passes_unchanged() {
     );
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_model_rewrite.effective_model")
-            .map(String::as_str),
+            .get("openai_responses_model_rewrite.effective_model"),
         Some("unknown-model"),
         "effective model should equal original"
     );
@@ -1143,8 +1127,7 @@ headers:
     );
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_model_rewrite.effective_model")
-            .map(String::as_str),
+            .get("openai_responses_model_rewrite.effective_model"),
         Some("old"),
         "metadata still written even with null headers"
     );
@@ -1233,8 +1216,12 @@ async fn on_request_repopulates_filter_results_from_metadata() {
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
 
-    ctx.set_metadata("openai_responses_model_rewrite.effective_model", "llama-3.3-70b");
-    ctx.set_metadata("openai_responses_model_rewrite.rewritten", "true");
+    ctx.filter_metadata
+        .insert("openai_responses_model_rewrite.effective_model", "llama-3.3-70b")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.filter_metadata
+        .insert("openai_responses_model_rewrite.rewritten", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
     ctx.filter_results.clear();
     assert!(

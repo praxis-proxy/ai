@@ -251,7 +251,9 @@ const AGENTIC_STREAM_GUARD_KEY: &str = "responses.agentic_stream_guard";
 /// Arm the agentic streaming safety check for the current IRR round.
 #[cfg(feature = "openai-agentic-loop")]
 pub(crate) fn arm_agentic_stream_guard(ctx: &mut HttpFilterContext<'_>) {
-    ctx.set_metadata(AGENTIC_STREAM_GUARD_KEY, "true");
+    ctx.filter_metadata
+        .insert(AGENTIC_STREAM_GUARD_KEY, "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 }
 
 /// Enforce the agentic streaming safety check after transport selection.
@@ -263,13 +265,17 @@ pub(crate) fn arm_agentic_stream_guard(ctx: &mut HttpFilterContext<'_>) {
 /// backend dispatch while allowing the adapter to run after upstream selection.
 #[cfg(feature = "openai-responses")]
 pub(crate) fn enforce_agentic_stream_guard(ctx: &mut HttpFilterContext<'_>) -> Option<Rejection> {
-    if ctx.get_metadata(AGENTIC_STREAM_GUARD_KEY) != Some("true") {
+    if ctx.filter_metadata.get(AGENTIC_STREAM_GUARD_KEY) != Some("true") {
         return None;
     }
 
-    ctx.set_metadata(AGENTIC_STREAM_GUARD_KEY, "false");
-    let stream_events_armed = ctx.get_metadata("responses.logical_stream") == Some("true");
-    ctx.set_metadata("responses.logical_stream", "false");
+    ctx.filter_metadata
+        .insert(AGENTIC_STREAM_GUARD_KEY, "false")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    let stream_events_armed = ctx.filter_metadata.get("responses.logical_stream") == Some("true");
+    ctx.filter_metadata
+        .insert("responses.logical_stream", "false")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
     (ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming && !stream_events_armed).then(|| {
         error::responses_error_rejection(
@@ -550,12 +556,16 @@ fn compute_mode(classified: &ClassifiedRequest) -> Option<&'static str> {
 /// Write durable metadata that persists across all Pingora lifecycle phases.
 #[cfg(feature = "openai-responses")]
 fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest, mode: Option<&str>) {
-    ctx.set_metadata("openai_responses_request.format", classified.format.as_str());
+    ctx.filter_metadata
+        .insert("openai_responses_request.format", classified.format.as_str())
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     write_optional_metadata(ctx, classified);
     write_boolean_metadata(ctx, classified);
 
     if let Some(m) = mode {
-        ctx.set_metadata("openai_responses_request.mode", m);
+        ctx.filter_metadata
+            .insert("openai_responses_request.mode", m)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
 }
 
@@ -565,29 +575,39 @@ fn write_optional_metadata(ctx: &mut HttpFilterContext<'_>, classified: &Classif
     if let Some(model) = &classified.model
         && is_promotable_value(model)
     {
-        ctx.set_metadata("openai_responses_request.model", model.clone());
+        ctx.filter_metadata
+            .insert("openai_responses_request.model", model.clone())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
 
     if let Some(stream) = classified.stream {
-        ctx.set_metadata("openai_responses_request.stream", if stream { "true" } else { "false" });
+        ctx.filter_metadata
+            .insert("openai_responses_request.stream", if stream { "true" } else { "false" })
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
 
     if let Some(store) = classified.store {
-        ctx.set_metadata("openai_responses_request.store", if store { "true" } else { "false" });
+        ctx.filter_metadata
+            .insert("openai_responses_request.store", if store { "true" } else { "false" })
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
 
     if let Some(background) = classified.background {
-        ctx.set_metadata(
-            "openai_responses_request.background",
-            if background { "true" } else { "false" },
-        );
+        ctx.filter_metadata
+            .insert(
+                "openai_responses_request.background",
+                if background { "true" } else { "false" },
+            )
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
 
     if let Some(max_output_tokens) = classified.max_output_tokens {
-        ctx.set_metadata(
-            "openai_responses_request.max_output_tokens",
-            max_output_tokens.to_string(),
-        );
+        ctx.filter_metadata
+            .insert(
+                "openai_responses_request.max_output_tokens",
+                max_output_tokens.to_string(),
+            )
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
 }
 
@@ -595,16 +615,24 @@ fn write_optional_metadata(ctx: &mut HttpFilterContext<'_>, classified: &Classif
 #[cfg(feature = "openai-responses")]
 fn write_boolean_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest) {
     if classified.has_previous_response_id {
-        ctx.set_metadata("openai_responses_request.has_previous_response_id", "true");
+        ctx.filter_metadata
+            .insert("openai_responses_request.has_previous_response_id", "true")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
     if classified.has_conversation {
-        ctx.set_metadata("openai_responses_request.has_conversation", "true");
+        ctx.filter_metadata
+            .insert("openai_responses_request.has_conversation", "true")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
     if classified.has_tools {
-        ctx.set_metadata("openai_responses_request.has_tools", "true");
+        ctx.filter_metadata
+            .insert("openai_responses_request.has_tools", "true")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
     if classified.has_prompt_id {
-        ctx.set_metadata("openai_responses_request.has_prompt_id", "true");
+        ctx.filter_metadata
+            .insert("openai_responses_request.has_prompt_id", "true")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
 }
 
@@ -805,9 +833,9 @@ fn defaulted_openresponses_item_type(object: &serde_json::Map<String, serde_json
 #[cfg(all(feature = "openai-responses", any(test, feature = "openai-agentic-loop")))]
 pub(crate) fn streamed_round_is_dispatchable(ctx: &HttpFilterContext<'_>, state: &state::ResponsesState) -> bool {
     state.request_body.get("stream").and_then(serde_json::Value::as_bool) != Some(true)
-        || (ctx.get_metadata("responses.stream_completion") == Some("terminal")
+        || (ctx.filter_metadata.get("responses.stream_completion") == Some("terminal")
             && state.response_object.get("status").and_then(serde_json::Value::as_str) == Some("completed")
-            && ctx.get_metadata("responses.stream_parse_error") != Some("true"))
+            && ctx.filter_metadata.get("responses.stream_parse_error") != Some("true"))
 }
 
 /// Arm the two-layer continuation stop (§7.3): `action="done"` ends
@@ -836,10 +864,16 @@ pub(crate) fn fs_arm_stream_stop(ctx: &mut HttpFilterContext<'_>) {
 /// on a pre-existing error, so a stale `action="loop"` cannot survive (#313 P1).
 #[cfg(feature = "openai-responses")]
 pub(crate) fn fs_end_stream_with_error_ctx(ctx: &mut HttpFilterContext<'_>, code: &str, message: &str) {
-    if ctx.get_metadata("responses.stream_error_code").is_none() {
-        ctx.set_metadata("responses.stream_error_code", code);
-        ctx.set_metadata("responses.stream_error_message", message);
-        ctx.set_metadata("responses.skip_persist", "true");
+    if ctx.filter_metadata.get("responses.stream_error_code").is_none() {
+        ctx.filter_metadata
+            .insert("responses.stream_error_code", code)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert("responses.stream_error_message", message)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert("responses.skip_persist", "true")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
     fs_arm_stream_stop(ctx);
 }

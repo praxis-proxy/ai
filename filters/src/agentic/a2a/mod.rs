@@ -139,7 +139,7 @@ impl HttpFilter for A2aFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -150,7 +150,7 @@ impl HttpFilter for A2aFilter {
 
     fn response_body_access(&self) -> BodyAccess {
         if self.task_route_store.is_some() {
-            BodyAccess::ReadOnly
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
         } else {
             BodyAccess::None
         }
@@ -220,7 +220,7 @@ impl HttpFilter for A2aFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let method = ctx.get_metadata("a2a.method");
+        let method = ctx.filter_metadata.get("a2a.method");
         let is_send_message = method.is_some_and(|m| m == "SendMessage");
         let is_sse_capable = method.is_some_and(|m| m == "SendStreamingMessage" || m == "SubscribeToTask");
 
@@ -248,7 +248,8 @@ impl HttpFilter for A2aFilter {
 
         if is_sse {
             ctx.filter_metadata
-                .insert("a2a.response.is_sse".to_owned(), "true".to_owned());
+                .insert("a2a.response.is_sse".to_owned(), "true".to_owned())
+                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
             return Ok(FilterAction::Continue);
         }
 
@@ -479,9 +480,15 @@ fn lookup_task_route(
             RouteSource::Task => "task_route_hit",
             RouteSource::Context => "context_route_hit",
         };
-        ctx.set_metadata("a2a.route_decision", decision);
-        ctx.set_metadata("a2a.route_source", source.as_str());
-        ctx.set_metadata("a2a.route_cluster", &*cluster);
+        ctx.filter_metadata
+            .insert("a2a.route_decision", decision)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert("a2a.route_source", source.as_str())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert("a2a.route_cluster", &*cluster)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
         debug!(
             has_task_id,
@@ -500,7 +507,9 @@ fn lookup_task_route(
         } else {
             "context_route_miss"
         };
-        ctx.set_metadata("a2a.route_decision", miss);
+        ctx.filter_metadata
+            .insert("a2a.route_decision", miss)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         debug!(
             has_task_id,
             task_id_len = task_id.map_or(0, str::len),
@@ -762,13 +771,21 @@ fn write_metadata(
     set_safe_metadata(ctx, "json_rpc.method", envelope.method.as_deref());
 
     if is_promotable(method_str) {
-        ctx.set_metadata("a2a.method", method_str);
+        ctx.filter_metadata
+            .insert("a2a.method", method_str)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
-    ctx.set_metadata("json_rpc.kind", envelope.kind.as_str());
+    ctx.filter_metadata
+        .insert("json_rpc.kind", envelope.kind.as_str())
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
     set_safe_metadata(ctx, "a2a.original_method", a2a.original_method.as_deref());
-    ctx.set_metadata("a2a.family", a2a.family.as_str());
-    ctx.set_metadata("a2a.streaming", if a2a.streaming { "true" } else { "false" });
+    ctx.filter_metadata
+        .insert("a2a.family", a2a.family.as_str())
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.filter_metadata
+        .insert("a2a.streaming", if a2a.streaming { "true" } else { "false" })
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     set_safe_metadata(ctx, "a2a.context_id", a2a.context_id.as_deref());
     set_safe_metadata(ctx, "a2a.task_id", a2a.task_id.as_deref());
     set_safe_metadata(ctx, "a2a.version", a2a.version.as_deref());
@@ -779,7 +796,9 @@ fn set_safe_metadata(ctx: &mut HttpFilterContext<'_>, key: &str, value: Option<&
     if let Some(v) = value
         && is_promotable(v)
     {
-        ctx.set_metadata(key, v);
+        ctx.filter_metadata
+            .insert(key, v)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
 }
 

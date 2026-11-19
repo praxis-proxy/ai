@@ -50,12 +50,12 @@ fn body_access_is_read_only() {
     let filter = make_filter("{}");
     assert_eq!(
         filter.request_body_access(),
-        BodyAccess::ReadOnly,
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional),
         "should use read-only body access"
     );
     assert_eq!(
         filter.bound_upstream_request_body_access(),
-        BodyAccess::ReadOnly,
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional),
         "should support provider-gated bound-body parsing"
     );
 }
@@ -142,16 +142,12 @@ async fn function_tools_metadata() {
     assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.has_tools")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.has_tools"),
         Some("true"),
         "should set has_tools"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.function_count")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.function_count"),
         Some("1"),
         "should set function_count"
     );
@@ -168,16 +164,12 @@ async fn nameless_function_tool_still_sets_has_tools() {
     assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.has_tools")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.has_tools"),
         Some("true"),
         "nameless function tool should still set has_tools metadata"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.function_count")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.function_count"),
         Some("1"),
         "nameless function tool should still count the discriminator"
     );
@@ -190,16 +182,12 @@ async fn web_search_metadata() {
     assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.has_web_search")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.has_web_search"),
         Some("true"),
         "should set has_web_search"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.has_tools")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.has_tools"),
         Some("true"),
         "web_search counts as has_tools"
     );
@@ -211,9 +199,7 @@ async fn web_search_context_size_metadata() {
     let (_action, ctx) = run_filter("{}", body).await;
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("tool_parse.search_context_size")
-            .map(String::as_str),
+        ctx.filter_metadata.get("tool_parse.search_context_size"),
         Some("high"),
         "should set search_context_size from tool entry"
     );
@@ -237,9 +223,7 @@ async fn file_search_metadata() {
     assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.has_file_search")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.has_file_search"),
         Some("true"),
         "should set has_file_search"
     );
@@ -252,7 +236,7 @@ async fn mcp_tool_metadata() {
     assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
-        ctx.filter_metadata.get("openai_tool_parse.has_mcp").map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.has_mcp"),
         Some("true"),
         "should set has_mcp"
     );
@@ -265,9 +249,7 @@ async fn tool_choice_metadata() {
     assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.tool_choice")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.tool_choice"),
         Some("required"),
         "should set tool_choice"
     );
@@ -280,9 +262,7 @@ async fn tool_choice_specific_metadata() {
     assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.tool_choice")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.tool_choice"),
         Some("calc"),
         "specific tool_choice should use tool name"
     );
@@ -295,9 +275,7 @@ async fn tool_choice_hosted_type_metadata() {
     assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.tool_choice")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.tool_choice"),
         Some("file_search"),
         "hosted tool_choice should use tool type"
     );
@@ -318,9 +296,7 @@ async fn tool_choice_allowed_tools_metadata_uses_mode() {
     assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.tool_choice")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.tool_choice"),
         Some("required"),
         "allowed_tools tool_choice should promote mode"
     );
@@ -337,16 +313,12 @@ async fn tool_choice_mcp_metadata() {
     assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.tool_choice")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.tool_choice"),
         Some("mcp"),
         "MCP tool_choice should promote as 'mcp'"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.tool_choice_type")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.tool_choice_type"),
         Some("mcp"),
         "MCP tool_choice_type should be 'mcp'"
     );
@@ -359,9 +331,7 @@ async fn tool_choice_type_metadata_for_function() {
     assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.tool_choice_type")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.tool_choice_type"),
         Some("function"),
         "function tool_choice_type should be 'function'"
     );
@@ -530,16 +500,12 @@ async fn code_interpreter_metadata() {
     assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.has_code_interpreter")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.has_code_interpreter"),
         Some("true"),
         "should set has_code_interpreter"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.has_tools")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.has_tools"),
         Some("true"),
         "code_interpreter counts as has_tools"
     );
@@ -552,9 +518,7 @@ async fn computer_use_metadata() {
     assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.has_computer_use")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.has_computer_use"),
         Some("true"),
         "should set has_computer_use"
     );
@@ -567,9 +531,7 @@ async fn image_generation_metadata() {
     assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.has_image_generation")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.has_image_generation"),
         Some("true"),
         "should set has_image_generation"
     );
@@ -582,9 +544,7 @@ async fn tool_search_metadata() {
     assert!(matches!(action, FilterAction::Release), "has tools should release");
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_tool_parse.has_tool_search")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_tool_parse.has_tool_search"),
         Some("true"),
         "should set has_tool_search"
     );
@@ -656,26 +616,39 @@ async fn mixed_tools_all_metadata_set() {
     let (action, ctx) = run_filter("{}", body).await;
     assert!(matches!(action, FilterAction::Release), "has tools should release");
 
-    assert_eq!(ctx.filter_metadata["openai_tool_parse.has_tools"], "true", "has_tools");
     assert_eq!(
-        ctx.filter_metadata["openai_tool_parse.function_count"], "2",
+        ctx.filter_metadata.get("openai_tool_parse.has_tools"),
+        Some("true"),
+        "has_tools"
+    );
+    assert_eq!(
+        ctx.filter_metadata.get("openai_tool_parse.function_count"),
+        Some("2"),
         "function_count"
     );
     assert_eq!(
-        ctx.filter_metadata["openai_tool_parse.has_web_search"], "true",
+        ctx.filter_metadata.get("openai_tool_parse.has_web_search"),
+        Some("true"),
         "has_web_search"
     );
     assert_eq!(
-        ctx.filter_metadata["openai_tool_parse.has_file_search"], "true",
+        ctx.filter_metadata.get("openai_tool_parse.has_file_search"),
+        Some("true"),
         "has_file_search"
     );
     assert_eq!(
-        ctx.filter_metadata["openai_tool_parse.has_code_interpreter"], "true",
+        ctx.filter_metadata.get("openai_tool_parse.has_code_interpreter"),
+        Some("true"),
         "has_code_interpreter"
     );
-    assert_eq!(ctx.filter_metadata["openai_tool_parse.has_mcp"], "true", "has_mcp");
     assert_eq!(
-        ctx.filter_metadata["openai_tool_parse.tool_choice"], "auto",
+        ctx.filter_metadata.get("openai_tool_parse.has_mcp"),
+        Some("true"),
+        "has_mcp"
+    );
+    assert_eq!(
+        ctx.filter_metadata.get("openai_tool_parse.tool_choice"),
+        Some("auto"),
         "tool_choice"
     );
 }
@@ -694,8 +667,8 @@ async fn bound_body_hook_promotes_tool_metadata() {
         .unwrap();
 
     assert!(matches!(outcome, BoundUpstreamBodyOutcome::Continue));
-    assert_eq!(ctx.get_metadata("openai_tool_parse.has_tools"), Some("true"));
-    assert_eq!(ctx.get_metadata("openai_tool_parse.function_count"), Some("1"));
+    assert_eq!(ctx.filter_metadata.get("openai_tool_parse.has_tools"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("openai_tool_parse.function_count"), Some("1"));
 }
 
 // =============================================================================
@@ -709,9 +682,15 @@ async fn restore_presence_flags_from_metadata() {
     let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
     let mut ctx = crate::test_utils::make_filter_context(req);
 
-    ctx.set_metadata("openai_tool_parse.has_tools", "true");
-    ctx.set_metadata("openai_tool_parse.has_web_search", "true");
-    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    ctx.filter_metadata
+        .insert("openai_tool_parse.has_tools", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.filter_metadata
+        .insert("openai_tool_parse.has_web_search", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.filter_metadata
+        .insert("openai_tool_parse.has_mcp", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -743,7 +722,9 @@ async fn restore_function_count_from_metadata() {
     let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
     let mut ctx = crate::test_utils::make_filter_context(req);
 
-    ctx.set_metadata("openai_tool_parse.function_count", "3");
+    ctx.filter_metadata
+        .insert("openai_tool_parse.function_count", "3")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -776,8 +757,12 @@ async fn restore_tool_choice_from_metadata() {
     let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
     let mut ctx = crate::test_utils::make_filter_context(req);
 
-    ctx.set_metadata("openai_tool_parse.tool_choice", "required");
-    ctx.set_metadata("openai_tool_parse.tool_choice_type", "function");
+    ctx.filter_metadata
+        .insert("openai_tool_parse.tool_choice", "required")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.filter_metadata
+        .insert("openai_tool_parse.tool_choice_type", "function")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 

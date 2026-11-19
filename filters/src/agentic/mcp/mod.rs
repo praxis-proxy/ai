@@ -123,7 +123,7 @@ impl HttpFilter for McpFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -360,28 +360,40 @@ fn write_metadata(
 
     let method_str = mcp.method.as_str();
     if !contains_control_chars(method_str) && method_str.len() <= max_len {
-        ctx.set_metadata("json_rpc.method", method_str);
-        ctx.set_metadata("mcp.method", method_str);
+        ctx.filter_metadata
+            .insert("json_rpc.method", method_str)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert("mcp.method", method_str)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
-    ctx.set_metadata("json_rpc.kind", envelope.kind.as_str());
+    ctx.filter_metadata
+        .insert("json_rpc.kind", envelope.kind.as_str())
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
     if let Some(name) = &mcp.name
         && !contains_control_chars(name)
         && name.len() <= max_len
     {
-        ctx.set_metadata("mcp.name", name.clone());
+        ctx.filter_metadata
+            .insert("mcp.name", name.clone())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
     if let Some(sid) = &mcp.session_id
         && !contains_control_chars(sid)
         && sid.len() <= max_len
     {
-        ctx.set_metadata("mcp.session_id", sid.clone());
+        ctx.filter_metadata
+            .insert("mcp.session_id", sid.clone())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
     if let Some(pv) = &mcp.protocol_version
         && !contains_control_chars(pv)
         && pv.len() <= max_len
     {
-        ctx.set_metadata("mcp.protocol_version", pv.clone());
+        ctx.filter_metadata
+            .insert("mcp.protocol_version", pv.clone())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
 }
 

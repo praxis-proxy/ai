@@ -102,10 +102,11 @@ fn ensure_described() {
 /// lifetime; values arriving after the cap are labeled `"other"`.
 pub fn resolve_model(ctx: &HttpFilterContext<'_>) -> String {
     let model = ctx
-        .get_metadata("openai_responses_request.model")
-        .or_else(|| ctx.get_metadata("openai_chat_completions_request.model"))
-        .or_else(|| ctx.get_metadata("anthropic_messages_request.model"))
-        .or_else(|| ctx.get_metadata("anthropic_messages_to_chat_completions.model"))
+        .filter_metadata
+        .get("openai_responses_request.model")
+        .or_else(|| ctx.filter_metadata.get("openai_chat_completions_request.model"))
+        .or_else(|| ctx.filter_metadata.get("anthropic_messages_request.model"))
+        .or_else(|| ctx.filter_metadata.get("anthropic_messages_to_chat_completions.model"))
         // The model_to_header filter publishes the client-requested model as
         // `model_to_header.model` metadata before token_count runs; fall back to
         // it so the label is populated even when no format filter ran. Only that
@@ -116,7 +117,7 @@ pub fn resolve_model(ctx: &HttpFilterContext<'_>) -> String {
         // hard-capped at MAX_MODEL_LABELS for the recorder lifetime (the
         // exporter has no idle eviction); values beyond the cap are labeled
         // "other" instead of growing the registry.
-        .or_else(|| ctx.get_metadata(META_MODEL_TO_HEADER_MODEL))
+        .or_else(|| ctx.filter_metadata.get(META_MODEL_TO_HEADER_MODEL))
         .filter(|v| !v.is_empty() && is_promotable_value(v))
         .unwrap_or("unknown");
     if model == OTHER_MODEL_LABEL || model == "unknown" {
@@ -274,8 +275,12 @@ mod tests {
     fn resolve_model_prefers_format_metadata() {
         let req = crate::test_utils::make_request(Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
-        ctx.set_metadata("openai_chat_completions_request.model", "gpt-format");
-        ctx.set_metadata("model_to_header.model", "gpt-header");
+        ctx.filter_metadata
+            .insert("openai_chat_completions_request.model", "gpt-format")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert("model_to_header.model", "gpt-header")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         assert_eq!(resolve_model(&ctx), "gpt-format");
     }
 
@@ -283,7 +288,9 @@ mod tests {
     fn resolve_model_uses_model_to_header_metadata() {
         let req = crate::test_utils::make_request(Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
-        ctx.set_metadata("model_to_header.model", "gpt-header");
+        ctx.filter_metadata
+            .insert("model_to_header.model", "gpt-header")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         assert_eq!(resolve_model(&ctx), "gpt-header");
     }
 
@@ -305,7 +312,9 @@ mod tests {
         let req = crate::test_utils::make_request(Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
         ctx.cluster = Some("cb-glm".to_owned().into());
-        ctx.set_metadata("openai_chat_completions_request.model", "gpt-x");
+        ctx.filter_metadata
+            .insert("openai_chat_completions_request.model", "gpt-x")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -359,7 +368,9 @@ mod tests {
     fn record_token_usage_bumps_empty_completions_on_zero_output() {
         let req = crate::test_utils::make_request(Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
-        ctx.set_metadata("model_to_header.model", "gpt-x");
+        ctx.filter_metadata
+            .insert("model_to_header.model", "gpt-x")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();

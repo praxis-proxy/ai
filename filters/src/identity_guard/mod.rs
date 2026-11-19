@@ -111,7 +111,9 @@ impl HttpFilter for IdentityHeaderGuardFilter {
                 // legitimate value set by an upstream proxy.
                 let namespaced = format!("{}.{}", self.namespace, name_lower);
                 if !ctx.filter_metadata.contains_key(&namespaced) {
-                    ctx.set_metadata(namespaced, val.to_owned());
+                    ctx.filter_metadata
+                        .insert(namespaced, val.to_owned())
+                        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
                     captured += 1;
                 }
             }

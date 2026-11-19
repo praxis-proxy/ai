@@ -114,7 +114,9 @@ async fn admit(filter: &TokenRateLimitFilter, req: &Request) -> FilterAction {
 /// metadata keys and values.
 fn complete(filter: &TokenRateLimitFilter, ctx: &mut HttpFilterContext<'_>, usage: &[(&str, &str)]) {
     for &(key, tokens) in usage {
-        ctx.set_metadata(key, tokens);
+        ctx.filter_metadata
+            .insert(key, tokens)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
     let mut body = None;
     drop(filter.on_response_body(ctx, &mut body, true).unwrap());

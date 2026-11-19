@@ -445,7 +445,7 @@ impl HttpFilter for McpBrokerFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -501,8 +501,12 @@ impl HttpFilter for McpBrokerFilter {
         };
 
         if !contains_control_chars(method_str) {
-            ctx.set_metadata("json_rpc.method", method_str.clone());
-            ctx.set_metadata("mcp.method", method_str.clone());
+            ctx.filter_metadata
+                .insert("json_rpc.method", method_str.clone())
+                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.filter_metadata
+                .insert("mcp.method", method_str.clone())
+                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         }
 
         self.dispatch_method(ctx, &value, &envelope, method_str, body)
@@ -822,7 +826,9 @@ fn handle_initialize(
     let session_id = format!("mcp-{}", ctx.id_generator.generate(ctx.time_source));
 
     debug!(session_id_len = session_id.len(), "MCP initialize");
-    ctx.set_metadata("mcp.session_id", session_id.clone());
+    ctx.filter_metadata
+        .insert("mcp.session_id", session_id.clone())
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
     Ok(FilterAction::Reject(
         Rejection::status(200)
@@ -862,7 +868,9 @@ fn record_client_protocol_version(ctx: &mut HttpFilterContext<'_>, value: &serde
         .and_then(|v| v.as_str())
         && !contains_control_chars(version)
     {
-        ctx.set_metadata("mcp.protocol_version", version.to_owned());
+        ctx.filter_metadata
+            .insert("mcp.protocol_version", version.to_owned())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
 }
 

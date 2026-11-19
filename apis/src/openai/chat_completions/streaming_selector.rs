@@ -65,7 +65,7 @@ impl HttpFilter for OpenaiChatCompletionsStreamingSelectorFilter {
 
     /// Read the complete JSON request before deciding its response transport.
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     /// The selector reads only the bounded request body and never mutates it.
@@ -77,7 +77,7 @@ impl HttpFilter for OpenaiChatCompletionsStreamingSelectorFilter {
 
     /// Keep a selected upstream SSE body progressive through this step.
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     /// Do not let the pipeline clamp an explicitly selected SSE response to a buffer.
@@ -128,9 +128,15 @@ mod tests {
     fn declares_streaming_capability_and_modes() {
         let filter = filter();
         assert!(filter.may_select_streaming_subrequest_response());
-        assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
+        assert_eq!(
+            filter.request_body_access(),
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+        );
         assert!(matches!(filter.request_body_mode(), BodyMode::StreamBuffer { .. }));
-        assert_eq!(filter.response_body_access(), BodyAccess::ReadOnly);
+        assert_eq!(
+            filter.response_body_access(),
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+        );
         assert!(matches!(filter.response_body_mode(), BodyMode::Stream));
     }
 

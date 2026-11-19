@@ -1108,7 +1108,7 @@ impl HttpFilter for McpDispatchFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -1120,7 +1120,7 @@ impl HttpFilter for McpDispatchFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -1151,7 +1151,9 @@ impl HttpFilter for McpDispatchFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
-        ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
+        ctx.filter_metadata
+            .insert(MAX_CALLS_METADATA, self.max_calls_per_round.to_string())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         // Publish the operator approval floor onto typed request state so the
         // owner's response-phase approval partitioning (`prepare_response_round`)
         // applies it this IRR iteration. Unlike `set_metadata` (bounded entry
@@ -1454,7 +1456,8 @@ async fn discover_pending_connectors(
         Err(ResolveError::RetainedBudget) => Ok(McpDispatchFilter::budget_limit_action(ctx)),
         Err(err) => {
             let streaming = ctx
-                .get_metadata("openai_responses_request.stream")
+                .filter_metadata
+                .get("openai_responses_request.stream")
                 .is_some_and(|v| v == "true");
             Ok(resolve_error_action(ctx, &err, streaming, body))
         },
@@ -1464,7 +1467,7 @@ async fn discover_pending_connectors(
 /// Return the response fan-out cap this dispatcher published for the owner.
 #[cfg(feature = "openai-agentic-loop")]
 pub(crate) fn configured_max_calls_per_round(ctx: &HttpFilterContext<'_>) -> Option<usize> {
-    ctx.get_metadata(MAX_CALLS_METADATA)?.parse().ok()
+    ctx.filter_metadata.get(MAX_CALLS_METADATA)?.parse().ok()
 }
 
 /// Validate and partition one model-produced MCP round for request-side execution.

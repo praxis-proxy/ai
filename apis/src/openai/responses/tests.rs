@@ -43,10 +43,14 @@ fn dispatchable_requires_terminal_completed_no_parse_error() {
     state.request_body = serde_json::json!({"stream": true});
     // Non-terminal stream: not dispatchable.
     assert!(!streamed_round_is_dispatchable(&ctx, &state));
-    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.filter_metadata
+        .insert("responses.stream_completion", "terminal")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     state.response_object = serde_json::json!({"status": "completed"});
     assert!(streamed_round_is_dispatchable(&ctx, &state));
-    ctx.set_metadata("responses.stream_parse_error", "true");
+    ctx.filter_metadata
+        .insert("responses.stream_parse_error", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     assert!(
         !streamed_round_is_dispatchable(&ctx, &state),
         "parse error blocks dispatch"
@@ -68,9 +72,12 @@ fn fs_end_stream_writes_five_keys_and_is_idempotent() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     fs_end_stream_with_error_ctx(&mut ctx, "server_error", "boom");
-    assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
-    assert_eq!(ctx.get_metadata("responses.stream_error_message"), Some("boom"));
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(
+        ctx.filter_metadata.get("responses.stream_error_code"),
+        Some("server_error")
+    );
+    assert_eq!(ctx.filter_metadata.get("responses.stream_error_message"), Some("boom"));
+    assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
     // After the #1046 unification the stream-stop is armed on the single
     // continuation owner (`openai_agentic_loop`), not the demoted file-search filter.
     let r = ctx.filter_results.get("openai_agentic_loop").unwrap();
@@ -78,7 +85,10 @@ fn fs_end_stream_writes_five_keys_and_is_idempotent() {
     assert_eq!(r.get("pending"), Some("false"));
     // Idempotent: a second call with a different code does not clobber.
     fs_end_stream_with_error_ctx(&mut ctx, "other_code", "later");
-    assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
+    assert_eq!(
+        ctx.filter_metadata.get("responses.stream_error_code"),
+        Some("server_error")
+    );
 }
 
 // -----------------------------------------------------------------------------

@@ -1,20 +1,20 @@
 name: Patch Praxis dependencies
 description: >-
-  Override crates.io praxis dependencies with local
+  Override pinned Praxis git dependencies with local
   path dependencies from the cloned praxis repo.
 
 runs:
   using: composite
   steps:
-    - name: Append [patch.crates-io] to Cargo.toml
+    - name: Append [patch."https://github.com/praxis-proxy/praxis"] to Cargo.toml
       run: |
         cat >> Cargo.toml << 'PATCH'
 
-        [patch.crates-io]
-        praxis-proxy-core = { path = "../praxis/core" }
-        praxis-proxy-filter = { path = "../praxis/filter" }
-        praxis-proxy-protocol = { path = "../praxis/protocol" }
-        praxis-proxy-tls = { path = "../praxis/tls" }
-        praxis-proxy = { path = "../praxis/server" }
+        [patch."https://github.com/praxis-proxy/praxis"]
+        praxis-proxy-core = { path = "../praxis/crates/core" }
+        praxis-proxy-filter = { path = "../praxis/crates/filter" }
+        praxis-proxy-protocol = { path = "../praxis/crates/protocol" }
+        praxis-proxy-tls = { path = "../praxis/crates/tls" }
+        praxis-proxy = { path = "../praxis/crates/server" }
         PATCH
       shell: bash

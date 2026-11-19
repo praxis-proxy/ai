@@ -139,10 +139,18 @@ pub(crate) fn set_credential_metadata(ctx: &mut HttpFilterContext<'_>, credentia
     let Some(credential) = credential else {
         return;
     };
-    ctx.set_metadata(CREDENTIAL_STRATEGY, &credential.strategy);
-    ctx.set_metadata(CREDENTIAL_NAME, &credential.secret_ref.name);
-    ctx.set_metadata(CREDENTIAL_NAMESPACE, &credential.secret_ref.namespace);
-    ctx.set_metadata(CREDENTIAL_KEY, &credential.secret_ref.key);
+    ctx.filter_metadata
+        .insert(CREDENTIAL_STRATEGY, &credential.strategy)
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.filter_metadata
+        .insert(CREDENTIAL_NAME, &credential.secret_ref.name)
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.filter_metadata
+        .insert(CREDENTIAL_NAMESPACE, &credential.secret_ref.namespace)
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.filter_metadata
+        .insert(CREDENTIAL_KEY, &credential.secret_ref.key)
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 }
 
 /// Remove any previously written credential-reference metadata.

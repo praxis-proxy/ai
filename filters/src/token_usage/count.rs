@@ -288,7 +288,7 @@ impl HttpFilter for TokenCountFilter {
         if self.provider == ProviderKind::BedrockInvokeModel {
             BodyAccess::None
         } else {
-            BodyAccess::ReadOnly
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
         }
     }
 

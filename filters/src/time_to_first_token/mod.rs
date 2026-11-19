@@ -95,7 +95,7 @@ impl HttpFilter for TimeToFirstTokenFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -116,7 +116,9 @@ impl HttpFilter for TimeToFirstTokenFilter {
             .is_some_and(is_event_stream_content_type);
 
         if is_sse {
-            ctx.filter_metadata.insert(META_ACTIVE.to_owned(), String::new());
+            ctx.filter_metadata
+                .insert(META_ACTIVE.to_owned(), String::new())
+                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         }
 
         Ok(FilterAction::Continue)

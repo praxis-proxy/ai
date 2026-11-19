@@ -238,7 +238,7 @@ impl AnthropicMessagesToChatCompletionsFilter {
             return FilterAction::Continue;
         }
 
-        let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY).map(str::to_owned);
+        let request_id = ctx.filter_metadata.get(RESPONSE_REQUEST_ID_KEY).map(str::to_owned);
         let buffer = ctx.extensions.remove::<StreamingErrorBuffer>().unwrap_or_default();
         if buffer.overflowed {
             *body = Some(Bytes::from(wire::error_body(
@@ -266,7 +266,7 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
     }
 
     fn selected_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -276,7 +276,7 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -292,16 +292,22 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
             return Ok(FilterAction::Continue);
         };
 
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, transform);
+        ctx.filter_metadata
+            .insert(RESPONSE_TRANSFORM_KEY, transform)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         if transform == RESPONSE_TRANSFORM_ERROR {
             let status = ctx
                 .response_header
                 .as_ref()
                 .map_or(500, |response| response.status.as_u16());
-            ctx.set_metadata(RESPONSE_STATUS_KEY, status.to_string());
+            ctx.filter_metadata
+                .insert(RESPONSE_STATUS_KEY, status.to_string())
+                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         }
         if let Some(request_id) = request_id {
-            ctx.set_metadata(RESPONSE_REQUEST_ID_KEY, request_id);
+            ctx.filter_metadata
+                .insert(RESPONSE_REQUEST_ID_KEY, request_id)
+                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         }
 
         ctx.set_response_body_mode(BodyMode::StreamBuffer {
@@ -369,7 +375,7 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        let transform_error = match ctx.get_metadata(RESPONSE_TRANSFORM_KEY) {
+        let transform_error = match ctx.filter_metadata.get(RESPONSE_TRANSFORM_KEY) {
             Some(RESPONSE_TRANSFORM_ERROR) => true,
             Some(RESPONSE_TRANSFORM_SUCCESS) => false,
             _ => return Ok(FilterAction::Continue),
@@ -399,7 +405,9 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
         // translation on the response path) can enforce its own byte ceiling on the
         // untransformed size rather than on the smaller body it observes.
         let raw_len = body.as_ref().map_or(0, Bytes::len);
-        ctx.set_metadata(RESPONSE_RAW_BYTES_KEY, raw_len.to_string());
+        ctx.filter_metadata
+            .insert(RESPONSE_RAW_BYTES_KEY, raw_len.to_string())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
         // Enforce the response byte ceiling on the RAW upstream body before any
         // transform can shrink it below a downstream size check. A
@@ -429,20 +437,22 @@ fn transform_buffered_response(
 ) -> FilterAction {
     if transform_error {
         let status = error_status(ctx);
-        let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY);
+        let request_id = ctx.filter_metadata.get(RESPONSE_REQUEST_ID_KEY);
         transform_error_body(body, status, request_id);
         FilterAction::Continue
     } else {
         let request_model = ctx
             .filter_metadata
             .get("anthropic_messages_to_chat_completions.model")
-            .map_or("", String::as_str);
-        let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY);
+            .unwrap_or_default();
+        let request_id = ctx.filter_metadata.get(RESPONSE_REQUEST_ID_KEY);
         let stop_sequences = client_stop_sequences(ctx);
         if let Some(finish_reason) =
             transform_non_streaming_body(body, request_model, request_id, stop_sequences.as_ref())
         {
-            ctx.set_metadata("openai.finish_reason", finish_reason);
+            ctx.filter_metadata
+                .insert("openai.finish_reason", finish_reason)
+                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
             FilterAction::Continue
         } else {
             // Reject the invalid success. If the upstream 200 headers have
@@ -460,7 +470,9 @@ fn transform_buffered_response(
 /// Extract streaming and model metadata from the parsed request body.
 fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, value: Option<&serde_json::Value>) {
     let Some(value) = value else {
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.filter_metadata
+            .insert("anthropic_messages_to_chat_completions.streaming", "false")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         return;
     };
 
@@ -468,17 +480,21 @@ fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, value: Option<&serd
         .get("stream")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    ctx.set_metadata(
-        "anthropic_messages_to_chat_completions.streaming",
-        if is_streaming { "true" } else { "false" },
-    );
+    ctx.filter_metadata
+        .insert(
+            "anthropic_messages_to_chat_completions.streaming",
+            if is_streaming { "true" } else { "false" },
+        )
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
     let model = value
         .get("model")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .unwrap_or_default();
-    ctx.set_metadata("anthropic_messages_to_chat_completions.model", model);
+    ctx.filter_metadata
+        .insert("anthropic_messages_to_chat_completions.model", model)
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
     if let Some(stop_sequences) = value
         .get("stop_sequences")
@@ -541,7 +557,9 @@ fn record_degraded_features(ctx: &mut HttpFilterContext<'_>, degraded: request::
         degraded_features = joined.as_str(),
         "degraded unsupported Anthropic features to complete the Chat Completions translation"
     );
-    ctx.set_metadata(DEGRADED_FEATURES_KEY, joined);
+    ctx.filter_metadata
+        .insert(DEGRADED_FEATURES_KEY, joined)
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 }
 
 /// Reconcile the degraded-feature response header with the proxy's own record.
@@ -551,7 +569,7 @@ fn record_degraded_features(ctx: &mut HttpFilterContext<'_>, degraded: request::
 /// a false Praxis signal, then re-inserts the header only when the proxy itself
 /// recorded a degradation.
 fn apply_degraded_features_header(ctx: &mut HttpFilterContext<'_>) {
-    let recorded = ctx.get_metadata(DEGRADED_FEATURES_KEY).map(str::to_owned);
+    let recorded = ctx.filter_metadata.get(DEGRADED_FEATURES_KEY).map(str::to_owned);
     let Some(response) = &mut ctx.response_header else {
         return;
     };
@@ -645,7 +663,8 @@ fn should_transform_response(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Recover the upstream error status recorded in the response-header phase.
 fn error_status(ctx: &HttpFilterContext<'_>) -> http::StatusCode {
-    ctx.get_metadata(RESPONSE_STATUS_KEY)
+    ctx.filter_metadata
+        .get(RESPONSE_STATUS_KEY)
         .and_then(|value| value.parse::<u16>().ok())
         .and_then(|value| http::StatusCode::from_u16(value).ok())
         .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR)
@@ -800,8 +819,12 @@ mod tests {
             .headers
             .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("72"));
         ctx.response_header = Some(&mut response);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true");
-        ctx.set_metadata("anthropic_messages_to_chat_completions.model", "gpt-4");
+        ctx.filter_metadata
+            .insert("anthropic_messages_to_chat_completions.streaming", "true")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert("anthropic_messages_to_chat_completions.model", "gpt-4")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         let action = filter.on_response(&mut ctx).await.unwrap();
 
         assert!(matches!(action, FilterAction::Continue), "filter should continue");
@@ -848,7 +871,9 @@ mod tests {
         let mut response = make_response();
         response.status = StatusCode::TOO_MANY_REQUESTS;
         ctx.response_header = Some(&mut response);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true");
+        ctx.filter_metadata
+            .insert("anthropic_messages_to_chat_completions.streaming", "true")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         // The managed IRR selected the streaming subrequest transport, so the error
         // round arrives as raw `Stream` chunks that this filter must accumulate.
         ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -906,7 +931,9 @@ mod tests {
         let mut response = make_response();
         response.status = StatusCode::TOO_MANY_REQUESTS;
         ctx.response_header = Some(&mut response);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true");
+        ctx.filter_metadata
+            .insert("anthropic_messages_to_chat_completions.streaming", "true")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         drop(filter.on_response(&mut ctx).await.unwrap());
         ctx.response_header = None;
 
@@ -947,7 +974,9 @@ mod tests {
         let mut response = make_response();
         response.status = StatusCode::TOO_MANY_REQUESTS;
         ctx.response_header = Some(&mut response);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.filter_metadata
+            .insert("anthropic_messages_to_chat_completions.streaming", "false")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         drop(filter.on_response(&mut ctx).await.unwrap());
         ctx.response_header = None;
 
@@ -981,7 +1010,9 @@ mod tests {
         response.status = StatusCode::TOO_MANY_REQUESTS;
         response.headers.insert("x-request-id", "req_over".parse().unwrap());
         ctx.response_header = Some(&mut response);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true");
+        ctx.filter_metadata
+            .insert("anthropic_messages_to_chat_completions.streaming", "true")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         // The managed IRR selected the streaming subrequest transport, so the error
         // round arrives as raw `Stream` chunks that this filter must accumulate.
         ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
@@ -1203,7 +1234,9 @@ mod tests {
     fn client_stop_sequences_ignores_non_string_entries() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata(STOP_SEQUENCES_KEY, r#"[1,","]"#);
+        ctx.filter_metadata
+            .insert(STOP_SEQUENCES_KEY, r#"[1,","]"#)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
         assert!(
             client_stop_sequences(&ctx).is_empty(),
@@ -1317,7 +1350,9 @@ mod tests {
     fn should_transform_response_streaming_returns_false() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true");
+        ctx.filter_metadata
+            .insert("anthropic_messages_to_chat_completions.streaming", "true")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         let mut response = make_response();
         ctx.response_header = Some(&mut response);
 
@@ -1331,7 +1366,9 @@ mod tests {
     fn should_transform_response_non_streaming_success() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.filter_metadata
+            .insert("anthropic_messages_to_chat_completions.streaming", "false")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         let mut response = make_response();
         ctx.response_header = Some(&mut response);
 
@@ -1352,7 +1389,9 @@ mod tests {
         ] {
             let request = make_request(Method::POST, "/v1/messages");
             let mut ctx = make_filter_context(&request);
-            ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+            ctx.filter_metadata
+                .insert("anthropic_messages_to_chat_completions.streaming", "false")
+                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
             let mut response = make_response();
             response
                 .headers
@@ -1367,7 +1406,9 @@ mod tests {
     fn should_not_transform_encoded_non_streaming_success() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.filter_metadata
+            .insert("anthropic_messages_to_chat_completions.streaming", "false")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         let mut response = make_response();
         response
             .headers
@@ -1386,7 +1427,9 @@ mod tests {
         let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.filter_metadata
+            .insert("anthropic_messages_to_chat_completions.streaming", "false")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         let mut response = make_response();
         response
             .headers
@@ -1416,7 +1459,9 @@ mod tests {
         let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.filter_metadata
+            .insert("anthropic_messages_to_chat_completions.streaming", "false")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         let mut response = make_response();
         response
             .headers
@@ -1447,7 +1492,9 @@ mod tests {
             let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
             let request = make_request(Method::POST, "/v1/messages");
             let mut ctx = make_filter_context(&request);
-            ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", is_streaming);
+            ctx.filter_metadata
+                .insert("anthropic_messages_to_chat_completions.streaming", is_streaming)
+                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
             let mut response = make_response();
             response.headers.insert("x-request-id", "req_success".parse().unwrap());
             ctx.response_header = Some(&mut response);
@@ -1469,7 +1516,9 @@ mod tests {
     fn should_not_transform_partial_non_streaming_success() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.filter_metadata
+            .insert("anthropic_messages_to_chat_completions.streaming", "false")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         let mut response = make_response();
         response.status = StatusCode::PARTIAL_CONTENT;
         response.headers.insert(
@@ -1490,7 +1539,9 @@ mod tests {
             for status in [StatusCode::BAD_REQUEST, StatusCode::INTERNAL_SERVER_ERROR] {
                 let request = make_request(Method::POST, "/v1/messages");
                 let mut ctx = make_filter_context(&request);
-                ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", is_streaming);
+                ctx.filter_metadata
+                    .insert("anthropic_messages_to_chat_completions.streaming", is_streaming)
+                    .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
                 let mut response = make_response();
                 response.status = status;
                 ctx.response_header = Some(&mut response);
@@ -1507,7 +1558,9 @@ mod tests {
     fn should_not_transform_redirect_response() {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        ctx.filter_metadata
+            .insert("anthropic_messages_to_chat_completions.streaming", "false")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         let mut response = make_response();
         response.status = StatusCode::FOUND;
         ctx.response_header = Some(&mut response);
@@ -1562,8 +1615,12 @@ mod tests {
         let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
-        ctx.set_metadata("anthropic_messages_to_chat_completions.model", "gpt-4");
+        ctx.filter_metadata
+            .insert("anthropic_messages_to_chat_completions.streaming", "false")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert("anthropic_messages_to_chat_completions.model", "gpt-4")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         let mut response = make_response();
         response
             .headers
@@ -1649,7 +1706,7 @@ mod tests {
 
                 // Both features are recorded for the response-header phase.
                 assert_eq!(
-                    ctx.get_metadata(DEGRADED_FEATURES_KEY),
+                    ctx.filter_metadata.get(DEGRADED_FEATURES_KEY),
                     Some("prompt_caching,extended_thinking"),
                     "both degraded features should be recorded in metadata"
                 );
@@ -1762,7 +1819,7 @@ mod tests {
                 assert_eq!(messages[2]["role"], "user");
 
                 assert_eq!(
-                    ctx.get_metadata(DEGRADED_FEATURES_KEY),
+                    ctx.filter_metadata.get(DEGRADED_FEATURES_KEY),
                     Some("mid_conversation_system"),
                     "the moved system message should be recorded in metadata"
                 );
@@ -1841,7 +1898,7 @@ mod tests {
         });
 
         assert_eq!(
-            ctx.get_metadata(DEGRADED_FEATURES_KEY),
+            ctx.filter_metadata.get(DEGRADED_FEATURES_KEY),
             None,
             "strict mode records no degradation"
         );
@@ -1887,7 +1944,7 @@ mod tests {
         });
 
         assert_eq!(
-            ctx.get_metadata(DEGRADED_FEATURES_KEY),
+            ctx.filter_metadata.get(DEGRADED_FEATURES_KEY),
             None,
             "no degradation is recorded for a clean request"
         );
@@ -1925,7 +1982,7 @@ mod tests {
             "WARN must name every degraded feature as a structured field"
         );
         assert_eq!(
-            ctx.get_metadata(DEGRADED_FEATURES_KEY),
+            ctx.filter_metadata.get(DEGRADED_FEATURES_KEY),
             Some("prompt_caching,extended_thinking"),
             "degraded features must be stashed for the response-header phase"
         );
@@ -1942,7 +1999,7 @@ mod tests {
 
         assert!(events.is_empty(), "no degradation must emit no WARN; got {events:?}");
         assert_eq!(
-            ctx.get_metadata(DEGRADED_FEATURES_KEY),
+            ctx.filter_metadata.get(DEGRADED_FEATURES_KEY),
             None,
             "no degradation must not stash metadata"
         );

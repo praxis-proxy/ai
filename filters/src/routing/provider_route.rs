@@ -236,13 +236,25 @@ impl HttpFilter for ProviderRouteFilter {
         }
 
         ctx.cluster = Some(Arc::clone(&route.cluster));
-        ctx.set_metadata(PROVIDER_ROUTE_CANDIDATE_ID, &candidate_id);
-        ctx.set_metadata(PROVIDER_ROUTE_CLUSTER, &*route.cluster);
-        ctx.set_metadata(PROVIDER_ROUTE_MODEL, &model);
-        ctx.set_metadata(PROVIDER_ROUTE_PROVIDER_ID, &*self.provider_id);
-        ctx.set_metadata(PROVIDER_ROUTE_REQUEST_ID, &request_id);
+        ctx.filter_metadata
+            .insert(PROVIDER_ROUTE_CANDIDATE_ID, &candidate_id)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert(PROVIDER_ROUTE_CLUSTER, &*route.cluster)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert(PROVIDER_ROUTE_MODEL, &model)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert(PROVIDER_ROUTE_PROVIDER_ID, &*self.provider_id)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert(PROVIDER_ROUTE_REQUEST_ID, &request_id)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         if let Some(revision) = &overlay_revision {
-            ctx.set_metadata(PROVIDER_ROUTE_OVERLAY_REVISION, revision);
+            ctx.filter_metadata
+                .insert(PROVIDER_ROUTE_OVERLAY_REVISION, revision)
+                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         }
         set_credential_metadata(ctx, route.credential.as_ref());
         set_provider_headers(ctx, &self.provider_id_header, &request_id, overlay_revision.as_deref())?;
@@ -264,7 +276,8 @@ impl HttpFilter for ProviderRouteFilter {
             return Ok(FilterAction::Continue);
         }
         let inference_provider = ctx
-            .get_metadata(PROVIDER_ROUTE_CLUSTER)
+            .filter_metadata
+            .get(PROVIDER_ROUTE_CLUSTER)
             .map(HeaderValue::from_str)
             .transpose()
             .map_err(|error| FilterError::from(format!("provider_route: invalid provider cluster header: {error}")))?;
@@ -761,11 +774,14 @@ mod tests {
         let req = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
         let mut ctx = test_utils::make_filter_context(&req);
         let _action = f.on_request(&mut ctx).await.unwrap();
-        assert_eq!(ctx.get_metadata(PROVIDER_ROUTE_CANDIDATE_ID), Some("abc123"));
-        assert_eq!(ctx.get_metadata(PROVIDER_ROUTE_CLUSTER), Some("mock-backend"));
-        assert_eq!(ctx.get_metadata(PROVIDER_ROUTE_MODEL), Some("sim-model-v1"));
-        assert_eq!(ctx.get_metadata(PROVIDER_ROUTE_PROVIDER_ID), Some("test-provider"));
-        assert!(ctx.get_metadata(PROVIDER_ROUTE_REQUEST_ID).is_some());
+        assert_eq!(ctx.filter_metadata.get(PROVIDER_ROUTE_CANDIDATE_ID), Some("abc123"));
+        assert_eq!(ctx.filter_metadata.get(PROVIDER_ROUTE_CLUSTER), Some("mock-backend"));
+        assert_eq!(ctx.filter_metadata.get(PROVIDER_ROUTE_MODEL), Some("sim-model-v1"));
+        assert_eq!(
+            ctx.filter_metadata.get(PROVIDER_ROUTE_PROVIDER_ID),
+            Some("test-provider")
+        );
+        assert!(ctx.filter_metadata.get(PROVIDER_ROUTE_REQUEST_ID).is_some());
     }
 
     #[tokio::test]
@@ -780,11 +796,11 @@ mod tests {
 
         assert!(matches!(action_a.unwrap(), FilterAction::Continue));
         assert!(matches!(action_b.unwrap(), FilterAction::Continue));
-        assert_eq!(ctx_a.get_metadata(PROVIDER_ROUTE_CLUSTER), Some("mock-backend"));
-        assert_eq!(ctx_b.get_metadata(PROVIDER_ROUTE_CLUSTER), Some("other-backend"));
+        assert_eq!(ctx_a.filter_metadata.get(PROVIDER_ROUTE_CLUSTER), Some("mock-backend"));
+        assert_eq!(ctx_b.filter_metadata.get(PROVIDER_ROUTE_CLUSTER), Some("other-backend"));
         assert_ne!(
-            ctx_a.get_metadata(PROVIDER_ROUTE_CLUSTER),
-            ctx_b.get_metadata(PROVIDER_ROUTE_CLUSTER),
+            ctx_a.filter_metadata.get(PROVIDER_ROUTE_CLUSTER),
+            ctx_b.filter_metadata.get(PROVIDER_ROUTE_CLUSTER),
             "independent requests against the same filter instance must not leak cluster metadata"
         );
     }
@@ -801,11 +817,14 @@ mod tests {
             let mut ctx = test_utils::make_filter_context(&req);
             let action = f.on_request(&mut ctx).await.unwrap();
             assert!(matches!(action, FilterAction::Continue));
-            assert_eq!(ctx.get_metadata(PROVIDER_ROUTE_PROVIDER_ID), Some("test-provider"));
-            assert_eq!(ctx.get_metadata(PROVIDER_ROUTE_CLUSTER), Some(expected_cluster));
+            assert_eq!(
+                ctx.filter_metadata.get(PROVIDER_ROUTE_PROVIDER_ID),
+                Some("test-provider")
+            );
+            assert_eq!(ctx.filter_metadata.get(PROVIDER_ROUTE_CLUSTER), Some(expected_cluster));
             assert_ne!(
-                ctx.get_metadata(PROVIDER_ROUTE_PROVIDER_ID),
-                ctx.get_metadata(PROVIDER_ROUTE_CLUSTER),
+                ctx.filter_metadata.get(PROVIDER_ROUTE_PROVIDER_ID),
+                ctx.filter_metadata.get(PROVIDER_ROUTE_CLUSTER),
                 "provider_id must remain distinct from the resolved backend cluster"
             );
         }
@@ -891,10 +910,18 @@ mod tests {
         let f = make_filter("abc123");
         let req = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
         let mut ctx = test_utils::make_filter_context(&req);
-        ctx.set_metadata(CREDENTIAL_STRATEGY, "stale");
-        ctx.set_metadata(CREDENTIAL_NAME, "stale");
-        ctx.set_metadata(CREDENTIAL_NAMESPACE, "stale");
-        ctx.set_metadata(CREDENTIAL_KEY, "stale");
+        ctx.filter_metadata
+            .insert(CREDENTIAL_STRATEGY, "stale")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert(CREDENTIAL_NAME, "stale")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert(CREDENTIAL_NAMESPACE, "stale")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.filter_metadata
+            .insert(CREDENTIAL_KEY, "stale")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         let _action = f.on_request(&mut ctx).await.unwrap();
         for key in [
             CREDENTIAL_STRATEGY,
@@ -903,7 +930,7 @@ mod tests {
             CREDENTIAL_KEY,
         ] {
             assert!(
-                ctx.get_metadata(key).is_none(),
+                ctx.filter_metadata.get(key).is_none(),
                 "{key} must be cleared when no credential is configured"
             );
         }
@@ -928,10 +955,10 @@ mod tests {
 
         let provider_action = provider.on_request(&mut ctx).await.unwrap();
         assert!(matches!(provider_action, FilterAction::Continue));
-        assert_eq!(ctx.get_metadata(CREDENTIAL_STRATEGY), Some("bearer_token"));
-        assert_eq!(ctx.get_metadata(CREDENTIAL_NAME), Some("provider-token"));
-        assert_eq!(ctx.get_metadata(CREDENTIAL_NAMESPACE), Some("grid-system"));
-        assert_eq!(ctx.get_metadata(CREDENTIAL_KEY), Some("token"));
+        assert_eq!(ctx.filter_metadata.get(CREDENTIAL_STRATEGY), Some("bearer_token"));
+        assert_eq!(ctx.filter_metadata.get(CREDENTIAL_NAME), Some("provider-token"));
+        assert_eq!(ctx.filter_metadata.get(CREDENTIAL_NAMESPACE), Some("grid-system"));
+        assert_eq!(ctx.filter_metadata.get(CREDENTIAL_KEY), Some("token"));
 
         let inject_action = inject.on_request(&mut ctx).await.unwrap();
         assert!(matches!(inject_action, FilterAction::Continue));

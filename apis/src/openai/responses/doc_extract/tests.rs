@@ -267,7 +267,9 @@ fn raw_base64(text: &str) -> String {
 }
 
 fn set_responses_metadata(ctx: &mut HttpFilterContext<'_>) {
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.filter_metadata
+        .insert("openai_responses_request.format", "openai_responses")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 }
 
 #[test]
@@ -362,8 +364,14 @@ fn from_config_zero_max_content_bytes_rejected() {
 #[test]
 fn declares_dual_phase_body_access() {
     let filter = make_filter();
-    assert_eq!(filter.request_body_access(), BodyAccess::ReadWrite);
-    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadWrite);
+    assert_eq!(
+        filter.request_body_access(),
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
+    );
+    assert_eq!(
+        filter.bound_upstream_request_body_access(),
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
+    );
 }
 
 #[test]

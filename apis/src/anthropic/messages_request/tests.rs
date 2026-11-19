@@ -52,7 +52,10 @@ async fn run_with<'a>(
 #[test]
 fn declares_read_only_buffered_body_access() {
     let filter = default_filter();
-    assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(
+        filter.request_body_access(),
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    );
     assert!(matches!(filter.request_body_mode(), BodyMode::StreamBuffer { .. }));
 }
 
@@ -107,12 +110,21 @@ async fn publishes_routing_metadata_and_filter_results() {
     let (_, ctx) = run_with(filter.as_ref(), &request, Some(&body)).await;
 
     assert_eq!(
-        ctx.get_metadata("anthropic_messages_request.model"),
+        ctx.filter_metadata.get("anthropic_messages_request.model"),
         Some("claude-opus-4-8")
     );
-    assert_eq!(ctx.get_metadata("anthropic_messages_request.stream"), Some("true"));
-    assert_eq!(ctx.get_metadata("anthropic_messages_request.max_tokens"), Some("64"));
-    assert_eq!(ctx.get_metadata("anthropic_messages_request.has_tools"), Some("true"));
+    assert_eq!(
+        ctx.filter_metadata.get("anthropic_messages_request.stream"),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.filter_metadata.get("anthropic_messages_request.max_tokens"),
+        Some("64")
+    );
+    assert_eq!(
+        ctx.filter_metadata.get("anthropic_messages_request.has_tools"),
+        Some("true")
+    );
 
     let results = ctx
         .filter_results
@@ -266,8 +278,8 @@ async fn the_anthropic_version_header_does_not_decide_the_operation() {
     assert!(matches!(plain_action, FilterAction::Release));
     assert!(matches!(header_action, FilterAction::Release));
     assert_eq!(
-        plain_ctx.get_metadata("anthropic_messages_request.model"),
-        header_ctx.get_metadata("anthropic_messages_request.model"),
+        plain_ctx.filter_metadata.get("anthropic_messages_request.model"),
+        header_ctx.filter_metadata.get("anthropic_messages_request.model"),
         "the version header is contract validation, not operation identity"
     );
 }
@@ -378,7 +390,7 @@ async fn the_endpoint_decides_the_published_format() {
         "an ordinary Anthropic body must not be refused by a rejecting chain"
     );
     assert_eq!(
-        ctx.get_metadata("anthropic_messages_request.format"),
+        ctx.filter_metadata.get("anthropic_messages_request.format"),
         Some("anthropic_messages")
     );
 }
@@ -403,7 +415,7 @@ async fn mcp_connector_published(extra: serde_json::Value) -> bool {
         "detection must not change the action"
     );
 
-    let metadata = ctx.get_metadata(MCP_CONNECTOR_METADATA_KEY) == Some("true");
+    let metadata = ctx.filter_metadata.get(MCP_CONNECTOR_METADATA_KEY) == Some("true");
     let result = ctx
         .filter_results
         .get("anthropic_messages_request")

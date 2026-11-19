@@ -667,7 +667,7 @@ fn budgeted_buffered_output_rejects_before_json_parse() {
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
     assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
 }
 
 #[test]
@@ -695,17 +695,17 @@ fn streaming_round_boundary_overflow_emits_terminal_sse_error() {
         "a committed stream cannot be rejected; the terminal error rides the stream"
     );
     assert_eq!(
-        ctx.get_metadata("responses.stream_error_code"),
+        ctx.filter_metadata.get("responses.stream_error_code"),
         Some("server_error"),
         "stream exhaustion must be reported as a server_error"
     );
     assert_eq!(
-        ctx.get_metadata("responses.stream_error_message"),
+        ctx.filter_metadata.get("responses.stream_error_message"),
         Some("The request exceeds a processing limit set by the platform administrator."),
         "the terminal error must use the sanitized client-facing message"
     );
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "an exhausted stream must not persist a successful response"
     );
@@ -739,12 +739,12 @@ fn buffered_round_boundary_overflow_rejects_with_json_502() {
         "buffered round exhaustion must reject with HTTP 502"
     );
     assert_eq!(
-        ctx.get_metadata("responses.stream_error_code"),
+        ctx.filter_metadata.get("responses.stream_error_code"),
         None,
         "a buffered rejection must not set streaming error metadata"
     );
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "an exhausted buffered response must not be persisted as successful"
     );
@@ -1087,7 +1087,9 @@ async fn on_request_allows_typed_streaming_with_logical_stream() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
-    ctx.set_metadata("responses.logical_stream", "true");
+    ctx.filter_metadata
+        .insert("responses.logical_stream", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
 
@@ -1097,7 +1099,7 @@ async fn on_request_allows_typed_streaming_with_logical_stream() {
     );
     // The marker is consumed so a stale "true" cannot satisfy a later IRR step
     // whose own filters did not re-publish it.
-    assert_eq!(ctx.get_metadata("responses.logical_stream"), Some("false"));
+    assert_eq!(ctx.filter_metadata.get("responses.logical_stream"), Some("false"));
 }
 
 #[tokio::test]
@@ -1138,7 +1140,9 @@ async fn selected_adapter_accepts_deferred_streaming_with_logical_stream() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("responses.logical_stream", "true");
+    ctx.filter_metadata
+        .insert("responses.logical_stream", "true")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
     assert!(matches!(
         filter.on_request(&mut ctx).await.unwrap(),
@@ -1150,7 +1154,7 @@ async fn selected_adapter_accepts_deferred_streaming_with_logical_stream() {
         super::enforce_agentic_stream_guard(&mut ctx).is_none(),
         "an armed logical stream should satisfy the deferred guard"
     );
-    assert_eq!(ctx.get_metadata("responses.logical_stream"), Some("false"));
+    assert_eq!(ctx.filter_metadata.get("responses.logical_stream"), Some("false"));
 }
 
 // -----------------------------------------------------------------------------
@@ -1493,7 +1497,9 @@ fn incomplete_stream_does_not_dispatch_accumulated_tool_call() {
             "content": [{"type": "output_text", "text": "partial"}]
         }]
     });
-    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.filter_metadata
+        .insert("responses.stream_completion", "terminal")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -1546,7 +1552,9 @@ fn failed_stream_does_not_dispatch_accumulated_tool_call() {
             "content": [{"type": "output_text", "text": "before failure"}]
         }]
     });
-    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.filter_metadata
+        .insert("responses.stream_completion", "terminal")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -1588,7 +1596,9 @@ fn streamed_web_search_call_is_available_to_dispatch_filter() {
             "action": {"type": "search", "query": "Praxis"}
         }]
     });
-    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.filter_metadata
+        .insert("responses.stream_completion", "terminal")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -1629,7 +1639,9 @@ fn multiple_streamed_client_function_calls_end_done() {
         {"type": "function_call", "call_id": "call_1", "name": "first", "status": "completed"},
         {"type": "function_call", "call_id": "call_2", "name": "second", "status": "completed"}
     ]});
-    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.filter_metadata
+        .insert("responses.stream_completion", "terminal")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -1645,7 +1657,7 @@ fn multiple_streamed_client_function_calls_end_done() {
         ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.len() == 2,
         "both client calls must remain visible for the client to execute"
     );
-    assert_eq!(ctx.get_metadata("responses.stream_error_code"), None);
+    assert_eq!(ctx.filter_metadata.get("responses.stream_error_code"), None);
 }
 
 #[cfg(feature = "openai-mcp-tools")]
@@ -1668,7 +1680,9 @@ fn mixed_streamed_function_call_ownership_fails_before_dispatch() {
         {"type": "function_call", "call_id": "call_1", "name": "server__lookup", "status": "completed"},
         {"type": "function_call", "call_id": "call_2", "name": "client", "status": "completed"}
     ]});
-    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.filter_metadata
+        .insert("responses.stream_completion", "terminal")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     ctx.extensions.insert(state);
 
     let mut body: Option<Bytes> = None;
@@ -1683,7 +1697,10 @@ fn mixed_streamed_function_call_ownership_fails_before_dispatch() {
         body.is_none(),
         "a streamed SSE error must not serialize JSON onto the committed stream"
     );
-    assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
+    assert_eq!(
+        ctx.filter_metadata.get("responses.stream_error_code"),
+        Some("server_error")
+    );
 }
 
 #[test]
@@ -1708,7 +1725,9 @@ fn streaming_iteration_limit_ends_with_sse_error() {
         {"type": "function_call", "call_id": "call_limit", "name": "server__lookup", "status": "completed"},
         {"type": "tool_search_call", "id": "tsc_limit", "status": "completed"}
     ]});
-    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.filter_metadata
+        .insert("responses.stream_completion", "terminal")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -1718,7 +1737,7 @@ fn streaming_iteration_limit_ends_with_sse_error() {
     );
     assert_action(&ctx, "done");
     assert_eq!(
-        ctx.get_metadata("responses.stream_error_code"),
+        ctx.filter_metadata.get("responses.stream_error_code"),
         Some("server_error"),
         "an exhausted committed stream must end with an SSE error"
     );
@@ -2287,7 +2306,7 @@ fn mixed_ownership_incomplete_response_is_preserved() {
 
     assert!(matches!(action, FilterAction::Continue));
     assert_action(&ctx, "done");
-    assert_eq!(ctx.get_metadata("responses.status"), Some("incomplete"));
+    assert_eq!(ctx.filter_metadata.get("responses.status"), Some("incomplete"));
     let returned: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
     assert_eq!(returned["status"], "incomplete");
     assert_eq!(returned["incomplete_details"]["reason"], "max_output_tokens");
@@ -2385,7 +2404,7 @@ fn finish_reason_length_exits_as_incomplete() {
     drop(filter.on_response_body(&mut ctx, &mut None, true).unwrap());
     assert_action(&ctx, "done");
 
-    let status = ctx.get_metadata("responses.status");
+    let status = ctx.filter_metadata.get("responses.status");
     assert_eq!(
         status,
         Some("incomplete"),
@@ -2426,7 +2445,7 @@ fn finish_reason_length_passes_body_unchanged() {
     );
     assert_action(&ctx, "done");
 
-    let status = ctx.get_metadata("responses.status");
+    let status = ctx.filter_metadata.get("responses.status");
     assert_eq!(
         status,
         Some("incomplete"),
@@ -3335,7 +3354,9 @@ fn streamed_tool_search_call_is_queued_for_deferred_discovery() {
             "status": "completed"
         }]
     });
-    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.filter_metadata
+        .insert("responses.stream_completion", "terminal")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -3382,7 +3403,9 @@ fn streamed_client_executed_tool_search_call_is_returned_without_deferred_discov
             "execution": "client"
         }]
     });
-    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.filter_metadata
+        .insert("responses.stream_completion", "terminal")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -3437,7 +3460,9 @@ fn streamed_incomplete_tool_search_call_is_not_queued() {
             "status": "incomplete"
         }]
     });
-    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.filter_metadata
+        .insert("responses.stream_completion", "terminal")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -3972,7 +3997,7 @@ async fn dispatch_failure_streaming_emits_sse_error_frame() {
     );
     assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "the failed streamed round must not be persisted"
     );
@@ -4000,7 +4025,7 @@ async fn dispatch_failure_before_stream_commit_preserves_http_error_status() {
     assert_eq!(response.status, 502);
     let body: Value = serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
     assert_eq!(body["error"]["message"], "vector store search failed");
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
 }
 
 /// A locally-detected security-context failure preempts a generic dispatch failure:

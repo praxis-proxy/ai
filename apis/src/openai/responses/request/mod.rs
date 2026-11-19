@@ -247,7 +247,7 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
     /// to classify and cache, the managed owner to classify when no pre-routing
     /// pass ran.
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     /// The managed owner also offers the bound-upstream phase, so a chain can
@@ -269,7 +269,7 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
     /// never needed to be.
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
         if self.config.initialize_state {
-            BodyAccess::ReadOnly
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
         } else {
             BodyAccess::None
         }
@@ -292,7 +292,7 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
     /// accumulation, breaking streamed-response persistence.
     fn response_body_access(&self) -> BodyAccess {
         if self.config.initialize_state {
-            BodyAccess::ReadOnly
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
         } else {
             BodyAccess::None
         }
@@ -769,16 +769,26 @@ fn enrich_context(
     response_id: &str,
     conversation_id: &str,
 ) {
-    ctx.set_metadata("responses.response_id", response_id);
-    ctx.set_metadata("responses.conversation_id", conversation_id);
+    ctx.filter_metadata
+        .insert("responses.response_id", response_id)
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.filter_metadata
+        .insert("responses.conversation_id", conversation_id)
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
     let store = classified.store.unwrap_or(true);
     let background = classified.background.unwrap_or(false);
     let stream = classified.stream.unwrap_or(false);
 
-    ctx.set_metadata("responses.store", if store { "true" } else { "false" });
-    ctx.set_metadata("responses.background", if background { "true" } else { "false" });
-    ctx.set_metadata("responses.stream", if stream { "true" } else { "false" });
+    ctx.filter_metadata
+        .insert("responses.store", if store { "true" } else { "false" })
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.filter_metadata
+        .insert("responses.background", if background { "true" } else { "false" })
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.filter_metadata
+        .insert("responses.stream", if stream { "true" } else { "false" })
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
     trace!(store, background, stream, "request facts published");
 }

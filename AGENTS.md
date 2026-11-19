@@ -90,8 +90,8 @@ server (praxis-ai-proxy)
   inference routing, prompt enrichment, token usage
   header injection)
 
-**Dependencies on Praxis core** use the versioned crates in the root
-`Cargo.toml`: `praxis-filter` for `HttpFilter`, pipeline, and registry;
+**Dependencies on Praxis core** track core main in the root `Cargo.toml` and share a commit pinned
+in `Cargo.lock`: `praxis-filter` for `HttpFilter`, pipeline, and registry;
 `praxis-core` for config types; `praxis-protocol` for HTTP/TCP adapters;
 and `praxis-tls` for TLS. Use `make patch-praxis` only when testing a
 local sibling checkout at `../praxis`.

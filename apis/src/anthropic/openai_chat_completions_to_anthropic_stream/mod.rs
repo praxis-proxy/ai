@@ -361,7 +361,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicStreamFilter {
 
     /// Allow incremental conversion of the selected Anthropic response stream.
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     /// Keep upstream SSE progressive; only the unfinished event is retained.
@@ -376,8 +376,8 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicStreamFilter {
 
     /// Arm conversion only when the bound provider is Anthropic and the client requested streaming.
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        if ctx.get_metadata(&format!("{BOUND_PREFIX}api_format")) != Some("messages")
-            || ctx.get_metadata(REQUEST_STREAM) != Some("true")
+        if ctx.filter_metadata.get(&format!("{BOUND_PREFIX}api_format")) != Some("messages")
+            || ctx.filter_metadata.get(REQUEST_STREAM) != Some("true")
         {
             return Ok(FilterAction::Continue);
         }
@@ -404,15 +404,18 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicStreamFilter {
             ));
         }
         let model = ctx
-            .get_metadata(CLIENT_MODEL)
+            .filter_metadata
+            .get(CLIENT_MODEL)
             .filter(|value| !value.is_empty())
             .ok_or("OpenAI client model is missing from the selected request profile")?;
         ctx.insert_filter_state(StreamState::new(
             &self.config,
             model.to_owned(),
-            ctx.get_metadata(INCLUDE_USAGE) == Some("true"),
+            ctx.filter_metadata.get(INCLUDE_USAGE) == Some("true"),
         ));
-        ctx.set_metadata(ARMED, "true");
+        ctx.filter_metadata
+            .insert(ARMED, "true")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         if let Some(response) = &mut ctx.response_header {
             response.headers.remove(http::header::CONTENT_LENGTH);
             response.headers.insert(
@@ -435,7 +438,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicStreamFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if ctx.get_metadata(ARMED) != Some("true") {
+        if ctx.filter_metadata.get(ARMED) != Some("true") {
             return Ok(FilterAction::Continue);
         }
         let state = ctx

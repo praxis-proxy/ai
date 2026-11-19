@@ -282,7 +282,7 @@ impl HttpFilter for ModelToProviderFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -359,7 +359,9 @@ impl HttpFilter for ModelToProviderFilter {
         };
         let needs_rewrite = client_model != mapping.target_model;
         ctx.insert_filter_state(ResolvedUpstream(Arc::clone(&mapping.upstream)));
-        ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, client_model);
+        ctx.filter_metadata
+            .insert(MODEL_PROVIDER_CLIENT_MODEL_METADATA, client_model)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
 
         if needs_rewrite {
             object.insert("model".to_owned(), Value::String(mapping.target_model.clone()));

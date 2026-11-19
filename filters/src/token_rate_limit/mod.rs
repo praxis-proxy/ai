@@ -2534,7 +2534,9 @@ impl TokenRateLimitFilter {
                 estimate,
             },
         );
-        ctx.set_metadata(META_ESTIMATE, request_estimate.to_string());
+        ctx.filter_metadata
+            .insert(META_ESTIMATE, request_estimate.to_string())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         Self::evaluate_tiers(ctx, rule, usage_after);
         record_admission_span(ctx, rule, request_estimate, "admitted");
         FilterAction::Continue
@@ -3162,7 +3164,7 @@ impl HttpFilter for TokenRateLimitFilter {
 
     fn request_body_access(&self) -> BodyAccess {
         if self.needs_body {
-            BodyAccess::ReadOnly
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
         } else {
             BodyAccess::None
         }
@@ -3179,7 +3181,7 @@ impl HttpFilter for TokenRateLimitFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {

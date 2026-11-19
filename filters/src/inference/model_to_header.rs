@@ -191,7 +191,9 @@ impl HttpFilter for ModelToHeaderFilter {
             .find(|(name, _)| name.as_ref().eq_ignore_ascii_case(self.header.as_str()))
             .map(|(_, value)| value.clone());
         if let Some(model) = model {
-            ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, model);
+            ctx.filter_metadata
+                .insert(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, model)
+                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         }
         Ok(action)
     }
@@ -268,7 +270,7 @@ mod tests {
         let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
         assert_eq!(
             filter.request_body_access(),
-            BodyAccess::ReadOnly,
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional),
             "body access should delegate to inner"
         );
         assert_eq!(
@@ -512,7 +514,7 @@ mod tests {
 
         drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
         assert_eq!(
-            ctx.get_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL),
+            ctx.filter_metadata.get(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL),
             Some("gpt-x"),
             "model_to_header should publish the promoted body model, not a spoofed client header"
         );
@@ -527,7 +529,7 @@ mod tests {
 
         drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
         assert_eq!(
-            ctx.get_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL),
+            ctx.filter_metadata.get(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL),
             None,
             "no model in the body should publish no model metadata"
         );

@@ -239,7 +239,9 @@ impl RehydrateFilter {
         state.restore_citation_files(citation_files);
         install_rehydrated_state(ctx, state);
         debug!(previous_response_id = %prev_id, "previous response validated, state populated");
-        ctx.set_metadata("responses.previous_response_id", prev_id);
+        ctx.filter_metadata
+            .insert("responses.previous_response_id", prev_id)
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         Ok(FilterAction::Release)
     }
 
@@ -286,11 +288,11 @@ impl HttpFilter for RehydrateFilter {
     fn request_body_access(&self) -> BodyAccess {
         // ReadWrite so a stored `configuration_update` reasoning default
         // can be published into the live request body.
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     /// `StreamBuffer` so the protocol layer assembles the complete
@@ -304,7 +306,7 @@ impl HttpFilter for RehydrateFilter {
     /// `ReadWrite` so the response phase can restore the caller's
     /// `previous_response_id` into the response body.
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     /// Streaming by default. A finite JSON response that requires the
@@ -344,7 +346,7 @@ impl HttpFilter for RehydrateFilter {
             return Ok(FilterAction::Release);
         }
 
-        if ctx.get_metadata("openai_responses_request.format") != Some("openai_responses") {
+        if ctx.filter_metadata.get("openai_responses_request.format") != Some("openai_responses") {
             return Ok(FilterAction::Release);
         }
 
@@ -1779,7 +1781,7 @@ fn install_rehydrated_state(ctx: &mut HttpFilterContext<'_>, mut state: Response
         state.store_persist_armed = previous.store_persist_armed;
         state.simple_budget = previous.simple_budget;
     }
-    state.response_id = ctx.get_metadata("responses.response_id").map(ToOwned::to_owned);
+    state.response_id = ctx.filter_metadata.get("responses.response_id").map(ToOwned::to_owned);
     write_previous_usage_metadata(ctx, state.previous_usage.as_ref());
     ctx.extensions.insert(state);
 }
@@ -1795,15 +1797,21 @@ fn write_previous_usage_metadata(ctx: &mut HttpFilterContext<'_>, usage: Option<
     };
 
     if let Some(input) = usage.get("input_tokens").and_then(Value::as_u64) {
-        ctx.set_metadata(PREV_USAGE_INPUT_KEY, input.to_string());
+        ctx.filter_metadata
+            .insert(PREV_USAGE_INPUT_KEY, input.to_string())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
 
     if let Some(output) = usage.get("output_tokens").and_then(Value::as_u64) {
-        ctx.set_metadata(PREV_USAGE_OUTPUT_KEY, output.to_string());
+        ctx.filter_metadata
+            .insert(PREV_USAGE_OUTPUT_KEY, output.to_string())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
 
     if let Some(total) = usage.get("total_tokens").and_then(Value::as_u64) {
-        ctx.set_metadata(PREV_USAGE_TOTAL_KEY, total.to_string());
+        ctx.filter_metadata
+            .insert(PREV_USAGE_TOTAL_KEY, total.to_string())
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     }
 
     trace!("extracted previous response usage");
