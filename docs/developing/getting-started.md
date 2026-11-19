@@ -256,6 +256,10 @@ insecure_options:
 | `csrf_log_only` | Run the CSRF filter in log-only mode: evaluate all rules but log violations as warnings instead of rejecting requests. Useful for initial rollout monitoring. |
 | `skip_pipeline_validation` | Demote pipeline ordering errors (e.g. filter placement issues) to warnings instead of failing startup. |
 
+For listeners that buffer requests, a finite `body_limits.max_request_bytes`
+must be at or below `body_limits.max_buffer_bytes`. Startup and reload reject
+a configuration where the transfer limit exceeds the buffer cap.
+
 Example overriding two flags for local development:
 
 ```yaml

@@ -1249,22 +1249,22 @@ insecure_options:
     #[test]
     fn model_inspection_inherits_configured_body_limits() {
         for (limits, insecure, expected, buffer_cap) in [
-            ("", "", 10_485_760, 67_108_864),
-            ("max_request_bytes: 33554432", "", 33_554_432, 67_108_864),
-            ("max_buffer_bytes: 134217728", "", 10_485_760, 134_217_728),
-            ("max_request_bytes: 134217728", "", 67_108_864, 67_108_864),
+            ("", "", Some(10_485_760), 67_108_864),
+            ("max_request_bytes: 33554432", "", Some(33_554_432), 67_108_864),
+            ("max_buffer_bytes: 134217728", "", Some(10_485_760), 134_217_728),
+            ("max_request_bytes: 134217728", "", None, 67_108_864),
             (
                 "max_request_bytes: 134217728, max_buffer_bytes: 134217728",
                 "",
-                134_217_728,
+                Some(134_217_728),
                 134_217_728,
             ),
-            ("max_request_bytes: 2048, max_buffer_bytes: 1024", "", 1024, 1024),
-            ("max_request_bytes: 1024, max_buffer_bytes: 2048", "", 1024, 2048),
+            ("max_request_bytes: 2048, max_buffer_bytes: 1024", "", None, 1024),
+            ("max_request_bytes: 1024, max_buffer_bytes: 2048", "", Some(1024), 2048),
             (
                 "max_request_bytes: null, max_buffer_bytes: 2048",
                 "allow_unbounded_body: true",
-                2048,
+                Some(2048),
                 2048,
             ),
         ] {
@@ -1302,8 +1302,18 @@ insecure_options:
                 &empty_kv_stores(),
                 &empty_inflight_registry(),
                 &client,
-            )
-            .unwrap();
+            );
+            let Some(expected) = expected else {
+                let Err(error) = pipelines else {
+                    panic!("the buffered pipeline must reject incompatible limits");
+                };
+                assert!(
+                    error.to_string().contains("exceeds body_limits.max_buffer_bytes"),
+                    "{limits}: {error}"
+                );
+                continue;
+            };
+            let pipelines = pipelines.unwrap();
             let pipeline = pipelines.get("web").unwrap().load();
             assert_eq!(pipeline.buffer_cap(), buffer_cap, "buffer cap for {limits}");
             assert_eq!(
@@ -1321,7 +1331,7 @@ insecure_options:
         for cap in [4096, 134_217_728] {
             let mut config = valid_config();
             config.body_limits.max_buffer_bytes = cap.try_into().unwrap();
-            config.body_limits.max_request_bytes = Some(268_435_456);
+            config.body_limits.max_request_bytes = Some(cap);
             config.body_limits.max_response_bytes = Some(268_435_456);
             config.filter_chains[0].filters.insert(
                 0,
