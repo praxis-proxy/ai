@@ -29,7 +29,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use metrics::{SharedString, counter};
-use praxis_ai_apis::{MODEL_PROVIDER_CLIENT_MODEL_METADATA, RecordAiMetadata as _, promotion::is_promotable_value};
+use praxis_ai_apis::{MODEL_PROVIDER_CLIENT_MODEL_METADATA, promotion::is_promotable_value};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
@@ -347,6 +347,7 @@ fn read_token_meta(ctx: &HttpFilterContext<'_>, key: &str) -> Option<u64> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, reason = "tests")]
 mod tests {
     use bytes::Bytes;
+    use praxis_ai_apis::RecordAiMetadata as _;
     use praxis_filter::{FilterAction, HttpFilter as _};
 
     use super::*;

@@ -75,7 +75,7 @@ targets.
 server (praxis-ai-proxy)
   -> filters (praxis-ai-filters)
   -> apis (praxis-ai-apis)
-  -> praxis-filter (versioned Praxis core dependency)
+  -> praxis-filter (pinned Praxis Core dependency)
 ```
 
 - **server** (`praxis-ai-proxy`): binary entry point,

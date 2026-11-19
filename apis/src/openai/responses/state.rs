@@ -567,7 +567,7 @@ pub(crate) struct ResponsesState {
     /// partitions approvals in the response phase of the same IRR iteration.
     ///
     /// Carried as typed request state (not step metadata) because the floor is a
-    /// security control that must never be silently dropped: `set_metadata` caps
+    /// security control that must never be silently dropped: `FilterMetadata::insert` caps
     /// at a fixed number of entries and drops a new key once full, so a saturated
     /// metadata map could silently disable the floor and let a client
     /// `require_approval: "never"` call execute automatically. A struct field has

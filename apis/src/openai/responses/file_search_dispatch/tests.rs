@@ -28,7 +28,7 @@ use super::{
     *,
 };
 use crate::{
-    CalloutCredentials, RecordAiMetadata as _, StateOwner,
+    CalloutCredentials, StateOwner,
     callout_policy::OnFailure,
     openai::responses::{
         agentic_loop::budget::SimpleBudget,

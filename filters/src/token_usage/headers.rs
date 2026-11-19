@@ -5,7 +5,6 @@
 
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
-use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config};
 use tracing::trace;
 
@@ -158,6 +157,8 @@ fn insert_token_header(headers: &mut http::HeaderMap, name: &HeaderName, value: 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
+    use praxis_ai_apis::RecordAiMetadata as _;
+
     use super::*;
 
     fn set_token_metadata(ctx: &mut HttpFilterContext<'_>, input: &str, output: &str, total: &str) {

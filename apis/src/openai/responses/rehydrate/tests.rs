@@ -9,7 +9,6 @@ use serde_json::json;
 
 use super::*;
 use crate::{
-    RecordAiMetadata as _,
     openai::sse::{SseFrame, SseFrameParser},
     store::{
         BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,

@@ -108,11 +108,8 @@ use std::{
 
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue, header::AUTHORIZATION};
-use praxis_ai_apis::{
-    RecordAiMetadata as _,
-    credential_source::{
-        CredentialSource, DiagnosticContext, SecretHandle, SecretSnapshot, WatchHandle, WatchRegistry,
-    },
+use praxis_ai_apis::credential_source::{
+    CredentialSource, DiagnosticContext, SecretHandle, SecretSnapshot, WatchHandle, WatchRegistry,
 };
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
 use serde::Deserialize;
@@ -1049,6 +1046,7 @@ fn validate_token(value: &str) -> Result<(), FilterError> {
 )]
 mod tests {
     use http::{HeaderValue, Method};
+    use praxis_ai_apis::RecordAiMetadata as _;
 
     use super::*;
 

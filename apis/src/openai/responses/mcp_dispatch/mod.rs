@@ -1155,7 +1155,7 @@ impl HttpFilter for McpDispatchFilter {
         ctx.record_ai_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
         // Publish the operator approval floor onto typed request state so the
         // owner's response-phase approval partitioning (`prepare_response_round`)
-        // applies it this IRR iteration. Unlike `set_metadata` (bounded entry
+        // applies it this IRR iteration. Unlike `FilterMetadata::insert` (bounded entry
         // count; silently drops a new key once full), a struct field cannot be
         // dropped under metadata saturation, so a configured security floor can
         // never be silently disabled. When there is no `ResponsesState` there is

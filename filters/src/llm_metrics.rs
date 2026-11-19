@@ -38,7 +38,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use metrics::{Unit, counter, describe_histogram, histogram};
-use praxis_ai_apis::{RecordAiMetadata as _, promotion::is_promotable_value};
+use praxis_ai_apis::promotion::is_promotable_value;
 use praxis_filter::HttpFilterContext;
 
 /// Prompt tokens (backend-reported) per request, cumulative.
@@ -267,6 +267,7 @@ pub fn record_finish_reason(ctx: &HttpFilterContext<'_>, reason: &str) {
 mod tests {
     use http::{HeaderValue, Method};
     use metrics_util::debugging::DebuggingRecorder;
+    use praxis_ai_apis::RecordAiMetadata as _;
 
     use super::*;
     use crate::test_utils::make_filter_context;

@@ -1414,7 +1414,7 @@ fn record_selection_metadata(ctx: &mut HttpFilterContext<'_>, group: Option<u32>
 /// Write bounded route-decision metadata on successful selection.
 ///
 /// Keys use `intelligent_route.` namespace. All values are bounded by the
-/// existing `set_metadata` limits.  No HTTP forwarding headers are
+/// existing `FilterMetadata::insert` limits.  No HTTP forwarding headers are
 /// written by this function.
 fn record_route_decision(
     ctx: &mut HttpFilterContext<'_>,

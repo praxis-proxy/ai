@@ -55,7 +55,7 @@ use self::{
     request::{TransformedRequest, classify, transform_request},
 };
 use crate::{
-    MODEL_PROVIDER_CLIENT_MODEL_METADATA, RecordAiMetadata as _,
+    MODEL_PROVIDER_CLIENT_MODEL_METADATA,
     anthropic::{ErrorType, error_rejection, invalid_request_rejection},
 };
 
@@ -522,7 +522,10 @@ mod tests {
     use praxis_filter::Request;
 
     use super::*;
-    use crate::test_utils::{make_filter_context, make_request, make_response};
+    use crate::{
+        RecordAiMetadata as _,
+        test_utils::{make_filter_context, make_request, make_response},
+    };
 
     fn filter(yaml: &str) -> Box<dyn HttpFilter> {
         let config: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
