@@ -29,10 +29,10 @@ LINT_FMT_CARGO = PATH="$$(dirname "$$(rustup which --toolchain nightly cargo)"):
 # Experimental filter features are package-specific and off by default.
 # Basic Auth is exposed by praxis-ai-proxy and forwarded by the integration-test
 # crate; it is not a praxis-ai-filters feature.
-FILTER_EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-quota-filter,token-ceiling-filter,inflight-tracker-filter,vertex-anthropic-filter
-INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-quota-filter,token-ceiling-filter,inflight-tracker-filter,vertex-anthropic-filter
+FILTER_EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-quota-filter,token-ceiling-filter,inflight-tracker-filter,vertex-anthropic-filter,anthropic-mcp-connector-filter
+INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-quota-filter,token-ceiling-filter,inflight-tracker-filter,vertex-anthropic-filter,anthropic-mcp-connector-filter
 # Experimental praxis-ai-apis features, whose unit tests live in that crate.
-APIS_EXPERIMENTAL_FEATURES := vertex-anthropic
+APIS_EXPERIMENTAL_FEATURES := vertex-anthropic,anthropic-mcp-connector
 # Release and container builds exclude experimental Responses and agents.
 # Opt in with PRAXIS_AI_FEATURES=full,openai-all,store-sqlite when needed.
 PRAXIS_AI_FEATURES ?= full

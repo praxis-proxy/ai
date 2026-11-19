@@ -717,6 +717,7 @@ jobs:
           cache-dependency-glob: |
             tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py
             tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py
+            tests/integration/sdk/anthropic/test_anthropic_mcp_connector_vllm.py
 
       - name: Verify pins are resolvable
         run: |
@@ -836,7 +837,7 @@ jobs:
 
       - name: Build Praxis and acceptance test
         run: |
-          cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres
+          cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres,anthropic-mcp-connector-filter
           cargo test -p praxis-tests-integration --test suite --no-run
 
       - name: Create restricted network namespace
@@ -1133,6 +1134,22 @@ jobs:
           uv run tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py -s \
             -p qualification_plugin -k "not live_tavily"
 
+      - name: Run Anthropic SDK MCP connector against real vLLM
+        id: anthropic_mcp_connector
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        timeout-minutes: 15
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_REQUIRE_LIVE: "1"
+          PYTHONPATH: tests/integration/sdk/openai
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/anthropic-mcp-connector-cases.json
+        run: |
+          # The live model is forced to call the one allowlisted tool on a local
+          # MCP stub, so this lane is deterministic and needs no external secret.
+          uv run tests/integration/sdk/anthropic/test_anthropic_mcp_connector_vllm.py -s \
+            -p qualification_plugin
+
       - name: Run credentialed live Tavily web search against real vLLM
         id: anthropic_credentialed_web_search
         if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
@@ -1232,6 +1249,7 @@ jobs:
           CLAUDE_COMPACTION: ${{ steps.claude_compaction.outcome }}
           ANTHROPIC_MESSAGES: ${{ steps.anthropic_messages.outcome }}
           ANTHROPIC_STUBBED_WEB_SEARCH: ${{ steps.anthropic_stubbed_web_search.outcome }}
+          ANTHROPIC_MCP_CONNECTOR: ${{ steps.anthropic_mcp_connector.outcome }}
           ANTHROPIC_CREDENTIALED_WEB_SEARCH: ${{ steps.anthropic_credentialed_web_search.outcome }}
           SELECTED_ANTHROPIC_OPENAI_CHAT: ${{ steps.selected_anthropic_openai_chat.outcome }}
         run: |
@@ -1241,12 +1259,14 @@ jobs:
                    "CLAUDE_TRANSLATED_AUTO", "CLAUDE_PLANNING", "CLAUDE_WEB_SEARCH",
                    "CLAUDE_COMPACTION",
                    "ANTHROPIC_MESSAGES", "ANTHROPIC_STUBBED_WEB_SEARCH",
+                   "ANTHROPIC_MCP_CONNECTOR",
                    "ANTHROPIC_CREDENTIALED_WEB_SEARCH",
                    "SELECTED_ANTHROPIC_OPENAI_CHAT")
           cases = [{"id": name.lower(), "status": os.environ[name] or "unexecuted"} for name in names]
           for case, filename in (
               ("anthropic_messages", "anthropic-messages-cases.json"),
               ("anthropic_stubbed_web_search", "anthropic-stubbed-web-search-cases.json"),
+              ("anthropic_mcp_connector", "anthropic-mcp-connector-cases.json"),
               ("anthropic_credentialed_web_search", "anthropic-credentialed-web-search-cases.json"),
               ("selected_anthropic_openai_chat", "selected-anthropic-openai-chat-cases.json"),
           ):

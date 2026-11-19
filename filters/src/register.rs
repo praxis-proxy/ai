@@ -355,6 +355,26 @@ fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: 
         http "openai_chat_completions_to_anthropic_stream" => praxis_ai_apis::anthropic::OpenaiChatCompletionsToAnthropicStreamFilter::from_config
     );
     register_anthropic_web_search(registry, subrequest_client);
+    #[cfg(feature = "anthropic-mcp-connector-filter")]
+    register_anthropic_mcp_connector(registry);
+}
+
+/// Register `anthropic_mcp_connector` as a chain-binding filter.
+///
+/// It runs inside an `iterative_request_router` step, where Praxis core binds
+/// an inline `outbound_chain` at step-build time. Every MCP `tools/list` and
+/// `tools/call` runs through that chain.
+#[cfg(feature = "anthropic-mcp-connector-filter")]
+#[expect(clippy::panic, reason = "matches register_filters! macro convention")]
+fn register_anthropic_mcp_connector(registry: &mut FilterRegistry) {
+    registry
+        .register_chain_binding(
+            "anthropic_mcp_connector",
+            ::std::sync::Arc::new(|config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
+                praxis_ai_apis::anthropic::AnthropicMcpConnectorFilter::from_config_with_binding(config, ctx)
+            }),
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'anthropic_mcp_connector'"));
 }
 
 /// Register Vertex AI translation filters.
@@ -984,6 +1004,10 @@ provider:
         ("openai_mcp_tool_resolve", cfg!(feature = "openai-mcp-tools")),
         ("openai_mcp_dispatch", cfg!(feature = "openai-mcp-tools")),
         ("openai_mcp_streaming_selector", cfg!(feature = "openai-mcp-tools")),
+        (
+            "anthropic_mcp_connector",
+            cfg!(feature = "anthropic-mcp-connector-filter"),
+        ),
     ];
 
     /// Opt-in filter groups register only when their cargo feature is enabled.

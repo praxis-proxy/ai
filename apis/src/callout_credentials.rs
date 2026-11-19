@@ -416,7 +416,7 @@ impl CalloutCredentials {
     }
 
     /// Look up the authorization assertion staged for `slot`, if any.
-    #[cfg(any(test, feature = "openai-mcp-tools"))]
+    #[cfg(any(test, feature = "mcp"))]
     pub(crate) fn get_assertion(&self, slot: &str) -> Option<&SecretString> {
         self.assertion_slots.get(slot)
     }
