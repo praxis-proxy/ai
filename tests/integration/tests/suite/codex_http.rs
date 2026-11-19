@@ -400,7 +400,8 @@ async fn run_live_codex_apply_patch_workflow(
         "You MUST use the apply_patch tool exactly once with this exact patch to add result.txt:\n\
          *** Begin Patch\n*** Add File: result.txt\n+{}\n*** End Patch\n\n\
          Do not use exec_command or another tool to write or edit files.\n\
-         After apply_patch succeeds, use exec_command only to run exactly `./verify.sh`.\n\
+         After apply_patch succeeds, use exec_command only to run exactly `./verify.sh` with default permissions.\n\
+         Omit the sandbox_permissions argument.\n\
          Do not answer before verification succeeds. Then summarize what changed. /no_think",
         workspace.expected_content(),
     );

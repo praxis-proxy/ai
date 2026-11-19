@@ -9810,16 +9810,17 @@ class TestAgenticLoopVLLM:
         output_item.added -> web_search_call.in_progress -> searching ->
         completed -> output_item.done sequence exactly once per call (no
         re-emission across IRR rounds), with ids and output indices that agree
-        with the terminal snapshot. The live model may make multiple searches.
+        with the terminal snapshot. The request bounds the live model to one search.
         """
         stream = translated_agentic_client.responses.create(
             model=CHAT_TRANSLATION_MODEL,
             input=(
-                "Search the web for the latest Rust release, then answer. "
-                "You MUST use the web search tool. Do not answer directly. "
+                "Search the web once for the latest Rust release, then report the result title. "
                 "/no_think"
             ),
-            tools=[{"type": "web_search_preview"}],
+            tools=[{"type": "web_search"}],
+            tool_choice={"type": "web_search"},
+            max_tool_calls=1,
             store=False,
             stream=True,
             max_output_tokens=512,
