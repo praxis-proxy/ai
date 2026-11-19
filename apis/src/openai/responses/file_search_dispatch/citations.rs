@@ -3,11 +3,92 @@
 
 //! Final-response citation extraction and OpenAI annotation rewriting.
 
+#[cfg(feature = "store")]
+use std::collections::HashSet;
 use std::{collections::HashMap, fmt, mem::size_of};
 
 use serde_json::Value;
 
+#[cfg(feature = "store")]
+use super::model_context::is_valid_filename;
 use super::model_context::{MAX_FILE_ID_BYTES, MAX_FILENAME_BYTES, is_valid_file_id};
+#[cfg(feature = "store")]
+use crate::openai::responses::state::MAX_CITATION_FILES;
+
+/// Private `response_object` key carrying the gateway-derived citation map
+/// across stored continuations (#2036).
+///
+/// The buffered store path records the decoded upstream body, so the store
+/// filter strips any upstream-supplied copy of this key before writing the
+/// gateway's own map; request input never reaches `response_object`. Store
+/// retrieval strips the key before a stored response is returned.
+///
+/// The map holds at most [`MAX_CITATION_FILES`] entries, each a file ID of at
+/// most [`MAX_FILE_ID_BYTES`] and a filename of at most [`MAX_FILENAME_BYTES`],
+/// so a stored record grows by at most about 1.6 MiB beyond the bridge context
+/// bounded by `MAX_TOTAL_MODEL_CONTEXT_BYTES`.
+#[cfg(feature = "store")]
+pub(crate) const STORED_CITATION_FILES_KEY: &str = "_praxis_file_search_citation_files";
+
+/// Record the request's citation map in a response about to be stored.
+///
+/// The map merges citations restored from `previous_response_id` with files
+/// this exchange retrieved, so each stored link carries the chain. When the
+/// merged map exceeds [`MAX_CITATION_FILES`], this exchange's entries are kept
+/// first and restored entries fill the remainder in file-ID order. Entries are
+/// emitted in file-ID order to keep stored bytes deterministic.
+#[cfg(feature = "store")]
+pub(crate) fn persist_citation_files(
+    response_object: &mut Value,
+    citation_files: &HashMap<String, String>,
+    restored_file_ids: &HashSet<String>,
+) {
+    let Some(object) = response_object.as_object_mut() else {
+        return;
+    };
+    if citation_files.is_empty() {
+        object.remove(STORED_CITATION_FILES_KEY);
+        return;
+    }
+    let mut entries: Vec<(&String, &String)> = citation_files.iter().collect();
+    entries.sort_unstable_by_key(|(file_id, _)| (restored_file_ids.contains(*file_id), *file_id));
+    entries.truncate(MAX_CITATION_FILES);
+    entries.sort_unstable_by_key(|(file_id, _)| *file_id);
+    let map = entries
+        .into_iter()
+        .map(|(file_id, filename)| (file_id.clone(), Value::String(filename.clone())))
+        .collect();
+    object.insert(STORED_CITATION_FILES_KEY.to_owned(), Value::Object(map));
+}
+
+/// Restore the citation map a stored response recorded, keeping only entries
+/// that pass the same file-ID and filename checks as freshly retrieved files.
+#[cfg(feature = "store")]
+pub(crate) fn restore_citation_files(response_object: &Value) -> HashMap<String, String> {
+    let Some(stored) = response_object
+        .get(STORED_CITATION_FILES_KEY)
+        .and_then(Value::as_object)
+    else {
+        return HashMap::new();
+    };
+    stored
+        .iter()
+        .filter_map(|(file_id, filename)| {
+            let filename = filename.as_str()?;
+            (file_id.len() <= MAX_FILE_ID_BYTES && is_valid_file_id(file_id) && is_valid_filename(filename))
+                .then(|| (file_id.clone(), filename.to_owned()))
+        })
+        .take(MAX_CITATION_FILES)
+        .collect()
+}
+
+/// Remove the private citation map before a stored response reaches a client.
+#[cfg(feature = "store")]
+pub(crate) fn strip_stored_citation_files(response_object: &mut Value) {
+    if let Some(object) = response_object.as_object_mut() {
+        object.remove(STORED_CITATION_FILES_KEY);
+    }
+}
 
 /// Maximum marker candidates processed across one response.
 const MAX_CITATION_MARKERS: usize = 4_096;
@@ -530,6 +611,92 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn stored_citation_files_round_trip_and_strip() {
+        let files = HashMap::from([
+            ("file-b".to_owned(), "b.txt".to_owned()),
+            ("file-a".to_owned(), "a.txt".to_owned()),
+        ]);
+        let mut response = json!({"id": "resp_1", "output": []});
+        persist_citation_files(&mut response, &files, &HashSet::new());
+        assert_eq!(
+            response[STORED_CITATION_FILES_KEY],
+            json!({"file-a": "a.txt", "file-b": "b.txt"}),
+            "entries are stored in deterministic file-ID order"
+        );
+        assert_eq!(restore_citation_files(&response), files);
+
+        strip_stored_citation_files(&mut response);
+        assert_eq!(response, json!({"id": "resp_1", "output": []}));
+        assert!(restore_citation_files(&response).is_empty());
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn empty_citation_files_clear_a_stale_stored_map() {
+        let mut response = json!({STORED_CITATION_FILES_KEY: {"file-a": "a.txt"}});
+        persist_citation_files(&mut response, &HashMap::new(), &HashSet::new());
+        assert_eq!(response, json!({}));
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn restored_citation_files_drop_invalid_entries() {
+        let long_name = "n".repeat(MAX_FILENAME_BYTES + 1);
+        let response = json!({STORED_CITATION_FILES_KEY: {
+            "file-ok": "ok.txt",
+            "not-a-file": "x.txt",
+            "file-bad id": "x.txt",
+            "file-long": long_name,
+            "file-control": "bad\nname",
+            "file-number": 7,
+        }});
+        assert_eq!(
+            restore_citation_files(&response),
+            HashMap::from([("file-ok".to_owned(), "ok.txt".to_owned())])
+        );
+        assert!(restore_citation_files(&json!({STORED_CITATION_FILES_KEY: []})).is_empty());
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn restored_citation_files_are_bounded() {
+        let map: serde_json::Map<String, Value> = (0..MAX_CITATION_FILES + 10)
+            .map(|index| (format!("file-{index}"), json!("f.txt")))
+            .collect();
+        let response = json!({STORED_CITATION_FILES_KEY: map});
+        assert_eq!(restore_citation_files(&response).len(), MAX_CITATION_FILES);
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn persisted_citation_files_keep_fresh_entries_at_the_cap() {
+        let restored: HashSet<String> = (0..MAX_CITATION_FILES)
+            .map(|index| format!("file-a{index:04}"))
+            .collect();
+        let mut files: HashMap<String, String> = restored
+            .iter()
+            .map(|file_id| (file_id.clone(), "old.txt".to_owned()))
+            .collect();
+        files.insert("file-z-fresh".to_owned(), "fresh.txt".to_owned());
+        let mut response = json!({"id": "resp_1"});
+        persist_citation_files(&mut response, &files, &restored);
+
+        let stored = response[STORED_CITATION_FILES_KEY].as_object().unwrap();
+        assert_eq!(stored.len(), MAX_CITATION_FILES, "the stored map stays bounded");
+        assert_eq!(
+            stored["file-z-fresh"], "fresh.txt",
+            "this exchange's entry survives a full restored map"
+        );
+        assert!(
+            !stored.contains_key("file-a1023"),
+            "restored entries fill the remainder in file-ID order"
+        );
+        let keys: Vec<&String> = stored.keys().collect();
+        assert!(keys.is_sorted(), "stored entries stay in file-ID order");
+    }
 
     #[test]
     #[expect(clippy::print_stderr, reason = "record fixed-baseline allocation evidence")]

@@ -622,7 +622,10 @@ provider:
     .unwrap();
 
     let filter = AiGuardrailsFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.request_body_access(), praxis_filter::body::BodyAccess::ReadWrite);
+    assert_eq!(
+        filter.request_body_access(),
+        praxis_filter::body::BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
+    );
 }
 
 #[test]
@@ -2508,7 +2511,7 @@ fn response_body_access_read_write_when_phase_enabled() {
     let filter = nemo_filter_response("http://nemo:8000/v1/checks");
     assert_eq!(
         filter.response_body_access(),
-        praxis_filter::body::BodyAccess::ReadWrite,
+        praxis_filter::body::BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional),
         "response body access should be ReadWrite when response phase is enabled"
     );
 }

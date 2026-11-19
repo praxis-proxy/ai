@@ -562,7 +562,7 @@ fn body_access_is_read_write() {
     let filter = make_filter(Some(&[("system", "Hello.")]), None);
     assert_eq!(
         filter.request_body_access(),
-        BodyAccess::ReadWrite,
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional),
         "body access should be ReadWrite"
     );
 }

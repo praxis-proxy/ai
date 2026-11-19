@@ -267,7 +267,7 @@ pub(super) fn drain_local_tool_synthesis(ctx: &mut HttpFilterContext<'_>, out: &
         return;
     }
     // Step 1: pre-existing error → discard without normalizing (preserves sequence).
-    if ctx.get_metadata("responses.stream_error_code").is_some() {
+    if ctx.filter_metadata.get("responses.stream_error_code").is_some() {
         return;
     }
     // Phase B — partition the queue into items the dispatcher has already

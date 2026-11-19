@@ -500,7 +500,7 @@ impl HttpFilter for HttpCalloutFilter {
 
     fn request_body_access(&self) -> BodyAccess {
         match self.phase {
-            Phase::RequestBody => BodyAccess::ReadOnly,
+            Phase::RequestBody => BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional),
             Phase::RequestHeaders => BodyAccess::None,
         }
     }

@@ -618,7 +618,7 @@ impl HttpFilter for StateOwnerFilter {
     fn request_body_access(&self) -> BodyAccess {
         // This filter does not inspect body bytes. ReadOnly participation makes
         // it run before downstream StreamBuffer consumers during pre-read.
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {

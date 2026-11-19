@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::{
+    RecordAiMetadata as _,
     json_body::MAX_JSON_BODY_BYTES,
     openai::responses::agentic_loop::budget::SimpleBudget,
     test_utils::{make_filter_context, make_request},
@@ -6170,7 +6171,7 @@ fn budgeted_client_tool_restoration_rejects_before_parsing_response() {
     assert_eq!(status, 502);
     assert!(message.contains("limit set by the platform administrator"));
     assert!(body.is_none());
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
 }
 
 #[test]
@@ -6240,7 +6241,7 @@ async fn streaming_rich_request_rejects_without_arming() {
     let filter = filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.extensions.insert(ResponsesState::from_request_body(json!({
         "stream": true,
         "tools": [{"type": "custom", "name": "run_python", "description": "d", "format": {"type": "text"}}],

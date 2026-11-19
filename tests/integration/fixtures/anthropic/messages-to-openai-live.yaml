@@ -1,0 +1,39 @@
+# Opt-in live Anthropic SDK test. The upstream key is injected after routing.
+listeners:
+  - name: gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [messages-to-openai]
+
+filter_chains:
+  - name: messages-to-openai
+    filters:
+      - filter: anthropic_messages_request
+      - filter: anthropic_messages_to_chat_completions
+        max_body_bytes: 1048576
+      - filter: anthropic_messages_to_chat_completions_stream
+        max_partial_event_bytes: 10485760
+        max_tool_blocks: 10000
+      - filter: path_rewrite
+        replace:
+          pattern: "^/v1/messages$"
+          replacement: "/v1/chat/completions"
+      - filter: router
+        routes:
+          - path_prefix: "/v1/chat/completions"
+            cluster: openai
+      - filter: headers
+        request_set:
+          - name: host
+            value: api.openai.com
+      - filter: credential_injection
+        clusters:
+          - name: openai
+            header: Authorization
+            env_var: OPENAI_API_KEY
+            header_prefix: "Bearer "
+      - filter: load_balancer
+        clusters:
+          - name: openai
+            endpoints: ["api.openai.com:443"]
+            tls:
+              sni: api.openai.com

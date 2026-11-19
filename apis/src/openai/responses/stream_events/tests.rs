@@ -22,6 +22,7 @@ use super::{
     canonicalize_logical_response, encode_local_completion, encode_local_error,
 };
 use crate::{
+    RecordAiMetadata as _,
     openai::{
         responses::{
             agentic_loop::budget::SimpleBudget,
@@ -272,7 +273,7 @@ fn retained_budget_overflow_poisoned_stream_emits_one_error_without_success() {
         ctx.get_filter_state::<StreamEventsState>().unwrap().event_count,
         accepted_count
     );
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
 
     let mut repeated = Some(make_sse_chunk(
         "response.completed",
@@ -287,7 +288,7 @@ fn retained_budget_overflow_poisoned_stream_emits_one_error_without_success() {
         accepted_count
     );
     assert_eq!(
-        ctx.get_metadata("responses.stream_error_message"),
+        ctx.filter_metadata.get("responses.stream_error_message"),
         Some("The request exceeds a processing limit set by the platform administrator.")
     );
 
@@ -297,7 +298,7 @@ fn retained_budget_overflow_poisoned_stream_emits_one_error_without_success() {
     assert_eq!(wire.matches("event: error").count(), 1, "{wire}");
     assert!(!wire.contains("response.completed"), "{wire}");
     assert!(!wire.contains("[DONE]"), "{wire}");
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
 }
 
 #[test]
@@ -329,7 +330,7 @@ fn budgeted_argument_deltas_stop_before_growing_the_argument_buffer() {
         ctx.get_filter_state::<StreamEventsState>().unwrap().tool_call_args["item:fc_1"].len(),
         500
     );
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
 }
 
 #[test]
@@ -350,7 +351,7 @@ fn budgeted_stream_preserves_typed_output_item() {
     let wire = String::from_utf8(item.unwrap().to_vec()).unwrap();
     assert!(wire.contains("event: response.output_item.done"), "{wire}");
     assert!(wire.contains("output_audio"), "{wire}");
-    assert!(ctx.get_metadata("responses.stream_error_code").is_none());
+    assert!(ctx.filter_metadata.get("responses.stream_error_code").is_none());
 }
 
 #[test]
@@ -379,7 +380,7 @@ fn retained_budget_allows_split_sse_frame_without_buffering_full_stream() {
             .is_some_and(|bytes| bytes.starts_with(b"event: response.created\n"))
     );
     assert_eq!(ctx.get_filter_state::<StreamEventsState>().unwrap().event_count, 1);
-    assert!(ctx.get_metadata("responses.stream_error_code").is_none());
+    assert!(ctx.filter_metadata.get("responses.stream_error_code").is_none());
 }
 
 #[test]
@@ -399,7 +400,7 @@ fn fragmented_compact_terminal_is_rejected_before_json_tree_allocation() {
         filter.on_response_body(&mut ctx, &mut body, false).unwrap();
         assert!(body.is_none(), "no partial or rejected terminal may be emitted");
     }
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
     assert_eq!(ctx.get_filter_state::<StreamEventsState>().unwrap().event_count, 0);
 
     let mut eos = None;
@@ -495,12 +496,12 @@ fn done_after_terminal_at_max_events_is_allowed() {
     assert_eq!(state.event_count, 1, "[DONE] must not consume an event slot");
     assert_eq!(state.completion_state, CompletionState::TerminalLifecycle);
     assert!(state.deferred_done, "the downstream sentinel must be retained");
-    assert!(ctx.get_metadata("responses.stream_parse_error").is_none());
+    assert!(ctx.filter_metadata.get("responses.stream_parse_error").is_none());
 
     let mut eos = None;
     filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
-    assert!(ctx.get_metadata("responses.stream_error_code").is_none());
-    assert!(ctx.get_metadata("responses.stream_incomplete").is_none());
+    assert!(ctx.filter_metadata.get("responses.stream_error_code").is_none());
+    assert!(ctx.filter_metadata.get("responses.stream_incomplete").is_none());
     assert!(
         eos.as_deref().is_some_and(|bytes| bytes.ends_with(b"data: [DONE]\n\n")),
         "a valid terminal stream must forward its [DONE] sentinel"
@@ -512,15 +513,15 @@ fn counted_event_beyond_max_events_is_rejected() {
     let (filter, mut ctx) = make_armed_context_with_filter(make_filter_from("max_events: 1"));
     let mut first = Some(make_sse_chunk("response.output_text.delta", &json!({"delta": "first"})));
     filter.on_response_body(&mut ctx, &mut first, false).unwrap();
-    assert!(ctx.get_metadata("responses.stream_parse_error").is_none());
+    assert!(ctx.filter_metadata.get("responses.stream_parse_error").is_none());
 
     let mut second = Some(make_sse_chunk(
         "response.output_text.delta",
         &json!({"delta": "second"}),
     ));
     filter.on_response_body(&mut ctx, &mut second, false).unwrap();
-    assert_eq!(ctx.get_metadata("responses.stream_parse_error"), Some("true"));
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.stream_parse_error"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
 }
 
 fn make_filter() -> StreamEventsFilter {
@@ -1027,7 +1028,7 @@ fn response_body_access_is_always_read_write() {
     let filter = make_filter();
     assert_eq!(
         filter.response_body_access(),
-        praxis_filter::BodyAccess::ReadWrite,
+        praxis_filter::BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional),
         "logical lifecycle normalization always rewrites emitted SSE frames"
     );
 }
@@ -1135,8 +1136,8 @@ async fn on_request_rejects_streaming_responses_outside_irr() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -1181,7 +1182,7 @@ fn arm_publishes_logical_stream_marker() {
     let (_filter, ctx) = make_armed_context();
 
     assert_eq!(
-        ctx.get_metadata("responses.logical_stream"),
+        ctx.filter_metadata.get("responses.logical_stream"),
         Some("true"),
         "arming must publish the per-round marker openai_agentic_loop consumes"
     );
@@ -1192,8 +1193,8 @@ async fn does_not_arm_for_non_streaming() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_request.stream", "false".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "false".to_owned());
     ctx.current_filter_id = Some(0);
 
     let _action = filter.on_request(&mut ctx).await.unwrap();
@@ -1208,8 +1209,8 @@ async fn does_not_arm_for_non_responses_format() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_request.format", "openai_chat_completions".to_owned());
-    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_chat_completions".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
     let _action = filter.on_request(&mut ctx).await.unwrap();
@@ -1228,8 +1229,8 @@ async fn does_not_arm_for_other_responses_routes() {
         let filter = make_filter();
         let req = make_request(method, path);
         let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-        ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
-        ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
+        ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+        ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
         ctx.current_filter_id = Some(0);
 
         let action = filter.on_request(&mut ctx).await.unwrap();
@@ -1674,7 +1675,7 @@ async fn logical_stream_suppresses_malformed_chunk_and_emits_terminal_error() {
         "the malformed resumed response identity must not leak downstream: {eos}"
     );
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "parse-error streams must not be persisted"
     );
@@ -1694,7 +1695,7 @@ async fn logical_stream_rejects_event_type_line_injection() {
         let output = String::from_utf8(eos.unwrap().to_vec()).unwrap();
         assert!(output.contains("event: error"));
         assert!(!output.contains("injected"));
-        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+        assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
     }
 }
 
@@ -1756,12 +1757,12 @@ async fn accumulation_byte_budget_fails_closed_across_chunks() {
         "aggregate output-item bytes must eventually fail the stream closed"
     );
     assert_eq!(
-        ctx.get_metadata("responses.stream_parse_error"),
+        ctx.filter_metadata.get("responses.stream_parse_error"),
         Some("true"),
         "budget overflow must be recorded as a stream parse error"
     );
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "budget-overflow streams must not be persisted"
     );
@@ -1909,7 +1910,7 @@ async fn staged_byte_budget_fails_closed_without_committing_delivery() {
     ));
     filter.on_response_body(&mut ctx, &mut msg_added, false).unwrap();
     assert_eq!(
-        ctx.get_metadata("responses.stream_parse_error"),
+        ctx.filter_metadata.get("responses.stream_parse_error"),
         None,
         "a staged (held) event must not poison the stream"
     );
@@ -1939,12 +1940,12 @@ async fn staged_byte_budget_fails_closed_without_committing_delivery() {
     filter.on_response_body(&mut ctx, &mut overflow, false).unwrap();
     assert!(overflow.is_none(), "the staged-overflow chunk must emit nothing");
     assert_eq!(
-        ctx.get_metadata("responses.stream_parse_error"),
+        ctx.filter_metadata.get("responses.stream_parse_error"),
         Some("true"),
         "staged-byte overflow must poison the stream"
     );
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "overflowed streams must not be persisted"
     );
@@ -1986,7 +1987,7 @@ async fn accumulation_item_count_budget_fails_closed() {
     filter.on_response_body(&mut ctx, &mut overflow, false).unwrap();
     assert!(overflow.is_none(), "the item past the count cap must fail closed");
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "count-overflow streams must not be persisted"
     );
@@ -2021,7 +2022,7 @@ async fn accumulation_budget_poisons_subsequent_terminal() {
         "a terminal event after budget overflow must stay suppressed"
     );
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "a poisoned stream must not be persisted even after a terminal event"
     );
@@ -2083,12 +2084,12 @@ async fn accumulation_charges_local_tool_progress_events() {
         "aggregate local-tool progress bytes must eventually fail the stream closed"
     );
     assert_eq!(
-        ctx.get_metadata("responses.stream_parse_error"),
+        ctx.filter_metadata.get("responses.stream_parse_error"),
         Some("true"),
         "budget overflow must be recorded as a stream parse error"
     );
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "budget-overflow streams must not be persisted"
     );
@@ -2114,7 +2115,7 @@ async fn accumulation_charges_tool_call_argument_bytes() {
 
     assert!(failed, "aggregate tool-call argument bytes must fail the stream closed");
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "tool-call budget overflow streams must not be persisted"
     );
@@ -2138,7 +2139,7 @@ async fn accumulation_count_charges_output_item_done() {
     filter.on_response_body(&mut ctx, &mut overflow, false).unwrap();
     assert!(overflow.is_none(), "the done item past the count cap must fail closed");
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "count-overflow streams must not be persisted"
     );
@@ -2190,7 +2191,7 @@ async fn accumulation_count_dedups_added_done_pair() {
         "a matched added/done pair is one item and must not trip the count cap"
     );
     assert_ne!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "a canonical added/done pair must not fail the stream closed"
     );
@@ -2244,7 +2245,7 @@ async fn repeated_function_call_done_reuses_one_output_item() {
             "repeated completion must not clone the full output item"
         );
     }
-    assert_ne!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_ne!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.output_items().len(), 1);
     assert!(
@@ -2274,7 +2275,7 @@ async fn coalesced_function_call_done_reuses_one_output_item() {
     let mut chunk = Some(Bytes::from(coalesced));
     filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
     assert!(chunk.is_some(), "a coalesced batch must retain one completed item");
-    assert_ne!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_ne!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.output_items().len(), 1);
 }
@@ -2300,7 +2301,7 @@ async fn mismatched_announced_index_still_updates_the_real_output_item() {
     let mut chunk = Some(Bytes::from(coalesced));
     filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
     assert!(chunk.is_some());
-    assert_ne!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_ne!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.output_items().len(), 1);
     assert_eq!(state.output_items()[0]["arguments"], "{}");
@@ -2332,7 +2333,7 @@ async fn accumulation_argument_done_without_item_is_incremental() {
     // No matching output item ever existed, so nothing was cloned or charged as a
     // clone and the stream is not failed closed.
     assert_ne!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "dones without a matching output item must not spuriously overflow the byte budget"
     );
@@ -2368,7 +2369,7 @@ async fn count_overflow_rejects_before_recording_local_tool_milestone() {
     filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
     assert!(chunk.is_none(), "the overflowing chunk must fail closed");
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "a count-overflow chunk must not be persisted"
     );
@@ -2428,7 +2429,7 @@ async fn accumulation_byte_budget_spans_irr_rounds() {
         "bytes charged in round 0 must carry into round 1 and fail the stream closed"
     );
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "a stream that overflows the request-wide byte budget must not be persisted"
     );
@@ -2466,12 +2467,12 @@ async fn accumulation_terminal_snapshot_charged_against_byte_budget() {
         "a terminal snapshot larger than the byte ceiling must fail the stream closed"
     );
     assert_eq!(
-        ctx.get_metadata("responses.stream_parse_error"),
+        ctx.filter_metadata.get("responses.stream_parse_error"),
         Some("true"),
         "an over-cap terminal snapshot must be recorded as a stream parse error"
     );
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "an over-cap terminal snapshot must not be persisted"
     );
@@ -4312,7 +4313,7 @@ async fn terminal_event_writes_response_object() {
     assert_eq!(state.response_object["id"], "resp_123");
     assert_eq!(state.output_items().len(), 1);
     assert_eq!(state.usage["total_tokens"], 15);
-    assert_eq!(ctx.get_metadata("responses.status"), Some("completed"),);
+    assert_eq!(ctx.filter_metadata.get("responses.status"), Some("completed"),);
 }
 
 #[tokio::test]
@@ -4639,11 +4640,11 @@ async fn eos_validates_stream_completeness() {
     let mut empty = None;
     filter.on_response_body(&mut ctx, &mut empty, true).unwrap();
     assert!(
-        ctx.get_metadata("responses.stream_parse_error").is_none(),
+        ctx.filter_metadata.get("responses.stream_parse_error").is_none(),
         "DONE sentinel should not set parse-error metadata"
     );
     assert!(
-        ctx.get_metadata("responses.stream_incomplete").is_none(),
+        ctx.filter_metadata.get("responses.stream_incomplete").is_none(),
         "complete stream should not set incomplete flag"
     );
 }
@@ -4659,7 +4660,7 @@ async fn eos_without_terminal_sets_incomplete() {
     let mut empty = None;
     filter.on_response_body(&mut ctx, &mut empty, true).unwrap();
     assert_eq!(
-        ctx.get_metadata("responses.stream_incomplete"),
+        ctx.filter_metadata.get("responses.stream_incomplete"),
         Some("true"),
         "missing terminal should set incomplete flag"
     );
@@ -4726,7 +4727,7 @@ async fn logical_eos_without_terminal_emits_error() {
     );
 
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "a stream missing its terminal event must not be persisted"
     );
@@ -4957,7 +4958,7 @@ fn parse_error_sets_metadata() {
     filter.on_response_body(&mut ctx, &mut body, false).unwrap();
 
     assert_eq!(
-        ctx.get_metadata("responses.stream_parse_error"),
+        ctx.filter_metadata.get("responses.stream_parse_error"),
         Some("true"),
         "parse error should set metadata flag"
     );
@@ -5013,22 +5014,22 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
     validate_stream_end(&mut ctx);
 
     assert_eq!(
-        ctx.get_metadata("responses.stream_incomplete"),
+        ctx.filter_metadata.get("responses.stream_incomplete"),
         Some("true"),
         "incomplete client-tool lifecycle must flag the stream incomplete"
     );
     assert_eq!(
-        ctx.get_metadata("responses.stream_error_code"),
+        ctx.filter_metadata.get("responses.stream_error_code"),
         Some("server_error"),
         "incomplete client-tool lifecycle must fail closed"
     );
     assert_eq!(
-        ctx.get_metadata("responses.stream_error_message"),
+        ctx.filter_metadata.get("responses.stream_error_message"),
         Some("upstream Responses stream did not terminate cleanly"),
         "fail-closed metadata must carry the unclean-termination message"
     );
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "must skip persisting a truncated client-tool restore"
     );
@@ -5076,7 +5077,7 @@ async fn terminal_incomplete_sets_status() {
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.response_object["id"], "resp_inc");
     assert_eq!(state.output_items().len(), 1);
-    assert_eq!(ctx.get_metadata("responses.status"), Some("incomplete"));
+    assert_eq!(ctx.filter_metadata.get("responses.status"), Some("incomplete"));
 }
 
 #[tokio::test]
@@ -5098,7 +5099,7 @@ async fn terminal_failed_sets_status() {
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.response_object["id"], "resp_fail");
     assert_eq!(state.output_items().len(), 0);
-    assert_eq!(ctx.get_metadata("responses.status"), Some("failed"));
+    assert_eq!(ctx.filter_metadata.get("responses.status"), Some("failed"));
 }
 
 #[tokio::test]
@@ -5271,7 +5272,7 @@ async fn error_after_terminal_lifecycle_is_accepted() {
         "first error after terminal lifecycle should be accepted"
     );
     assert!(
-        ctx.get_metadata("responses.stream_parse_error").is_none(),
+        ctx.filter_metadata.get("responses.stream_parse_error").is_none(),
         "accepted error should not set parse error"
     );
 }
@@ -5294,7 +5295,7 @@ async fn second_error_after_terminal_is_rejected() {
     filter.on_response_body(&mut ctx, &mut b3, false).unwrap();
 
     assert_eq!(
-        ctx.get_metadata("responses.stream_parse_error"),
+        ctx.filter_metadata.get("responses.stream_parse_error"),
         Some("true"),
         "second error event should be rejected as EventAfterTerminal"
     );
@@ -5401,8 +5402,8 @@ async fn tool_call_argument_bytes_cap_enforced() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
     filter.arm(&mut ctx);
@@ -5446,8 +5447,8 @@ async fn tool_call_argument_bytes_cap_rejects_restart_after_overflow() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     filter.arm(&mut ctx);
 
@@ -5492,8 +5493,8 @@ async fn tool_call_argument_bytes_cap_rejects_oversized_done_payload() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     filter.arm(&mut ctx);
 
@@ -5542,8 +5543,8 @@ async fn tool_call_argument_bytes_within_limit() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
     filter.arm(&mut ctx);
@@ -5655,8 +5656,8 @@ async fn on_request_keeps_accept_encoding_when_not_arming() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_request.stream", "false".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "false".to_owned());
     ctx.current_filter_id = Some(0);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -5757,8 +5758,8 @@ async fn apply_arm_does_not_cap_timeout_before_first_chunk() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     ctx.upstream = Some(Upstream {
         address: Arc::from("127.0.0.1:9"),
@@ -5938,8 +5939,8 @@ async fn stream_deadline_recaps_live_body_on_irr_body_context() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     ctx.upstream = Some(Upstream {
         address: Arc::from("127.0.0.1:9"),
@@ -6042,11 +6043,11 @@ async fn idle_timeout_does_not_fail_a_completed_sse_stream() {
         "response.completed must leave the parser in a terminal lifecycle"
     );
     assert!(
-        ctx.get_metadata("responses.stream_error_code").is_none(),
+        ctx.filter_metadata.get("responses.stream_error_code").is_none(),
         "a terminal lifecycle event must not be rewritten as a transport timeout"
     );
     assert!(
-        ctx.get_metadata("responses.skip_persist").is_none(),
+        ctx.filter_metadata.get("responses.skip_persist").is_none(),
         "a completed SSE stream must remain persistable when the HTTP body closes slowly"
     );
 }
@@ -6061,12 +6062,12 @@ async fn idle_timeout_fails_an_open_sse_stream() {
     super::publish_idle_timeout_if_incomplete(&mut ctx);
 
     assert_eq!(
-        ctx.get_metadata("responses.stream_error_code"),
+        ctx.filter_metadata.get("responses.stream_error_code"),
         Some("server_error"),
         "an idle abort before a terminal event is a stream timeout"
     );
     assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
+        ctx.filter_metadata.get("responses.skip_persist"),
         Some("true"),
         "an incomplete idle abort must not be persisted"
     );
@@ -6412,7 +6413,7 @@ fn drain_defers_still_pending_item() {
 #[test]
 fn drain_pre_existing_error_suppresses_synthesis() {
     let mut ctx = test_ctx_without_file_search_tool();
-    ctx.set_metadata("responses.stream_error_code", "server_error"); // set before drain
+    ctx.record_ai_metadata("responses.stream_error_code", "server_error"); // set before drain
     let mut state = ResponsesState::default();
     state.accumulated_output = vec![json!({"type":"file_search_call","status":"completed","results":[]})];
     state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Native)]; // a VALID queued item
@@ -6445,7 +6446,7 @@ fn drain_invalid_index_sets_error_and_no_gap() {
     super::local_tools::drain_local_tool_synthesis(&mut ctx, &mut out);
     assert!(out.is_empty(), "no guessed frame on invariant failure");
     assert!(
-        ctx.get_metadata("responses.stream_error_code").is_some(),
+        ctx.filter_metadata.get("responses.stream_error_code").is_some(),
         "five-write set"
     );
 }
@@ -6495,8 +6496,8 @@ async fn native_progress_precedes_closed_error_ordering() {
         .or_default()
         .set("action", "done")
         .unwrap();
-    ctx.set_metadata("responses.stream_error_code", "server_error");
-    ctx.set_metadata("responses.stream_error_message", "file_search failed");
+    ctx.record_ai_metadata("responses.stream_error_code", "server_error");
+    ctx.record_ai_metadata("responses.stream_error_message", "file_search failed");
 
     // Call finalizer → should emit error frame
     let mut eos = None;
@@ -6551,7 +6552,7 @@ fn drain_atomicity_valid_item_before_invalid_both_suppressed() {
         "atomicity: the VALID item is not emitted when a later queued item is invalid"
     );
     assert!(
-        ctx.get_metadata("responses.stream_error_code").is_some(),
+        ctx.filter_metadata.get("responses.stream_error_code").is_some(),
         "validation failure sets the five-write"
     );
 }
@@ -7291,7 +7292,7 @@ async fn poisoned_stream_never_leaks_rolled_back_lowered_name_on_later_done() {
         "a poisoned stream must not emit a successful completion terminal: {combined}"
     );
     assert_eq!(
-        ctx.get_metadata("responses.stream_error_code"),
+        ctx.filter_metadata.get("responses.stream_error_code"),
         Some("server_error"),
         "the poisoned stream must fail closed"
     );
@@ -7337,8 +7338,8 @@ fn make_armed_context_with_filter(
 ) -> (StreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.set_metadata("openai_responses_request.format", "openai_responses".to_owned());
-    ctx.set_metadata("openai_responses_request.stream", "true".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     filter.arm(&mut ctx);
     (filter, ctx)
@@ -7473,13 +7474,17 @@ async fn apply_patch_stream_fails_closed_on_malformed_patch() {
     // client-safe restore cause, and suppresses the successful custom-input events —
     // it does not return an error from on_response_body.
     assert_eq!(
-        ctx.get_metadata("responses.stream_parse_error"),
+        ctx.filter_metadata.get("responses.stream_parse_error"),
         Some("true"),
         "a malformed streamed patch poisons the stream",
     );
-    assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
+    assert_eq!(
+        ctx.filter_metadata.get("responses.stream_error_code"),
+        Some("server_error")
+    );
     assert!(
-        ctx.get_metadata("responses.stream_error_message")
+        ctx.filter_metadata
+            .get("responses.stream_error_message")
             .unwrap_or_default()
             .contains("client tool restoration failed"),
         "the fail-closed cause is the client-tool restore error",

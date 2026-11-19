@@ -7,7 +7,7 @@ name: Coding Conventions
 on:
   pull_request_target:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
@@ -32,29 +32,179 @@ jobs:
           app-id: ${{ secrets.PRAXIS_BOT_APP_ID }}
           private-key: ${{ secrets.PRAXIS_BOT_APP_PRIVATE_KEY }}
 
-      - name: Check for description
+      - name: Check for why, what, and how
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          labels=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels -q '.labels[].name')
+          labels=$(gh pr view "$PR_NUMBER" --repo "$GH_REPO" --json labels -q '.labels[].name')
           if echo "$labels" | grep -q '^skip/pr-conventions$'; then
             echo "skip/pr-conventions label present — skipping description check"
             exit 0
           fi
 
-          word_count=$(echo "$PR_BODY" | wc -w)
-          if [ "$word_count" -lt 2 ]; then
-            marker="<!-- praxis:pr-description-check -->"
-            already=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+          missing=$(python3 - <<'PY'
+          import os
+          import re
+
+          body = re.sub(r"<!--.*?-->", "", os.environ.get("PR_BODY", ""), flags=re.DOTALL)
+          visible_lines = []
+          fence_char = None
+          fence_length = 0
+          for line in body.splitlines():
+              fence = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+              if fence_char is None:
+                  if fence:
+                      fence_char = fence.group(1)[0]
+                      fence_length = len(fence.group(1))
+                      continue
+              else:
+                  if (
+                      fence
+                      and fence.group(1)[0] == fence_char
+                      and len(fence.group(1)) >= fence_length
+                      and re.fullmatch(r" {0,3}(?:`{3,}|~{3,})\s*", line)
+                  ):
+                      fence_char = None
+                      fence_length = 0
+                  continue
+              visible_lines.append(line)
+
+          headings = {
+              "why": re.compile(r"^#{1,6}\s+why\b", re.IGNORECASE),
+              "what": re.compile(r"^#{1,6}\s+what\b", re.IGNORECASE),
+              "how": re.compile(r"^#{1,6}\s+how\b", re.IGNORECASE),
+          }
+          issue_reference = re.compile(
+              r"^\s*(?:closes?|fix(?:es|ed)?|resolves?|refs?|related to|part of)\s+#\d+\b",
+              re.IGNORECASE,
+          )
+          sections = {}
+          current = None
+          current_level = None
+          for line in visible_lines:
+              heading = re.match(r"^(#{1,6})\s+(.*)$", line.strip())
+              if not heading:
+                  if current:
+                      sections[current].append(line)
+                  continue
+
+              level = len(heading.group(1))
+              title = heading.group(2)
+              match = next((name for name, pattern in headings.items() if pattern.match(line.strip())), None)
+              if match:
+                  current = match
+                  current_level = level
+                  sections.setdefault(current, [])
+              elif current and level <= current_level:
+                  current = None
+                  current_level = None
+
+          missing = []
+          for name in headings:
+              content = "\n".join(sections.get(name, []))
+              content = content.strip()
+              if not content:
+                  missing.append(name)
+          if not any(issue_reference.search(line) for line in visible_lines):
+              missing.append("issue")
+          print(" ".join(missing))
+          PY
+          )
+
+          if [ -n "$missing" ]; then
+            marker="<!-- praxis:pr-description-check-v3 -->"
+            details=""
+            for section in $missing; do
+              if [ "$section" = "issue" ]; then
+                details="${details}"$'\n- Related issue: add Closes #123 or Refs #123 for the issue this PR addresses.'
+              else
+                details="${details}"$'\n- '"${section^}"': add a short explanation under the section heading.'
+              fi
+            done
+            already=$(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
               --jq "[.[] | select(.body | contains(\"${marker}\"))] | length")
             if [ "$already" -eq 0 ]; then
-              gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" \
+              gh pr comment "$PR_NUMBER" --repo "$GH_REPO" \
                 --body "${marker}
-          Please add a description to this PR explaining what it does and why. See our [coding conventions](https://github.com/praxis-proxy/conventions/blob/main/docs/conventions.md)."
+                This PR needs non-empty **Why**, **What**, and **How** sections plus a linked issue reference. Explain why the change is needed, what problem it fixes, and how the change addresses it. For a new filter parameter, justify why it is needed and what behavior it controls.${details}
+
+                See [CONTRIBUTING.md](https://github.com/${GH_REPO}/blob/main/CONTRIBUTING.md#pull-request-gates)."
             fi
+            echo "PR description or issue reference is missing: $missing"
+            exit 1
           fi
+
+          echo "PR description contains non-empty Why, What, and How sections and links an issue."
+
+  # ----------------------------------------------------------------------------
+  # Author Open PR Limit
+  # ----------------------------------------------------------------------------
+
+  author-open-pr-limit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Generate token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.PRAXIS_BOT_APP_ID }}
+          private-key: ${{ secrets.PRAXIS_BOT_APP_PRIVATE_KEY }}
+
+      - name: Enforce the open PR limit
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+
+          max_open_prs=3
+          marker="<!-- praxis:author-open-pr-limit -->"
+          open_prs=$(gh pr list --repo "$GH_REPO" --author "$PR_AUTHOR" --state open \
+            --limit 1000 --json number,title,url,isDraft)
+          open_pr_count=$(jq 'length' <<< "$open_prs")
+          if ! jq -e --argjson current "$PR_NUMBER" \
+              'any(.[]; .number == $current)' <<< "$open_prs" >/dev/null; then
+            open_pr_count=$((open_pr_count + 1))
+          fi
+          comment_id=$(gh api --paginate "repos/${GH_REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
+            --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | sed -n '1p')
+
+          if [ "$open_pr_count" -gt "$max_open_prs" ]; then
+            other_prs=$(jq -r --argjson current "$PR_NUMBER" \
+              '.[] | select(.number != $current) | "- [#\(.number) \(.title)](\(.url))" + (if .isDraft then " (draft)" else "" end)' \
+              <<< "$open_prs")
+            body=$(cat <<EOF
+          ${marker}
+          **Open PR limit exceeded: ${open_pr_count} open PRs; the maximum is ${max_open_prs}.**
+
+          This PR will not receive review attention until enough of your other PRs are merged to bring your total down to ${max_open_prs} or fewer. Draft PRs count. After merging them, edit or update this PR to refresh the check.
+
+          Other open PRs:
+          ${other_prs}
+          EOF
+          )
+            if [ -n "$comment_id" ]; then
+              gh api -X PATCH "repos/${GH_REPO}/issues/comments/${comment_id}" -f body="$body" >/dev/null
+            else
+              gh pr comment "$PR_NUMBER" --repo "$GH_REPO" --body "$body"
+            fi
+            echo "::error::${PR_AUTHOR} has ${open_pr_count} open PRs; the maximum is ${max_open_prs}. Draft PRs count."
+            exit 1
+          fi
+
+          if [ -n "$comment_id" ]; then
+            body="${marker}
+          **Open PR limit cleared:** you now have ${open_pr_count} open PRs; the maximum is ${max_open_prs}. Draft PRs count."
+            gh api -X PATCH "repos/${GH_REPO}/issues/comments/${comment_id}" -f body="$body" >/dev/null
+          fi
+
+          echo "${PR_AUTHOR} has ${open_pr_count} open PRs; the maximum is ${max_open_prs}."
 
   # ----------------------------------------------------------------------------
   # Dependency Version Check

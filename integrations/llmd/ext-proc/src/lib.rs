@@ -1176,7 +1176,7 @@ impl HttpFilter for ExtProcFilter {
 
     fn request_body_access(&self) -> BodyAccess {
         if self.request_body_mode.is_full_duplex() {
-            BodyAccess::ReadWrite
+            BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
         } else {
             BodyAccess::None
         }

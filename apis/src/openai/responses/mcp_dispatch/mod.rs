@@ -94,6 +94,7 @@ use super::{
     state::McpApprovalState,
 };
 use crate::{
+    RecordAiMetadata as _,
     callout_headers::effective_body_callout_headers,
     callout_identity::{McpCalloutIdentity, stage_mcp_callout_identity},
     json_body::{MAX_JSON_BODY_BYTES, serialized_len},
@@ -503,14 +504,7 @@ impl McpDispatchFilter {
             return;
         };
         for result in results {
-            let result_start = state.messages.len();
-            if state.captures_persistence_history() {
-                state.messages.push(result.message.clone());
-                state.push_persisted_message(result.message);
-            } else {
-                state.messages.push(result.message);
-            }
-            state.mark_local_tool_results_from(result_start);
+            state.append_local_tool_results([result.message]);
             // Record execution provenance keyed on the item id `stream_events`
             // reads, so only this locally executed `mcp_call` gains a synthesized
             // lifecycle.
@@ -1115,7 +1109,7 @@ impl HttpFilter for McpDispatchFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -1127,7 +1121,7 @@ impl HttpFilter for McpDispatchFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -1158,10 +1152,10 @@ impl HttpFilter for McpDispatchFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
-        ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
+        ctx.record_ai_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
         // Publish the operator approval floor onto typed request state so the
         // owner's response-phase approval partitioning (`prepare_response_round`)
-        // applies it this IRR iteration. Unlike `set_metadata` (bounded entry
+        // applies it this IRR iteration. Unlike `FilterMetadata::insert` (bounded entry
         // count; silently drops a new key once full), a struct field cannot be
         // dropped under metadata saturation, so a configured security floor can
         // never be silently disabled. When there is no `ResponsesState` there is
@@ -1461,7 +1455,8 @@ async fn discover_pending_connectors(
         Err(ResolveError::RetainedBudget) => Ok(McpDispatchFilter::budget_limit_action(ctx)),
         Err(err) => {
             let streaming = ctx
-                .get_metadata("openai_responses_request.stream")
+                .filter_metadata
+                .get("openai_responses_request.stream")
                 .is_some_and(|v| v == "true");
             Ok(resolve_error_action(ctx, &err, streaming, body))
         },
@@ -1471,7 +1466,7 @@ async fn discover_pending_connectors(
 /// Return the response fan-out cap this dispatcher published for the owner.
 #[cfg(feature = "openai-agentic-loop")]
 pub(crate) fn configured_max_calls_per_round(ctx: &HttpFilterContext<'_>) -> Option<usize> {
-    ctx.get_metadata(MAX_CALLS_METADATA)?.parse().ok()
+    ctx.filter_metadata.get(MAX_CALLS_METADATA)?.parse().ok()
 }
 
 /// Validate and partition one model-produced MCP round for request-side execution.

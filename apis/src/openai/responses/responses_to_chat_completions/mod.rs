@@ -47,6 +47,7 @@ use super::{
     state::ResponsesState,
 };
 use crate::{
+    RecordAiMetadata as _,
     classifier::is_responses_create,
     json_body::MAX_JSON_BODY_BYTES,
     openai::translation::{
@@ -300,7 +301,7 @@ impl ResponsesToChatCompletionsFilter {
     ) -> Result<FilterAction, FilterError> {
         if !reserve_finite_chat_response(ctx, body.as_deref().unwrap_or_default()) {
             *body = None;
-            ctx.set_metadata("responses.skip_persist", "true");
+            ctx.record_ai_metadata("responses.skip_persist", "true");
             return Ok(FilterAction::Reject(responses_error_rejection(
                 502,
                 "server_error",
@@ -369,7 +370,7 @@ impl ResponsesToChatCompletionsFilter {
             return Ok(FilterAction::Reject(missing_pipeline_state()));
         };
         let Some(output_allowance) = reserve_chat_stream_snapshots(ctx) else {
-            ctx.set_metadata("responses.skip_persist", "true");
+            ctx.record_ai_metadata("responses.skip_persist", "true");
             return Ok(FilterAction::Reject(responses_error_rejection(
                 502,
                 "server_error",
@@ -642,9 +643,9 @@ fn chat_stream_budget_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<B
     if let Some(exchange) = ctx.get_filter_state_mut::<Exchange>() {
         exchange.response = Some(ResponseTranslation::StreamBudgetFailed);
     }
-    ctx.set_metadata("responses.stream_error_code", "server_error");
-    ctx.set_metadata("responses.stream_error_message", CHAT_RESPONSE_OVERFLOW);
-    ctx.set_metadata("responses.skip_persist", "true");
+    ctx.record_ai_metadata("responses.stream_error_code", "server_error");
+    ctx.record_ai_metadata("responses.stream_error_message", CHAT_RESPONSE_OVERFLOW);
+    ctx.record_ai_metadata("responses.skip_persist", "true");
     super::fs_arm_stream_stop(ctx);
     FilterAction::Continue
 }
@@ -745,7 +746,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
     }
 
     fn selected_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -762,7 +763,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn may_select_streaming_subrequest_response(&self) -> bool {
@@ -905,7 +906,7 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<SelectedUpstreamBo
     if !is_responses_create(&ctx.request.method, ctx.request.uri.path()) {
         return Some(SelectedUpstreamBodyOutcome::Continue);
     }
-    match ctx.get_metadata("openai_responses_request.format") {
+    match ctx.filter_metadata.get("openai_responses_request.format") {
         Some("openai_responses") => None,
         Some(format) => {
             trace!(
@@ -1001,7 +1002,7 @@ fn ensure_previous_response_rehydrated(state: &ResponsesState) -> Result<(), Sel
 
 /// Return the client stream preference captured by the classifier.
 fn request_is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_request.stream").map_or_else(
+    ctx.filter_metadata.get("openai_responses_request.stream").map_or_else(
         || {
             ctx.extensions
                 .get::<ResponsesState>()
@@ -1111,7 +1112,8 @@ fn record_stream_reasoning_replay(ctx: &mut HttpFilterContext<'_>, converter: &m
 fn stream_identity(ctx: &HttpFilterContext<'_>) -> Option<(String, u64)> {
     let state = ctx.extensions.get::<ResponsesState>();
     let response_id = ctx
-        .get_metadata("responses.response_id")
+        .filter_metadata
+        .get("responses.response_id")
         .map(str::to_owned)
         .or_else(|| state.and_then(|state| state.response_id.clone()))?;
     let created_at = recorded_created_at(ctx).or_else(|| state.and_then(|state| state.response_created_at))?;
@@ -1148,7 +1150,8 @@ fn translate_success_response(
         .get::<ResponsesState>()
         .ok_or_else(|| -> FilterError { "openai_responses_to_chat_completions: missing Responses state".into() })?;
     let response_id = ctx
-        .get_metadata("responses.response_id")
+        .filter_metadata
+        .get("responses.response_id")
         .or(state.response_id.as_deref())
         .ok_or_else(|| -> FilterError { "openai_responses_to_chat_completions: missing response id".into() })?;
     let created_at = recorded_created_at(ctx)

@@ -70,11 +70,12 @@ fn filter_body_processing_limits_enforce_explicit_boundary_with_larger_shared_bu
 #[test]
 fn filter_body_processing_limits_preserve_pipeline_request_and_buffer_bounds() {
     for (example, filter, model) in CASES {
-        for (request_cap, buffer_cap) in [(1024, 2048), (2048, 1024)] {
+        for (request_cap, buffer_cap) in [(Some(1024), 2048), (None, 1024)] {
             for chunked in [false, true] {
                 let backend = StatefulCapturingBackend::new(vec![(200, "ok".to_owned())]).start_with_shutdown();
                 let mut config = config(example, filter, backend.port(), None);
-                config.body_limits.max_request_bytes = Some(request_cap);
+                config.body_limits.max_request_bytes = request_cap;
+                config.insecure_options.allow_unbounded_body = request_cap.is_none();
                 config.body_limits.max_buffer_bytes = buffer_cap.try_into().unwrap();
                 let proxy = start_proxy(&config);
                 let raw = http_send(proxy.addr(), &request(&model_body(model, 512), chunked));

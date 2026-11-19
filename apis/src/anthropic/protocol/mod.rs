@@ -120,7 +120,7 @@ impl HttpFilter for AnthropicMessagesProtocolFilter {
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if let Some(provider) = ctx.selected_application_provider()
             && provider != ANTHROPIC_PROVIDER
-            && ctx.get_metadata(MCP_CONNECTOR_METADATA_KEY) == Some("true")
+            && ctx.filter_metadata.get(MCP_CONNECTOR_METADATA_KEY) == Some("true")
         {
             debug!(provider, "rejecting MCP connector for a non-Anthropic provider");
             return Ok(FilterAction::Reject(wire::invalid_request_rejection(

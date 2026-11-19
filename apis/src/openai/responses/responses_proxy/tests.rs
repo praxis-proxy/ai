@@ -13,7 +13,10 @@ use praxis_filter::{
 use serde_json::json;
 
 use super::super::state::ResponsesState;
-use crate::test_utils::{make_filter_context, make_request};
+use crate::{
+    RecordAiMetadata as _,
+    test_utils::{make_filter_context, make_request},
+};
 
 // -----------------------------------------------------------------------------
 // Tests
@@ -54,7 +57,7 @@ fn body_rewrite_runs_after_upstream_selection() {
     assert_eq!(filter.request_body_access(), BodyAccess::None);
     assert_eq!(
         filter.selected_upstream_request_body_access(),
-        BodyAccess::ReadWrite,
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional),
         "openai_responses_proxy must rewrite only after upstream selection"
     );
 }
@@ -108,7 +111,7 @@ async fn selects_streaming_from_effective_passthrough_body() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_responses_request.stream", "false");
+    ctx.record_ai_metadata("openai_responses_request.stream", "false");
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1","input":"hello","stream":true}"#,
     ));
@@ -163,7 +166,7 @@ async fn uses_rebuilt_state_body_not_client_intent_metadata() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_responses_request.stream", "true");
+    ctx.record_ai_metadata("openai_responses_request.stream", "true");
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1",
         "input": "hello",
@@ -197,7 +200,7 @@ async fn selects_streaming_for_rebuilt_effective_body() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_responses_request.stream", "false");
+    ctx.record_ai_metadata("openai_responses_request.stream", "false");
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1",
         "input": "hello",

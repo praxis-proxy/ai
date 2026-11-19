@@ -4224,6 +4224,7 @@ class TestOpenAIResponsesVLLM:
         # rewrite never touches, so before the fix the stored response echoed the
         # backend's null even though the streamed terminal carried first.id.
         retrieved = _retrieve_with_retry(openai_client, final_response.id)
+        assert retrieved.model == final_response.model
         assert retrieved.previous_response_id == first.id, (
             "the stored streaming response must persist the caller's "
             "previous_response_id, matching the terminal frame the client saw; "
@@ -10858,6 +10859,78 @@ class TestFileSearchChatCompletionsVLLM:
                 recorded_request_count,
                 tool_name="file_search",
             )
+
+    @requires_simulator
+    def test_file_search_result_survives_previous_response_id_continuation(
+        self, file_search_chat_client, vector_store
+    ):
+        """Issue #2036: a stored continuation replays the private search result.
+
+        The gateway feeds the retrieved passage to the next round as a private
+        tool call/result pair. A ``previous_response_id`` follow-up must replay
+        that exact pair from the store, not just the public file_search_call.
+        """
+        store_id, marker = vector_store
+        tools = [{"type": "file_search", "vector_store_ids": [store_id]}]
+        recorded_start = len(SimulatorBackendHandler.recorded_requests)
+        first = file_search_chat_client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="Find the Praxis marker with file_search. /no_think",
+            tools=tools,
+            max_output_tokens=512,
+        )
+        assert first.status == "completed", f"first turn: {first.status}"
+        assert any(item.type == "file_search_call" for item in first.output)
+
+        continuation_start = len(SimulatorBackendHandler.recorded_requests)
+        second = file_search_chat_client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="What else does the report say? /no_think",
+            previous_response_id=first.id,
+            tools=tools,
+            max_output_tokens=512,
+        )
+        assert second.status == "completed", f"continuation: {second.status}"
+        continuation_end = len(SimulatorBackendHandler.recorded_requests)
+
+        def search_pairs(start: int, end: int):
+            """Return (assistant tool_calls, tool results) per Chat request."""
+            pairs = []
+            for path, body in SimulatorBackendHandler.recorded_requests[start:end]:
+                if not path.rstrip("/").endswith("/v1/chat/completions"):
+                    continue
+                messages = body.get("messages", [])
+                calls = [
+                    call
+                    for message in messages
+                    if message.get("role") == "assistant"
+                    for call in message.get("tool_calls") or []
+                    if call.get("function", {}).get("name") == "file_search"
+                ]
+                results = [
+                    message for message in messages if message.get("role") == "tool"
+                ]
+                pairs.append((calls, results))
+            return pairs
+
+        live = [pair for pair in search_pairs(recorded_start, continuation_start) if pair[1]]
+        assert len(live) == 1, f"one live re-entry carries the search result: {live}"
+        replayed = search_pairs(continuation_start, continuation_end)
+        assert len(replayed) == 1, f"one continuation inference: {replayed}"
+        live_calls, live_results = live[0]
+        replayed_calls, replayed_results = replayed[0]
+        assert replayed_calls == live_calls, (
+            "the continuation must replay the live private file_search call"
+        )
+        assert replayed_results == live_results, (
+            "the continuation must replay the live private file_search result"
+        )
+        assert any(marker in (result.get("content") or "") for result in replayed_results), (
+            "the replayed tool result must carry the retrieved passage"
+        )
+        assert {result.get("tool_call_id") for result in replayed_results} == {
+            call.get("id") for call in replayed_calls
+        }, "replayed call and result must keep their correlation id"
 
 
 # ---------------------------------------------------------------------------

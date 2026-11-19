@@ -535,15 +535,15 @@ mod tests {
         let client = test_client();
         praxis_ai_filters::register_ai_filters(&mut registry, Some(&client));
         let original = live.get("web").unwrap().load_full();
-        for cap in [1024, 4096] {
+        for (request_cap, cap) in [(2048, 1024), (1024, 1024), (2048, 4096)] {
             let mut config = old_config.clone();
             config.body_limits.max_buffer_bytes = cap.try_into().unwrap();
-            config.body_limits.max_request_bytes = Some(2048);
+            config.body_limits.max_request_bytes = Some(request_cap);
             config.body_limits.max_response_bytes = None;
             config.insecure_options.allow_unbounded_body = true;
             config.filter_chains[0].filters =
                 serde_yaml::from_str("- filter: model_to_header\n- filter: static_response\n  status: 200").unwrap();
-            reload_pipelines(
+            let result = reload_pipelines(
                 &config,
                 &old_config,
                 &registry,
@@ -554,14 +554,23 @@ mod tests {
                 &client,
                 &crate::StoreReloadHandle::default(),
                 &crate::SharedHealthRegistry::default(),
-            )
-            .unwrap();
+            );
+            if request_cap > cap {
+                let error = result.expect_err("reload must reject incompatible buffered limits");
+                assert!(
+                    error.to_string().contains("exceeds body_limits.max_buffer_bytes"),
+                    "{error}"
+                );
+                assert!(Arc::ptr_eq(&live.get("web").unwrap().load_full(), &original));
+                continue;
+            }
+            result.unwrap();
             let current = live.get("web").unwrap().load();
             assert_eq!(current.buffer_cap(), cap, "reload must apply the new buffer cap");
             assert_eq!(
                 current.body_capabilities().request_body_mode,
                 praxis_filter::BodyMode::StreamBuffer {
-                    max_bytes: Some(cap.min(2048))
+                    max_bytes: Some(request_cap)
                 },
                 "reload must retain the independent request limit"
             );
