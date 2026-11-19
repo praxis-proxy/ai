@@ -1048,11 +1048,11 @@ impl HttpFilter for McpToolResolveFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -1876,9 +1876,10 @@ fn build_list_tools_failure_response(
     // (the OpenAI default). `openai_stream_events` accumulates this failure into
     // `ResponsesState` and `openai_responses_store` persists it, so this flag must
     // match what the caller observes on retrieval.
-    let store = ctx.get_metadata("openai_responses_request.store") != Some("false");
+    let store = ctx.filter_metadata.get("openai_responses_request.store") != Some("false");
     let response_id = ctx
-        .get_metadata("responses.response_id")
+        .filter_metadata
+        .get("responses.response_id")
         .or_else(|| {
             ctx.extensions
                 .get::<ResponsesState>()
@@ -1906,7 +1907,8 @@ fn build_list_tools_failure_response(
     // even when no `ResponsesState` was built (e.g. no validate/rehydrate in the
     // pipeline); fall back to the captured options, then to an empty string.
     let model = ctx
-        .get_metadata("openai_responses_request.model")
+        .filter_metadata
+        .get("openai_responses_request.model")
         .or_else(|| {
             options
                 .and_then(|body| body.get("model"))
@@ -2242,7 +2244,8 @@ fn require_tool_search_for_deferred(
 
 /// Check whether `openai_tool_parse` detected a `tool_search` tool.
 fn has_tool_search(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_tool_parse.has_tool_search")
+    ctx.filter_metadata
+        .get("openai_tool_parse.has_tool_search")
         .is_some_and(|v| v == "true")
 }
 
@@ -3639,13 +3642,15 @@ fn append_discovery_item(state: &mut ResponsesState, item: serde_json::Value) ->
 
 /// Check whether `openai_tool_parse` detected MCP tools.
 fn has_mcp_tools(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_tool_parse.has_mcp")
+    ctx.filter_metadata
+        .get("openai_tool_parse.has_mcp")
         .is_some_and(|v| v == "true")
 }
 
 /// Check whether the request is streaming.
 fn is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_request.stream")
+    ctx.filter_metadata
+        .get("openai_responses_request.stream")
         .is_some_and(|v| v == "true")
 }
 

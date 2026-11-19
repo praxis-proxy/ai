@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use bytes::Bytes;
 use http::HeaderMap;
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{FilterAction, HttpFilter as _};
 
 use super::{
@@ -226,7 +227,7 @@ async fn null_context_id_header_disables_header_but_promotes_metadata_and_result
 
     assert!(matches!(action, FilterAction::Release), "should release");
     assert_eq!(
-        ctx.get_metadata("a2a.context_id"),
+        ctx.filter_metadata.get("a2a.context_id"),
         Some("ctx-null-hdr"),
         "metadata should still promote context_id when header is null"
     );
@@ -682,9 +683,9 @@ async fn send_message_extracts_metadata() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(matches!(action, FilterAction::Release), "should release on valid A2A");
-    assert_eq!(ctx.get_metadata("a2a.method"), Some("SendMessage"));
-    assert_eq!(ctx.get_metadata("a2a.family"), Some("message"));
-    assert_eq!(ctx.get_metadata("a2a.streaming"), Some("false"));
+    assert_eq!(ctx.filter_metadata.get("a2a.method"), Some("SendMessage"));
+    assert_eq!(ctx.filter_metadata.get("a2a.family"), Some("message"));
+    assert_eq!(ctx.filter_metadata.get("a2a.streaming"), Some("false"));
 }
 
 #[tokio::test]
@@ -699,7 +700,7 @@ async fn send_message_context_id_promoted_to_metadata_headers_results() {
 
     assert!(matches!(action, FilterAction::Release), "should release");
     assert_eq!(
-        ctx.get_metadata("a2a.context_id"),
+        ctx.filter_metadata.get("a2a.context_id"),
         Some("ctx-promo"),
         "context_id should be in durable metadata"
     );
@@ -738,12 +739,12 @@ async fn streaming_message_sets_streaming_true() {
         "streaming message should release"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.streaming"),
+        ctx.filter_metadata.get("a2a.streaming"),
         Some("true"),
         "streaming should be true"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.family"),
+        ctx.filter_metadata.get("a2a.family"),
         Some("message"),
         "family should be message"
     );
@@ -761,13 +762,17 @@ async fn get_task_extracts_task_id() {
 
     assert!(matches!(action, FilterAction::Release), "GetTask should release");
     assert_eq!(
-        ctx.get_metadata("a2a.method"),
+        ctx.filter_metadata.get("a2a.method"),
         Some("GetTask"),
         "method should be GetTask"
     );
-    assert_eq!(ctx.get_metadata("a2a.family"), Some("task"), "family should be task");
     assert_eq!(
-        ctx.get_metadata("a2a.task_id"),
+        ctx.filter_metadata.get("a2a.family"),
+        Some("task"),
+        "family should be task"
+    );
+    assert_eq!(
+        ctx.filter_metadata.get("a2a.task_id"),
         Some("task-999"),
         "task_id should be extracted"
     );
@@ -789,12 +794,12 @@ async fn push_notification_config_extracts_task_id_from_params() {
         "push notification config should release"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.family"),
+        ctx.filter_metadata.get("a2a.family"),
         Some("push_notification"),
         "family should be push_notification"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.task_id"),
+        ctx.filter_metadata.get("a2a.task_id"),
         Some("task-abc"),
         "task_id should be extracted from params"
     );
@@ -812,12 +817,12 @@ async fn alias_resolves_and_sets_original_method() {
 
     assert!(matches!(action, FilterAction::Release));
     assert_eq!(
-        ctx.get_metadata("a2a.method"),
+        ctx.filter_metadata.get("a2a.method"),
         Some("SendMessage"),
         "canonical method should be promoted"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.original_method"),
+        ctx.filter_metadata.get("a2a.original_method"),
         Some("message/send"),
         "original aliased method should be stored"
     );
@@ -838,12 +843,12 @@ async fn unknown_method_classifies_as_family_unknown() {
         "unknown methods should still be classified, not rejected"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.method"),
+        ctx.filter_metadata.get("a2a.method"),
         Some("CustomUnknown"),
         "unknown method should be promoted"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.family"),
+        ctx.filter_metadata.get("a2a.family"),
         Some("unknown"),
         "unknown method family should be unknown"
     );
@@ -862,7 +867,7 @@ async fn version_header_extracted_to_metadata() {
 
     assert!(matches!(action, FilterAction::Release), "should release with version");
     assert_eq!(
-        ctx.get_metadata("a2a.version"),
+        ctx.filter_metadata.get("a2a.version"),
         Some("1.0"),
         "A2A-Version header should be promoted to metadata"
     );
@@ -946,7 +951,7 @@ fn body_access_is_read_only() {
     let filter = make_default_filter();
     assert_eq!(
         filter.request_body_access(),
-        praxis_filter::body::BodyAccess::ReadOnly,
+        praxis_filter::body::BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional),
         "A2A filter should use ReadOnly body access"
     );
 }
@@ -1111,7 +1116,7 @@ async fn notification_sets_kind() {
 
     assert!(matches!(action, FilterAction::Release), "notification should release");
     assert_eq!(
-        ctx.get_metadata("json_rpc.kind"),
+        ctx.filter_metadata.get("json_rpc.kind"),
         Some("notification"),
         "message without id should be a notification"
     );
@@ -1186,7 +1191,7 @@ async fn control_char_method_skips_all_promotions() {
     );
 
     assert_eq!(
-        ctx.get_metadata("a2a.method"),
+        ctx.filter_metadata.get("a2a.method"),
         None,
         "method with control chars should not be set in durable metadata"
     );
@@ -1207,7 +1212,7 @@ async fn control_char_task_id_skips_promotion() {
         "control char task ID should still release"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.task_id"),
+        ctx.filter_metadata.get("a2a.task_id"),
         None,
         "task ID with control chars should not be promoted to metadata"
     );
@@ -1229,7 +1234,7 @@ async fn too_long_task_id_not_promoted() {
         "too-long task ID should still release"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.task_id"),
+        ctx.filter_metadata.get("a2a.task_id"),
         None,
         "task ID exceeding 256 bytes should not be promoted"
     );
@@ -1260,7 +1265,7 @@ async fn context_id_control_chars_not_promoted() {
         "control char context ID should still release"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.context_id"),
+        ctx.filter_metadata.get("a2a.context_id"),
         None,
         "context ID with control chars should not be promoted to metadata"
     );
@@ -1300,7 +1305,7 @@ async fn context_id_too_long_not_promoted() {
         "too-long context ID should still release"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.context_id"),
+        ctx.filter_metadata.get("a2a.context_id"),
         None,
         "context ID exceeding 256 bytes should not be promoted"
     );
@@ -1338,7 +1343,7 @@ async fn too_long_version_not_promoted() {
         "too-long version should still release"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.version"),
+        ctx.filter_metadata.get("a2a.version"),
         None,
         "version exceeding 256 bytes should not be promoted"
     );
@@ -1359,7 +1364,11 @@ async fn too_long_unknown_method_releases_without_error() {
         matches!(action, FilterAction::Release),
         "257-byte unknown method should still release, not error"
     );
-    assert_eq!(ctx.get_metadata("a2a.method"), None, "too-long method skips metadata");
+    assert_eq!(
+        ctx.filter_metadata.get("a2a.method"),
+        None,
+        "too-long method skips metadata"
+    );
 
     let headers: std::collections::HashMap<_, _> = ctx
         .extra_request_headers
@@ -1388,17 +1397,17 @@ async fn alias_stores_original_in_json_rpc_method() {
 
     assert!(matches!(action, FilterAction::Release));
     assert_eq!(
-        ctx.get_metadata("json_rpc.method"),
+        ctx.filter_metadata.get("json_rpc.method"),
         Some("message/send"),
         "json_rpc.method should store the original wire method"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.method"),
+        ctx.filter_metadata.get("a2a.method"),
         Some("SendMessage"),
         "a2a.method should store the canonical method"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.original_method"),
+        ctx.filter_metadata.get("a2a.original_method"),
         Some("message/send"),
         "a2a.original_method should track the alias input"
     );
@@ -1419,17 +1428,17 @@ async fn canonical_method_stores_same_in_json_rpc_method() {
         "canonical method should release"
     );
     assert_eq!(
-        ctx.get_metadata("json_rpc.method"),
+        ctx.filter_metadata.get("json_rpc.method"),
         Some("SendMessage"),
         "json_rpc.method should match body method when no alias"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.method"),
+        ctx.filter_metadata.get("a2a.method"),
         Some("SendMessage"),
         "a2a.method should match canonical"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.original_method"),
+        ctx.filter_metadata.get("a2a.original_method"),
         None,
         "a2a.original_method should be absent for canonical methods"
     );
@@ -1683,7 +1692,7 @@ async fn task_route_miss_continues_without_route_cluster_header() {
         "task route miss should not inject route cluster header"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.route_decision"),
+        ctx.filter_metadata.get("a2a.route_decision"),
         Some("task_route_miss"),
         "task miss should record task_route_miss, not generic route_miss"
     );
@@ -1703,12 +1712,12 @@ async fn task_route_hit_records_bounded_route_metadata() {
     drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
 
     assert_eq!(
-        ctx.get_metadata("a2a.route_decision"),
+        ctx.filter_metadata.get("a2a.route_decision"),
         Some("task_route_hit"),
         "route decision metadata should be set"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.route_cluster"),
+        ctx.filter_metadata.get("a2a.route_cluster"),
         Some("agent-b"),
         "route cluster metadata should be set"
     );
@@ -1918,8 +1927,7 @@ async fn on_response_enables_capture_for_success_non_sse_send_message() {
     let req = make_a2a_request(&[]);
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendMessage".to_owned());
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -1940,8 +1948,7 @@ async fn sse_response_skips_task_route_capture() {
     let req = make_a2a_request(&[]);
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendMessage".to_owned());
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -1955,7 +1962,7 @@ async fn sse_response_skips_task_route_capture() {
     ctx.response_header = None;
 
     assert_eq!(
-        ctx.get_metadata("a2a.response.is_sse"),
+        ctx.filter_metadata.get("a2a.response.is_sse"),
         Some("true"),
         "SSE response should be flagged"
     );
@@ -1973,8 +1980,7 @@ async fn mixed_case_sse_content_type_skips_capture() {
     let req = make_a2a_request(&[]);
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendMessage".to_owned());
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -1988,7 +1994,7 @@ async fn mixed_case_sse_content_type_skips_capture() {
     ctx.response_header = None;
 
     assert_eq!(
-        ctx.get_metadata("a2a.response.is_sse"),
+        ctx.filter_metadata.get("a2a.response.is_sse"),
         Some("true"),
         "mixed-case SSE content-type should be detected"
     );
@@ -2113,17 +2119,17 @@ async fn context_route_hit_injects_route_cluster_header_for_list_tasks() {
         "ListTasks context route hit should inject route cluster header"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.route_decision"),
+        ctx.filter_metadata.get("a2a.route_decision"),
         Some("context_route_hit"),
         "route_decision should reflect context hit"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.route_source"),
+        ctx.filter_metadata.get("a2a.route_source"),
         Some("context"),
         "route_source should be context"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.route_cluster"),
+        ctx.filter_metadata.get("a2a.route_cluster"),
         Some("agent-a"),
         "route_cluster metadata should be set"
     );
@@ -2154,7 +2160,7 @@ async fn context_route_hit_injects_route_cluster_header_for_send_message() {
         Some(&"agent-a"),
         "SendMessage context route hit should inject route cluster header"
     );
-    assert_eq!(ctx.get_metadata("a2a.route_decision"), Some("context_route_hit"));
+    assert_eq!(ctx.filter_metadata.get("a2a.route_decision"), Some("context_route_hit"));
 }
 
 #[tokio::test]
@@ -2182,7 +2188,7 @@ async fn context_route_hit_injects_route_cluster_header_for_send_streaming_messa
         Some(&"agent-a"),
         "SendStreamingMessage context route hit should inject route cluster header"
     );
-    assert_eq!(ctx.get_metadata("a2a.route_decision"), Some("context_route_hit"));
+    assert_eq!(ctx.filter_metadata.get("a2a.route_decision"), Some("context_route_hit"));
 }
 
 #[tokio::test]
@@ -2208,7 +2214,7 @@ async fn context_route_miss_continues_without_route_header() {
         "context route miss should not inject route cluster header"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.route_decision"),
+        ctx.filter_metadata.get("a2a.route_decision"),
         Some("context_route_miss"),
         "context miss should record context_route_miss"
     );
@@ -2278,7 +2284,7 @@ async fn classifier_only_unchanged_when_task_routing_disabled() {
 
     // No task_routing.enabled means no route lookup attempted.
     assert_eq!(
-        ctx.get_metadata("a2a.route_decision"),
+        ctx.filter_metadata.get("a2a.route_decision"),
         None,
         "classifier-only mode should not set route_decision"
     );
@@ -2306,11 +2312,11 @@ async fn context_route_hit_records_bounded_metadata() {
 
     drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
 
-    assert_eq!(ctx.get_metadata("a2a.route_decision"), Some("context_route_hit"));
-    assert_eq!(ctx.get_metadata("a2a.route_source"), Some("context"));
-    assert_eq!(ctx.get_metadata("a2a.route_cluster"), Some("agent-b"));
+    assert_eq!(ctx.filter_metadata.get("a2a.route_decision"), Some("context_route_hit"));
+    assert_eq!(ctx.filter_metadata.get("a2a.route_source"), Some("context"));
+    assert_eq!(ctx.filter_metadata.get("a2a.route_cluster"), Some("agent-b"));
     assert_eq!(
-        ctx.get_metadata("a2a.context_id"),
+        ctx.filter_metadata.get("a2a.context_id"),
         Some("ctx-meta"),
         "classifier-promoted context_id should still be in metadata"
     );
@@ -2341,7 +2347,7 @@ async fn context_id_with_control_chars_is_not_promoted_and_does_not_route() {
         "context ID with control chars should not route"
     );
     assert_eq!(
-        ctx.get_metadata("a2a.context_id"),
+        ctx.filter_metadata.get("a2a.context_id"),
         None,
         "context ID with control chars should not be promoted"
     );
@@ -2677,8 +2683,7 @@ async fn sse_streaming_response_enables_capture_for_send_streaming_message() {
     let req = make_a2a_request(&[]);
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendStreamingMessage".to_owned());
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendStreamingMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -2980,8 +2985,7 @@ async fn non_sse_response_does_not_enter_sse_capture_path() {
     let req = make_a2a_request(&[]);
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendStreamingMessage".to_owned());
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendStreamingMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -3008,7 +3012,7 @@ async fn non_sse_response_falls_through_to_non_streaming_capture() {
         let req = make_a2a_request(&[]);
         let mut ctx = make_ctx(&req);
         ctx.cluster = Some(Arc::from("agent-a"));
-        ctx.filter_metadata.insert("a2a.method".to_owned(), method.to_owned());
+        ctx.record_ai_metadata("a2a.method".to_owned(), method.to_owned());
 
         let mut resp = praxis_filter::Response {
             status: http::StatusCode::OK,
@@ -3040,8 +3044,7 @@ async fn wrong_method_does_not_enter_sse_capture() {
     let req = make_a2a_request(&[]);
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "GetTask".to_owned());
+    ctx.record_ai_metadata("a2a.method".to_owned(), "GetTask".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -3069,7 +3072,7 @@ async fn error_sse_response_does_not_enable_capture() {
         let req = make_a2a_request(&[]);
         let mut ctx = make_ctx(&req);
         ctx.cluster = Some(Arc::from("agent-a"));
-        ctx.filter_metadata.insert("a2a.method".to_owned(), method.to_owned());
+        ctx.record_ai_metadata("a2a.method".to_owned(), method.to_owned());
 
         let mut resp = praxis_filter::Response {
             status: http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -3120,8 +3123,7 @@ async fn sse_streaming_capture_mixed_case_content_type() {
     let req = make_a2a_request(&[]);
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendStreamingMessage".to_owned());
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendStreamingMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -3295,8 +3297,7 @@ async fn on_response_enables_capture_for_success_sse_subscribe_to_task() {
     let req = make_a2a_request(&[]);
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SubscribeToTask".to_owned());
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SubscribeToTask".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,

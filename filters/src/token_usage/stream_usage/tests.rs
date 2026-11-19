@@ -339,7 +339,7 @@ fn default_config() {
     let filter = make_filter();
     assert_eq!(
         filter.request_body_access(),
-        praxis_filter::BodyAccess::ReadWrite,
+        praxis_filter::BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional),
         "should request read-write body access"
     );
     assert!(

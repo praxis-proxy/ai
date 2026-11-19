@@ -50,6 +50,7 @@ use self::{
     model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
 };
 use crate::{
+    RecordAiMetadata as _,
     callout_headers::effective_body_callout_headers,
     callout_identity::{CalloutContextMissing, stage_callout_identity},
     callout_policy::{MISSING_CALLOUT_CONTEXT, OnFailure},
@@ -431,7 +432,7 @@ impl FileSearchDispatchFilter {
             if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
                 state.dispatch_failure = Some(file_search_budget_failure());
             }
-            ctx.set_metadata("responses.skip_persist", "true");
+            ctx.record_ai_metadata("responses.skip_persist", "true");
             return Ok(FilterAction::Continue);
         };
         let hdrs = callout_request_headers(ctx);
@@ -455,7 +456,7 @@ impl FileSearchDispatchFilter {
             if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
                 state.dispatch_failure = Some(file_search_budget_failure());
             }
-            ctx.set_metadata("responses.skip_persist", "true");
+            ctx.record_ai_metadata("responses.skip_persist", "true");
             return Ok(FilterAction::Continue);
         }
         if let Some(failure) = self.dispatch_failure(&batch) {
@@ -470,14 +471,14 @@ impl FileSearchDispatchFilter {
         };
         let Some((peak_charge, model_limit)) = file_search_format_reservation(state, &plan, &batch) else {
             state.dispatch_failure = Some(file_search_budget_failure());
-            ctx.set_metadata("responses.skip_persist", "true");
+            ctx.record_ai_metadata("responses.skip_persist", "true");
             return Ok(FilterAction::Continue);
         };
         if let Some(budget) = state.simple_budget.as_mut()
             && !budget.reserve_additional_input(peak_charge)
         {
             state.dispatch_failure = Some(file_search_budget_failure());
-            ctx.set_metadata("responses.skip_persist", "true");
+            ctx.record_ai_metadata("responses.skip_persist", "true");
             return Ok(FilterAction::Continue);
         }
         // Terminalize any assignments the per-continuation server cap dropped
@@ -487,7 +488,7 @@ impl FileSearchDispatchFilter {
             Ok(charge) => charge,
             Err(failure) => {
                 state.dispatch_failure = Some(failure);
-                ctx.set_metadata("responses.skip_persist", "true");
+                ctx.record_ai_metadata("responses.skip_persist", "true");
                 return Ok(FilterAction::Continue);
             },
         };
@@ -498,7 +499,7 @@ impl FileSearchDispatchFilter {
             && !budget.settle_additional_input(peak_charge, retained_charge)
         {
             state.dispatch_failure = Some(file_search_budget_failure());
-            ctx.set_metadata("responses.skip_persist", "true");
+            ctx.record_ai_metadata("responses.skip_persist", "true");
             return Ok(FilterAction::Continue);
         }
         if !continuation_state_fits(framework_bytes, state, self.max_state_bytes, 0) {
@@ -555,7 +556,7 @@ impl HttpFilter for FileSearchDispatchFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -568,7 +569,7 @@ impl HttpFilter for FileSearchDispatchFilter {
         // The dispatcher no longer parses or rewrites response bytes — the loop
         // owner (`openai_agentic_loop`) is the sole response parser and terminal
         // owner. Reading nothing keeps this filter a pure request-phase executor.
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {

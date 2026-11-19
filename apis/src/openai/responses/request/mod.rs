@@ -61,6 +61,7 @@ use super::{
     state::ResponsesState,
 };
 use crate::{
+    RecordAiMetadata as _,
     classifier::{AiRequestFormat, ClassifiedRequest, classify_object, empty_result},
     json_body::MAX_JSON_BODY_BYTES,
     operation::RequestBody,
@@ -247,7 +248,7 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
     /// to classify and cache, the managed owner to classify when no pre-routing
     /// pass ran.
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     /// The managed owner also offers the bound-upstream phase, so a chain can
@@ -269,7 +270,7 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
     /// never needed to be.
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
         if self.config.initialize_state {
-            BodyAccess::ReadOnly
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
         } else {
             BodyAccess::None
         }
@@ -292,7 +293,7 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
     /// accumulation, breaking streamed-response persistence.
     fn response_body_access(&self) -> BodyAccess {
         if self.config.initialize_state {
-            BodyAccess::ReadOnly
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
         } else {
             BodyAccess::None
         }
@@ -769,16 +770,16 @@ fn enrich_context(
     response_id: &str,
     conversation_id: &str,
 ) {
-    ctx.set_metadata("responses.response_id", response_id);
-    ctx.set_metadata("responses.conversation_id", conversation_id);
+    ctx.record_ai_metadata("responses.response_id", response_id);
+    ctx.record_ai_metadata("responses.conversation_id", conversation_id);
 
     let store = classified.store.unwrap_or(true);
     let background = classified.background.unwrap_or(false);
     let stream = classified.stream.unwrap_or(false);
 
-    ctx.set_metadata("responses.store", if store { "true" } else { "false" });
-    ctx.set_metadata("responses.background", if background { "true" } else { "false" });
-    ctx.set_metadata("responses.stream", if stream { "true" } else { "false" });
+    ctx.record_ai_metadata("responses.store", if store { "true" } else { "false" });
+    ctx.record_ai_metadata("responses.background", if background { "true" } else { "false" });
+    ctx.record_ai_metadata("responses.stream", if stream { "true" } else { "false" });
 
     trace!(store, background, stream, "request facts published");
 }

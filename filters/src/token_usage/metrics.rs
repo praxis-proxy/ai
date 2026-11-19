@@ -248,7 +248,7 @@ impl HttpFilter for TokenUsageMetricsFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -256,7 +256,7 @@ impl HttpFilter for TokenUsageMetricsFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let Some(tenant) = ctx.get_metadata(&self.tenant_metadata_key) else {
+        let Some(tenant) = ctx.filter_metadata.get(&self.tenant_metadata_key) else {
             trace!(metadata_key = %self.tenant_metadata_key, "no authenticated tenant metadata; skipping token usage metrics");
             return Ok(FilterAction::Continue);
         };
@@ -304,13 +304,14 @@ fn resolve_model<'a>(ctx: &'a HttpFilterContext<'_>) -> Option<&'a str> {
     ]
     .into_iter()
     .find_map(|key| {
-        ctx.get_metadata(key)
+        ctx.filter_metadata
+            .get(key)
             .filter(|value| !value.is_empty() && is_promotable_value(value))
     })
 }
 
 fn emit_token_counters(ctx: &HttpFilterContext<'_>, state: &MetricsRequestState, model: &SharedString) {
-    if ctx.get_metadata(META_TOKEN_STATUS) == Some(TOKEN_STATUS_OVERFLOW) {
+    if ctx.filter_metadata.get(META_TOKEN_STATUS) == Some(TOKEN_STATUS_OVERFLOW) {
         debug!("token capture overflow, skipping token usage metrics");
         return;
     }
@@ -338,7 +339,7 @@ fn increment_tokens(state: &MetricsRequestState, model: &SharedString, usage_typ
 }
 
 fn read_token_meta(ctx: &HttpFilterContext<'_>, key: &str) -> Option<u64> {
-    ctx.get_metadata(key).and_then(|value| value.parse().ok())
+    ctx.filter_metadata.get(key).and_then(|value| value.parse().ok())
 }
 
 #[cfg(test)]
@@ -346,6 +347,7 @@ fn read_token_meta(ctx: &HttpFilterContext<'_>, key: &str) -> Option<u64> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, reason = "tests")]
 mod tests {
     use bytes::Bytes;
+    use praxis_ai_apis::RecordAiMetadata as _;
     use praxis_filter::{FilterAction, HttpFilter as _};
 
     use super::*;
@@ -363,9 +365,9 @@ mod tests {
     }
 
     fn set_counts(ctx: &mut HttpFilterContext<'_>, input: u64, output: u64, total: u64) {
-        ctx.set_metadata(META_TOKEN_INPUT, input.to_string());
-        ctx.set_metadata(META_TOKEN_OUTPUT, output.to_string());
-        ctx.set_metadata(META_TOKEN_TOTAL, total.to_string());
+        ctx.record_ai_metadata(META_TOKEN_INPUT, input.to_string());
+        ctx.record_ai_metadata(META_TOKEN_OUTPUT, output.to_string());
+        ctx.record_ai_metadata(META_TOKEN_TOTAL, total.to_string());
     }
 
     async fn request(filter: &TokenUsageMetricsFilter, ctx: &mut HttpFilterContext<'_>) {
@@ -465,9 +467,9 @@ mod tests {
         let filter = filter();
         let req = make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(DEFAULT_TENANT_METADATA_KEY, "alice");
+        ctx.record_ai_metadata(DEFAULT_TENANT_METADATA_KEY, "alice");
         request(&filter, &mut ctx).await;
-        ctx.set_metadata(META_METERING_MODEL, "gpt-4o");
+        ctx.record_ai_metadata(META_METERING_MODEL, "gpt-4o");
         set_counts(&mut ctx, 10, 20, 30);
         let snapshot = emit(&filter, &mut ctx);
         assert_eq!(value(&snapshot, "alice", "gpt-4o", "input"), Some(10));
@@ -479,9 +481,9 @@ mod tests {
     fn resolve_model_skips_invalid_candidates() {
         let req = make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
-        ctx.set_metadata("openai_responses_request.model", "");
-        ctx.set_metadata("anthropic_messages_request.model", "bad\nmodel");
-        ctx.set_metadata("model_to_header.model", "gpt-4o");
+        ctx.record_ai_metadata("openai_responses_request.model", "");
+        ctx.record_ai_metadata("anthropic_messages_request.model", "bad\nmodel");
+        ctx.record_ai_metadata("model_to_header.model", "gpt-4o");
         assert_eq!(resolve_model(&ctx), Some("gpt-4o"));
     }
 
@@ -489,8 +491,8 @@ mod tests {
     fn resolve_model_prefers_preserved_client_model() {
         let req = make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "gpt-4o");
-        ctx.set_metadata("openai_chat_completions_request.model", "provider-model");
+        ctx.record_ai_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "gpt-4o");
+        ctx.record_ai_metadata("openai_chat_completions_request.model", "provider-model");
         assert_eq!(resolve_model(&ctx), Some("gpt-4o"));
     }
 
@@ -499,8 +501,8 @@ mod tests {
         let filter = filter();
         let req = make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(DEFAULT_TENANT_METADATA_KEY, "carol");
-        ctx.set_metadata("openai_chat_completions_request.model", "novel-model");
+        ctx.record_ai_metadata(DEFAULT_TENANT_METADATA_KEY, "carol");
+        ctx.record_ai_metadata("openai_chat_completions_request.model", "novel-model");
         request(&filter, &mut ctx).await;
         set_counts(&mut ctx, 1, 2, 3);
         let snapshot = emit(&filter, &mut ctx);
@@ -515,7 +517,7 @@ mod tests {
         req.headers
             .insert("x-tenant-username", "mallory".parse().expect("valid header"));
         let mut ctx = make_filter_context(&req);
-        ctx.set_metadata("identity.x-tenant-username", "mallory");
+        ctx.record_ai_metadata("identity.x-tenant-username", "mallory");
         request(&filter, &mut ctx).await;
         set_counts(&mut ctx, 1, 2, 3);
         assert!(
@@ -534,14 +536,14 @@ mod tests {
             let filter = filter();
             let req = make_request(http::Method::POST, "/v1/chat/completions");
             let mut ctx = make_filter_context(&req);
-            ctx.set_metadata(
+            ctx.record_ai_metadata(
                 DEFAULT_TENANT_METADATA_KEY,
                 if mode == "invalid" { "bad\ntenant" } else { "alice" },
             );
             request(&filter, &mut ctx).await;
             if mode == "overflow" {
                 set_counts(&mut ctx, 1, 2, 3);
-                ctx.set_metadata(META_TOKEN_STATUS, TOKEN_STATUS_OVERFLOW);
+                ctx.record_ai_metadata(META_TOKEN_STATUS, TOKEN_STATUS_OVERFLOW);
             }
             assert!(
                 emit(&filter, &mut ctx).is_empty(),
@@ -555,7 +557,7 @@ mod tests {
         let filter = filter();
         let req = make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
-        ctx.set_metadata(DEFAULT_TENANT_METADATA_KEY, "alice");
+        ctx.record_ai_metadata(DEFAULT_TENANT_METADATA_KEY, "alice");
         request(&filter, &mut ctx).await;
         set_counts(&mut ctx, 10, 20, 30);
         let recorder = metrics_util::debugging::DebuggingRecorder::new();

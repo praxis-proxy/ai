@@ -54,7 +54,7 @@ preconditions:
       when a matching filter installed a formatter. Otherwise that path emits
       RFC 9457 application/problem+json. Explicit filter and body-limit
       rejections carry their own bodies and bypass this formatting path.
-    evidence: praxis-proxy-protocol-0.8.0/src/http/pingora/handler/fail_to_proxy.rs:288-307
+    evidence: praxis-proxy-protocol-0.8.0/src/http/pingora/handler/fail_to_proxy.rs:299-340
     detail:
       - "Installers: ai_operation (apis/src/operation_classifier/mod.rs:233-246, picks the
          OpenAI or Anthropic formatter from the matched protocol),
@@ -388,7 +388,7 @@ surfaces:
         status: dropped
         note: See the shared oversized-body gap below.
         blocker: TODO-ISSUE format the 413 produced by the body-limit filter
-        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215
+        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213
 
   # -------------------------------------------------------------------------
   - id: responses-to-chat-completions
@@ -545,7 +545,7 @@ surfaces:
         status: dropped
         note: See the shared oversized-body gap below.
         blocker: TODO-ISSUE format the 413 produced by the body-limit filter
-        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215
+        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213
 
   # -------------------------------------------------------------------------
   - id: chat-completions-to-vertexai-gemini
@@ -691,7 +691,7 @@ surfaces:
         status: dropped
         note: See the shared oversized-body gap below.
         blocker: TODO-ISSUE format the 413 produced by the body-limit filter
-        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215
+        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213
 
   # -------------------------------------------------------------------------
   - id: chat-completions-to-azureai
@@ -757,7 +757,7 @@ surfaces:
         status: dropped
         note: See the shared oversized-body gap below.
         blocker: TODO-ISSUE format the 413 produced by the body-limit filter
-        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215
+        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213
 
   # -------------------------------------------------------------------------
   - id: chat-completions-to-bedrock-converse
@@ -902,7 +902,7 @@ surfaces:
         status: dropped
         note: See the shared oversized-body gap below.
         blocker: TODO-ISSUE format the 413 produced by the body-limit filter
-        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215
+        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213
 
 # ---------------------------------------------------------------------------
 # Defects that span surfaces. Rendered once, above the per-surface tables, so

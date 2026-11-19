@@ -5,6 +5,7 @@
 
 use bytes::Bytes;
 use http::Method;
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::FilterAction;
 use serde_json::json;
 
@@ -84,7 +85,7 @@ async fn mapping_stages_cluster_preserves_public_id_and_rewrites_target() {
     let mut body = Some(Bytes::from_static(br#"{"model":"claude-sonnet-4-5","messages":[]}"#));
     assert_continue(&filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
     assert!(ctx.cluster.is_none(), "pre-read only stages selection");
-    let public_model = ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA);
+    let public_model = ctx.filter_metadata.get(MODEL_PROVIDER_CLIENT_MODEL_METADATA);
     assert_eq!(
         public_model,
         Some("claude-sonnet-4-5"),
@@ -125,7 +126,7 @@ async fn mapping_uses_explicit_fallback_without_changing_unmatched_bodies() {
             "unmatched bodies retain the client model"
         );
         assert!(
-            ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none(),
+            ctx.filter_metadata.get(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none(),
             "no match means no alias metadata"
         );
     }
@@ -210,7 +211,7 @@ async fn unmatched_complete_bodies_clear_staged_state() {
         let request = make_request(Method::POST, path);
         let mut ctx = context(&request);
         ctx.insert_filter_state(ResolvedUpstream(Arc::from("stale")));
-        ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "stale-model");
+        ctx.record_ai_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "stale-model");
         let mut body = raw.map(|value| Bytes::copy_from_slice(value.as_bytes()));
         assert_continue(&filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
         assert_continue(&filter.on_request(&mut ctx).await.unwrap());
@@ -219,7 +220,7 @@ async fn unmatched_complete_bodies_clear_staged_state() {
             "stale state must not select a cluster for an unmatched body"
         );
         assert!(
-            ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none(),
+            ctx.filter_metadata.get(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none(),
             "stale aliases must be cleared"
         );
     }
@@ -259,7 +260,7 @@ async fn mapping_preserves_last_model_and_decodes_escaped_names() {
         assert_continue(&filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
         assert_continue(&filter.on_request(&mut ctx).await.unwrap());
         assert_eq!(ctx.cluster.as_deref(), Some("vertex"), "last model selects: {raw}");
-        let public_model = ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA);
+        let public_model = ctx.filter_metadata.get(MODEL_PROVIDER_CLIENT_MODEL_METADATA);
         assert_eq!(
             public_model,
             Some("claude-sonnet-4-5"),
@@ -315,7 +316,7 @@ async fn unchanged_target_preserves_bytes_and_still_validates_entire_body() {
         "no rewrite must preserve whitespace and duplicate members"
     );
     assert_eq!(
-        ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA),
+        ctx.filter_metadata.get(MODEL_PROVIDER_CLIENT_MODEL_METADATA),
         Some("claude-sonnet-4-5"),
         "an unchanged target retains public identity metadata"
     );
@@ -411,7 +412,7 @@ async fn assert_passthrough(filter: &dyn HttpFilter, raw: &[u8]) {
         "a rejected candidate must preserve selection"
     );
     assert!(
-        ctx.get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none(),
+        ctx.filter_metadata.get(MODEL_PROVIDER_CLIENT_MODEL_METADATA).is_none(),
         "a rejected candidate must not publish a public model"
     );
 }

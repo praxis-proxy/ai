@@ -11,6 +11,7 @@ use super::{
     BOUND_PREFIX, CREDENTIAL_KEY, CREDENTIAL_NAME, CREDENTIAL_NAMESPACE, CREDENTIAL_STRATEGY,
     OpenaiChatCompletionsToAnthropicFilter, RESPONSE_ARMED, request::translate_request, response,
 };
+use crate::RecordAiMetadata as _;
 
 const INPUT: &str = r#"{
       "model":"client-model",
@@ -550,14 +551,14 @@ async fn request_profile_stays_pinned_through_response_after_route_metadata_chan
     assert_eq!(upstream["model"], "claude-test");
 
     // Simulate a later overlay selection. The bound profile is the response authority.
-    ctx.set_metadata("intelligent_route.api_format", "openai-chat");
-    ctx.set_metadata("intelligent_route.overlay_revision", "a".repeat(64));
+    ctx.record_ai_metadata("intelligent_route.api_format", "openai-chat");
+    ctx.record_ai_metadata("intelligent_route.overlay_revision", "a".repeat(64));
     ctx.response_header = Some(&mut response);
     assert!(matches!(
         filter.on_response(&mut ctx).await.unwrap(),
         FilterAction::Continue
     ));
-    assert_eq!(ctx.get_metadata(RESPONSE_ARMED), Some("true"));
+    assert_eq!(ctx.filter_metadata.get(RESPONSE_ARMED), Some("true"));
     let anthropic = Bytes::from_static(br#"{"type":"message","id":"msg_1","role":"assistant","model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2}}"#);
     let mut response_body = Some(anthropic);
     assert!(matches!(
@@ -567,7 +568,13 @@ async fn request_profile_stays_pinned_through_response_after_route_metadata_chan
     let downstream: Value = serde_json::from_slice(response_body.as_ref().unwrap()).unwrap();
     assert_eq!(downstream["model"], "client-model");
     assert_eq!(downstream["choices"][0]["message"]["content"], "ok");
-    assert_eq!(ctx.get_metadata(&format!("{BOUND_PREFIX}revision")).unwrap().len(), 64);
+    assert_eq!(
+        ctx.filter_metadata
+            .get(&format!("{BOUND_PREFIX}revision"))
+            .unwrap()
+            .len(),
+        64
+    );
 }
 
 #[tokio::test]
@@ -916,7 +923,7 @@ async fn openai_candidate_json_response_remains_chunked_passthrough() {
         filter.on_response(&mut ctx).await.unwrap(),
         FilterAction::Continue
     ));
-    assert_eq!(ctx.get_metadata(RESPONSE_ARMED), None);
+    assert_eq!(ctx.filter_metadata.get(RESPONSE_ARMED), None);
 
     for (chunk, eos) in [(b"{\"choices\":".as_slice(), false), (b"[]}".as_slice(), true)] {
         let original = Bytes::copy_from_slice(chunk);
@@ -960,18 +967,18 @@ fn anthropic_json_response() -> &'static [u8] {
 
 fn selected_profile_metadata(ctx: &mut praxis_filter::HttpFilterContext<'_>) {
     selected_profile_metadata_with_format(ctx, "messages");
-    ctx.set_metadata(CREDENTIAL_STRATEGY, "apikey");
-    ctx.set_metadata(CREDENTIAL_NAME, "anthropic-key");
-    ctx.set_metadata(CREDENTIAL_NAMESPACE, "tenant-a");
-    ctx.set_metadata(CREDENTIAL_KEY, "api-key");
+    ctx.record_ai_metadata(CREDENTIAL_STRATEGY, "apikey");
+    ctx.record_ai_metadata(CREDENTIAL_NAME, "anthropic-key");
+    ctx.record_ai_metadata(CREDENTIAL_NAMESPACE, "tenant-a");
+    ctx.record_ai_metadata(CREDENTIAL_KEY, "api-key");
 }
 
 fn selected_profile_metadata_with_format(ctx: &mut praxis_filter::HttpFilterContext<'_>, format: &str) {
-    ctx.set_metadata("intelligent_route.outcome", "routed");
-    ctx.set_metadata("intelligent_route.stable_id", "model/provider");
-    ctx.set_metadata("intelligent_route.overlay_revision", "b".repeat(64));
-    ctx.set_metadata("intelligent_route.api_format", format);
-    ctx.set_metadata("intelligent_route.path", "/v1/messages");
-    ctx.set_metadata("intelligent_route.target_model", "claude-test");
-    ctx.set_metadata("intelligent_route.name", "client-model");
+    ctx.record_ai_metadata("intelligent_route.outcome", "routed");
+    ctx.record_ai_metadata("intelligent_route.stable_id", "model/provider");
+    ctx.record_ai_metadata("intelligent_route.overlay_revision", "b".repeat(64));
+    ctx.record_ai_metadata("intelligent_route.api_format", format);
+    ctx.record_ai_metadata("intelligent_route.path", "/v1/messages");
+    ctx.record_ai_metadata("intelligent_route.target_model", "claude-test");
+    ctx.record_ai_metadata("intelligent_route.name", "client-model");
 }

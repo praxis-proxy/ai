@@ -215,7 +215,8 @@ impl AnthropicMessagesToVertexaiAnthropicFilter {
         // target earlier in the chain, the client sent that public id, so it
         // is the one responses must carry back.
         let user_model = ctx
-            .get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
+            .filter_metadata
+            .get(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
             .map_or(transformed.target_model, str::to_owned);
         debug!(
             model = %user_model,
@@ -240,7 +241,7 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
     }
 
     fn selected_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -250,7 +251,7 @@ impl HttpFilter for AnthropicMessagesToVertexaiAnthropicFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -521,7 +522,10 @@ mod tests {
     use praxis_filter::Request;
 
     use super::*;
-    use crate::test_utils::{make_filter_context, make_request, make_response};
+    use crate::{
+        RecordAiMetadata as _,
+        test_utils::{make_filter_context, make_request, make_response},
+    };
 
     fn filter(yaml: &str) -> Box<dyn HttpFilter> {
         let config: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
@@ -616,7 +620,10 @@ mod tests {
     fn body_translation_waits_for_upstream_selection() {
         let filter = filter("project: demo");
         assert_eq!(filter.request_body_access(), BodyAccess::None);
-        assert_eq!(filter.selected_upstream_request_body_access(), BodyAccess::ReadWrite);
+        assert_eq!(
+            filter.selected_upstream_request_body_access(),
+            BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
+        );
     }
 
     #[tokio::test]
@@ -1147,7 +1154,7 @@ mod tests {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = filter_context(&request);
         // model_to_provider mapped a public alias before upstream selection.
-        ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "public-claude");
+        ctx.record_ai_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "public-claude");
 
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await

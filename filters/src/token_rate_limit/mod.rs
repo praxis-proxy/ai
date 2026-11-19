@@ -123,6 +123,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::HeaderName;
 use metrics::{counter, gauge};
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{
     AuthenticatedIdentity, BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     TrustedHeaderMutation, parse_filter_config,
@@ -2534,7 +2535,7 @@ impl TokenRateLimitFilter {
                 estimate,
             },
         );
-        ctx.set_metadata(META_ESTIMATE, request_estimate.to_string());
+        ctx.record_ai_metadata(META_ESTIMATE, request_estimate.to_string());
         Self::evaluate_tiers(ctx, rule, usage_after);
         record_admission_span(ctx, rule, request_estimate, "admitted");
         FilterAction::Continue
@@ -3162,7 +3163,7 @@ impl HttpFilter for TokenRateLimitFilter {
 
     fn request_body_access(&self) -> BodyAccess {
         if self.needs_body {
-            BodyAccess::ReadOnly
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
         } else {
             BodyAccess::None
         }
@@ -3179,7 +3180,7 @@ impl HttpFilter for TokenRateLimitFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {

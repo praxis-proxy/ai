@@ -175,7 +175,8 @@ the forwarded wire contract.
 `mode: per_ip` groups requests by their TCP peer address, independently of the
 Conversations store's owner isolation. The core configuration controls refill,
 burst, IPv6 grouping, and shadow mode. Omitting the block disables admission.
-Buckets are local to the pipeline instance and reset when it is rebuilt. This is
+The scope defaults to `local`, with buckets that reset when the pipeline is
+rebuilt. This is
 request admission, not a distributed or owner-specific quota guarantee.
 
 The focused conformance suite requires a runtime rejection test for every

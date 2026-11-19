@@ -16,9 +16,12 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::StreamEventsState;
-use crate::openai::{
-    responses::{state::ResponsesState, usage::merge_usage},
-    sse::responses::ResponsesEvent,
+use crate::{
+    RecordAiMetadata as _,
+    openai::{
+        responses::{state::ResponsesState, usage::merge_usage},
+        sse::responses::ResponsesEvent,
+    },
 };
 
 /// Process a single SSE event, updating `ResponsesState` in
@@ -109,7 +112,7 @@ pub(super) fn accumulate_response_object(
         state.local_completion_response_template = Value::Null;
         had_prior_usage
     };
-    ctx.set_metadata("responses.status", status.clone());
+    ctx.record_ai_metadata("responses.status", status.clone());
 
     debug!(status, "complete response received, ResponsesState updated");
     had_prior_usage
