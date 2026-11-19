@@ -34,6 +34,10 @@ pub mod json_body;
 pub(crate) mod mcp_client;
 #[cfg(feature = "mcp")]
 pub(crate) mod mcp_core;
+/// Outbound MCP chain selector shared by every MCP adapter. Registered under
+/// its historical `openai_mcp_streaming_selector` name for config stability.
+#[cfg(feature = "mcp")]
+pub use mcp_client::McpStreamingSelectorFilter;
 pub mod openai;
 pub mod operation;
 pub mod operation_classifier;

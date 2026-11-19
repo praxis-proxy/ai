@@ -154,7 +154,8 @@ impl HttpFilter for AnthropicMessagesProtocolFilter {
         }
 
         if ctx.request.headers.get(ANTHROPIC_BETA_HEADER).is_none() {
-            let connector_resolved = ctx.get_metadata(MCP_CONNECTOR_METADATA_KEY) == Some(MCP_CONNECTOR_RESOLVED);
+            let connector_resolved =
+                ctx.filter_metadata.get(MCP_CONNECTOR_METADATA_KEY) == Some(MCP_CONNECTOR_RESOLVED);
             restore_beta_header(ctx, connector_resolved);
         }
 
