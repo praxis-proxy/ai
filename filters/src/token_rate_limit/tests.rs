@@ -5,6 +5,7 @@
 
 use std::future::Future;
 
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{FilterAction, HttpFilter};
 
 use super::{ExchangeHolds, TokenRateLimitFilter};
@@ -1012,9 +1013,7 @@ async fn reconcile_releases_unused_tokens_on_overestimate() {
     let mut ctx = filter_context(&req);
 
     drop(filter.on_request(&mut ctx).await.unwrap()); // reserves 50, 50 left
-    ctx.filter_metadata
-        .insert(META_TOKEN_TOTAL, "30")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss); // actual usage was only 30
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "30"); // actual usage was only 30
 
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
@@ -1046,9 +1045,7 @@ async fn reconcile_draws_more_tokens_on_underestimate_and_can_starve_next_reques
     let mut ctx = filter_context(&req);
 
     drop(filter.on_request(&mut ctx).await.unwrap()); // reserves 50, 50 left
-    ctx.filter_metadata
-        .insert(META_TOKEN_TOTAL, "90")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss); // actual usage exceeded the estimate
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "90"); // actual usage exceeded the estimate
 
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
@@ -1103,9 +1100,7 @@ async fn does_not_reconcile_before_end_of_stream() {
     let mut ctx = filter_context(&req);
 
     drop(filter.on_request(&mut ctx).await.unwrap());
-    ctx.filter_metadata
-        .insert(META_TOKEN_TOTAL, "5")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "5");
 
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
@@ -1168,9 +1163,7 @@ async fn missing_reservation_id_skips_reconciliation() {
         "the first 400-token request fits"
     );
     ctx.get_filter_state_mut::<ExchangeHolds>().unwrap().reservation = None;
-    ctx.filter_metadata
-        .insert(META_TOKEN_TOTAL, "200")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "200");
     let mut body = None;
     assert!(
         matches!(
@@ -1211,9 +1204,7 @@ async fn two_instances_in_one_pipeline_each_settle_their_own_reservation() {
             "instance {id}: the first 400-token request fits"
         );
     }
-    ctx.filter_metadata
-        .insert(META_TOKEN_TOTAL, "200")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "200");
     for (id, filter) in filters.iter().enumerate().rev() {
         ctx.current_filter_id = Some(id);
         let mut body = None;
@@ -2019,9 +2010,7 @@ async fn valkey_worker_reconciles_usage_off_the_response_path() {
     let mut body = Some(bytes::Bytes::from_static(br#"{"max_tokens":50}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
-    ctx.filter_metadata
-        .insert(META_TOKEN_TOTAL, "10")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss); // actual usage far below the 50-token estimate
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "10"); // actual usage far below the 50-token estimate
 
     // Reconciliation for a Valkey backend is enqueued onto a background
     // worker rather than awaited inline (the response must not be held
@@ -2262,9 +2251,7 @@ async fn valkey_token_bucket_worker_reconciles_usage_off_the_response_path() {
     let mut body = Some(bytes::Bytes::from_static(br#"{"max_tokens":50}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
-    ctx.filter_metadata
-        .insert(META_TOKEN_TOTAL, "10")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss); // actual usage far below the 50-token estimate
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "10"); // actual usage far below the 50-token estimate
 
     let mut body = None;
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
@@ -2764,9 +2751,7 @@ async fn body_dependent_reconciliation_uses_meta_estimate() {
     let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 500}"#));
     drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
 
-    ctx.filter_metadata
-        .insert(META_TOKEN_TOTAL, "200")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "200");
 
     let mut resp_body = None;
     drop(filter.on_response_body(&mut ctx, &mut resp_body, true).unwrap());
@@ -2979,15 +2964,9 @@ async fn model_scaled_outer_multiplier_composes_with_per_model_multiplier() {
 // -----------------------------------------------------------------------------
 
 fn set_typed_usage(ctx: &mut praxis_filter::HttpFilterContext<'_>, input: u64, output: u64, total: u64) {
-    ctx.filter_metadata
-        .insert(META_TOKEN_INPUT, input.to_string())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(META_TOKEN_OUTPUT, output.to_string())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(META_TOKEN_TOTAL, total.to_string())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_TOKEN_INPUT, input.to_string());
+    ctx.record_ai_metadata(META_TOKEN_OUTPUT, output.to_string());
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, total.to_string());
 }
 
 #[tokio::test]
@@ -3005,9 +2984,7 @@ async fn weighted_cache_hit_refunds_more_than_token_total() {
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     set_typed_usage(&mut ctx, 100, 10, 110);
-    ctx.filter_metadata
-        .insert(META_TOKEN_CACHE_READ, "90")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_TOKEN_CACHE_READ, "90");
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
@@ -3029,9 +3006,7 @@ async fn unweighted_total_of_the_same_cached_request_would_starve_the_window() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
-    ctx.filter_metadata
-        .insert(META_TOKEN_TOTAL, "110")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "110");
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
@@ -3127,9 +3102,7 @@ async fn google_additive_reasoning_does_not_drop_visible_output() {
     let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     set_typed_usage(&mut ctx, 50, 80, 330);
-    ctx.filter_metadata
-        .insert(META_TOKEN_REASONING, "200")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_TOKEN_REASONING, "200");
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
@@ -3163,9 +3136,7 @@ async fn openai_nested_reasoning_is_not_double_counted() {
     let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     set_typed_usage(&mut ctx, 120, 800, 920);
-    ctx.filter_metadata
-        .insert(META_TOKEN_REASONING, "640")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_TOKEN_REASONING, "640");
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
@@ -3184,9 +3155,7 @@ async fn overflow_status_keeps_the_reservation_estimate() {
     let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     set_typed_usage(&mut ctx, 10, 10, 20);
-    ctx.filter_metadata
-        .insert(META_TOKEN_STATUS, TOKEN_STATUS_OVERFLOW)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_TOKEN_STATUS, TOKEN_STATUS_OVERFLOW);
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
@@ -3241,12 +3210,8 @@ async fn anthropic_cache_write_weight_is_applied() {
     let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     set_typed_usage(&mut ctx, 6050, 100, 6150);
-    ctx.filter_metadata
-        .insert(META_TOKEN_CACHE_READ, "5000")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(META_TOKEN_CACHE_WRITE, "1000")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_TOKEN_CACHE_READ, "5000");
+    ctx.record_ai_metadata(META_TOKEN_CACHE_WRITE, "1000");
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
@@ -3306,9 +3271,7 @@ async fn bedrock_normalized_cache_breakdown_applies_cached_input_weight() {
     let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     set_typed_usage(&mut ctx, 1075, 214, 1289);
-    ctx.filter_metadata
-        .insert(META_TOKEN_CACHE_READ, "1066")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_TOKEN_CACHE_READ, "1066");
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
@@ -3335,9 +3298,7 @@ async fn token_bucket_applies_the_same_weighted_cost() {
     let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     set_typed_usage(&mut ctx, 100, 10, 110);
-    ctx.filter_metadata
-        .insert(META_TOKEN_CACHE_READ, "90")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_TOKEN_CACHE_READ, "90");
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
@@ -4444,9 +4405,7 @@ async fn the_decision_span_records_the_admission_and_the_actual_cost() {
     let mut ctx = filter_context(&req);
 
     drop(filter.on_request(&mut ctx).await.unwrap());
-    ctx.filter_metadata
-        .insert(META_TOKEN_TOTAL, "40")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "40");
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 

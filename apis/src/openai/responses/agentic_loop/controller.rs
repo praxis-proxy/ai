@@ -41,6 +41,7 @@ use super::{
     config::{AgenticLoopConfig, build_config},
 };
 use crate::{
+    RecordAiMetadata as _,
     classifier::is_responses_create,
     http_hop::{connection_nominates_header, is_hop_by_hop},
     json_body::MAX_JSON_BODY_BYTES,
@@ -222,9 +223,7 @@ impl HttpFilter for AgenticLoopFilter {
             {
                 return Ok(FilterAction::Continue);
             }
-            ctx.filter_metadata
-                .insert("responses.agentic_response_processed_iteration", marker)
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata("responses.agentic_response_processed_iteration", marker);
         }
 
         let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
@@ -235,9 +234,7 @@ impl HttpFilter for AgenticLoopFilter {
             && let Some(budget) = state.simple_budget.as_mut()
             && !body.as_ref().is_some_and(|bytes| budget.admit_output(bytes))
         {
-            ctx.filter_metadata
-                .insert("responses.skip_persist", "true")
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata("responses.skip_persist", "true");
             set_action(ctx, ACTION_DONE)?;
             return Ok(FilterAction::Reject(responses_error_rejection(
                 502,
@@ -528,9 +525,7 @@ fn convert_dispatch_failure(
     // The loop terminates here; drop this round's dispatch bookkeeping.
     clear_round_dispatch_state(&mut state);
     let streaming = request_is_streaming(&state) && ctx.extensions.get::<ClientResponseHeadersCommitted>().is_some();
-    ctx.filter_metadata
-        .insert("responses.skip_persist", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.skip_persist", "true");
     ctx.extensions.insert(state);
     set_action(ctx, ACTION_DONE)?;
 
@@ -562,9 +557,7 @@ fn finish_incomplete_round(
     mut state: ResponsesState,
     body: &mut Option<Bytes>,
 ) -> Result<FilterAction, FilterError> {
-    ctx.filter_metadata
-        .insert(META_STATUS, "incomplete")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_STATUS, "incomplete");
     // A streamed `incomplete` terminal (status == "incomplete", e.g. truncated at
     // max_output_tokens) is finalized by `openai_stream_events` from
     // `accumulated_output`; the draining finalizer must not run on that path (see
@@ -639,15 +632,9 @@ fn end_stream_with_error(
     state.tool_search_calls.clear();
     state.web_search_calls.clear();
     state.file_search_assignments.clear();
-    ctx.filter_metadata
-        .insert("responses.stream_error_code", code.to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("responses.stream_error_message", message.to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("responses.skip_persist", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.stream_error_code", code.to_owned());
+    ctx.record_ai_metadata("responses.stream_error_message", message.to_owned());
+    ctx.record_ai_metadata("responses.skip_persist", "true");
     set_action(ctx, ACTION_DONE)
 }
 
@@ -918,9 +905,7 @@ fn release_completed_round(
         )?;
         return Ok(Some(FilterAction::Continue));
     }
-    ctx.filter_metadata
-        .insert("responses.skip_persist", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.skip_persist", "true");
     set_action(ctx, ACTION_DONE)?;
     Ok(Some(FilterAction::Reject(responses_error_rejection(
         502,

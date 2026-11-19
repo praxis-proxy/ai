@@ -11,6 +11,7 @@
 use std::{sync::Arc, time::Instant};
 
 use http::HeaderName;
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{FilterAction, HttpFilter as _, HttpFilterContext, Request};
 
 use super::{
@@ -114,9 +115,7 @@ async fn admit(filter: &TokenRateLimitFilter, req: &Request) -> FilterAction {
 /// metadata keys and values.
 fn complete(filter: &TokenRateLimitFilter, ctx: &mut HttpFilterContext<'_>, usage: &[(&str, &str)]) {
     for &(key, tokens) in usage {
-        ctx.filter_metadata
-            .insert(key, tokens)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(key, tokens);
     }
     let mut body = None;
     drop(filter.on_response_body(ctx, &mut body, true).unwrap());

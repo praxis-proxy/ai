@@ -168,7 +168,10 @@ use super::{
     error::responses_error_rejection,
     state::{ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, is_client_executed_tool_call},
 };
-use crate::json_body::{SerializedJson, serialize_json_body};
+use crate::{
+    RecordAiMetadata as _,
+    json_body::{SerializedJson, serialize_json_body},
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -607,9 +610,7 @@ impl HttpFilter for ClientToolCompatFilter {
         };
         if !reserve_client_tool_restoration(state, bytes) {
             *body = None;
-            ctx.filter_metadata
-                .insert("responses.skip_persist", "true")
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata("responses.skip_persist", "true");
             return Ok(FilterAction::Reject(responses_error_rejection(
                 502,
                 "server_error",

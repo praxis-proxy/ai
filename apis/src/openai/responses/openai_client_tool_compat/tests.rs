@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::{
+    RecordAiMetadata as _,
     json_body::MAX_JSON_BODY_BYTES,
     openai::responses::agentic_loop::budget::SimpleBudget,
     test_utils::{make_filter_context, make_request},
@@ -6240,9 +6241,7 @@ async fn streaming_rich_request_rejects_without_arming() {
     let filter = filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "true".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.extensions.insert(ResponsesState::from_request_body(json!({
         "stream": true,
         "tools": [{"type": "custom", "name": "run_python", "description": "d", "format": {"type": "text"}}],

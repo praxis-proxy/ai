@@ -63,6 +63,7 @@ use tracing::{debug, trace};
 
 use self::config::{AnthropicMessagesRequestConfig, build_config};
 use crate::{
+    RecordAiMetadata as _,
     anthropic::{
         routes::{AnthropicMessagesOperation, match_route},
         wire,
@@ -353,39 +354,27 @@ fn uses_mcp_connector(object: &serde_json::Map<String, serde_json::Value>) -> bo
 
 /// Write durable routing metadata.
 fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest, mcp_connector: bool) {
-    ctx.filter_metadata
-        .insert("anthropic_messages_request.format", classified.format.as_str())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("anthropic_messages_request.format", classified.format.as_str());
 
     if let Some(model) = &classified.model
         && is_promotable_value(model)
     {
-        ctx.filter_metadata
-            .insert("anthropic_messages_request.model", model.clone())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("anthropic_messages_request.model", model.clone());
     }
     if let Some(stream) = classified.stream {
-        ctx.filter_metadata
-            .insert(
-                "anthropic_messages_request.stream",
-                if stream { "true" } else { "false" },
-            )
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(
+            "anthropic_messages_request.stream",
+            if stream { "true" } else { "false" },
+        );
     }
     if let Some(max_tokens) = classified.max_tokens {
-        ctx.filter_metadata
-            .insert("anthropic_messages_request.max_tokens", max_tokens.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("anthropic_messages_request.max_tokens", max_tokens.to_string());
     }
     if classified.has_tools {
-        ctx.filter_metadata
-            .insert("anthropic_messages_request.has_tools", "true")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("anthropic_messages_request.has_tools", "true");
     }
     if mcp_connector {
-        ctx.filter_metadata
-            .insert(MCP_CONNECTOR_METADATA_KEY, "true")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(MCP_CONNECTOR_METADATA_KEY, "true");
     }
 }
 

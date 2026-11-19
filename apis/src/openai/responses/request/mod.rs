@@ -61,6 +61,7 @@ use super::{
     state::ResponsesState,
 };
 use crate::{
+    RecordAiMetadata as _,
     classifier::{AiRequestFormat, ClassifiedRequest, classify_object, empty_result},
     json_body::MAX_JSON_BODY_BYTES,
     operation::RequestBody,
@@ -769,26 +770,16 @@ fn enrich_context(
     response_id: &str,
     conversation_id: &str,
 ) {
-    ctx.filter_metadata
-        .insert("responses.response_id", response_id)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("responses.conversation_id", conversation_id)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.response_id", response_id);
+    ctx.record_ai_metadata("responses.conversation_id", conversation_id);
 
     let store = classified.store.unwrap_or(true);
     let background = classified.background.unwrap_or(false);
     let stream = classified.stream.unwrap_or(false);
 
-    ctx.filter_metadata
-        .insert("responses.store", if store { "true" } else { "false" })
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("responses.background", if background { "true" } else { "false" })
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("responses.stream", if stream { "true" } else { "false" })
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.store", if store { "true" } else { "false" });
+    ctx.record_ai_metadata("responses.background", if background { "true" } else { "false" });
+    ctx.record_ai_metadata("responses.stream", if stream { "true" } else { "false" });
 
     trace!(store, background, stream, "request facts published");
 }

@@ -13,7 +13,10 @@ use praxis_filter::{
 use serde_json::json;
 
 use super::super::state::ResponsesState;
-use crate::test_utils::{make_filter_context, make_request};
+use crate::{
+    RecordAiMetadata as _,
+    test_utils::{make_filter_context, make_request},
+};
 
 // -----------------------------------------------------------------------------
 // Tests
@@ -108,9 +111,7 @@ async fn selects_streaming_from_effective_passthrough_body() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "false")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.stream", "false");
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1","input":"hello","stream":true}"#,
     ));
@@ -165,9 +166,7 @@ async fn uses_rebuilt_state_body_not_client_intent_metadata() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.stream", "true");
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1",
         "input": "hello",
@@ -201,9 +200,7 @@ async fn selects_streaming_for_rebuilt_effective_body() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "false")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.stream", "false");
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1",
         "input": "hello",

@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 use http::header::HeaderValue;
-use praxis_ai_apis::promotion::MAX_PROMOTED_VALUE_LEN;
+use praxis_ai_apis::{RecordAiMetadata as _, promotion::MAX_PROMOTED_VALUE_LEN};
 use praxis_filter::{HttpFilter as _, Response};
 
 use super::*;
@@ -136,9 +136,7 @@ async fn first_non_empty_chunk_records_with_model_label() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    ctx.filter_metadata
-        .insert("openai_responses_request.model", "gpt-4o")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.model", "gpt-4o");
 
     let mut resp = make_response_with_content_type("text/event-stream");
     ctx.response_header = Some(&mut resp);
@@ -228,9 +226,7 @@ fn resolve_model_openai() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    ctx.filter_metadata
-        .insert("openai_responses_request.model", "gpt-4o")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.model", "gpt-4o");
     assert_eq!(crate::llm_metrics::resolve_model(&ctx), "gpt-4o");
 }
 
@@ -239,9 +235,7 @@ fn resolve_model_chat_completions() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    ctx.filter_metadata
-        .insert("openai_chat_completions_request.model", "gpt-4")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_chat_completions_request.model", "gpt-4");
     assert_eq!(crate::llm_metrics::resolve_model(&ctx), "gpt-4");
 }
 
@@ -250,12 +244,8 @@ fn resolve_model_prefers_responses_over_chat_completions() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    ctx.filter_metadata
-        .insert("openai_responses_request.model", "gpt-4o")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_chat_completions_request.model", "gpt-4")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.model", "gpt-4o");
+    ctx.record_ai_metadata("openai_chat_completions_request.model", "gpt-4");
     assert_eq!(crate::llm_metrics::resolve_model(&ctx), "gpt-4o");
 }
 
@@ -264,9 +254,7 @@ fn resolve_model_anthropic() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    ctx.filter_metadata
-        .insert("anthropic_messages_request.model", "claude-sonnet-5")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("anthropic_messages_request.model", "claude-sonnet-5");
     assert_eq!(crate::llm_metrics::resolve_model(&ctx), "claude-sonnet-5");
 }
 
@@ -275,9 +263,7 @@ fn resolve_model_anthropic_messages_to_chat_completions() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    ctx.filter_metadata
-        .insert("anthropic_messages_to_chat_completions.model", "claude-haiku-4-5")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("anthropic_messages_to_chat_completions.model", "claude-haiku-4-5");
     assert_eq!(crate::llm_metrics::resolve_model(&ctx), "claude-haiku-4-5");
 }
 
@@ -286,12 +272,8 @@ fn resolve_model_prefers_openai_over_anthropic() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    ctx.filter_metadata
-        .insert("openai_responses_request.model", "gpt-4o")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("anthropic_messages_request.model", "claude-sonnet-5")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.model", "gpt-4o");
+    ctx.record_ai_metadata("anthropic_messages_request.model", "claude-sonnet-5");
     assert_eq!(crate::llm_metrics::resolve_model(&ctx), "gpt-4o");
 }
 
@@ -324,9 +306,7 @@ fn resolve_model_rejects_control_characters() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
-    ctx.filter_metadata
-        .insert("anthropic_messages_to_chat_completions.model", "model\ninjection")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("anthropic_messages_to_chat_completions.model", "model\ninjection");
     assert_eq!(crate::llm_metrics::resolve_model(&ctx), "unknown");
 }
 
@@ -336,9 +316,7 @@ fn resolve_model_rejects_oversized_value() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
     let long_model = "a".repeat(MAX_PROMOTED_VALUE_LEN + 1);
-    ctx.filter_metadata
-        .insert("openai_responses_request.model", &long_model)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.model", &long_model);
     assert_eq!(crate::llm_metrics::resolve_model(&ctx), "unknown");
 }
 
@@ -348,9 +326,7 @@ fn resolve_model_accepts_max_length_value() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
     let model = "a".repeat(MAX_PROMOTED_VALUE_LEN);
-    ctx.filter_metadata
-        .insert("openai_responses_request.model", &model)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.model", &model);
     assert_eq!(crate::llm_metrics::resolve_model(&ctx), model);
 }
 

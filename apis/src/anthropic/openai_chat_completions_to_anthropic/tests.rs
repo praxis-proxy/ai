@@ -11,6 +11,7 @@ use super::{
     BOUND_PREFIX, CREDENTIAL_KEY, CREDENTIAL_NAME, CREDENTIAL_NAMESPACE, CREDENTIAL_STRATEGY,
     OpenaiChatCompletionsToAnthropicFilter, RESPONSE_ARMED, request::translate_request, response,
 };
+use crate::RecordAiMetadata as _;
 
 const INPUT: &str = r#"{
       "model":"client-model",
@@ -550,12 +551,8 @@ async fn request_profile_stays_pinned_through_response_after_route_metadata_chan
     assert_eq!(upstream["model"], "claude-test");
 
     // Simulate a later overlay selection. The bound profile is the response authority.
-    ctx.filter_metadata
-        .insert("intelligent_route.api_format", "openai-chat")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("intelligent_route.overlay_revision", "a".repeat(64))
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("intelligent_route.api_format", "openai-chat");
+    ctx.record_ai_metadata("intelligent_route.overlay_revision", "a".repeat(64));
     ctx.response_header = Some(&mut response);
     assert!(matches!(
         filter.on_response(&mut ctx).await.unwrap(),
@@ -970,40 +967,18 @@ fn anthropic_json_response() -> &'static [u8] {
 
 fn selected_profile_metadata(ctx: &mut praxis_filter::HttpFilterContext<'_>) {
     selected_profile_metadata_with_format(ctx, "messages");
-    ctx.filter_metadata
-        .insert(CREDENTIAL_STRATEGY, "apikey")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(CREDENTIAL_NAME, "anthropic-key")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(CREDENTIAL_NAMESPACE, "tenant-a")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(CREDENTIAL_KEY, "api-key")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(CREDENTIAL_STRATEGY, "apikey");
+    ctx.record_ai_metadata(CREDENTIAL_NAME, "anthropic-key");
+    ctx.record_ai_metadata(CREDENTIAL_NAMESPACE, "tenant-a");
+    ctx.record_ai_metadata(CREDENTIAL_KEY, "api-key");
 }
 
 fn selected_profile_metadata_with_format(ctx: &mut praxis_filter::HttpFilterContext<'_>, format: &str) {
-    ctx.filter_metadata
-        .insert("intelligent_route.outcome", "routed")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("intelligent_route.stable_id", "model/provider")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("intelligent_route.overlay_revision", "b".repeat(64))
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("intelligent_route.api_format", format)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("intelligent_route.path", "/v1/messages")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("intelligent_route.target_model", "claude-test")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("intelligent_route.name", "client-model")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("intelligent_route.outcome", "routed");
+    ctx.record_ai_metadata("intelligent_route.stable_id", "model/provider");
+    ctx.record_ai_metadata("intelligent_route.overlay_revision", "b".repeat(64));
+    ctx.record_ai_metadata("intelligent_route.api_format", format);
+    ctx.record_ai_metadata("intelligent_route.path", "/v1/messages");
+    ctx.record_ai_metadata("intelligent_route.target_model", "claude-test");
+    ctx.record_ai_metadata("intelligent_route.name", "client-model");
 }

@@ -17,7 +17,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_ai_apis::{MODEL_PROVIDER_CLIENT_MODEL_METADATA, json_body::replace_json_body};
+use praxis_ai_apis::{MODEL_PROVIDER_CLIENT_MODEL_METADATA, RecordAiMetadata as _, json_body::replace_json_body};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     builtins::http::payload_processing::config_validation::validate_max_body_bytes, parse_filter_config,
@@ -359,9 +359,7 @@ impl HttpFilter for ModelToProviderFilter {
         };
         let needs_rewrite = client_model != mapping.target_model;
         ctx.insert_filter_state(ResolvedUpstream(Arc::clone(&mapping.upstream)));
-        ctx.filter_metadata
-            .insert(MODEL_PROVIDER_CLIENT_MODEL_METADATA, client_model)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, client_model);
 
         if needs_rewrite {
             object.insert("model".to_owned(), Value::String(mapping.target_model.clone()));

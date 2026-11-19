@@ -53,6 +53,7 @@ use super::{
     },
 };
 use crate::{
+    RecordAiMetadata as _,
     callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity},
     callout_policy::MISSING_CALLOUT_CONTEXT,
     json_body::MAX_JSON_BODY_BYTES,
@@ -702,12 +703,8 @@ impl HttpFilter for WebSearchDispatchFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
-        ctx.filter_metadata
-            .insert(MAX_CALLS_METADATA, self.max_calls_per_round.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(MAX_QUERY_METADATA, self.max_query_bytes.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
+        ctx.record_ai_metadata(MAX_QUERY_METADATA, self.max_query_bytes.to_string());
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
@@ -1786,9 +1783,7 @@ fn record_web_search_budget_failure(ctx: &mut HttpFilterContext<'_>) {
             message: "Web search exceeds a processing limit set by the platform administrator.".to_owned(),
         });
     }
-    ctx.filter_metadata
-        .insert("responses.skip_persist", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.skip_persist", "true");
 }
 
 // -----------------------------------------------------------------------------

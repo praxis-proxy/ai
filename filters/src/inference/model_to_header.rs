@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderName;
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, builtins::JsonBodyFieldFilter,
     parse_filter_config,
@@ -191,9 +192,7 @@ impl HttpFilter for ModelToHeaderFilter {
             .find(|(name, _)| name.as_ref().eq_ignore_ascii_case(self.header.as_str()))
             .map(|(_, value)| value.clone());
         if let Some(model) = model {
-            ctx.filter_metadata
-                .insert(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, model)
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, model);
         }
         Ok(action)
     }

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
+use praxis_ai_apis::RecordAiMetadata as _;
+
 use super::*;
 use crate::test_utils::{make_filter_context, make_request};
 
@@ -237,9 +239,7 @@ fn captured_model_wins_over_default_model() {
     let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\ndefault_model: \"unknown\"\n");
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert(META_METERING_MODEL.to_owned(), "gpt-4".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_METERING_MODEL.to_owned(), "gpt-4".to_owned());
     let state = state_for("alice", "");
 
     assert_eq!(filter.resolve_report_model(&ctx, &state), "gpt-4");
@@ -250,12 +250,8 @@ fn provider_resolved_public_model_wins_over_rewritten_body_model() {
     let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\ndefault_model: \"unknown\"\n");
     let req = make_request(http::Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(META_METERING_MODEL.to_owned(), "vertex/claude-sonnet-4-5".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5");
+    ctx.record_ai_metadata(META_METERING_MODEL.to_owned(), "vertex/claude-sonnet-4-5".to_owned());
     let state = state_for("alice", "");
 
     assert_eq!(filter.resolve_report_model(&ctx, &state), "claude-sonnet-4-5");
@@ -266,9 +262,7 @@ fn provider_resolved_model_does_not_override_captured_identity_model() {
     let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\n");
     let req = make_request(http::Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5");
     let state = state_for("alice", "tenant-model");
 
     assert_eq!(filter.resolve_report_model(&ctx, &state), "tenant-model");
@@ -281,9 +275,7 @@ async fn provider_resolved_public_model_is_used_for_balance_check() {
     );
     let req = make_request(http::Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
 
@@ -503,9 +495,7 @@ fn usage_event_carries_reasoning_tokens() {
 fn token_counts_read_includes_reasoning() {
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert(META_TOKEN_REASONING.to_owned(), "17".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_TOKEN_REASONING.to_owned(), "17".to_owned());
 
     let tokens = TokenCounts::read(&ctx);
 
@@ -666,19 +656,11 @@ fn verified_identity_ignores_forged_headers_and_guard_metadata() {
 
     let mut ctx = make_filter_context(&req);
     // Verified claims written by an authentication filter (unnamespaced).
-    ctx.filter_metadata
-        .insert("x-tenant-username".to_owned(), "alice".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("x-tenant-group".to_owned(), "engineering".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("x-tenant-username".to_owned(), "alice".to_owned());
+    ctx.record_ai_metadata("x-tenant-group".to_owned(), "engineering".to_owned());
     // Guard-captured copies of the forged headers (namespaced).
-    ctx.filter_metadata
-        .insert("identity.x-tenant-subscription".to_owned(), "sub-forged".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("identity.x-tenant-model".to_owned(), "model-forged".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("identity.x-tenant-subscription".to_owned(), "sub-forged".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-model".to_owned(), "model-forged".to_owned());
 
     let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
@@ -704,18 +686,10 @@ fn verified_billing_identity_ignores_forged_org_and_cost_center() {
     req.headers.insert("x-tenant-cost-center", "cc-forged".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("x-tenant-organization-id".to_owned(), "org-verified".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("x-tenant-cost-center".to_owned(), "cc-verified".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("identity.x-tenant-organization-id".to_owned(), "org-forged".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("identity.x-tenant-cost-center".to_owned(), "cc-forged".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("x-tenant-organization-id".to_owned(), "org-verified".to_owned());
+    ctx.record_ai_metadata("x-tenant-cost-center".to_owned(), "cc-verified".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-organization-id".to_owned(), "org-forged".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-cost-center".to_owned(), "cc-forged".to_owned());
 
     let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
@@ -727,18 +701,10 @@ fn verified_billing_identity_ignores_forged_org_and_cost_center() {
 fn guard_metadata_supplies_identity_without_verified_claims() {
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("identity.x-tenant-username".to_owned(), "bob".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("identity.x-tenant-group".to_owned(), "ml".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("identity.x-tenant-subscription".to_owned(), "sub-7".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("identity.x-tenant-model".to_owned(), "claude-3".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("identity.x-tenant-username".to_owned(), "bob".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-group".to_owned(), "ml".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-subscription".to_owned(), "sub-7".to_owned());
+    ctx.record_ai_metadata("identity.x-tenant-model".to_owned(), "claude-3".to_owned());
 
     let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
@@ -756,13 +722,9 @@ fn partial_verified_identity_blocks_lower_tiers() {
 
     let mut ctx = make_filter_context(&req);
     // An auth filter that maps only the group claim, no username.
-    ctx.filter_metadata
-        .insert("x-tenant-group".to_owned(), "engineering".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("x-tenant-group".to_owned(), "engineering".to_owned());
     // Guard-captured copy of a forged subscription.
-    ctx.filter_metadata
-        .insert("identity.x-tenant-subscription".to_owned(), "sub-forged".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("identity.x-tenant-subscription".to_owned(), "sub-forged".to_owned());
 
     let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
@@ -782,9 +744,7 @@ fn partial_verified_identity_blocks_lower_tiers() {
 fn custom_namespace_supplies_guard_identity() {
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("tenant-meta.x-tenant-username".to_owned(), "bob".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("tenant-meta.x-tenant-username".to_owned(), "bob".to_owned());
 
     let state = capture_identity(&mut ctx, "x-tenant-", "tenant-meta", None, None);
 
@@ -816,9 +776,7 @@ fn guard_identity_blocks_raw_header_fallback() {
     req.headers.insert("x-tenant-subscription", "raw-sub".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("identity.x-tenant-username".to_owned(), "bob".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("identity.x-tenant-username".to_owned(), "bob".to_owned());
 
     let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
@@ -842,9 +800,7 @@ fn guard_group_only_blocks_raw_header_username() {
         .insert("x-tenant-username", "header-mallory".parse().unwrap());
 
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("identity.x-tenant-group".to_owned(), "ml".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("identity.x-tenant-group".to_owned(), "ml".to_owned());
 
     let state = capture_identity(&mut ctx, "x-tenant-", "identity", None, None);
 
@@ -967,15 +923,9 @@ fn extract_model_returns_none_on_non_string_value() {
 fn reads_token_metadata() {
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("token.input".to_owned(), "150".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("token.output".to_owned(), "80".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("token.total".to_owned(), "230".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("token.input".to_owned(), "150".to_owned());
+    ctx.record_ai_metadata("token.output".to_owned(), "80".to_owned());
+    ctx.record_ai_metadata("token.total".to_owned(), "230".to_owned());
 
     assert_eq!(read_token_meta(&ctx, META_TOKEN_INPUT), 150);
     assert_eq!(read_token_meta(&ctx, META_TOKEN_OUTPUT), 80);
@@ -1029,9 +979,7 @@ async fn request_body_does_not_override_identity_model() {
     let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\n");
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert(META_METERING_MODEL.to_owned(), "from-header".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(META_METERING_MODEL.to_owned(), "from-header".to_owned());
     let mut body = Some(Bytes::from_static(br#"{"model":"from-body"}"#));
 
     let _action = filter.on_request_body(&mut ctx, &mut body, false).await.unwrap();

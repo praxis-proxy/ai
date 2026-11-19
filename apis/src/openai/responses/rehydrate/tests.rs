@@ -9,6 +9,7 @@ use serde_json::json;
 
 use super::*;
 use crate::{
+    RecordAiMetadata as _,
     openai::sse::{SseFrame, SseFrameParser},
     store::{
         BudgetedRecord, ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
@@ -233,9 +234,7 @@ async fn skips_non_responses_format() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_chat_completions")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_chat_completions");
     let mut body = Some(Bytes::from(r#"{"messages":[]}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -264,9 +263,7 @@ async fn skips_cancel_request_without_parsing_empty_body() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/resp_123/cancel");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::new());
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -286,9 +283,7 @@ async fn budgeted_explicit_compact_leaves_store_read_to_compact_filter() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/compact");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     ctx.extensions
         .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
     let mut body = Some(Bytes::from_static(
@@ -315,9 +310,7 @@ async fn passthrough_when_no_previous_response_id() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let original = r#"{"model":"gpt-4.1","input":"Hello"}"#;
     let mut body = Some(Bytes::from(original));
 
@@ -342,9 +335,7 @@ async fn passthrough_when_previous_response_id_is_null() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"Hello","previous_response_id":null}"#,
     ));
@@ -364,9 +355,7 @@ async fn skips_rehydration_when_history_already_restored() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
 
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4.1",
@@ -412,12 +401,8 @@ async fn conformance_responses_validates_previous_response_and_sets_metadata() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("responses.response_id", "resp_current")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("responses.response_id", "resp_current");
     let original = r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_prev"}"#;
     let mut body = Some(Bytes::from(original));
 
@@ -473,12 +458,8 @@ async fn reuses_existing_state_instead_of_reparsing() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("responses.response_id", "resp_current")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("responses.response_id", "resp_current");
     let original = r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_prev"}"#;
 
     // Simulate the managed owner having built state from the same body, with a
@@ -534,9 +515,7 @@ async fn budgeted_previous_response_restores_and_preserves_request_charge() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let before = arm_retained_budget(&mut ctx, request_body, 8_388_608);
     let mut body = Some(Bytes::from(request_body));
 
@@ -563,9 +542,7 @@ async fn budgeted_previous_response_rejects_large_store_row_before_replacement()
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     arm_retained_budget(&mut ctx, request_body, 8_388_608);
     let mut body = Some(Bytes::from(request_body));
 
@@ -592,9 +569,7 @@ async fn budgeted_restore_rejects_sparse_json_before_store_decode() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     arm_retained_budget(&mut ctx, request_body, 8_388_608);
     let mut body = Some(Bytes::from(request_body));
 
@@ -618,9 +593,7 @@ async fn budgeted_restore_admits_file_history_for_metered_expansion() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     arm_retained_budget(&mut ctx, request_body, 8_388_608);
     let mut body = Some(Bytes::from(request_body));
 
@@ -654,9 +627,7 @@ async fn budgeted_conversation_restores_file_history_for_metered_expansion() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let before = arm_retained_budget(&mut ctx, request_body, 8_388_608);
     let mut body = Some(Bytes::from(request_body));
 
@@ -682,9 +653,7 @@ async fn budgeted_conversation_restores_plain_history_with_shared_charge() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let before = arm_retained_budget(&mut ctx, request_body, 8_388_608);
     let mut body = Some(Bytes::from(request_body));
 
@@ -706,9 +675,7 @@ async fn budgeted_conversation_rejects_large_row_before_replay() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     arm_retained_budget(&mut ctx, request_body, 8_388_608);
     let mut body = Some(Bytes::from(request_body));
 
@@ -729,9 +696,7 @@ async fn budget_policy_does_not_require_create_state_for_input_tokens() {
     ctx.extensions.insert(registry);
     ctx.extensions
         .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1","input":"Next turn","previous_response_id":"resp_prev"}"#,
     ));
@@ -752,9 +717,7 @@ async fn budgeted_create_without_budget_state_fails_before_store_read() {
     ctx.extensions.insert(registry);
     ctx.extensions
         .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1","input":"Next turn","previous_response_id":"resp_prev"}"#,
     ));
@@ -783,9 +746,7 @@ async fn store_persist_armed_survives_rehydrate_from_previous_response() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     // The store filter arms persistence earlier in the request phase; rehydrate
     // replaces ResponsesState and must not drop that exchange-scoped marker, or a
     // continuation-turn approval would be falsely rejected as unresumable.
@@ -826,9 +787,7 @@ async fn store_persist_armed_survives_rehydrate_from_conversation() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     ctx.extensions.insert(ResponsesState {
         store_persist_armed: true,
         ..Default::default()
@@ -917,9 +876,7 @@ async fn sqlite_item_history_rehydrates_complete_order_after_delete_and_append_a
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
         let mut ctx = crate::test_utils::make_owned_filter_context(&req);
         ctx.extensions.insert(registry.clone());
-        ctx.filter_metadata
-            .insert("openai_responses_request.format", "openai_responses")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
         let original = Bytes::from(
             serde_json::to_vec(&json!({
                 "model": "gpt-4.1", "input": "next", "conversation": "conv_items", "truncation": truncation
@@ -1096,9 +1053,7 @@ async fn conformance_responses_rejects_when_previous_response_not_found() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_missing"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1158,9 +1113,7 @@ async fn conformance_responses_rejects_when_status_not_completed() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_123"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1180,9 +1133,7 @@ async fn rejects_when_status_incomplete() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_123"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1201,9 +1152,7 @@ async fn rejects_when_status_failed() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_123"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1218,9 +1167,7 @@ async fn rejects_when_store_unavailable() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_123"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1238,9 +1185,7 @@ async fn rejects_when_store_not_registered() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_123"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1255,9 +1200,7 @@ async fn rejects_invalid_json_body() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from("not json"));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1272,9 +1215,7 @@ async fn rejects_non_string_previous_response_id() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":123}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1293,9 +1234,7 @@ async fn rejects_when_store_fetch_fails() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_123"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1314,9 +1253,7 @@ async fn rejects_when_conversation_store_fails() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_abc"}"#,
     ));
@@ -1355,9 +1292,7 @@ async fn extracts_mcp_tools_from_previous_response() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"input":"Follow up","previous_response_id":"resp_mcp"}"#,
     ));
@@ -1411,9 +1346,7 @@ async fn no_previous_tools_when_output_has_no_mcp_items() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_no_mcp"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1458,9 +1391,7 @@ async fn extracts_mcp_tools_from_multiple_servers() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_multi"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1537,9 +1468,7 @@ async fn deduplicates_mcp_tools_independent_of_tool_order() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Next","previous_response_id":"resp_dedupe"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1624,9 +1553,7 @@ async fn extracts_mcp_tools_from_stored_history_when_latest_output_has_none() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"input":"Third turn","previous_response_id":"resp_chain"}"#,
     ));
@@ -1698,9 +1625,7 @@ async fn large_mcp_tool_listing_is_preserved_in_state() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_big"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1739,9 +1664,7 @@ async fn extracts_usage_from_previous_response() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_usage"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1786,9 +1709,7 @@ async fn no_usage_metadata_when_usage_missing() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_no_usage"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1836,9 +1757,7 @@ async fn extracts_partial_usage_fields() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_partial"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -1908,9 +1827,7 @@ async fn fallback_reconstruction_replays_only_canonical_input_items() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"Next","previous_response_id":"resp_mcp_fb"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2090,9 +2007,7 @@ async fn large_history_accepted_without_rejection() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"input":"next","previous_response_id":"resp_big"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2125,9 +2040,7 @@ async fn truncation_setting_preserved_through_rehydration() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"input":"next","previous_response_id":"resp_trunc","truncation":"auto"}"#,
     ));
@@ -2167,9 +2080,7 @@ async fn an_explicit_null_conversation_is_treated_as_absent() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"count me","conversation":null}"#,
     ));
@@ -2196,12 +2107,8 @@ async fn conformance_responses_rehydrates_from_conversation_string_id() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("responses.response_id", "resp_conversation")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("responses.response_id", "resp_conversation");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"turn two","conversation":"conv_abc"}"#,
     ));
@@ -2248,9 +2155,7 @@ async fn conformance_responses_rehydrates_from_conversation_object_form() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"follow up","conversation":{"id":"conv_obj"}}"#,
     ));
@@ -2295,9 +2200,7 @@ async fn configuration_update_applies_to_native_and_translated_conversation_requ
             let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
             let mut ctx = crate::test_utils::make_owned_filter_context(&req);
             ctx.extensions.insert(registry);
-            ctx.filter_metadata
-                .insert("openai_responses_request.format", "openai_responses")
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
             let mut request = json!({
                 "model": "gpt-4.1", "input": "continue", "conversation": "conv_config",
             });
@@ -2394,9 +2297,7 @@ async fn configuration_update_publishes_merged_default_to_live_request_body() {
             let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
             let mut ctx = crate::test_utils::make_owned_filter_context(&req);
             ctx.extensions.insert(registry);
-            ctx.filter_metadata
-                .insert("openai_responses_request.format", "openai_responses")
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
             let mut request = json!({"model": "gpt-4.1", "input": "continue", "conversation": "conv_config"});
             if let Some(reasoning) = &request_reasoning {
                 request["reasoning"] = reasoning.clone();
@@ -2484,9 +2385,7 @@ async fn rejects_when_conversation_not_found() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_missing"}"#,
     ));
@@ -2507,9 +2406,7 @@ async fn tenant_mismatch_rejects_conversation() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     ctx.extensions.insert(crate::test_utils::test_owner("tenant_b"));
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_abc"}"#,
@@ -2539,9 +2436,7 @@ async fn same_tenant_different_owner_rejects_conversation() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     ctx.extensions.insert(
         StateOwner::from_trusted_parts("default", "test-issuer", "other-subject").expect("test owner should be valid"),
     );
@@ -2572,9 +2467,7 @@ async fn rejects_malformed_conversation_empty_object() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"model":"gpt-4.1","input":"Hi","conversation":{}}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2593,9 +2486,7 @@ async fn rejects_malformed_conversation_numeric() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(r#"{"model":"gpt-4.1","input":"Hi","conversation":42}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2614,9 +2505,7 @@ async fn empty_conversation_produces_valid_state() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"first message","conversation":"conv_empty"}"#,
     ));
@@ -2644,9 +2533,7 @@ async fn conversation_rehydration_requires_store_registry() {
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_123"}"#,
     ));
@@ -2667,9 +2554,7 @@ async fn conversation_null_messages_treated_as_empty() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry.clone());
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"test","conversation":"conv_null_msgs"}"#,
     ));

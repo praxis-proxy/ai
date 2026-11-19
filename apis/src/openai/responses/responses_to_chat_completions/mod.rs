@@ -47,6 +47,7 @@ use super::{
     state::ResponsesState,
 };
 use crate::{
+    RecordAiMetadata as _,
     classifier::is_responses_create,
     json_body::MAX_JSON_BODY_BYTES,
     openai::translation::{
@@ -300,9 +301,7 @@ impl ResponsesToChatCompletionsFilter {
     ) -> Result<FilterAction, FilterError> {
         if !reserve_finite_chat_response(ctx, body.as_deref().unwrap_or_default()) {
             *body = None;
-            ctx.filter_metadata
-                .insert("responses.skip_persist", "true")
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata("responses.skip_persist", "true");
             return Ok(FilterAction::Reject(responses_error_rejection(
                 502,
                 "server_error",
@@ -371,9 +370,7 @@ impl ResponsesToChatCompletionsFilter {
             return Ok(FilterAction::Reject(missing_pipeline_state()));
         };
         let Some(output_allowance) = reserve_chat_stream_snapshots(ctx) else {
-            ctx.filter_metadata
-                .insert("responses.skip_persist", "true")
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata("responses.skip_persist", "true");
             return Ok(FilterAction::Reject(responses_error_rejection(
                 502,
                 "server_error",
@@ -646,15 +643,9 @@ fn chat_stream_budget_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<B
     if let Some(exchange) = ctx.get_filter_state_mut::<Exchange>() {
         exchange.response = Some(ResponseTranslation::StreamBudgetFailed);
     }
-    ctx.filter_metadata
-        .insert("responses.stream_error_code", "server_error")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("responses.stream_error_message", CHAT_RESPONSE_OVERFLOW)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("responses.skip_persist", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.stream_error_code", "server_error");
+    ctx.record_ai_metadata("responses.stream_error_message", CHAT_RESPONSE_OVERFLOW);
+    ctx.record_ai_metadata("responses.skip_persist", "true");
     super::fs_arm_stream_stop(ctx);
     FilterAction::Continue
 }

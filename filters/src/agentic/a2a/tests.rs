@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use bytes::Bytes;
 use http::HeaderMap;
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{FilterAction, HttpFilter as _};
 
 use super::{
@@ -1926,9 +1927,7 @@ async fn on_response_enables_capture_for_success_non_sse_send_message() {
     let req = make_a2a_request(&[]);
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendMessage".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -1949,9 +1948,7 @@ async fn sse_response_skips_task_route_capture() {
     let req = make_a2a_request(&[]);
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendMessage".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -1983,9 +1980,7 @@ async fn mixed_case_sse_content_type_skips_capture() {
     let req = make_a2a_request(&[]);
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendMessage".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -2688,9 +2683,7 @@ async fn sse_streaming_response_enables_capture_for_send_streaming_message() {
     let req = make_a2a_request(&[]);
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendStreamingMessage".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendStreamingMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -2992,9 +2985,7 @@ async fn non_sse_response_does_not_enter_sse_capture_path() {
     let req = make_a2a_request(&[]);
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendStreamingMessage".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendStreamingMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -3021,9 +3012,7 @@ async fn non_sse_response_falls_through_to_non_streaming_capture() {
         let req = make_a2a_request(&[]);
         let mut ctx = make_ctx(&req);
         ctx.cluster = Some(Arc::from("agent-a"));
-        ctx.filter_metadata
-            .insert("a2a.method".to_owned(), method.to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("a2a.method".to_owned(), method.to_owned());
 
         let mut resp = praxis_filter::Response {
             status: http::StatusCode::OK,
@@ -3055,9 +3044,7 @@ async fn wrong_method_does_not_enter_sse_capture() {
     let req = make_a2a_request(&[]);
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "GetTask".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("a2a.method".to_owned(), "GetTask".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -3085,9 +3072,7 @@ async fn error_sse_response_does_not_enable_capture() {
         let req = make_a2a_request(&[]);
         let mut ctx = make_ctx(&req);
         ctx.cluster = Some(Arc::from("agent-a"));
-        ctx.filter_metadata
-            .insert("a2a.method".to_owned(), method.to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("a2a.method".to_owned(), method.to_owned());
 
         let mut resp = praxis_filter::Response {
             status: http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -3138,9 +3123,7 @@ async fn sse_streaming_capture_mixed_case_content_type() {
     let req = make_a2a_request(&[]);
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SendStreamingMessage".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SendStreamingMessage".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,
@@ -3314,9 +3297,7 @@ async fn on_response_enables_capture_for_success_sse_subscribe_to_task() {
     let req = make_a2a_request(&[]);
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some(Arc::from("agent-a"));
-    ctx.filter_metadata
-        .insert("a2a.method".to_owned(), "SubscribeToTask".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("a2a.method".to_owned(), "SubscribeToTask".to_owned());
 
     let mut resp = praxis_filter::Response {
         status: http::StatusCode::OK,

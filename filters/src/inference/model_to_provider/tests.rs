@@ -5,6 +5,7 @@
 
 use bytes::Bytes;
 use http::Method;
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::FilterAction;
 use serde_json::json;
 
@@ -210,9 +211,7 @@ async fn unmatched_complete_bodies_clear_staged_state() {
         let request = make_request(Method::POST, path);
         let mut ctx = context(&request);
         ctx.insert_filter_state(ResolvedUpstream(Arc::from("stale")));
-        ctx.filter_metadata
-            .insert(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "stale-model")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "stale-model");
         let mut body = raw.map(|value| Bytes::copy_from_slice(value.as_bytes()));
         assert_continue(&filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
         assert_continue(&filter.on_request(&mut ctx).await.unwrap());

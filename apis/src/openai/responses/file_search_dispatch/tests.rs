@@ -28,7 +28,7 @@ use super::{
     *,
 };
 use crate::{
-    CalloutCredentials, StateOwner,
+    CalloutCredentials, RecordAiMetadata as _, StateOwner,
     callout_policy::OnFailure,
     openai::responses::{
         agentic_loop::budget::SimpleBudget,
@@ -2112,9 +2112,7 @@ fn make_context_with_request_headers(
     }
     let request = Box::leak(Box::new(request));
     let mut ctx = crate::test_utils::make_filter_context(request);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "false")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.stream", "false");
     if let Some(state) = state {
         ctx.extensions.insert(state);
     }

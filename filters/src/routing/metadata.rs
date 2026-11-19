@@ -9,6 +9,7 @@
 //! client-supplied values before setting replacements. Provider gateways consume
 //! peer fields only after mTLS peer authentication and authorization.
 
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::HttpFilterContext;
 use serde::Deserialize;
 
@@ -139,18 +140,10 @@ pub(crate) fn set_credential_metadata(ctx: &mut HttpFilterContext<'_>, credentia
     let Some(credential) = credential else {
         return;
     };
-    ctx.filter_metadata
-        .insert(CREDENTIAL_STRATEGY, &credential.strategy)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(CREDENTIAL_NAME, &credential.secret_ref.name)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(CREDENTIAL_NAMESPACE, &credential.secret_ref.namespace)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(CREDENTIAL_KEY, &credential.secret_ref.key)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(CREDENTIAL_STRATEGY, &credential.strategy);
+    ctx.record_ai_metadata(CREDENTIAL_NAME, &credential.secret_ref.name);
+    ctx.record_ai_metadata(CREDENTIAL_NAMESPACE, &credential.secret_ref.namespace);
+    ctx.record_ai_metadata(CREDENTIAL_KEY, &credential.secret_ref.key);
 }
 
 /// Remove any previously written credential-reference metadata.

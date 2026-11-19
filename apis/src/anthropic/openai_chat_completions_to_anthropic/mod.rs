@@ -23,6 +23,7 @@ use praxis_filter::{
 pub(crate) use response::{map_stop_reason, total_input_tokens};
 
 use self::config::OpenaiChatCompletionsToAnthropicConfig;
+use crate::RecordAiMetadata as _;
 
 /// Registered filter identifier.
 const FILTER_NAME: &str = "openai_chat_completions_to_anthropic";
@@ -161,9 +162,7 @@ impl OpenaiChatCompletionsToAnthropicFilter {
             {
                 return Err(format!("{FILTER_NAME}: selected provider profile changed during the request").into());
             }
-            ctx.filter_metadata
-                .insert(&bound_key, value)
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata(&bound_key, value);
         }
         Ok(())
     }
@@ -348,15 +347,9 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
                 )));
             },
         };
-        ctx.filter_metadata
-            .insert(REQUEST_STREAM, request.stream.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(CLIENT_MODEL, request.client_model)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(INCLUDE_USAGE, request.include_usage.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(REQUEST_STREAM, request.stream.to_string());
+        ctx.record_ai_metadata(CLIENT_MODEL, request.client_model);
+        ctx.record_ai_metadata(INCLUDE_USAGE, request.include_usage.to_string());
         *body = Some(Bytes::from(translated));
         Ok(SelectedUpstreamBodyOutcome::Continue)
     }
@@ -408,15 +401,9 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
                 .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
             ctx.response_headers_modified = true;
         }
-        ctx.filter_metadata
-            .insert(RESPONSE_ARMED, "true")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(RESPONSE_ERROR, (!success).to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(RESPONSE_STATUS, status.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(RESPONSE_ARMED, "true");
+        ctx.record_ai_metadata(RESPONSE_ERROR, (!success).to_string());
+        ctx.record_ai_metadata(RESPONSE_STATUS, status.to_string());
         Ok(FilterAction::Continue)
     }
 

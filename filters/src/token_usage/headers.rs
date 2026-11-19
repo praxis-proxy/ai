@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config};
 use tracing::trace;
 
@@ -160,15 +161,9 @@ mod tests {
     use super::*;
 
     fn set_token_metadata(ctx: &mut HttpFilterContext<'_>, input: &str, output: &str, total: &str) {
-        ctx.filter_metadata
-            .insert(META_TOKEN_INPUT, input.to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(META_TOKEN_OUTPUT, output.to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(META_TOKEN_TOTAL, total.to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(META_TOKEN_INPUT, input.to_owned());
+        ctx.record_ai_metadata(META_TOKEN_OUTPUT, output.to_owned());
+        ctx.record_ai_metadata(META_TOKEN_TOTAL, total.to_owned());
     }
 
     #[tokio::test]
@@ -221,9 +216,7 @@ mod tests {
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = crate::test_utils::make_filter_context(&req);
 
-        ctx.filter_metadata
-            .insert(META_TOKEN_INPUT, "200".to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(META_TOKEN_INPUT, "200".to_owned());
 
         let mut resp = crate::test_utils::make_response();
         ctx.response_header = Some(&mut resp);
@@ -287,15 +280,9 @@ mod tests {
         let filter = TokenUsageHeadersFilter;
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.filter_metadata
-            .insert(META_TOKEN_INPUT, "100".to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(META_TOKEN_OUTPUT, "bad\nvalue".to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(META_TOKEN_TOTAL, "200".to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(META_TOKEN_INPUT, "100".to_owned());
+        ctx.record_ai_metadata(META_TOKEN_OUTPUT, "bad\nvalue".to_owned());
+        ctx.record_ai_metadata(META_TOKEN_TOTAL, "200".to_owned());
 
         let mut resp = crate::test_utils::make_response();
         ctx.response_header = Some(&mut resp);
@@ -321,9 +308,7 @@ mod tests {
         let filter = TokenUsageHeadersFilter;
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.filter_metadata
-            .insert(META_TOKEN_STATUS, "overflow".to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(META_TOKEN_STATUS, "overflow".to_owned());
 
         let mut resp = crate::test_utils::make_response();
         ctx.response_header = Some(&mut resp);

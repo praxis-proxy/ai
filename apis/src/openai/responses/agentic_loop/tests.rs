@@ -16,6 +16,7 @@ use crate::openai::responses::mcp_admission::ConnectorToolPolicy;
 #[cfg(feature = "openai-mcp-tools")]
 use crate::openai::responses::state::DeferredMcpConnector;
 use crate::{
+    RecordAiMetadata as _,
     openai::responses::state::{
         DispatchFailure, FileSearchAssignment, McpApprovalState, ResponsesState, SynthesisKind,
     },
@@ -1087,9 +1088,7 @@ async fn on_request_allows_typed_streaming_with_logical_stream() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
-    ctx.filter_metadata
-        .insert("responses.logical_stream", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.logical_stream", "true");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
 
@@ -1140,9 +1139,7 @@ async fn selected_adapter_accepts_deferred_streaming_with_logical_stream() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("responses.logical_stream", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.logical_stream", "true");
 
     assert!(matches!(
         filter.on_request(&mut ctx).await.unwrap(),
@@ -1497,9 +1494,7 @@ fn incomplete_stream_does_not_dispatch_accumulated_tool_call() {
             "content": [{"type": "output_text", "text": "partial"}]
         }]
     });
-    ctx.filter_metadata
-        .insert("responses.stream_completion", "terminal")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -1552,9 +1547,7 @@ fn failed_stream_does_not_dispatch_accumulated_tool_call() {
             "content": [{"type": "output_text", "text": "before failure"}]
         }]
     });
-    ctx.filter_metadata
-        .insert("responses.stream_completion", "terminal")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -1596,9 +1589,7 @@ fn streamed_web_search_call_is_available_to_dispatch_filter() {
             "action": {"type": "search", "query": "Praxis"}
         }]
     });
-    ctx.filter_metadata
-        .insert("responses.stream_completion", "terminal")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -1639,9 +1630,7 @@ fn multiple_streamed_client_function_calls_end_done() {
         {"type": "function_call", "call_id": "call_1", "name": "first", "status": "completed"},
         {"type": "function_call", "call_id": "call_2", "name": "second", "status": "completed"}
     ]});
-    ctx.filter_metadata
-        .insert("responses.stream_completion", "terminal")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -1680,9 +1669,7 @@ fn mixed_streamed_function_call_ownership_fails_before_dispatch() {
         {"type": "function_call", "call_id": "call_1", "name": "server__lookup", "status": "completed"},
         {"type": "function_call", "call_id": "call_2", "name": "client", "status": "completed"}
     ]});
-    ctx.filter_metadata
-        .insert("responses.stream_completion", "terminal")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
     let mut body: Option<Bytes> = None;
@@ -1725,9 +1712,7 @@ fn streaming_iteration_limit_ends_with_sse_error() {
         {"type": "function_call", "call_id": "call_limit", "name": "server__lookup", "status": "completed"},
         {"type": "tool_search_call", "id": "tsc_limit", "status": "completed"}
     ]});
-    ctx.filter_metadata
-        .insert("responses.stream_completion", "terminal")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -3354,9 +3339,7 @@ fn streamed_tool_search_call_is_queued_for_deferred_discovery() {
             "status": "completed"
         }]
     });
-    ctx.filter_metadata
-        .insert("responses.stream_completion", "terminal")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -3403,9 +3386,7 @@ fn streamed_client_executed_tool_search_call_is_returned_without_deferred_discov
             "execution": "client"
         }]
     });
-    ctx.filter_metadata
-        .insert("responses.stream_completion", "terminal")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -3460,9 +3441,7 @@ fn streamed_incomplete_tool_search_call_is_not_queued() {
             "status": "incomplete"
         }]
     });
-    ctx.filter_metadata
-        .insert("responses.stream_completion", "terminal")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();

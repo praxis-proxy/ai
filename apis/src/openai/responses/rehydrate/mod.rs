@@ -60,7 +60,7 @@ use super::{
     state::{LOCAL_COMPACTION_MARKER, ResponsesState, strip_local_compaction_marker},
 };
 use crate::{
-    is_event_stream_content_type,
+    RecordAiMetadata as _, is_event_stream_content_type,
     json_body::{MAX_JSON_BODY_BYTES, replace_json_body},
     state_owner::{StateOwner, require_state_owner},
     store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry, StoreError},
@@ -239,9 +239,7 @@ impl RehydrateFilter {
         state.restore_citation_files(citation_files);
         install_rehydrated_state(ctx, state);
         debug!(previous_response_id = %prev_id, "previous response validated, state populated");
-        ctx.filter_metadata
-            .insert("responses.previous_response_id", prev_id)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("responses.previous_response_id", prev_id);
         Ok(FilterAction::Release)
     }
 
@@ -1797,21 +1795,15 @@ fn write_previous_usage_metadata(ctx: &mut HttpFilterContext<'_>, usage: Option<
     };
 
     if let Some(input) = usage.get("input_tokens").and_then(Value::as_u64) {
-        ctx.filter_metadata
-            .insert(PREV_USAGE_INPUT_KEY, input.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(PREV_USAGE_INPUT_KEY, input.to_string());
     }
 
     if let Some(output) = usage.get("output_tokens").and_then(Value::as_u64) {
-        ctx.filter_metadata
-            .insert(PREV_USAGE_OUTPUT_KEY, output.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(PREV_USAGE_OUTPUT_KEY, output.to_string());
     }
 
     if let Some(total) = usage.get("total_tokens").and_then(Value::as_u64) {
-        ctx.filter_metadata
-            .insert(PREV_USAGE_TOTAL_KEY, total.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(PREV_USAGE_TOTAL_KEY, total.to_string());
     }
 
     trace!("extracted previous response usage");

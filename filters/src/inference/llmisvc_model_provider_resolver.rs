@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderName;
-use praxis_ai_apis::json_body::replace_json_body;
+use praxis_ai_apis::{RecordAiMetadata as _, json_body::replace_json_body};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, PendingHeaderResult, Rejection,
     builtins::http::payload_processing::config_validation::validate_max_body_bytes, parse_filter_config,
@@ -169,9 +169,7 @@ impl LlmisvcModelProviderResolverFilter {
         match rewrite_publisher_body_model(body, short_name, self.name())? {
             PublisherBodyRewrite::Noop => {},
             PublisherBodyRewrite::Matched { rewritten } => {
-                ctx.filter_metadata
-                    .insert(META_PUBLISHER_ID, model_name.as_str())
-                    .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+                ctx.record_ai_metadata(META_PUBLISHER_ID, model_name.as_str());
                 if rewritten {
                     debug!(
                         original = %model_name,

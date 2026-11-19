@@ -22,6 +22,7 @@ use super::{
     canonicalize_logical_response, encode_local_completion, encode_local_error,
 };
 use crate::{
+    RecordAiMetadata as _,
     openai::{
         responses::{
             agentic_loop::budget::SimpleBudget,
@@ -1135,12 +1136,8 @@ async fn on_request_rejects_streaming_responses_outside_irr() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "true".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -1196,12 +1193,8 @@ async fn does_not_arm_for_non_streaming() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "false".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "false".to_owned());
     ctx.current_filter_id = Some(0);
 
     let _action = filter.on_request(&mut ctx).await.unwrap();
@@ -1216,12 +1209,8 @@ async fn does_not_arm_for_non_responses_format() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_chat_completions".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "true".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_chat_completions".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
     let _action = filter.on_request(&mut ctx).await.unwrap();
@@ -1240,12 +1229,8 @@ async fn does_not_arm_for_other_responses_routes() {
         let filter = make_filter();
         let req = make_request(method, path);
         let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-        ctx.filter_metadata
-            .insert("openai_responses_request.format", "openai_responses".to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert("openai_responses_request.stream", "true".to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+        ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
         ctx.current_filter_id = Some(0);
 
         let action = filter.on_request(&mut ctx).await.unwrap();
@@ -5417,12 +5402,8 @@ async fn tool_call_argument_bytes_cap_enforced() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "true".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
     filter.arm(&mut ctx);
@@ -5466,12 +5447,8 @@ async fn tool_call_argument_bytes_cap_rejects_restart_after_overflow() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "true".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     filter.arm(&mut ctx);
 
@@ -5516,12 +5493,8 @@ async fn tool_call_argument_bytes_cap_rejects_oversized_done_payload() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "true".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     filter.arm(&mut ctx);
 
@@ -5570,12 +5543,8 @@ async fn tool_call_argument_bytes_within_limit() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "true".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
 
     filter.arm(&mut ctx);
@@ -5687,12 +5656,8 @@ async fn on_request_keeps_accept_encoding_when_not_arming() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "false".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "false".to_owned());
     ctx.current_filter_id = Some(0);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -5793,12 +5758,8 @@ async fn apply_arm_does_not_cap_timeout_before_first_chunk() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "true".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     ctx.upstream = Some(Upstream {
         address: Arc::from("127.0.0.1:9"),
@@ -5978,12 +5939,8 @@ async fn stream_deadline_recaps_live_body_on_irr_body_context() {
     let filter = StreamEventsFilter::build(&yaml).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "true".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     ctx.upstream = Some(Upstream {
         address: Arc::from("127.0.0.1:9"),
@@ -6456,9 +6413,7 @@ fn drain_defers_still_pending_item() {
 #[test]
 fn drain_pre_existing_error_suppresses_synthesis() {
     let mut ctx = test_ctx_without_file_search_tool();
-    ctx.filter_metadata
-        .insert("responses.stream_error_code", "server_error")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss); // set before drain
+    ctx.record_ai_metadata("responses.stream_error_code", "server_error"); // set before drain
     let mut state = ResponsesState::default();
     state.accumulated_output = vec![json!({"type":"file_search_call","status":"completed","results":[]})];
     state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Native)]; // a VALID queued item
@@ -6541,12 +6496,8 @@ async fn native_progress_precedes_closed_error_ordering() {
         .or_default()
         .set("action", "done")
         .unwrap();
-    ctx.filter_metadata
-        .insert("responses.stream_error_code", "server_error")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("responses.stream_error_message", "file_search failed")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.stream_error_code", "server_error");
+    ctx.record_ai_metadata("responses.stream_error_message", "file_search failed");
 
     // Call finalizer → should emit error frame
     let mut eos = None;
@@ -7387,12 +7338,8 @@ fn make_armed_context_with_filter(
 ) -> (StreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "true".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses".to_owned());
+    ctx.record_ai_metadata("openai_responses_request.stream", "true".to_owned());
     ctx.current_filter_id = Some(0);
     filter.arm(&mut ctx);
     (filter, ctx)

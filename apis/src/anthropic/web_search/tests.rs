@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::{
-    CalloutCredentials,
+    CalloutCredentials, RecordAiMetadata as _,
     callout_identity::CalloutIdentity,
     test_utils::{make_filter_context, make_request, make_response},
     web_search::config::MAX_SEARCH_QUERY_BYTES,
@@ -644,9 +644,7 @@ async fn buffered_response_rejected_from_recorded_raw_size_after_translation_shr
         body.as_ref().unwrap().len() < 1024,
         "the observed (translated) body must be under max_body_bytes",
     );
-    ctx.filter_metadata
-        .insert(RESPONSE_RAW_BYTES_KEY, "8192")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(RESPONSE_RAW_BYTES_KEY, "8192");
 
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
 
@@ -673,9 +671,7 @@ async fn buffered_response_rejected_when_translation_expands_body_over_limit() {
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = initialized_context(&request).await;
     // The raw upstream round was small; only the translated body is oversized.
-    ctx.filter_metadata
-        .insert(RESPONSE_RAW_BYTES_KEY, "512")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(RESPONSE_RAW_BYTES_KEY, "512");
     let mut body = Some(message_response(
         json!([{"type":"text","text":"x".repeat(4096)}]),
         "end_turn",

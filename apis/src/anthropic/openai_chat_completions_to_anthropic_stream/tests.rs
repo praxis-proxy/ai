@@ -6,6 +6,7 @@ use http::{HeaderValue, StatusCode};
 use praxis_filter::{FilterAction, HttpFilter, Response};
 
 use super::{ARMED, OpenaiChatCompletionsToAnthropicStreamFilter};
+use crate::RecordAiMetadata as _;
 
 const EVENTS: &str = concat!(
     "event: message_start\n",
@@ -33,9 +34,7 @@ async fn converts_anthropic_sse_incrementally_and_emits_openai_termination_and_u
         FilterAction::Continue
     ));
     assert_eq!(ctx.filter_metadata.get(ARMED), Some("true"));
-    ctx.filter_metadata
-        .insert("intelligent_route.api_format", "openai-chat")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("intelligent_route.api_format", "openai-chat");
 
     let split = EVENTS.find("event: content_block_delta").unwrap();
     let mut first = Some(Bytes::copy_from_slice(&EVENTS.as_bytes()[..split]));
@@ -176,9 +175,7 @@ async fn leaves_openai_candidate_response_unmodified() {
     let mut ctx = crate::test_utils::make_filter_context(&request);
     arm(&mut ctx, false);
     ctx.response_header = Some(&mut response);
-    ctx.filter_metadata
-        .insert("openai_chat_completions_to_anthropic.bound.api_format", "openai-chat")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_chat_completions_to_anthropic.bound.api_format", "openai-chat");
     assert!(matches!(
         filter.on_response(&mut ctx).await.unwrap(),
         FilterAction::Continue
@@ -265,21 +262,13 @@ fn arm(ctx: &mut praxis_filter::HttpFilterContext<'_>, include_usage: bool) {
     // Pipeline execution sets this before each filter callback; the test
     // context helper intentionally leaves it unset.
     ctx.current_filter_id = Some(1);
-    ctx.filter_metadata
-        .insert("openai_chat_completions_to_anthropic.bound.api_format", "messages")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_chat_completions_to_anthropic.request_stream", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_chat_completions_to_anthropic.client_model", "client-model")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(
-            "openai_chat_completions_to_anthropic_stream.include_usage",
-            include_usage.to_string(),
-        )
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_chat_completions_to_anthropic.bound.api_format", "messages");
+    ctx.record_ai_metadata("openai_chat_completions_to_anthropic.request_stream", "true");
+    ctx.record_ai_metadata("openai_chat_completions_to_anthropic.client_model", "client-model");
+    ctx.record_ai_metadata(
+        "openai_chat_completions_to_anthropic_stream.include_usage",
+        include_usage.to_string(),
+    );
 }
 
 fn sse_response() -> Response {

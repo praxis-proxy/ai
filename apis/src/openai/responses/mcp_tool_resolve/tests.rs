@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::*;
+use crate::RecordAiMetadata as _;
 
 /// Capture WARN messages emitted on this test thread without changing the
 /// process-wide tracing subscriber shared by parallel tests.
@@ -130,9 +131,7 @@ async fn budgeted_mcp_resolve_requires_shared_budget_before_discovery() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&request);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
     ctx.extensions
         .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
     let raw =
@@ -158,9 +157,7 @@ async fn budgeted_eager_mcp_discovery_rewrites_tools_and_settles_reservation() {
     let filter = McpToolResolveFilter::from_config_allow_private(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&request);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
     ctx.extensions
         .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
     let request_body = serde_json::json!({
@@ -283,9 +280,7 @@ connectors:
     let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&request);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4o","tools":[{"type":"mcp","server_label":"corp","connector_id":"trusted"}]}"#,
     ));
@@ -310,9 +305,7 @@ connectors:
     ctx.extensions.insert(
         StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").expect("trusted owner should be valid"),
     );
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4o","tools":[{"type":"mcp","server_label":"corp","connector_id":"trusted"}]}"#,
     ));
@@ -339,9 +332,7 @@ connectors:
     ctx.extensions.insert(
         StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").expect("trusted owner should be valid"),
     );
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4o","tools":[{"type":"mcp","server_label":"corp","connector_id":"trusted"}]}"#,
     ));
@@ -865,9 +856,7 @@ async fn cache_hit_populates_mcp_tool_map_on_existing_state() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
@@ -903,9 +892,7 @@ async fn rewritten_body_over_limit_rejected_with_413() {
         McpToolResolveFilter::from_config(&serde_yaml::from_str("max_rewritten_body_bytes: 10").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
@@ -932,9 +919,7 @@ async fn rewritten_body_under_limit_committed() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
@@ -970,9 +955,7 @@ async fn cache_hit_with_blocked_url_still_rejected() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = mcp_body("http://127.0.0.1/mcp");
     let mut state = ResponsesState::from_request_body(body_json.clone());
@@ -998,9 +981,7 @@ async fn no_spurious_state_creation_without_existing_state() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = mcp_body("http://127.0.0.1:1/mcp");
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
@@ -1021,9 +1002,7 @@ async fn connector_id_entry_without_configured_connectors_rejected() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o", "input": "test",
@@ -1044,9 +1023,7 @@ async fn missing_server_label_skips_resolution() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o", "input": "test",
@@ -1066,9 +1043,7 @@ async fn defer_loading_true_skips_eager_resolution() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o", "input": "test",
@@ -1597,9 +1572,7 @@ async fn connector_id_entry_without_configured_connectors_rejects_with_400() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o", "input": "test",
@@ -1622,9 +1595,7 @@ async fn require_connector_rejects_direct_server_url_before_identity_or_callout(
     let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("require_connector: true").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o",
@@ -1853,9 +1824,7 @@ async fn dedup_cache_miss_when_partial_cache_covers_only_representative() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let server_url = "http://10.0.0.5/mcp";
     let body_json = serde_json::json!({
@@ -1968,9 +1937,7 @@ async fn max_servers_exceeded_returns_rejection() {
     let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o", "input": "test",
@@ -2004,9 +1971,7 @@ connectors:
     let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o", "input": "test",
@@ -2030,9 +1995,7 @@ async fn deferred_entries_not_counted_against_max_servers() {
     let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o", "input": "test",
@@ -3408,9 +3371,7 @@ async fn duplicate_label_entries_rejected_at_filter_level() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o", "input": "test",
@@ -3464,9 +3425,7 @@ async fn expanded_body_exceeding_limit_returns_413() {
     let filter = filter_with_max_rewritten_body_bytes(256);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
@@ -3505,9 +3464,7 @@ async fn expanded_body_counts_input_toward_limit() {
     let filter = filter_with_max_rewritten_body_bytes(2048);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let server_url = "http://8.8.8.8/mcp";
     let mut body_json = mcp_body(server_url);
@@ -3542,9 +3499,7 @@ async fn expanded_body_within_limit_continues() {
     let filter = filter_with_max_rewritten_body_bytes(1_048_576);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
@@ -3572,9 +3527,7 @@ async fn measure_expanded_body_len(server_url: &str, cached: &[serde_json::Value
     let body_json = mcp_body(server_url);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
         "server_label": "weather", "server_url": server_url, "tools": cached,
@@ -3600,9 +3553,7 @@ async fn expanded_body_at_exact_limit_continues() {
     let body_json = mcp_body(server_url);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
         "server_label": "weather", "server_url": server_url, "tools": cached,
@@ -4061,9 +4012,7 @@ async fn connector_entry_rejected_when_no_connectors_configured() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o", "input": "test",
@@ -4094,9 +4043,7 @@ connectors:
     let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o", "input": "test",
@@ -4131,9 +4078,7 @@ connectors:
     let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o", "input": "test",
@@ -4168,12 +4113,8 @@ connectors:
     let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_tool_search", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
+    ctx.record_ai_metadata("openai_tool_parse.has_tool_search", "true");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o", "input": "test",
@@ -4735,9 +4676,7 @@ connectors:
     let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o", "input": "test",
@@ -4769,9 +4708,7 @@ connectors:
     let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o", "input": "test",
@@ -5034,9 +4971,7 @@ async fn zero_permitted_tools_does_not_leak_credentials_to_backend() {
     let filter = McpToolResolveFilter::from_config_allow_private(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o",
@@ -5090,15 +5025,9 @@ async fn streaming_list_failure_emits_conformant_mcp_failure_lifecycle() {
     // pipeline index, which the real pre-read machinery sets. Emulate it so the
     // body-phase stash survives into the header phase.
     ctx.current_filter_id = Some(0);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("responses.response_id", "resp_listing_failure")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
+    ctx.record_ai_metadata("openai_responses_request.stream", "true");
+    ctx.record_ai_metadata("responses.response_id", "resp_listing_failure");
 
     let body_json = serde_json::json!({
         "model": "gpt-4o-mini",
@@ -6132,9 +6061,7 @@ async fn cache_hit_seeds_mcp_list_tools_output_item() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
@@ -6384,9 +6311,7 @@ async fn malformed_allowed_tools_string_rejects_before_rewrite() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     let server_url = "http://10.0.0.5/mcp";
     let body_json = serde_json::json!({

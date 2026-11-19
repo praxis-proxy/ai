@@ -21,6 +21,7 @@ mod config;
 mod tests;
 
 use async_trait::async_trait;
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config};
 use tracing::trace;
 
@@ -111,9 +112,7 @@ impl HttpFilter for IdentityHeaderGuardFilter {
                 // legitimate value set by an upstream proxy.
                 let namespaced = format!("{}.{}", self.namespace, name_lower);
                 if !ctx.filter_metadata.contains_key(&namespaced) {
-                    ctx.filter_metadata
-                        .insert(namespaced, val.to_owned())
-                        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+                    ctx.record_ai_metadata(namespaced, val.to_owned());
                     captured += 1;
                 }
             }

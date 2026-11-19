@@ -55,7 +55,7 @@ use self::{
     request::{TransformedRequest, classify, transform_request},
 };
 use crate::{
-    MODEL_PROVIDER_CLIENT_MODEL_METADATA,
+    MODEL_PROVIDER_CLIENT_MODEL_METADATA, RecordAiMetadata as _,
     anthropic::{ErrorType, error_rejection, invalid_request_rejection},
 };
 
@@ -1151,9 +1151,7 @@ mod tests {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = filter_context(&request);
         // model_to_provider mapped a public alias before upstream selection.
-        ctx.filter_metadata
-            .insert(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "public-claude")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "public-claude");
 
         run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
             .await

@@ -4,6 +4,7 @@
 use bytes::Bytes;
 
 use super::*;
+use crate::RecordAiMetadata as _;
 
 // -----------------------------------------------------------------------------
 // Config Parsing — Valid
@@ -1216,12 +1217,8 @@ async fn on_request_repopulates_filter_results_from_metadata() {
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
 
-    ctx.filter_metadata
-        .insert("openai_responses_model_rewrite.effective_model", "llama-3.3-70b")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_responses_model_rewrite.rewritten", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_model_rewrite.effective_model", "llama-3.3-70b");
+    ctx.record_ai_metadata("openai_responses_model_rewrite.rewritten", "true");
 
     ctx.filter_results.clear();
     assert!(

@@ -94,6 +94,7 @@ use super::{
     state::McpApprovalState,
 };
 use crate::{
+    RecordAiMetadata as _,
     callout_headers::effective_body_callout_headers,
     callout_identity::{McpCalloutIdentity, stage_mcp_callout_identity},
     json_body::{MAX_JSON_BODY_BYTES, serialized_len},
@@ -1151,9 +1152,7 @@ impl HttpFilter for McpDispatchFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
-        ctx.filter_metadata
-            .insert(MAX_CALLS_METADATA, self.max_calls_per_round.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
         // Publish the operator approval floor onto typed request state so the
         // owner's response-phase approval partitioning (`prepare_response_round`)
         // applies it this IRR iteration. Unlike `set_metadata` (bounded entry

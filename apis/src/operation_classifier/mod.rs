@@ -58,6 +58,7 @@ use tracing::debug;
 
 use self::config::{OperationClassifierConfig, ValidatedConfig, build_config};
 use crate::{
+    RecordAiMetadata as _,
     anthropic::routes as anthropic_messages_routes,
     openai::{
         chat_completions::routes as chat_completions_routes, conversations::routes as conversations_routes,
@@ -254,12 +255,8 @@ fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: AiOperationMatch) -> 
     let application_protocol = matched.application_protocol.as_str();
 
     ctx.extensions.insert(matched);
-    ctx.filter_metadata
-        .insert("ai_operation.application_protocol", application_protocol)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("ai_operation.operation_id", matched.operation_id)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("ai_operation.application_protocol", application_protocol);
+    ctx.record_ai_metadata("ai_operation.operation_id", matched.operation_id);
 
     let results = ctx.filter_results.entry(FILTER_NAME).or_default();
     results.set("application_protocol", application_protocol)?;

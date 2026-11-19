@@ -64,6 +64,7 @@ use super::agentic_loop::{
 };
 use super::error::responses_error_rejection;
 use crate::{
+    RecordAiMetadata as _,
     classifier::{is_chat_completions_create, is_responses_create},
     json_body::{MAX_JSON_BODY_BYTES, replace_json_body},
     promotion::is_promotable_value,
@@ -506,27 +507,19 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, result: &RewriteResult) {
     if let Some(orig) = &result.original_model
         && is_promotable_value(orig)
     {
-        ctx.filter_metadata
-            .insert("openai_responses_model_rewrite.original_model", orig.clone())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("openai_responses_model_rewrite.original_model", orig.clone());
     }
     if !result.effective_model.is_empty() && is_promotable_value(&result.effective_model) {
-        ctx.filter_metadata
-            .insert(
-                "openai_responses_model_rewrite.effective_model",
-                result.effective_model.clone(),
-            )
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(
+            "openai_responses_model_rewrite.effective_model",
+            result.effective_model.clone(),
+        );
     }
     if result.rewritten {
-        ctx.filter_metadata
-            .insert("openai_responses_model_rewrite.rewritten", "true")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("openai_responses_model_rewrite.rewritten", "true");
     }
     if result.default_injected {
-        ctx.filter_metadata
-            .insert("openai_responses_model_rewrite.default_injected", "true")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("openai_responses_model_rewrite.default_injected", "true");
     }
 }
 

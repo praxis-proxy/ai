@@ -7,11 +7,12 @@
 //! managed-path policy) is covered in `request/tests.rs`, the module that owns
 //! that logic.
 
-#[cfg(feature = "openai-responses")]
 use bytes::Bytes;
 
 #[cfg(feature = "openai-responses")]
 use super::*;
+#[cfg(feature = "openai-responses")]
+use crate::RecordAiMetadata as _;
 
 #[tokio::test]
 #[cfg(feature = "openai-responses")]
@@ -43,14 +44,10 @@ fn dispatchable_requires_terminal_completed_no_parse_error() {
     state.request_body = serde_json::json!({"stream": true});
     // Non-terminal stream: not dispatchable.
     assert!(!streamed_round_is_dispatchable(&ctx, &state));
-    ctx.filter_metadata
-        .insert("responses.stream_completion", "terminal")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.stream_completion", "terminal");
     state.response_object = serde_json::json!({"status": "completed"});
     assert!(streamed_round_is_dispatchable(&ctx, &state));
-    ctx.filter_metadata
-        .insert("responses.stream_parse_error", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("responses.stream_parse_error", "true");
     assert!(
         !streamed_round_is_dispatchable(&ctx, &state),
         "parse error blocks dispatch"

@@ -18,6 +18,7 @@ use std::{
 
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue, header::AUTHORIZATION};
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
 use serde::Deserialize;
 
@@ -236,25 +237,13 @@ impl HttpFilter for ProviderRouteFilter {
         }
 
         ctx.cluster = Some(Arc::clone(&route.cluster));
-        ctx.filter_metadata
-            .insert(PROVIDER_ROUTE_CANDIDATE_ID, &candidate_id)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(PROVIDER_ROUTE_CLUSTER, &*route.cluster)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(PROVIDER_ROUTE_MODEL, &model)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(PROVIDER_ROUTE_PROVIDER_ID, &*self.provider_id)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(PROVIDER_ROUTE_REQUEST_ID, &request_id)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(PROVIDER_ROUTE_CANDIDATE_ID, &candidate_id);
+        ctx.record_ai_metadata(PROVIDER_ROUTE_CLUSTER, &*route.cluster);
+        ctx.record_ai_metadata(PROVIDER_ROUTE_MODEL, &model);
+        ctx.record_ai_metadata(PROVIDER_ROUTE_PROVIDER_ID, &*self.provider_id);
+        ctx.record_ai_metadata(PROVIDER_ROUTE_REQUEST_ID, &request_id);
         if let Some(revision) = &overlay_revision {
-            ctx.filter_metadata
-                .insert(PROVIDER_ROUTE_OVERLAY_REVISION, revision)
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata(PROVIDER_ROUTE_OVERLAY_REVISION, revision);
         }
         set_credential_metadata(ctx, route.credential.as_ref());
         set_provider_headers(ctx, &self.provider_id_header, &request_id, overlay_revision.as_deref())?;
@@ -910,18 +899,10 @@ mod tests {
         let f = make_filter("abc123");
         let req = request_with_peer_context("/v1/chat/completions", "abc123", "req-1", "sim-model-v1");
         let mut ctx = test_utils::make_filter_context(&req);
-        ctx.filter_metadata
-            .insert(CREDENTIAL_STRATEGY, "stale")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(CREDENTIAL_NAME, "stale")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(CREDENTIAL_NAMESPACE, "stale")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(CREDENTIAL_KEY, "stale")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(CREDENTIAL_STRATEGY, "stale");
+        ctx.record_ai_metadata(CREDENTIAL_NAME, "stale");
+        ctx.record_ai_metadata(CREDENTIAL_NAMESPACE, "stale");
+        ctx.record_ai_metadata(CREDENTIAL_KEY, "stale");
         let _action = f.on_request(&mut ctx).await.unwrap();
         for key in [
             CREDENTIAL_STRATEGY,

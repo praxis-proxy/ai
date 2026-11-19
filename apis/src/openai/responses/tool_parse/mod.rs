@@ -39,7 +39,10 @@ use tracing::{debug, trace};
 
 use self::parser::{ParsedTools, parse_tools};
 use super::bound_body_outcome;
-use crate::{classifier::is_responses_create, json_body::MAX_JSON_BODY_BYTES, promotion::is_promotable_value};
+use crate::{
+    RecordAiMetadata as _, classifier::is_responses_create, json_body::MAX_JSON_BODY_BYTES,
+    promotion::is_promotable_value,
+};
 
 // -----------------------------------------------------------------------------
 // ToolParseFilter
@@ -169,15 +172,11 @@ impl HttpFilter for ToolParseFilter {
 /// Write durable metadata that persists across all Pingora lifecycle phases.
 fn write_metadata(ctx: &mut HttpFilterContext<'_>, parsed: &ParsedTools) {
     if parsed.has_tools() {
-        ctx.filter_metadata
-            .insert("openai_tool_parse.has_tools", "true")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("openai_tool_parse.has_tools", "true");
     }
 
     if parsed.function_count > 0 {
-        ctx.filter_metadata
-            .insert("openai_tool_parse.function_count", parsed.function_count.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("openai_tool_parse.function_count", parsed.function_count.to_string());
     }
 
     write_tool_presence_metadata(ctx, parsed);
@@ -185,16 +184,12 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, parsed: &ParsedTools) {
     if let Some(tc) = &parsed.tool_choice {
         let choice = tc.as_str();
         if is_promotable_value(choice) {
-            ctx.filter_metadata
-                .insert("openai_tool_parse.tool_choice", choice)
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata("openai_tool_parse.tool_choice", choice);
         }
         if let Some(type_str) = tc.type_str()
             && is_promotable_value(type_str)
         {
-            ctx.filter_metadata
-                .insert("openai_tool_parse.tool_choice_type", type_str)
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata("openai_tool_parse.tool_choice_type", type_str);
         }
     }
 }
@@ -212,9 +207,7 @@ fn write_tool_presence_metadata(ctx: &mut HttpFilterContext<'_>, parsed: &Parsed
     ];
     for &(key, present) in flags {
         if present {
-            ctx.filter_metadata
-                .insert(key, "true")
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata(key, "true");
         }
     }
 
@@ -223,9 +216,7 @@ fn write_tool_presence_metadata(ctx: &mut HttpFilterContext<'_>, parsed: &Parsed
         .as_ref()
         .and_then(|ws| ws.search_context_size.as_deref())
     {
-        ctx.filter_metadata
-            .insert("tool_parse.search_context_size", size)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("tool_parse.search_context_size", size);
     }
 }
 

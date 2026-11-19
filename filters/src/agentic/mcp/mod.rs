@@ -26,7 +26,7 @@ use std::borrow::Cow;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_ai_apis::promotion::contains_control_chars;
+use praxis_ai_apis::{RecordAiMetadata as _, promotion::contains_control_chars};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     builtins::http::payload_processing::{MAX_DYNAMIC_VALUE_LEN, OnInvalidBehavior, json_rpc::config::JsonRpcConfig},
@@ -360,40 +360,28 @@ fn write_metadata(
 
     let method_str = mcp.method.as_str();
     if !contains_control_chars(method_str) && method_str.len() <= max_len {
-        ctx.filter_metadata
-            .insert("json_rpc.method", method_str)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert("mcp.method", method_str)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("json_rpc.method", method_str);
+        ctx.record_ai_metadata("mcp.method", method_str);
     }
-    ctx.filter_metadata
-        .insert("json_rpc.kind", envelope.kind.as_str())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("json_rpc.kind", envelope.kind.as_str());
 
     if let Some(name) = &mcp.name
         && !contains_control_chars(name)
         && name.len() <= max_len
     {
-        ctx.filter_metadata
-            .insert("mcp.name", name.clone())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("mcp.name", name.clone());
     }
     if let Some(sid) = &mcp.session_id
         && !contains_control_chars(sid)
         && sid.len() <= max_len
     {
-        ctx.filter_metadata
-            .insert("mcp.session_id", sid.clone())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("mcp.session_id", sid.clone());
     }
     if let Some(pv) = &mcp.protocol_version
         && !contains_control_chars(pv)
         && pv.len() <= max_len
     {
-        ctx.filter_metadata
-            .insert("mcp.protocol_version", pv.clone())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("mcp.protocol_version", pv.clone());
     }
 }
 

@@ -7,6 +7,7 @@ use bytes::Bytes;
 use praxis_filter::{BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, HttpFilter};
 
 use super::ToolParseFilter;
+use crate::RecordAiMetadata as _;
 
 // =============================================================================
 // Config Parsing
@@ -682,15 +683,9 @@ async fn restore_presence_flags_from_metadata() {
     let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
     let mut ctx = crate::test_utils::make_filter_context(req);
 
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_tools", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_web_search", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.has_mcp", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.has_tools", "true");
+    ctx.record_ai_metadata("openai_tool_parse.has_web_search", "true");
+    ctx.record_ai_metadata("openai_tool_parse.has_mcp", "true");
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -722,9 +717,7 @@ async fn restore_function_count_from_metadata() {
     let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
     let mut ctx = crate::test_utils::make_filter_context(req);
 
-    ctx.filter_metadata
-        .insert("openai_tool_parse.function_count", "3")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.function_count", "3");
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -757,12 +750,8 @@ async fn restore_tool_choice_from_metadata() {
     let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
     let mut ctx = crate::test_utils::make_filter_context(req);
 
-    ctx.filter_metadata
-        .insert("openai_tool_parse.tool_choice", "required")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("openai_tool_parse.tool_choice_type", "function")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_tool_parse.tool_choice", "required");
+    ctx.record_ai_metadata("openai_tool_parse.tool_choice_type", "function");
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 

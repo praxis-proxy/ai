@@ -73,6 +73,7 @@ use super::{
     config::{ResponseStoreConfig, validate_config},
 };
 use crate::{
+    RecordAiMetadata as _,
     classifier::is_responses_create,
     is_event_stream_content_type,
     json_body::MAX_JSON_BODY_BYTES,
@@ -900,9 +901,7 @@ fn response_is_persistable(ctx: &mut HttpFilterContext<'_>) -> bool {
 
     if !resp.status.is_success() {
         trace!(status = %resp.status, "skipping persistence for non-2xx response");
-        ctx.filter_metadata
-            .insert("responses.skip_persist", "true")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("responses.skip_persist", "true");
         return false;
     }
 
@@ -914,9 +913,7 @@ fn response_is_persistable(ctx: &mut HttpFilterContext<'_>) -> bool {
     let is_persistable_content = is_json_content_type(content_type) || is_event_stream_content_type(content_type);
     if !is_persistable_content {
         trace!("skipping persistence for non-persistable content type");
-        ctx.filter_metadata
-            .insert("responses.skip_persist", "true")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("responses.skip_persist", "true");
         return false;
     }
 

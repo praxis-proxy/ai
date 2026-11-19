@@ -20,6 +20,7 @@ use self::config::OpenaiChatCompletionsToAnthropicStreamConfig;
 use super::openai_chat_completions_to_anthropic::{
     BOUND_PREFIX, CLIENT_MODEL, INCLUDE_USAGE, REQUEST_STREAM, map_stop_reason, total_input_tokens,
 };
+use crate::RecordAiMetadata as _;
 
 /// Registered filter identifier.
 const FILTER_NAME: &str = "openai_chat_completions_to_anthropic_stream";
@@ -413,9 +414,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicStreamFilter {
             model.to_owned(),
             ctx.filter_metadata.get(INCLUDE_USAGE) == Some("true"),
         ));
-        ctx.filter_metadata
-            .insert(ARMED, "true")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(ARMED, "true");
         if let Some(response) = &mut ctx.response_header {
             response.headers.remove(http::header::CONTENT_LENGTH);
             response.headers.insert(

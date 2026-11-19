@@ -4,7 +4,10 @@
 //! Tests for the `openai_web_search_dispatch` filter.
 
 use super::*;
-use crate::{openai::responses::agentic_loop::budget::SimpleBudget, web_search::config::MAX_SEARCH_QUERY_BYTES};
+use crate::{
+    RecordAiMetadata as _, openai::responses::agentic_loop::budget::SimpleBudget,
+    web_search::config::MAX_SEARCH_QUERY_BYTES,
+};
 
 // -----------------------------------------------------------------------------
 // Helper: build filter from YAML
@@ -3353,9 +3356,7 @@ fn build_tool_result_messages_incomplete_with_results_keeps_them() {
 fn bound_streamed_search_action_replaces_invalid_queries() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert(MAX_QUERY_METADATA, "16".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(MAX_QUERY_METADATA, "16".to_owned());
     let oversized = "x".repeat(17);
     for action in [
         serde_json::json!({"type": "search", "query": oversized}),
@@ -3377,9 +3378,7 @@ fn bound_streamed_search_action_replaces_invalid_queries() {
 fn bound_streamed_search_action_keeps_valid_and_queryless_items() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.filter_metadata
-        .insert(MAX_QUERY_METADATA, "16".to_owned())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(MAX_QUERY_METADATA, "16".to_owned());
     for item in [
         serde_json::json!({"type": "web_search_call", "id": "ws_1", "action": {"type": "search", "query": " rust "}}),
         serde_json::json!({"type": "web_search_call", "id": "ws_1", "status": "in_progress"}),

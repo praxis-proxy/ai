@@ -29,7 +29,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use metrics::{SharedString, counter};
-use praxis_ai_apis::{MODEL_PROVIDER_CLIENT_MODEL_METADATA, promotion::is_promotable_value};
+use praxis_ai_apis::{MODEL_PROVIDER_CLIENT_MODEL_METADATA, RecordAiMetadata as _, promotion::is_promotable_value};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
@@ -364,15 +364,9 @@ mod tests {
     }
 
     fn set_counts(ctx: &mut HttpFilterContext<'_>, input: u64, output: u64, total: u64) {
-        ctx.filter_metadata
-            .insert(META_TOKEN_INPUT, input.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(META_TOKEN_OUTPUT, output.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(META_TOKEN_TOTAL, total.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(META_TOKEN_INPUT, input.to_string());
+        ctx.record_ai_metadata(META_TOKEN_OUTPUT, output.to_string());
+        ctx.record_ai_metadata(META_TOKEN_TOTAL, total.to_string());
     }
 
     async fn request(filter: &TokenUsageMetricsFilter, ctx: &mut HttpFilterContext<'_>) {
@@ -472,13 +466,9 @@ mod tests {
         let filter = filter();
         let req = make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
-        ctx.filter_metadata
-            .insert(DEFAULT_TENANT_METADATA_KEY, "alice")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(DEFAULT_TENANT_METADATA_KEY, "alice");
         request(&filter, &mut ctx).await;
-        ctx.filter_metadata
-            .insert(META_METERING_MODEL, "gpt-4o")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(META_METERING_MODEL, "gpt-4o");
         set_counts(&mut ctx, 10, 20, 30);
         let snapshot = emit(&filter, &mut ctx);
         assert_eq!(value(&snapshot, "alice", "gpt-4o", "input"), Some(10));
@@ -490,15 +480,9 @@ mod tests {
     fn resolve_model_skips_invalid_candidates() {
         let req = make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
-        ctx.filter_metadata
-            .insert("openai_responses_request.model", "")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert("anthropic_messages_request.model", "bad\nmodel")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert("model_to_header.model", "gpt-4o")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("openai_responses_request.model", "");
+        ctx.record_ai_metadata("anthropic_messages_request.model", "bad\nmodel");
+        ctx.record_ai_metadata("model_to_header.model", "gpt-4o");
         assert_eq!(resolve_model(&ctx), Some("gpt-4o"));
     }
 
@@ -506,12 +490,8 @@ mod tests {
     fn resolve_model_prefers_preserved_client_model() {
         let req = make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
-        ctx.filter_metadata
-            .insert(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "gpt-4o")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert("openai_chat_completions_request.model", "provider-model")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "gpt-4o");
+        ctx.record_ai_metadata("openai_chat_completions_request.model", "provider-model");
         assert_eq!(resolve_model(&ctx), Some("gpt-4o"));
     }
 
@@ -520,12 +500,8 @@ mod tests {
         let filter = filter();
         let req = make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
-        ctx.filter_metadata
-            .insert(DEFAULT_TENANT_METADATA_KEY, "carol")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert("openai_chat_completions_request.model", "novel-model")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(DEFAULT_TENANT_METADATA_KEY, "carol");
+        ctx.record_ai_metadata("openai_chat_completions_request.model", "novel-model");
         request(&filter, &mut ctx).await;
         set_counts(&mut ctx, 1, 2, 3);
         let snapshot = emit(&filter, &mut ctx);
@@ -540,9 +516,7 @@ mod tests {
         req.headers
             .insert("x-tenant-username", "mallory".parse().expect("valid header"));
         let mut ctx = make_filter_context(&req);
-        ctx.filter_metadata
-            .insert("identity.x-tenant-username", "mallory")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("identity.x-tenant-username", "mallory");
         request(&filter, &mut ctx).await;
         set_counts(&mut ctx, 1, 2, 3);
         assert!(
@@ -561,18 +535,14 @@ mod tests {
             let filter = filter();
             let req = make_request(http::Method::POST, "/v1/chat/completions");
             let mut ctx = make_filter_context(&req);
-            ctx.filter_metadata
-                .insert(
-                    DEFAULT_TENANT_METADATA_KEY,
-                    if mode == "invalid" { "bad\ntenant" } else { "alice" },
-                )
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata(
+                DEFAULT_TENANT_METADATA_KEY,
+                if mode == "invalid" { "bad\ntenant" } else { "alice" },
+            );
             request(&filter, &mut ctx).await;
             if mode == "overflow" {
                 set_counts(&mut ctx, 1, 2, 3);
-                ctx.filter_metadata
-                    .insert(META_TOKEN_STATUS, TOKEN_STATUS_OVERFLOW)
-                    .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+                ctx.record_ai_metadata(META_TOKEN_STATUS, TOKEN_STATUS_OVERFLOW);
             }
             assert!(
                 emit(&filter, &mut ctx).is_empty(),
@@ -586,9 +556,7 @@ mod tests {
         let filter = filter();
         let req = make_request(http::Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
-        ctx.filter_metadata
-            .insert(DEFAULT_TENANT_METADATA_KEY, "alice")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(DEFAULT_TENANT_METADATA_KEY, "alice");
         request(&filter, &mut ctx).await;
         set_counts(&mut ctx, 10, 20, 30);
         let recorder = metrics_util::debugging::DebuggingRecorder::new();

@@ -33,6 +33,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use http::{HeaderName, HeaderValue};
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
 use serde::Deserialize;
 
@@ -685,9 +686,7 @@ impl IntelligentRouteFilter {
         kind: CapabilityKind,
         name: &str,
     ) -> Result<FilterAction, FilterError> {
-        ctx.filter_metadata
-            .insert(ROUTE_CANDIDATE_COUNT, candidate_count(snap, kind, name).to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(ROUTE_CANDIDATE_COUNT, candidate_count(snap, kind, name).to_string());
         let session_key = self.session_affinity.as_ref().and_then(|a| extract_session_key(a, ctx));
         let outcome = resolve_affinity(
             self.session_affinity.as_ref(),
@@ -1097,15 +1096,9 @@ fn apply_reused(
     #[cfg(feature = "opentelemetry")]
     crate::opentelemetry::record_routing_selection(candidate, local_site, semantic_revision);
     record_selection_metadata(ctx, candidate.selection_group, mode);
-    ctx.filter_metadata
-        .insert("intelligent_route.session.bound", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("intelligent_route.session.reused", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("intelligent_route.session.failover", "false")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("intelligent_route.session.bound", "true");
+    ctx.record_ai_metadata("intelligent_route.session.reused", "true");
+    ctx.record_ai_metadata("intelligent_route.session.failover", "false");
     Ok(FilterAction::Continue)
 }
 
@@ -1148,18 +1141,12 @@ fn record_session(
             SessionEvent::Bound
         });
     }
-    ctx.filter_metadata
-        .insert("intelligent_route.session.bound", if bound { "true" } else { "false" })
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("intelligent_route.session.reused", "false")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(
-            "intelligent_route.session.failover",
-            if failover { "true" } else { "false" },
-        )
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("intelligent_route.session.bound", if bound { "true" } else { "false" });
+    ctx.record_ai_metadata("intelligent_route.session.reused", "false");
+    ctx.record_ai_metadata(
+        "intelligent_route.session.failover",
+        if failover { "true" } else { "false" },
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -1385,9 +1372,7 @@ fn evict_expired(affinity: &SessionAffinity) {
 /// Written on every path, including rejections, so access logs and
 /// dashboards see the same vocabulary.
 fn record_outcome(ctx: &mut HttpFilterContext<'_>, outcome: DecisionOutcome, kind: Option<CapabilityKind>) {
-    ctx.filter_metadata
-        .insert(ROUTE_OUTCOME, outcome.as_str())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(ROUTE_OUTCOME, outcome.as_str());
     metrics::record_decision(outcome, kind);
 }
 
@@ -1417,12 +1402,8 @@ fn candidate_count(snap: &RouteSnapshot, kind: CapabilityKind, name: &str) -> us
 /// Record bounded request metadata without changing forwarding headers.
 fn record_selection_metadata(ctx: &mut HttpFilterContext<'_>, group: Option<u32>, mode: PickerPolicy) {
     if let Some(group) = group {
-        ctx.filter_metadata
-            .insert(ROUTE_SELECTION_GROUP, group.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(ROUTE_SELECTION_MODE, mode.as_str())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(ROUTE_SELECTION_GROUP, group.to_string());
+        ctx.record_ai_metadata(ROUTE_SELECTION_MODE, mode.as_str());
     }
 }
 
@@ -1441,52 +1422,26 @@ fn record_route_decision(
     candidate: &RouteCandidate,
     semantic_revision: Option<&Arc<str>>,
 ) {
-    ctx.filter_metadata
-        .insert(ROUTE_ADMISSION_STATE, candidate.admission_state.as_str())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(ROUTE_CLUSTER, &*candidate.cluster)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(ROUTE_KIND, candidate.kind.as_str())
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(ROUTE_LOCAL_SITE, &**local_site)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(ROUTE_NAME, &*candidate.name)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(ROUTE_SITE, &*candidate.site)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert(ROUTE_STABLE_ID, &*candidate.stable_id)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(ROUTE_ADMISSION_STATE, candidate.admission_state.as_str());
+    ctx.record_ai_metadata(ROUTE_CLUSTER, &*candidate.cluster);
+    ctx.record_ai_metadata(ROUTE_KIND, candidate.kind.as_str());
+    ctx.record_ai_metadata(ROUTE_LOCAL_SITE, &**local_site);
+    ctx.record_ai_metadata(ROUTE_NAME, &*candidate.name);
+    ctx.record_ai_metadata(ROUTE_SITE, &*candidate.site);
+    ctx.record_ai_metadata(ROUTE_STABLE_ID, &*candidate.stable_id);
     if let Some(profile) = &candidate.provider_profile {
-        ctx.filter_metadata
-            .insert(ROUTE_API_FORMAT, profile.api_format.as_str())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(ROUTE_PATH, profile.path.as_ref())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(ROUTE_TARGET_MODEL, profile.target_model.as_ref())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(ROUTE_API_FORMAT, profile.api_format.as_str());
+        ctx.record_ai_metadata(ROUTE_PATH, profile.path.as_ref());
+        ctx.record_ai_metadata(ROUTE_TARGET_MODEL, profile.target_model.as_ref());
     }
     if let Some(revision) = semantic_revision {
-        ctx.filter_metadata
-            .insert(ROUTE_OVERLAY_REVISION, revision.as_ref())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(ROUTE_OVERLAY_REVISION, revision.as_ref());
     }
     if let Some(rank) = candidate.rank {
-        ctx.filter_metadata
-            .insert(ROUTE_RANK, rank.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(ROUTE_RANK, rank.to_string());
     }
     if let Some(tier) = &candidate.selection_tier {
-        ctx.filter_metadata
-            .insert(ROUTE_SELECTION_TIER, &**tier)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(ROUTE_SELECTION_TIER, &**tier);
     }
     set_credential_metadata(ctx, candidate.credential.as_ref());
 }
@@ -1540,9 +1495,7 @@ fn write_provider_context(
         ctx.request_headers_to_set
             .push((HeaderName::from_static(OVERLAY_REVISION_HEADER), rev_value));
     }
-    ctx.filter_metadata
-        .insert(ROUTE_PROVIDER_HOP_REQUEST_ID, hop_request_id)
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(ROUTE_PROVIDER_HOP_REQUEST_ID, hop_request_id);
     Ok(())
 }
 
@@ -2181,12 +2134,8 @@ mod tests {
         ]);
         let req = crate::test_utils::make_request(Method::POST, "/mcp");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.filter_metadata
-            .insert("mcp.method", "tools/call")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert("mcp.name", "weather")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("mcp.method", "tools/call");
+        ctx.record_ai_metadata("mcp.name", "weather");
 
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(matches!(action, FilterAction::Continue), "valid MCP tool should route");
@@ -2208,12 +2157,8 @@ mod tests {
         let mut req = crate::test_utils::make_request(Method::POST, "/mcp");
         req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.filter_metadata
-            .insert("mcp.method", "tools/call")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert("mcp.name", "weather")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("mcp.method", "tools/call");
+        ctx.record_ai_metadata("mcp.name", "weather");
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
         assert_eq!(
@@ -2229,9 +2174,7 @@ mod tests {
         let mut req = crate::test_utils::make_request(Method::POST, "/mcp");
         req.headers.insert("X-Model", HeaderValue::from_static("llama"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.filter_metadata
-            .insert("mcp.method", "initialize")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("mcp.method", "initialize");
 
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(
@@ -2247,9 +2190,7 @@ mod tests {
         let f = make_filter(&[("mcp_tool", "weather", "site-c", "c")]);
         let req = crate::test_utils::make_request(Method::POST, "/mcp");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.filter_metadata
-            .insert("mcp.method", "tools/call")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("mcp.method", "tools/call");
         // mcp.name not set
 
         let action = f.on_request(&mut ctx).await.unwrap();
@@ -2265,12 +2206,8 @@ mod tests {
         let f = make_filter(&[("mcp_tool", "weather", "site-c", "c")]);
         let req = crate::test_utils::make_request(Method::POST, "/mcp");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.filter_metadata
-            .insert("mcp.method", "tools/call")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert("mcp.name", "")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("mcp.method", "tools/call");
+        ctx.record_ai_metadata("mcp.name", "");
 
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(
@@ -2285,12 +2222,8 @@ mod tests {
         let f = make_filter(&[("mcp_tool", "weather", "site-c", "c")]);
         let req = crate::test_utils::make_request(Method::POST, "/mcp");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.filter_metadata
-            .insert("mcp.method", "tools/call")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert("mcp.name", "unknown-tool")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("mcp.method", "tools/call");
+        ctx.record_ai_metadata("mcp.name", "unknown-tool");
 
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(
@@ -2306,12 +2239,8 @@ mod tests {
         let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
         let req = crate::test_utils::make_request(Method::POST, "/mcp");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.filter_metadata
-            .insert("mcp.method", "tools/call")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert("mcp.name", "llama")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("mcp.method", "tools/call");
+        ctx.record_ai_metadata("mcp.name", "llama");
 
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(
@@ -2328,12 +2257,8 @@ mod tests {
         ]);
         let req = crate::test_utils::make_request(Method::POST, "/mcp");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.filter_metadata
-            .insert("mcp.method", "tools/call")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert("mcp.name", "weather")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("mcp.method", "tools/call");
+        ctx.record_ai_metadata("mcp.name", "weather");
 
         let _unused = f.on_request(&mut ctx).await.unwrap();
         assert_eq!(

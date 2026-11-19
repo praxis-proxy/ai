@@ -14,6 +14,7 @@ use super::{
     *,
 };
 use crate::{
+    RecordAiMetadata as _,
     json_body::MAX_JSON_BODY_BYTES,
     test_utils::{make_filter_context, make_request},
 };
@@ -267,9 +268,7 @@ fn raw_base64(text: &str) -> String {
 }
 
 fn set_responses_metadata(ctx: &mut HttpFilterContext<'_>) {
-    ctx.filter_metadata
-        .insert("openai_responses_request.format", "openai_responses")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
 }
 
 #[test]

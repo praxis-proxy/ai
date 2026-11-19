@@ -22,6 +22,7 @@ use super::{
     resolve_tool_entry, result_payload_limit,
 };
 use crate::{
+    RecordAiMetadata as _,
     callout_identity::McpCalloutIdentity,
     openai::responses::{
         DEFAULT_TENANT_ID,
@@ -2948,9 +2949,7 @@ async fn on_request_body_skips_deferred_discovery_when_max_tool_calls_exhausted(
 async fn deferred_discovery_budget_failure_ends_committed_stream_with_sse_error() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.filter_metadata
-        .insert("openai_responses_format.stream", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_format.stream", "true");
     ctx.extensions.insert(ClientResponseHeadersCommitted);
     let request = json!({"model": "gpt-4.1", "input": "hello", "stream": true, "store": false});
     let mut state = ResponsesState::from_request_body(request.clone());
@@ -3040,12 +3039,8 @@ async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.current_filter_id = Some(0);
-    ctx.filter_metadata
-        .insert("openai_responses_request.stream", "true")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-    ctx.filter_metadata
-        .insert("responses.response_id", "resp_deferred_listing_failure")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_responses_request.stream", "true");
+    ctx.record_ai_metadata("responses.response_id", "resp_deferred_listing_failure");
 
     let body_json = json!({
         "model": "gpt-4o-mini",

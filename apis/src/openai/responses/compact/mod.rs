@@ -69,6 +69,7 @@ use super::{
     state::{ResponsesState, mark_local_compaction_item},
 };
 use crate::{
+    RecordAiMetadata as _,
     callout_policy::OnFailure,
     json_body::MAX_JSON_BODY_BYTES,
     state_owner::{StateOwner, require_state_owner},
@@ -676,9 +677,7 @@ impl HttpFilter for CompactFilter {
             Err(action) => return Ok(action),
         };
         self.apply_compaction(ctx, &summary);
-        ctx.filter_metadata
-            .insert("responses.compacted", "true")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("responses.compacted", "true");
         Ok(FilterAction::Release)
     }
 

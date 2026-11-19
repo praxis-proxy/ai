@@ -123,6 +123,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::HeaderName;
 use metrics::{counter, gauge};
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{
     AuthenticatedIdentity, BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     TrustedHeaderMutation, parse_filter_config,
@@ -2534,9 +2535,7 @@ impl TokenRateLimitFilter {
                 estimate,
             },
         );
-        ctx.filter_metadata
-            .insert(META_ESTIMATE, request_estimate.to_string())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(META_ESTIMATE, request_estimate.to_string());
         Self::evaluate_tiers(ctx, rule, usage_after);
         record_admission_span(ctx, rule, request_estimate, "admitted");
         FilterAction::Continue

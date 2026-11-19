@@ -1246,6 +1246,7 @@ mod tests {
     use std::borrow::Cow;
 
     use super::*;
+    use crate::RecordAiMetadata as _;
 
     #[test]
     fn empty_chunk_preserves_emitted_cr_marker() {
@@ -1622,12 +1623,10 @@ mod tests {
     #[test]
     fn message_delta_reports_matched_stop_sequence() {
         let (filter, mut ctx) = make_filter_and_context();
-        ctx.filter_metadata
-            .insert(
-                crate::anthropic::messages_to_chat_completions::STOP_SEQUENCES_KEY,
-                r#"[","]"#,
-            )
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(
+            crate::anthropic::messages_to_chat_completions::STOP_SEQUENCES_KEY,
+            r#"[","]"#,
+        );
 
         let chunk1 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Count: 1\"},\"index\":0,\"finish_reason\":\"stop\",\"stop_reason\":\",\"}]}\n\n";
         let mut body1 = Some(Bytes::from(chunk1));
@@ -1686,12 +1685,10 @@ mod tests {
     #[test]
     fn message_delta_ignores_stop_reason_outside_client_sequences() {
         let (filter, mut ctx) = make_filter_and_context();
-        ctx.filter_metadata
-            .insert(
-                crate::anthropic::messages_to_chat_completions::STOP_SEQUENCES_KEY,
-                r#"[","]"#,
-            )
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(
+            crate::anthropic::messages_to_chat_completions::STOP_SEQUENCES_KEY,
+            r#"[","]"#,
+        );
 
         let chunk1 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0,\"finish_reason\":\"stop\",\"stop_reason\":\"</s>\"}]}\n\n";
         let mut body1 = Some(Bytes::from(chunk1));
@@ -1834,9 +1831,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.filter_metadata
-            .insert("anthropic_messages_request.stream", "true".to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("anthropic_messages_request.stream", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1862,9 +1857,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream; charset=utf-8"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.filter_metadata
-            .insert("anthropic_messages_to_chat_completions.streaming", "true".to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1886,9 +1879,7 @@ mod tests {
             http::HeaderValue::from_static("Text/Event-Stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.filter_metadata
-            .insert("anthropic_messages_to_chat_completions.streaming", "true".to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1932,9 +1923,7 @@ mod tests {
             http::HeaderValue::from_static("application/json"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.filter_metadata
-            .insert("anthropic_messages_to_chat_completions.streaming", "true".to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1966,9 +1955,7 @@ mod tests {
         resp.headers
             .insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static("gzip"));
         ctx.response_header = Some(&mut resp);
-        ctx.filter_metadata
-            .insert("anthropic_messages_to_chat_completions.streaming", "true".to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1997,9 +1984,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.filter_metadata
-            .insert("anthropic_messages_request.stream", "true".to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("anthropic_messages_request.stream", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -2145,12 +2130,10 @@ mod tests {
     #[test]
     fn message_delta_prefers_matched_stop_sequence_over_tool_use() {
         let (filter, mut ctx) = make_filter_and_context();
-        ctx.filter_metadata
-            .insert(
-                crate::anthropic::messages_to_chat_completions::STOP_SEQUENCES_KEY,
-                r#"[","]"#,
-            )
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(
+            crate::anthropic::messages_to_chat_completions::STOP_SEQUENCES_KEY,
+            r#"[","]"#,
+        );
 
         let tool_start = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},\"index\":0}]}\n\n";
         let mut body1 = Some(Bytes::from(tool_start));
@@ -2351,9 +2334,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.filter_metadata
-            .insert("anthropic_messages_to_chat_completions.streaming", "true".to_owned())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 

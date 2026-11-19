@@ -38,7 +38,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use metrics::{Unit, counter, describe_histogram, histogram};
-use praxis_ai_apis::promotion::is_promotable_value;
+use praxis_ai_apis::{RecordAiMetadata as _, promotion::is_promotable_value};
 use praxis_filter::HttpFilterContext;
 
 /// Prompt tokens (backend-reported) per request, cumulative.
@@ -275,12 +275,8 @@ mod tests {
     fn resolve_model_prefers_format_metadata() {
         let req = crate::test_utils::make_request(Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
-        ctx.filter_metadata
-            .insert("openai_chat_completions_request.model", "gpt-format")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert("model_to_header.model", "gpt-header")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("openai_chat_completions_request.model", "gpt-format");
+        ctx.record_ai_metadata("model_to_header.model", "gpt-header");
         assert_eq!(resolve_model(&ctx), "gpt-format");
     }
 
@@ -288,9 +284,7 @@ mod tests {
     fn resolve_model_uses_model_to_header_metadata() {
         let req = crate::test_utils::make_request(Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
-        ctx.filter_metadata
-            .insert("model_to_header.model", "gpt-header")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("model_to_header.model", "gpt-header");
         assert_eq!(resolve_model(&ctx), "gpt-header");
     }
 
@@ -312,9 +306,7 @@ mod tests {
         let req = crate::test_utils::make_request(Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
         ctx.cluster = Some("cb-glm".to_owned().into());
-        ctx.filter_metadata
-            .insert("openai_chat_completions_request.model", "gpt-x")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("openai_chat_completions_request.model", "gpt-x");
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -368,9 +360,7 @@ mod tests {
     fn record_token_usage_bumps_empty_completions_on_zero_output() {
         let req = crate::test_utils::make_request(Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
-        ctx.filter_metadata
-            .insert("model_to_header.model", "gpt-x")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("model_to_header.model", "gpt-x");
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();

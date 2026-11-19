@@ -37,7 +37,7 @@ use http::header::HeaderName;
 use metrics::counter;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use praxis_ai_apis::{
-    MODEL_PROVIDER_CLIENT_MODEL_METADATA,
+    MODEL_PROVIDER_CLIENT_MODEL_METADATA, RecordAiMetadata as _,
     callout_target::AddressPolicy,
     credential_source::{self, CredentialSource, DiagnosticContext, SecretHandle, WatchHandle},
     subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
@@ -556,9 +556,7 @@ impl HttpFilter for ExternalMeteringFilter {
         }
 
         if !state.model.is_empty() {
-            ctx.filter_metadata
-                .insert(META_METERING_MODEL.to_owned(), state.model.clone())
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata(META_METERING_MODEL.to_owned(), state.model.clone());
         }
 
         let action = self.check_balance(&state).await;
@@ -589,9 +587,7 @@ impl HttpFilter for ExternalMeteringFilter {
             .filter(|_| unresolved)
             .and_then(|chunk| extract_model_from_bytes(chunk))
         {
-            ctx.filter_metadata
-                .insert(META_METERING_MODEL.to_owned(), model)
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata(META_METERING_MODEL.to_owned(), model);
         }
 
         Ok(FilterAction::Release)

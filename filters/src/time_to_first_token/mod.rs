@@ -32,7 +32,7 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use metrics::histogram;
-use praxis_ai_apis::is_event_stream_content_type;
+use praxis_ai_apis::{RecordAiMetadata as _, is_event_stream_content_type};
 use praxis_filter::{
     BodyAccess, EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
@@ -116,9 +116,7 @@ impl HttpFilter for TimeToFirstTokenFilter {
             .is_some_and(is_event_stream_content_type);
 
         if is_sse {
-            ctx.filter_metadata
-                .insert(META_ACTIVE.to_owned(), String::new())
-                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+            ctx.record_ai_metadata(META_ACTIVE.to_owned(), String::new());
         }
 
         Ok(FilterAction::Continue)

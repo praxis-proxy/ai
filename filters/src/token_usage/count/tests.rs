@@ -6,6 +6,7 @@
 use bytes::Bytes;
 use http::header::HeaderValue;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{FilterAction, HttpFilter as _, Request, Response};
 
 use super::*;
@@ -2040,9 +2041,7 @@ fn publish_token_usage_records_llm_metrics() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some("cb-glm".to_owned().into());
-    ctx.filter_metadata
-        .insert("openai_chat_completions_request.model", "gpt-x")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata("openai_chat_completions_request.model", "gpt-x");
 
     let usage = TokenUsage::new(12, 34, Some(46))
         .with_cache(Some(5), None)
@@ -2085,9 +2084,7 @@ fn publish_token_usage_records_llm_metrics() {
 fn publish_token_usage_bumps_empty_completions_on_zero_output() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_ctx(&req);
-    ctx.filter_metadata
-        .insert(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "gpt-x")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "gpt-x");
 
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
@@ -2115,9 +2112,7 @@ fn bedrock_headers_record_llm_metrics() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some("bedrock".to_owned().into());
-    ctx.filter_metadata
-        .insert(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "claude-x")
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "claude-x");
     let mut headers = http::HeaderMap::new();
     headers.insert(HEADER_BEDROCK_INPUT, HeaderValue::from_static("40"));
     headers.insert(HEADER_BEDROCK_OUTPUT, HeaderValue::from_static("7"));

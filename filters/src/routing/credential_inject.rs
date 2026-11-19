@@ -108,8 +108,11 @@ use std::{
 
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue, header::AUTHORIZATION};
-use praxis_ai_apis::credential_source::{
-    CredentialSource, DiagnosticContext, SecretHandle, SecretSnapshot, WatchHandle, WatchRegistry,
+use praxis_ai_apis::{
+    RecordAiMetadata as _,
+    credential_source::{
+        CredentialSource, DiagnosticContext, SecretHandle, SecretSnapshot, WatchHandle, WatchRegistry,
+    },
 };
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
 use serde::Deserialize;
@@ -2221,12 +2224,8 @@ mod tests {
         let f = make_filter_with_value("sec", "ns", "key", "tok");
         let req = crate::test_utils::make_request(Method::POST, "/chat");
         let mut ctx = crate::test_utils::make_filter_context(&req);
-        ctx.filter_metadata
-            .insert(CREDENTIAL_STRATEGY, STRATEGY_BEARER_TOKEN)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(CREDENTIAL_NAME, "sec")
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(CREDENTIAL_STRATEGY, STRATEGY_BEARER_TOKEN);
+        ctx.record_ai_metadata(CREDENTIAL_NAME, "sec");
 
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(
@@ -2355,17 +2354,9 @@ mod tests {
         namespace: &str,
         key: &str,
     ) {
-        ctx.filter_metadata
-            .insert(CREDENTIAL_STRATEGY, strategy)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(CREDENTIAL_NAME, name)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(CREDENTIAL_NAMESPACE, namespace)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
-        ctx.filter_metadata
-            .insert(CREDENTIAL_KEY, key)
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(CREDENTIAL_STRATEGY, strategy);
+        ctx.record_ai_metadata(CREDENTIAL_NAME, name);
+        ctx.record_ai_metadata(CREDENTIAL_NAMESPACE, namespace);
+        ctx.record_ai_metadata(CREDENTIAL_KEY, key);
     }
 }

@@ -42,6 +42,7 @@ use tracing::{debug, trace};
 
 use self::config::{ChatCompletionsRequestConfig, FILTER_NAME, build_config};
 use crate::{
+    RecordAiMetadata as _,
     classifier::{AiRequestFormat, ClassifiedRequest, classify_request_body},
     openai::chat_completions::routes as chat_completions_routes,
     operation_classifier::AiOperationMatch,
@@ -168,28 +169,22 @@ fn is_create_chat_completion(ctx: &HttpFilterContext<'_>) -> bool {
 /// The format is fixed to the Chat Completions endpoint because the head already
 /// proved the operation; only the model and stream flag are read from the body.
 fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest) {
-    ctx.filter_metadata
-        .insert(
-            "openai_chat_completions_request.format",
-            AiRequestFormat::ChatCompletions.as_str(),
-        )
-        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+    ctx.record_ai_metadata(
+        "openai_chat_completions_request.format",
+        AiRequestFormat::ChatCompletions.as_str(),
+    );
 
     if let Some(model) = &classified.model
         && is_promotable_value(model)
     {
-        ctx.filter_metadata
-            .insert("openai_chat_completions_request.model", model.clone())
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata("openai_chat_completions_request.model", model.clone());
     }
 
     if let Some(stream) = classified.stream {
-        ctx.filter_metadata
-            .insert(
-                "openai_chat_completions_request.stream",
-                if stream { "true" } else { "false" },
-            )
-            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
+        ctx.record_ai_metadata(
+            "openai_chat_completions_request.stream",
+            if stream { "true" } else { "false" },
+        );
     }
 }
 
