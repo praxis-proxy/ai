@@ -9099,12 +9099,20 @@ class TestAgenticLoopVLLM:
         assert len(BraveSearchHandler.request_paths) == request_count + 1
 
     @requires_vllm_compat
+    @pytest.mark.parametrize("parallel", [True, False], ids=["parallel", "sequential"])
     def test_batched_mcp_tools_honor_parallel_tool_calls(
         self,
         agentic_client,
         agentic_proxy,
+        parallel,
     ):
-        """Two MCP calls emitted in one model round both complete."""
+        """Two MCP calls both complete, each paired with its own tool's output.
+
+        The stub returns a distinct text per tool, so a result attached to the
+        wrong call fails the pairing assertion. With ``parallel_tool_calls``
+        disabled the model may split the calls across rounds; the pairing
+        contract holds either way.
+        """
 
         response = agentic_client.responses.create(
             model=VLLM_MODEL,
@@ -9122,17 +9130,22 @@ class TestAgenticLoopVLLM:
                     "require_approval": "never",
                 }
             ],
-            parallel_tool_calls=True,
+            parallel_tool_calls=parallel,
             store=False,
             max_output_tokens=512,
         )
 
         mcp_calls = [item for item in response.output if item.type == "mcp_call"]
         assert len(mcp_calls) == 2, (
-            "both calls from the batched model round must execute exactly "
-            f"once; got: {[item.type for item in response.output]}"
+            "both calls must execute exactly once; "
+            f"got: {[item.type for item in response.output]}"
         )
-        assert {item.name for item in mcp_calls} == {"get_weather", "get_time"}
+        outputs = {item.name: item.output or "" for item in mcp_calls}
+        assert set(outputs) == {"get_weather", "get_time"}
+        assert "72F and sunny" in outputs["get_weather"], (
+            "get_weather must carry its own result"
+        )
+        assert "12:00 PM" in outputs["get_time"], "get_time must carry its own result"
 
     @requires_vllm_compat
     def test_mcp_approval_batch_resume_executes_multiple_approved_tools(

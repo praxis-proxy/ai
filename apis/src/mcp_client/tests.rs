@@ -2990,3 +2990,10 @@ fn listing_size_preserves_partial_count_on_serialization_error() {
     // this prefix, while core's error alone carries no partial byte count.
     assert_eq!(measure_tools_json_bytes(&FailsAfterItem), 2);
 }
+
+#[test]
+fn mcp_result_charge_tracks_measured_parse_cost() {
+    let payload = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}],"structuredContent":{"replicas":[1,2,3],"ready":true}}}"#;
+    let nodes = crate::json_body::json_node_count(payload).unwrap();
+    assert_eq!(mcp_result_charge(payload), Some(payload.len() * 16 + nodes * 512));
+}

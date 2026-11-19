@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 #[cfg(feature = "openai-mcp-tools")]
-use super::mcp_tool_resolve::encode_function_name;
+use super::naming::encode_function_name;
 
 /// Operator admission mode for MCP tool metadata.
 #[cfg(feature = "openai-mcp-tools")]

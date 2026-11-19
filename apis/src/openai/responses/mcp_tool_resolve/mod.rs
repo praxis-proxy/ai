@@ -76,9 +76,6 @@ use super::{
     agentic_loop::budget::input_charge,
     bound_body_outcome,
     error::responses_error_rejection,
-    mcp_admission::{
-        ConnectorToolPolicy, McpAdmissionDecisions, McpAdmissionPolicy, McpDenyReason, McpToolVerdict, evaluate_tool,
-    },
     state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState},
 };
 use crate::{
@@ -88,11 +85,17 @@ use crate::{
     classifier::is_responses_create,
     json_body::{BoundedJsonBody, MAX_JSON_BODY_BYTES, SerializedJson, serialize_json_body_within, serialized_len},
     mcp_client,
+    mcp_core::{
+        admission::{ConnectorToolPolicy, McpAdmissionDecisions, McpAdmissionPolicy, McpToolVerdict},
+        naming::encode_function_name,
+        tool_map::{
+            self, McpToolMapError, admit_deferred_tools, admit_tools, apply_allowed_tools_filter,
+            extract_allowed_tools, insert_tools, is_allowed_tool, protected_exclusion, protected_exclusion_reason,
+            reject_direct_server_urls, resolve_connector_ids, select_forward_headers, server_label,
+            tool_policy_for_entry,
+        },
+    },
 };
-
-/// Maximum length for generated function names per the OpenAI
-/// Responses POST schema (`^[a-zA-Z0-9_-]+$`, max 64 chars).
-const MAX_FUNCTION_NAME_LEN: usize = 64;
 
 /// The same listing can be held by rmcp, the converted JSON tree, generated
 /// functions, the dispatch map, the rewritten request, and public/private
@@ -854,7 +857,7 @@ impl McpToolResolveFilter {
         let owner_fingerprint = ctx
             .extensions
             .get::<StateOwner>()
-            .map(super::mcp_dispatch::owner_fingerprint);
+            .map(crate::mcp_core::fingerprint::owner_fingerprint);
         let effective_headers = effective_body_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers));
         let forwarded_headers = select_forward_headers(&self.forward_headers, &effective_headers);
         self.resolve_all_entries(
@@ -1260,6 +1263,20 @@ pub(crate) enum ResolveError {
     InvalidAllowedTools(String),
 }
 
+impl From<McpToolMapError> for ResolveError {
+    fn from(error: McpToolMapError) -> Self {
+        match error {
+            McpToolMapError::NameCollision(name) => Self::NameCollision(name),
+            McpToolMapError::UnknownConnector(id) => Self::UnknownConnector(id),
+            McpToolMapError::DirectServerUrl => Self::DirectServerUrl,
+            McpToolMapError::MutuallyExclusiveTarget(id) => Self::MutuallyExclusiveTarget(id),
+            McpToolMapError::InvalidConnectorId => Self::InvalidConnectorId,
+            McpToolMapError::MissingConnectorLabel(id) => Self::MissingConnectorLabel(id),
+            McpToolMapError::InvalidAllowedTools(message) => Self::InvalidAllowedTools(message),
+        }
+    }
+}
+
 /// Per-entry resolution outcome.
 enum EntryResolution {
     /// Entry was not resolved (direct-URL deferred or no `server_url`).
@@ -1473,70 +1490,6 @@ fn consume_task_result(
         *remaining = 0;
         result.take()
     }
-}
-
-/// Resolve connector IDs to server URLs for MCP tool entries.
-///
-/// Mutates entries in place, replacing `connector_id` with the
-/// corresponding `server_url` from the configured connectors map.
-fn resolve_connector_ids(
-    connectors: &HashMap<String, url::Url>,
-    entries: &mut [serde_json::Value],
-) -> Result<(), ResolveError> {
-    for entry in entries.iter_mut() {
-        let Some(connector_id_value) = entry.get("connector_id") else {
-            continue;
-        };
-
-        let connector_id = match connector_id_value.as_str() {
-            Some(s) if !s.is_empty() && s.len() <= config::MAX_CONNECTOR_ID_LEN => s.to_owned(),
-            _ => return Err(ResolveError::InvalidConnectorId),
-        };
-
-        validate_connector_entry(entry, &connector_id)?;
-
-        let resolved_url = connectors
-            .get(&connector_id)
-            .ok_or(ResolveError::UnknownConnector(connector_id))?;
-
-        if let Some(obj) = entry.as_object_mut() {
-            obj.insert(
-                "server_url".to_owned(),
-                serde_json::Value::String(resolved_url.to_string()),
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Reject direct client-selected MCP destinations before any identity staging or
-/// outbound callout is acquired.
-///
-/// The error intentionally contains no request data: `server_url`,
-/// `server_label`, credentials, and assertions must not leak through the
-/// client-visible rejection.
-fn reject_direct_server_urls(entries: &[serde_json::Value]) -> Result<(), ResolveError> {
-    if entries.iter().any(|entry| entry.get("server_url").is_some()) {
-        return Err(ResolveError::DirectServerUrl);
-    }
-    Ok(())
-}
-
-/// Validate that a connector entry has required fields and no conflicts.
-fn validate_connector_entry(entry: &serde_json::Value, connector_id: &str) -> Result<(), ResolveError> {
-    let label = entry
-        .get("server_label")
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty());
-    if label.is_none() {
-        return Err(ResolveError::MissingConnectorLabel(connector_id.to_owned()));
-    }
-
-    if entry.get("server_url").is_some() {
-        return Err(ResolveError::MutuallyExclusiveTarget(connector_id.to_owned()));
-    }
-
-    Ok(())
 }
 
 #[expect(
@@ -2460,17 +2413,6 @@ async fn fetch_tools(
     })
 }
 
-/// Select only configured headers from the effective body-phase request.
-fn select_forward_headers(names: &[http::HeaderName], source: &http::HeaderMap) -> http::HeaderMap {
-    let mut selected = http::HeaderMap::with_capacity(names.len());
-    for name in names {
-        if let Some(value) = source.get(name) {
-            selected.insert(name.clone(), value.clone());
-        }
-    }
-    selected
-}
-
 /// Rewrite the request body, replacing resolved `type: "mcp"`
 /// entries with `type: "function"` entries and translating any
 /// MCP `tool_choice` references.
@@ -2624,19 +2566,11 @@ fn sanitize_deferred_connector_tool(tool: serde_json::Value) -> serde_json::Valu
 /// This only rejects collisions where lossy encoding produced a
 /// generated name that clashes with another tool.
 fn detect_name_collisions(tools: &[serde_json::Value], generated_names: &HashSet<String>) -> Result<(), ResolveError> {
-    let mut seen = HashSet::new();
-    for tool in tools {
-        if tool.get("type").and_then(serde_json::Value::as_str) != Some("function") {
-            continue;
-        }
-        let Some(name) = tool.get("name").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        if !seen.insert(name) && generated_names.contains(name) {
-            return Err(ResolveError::NameCollision(name.to_owned()));
-        }
-    }
-    Ok(())
+    let function_names = tools
+        .iter()
+        .filter(|tool| tool.get("type").and_then(serde_json::Value::as_str) == Some("function"))
+        .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str));
+    Ok(tool_map::detect_name_collisions(function_names, generated_names)?)
 }
 
 /// Rewrite `tool_choice` when it references MCP tools.
@@ -2943,97 +2877,6 @@ fn mcp_tool_to_list_tools_entry(definition: &serde_json::Value) -> serde_json::V
         obj.insert("annotations".to_owned(), annotations.clone());
     }
     serde_json::Value::Object(obj)
-}
-
-/// Encode `(label, tool_name)` into a bounded, schema-valid
-/// function name matching `^[a-zA-Z0-9_-]+$` with max 64 chars.
-///
-/// The `{label}__{tool_name}` prefix is required for dispatch:
-/// the backend has no concept of MCP servers, so the proxy must
-/// embed the server identity in the function name to route
-/// tool-call responses back to the correct upstream server.
-///
-/// Replaces invalid characters with `_` and truncates to fit
-/// within [`MAX_FUNCTION_NAME_LEN`]. Lossy: distinct inputs can
-/// produce the same output. Use [`detect_name_collisions`] after
-/// building the full tools array to catch this.
-pub(crate) fn encode_function_name(label: &str, tool_name: &str) -> String {
-    // Stop at the schema limit while building the string. Truncating a long
-    // allocation would leave its full capacity retained in every reference.
-    let mut sanitized = String::with_capacity(MAX_FUNCTION_NAME_LEN);
-    for character in label
-        .chars()
-        .chain("__".chars())
-        .chain(tool_name.chars())
-        .take(MAX_FUNCTION_NAME_LEN)
-    {
-        sanitized.push(
-            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
-                character
-            } else {
-                '_'
-            },
-        );
-    }
-    sanitized
-}
-
-/// Reverse lookup for model-facing MCP function names.
-///
-/// Building this once per filter phase avoids repeatedly encoding every
-/// resolved `(server_label, tool_name)` pair for each model-emitted call.
-/// Lossy name collisions remain explicit so dispatch can fail closed.
-pub(crate) struct McpToolIndex<'a> {
-    /// Encoded function names mapped to their unique entry or collision count.
-    entries: HashMap<String, McpToolMatch<'a>>,
-}
-
-/// Resolution state for one encoded MCP function name.
-#[derive(Clone, Copy)]
-pub(crate) enum McpToolMatch<'a> {
-    /// Exactly one resolved MCP tool owns the encoded name.
-    Unique {
-        /// Original `(server_label, tool_name)` key.
-        key: &'a (String, String),
-        /// Resolved dispatch metadata.
-        entry: &'a serde_json::Value,
-    },
-    /// Multiple tools collapsed to the same lossy encoded name.
-    Ambiguous {
-        /// Number of colliding tools.
-        count: usize,
-    },
-}
-
-impl<'a> McpToolIndex<'a> {
-    /// Build a reverse index for one resolved MCP tool map.
-    pub(crate) fn new(tool_map: &'a HashMap<(String, String), serde_json::Value>) -> Self {
-        let mut entries = HashMap::with_capacity(tool_map.len());
-        for (key @ (label, tool_name), entry) in tool_map {
-            let encoded_name = encode_function_name(label, tool_name);
-            entries
-                .entry(encoded_name)
-                .and_modify(|existing| {
-                    let count = match existing {
-                        McpToolMatch::Unique { .. } => 2,
-                        McpToolMatch::Ambiguous { count } => count.saturating_add(1),
-                    };
-                    *existing = McpToolMatch::Ambiguous { count };
-                })
-                .or_insert(McpToolMatch::Unique { key, entry });
-        }
-        Self { entries }
-    }
-
-    /// Return whether any resolved MCP tool owns `encoded_name`.
-    pub(crate) fn contains(&self, encoded_name: &str) -> bool {
-        self.entries.contains_key(encoded_name)
-    }
-
-    /// Return the unique entry or collision state for `encoded_name`.
-    pub(crate) fn get(&self, encoded_name: &str) -> Option<McpToolMatch<'a>> {
-        self.entries.get(encoded_name).copied()
-    }
 }
 
 /// Write the resolved tool map and rewritten body to
@@ -3711,14 +3554,6 @@ fn reusable_listing_server_url(entry: &serde_json::Value) -> Option<&str> {
     }
 }
 
-/// Extract `server_label` from an MCP tool entry.
-fn server_label(entry: &serde_json::Value) -> &str {
-    entry
-        .get("server_label")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown")
-}
-
 /// Move MCP tool entries out of the parsed request body for resolution.
 fn extract_mcp_entries(value: &mut serde_json::Value) -> ExtractedMcpEntries {
     let Some(tools) = value.get_mut("tools").and_then(serde_json::Value::as_array_mut) else {
@@ -3742,125 +3577,6 @@ fn extract_mcp_entries_from_tools(tools: &mut [serde_json::Value]) -> ExtractedM
         }
     }
     ExtractedMcpEntries { values, tool_indices }
-}
-
-/// Extract `allowed_tools` from an MCP tool entry.
-///
-/// Handles `null` (unrestricted, matching the OpenAI schema), the
-/// string-array form (`["a", "b"]`), and the `MCPToolFilter` object
-/// form (`{"tool_names": ["a"]}`).
-fn extract_allowed_tools(entry: &serde_json::Value) -> Result<AllowedTools, ResolveError> {
-    let Some(value) = entry.get("allowed_tools") else {
-        return Ok(AllowedTools::unrestricted());
-    };
-    if value.is_null() {
-        return Ok(AllowedTools::unrestricted());
-    }
-    if let Some(arr) = value.as_array() {
-        return validate_string_array(arr).map(|names| AllowedTools {
-            names: Some(names),
-            read_only: None,
-        });
-    }
-    if let Some(obj) = value.as_object() {
-        return extract_from_filter_object(obj);
-    }
-    Err(ResolveError::InvalidAllowedTools(format!(
-        "allowed_tools must be an array of strings or an MCPToolFilter object, got {}",
-        json_type_name(value),
-    )))
-}
-
-/// Recognized fields in an `MCPToolFilter` object.
-const ALLOWED_FILTER_FIELDS: &[&str] = &["tool_names", "read_only"];
-
-/// Parse an `MCPToolFilter` object: `{tool_names?, read_only?}`.
-fn extract_from_filter_object(obj: &serde_json::Map<String, serde_json::Value>) -> Result<AllowedTools, ResolveError> {
-    for key in obj.keys() {
-        if !ALLOWED_FILTER_FIELDS.contains(&key.as_str()) {
-            return Err(ResolveError::InvalidAllowedTools(format!(
-                "unknown field \"{key}\" in allowed_tools filter object",
-            )));
-        }
-    }
-    let names = match obj.get("tool_names") {
-        Some(v) => {
-            let arr = v.as_array().ok_or_else(|| {
-                ResolveError::InvalidAllowedTools(format!(
-                    "allowed_tools.tool_names must be an array, got {}",
-                    json_type_name(v),
-                ))
-            })?;
-            Some(validate_string_array(arr)?)
-        },
-        None => None,
-    };
-    let read_only = match obj.get("read_only") {
-        Some(v) => Some(v.as_bool().ok_or_else(|| {
-            ResolveError::InvalidAllowedTools(format!(
-                "allowed_tools.read_only must be a boolean, got {}",
-                json_type_name(v),
-            ))
-        })?),
-        None => None,
-    };
-    Ok(AllowedTools { names, read_only })
-}
-
-/// Validate that every element in a JSON array is a string.
-fn validate_string_array(arr: &[serde_json::Value]) -> Result<Vec<String>, ResolveError> {
-    let mut result = Vec::with_capacity(arr.len());
-    for (i, item) in arr.iter().enumerate() {
-        match item.as_str() {
-            Some(s) => result.push(s.to_owned()),
-            None => {
-                return Err(ResolveError::InvalidAllowedTools(format!(
-                    "allowed_tools[{i}] must be a string, got {}",
-                    json_type_name(item),
-                )));
-            },
-        }
-    }
-    Ok(result)
-}
-
-/// Human-readable JSON type name for error messages.
-fn json_type_name(v: &serde_json::Value) -> &'static str {
-    match v {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
-}
-
-/// Outcome of parsing `allowed_tools`.
-#[derive(Debug)]
-struct AllowedTools {
-    /// Optional tool-name allowlist.
-    names: Option<Vec<String>>,
-    /// `Some(true)` = only read-only tools,
-    /// `Some(false)` = only writable tools,
-    /// `None` = no read-only filter.
-    read_only: Option<bool>,
-}
-
-impl AllowedTools {
-    /// No filter — expose all tools.
-    fn unrestricted() -> Self {
-        Self {
-            names: None,
-            read_only: None,
-        }
-    }
-
-    /// Return the name list as a slice, or `None` if
-    /// unrestricted.
-    fn as_names(&self) -> Option<&[String]> {
-        self.names.as_deref()
-    }
 }
 
 /// Check `previous_tools` for a cached listing matching
@@ -3919,7 +3635,7 @@ fn find_cached_listing_budgeted(
         pt.get("server_label").and_then(serde_json::Value::as_str) == Some(label)
             && pt.get("server_url").and_then(serde_json::Value::as_str) == Some(server_url)
             && pt
-                .get(super::mcp_dispatch::OWNER_FINGERPRINT)
+                .get(crate::mcp_core::fingerprint::OWNER_FINGERPRINT)
                 .and_then(serde_json::Value::as_str)
                 == owner_fingerprint
     }) else {
@@ -3948,211 +3664,4 @@ fn find_cached_listing_budgeted(
     }
 
     Ok(Some(cached_tools.clone()))
-}
-
-/// Filter tools by name list and/or read-only annotation.
-fn apply_allowed_tools_filter(tools: Vec<serde_json::Value>, allowed: &AllowedTools) -> Vec<serde_json::Value> {
-    if allowed.as_names().is_none() && allowed.read_only.is_none() {
-        return tools;
-    }
-    tools
-        .into_iter()
-        .filter(|tool| is_allowed_tool(tool, allowed))
-        .collect()
-}
-
-/// Match the same allowed-tools policy during preflight and final filtering.
-fn is_allowed_tool(tool: &serde_json::Value, allowed: &AllowedTools) -> bool {
-    if let Some(names) = allowed.as_names() {
-        let matches_name = tool
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|name| names.iter().any(|allowed_name| allowed_name == name));
-        if !matches_name {
-            return false;
-        }
-    }
-    allowed
-        .read_only
-        .is_none_or(|want_read_only| tool_read_only_hint(tool) == want_read_only)
-}
-
-/// Return whether an MCP tool has `annotations.readOnlyHint`
-/// set to `true` (defaults to `false` when absent).
-///
-/// This is the **advisory** server hint consulted by the standard client
-/// `allowed_tools.read_only` selector only. It is not a trusted classification;
-/// operator-enforced read-only uses [`super::mcp_admission`] instead.
-fn tool_read_only_hint(tool: &serde_json::Value) -> bool {
-    tool.get("annotations")
-        .and_then(|a| a.get("readOnlyHint"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-}
-
-/// Apply operator metadata admission to the client-filtered tools of one entry.
-///
-/// In advisory mode this is a no-op: the tools pass through unchanged and no
-/// verdict is recorded, so existing behavior is byte-for-byte preserved. In
-/// protected mode each tool is evaluated against the operator policy and the
-/// resolving entry's connector policy ([`tool_policy_for_entry`]); admitted
-/// tools are returned (and reach the model + dispatch map), while denied tools are dropped
-/// and recorded in `decisions` so a later forged call can be rejected explicitly
-/// rather than mis-classified as a client function.
-fn admit_tools(
-    policy: McpAdmissionPolicy,
-    tool_policy: ConnectorToolPolicy,
-    label: &str,
-    tools: Vec<serde_json::Value>,
-    decisions: &mut McpAdmissionDecisions,
-) -> Vec<serde_json::Value> {
-    if !policy.is_protected() {
-        return tools;
-    }
-    let mut admitted = Vec::with_capacity(tools.len());
-    for tool in tools {
-        // A tool without a name has no dispatchable identity; in protected mode
-        // it is excluded rather than admitted under an unknown identity.
-        let Some(tool_name) = tool.get("name").and_then(serde_json::Value::as_str).map(str::to_owned) else {
-            continue;
-        };
-        let verdict = evaluate_tool(policy, tool_policy, &tool);
-        decisions.record(label, &tool_name, verdict);
-        if matches!(verdict, McpToolVerdict::Admitted(_)) {
-            admitted.push(tool);
-        }
-    }
-    admitted
-}
-
-/// Why protected mode excludes an MCP entry outright without dialing, or `None`
-/// if the target may be contacted.
-///
-/// A target is excluded without contact when its policy is `Deny` — direct
-/// `server_url` targets, denied connectors, and targetless (label-only) entries.
-///
-/// Centralizes the exclusion rule shared by `resolve_entry` (eager dial),
-/// `collect_resolutions` (deferred/targetless entries with no resolution task),
-/// and `collect_deferred_connectors` (deferred-discovery queueing) (#1724).
-fn protected_exclusion_reason(tool_policy: ConnectorToolPolicy, policy: McpAdmissionPolicy) -> Option<McpDenyReason> {
-    if !policy.is_protected() {
-        return None;
-    }
-    // Exhaustive over `ConnectorToolPolicy` on purpose: a new variant must force a
-    // decision here rather than silently become contactable.
-    match tool_policy {
-        ConnectorToolPolicy::Deny => Some(McpDenyReason::UntrustedSource),
-        ConnectorToolPolicy::AllowAll | ConnectorToolPolicy::ReadOnly => None,
-    }
-}
-
-/// [`protected_exclusion_reason`] resolved for one MCP entry via its connector
-/// policy ([`tool_policy_for_entry`]).
-fn protected_exclusion(
-    entry: &serde_json::Value,
-    policy: McpAdmissionPolicy,
-    connector_tool_policies: &HashMap<String, ConnectorToolPolicy>,
-) -> Option<McpDenyReason> {
-    protected_exclusion_reason(tool_policy_for_entry(entry, connector_tool_policies), policy)
-}
-
-/// Resolve the operator tool policy for one MCP entry.
-///
-/// A direct, client-selected `server_url` entry and an unknown connector are
-/// denied by default. A configured connector's policy is looked up by
-/// `connector_id`; a missing entry fails closed.
-fn tool_policy_for_entry(
-    entry: &serde_json::Value,
-    connector_tool_policies: &HashMap<String, ConnectorToolPolicy>,
-) -> ConnectorToolPolicy {
-    entry
-        .get("connector_id")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|id| connector_tool_policies.get(id))
-        .copied()
-        .unwrap_or_default()
-}
-
-/// Evaluate operator admission for one deferred connector's client-filtered
-/// tools, returning the admitted tools and the `(tool_name, verdict)` pairs to
-/// record once concurrent discovery commits (the decisions live in `state`,
-/// which is not borrowed across the concurrent `tools/list` calls).
-///
-/// Advisory mode returns the tools unchanged with no verdicts.
-fn admit_deferred_tools(
-    policy: McpAdmissionPolicy,
-    tool_policy: ConnectorToolPolicy,
-    tools: Vec<serde_json::Value>,
-) -> (Vec<serde_json::Value>, Vec<(String, McpToolVerdict)>) {
-    if !policy.is_protected() {
-        return (tools, Vec::new());
-    }
-    let mut admitted = Vec::with_capacity(tools.len());
-    let mut verdicts = Vec::new();
-    for tool in tools {
-        let Some(tool_name) = tool.get("name").and_then(serde_json::Value::as_str).map(str::to_owned) else {
-            continue;
-        };
-        let verdict = evaluate_tool(policy, tool_policy, &tool);
-        verdicts.push((tool_name, verdict));
-        if matches!(verdict, McpToolVerdict::Admitted(_)) {
-            admitted.push(tool);
-        }
-    }
-    (admitted, verdicts)
-}
-
-/// Insert resolved tools into the tool map keyed by
-/// `(server_label, tool_name)`, consuming the definitions.
-#[expect(
-    clippy::too_many_lines,
-    reason = "explicit map construction moves tool definitions while preserving dispatch metadata"
-)]
-fn insert_tools(
-    tools: Vec<serde_json::Value>,
-    entry: &serde_json::Value,
-    tool_map: &mut HashMap<(String, String), serde_json::Value>,
-) {
-    let label = server_label(entry);
-    let server_url = entry
-        .get("server_url")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    let headers = entry.get("headers");
-    let authorization = entry.get("authorization");
-    let require_approval = entry.get("require_approval");
-    let connector_id = entry.get("connector_id");
-
-    for tool in tools {
-        let tool_name = tool.get("name").and_then(serde_json::Value::as_str).map(str::to_owned);
-        let Some(tool_name) = tool_name else {
-            continue;
-        };
-
-        let key = (label.to_owned(), tool_name);
-        let mut dispatch = serde_json::Map::new();
-        dispatch.insert("server_label".to_owned(), serde_json::Value::String(label.to_owned()));
-        dispatch.insert(
-            "server_url".to_owned(),
-            serde_json::Value::String(server_url.to_owned()),
-        );
-        dispatch.insert(
-            "headers".to_owned(),
-            headers.cloned().unwrap_or(serde_json::Value::Null),
-        );
-        dispatch.insert(
-            "authorization".to_owned(),
-            authorization.cloned().unwrap_or(serde_json::Value::Null),
-        );
-        dispatch.insert(
-            "require_approval".to_owned(),
-            require_approval.cloned().unwrap_or(serde_json::Value::Null),
-        );
-        dispatch.insert(
-            "connector_id".to_owned(),
-            connector_id.cloned().unwrap_or(serde_json::Value::Null),
-        );
-        dispatch.insert("tool_definition".to_owned(), tool);
-        tool_map.insert(key, serde_json::Value::Object(dispatch));
-    }
 }
