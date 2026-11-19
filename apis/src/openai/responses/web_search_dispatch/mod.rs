@@ -1013,7 +1013,7 @@ fn tool_search_is_client_executed(tool: &Value) -> bool {
 fn mcp_function_membership(
     mcp_tool_map: &std::collections::HashMap<(String, String), Value>,
 ) -> impl Fn(&str) -> bool + '_ {
-    let index = super::mcp_tool_resolve::McpToolIndex::new(mcp_tool_map);
+    let index = crate::mcp_core::naming::McpToolIndex::new(mcp_tool_map);
     move |name: &str| index.contains(name)
 }
 

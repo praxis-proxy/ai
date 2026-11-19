@@ -86,7 +86,7 @@ fn advertised_input_schema(tool_definition: Option<&Value>) -> Option<&Value> {
 /// schema. Extra fields are rejected only when the schema sets
 /// `additionalProperties: false`; JSON Schema permits them by default, so this
 /// check does not add stricter semantics than the advertisement.
-pub(super) fn validate_arguments(tool_definition: Option<&Value>, arguments: &Value) -> Result<(), String> {
+pub(crate) fn validate_arguments(tool_definition: Option<&Value>, arguments: &Value) -> Result<(), String> {
     let schema = advertised_input_schema(tool_definition).unwrap_or(&DEFAULT_OBJECT_SCHEMA);
     // Estimate before compiling: `validator_for` recurses through `$ref`s, so a
     // deep reference chain can overflow the stack during compilation. The
@@ -663,8 +663,7 @@ mod tests {
         // isolated subprocess so a regression surfaces as a non-zero child exit,
         // not a crash of the whole test binary.
         const MARKER: &str = "DEEP_REF_CHAIN_OK";
-        const TEST_PATH: &str =
-            "openai::responses::mcp_dispatch::validate::tests::deep_ref_chain_does_not_crash_the_process";
+        const TEST_PATH: &str = "mcp_core::validate::tests::deep_ref_chain_does_not_crash_the_process";
 
         if std::env::var("PRAXIS_MCP_DEEP_REF_CHILD").is_ok() {
             let mut defs = serde_json::Map::new();

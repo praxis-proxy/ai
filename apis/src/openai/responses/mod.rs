@@ -47,10 +47,6 @@ pub(crate) mod file_search_dispatch;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod history;
 #[cfg(feature = "openai-mcp-tools")]
-pub(crate) mod mcp_admission;
-#[cfg(feature = "openai-mcp-tools")]
-pub(crate) mod mcp_classify;
-#[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_dispatch;
 #[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_tool_resolve;

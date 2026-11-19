@@ -277,6 +277,49 @@ impl BodyMutation {
 // Tests
 // -----------------------------------------------------------------------------
 
+/// Count syntactic JSON nodes without allocating or trusting the payload.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the lexical scan keeps string and number state without allocating"
+)]
+#[cfg(feature = "openai-responses")]
+pub(crate) fn json_node_count(bytes: &[u8]) -> Option<usize> {
+    let mut nodes = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_number = false;
+    for &byte in bytes {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => {
+                nodes = nodes.checked_add(1)?;
+                in_string = true;
+                in_number = false;
+            },
+            b'{' | b'[' | b't' | b'f' | b'n' => {
+                nodes = nodes.checked_add(1)?;
+                in_number = false;
+            },
+            b'-' | b'0'..=b'9' if !in_number => {
+                nodes = nodes.checked_add(1)?;
+                in_number = true;
+            },
+            b'-' | b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' if in_number => {},
+            _ => in_number = false,
+        }
+    }
+    Some(nodes)
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(

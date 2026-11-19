@@ -367,7 +367,11 @@ fn parse_shared_config_items(root: &Path) -> ModuleItems {
 
 /// Local configuration files whose types are shared by filters in separate
 /// API categories. Paths are relative to the workspace root.
-const LOCAL_SHARED_CONFIG_FILES: &[&str] = &["apis/src/web_search/config.rs", "apis/src/callout_policy.rs"];
+const LOCAL_SHARED_CONFIG_FILES: &[&str] = &[
+    "apis/src/web_search/config.rs",
+    "apis/src/callout_policy.rs",
+    "apis/src/mcp_core/connector.rs",
+];
 
 /// Parse local configuration types shared by filters in separate API categories.
 fn parse_local_shared_config(root: &Path, items: &mut ModuleItems) {

@@ -6,7 +6,13 @@
 use std::sync::{Arc, Mutex};
 
 use super::*;
-use crate::RecordAiMetadata as _;
+use crate::{
+    RecordAiMetadata as _,
+    mcp_core::{
+        naming::MAX_FUNCTION_NAME_LEN,
+        tool_map::{AllowedTools, McpToolMapError},
+    },
+};
 
 /// Capture WARN messages emitted on this test thread without changing the
 /// process-wide tracing subscriber shared by parallel tests.
@@ -4762,7 +4768,7 @@ fn resolve_connector_ids_rejects_oversized_id() {
     })];
     let err = resolve_connector_ids(&connectors, &mut entries).unwrap_err();
     assert!(
-        matches!(err, ResolveError::InvalidConnectorId),
+        matches!(err, McpToolMapError::InvalidConnectorId),
         "oversized connector_id should be rejected: {err}"
     );
 }
@@ -6386,7 +6392,7 @@ mod admission {
         McpToolVerdict, admit_tools, build_entry_resolution, collect_deferred_connectors, protected_exclusion,
         tool_policy_for_entry,
     };
-    use crate::openai::responses::mcp_admission::{AdmissionBasis, McpAdmissionMode, McpDenyReason};
+    use crate::mcp_core::admission::{AdmissionBasis, McpAdmissionMode, McpDenyReason};
 
     fn protected() -> McpAdmissionPolicy {
         McpAdmissionPolicy {
@@ -6465,7 +6471,7 @@ mod admission {
     #[test]
     fn config_defaults_connector_tool_policy_to_deny() {
         // Omitting `tool_policy` is valid and denies the connector in protected mode.
-        let connector: super::super::config::ConnectorConfig =
+        let connector: crate::mcp_core::connector::ConnectorConfig =
             serde_yaml::from_str("id: gw\nserver_url: https://gw.internal/mcp\n").unwrap();
         assert_eq!(
             connector.tool_policy.snapshot(),

@@ -17,9 +17,8 @@ use tracing::{debug, trace};
 
 #[cfg(feature = "openai-mcp-tools")]
 use super::super::{
-    mcp_classify::{ApprovalFloor, McpDisposition, classify_mcp},
     mcp_dispatch::{configured_max_calls_per_round as configured_mcp_max_calls, prepare_response_round},
-    mcp_tool_resolve::{McpToolIndex, has_pending_deferred_discovery},
+    mcp_tool_resolve::has_pending_deferred_discovery,
 };
 use super::{
     super::{
@@ -39,6 +38,11 @@ use super::{
     },
     AgenticBudgetPolicy,
     config::{AgenticLoopConfig, build_config},
+};
+#[cfg(feature = "openai-mcp-tools")]
+use crate::mcp_core::{
+    classify::{ApprovalFloor, McpDisposition, classify_mcp},
+    naming::McpToolIndex,
 };
 use crate::{
     RecordAiMetadata as _,

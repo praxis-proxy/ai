@@ -47,8 +47,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, trace, warn};
 
-#[cfg(feature = "openai-mcp-tools")]
-use super::mcp_dispatch::{OWNER_FINGERPRINT, owner_fingerprint};
 use super::{
     AgenticBudgetPolicy, DEFAULT_STORE_NAME, append_stored_input_items, bound_body_outcome,
     canonical_openresponses_replay_item,
@@ -59,6 +57,8 @@ use super::{
     is_canonical_openresponses_replay_type,
     state::{LOCAL_COMPACTION_MARKER, ResponsesState, strip_local_compaction_marker},
 };
+#[cfg(feature = "openai-mcp-tools")]
+use crate::mcp_core::fingerprint::{OWNER_FINGERPRINT, owner_fingerprint};
 use crate::{
     RecordAiMetadata as _, is_event_stream_content_type,
     json_body::{MAX_JSON_BODY_BYTES, replace_json_body},

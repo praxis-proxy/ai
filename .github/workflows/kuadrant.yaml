@@ -18,6 +18,7 @@ on:
       - "examples/configs/openai/responses/full-flow-agentic.yaml"
       - "apis/src/openai/responses/mcp_tool_resolve/**"
       - "apis/src/openai/responses/mcp_dispatch/**"
+      - "apis/src/mcp_core/**"
       - "apis/src/mcp_client/**"
       - "apis/src/callout_credentials.rs"
       - "apis/src/callout_identity.rs"
@@ -85,6 +86,7 @@ jobs:
             'examples/configs/openai/responses/full-flow-agentic.yaml' \
             'apis/src/openai/responses/mcp_tool_resolve/' \
             'apis/src/openai/responses/mcp_dispatch/' \
+            'apis/src/mcp_core/' \
             'apis/src/mcp_client/' \
             'apis/src/callout_credentials.rs' \
             'apis/src/callout_identity.rs' \

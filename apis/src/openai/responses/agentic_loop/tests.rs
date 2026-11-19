@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use super::{super::budget::SimpleBudget, collect_output_items};
 #[cfg(feature = "openai-mcp-tools")]
-use crate::openai::responses::mcp_admission::ConnectorToolPolicy;
+use crate::mcp_core::admission::ConnectorToolPolicy;
 #[cfg(feature = "openai-mcp-tools")]
 use crate::openai::responses::state::DeferredMcpConnector;
 use crate::{
@@ -4082,7 +4082,7 @@ fn pending_deferred_connector() -> DeferredMcpConnector {
 #[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn denied_mcp_call_is_dispatchable_and_server_owned() {
-    use crate::openai::responses::mcp_admission::{
+    use crate::mcp_core::admission::{
         McpAdmissionDecisions, McpAdmissionMode, McpAdmissionPolicy, McpDenyReason, McpToolVerdict,
     };
 
