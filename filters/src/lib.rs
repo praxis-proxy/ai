@@ -132,7 +132,7 @@ pub(crate) mod test_utils {
             request_headers_to_remove: Vec::new(),
             request_headers_to_set: Vec::new(),
             request_header_mutations: Vec::new(),
-            filter_metadata: Default::default(),
+            filter_metadata: praxis_filter::FilterMetadata::default(),
             pre_read_mutations: Vec::new(),
             prior_pre_read_mutations: Vec::new(),
             structured_metadata: std::collections::HashMap::new(),
