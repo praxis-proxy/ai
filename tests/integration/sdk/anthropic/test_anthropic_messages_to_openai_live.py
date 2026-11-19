@@ -1,4 +1,6 @@
+#!/usr/bin/env python3
 # /// script
+# requires-python = ">=3.11"
 # dependencies = ["anthropic==1.17.0", "pytest==8.4.2"]
 # ///
 """Opt-in Anthropic SDK checks against official OpenAI through Praxis."""
@@ -89,3 +91,9 @@ def test_unknown_model_translates_upstream_error(client):
     # The translator preserves error types shared by both APIs.
     assert exc.value.status_code == 404
     assert exc.value.body["error"]["type"] == "invalid_request_error"
+
+
+if __name__ == "__main__":
+    import sys
+
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

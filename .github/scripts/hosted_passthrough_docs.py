@@ -27,7 +27,6 @@ def render():
     secret = field(r"secrets\.([A-Z_]+)", workflow)
     artifact = field(r"^\s+name: (hosted-\S+-results)$", workflow)
     sdk = field(r'"openai==([^"]+)"', suite)
-    pytest = field(r'"pytest==([^"]+)"', suite)
     model = field(r'^MODEL = "([^"]+)"$', suite)
 
     return f"""# Hosted passthrough nightly
@@ -38,7 +37,8 @@ def render():
 `{runner}` at cron `{cron}` (UTC) and supports manual dispatch.
 It builds Praxis from the workflow checkout and uses the
 `{secret}` Actions secret to call official OpenAI. A missing
-secret fails the credential check before the build.
+secret fails the credential check before the build. Fork schedules skip
+the job. Manual runs require the secret in the repository running the job.
 
 The [SDK suite](../../{SUITE}) sends Chat Completions requests
 through the local [Praxis configuration](../../{CONFIG})
@@ -52,14 +52,17 @@ repository root, and set `{secret}` in the shell that runs the SDK tests.
 
 ```bash
 PRAXIS_LIVE_OPENAI_BASE_URL=http://127.0.0.1:8080/v1 \\
-  uv run --with pytest=={pytest} --with openai=={sdk} pytest \\
+  uv run --script \\
   {SUITE}
 ```
 
 The run summary records the tested commit and configuration. The
-`{artifact}` artifact contains JUnit results. Release CI
+`{artifact}` artifact contains JUnit results and gateway logs. Release CI
 qualification records this lane when it finds a run for the exact release
-commit. The tests forward the caller's provider key. Gateway authorization,
+commit. A release with no matching run shows `not_run`. Update the pinned
+model snapshot in the SDK suite when OpenAI retires it.
+
+The tests forward the caller's provider key. Gateway authorization,
 tenant isolation, credential injection, and retries are outside this suite.
 """
 

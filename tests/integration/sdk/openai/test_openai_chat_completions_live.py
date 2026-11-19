@@ -1,12 +1,13 @@
+#!/usr/bin/env python3
 # /// script
+# requires-python = ">=3.11"
 # dependencies = ["openai==3.49.0", "pytest==8.4.2"]
 # ///
 """Opt-in live Chat Completions checks through a local Praxis gateway.
 
 Start Praxis with tests/integration/fixtures/openai/chat-completions-live.yaml.
 Set PRAXIS_LIVE_OPENAI_BASE_URL to its loopback /v1 URL and OPENAI_API_KEY
-to an upstream key the gateway forwards. Run with uv run --with pytest==8.4.2 --with
-openai==3.49.0 pytest tests/integration/sdk/openai/test_openai_chat_completions_live.py.
+to an upstream key the gateway forwards. Run this file with uv run --script.
 """
 
 import json
@@ -57,7 +58,7 @@ def test_stream_delivers_deltas_terminal_reason_and_usage(client):
     with client.chat.completions.create(
         model=MODEL,
         messages=[{"role": "user", "content": "Reply with OK."}],
-        max_completion_tokens=16,
+        max_completion_tokens=64,
         stream=True,
         stream_options={"include_usage": True},
     ) as stream:
@@ -101,3 +102,9 @@ def test_unknown_model_preserves_openai_error(client):
             messages=[{"role": "user", "content": "Reply with OK."}],
         )
     assert exc.value.code == "model_not_found"
+
+
+if __name__ == "__main__":
+    import sys
+
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

@@ -1,3 +1,4 @@
+# Live provider calls are billable. Results apply to the tested checkout.
 name: Hosted Passthrough Nightly
 
 on:
@@ -5,12 +6,17 @@ on:
     - cron: "43 5 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
 
 jobs:
   openai-chat:
     name: OpenAI Chat Completions passthrough
+    if: github.repository == 'praxis-proxy/ai' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -69,12 +75,10 @@ jobs:
           {
             echo "### OpenAI Chat Completions passthrough"
             echo "- Gateway commit: $(git rev-parse HEAD)"
-            echo "- OpenAI Python SDK: 3.49.0"
-            echo "- OpenAI model: gpt-4.1-mini-2025-04-14"
             echo "- Configuration: tests/integration/fixtures/openai/chat-completions-live.yaml"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          uv run --with pytest==8.4.2 --with openai==3.49.0 pytest \
+          uv run --script \
             tests/integration/sdk/openai/test_openai_chat_completions_live.py \
             --junitxml="$RUNNER_TEMP/hosted-openai-junit.xml" --tb=line
 
@@ -83,5 +87,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: hosted-openai-passthrough-results
-          path: ${{ runner.temp }}/hosted-openai-junit.xml
+          path: |
+            ${{ runner.temp }}/hosted-openai-junit.xml
+            ${{ runner.temp }}/hosted-openai-praxis.log
           if-no-files-found: ignore
