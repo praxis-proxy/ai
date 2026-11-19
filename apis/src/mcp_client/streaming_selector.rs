@@ -36,10 +36,6 @@ impl McpStreamingSelectorFilter {
     /// Returns [`FilterError`] if any configuration is supplied. Only a null or
     /// empty mapping is accepted; a non-empty mapping, a scalar, or a sequence
     /// is rejected via [`EmptyFilterConfig`]'s `deny_unknown_fields` contract.
-    #[cfg_attr(
-        not(any(test, feature = "openai-mcp-tools")),
-        expect(dead_code, reason = "registered only by the OpenAI Responses filters")
-    )]
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let _: EmptyFilterConfig = parse_filter_config(Self::NAME, config)?;
         Ok(Box::new(Self))

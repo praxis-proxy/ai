@@ -662,7 +662,7 @@ async fn first_round_resolves_connector_into_plain_tools() {
         .collect();
     assert_eq!(names, ["local", "weather__get_weather"]);
     assert_eq!(
-        ctx.get_metadata(MCP_CONNECTOR_METADATA_KEY),
+        ctx.filter_metadata.get(MCP_CONNECTOR_METADATA_KEY),
         Some(MCP_CONNECTOR_RESOLVED)
     );
     let state = ctx.extensions.get::<ConnectorState>().unwrap();

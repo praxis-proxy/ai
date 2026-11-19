@@ -357,6 +357,8 @@ fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: 
     register_anthropic_web_search(registry, subrequest_client);
     #[cfg(feature = "anthropic-mcp-connector-filter")]
     register_anthropic_mcp_connector(registry);
+    #[cfg(any(feature = "openai-mcp-tools", feature = "anthropic-mcp-connector-filter"))]
+    register_mcp_streaming_selector(registry);
 }
 
 /// Register `anthropic_mcp_connector` as a chain-binding filter.
@@ -562,9 +564,18 @@ fn register_mcp_callout_filters(registry: &mut FilterRegistry) {
             }),
         )
         .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_mcp_dispatch'"));
+}
+
+/// Register the selector that every MCP outbound chain auto-injects.
+///
+/// OpenAI Responses `mcp` tools and the Anthropic MCP connector both bind
+/// outbound chains that start with it, so it registers when either adapter
+/// is built.
+#[cfg(any(feature = "openai-mcp-tools", feature = "anthropic-mcp-connector-filter"))]
+fn register_mcp_streaming_selector(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_mcp_streaming_selector" => praxis_ai_apis::openai::McpStreamingSelectorFilter::from_config
+        http "openai_mcp_streaming_selector" => praxis_ai_apis::McpStreamingSelectorFilter::from_config
     );
 }
 
@@ -1003,7 +1014,13 @@ provider:
         ("openai_responses_compact", cfg!(feature = "openai-compact")),
         ("openai_mcp_tool_resolve", cfg!(feature = "openai-mcp-tools")),
         ("openai_mcp_dispatch", cfg!(feature = "openai-mcp-tools")),
-        ("openai_mcp_streaming_selector", cfg!(feature = "openai-mcp-tools")),
+        (
+            "openai_mcp_streaming_selector",
+            cfg!(any(
+                feature = "openai-mcp-tools",
+                feature = "anthropic-mcp-connector-filter"
+            )),
+        ),
         (
             "anthropic_mcp_connector",
             cfg!(feature = "anthropic-mcp-connector-filter"),

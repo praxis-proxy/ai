@@ -54,6 +54,7 @@ use super::{
     wire,
 };
 use crate::{
+    RecordAiMetadata as _,
     callout_headers::effective_body_callout_headers,
     callout_identity::{McpCalloutIdentity, stage_mcp_callout_identity},
     mcp_client,
@@ -330,7 +331,7 @@ impl AnthropicMcpConnectorFilter {
                 "resolved Anthropic MCP connector"
             );
             ctx.extensions.insert(state);
-            ctx.set_metadata(MCP_CONNECTOR_METADATA_KEY, MCP_CONNECTOR_RESOLVED);
+            ctx.record_ai_metadata(MCP_CONNECTOR_METADATA_KEY, MCP_CONNECTOR_RESOLVED);
             strip_beta_header(ctx);
         }
         let rebuilt = serde_json::to_vec(&object)
@@ -524,7 +525,7 @@ impl AnthropicMcpConnectorFilter {
         if ctx.extensions.get::<ConnectorState>().is_none() {
             return Ok(FilterAction::Continue);
         }
-        ctx.set_metadata(MCP_CONNECTOR_METADATA_KEY, MCP_CONNECTOR_RESOLVED);
+        ctx.record_ai_metadata(MCP_CONNECTOR_METADATA_KEY, MCP_CONNECTOR_RESOLVED);
         let Some(state) = ctx.extensions.get::<ConnectorState>().filter(|state| state.pending) else {
             return Ok(FilterAction::Continue);
         };
@@ -668,7 +669,8 @@ impl AnthropicMcpConnectorFilter {
     ) -> Result<FilterAction, FilterError> {
         let observed = body.as_ref().map_or(0, Bytes::len);
         let raw = ctx
-            .get_metadata(RESPONSE_RAW_BYTES_KEY)
+            .filter_metadata
+            .get(RESPONSE_RAW_BYTES_KEY)
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(observed);
         if raw > self.config.max_body_bytes || observed > self.config.max_body_bytes {
@@ -772,7 +774,7 @@ impl HttpFilter for AnthropicMcpConnectorFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -782,7 +784,7 @@ impl HttpFilter for AnthropicMcpConnectorFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
