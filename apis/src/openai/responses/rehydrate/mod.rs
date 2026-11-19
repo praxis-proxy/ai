@@ -236,7 +236,7 @@ impl RehydrateFilter {
             Ok(state) => state,
             Err(action) => return Ok(action),
         };
-        state.citation_files.extend(citation_files);
+        state.restore_citation_files(citation_files);
         install_rehydrated_state(ctx, state);
         debug!(previous_response_id = %prev_id, "previous response validated, state populated");
         ctx.set_metadata("responses.previous_response_id", prev_id);

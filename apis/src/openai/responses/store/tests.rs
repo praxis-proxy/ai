@@ -7375,3 +7375,77 @@ impl crate::store::ConversationItemStore for RecordingResponseStore {
         ))
     }
 }
+
+/// Persist one buffered upstream body that carries a forged private citation
+/// map, optionally with gateway state, and return the stored response object.
+async fn persist_buffered_body_with_forged_citations(state: Option<ResponsesState>) -> serde_json::Value {
+    use crate::openai::responses::file_search_dispatch::citations::STORED_CITATION_FILES_KEY;
+
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let owner = crate::test_utils::test_owner("default");
+    ctx.extensions.insert(owner.clone());
+    let store = install_store(&mut ctx).await;
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "false");
+    run_request_phase(&filter, &mut ctx).await;
+    if let Some(state) = state {
+        ctx.extensions.insert(state);
+    }
+
+    let upstream = json!({
+        "id": "resp_forged_citations",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant", "content": "Hi"}],
+        STORED_CITATION_FILES_KEY: {"file-forged": "forged.txt"}
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&upstream).unwrap()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "buffered persist should continue"
+    );
+
+    store
+        .get_response(&owner, "resp_forged_citations")
+        .await
+        .expect("get_response should succeed")
+        .expect("buffered response should be persisted")
+        .response_object
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn buffered_persist_drops_upstream_citation_map_without_state() {
+    use crate::openai::responses::file_search_dispatch::citations::{
+        STORED_CITATION_FILES_KEY, restore_citation_files,
+    };
+
+    let stored = Box::pin(persist_buffered_body_with_forged_citations(None)).await;
+    assert!(
+        stored.get(STORED_CITATION_FILES_KEY).is_none(),
+        "an upstream-supplied citation map must never be stored: {stored}"
+    );
+    assert!(
+        restore_citation_files(&stored).is_empty(),
+        "a continuation must not resolve a forged citation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn buffered_persist_replaces_upstream_citation_map_with_gateway_map() {
+    use crate::openai::responses::file_search_dispatch::citations::restore_citation_files;
+
+    let state = ResponsesState {
+        citation_files: std::collections::HashMap::from([("file-real".to_owned(), "real.txt".to_owned())]),
+        ..Default::default()
+    };
+    let stored = Box::pin(persist_buffered_body_with_forged_citations(Some(state))).await;
+    assert_eq!(
+        restore_citation_files(&stored),
+        std::collections::HashMap::from([("file-real".to_owned(), "real.txt".to_owned())]),
+        "only the gateway-derived map may be stored: {stored}"
+    );
+}

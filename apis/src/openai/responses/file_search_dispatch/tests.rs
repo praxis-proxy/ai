@@ -32,7 +32,7 @@ use crate::{
     callout_policy::OnFailure,
     openai::responses::{
         agentic_loop::budget::SimpleBudget,
-        state::{CollectedRound, FileSearchAssignment, SynthesisKind},
+        state::{CollectedRound, FileSearchAssignment, MAX_CITATION_FILES, SynthesisKind},
     },
     subrequest::{SubRequestClient, SubRequestError, SubResponse},
 };

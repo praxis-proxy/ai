@@ -59,7 +59,7 @@ use crate::{
         responses::{
             bounded_json_size,
             error::responses_error_rejection,
-            state::{DispatchFailure, FileSearchAssignment, MAX_CITATION_FILES, ResponsesState},
+            state::{DispatchFailure, FileSearchAssignment, ResponsesState},
         },
         translation::chat_completions::{
             TranslationError, responses_file_search_tool_choice_lowering, synthesized_file_search_tool_responses,
@@ -218,7 +218,7 @@ impl FileSearchDispatchFilter {
                 truncated,
             } = BridgeBudget {
                 known_citation_files: &state.citation_files,
-                max_new_citation_files: MAX_CITATION_FILES.saturating_sub(state.citation_files.len()),
+                max_new_citation_files: state.new_citation_file_slots(),
                 remaining_model_bytes,
                 source_item,
                 output_index: call.output_index,
@@ -289,7 +289,7 @@ impl FileSearchDispatchFilter {
         // is not valid OpenResponses input (issue #808), so no output item is
         // replayed here.
         for bridge in bridges {
-            append_search_bridge(state, bridge);
+            state.append_local_tool_results(bridge);
         }
         Ok(retained_charge)
     }
@@ -1515,31 +1515,6 @@ fn ensure_pending_file_search_call_ids(state: &mut ResponsesState, plan: &Search
             ensure_public_file_search_call_id(object, output_index, response_identity_hash);
         }
     }
-}
-
-/// Append one private bridge to working history and, when this exchange
-/// retains durable history, to its persistence mirror.
-///
-/// The persisted pair lands after the round's collected reasoning and
-/// `file_search_call`, so a `previous_response_id` continuation and a later
-/// compaction replay the same reasoning/call/result prefix the next inference
-/// round received (#2036). Both histories share one immutable payload per item,
-/// so persistence adds no copy of the retrieved context; later working-history
-/// edits detach through `MessageHistory`'s copy-on-write.
-fn append_search_bridge(state: &mut ResponsesState, bridge: [Value; 2]) {
-    let result_start = state.messages.len();
-    if state.captures_persistence_history() {
-        for item in bridge {
-            let item = Arc::new(item);
-            state.messages.push_shared(Arc::clone(&item));
-            if let Some(persisted) = state.persisted_messages_mut() {
-                persisted.push_shared(item);
-            }
-        }
-    } else {
-        state.messages.extend(bridge);
-    }
-    state.mark_local_tool_results_from(result_start);
 }
 
 /// Build the standard Responses bridge carrying private model context.

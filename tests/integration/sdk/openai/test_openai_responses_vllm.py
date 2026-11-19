@@ -10739,8 +10739,9 @@ class TestFileSearchChatCompletionsVLLM:
             max_output_tokens=512,
         )
         assert second.status == "completed", f"continuation: {second.status}"
+        continuation_end = len(SimulatorBackendHandler.recorded_requests)
 
-        def search_pairs(start: int, end: int | None = None):
+        def search_pairs(start: int, end: int):
             """Return (assistant tool_calls, tool results) per Chat request."""
             pairs = []
             for path, body in SimulatorBackendHandler.recorded_requests[start:end]:
@@ -10762,7 +10763,7 @@ class TestFileSearchChatCompletionsVLLM:
 
         live = [pair for pair in search_pairs(recorded_start, continuation_start) if pair[1]]
         assert len(live) == 1, f"one live re-entry carries the search result: {live}"
-        replayed = search_pairs(continuation_start)
+        replayed = search_pairs(continuation_start, continuation_end)
         assert len(replayed) == 1, f"one continuation inference: {replayed}"
         live_calls, live_results = live[0]
         replayed_calls, replayed_results = replayed[0]
