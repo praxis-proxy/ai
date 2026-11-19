@@ -7,7 +7,10 @@
 //! `type` and `sequence_number` fields; [`encode`] injects both at emission
 //! time so the state machine owns sequencing centrally.
 
+use openssl::rand::rand_bytes;
 use serde_json::{Value, json};
+
+use super::{ConvertError, serialized_json_len};
 
 /// A Responses streaming event ready for sequencing and encoding.
 pub(super) struct StreamEvent {
@@ -24,21 +27,50 @@ impl StreamEvent {
     }
 }
 
+/// Round the complete encoded SSE frame length up in 64-byte steps.
+fn pad_payload(payload: &mut Value, framing_len: usize) -> Result<(), ConvertError> {
+    const BUCKET_BYTES: usize = 64;
+    payload["obfuscation"] = Value::String(String::new());
+    let frame_len = framing_len + serialized_json_len(payload)?;
+    let padding_len = BUCKET_BYTES - frame_len % BUCKET_BYTES;
+    let mut random = [0; BUCKET_BYTES];
+    rand_bytes(&mut random).map_err(|error| {
+        tracing::warn!(%error, "failed to generate Responses stream padding");
+        ConvertError::ObfuscationRandomness
+    })?;
+    let padding = random
+        .iter()
+        .take(padding_len)
+        .map(|byte| char::from(b'a' + byte % 26))
+        .collect();
+    payload["obfuscation"] = Value::String(padding);
+    Ok(())
+}
+
 /// Encode one event as a Responses SSE frame, injecting `type` and
 /// `sequence_number`, and append it to `out`.
 ///
 /// # Errors
 ///
-/// Returns [`serde_json::Error`] when the payload cannot be serialized.
-pub(super) fn encode(mut event: StreamEvent, sequence_number: u64, out: &mut Vec<u8>) -> Result<(), serde_json::Error> {
+/// Returns an error if padding cannot be generated or the payload cannot be serialized.
+pub(super) fn encode(
+    mut event: StreamEvent,
+    sequence_number: u64,
+    include_obfuscation: bool,
+    out: &mut Vec<u8>,
+) -> Result<(), ConvertError> {
     if let Value::Object(map) = &mut event.payload {
         map.insert("type".to_owned(), Value::String(event.event_type.to_owned()));
         map.insert("sequence_number".to_owned(), Value::Number(sequence_number.into()));
     }
+    if include_obfuscation && event.event_type.ends_with(".delta") {
+        let framing_len = b"event: ".len() + event.event_type.len() + b"\ndata: ".len() + b"\n\n".len();
+        pad_payload(&mut event.payload, framing_len)?;
+    }
     out.extend_from_slice(b"event: ");
     out.extend_from_slice(event.event_type.as_bytes());
     out.extend_from_slice(b"\ndata: ");
-    serde_json::to_writer(&mut *out, &event.payload)?;
+    serde_json::to_writer(&mut *out, &event.payload).map_err(ConvertError::Serialize)?;
     out.extend_from_slice(b"\n\n");
     Ok(())
 }
@@ -246,7 +278,7 @@ mod tests {
     #[test]
     fn encode_injects_type_and_sequence_number() {
         let mut out = Vec::new();
-        encode(output_text_delta("msg_1", 0, 0, "hi", &json!([])), 4, &mut out).unwrap();
+        encode(output_text_delta("msg_1", 0, 0, "hi", &json!([])), 4, false, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.starts_with("event: response.output_text.delta\ndata: "),
@@ -265,11 +297,34 @@ mod tests {
     }
 
     #[test]
+    fn padding_normalizes_complete_sse_frames() {
+        for size in [0, 1, 63, 64, 65, 128] {
+            let delta = "é\n".repeat(size);
+            let logprobs = json!([{"token": delta, "logprob": -0.5}]);
+            let make_events: [&dyn Fn() -> StreamEvent; 4] = [
+                &|| output_text_delta("msg_1", 0, 0, &delta, &logprobs),
+                &|| refusal_delta("msg_1", 0, 0, &delta),
+                &|| function_call_arguments_delta("call_1", 0, &delta),
+                &|| reasoning_text_delta("reason_1", 0, &delta),
+            ];
+            for make_event in make_events {
+                let mut padded = Vec::new();
+                let mut plain = Vec::new();
+                encode(make_event(), 123, true, &mut padded).unwrap();
+                encode(make_event(), 123, false, &mut plain).unwrap();
+                assert_eq!(padded.len() % 64, 0);
+                assert!((1..=64).contains(&(padded.len() - plain.len() - b",\"obfuscation\":\"\"".len())));
+            }
+        }
+    }
+
+    #[test]
     fn response_created_wraps_resource() {
         let mut out = Vec::new();
         encode(
             response_created(&json!({"id": "resp_1", "status": "in_progress"})),
             0,
+            false,
             &mut out,
         )
         .unwrap();

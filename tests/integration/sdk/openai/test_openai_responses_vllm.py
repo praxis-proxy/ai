@@ -11768,6 +11768,54 @@ def test_null_tool_choice_succeeds_sdk(chat_streaming_client):
 
 @pytest.mark.skipif(
     VLLM_TEST_BACKEND != "simulator",
+    reason="uses the simulator's scripted Chat stream",
+)
+@pytest.mark.parametrize("include_obfuscation", [None, True, False])
+def test_translated_stream_obfuscation(chat_streaming_client, include_obfuscation):
+    options = (
+        {} if include_obfuscation is None
+        else {"stream_options": {"include_obfuscation": include_obfuscation}}
+    )
+    with chat_streaming_client.responses.with_streaming_response.create(
+        model=CHAT_TRANSLATION_MODEL,
+        input="STREAM-SERVICE-TIER-1549",
+        store=False,
+        stream=True,
+        **options,
+    ) as stream:
+        wire = b"".join(stream.iter_bytes())
+
+    events = []
+    for frame in wire.split(b"\n\n"):
+        for line in frame.splitlines():
+            if line.startswith(b"data: "):
+                events.append((json.loads(line.removeprefix(b"data: ")), len(frame) + 2))
+
+    assert events[-1][0]["type"] == "response.completed"
+    deltas = [(event, size) for event, size in events if event["type"] == "response.output_text.delta"]
+    assert deltas
+    for event, size in deltas:
+        if include_obfuscation is False:
+            assert "obfuscation" not in event
+        else:
+            assert 1 <= len(event["obfuscation"]) <= 64
+            assert size % 64 == 0
+    assert all("obfuscation" not in event for event, _ in events if not event["type"].endswith(".delta"))
+
+
+def test_translated_stream_rejects_non_boolean_obfuscation(chat_streaming_client):
+    with pytest.raises(openai.BadRequestError, match=r"stream_options\.include_obfuscation"):
+        chat_streaming_client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="STREAM-SERVICE-TIER-1549",
+            store=False,
+            stream=True,
+            extra_body={"stream_options": {"include_obfuscation": "false"}},
+        )
+
+
+@pytest.mark.skipif(
+    VLLM_TEST_BACKEND != "simulator",
     reason="the service-tier provider response is deterministically scripted",
 )
 def test_streaming_service_tier_snapshot_uses_provider_value(chat_streaming_client):
