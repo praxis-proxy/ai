@@ -26,11 +26,10 @@
 use std::io;
 
 use bytes::Bytes;
+use praxis_filter::json_size::{self, JsonSizeError};
 use serde::Serialize;
 use serde_json::Value;
 use tracing::debug;
-
-use crate::json_size::{self, JsonSizeError};
 
 /// Cap for JSON bodies these filters buffer, size, or accumulate. Praxis 0.8.0 raised its own
 /// `MAX_JSON_BODY_BYTES` to the addressable maximum and leaves the cap to `body_limits`; praxis-ai keeps 64 MiB.
@@ -85,7 +84,8 @@ pub(crate) fn json_size_error(error: JsonSizeError) -> serde_json::Error {
 /// error, so nothing can be committed.
 ///
 /// ```
-/// use praxis_ai_apis::{json_body::serialize_json_body_capped, json_size::JsonSizeError};
+/// use praxis_ai_apis::json_body::serialize_json_body_capped;
+/// use praxis_filter::json_size::JsonSizeError;
 ///
 /// let value = serde_json::json!({"a": "é"});
 /// assert_eq!(serialize_json_body_capped(&value, 10)?.len(), 10);

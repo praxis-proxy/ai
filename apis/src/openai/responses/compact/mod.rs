@@ -568,7 +568,7 @@ fn compaction_response_limit(budget: Option<SimpleBudget>) -> Result<usize, Filt
 
 /// Count already parsed JSON without building another serialized payload.
 fn count_json_bytes<T: serde::Serialize>(value: &T) -> Option<usize> {
-    crate::json_size::serialized_len(value).ok()
+    praxis_filter::json_size::serialized_len(value).ok()
 }
 
 /// Budget failures always terminate the request, including fail-open callouts.

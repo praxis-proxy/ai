@@ -288,7 +288,7 @@ pub(crate) fn bounded_json_size<T: serde::Serialize + ?Sized>(
     value: &T,
     max_bytes: usize,
 ) -> Result<Option<usize>, serde_json::Error> {
-    use crate::json_size::{JsonSizeError, serialized_len_capped};
+    use praxis_filter::json_size::{JsonSizeError, serialized_len_capped};
     match serialized_len_capped(value, max_bytes) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(JsonSizeError::LimitExceeded | JsonSizeError::LengthOverflow) => Ok(None),
