@@ -23,6 +23,7 @@ use super::{
     validate::validate_metadata,
 };
 use crate::{
+    RecordAiMetadata as _,
     openai::{
         operation::conformance::{
             OperationKey, assert_matches_schema, generated_operation_keys, generated_response_schemas,
@@ -3598,8 +3599,14 @@ async fn delete_item_returns_updated_conversation() {
 #[test]
 fn filter_declares_dual_phase_request_body_access() {
     let filter = build_test_filter();
-    assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
-    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(
+        filter.request_body_access(),
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    );
+    assert_eq!(
+        filter.bound_upstream_request_body_access(),
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -3705,8 +3712,8 @@ async fn patch_on_conversation_path_continues() {
 // -----------------------------------------------------------------------------
 
 fn set_append_back_metadata(ctx: &mut HttpFilterContext<'_>) {
-    ctx.set_metadata("openai_responses_request.has_conversation", "true");
-    ctx.set_metadata("responses.conversation_id", "conv_test_123");
+    ctx.record_ai_metadata("openai_responses_request.has_conversation", "true");
+    ctx.record_ai_metadata("responses.conversation_id", "conv_test_123");
 }
 
 async fn capture_append_owner_for_test(filter: &dyn HttpFilter, ctx: &mut HttpFilterContext<'_>) {
@@ -3749,10 +3756,10 @@ async fn streaming_terminal_appends_once_without_buffering_sse() {
     let mut ctx = conv_ctx(&store, &req);
     ctx.current_filter_id = Some(0);
     ctx.response_body_mode = filter.response_body_mode();
-    ctx.set_metadata("openai_responses_request.has_conversation", "true");
-    ctx.set_metadata("responses.conversation_id", &conv_id);
-    ctx.set_metadata("openai_responses_request.stream", "true");
-    ctx.set_metadata("openai_responses_request.store", "false");
+    ctx.record_ai_metadata("openai_responses_request.has_conversation", "true");
+    ctx.record_ai_metadata("responses.conversation_id", &conv_id);
+    ctx.record_ai_metadata("openai_responses_request.stream", "true");
+    ctx.record_ai_metadata("openai_responses_request.store", "false");
     ctx.extensions.insert(ResponsesState {
         input: vec![serde_json::json!({"role":"user","content":"streamed question"})].into(),
         response_object: serde_json::json!({
@@ -3807,9 +3814,9 @@ async fn local_stream_completion_appends_before_eos() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = conv_ctx(&store, &req);
     ctx.current_filter_id = Some(0);
-    ctx.set_metadata("openai_responses_request.has_conversation", "true");
-    ctx.set_metadata("responses.conversation_id", &conv_id);
-    ctx.set_metadata("openai_responses_request.stream", "true");
+    ctx.record_ai_metadata("openai_responses_request.has_conversation", "true");
+    ctx.record_ai_metadata("responses.conversation_id", &conv_id);
+    ctx.record_ai_metadata("openai_responses_request.stream", "true");
     ctx.extensions.insert(ResponsesState {
         input: vec![serde_json::json!({"type":"message","role":"user","content":"local input"})].into(),
         response_object: serde_json::json!({
@@ -3863,9 +3870,9 @@ async fn stream_without_completed_terminal_does_not_append_conversation_items() 
         let req = make_request(Method::POST, "/v1/responses");
         let mut ctx = conv_ctx(&store, &req);
         ctx.current_filter_id = Some(0);
-        ctx.set_metadata("openai_responses_request.has_conversation", "true");
-        ctx.set_metadata("responses.conversation_id", &conv_id);
-        ctx.set_metadata("openai_responses_request.stream", "true");
+        ctx.record_ai_metadata("openai_responses_request.has_conversation", "true");
+        ctx.record_ai_metadata("responses.conversation_id", &conv_id);
+        ctx.record_ai_metadata("openai_responses_request.stream", "true");
         ctx.extensions.insert(ResponsesState {
             input: vec![serde_json::json!({"type":"message","role":"user","content":"unfinished"})].into(),
             response_object: serde_json::json!({"status":status,"output":[]}),
@@ -3905,7 +3912,7 @@ async fn on_response_not_armed_when_background() {
     let mut ctx = conv_ctx(&store, &req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
-    ctx.set_metadata("openai_responses_request.background", "true");
+    ctx.record_ai_metadata("openai_responses_request.background", "true");
 
     let action = filter.on_response(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
@@ -4243,8 +4250,8 @@ async fn on_response_body_appends_completed_response() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = conv_ctx(&store, &req);
     ctx.current_filter_id = Some(0);
-    ctx.set_metadata("openai_responses_request.has_conversation", "true");
-    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.record_ai_metadata("openai_responses_request.has_conversation", "true");
+    ctx.record_ai_metadata("responses.conversation_id", &conv_id);
 
     let input_items = vec![serde_json::json!({
         "role": "user",
@@ -4321,8 +4328,8 @@ async fn append_back_cannot_write_another_owners_conversation() {
     let mut ctx = conv_ctx(&store, &req);
     ctx.current_filter_id = Some(0);
     ctx.extensions.insert(other_subject);
-    ctx.set_metadata("openai_responses_request.has_conversation", "true");
-    ctx.set_metadata("responses.conversation_id", &conversation_id);
+    ctx.record_ai_metadata("openai_responses_request.has_conversation", "true");
+    ctx.record_ai_metadata("responses.conversation_id", &conversation_id);
     ctx.extensions.insert(ResponsesState {
         input: vec![serde_json::json!({"type": "message", "role": "user", "content": "intruder"})].into(),
         ..ResponsesState::default()
@@ -4412,7 +4419,7 @@ async fn streaming_terminal_propagates_append_failure_before_release() {
     let mut ctx = conv_ctx(&store, &req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
-    ctx.set_metadata("openai_responses_request.stream", "true");
+    ctx.record_ai_metadata("openai_responses_request.stream", "true");
     ctx.extensions.insert(ResponsesState {
         input: vec![serde_json::json!({"type":"message","role":"user","content":"hello"})].into(),
         response_object: serde_json::json!({"status":"completed","output":[]}),
@@ -5922,7 +5929,7 @@ async fn conformance_conversations_rate_limit_rejects_every_operation_before_sto
     let validator = pinned_error_validator();
     for operation in operation_specs() {
         let config = serde_yaml::from_str(
-            "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nrate_limit: {mode: global, rate: 0.000001, burst: 1}",
+            "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nrate_limit: {scope: local, mode: global, rate: 0.000001, burst: 1}",
         )
         .unwrap();
         let filter = OpenaiConversationsFilter::from_config(&config).unwrap();
@@ -6063,6 +6070,7 @@ fn rate_limit_config_reuses_core_validation_and_stays_out_of_store_config() {
         "{mode: global, rate: 0, burst: 1}",
         "{mode: global, rate: 1, burst: 0}",
         "{mode: owner, rate: 1, burst: 1}",
+        "{scope: unknown, mode: global, rate: 1, burst: 1}",
         "{mode: global, rate: 1, burst: 1, unknown: true}",
     ] {
         let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(

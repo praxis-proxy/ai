@@ -98,12 +98,12 @@ async fn captures_matching_headers_to_metadata() {
     assert!(matches!(action, FilterAction::Continue), "should continue the pipeline");
     assert_eq!(
         ctx.filter_metadata.get("identity.x-tenant-username"),
-        Some(&"yossi".to_owned()),
+        Some("yossi"),
         "username should be captured to metadata"
     );
     assert_eq!(
         ctx.filter_metadata.get("identity.x-tenant-group"),
-        Some(&"ai-eng".to_owned()),
+        Some("ai-eng"),
         "group should be captured to metadata"
     );
 }
@@ -174,7 +174,7 @@ async fn case_insensitive_prefix_matching() {
 
     assert_eq!(
         ctx.filter_metadata.get("identity.x-tenant-username"),
-        Some(&"yossi".to_owned()),
+        Some("yossi"),
         "case-insensitive match should capture the header"
     );
 }
@@ -198,7 +198,7 @@ metadata_namespace: "maas"
 
     assert_eq!(
         ctx.filter_metadata.get("maas.x-maas-username"),
-        Some(&"alice".to_owned()),
+        Some("alice"),
         "should use custom namespace"
     );
     assert!(

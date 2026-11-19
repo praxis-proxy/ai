@@ -4,7 +4,10 @@
 //! Tests for the `openai_web_search_dispatch` filter.
 
 use super::*;
-use crate::{openai::responses::agentic_loop::budget::SimpleBudget, web_search::config::MAX_SEARCH_QUERY_BYTES};
+use crate::{
+    RecordAiMetadata as _, openai::responses::agentic_loop::budget::SimpleBudget,
+    web_search::config::MAX_SEARCH_QUERY_BYTES,
+};
 
 // -----------------------------------------------------------------------------
 // Helper: build filter from YAML
@@ -452,7 +455,10 @@ fn filter_response_body_access_is_read_only() {
     let yaml = make_filter_yaml("brave", "test-key");
     let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
-    assert_eq!(filter.response_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(
+        filter.response_body_access(),
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -1116,7 +1122,7 @@ async fn budgeted_web_search_rejects_oversized_body_without_publishing_results()
             .all(|item| item.get("type").and_then(Value::as_str) != Some("function_call_output")),
         "no result may enter persisted history"
     );
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
 }
 
 #[test]
@@ -3350,7 +3356,7 @@ fn build_tool_result_messages_incomplete_with_results_keeps_them() {
 fn bound_streamed_search_action_replaces_invalid_queries() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata(MAX_QUERY_METADATA, "16".to_owned());
+    ctx.record_ai_metadata(MAX_QUERY_METADATA, "16".to_owned());
     let oversized = "x".repeat(17);
     for action in [
         serde_json::json!({"type": "search", "query": oversized}),
@@ -3372,7 +3378,7 @@ fn bound_streamed_search_action_replaces_invalid_queries() {
 fn bound_streamed_search_action_keeps_valid_and_queryless_items() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata(MAX_QUERY_METADATA, "16".to_owned());
+    ctx.record_ai_metadata(MAX_QUERY_METADATA, "16".to_owned());
     for item in [
         serde_json::json!({"type": "web_search_call", "id": "ws_1", "action": {"type": "search", "query": " rust "}}),
         serde_json::json!({"type": "web_search_call", "id": "ws_1", "status": "in_progress"}),
@@ -3409,13 +3415,10 @@ fn bound_streamed_search_action_is_noop_without_dispatcher_bound() {
 fn search_bridge_shares_payloads_and_detaches_on_mutation() {
     let mut state = ResponsesState::from_request_body(serde_json::json!({"input": "hello"}));
     let start = state.messages.len();
-    append_search_bridge(
-        &mut state,
-        [
-            serde_json::json!({"type": "function_call", "call_id": "bridge"}),
-            serde_json::json!({"type": "function_call_output", "call_id": "bridge", "output": "results"}),
-        ],
-    );
+    state.append_local_tool_results([
+        serde_json::json!({"type": "function_call", "call_id": "bridge"}),
+        serde_json::json!({"type": "function_call_output", "call_id": "bridge", "output": "results"}),
+    ]);
     for index in start..start + 2 {
         assert!(
             state.messages.shares_item_with(index, &state.persisted_messages, index),

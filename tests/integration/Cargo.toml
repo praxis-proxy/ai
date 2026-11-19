@@ -11,10 +11,12 @@ publish = false
 # Feature passthroughs mirroring praxis-ai-proxy (see its Cargo.toml). The
 # default is `full`; experimental filter suites require explicit opt-in.
 default = ["full"]
-standard = ["praxis-ai-proxy/standard", "praxis-test-utils/standard"]
+standard = ["policy-engine", "praxis-ai-proxy/standard", "praxis-test-utils/standard"]
 # The signing filter alone, so the FIPS suite run can enable exactly the
 # feature set the FIPS binary ships (see FIPS_FEATURES in the Makefile).
 aws-sigv4-filter = ["praxis-ai-proxy/aws-sigv4-filter", "praxis-test-utils/aws-sigv4-filter"]
+# The `policy` filter from Praxis core. Part of `standard`; the FIPS build omits it.
+policy-engine = ["praxis-ai-proxy/policy-engine"]
 openai-responses = ["experimental", "praxis-ai-proxy/openai-responses", "praxis-test-utils/openai-responses"]
 # Experimental ephemeral agent orchestration; separate from Responses support.
 openai-agentic-loop = ["openai-responses", "experimental", "praxis-ai-proxy/openai-agentic-loop", "praxis-test-utils/openai-agentic-loop"]

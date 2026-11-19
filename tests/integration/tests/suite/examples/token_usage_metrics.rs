@@ -85,7 +85,9 @@ impl HttpFilter for TrustedTenantMetadata {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        ctx.set_metadata("x-tenant-username", "token-metrics-example-alice");
+        ctx.filter_metadata
+            .insert("x-tenant-username", "token-metrics-example-alice")
+            .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
         Ok(FilterAction::Continue)
     }
 }

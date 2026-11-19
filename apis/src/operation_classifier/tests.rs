@@ -80,13 +80,11 @@ async fn classifies_a_conversations_operation() {
     assert_eq!(matched.request_body, RequestBody::None);
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("ai_operation.application_protocol")
-            .map(String::as_str),
+        ctx.filter_metadata.get("ai_operation.application_protocol"),
         Some("openai_conversations")
     );
     assert_eq!(
-        ctx.filter_metadata.get("ai_operation.operation_id").map(String::as_str),
+        ctx.filter_metadata.get("ai_operation.operation_id"),
         Some("getConversation")
     );
 }
@@ -475,9 +473,7 @@ async fn headers_can_be_disabled_while_metadata_still_publishes() {
 
     assert!(ctx.request_headers_to_set.is_empty());
     assert_eq!(
-        ctx.filter_metadata
-            .get("ai_operation.application_protocol")
-            .map(String::as_str),
+        ctx.filter_metadata.get("ai_operation.application_protocol"),
         Some("openai_responses")
     );
 }
@@ -816,13 +812,11 @@ async fn publishes_anthropic_metadata_and_filter_results() {
     drop(filter.on_request_head(&mut ctx).await.unwrap());
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("ai_operation.application_protocol")
-            .map(String::as_str),
+        ctx.filter_metadata.get("ai_operation.application_protocol"),
         Some("anthropic_messages")
     );
     assert_eq!(
-        ctx.filter_metadata.get("ai_operation.operation_id").map(String::as_str),
+        ctx.filter_metadata.get("ai_operation.operation_id"),
         Some("messages_post")
     );
 

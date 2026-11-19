@@ -4224,6 +4224,7 @@ class TestOpenAIResponsesVLLM:
         # rewrite never touches, so before the fix the stored response echoed the
         # backend's null even though the streamed terminal carried first.id.
         retrieved = _retrieve_with_retry(openai_client, final_response.id)
+        assert retrieved.model == final_response.model
         assert retrieved.previous_response_id == first.id, (
             "the stored streaming response must persist the caller's "
             "previous_response_id, matching the terminal frame the client saw; "
@@ -9810,16 +9811,18 @@ class TestAgenticLoopVLLM:
         output_item.added -> web_search_call.in_progress -> searching ->
         completed -> output_item.done sequence exactly once per call (no
         re-emission across IRR rounds), with ids and output indices that agree
-        with the terminal snapshot. The live model may make multiple searches.
+        with the terminal snapshot. The assertions expect exactly one search item
+        because the request sets max_tool_calls=1.
         """
         stream = translated_agentic_client.responses.create(
             model=CHAT_TRANSLATION_MODEL,
             input=(
-                "Search the web for the latest Rust release, then answer. "
-                "You MUST use the web search tool. Do not answer directly. "
+                "Search the web once for the latest Rust release, then report the result title. "
                 "/no_think"
             ),
-            tools=[{"type": "web_search_preview"}],
+            tools=[{"type": "web_search"}],
+            tool_choice={"type": "web_search"},
+            max_tool_calls=1,
             store=False,
             stream=True,
             max_output_tokens=512,
@@ -9898,16 +9901,12 @@ class TestAgenticLoopVLLM:
         # one incremental output_item.added. Without the synthesis they appear
         # only in the terminal snapshot and never here.
         ws_added = [a for a in added if a[1] == "web_search_call"]
-        assert ws_added, (
-            "locally executed web_search_calls should surface as incremental "
-            f"response.output_item.added; got incremental added items: {added}"
+        assert len(ws_added) == 1, (
+            "expected exactly one incremental web_search_call with "
+            f"max_tool_calls=1; got {len(ws_added)}: {ws_added}"
         )
         ws_ids = [item_id for _, _, item_id, _ in ws_added]
         assert all(ws_ids), f"every synthesized web_search_call must carry an id; got: {ws_added}"
-        assert len(ws_ids) == len(set(ws_ids)), (
-            "each locally executed search must be announced once with a unique id; "
-            f"got: {ws_ids}"
-        )
 
         # Each id must have exactly one matching output_item.done, proving the
         # item is not re-emitted across IRR rounds and that every pair closes.
@@ -10858,6 +10857,78 @@ class TestFileSearchChatCompletionsVLLM:
                 recorded_request_count,
                 tool_name="file_search",
             )
+
+    @requires_simulator
+    def test_file_search_result_survives_previous_response_id_continuation(
+        self, file_search_chat_client, vector_store
+    ):
+        """Issue #2036: a stored continuation replays the private search result.
+
+        The gateway feeds the retrieved passage to the next round as a private
+        tool call/result pair. A ``previous_response_id`` follow-up must replay
+        that exact pair from the store, not just the public file_search_call.
+        """
+        store_id, marker = vector_store
+        tools = [{"type": "file_search", "vector_store_ids": [store_id]}]
+        recorded_start = len(SimulatorBackendHandler.recorded_requests)
+        first = file_search_chat_client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="Find the Praxis marker with file_search. /no_think",
+            tools=tools,
+            max_output_tokens=512,
+        )
+        assert first.status == "completed", f"first turn: {first.status}"
+        assert any(item.type == "file_search_call" for item in first.output)
+
+        continuation_start = len(SimulatorBackendHandler.recorded_requests)
+        second = file_search_chat_client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="What else does the report say? /no_think",
+            previous_response_id=first.id,
+            tools=tools,
+            max_output_tokens=512,
+        )
+        assert second.status == "completed", f"continuation: {second.status}"
+        continuation_end = len(SimulatorBackendHandler.recorded_requests)
+
+        def search_pairs(start: int, end: int):
+            """Return (assistant tool_calls, tool results) per Chat request."""
+            pairs = []
+            for path, body in SimulatorBackendHandler.recorded_requests[start:end]:
+                if not path.rstrip("/").endswith("/v1/chat/completions"):
+                    continue
+                messages = body.get("messages", [])
+                calls = [
+                    call
+                    for message in messages
+                    if message.get("role") == "assistant"
+                    for call in message.get("tool_calls") or []
+                    if call.get("function", {}).get("name") == "file_search"
+                ]
+                results = [
+                    message for message in messages if message.get("role") == "tool"
+                ]
+                pairs.append((calls, results))
+            return pairs
+
+        live = [pair for pair in search_pairs(recorded_start, continuation_start) if pair[1]]
+        assert len(live) == 1, f"one live re-entry carries the search result: {live}"
+        replayed = search_pairs(continuation_start, continuation_end)
+        assert len(replayed) == 1, f"one continuation inference: {replayed}"
+        live_calls, live_results = live[0]
+        replayed_calls, replayed_results = replayed[0]
+        assert replayed_calls == live_calls, (
+            "the continuation must replay the live private file_search call"
+        )
+        assert replayed_results == live_results, (
+            "the continuation must replay the live private file_search result"
+        )
+        assert any(marker in (result.get("content") or "") for result in replayed_results), (
+            "the replayed tool result must carry the retrieved passage"
+        )
+        assert {result.get("tool_call_id") for result in replayed_results} == {
+            call.get("id") for call in replayed_calls
+        }, "replayed call and result must keep their correlation id"
 
 
 # ---------------------------------------------------------------------------

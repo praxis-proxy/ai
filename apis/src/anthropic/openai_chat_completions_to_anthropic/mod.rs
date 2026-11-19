@@ -23,6 +23,7 @@ use praxis_filter::{
 pub(crate) use response::{map_stop_reason, total_input_tokens};
 
 use self::config::OpenaiChatCompletionsToAnthropicConfig;
+use crate::RecordAiMetadata as _;
 
 /// Registered filter identifier.
 const FILTER_NAME: &str = "openai_chat_completions_to_anthropic";
@@ -156,12 +157,12 @@ impl OpenaiChatCompletionsToAnthropicFilter {
     fn bind_profile(ctx: &mut HttpFilterContext<'_>, profile: &SelectedProfile) -> Result<(), FilterError> {
         for (key, value) in profile_metadata(profile) {
             let bound_key = format!("{BOUND_PREFIX}{key}");
-            if let Some(previous) = ctx.get_metadata(&bound_key)
+            if let Some(previous) = ctx.filter_metadata.get(&bound_key)
                 && previous != value
             {
                 return Err(format!("{FILTER_NAME}: selected provider profile changed during the request").into());
             }
-            ctx.set_metadata(&bound_key, value);
+            ctx.record_ai_metadata(&bound_key, value);
         }
         Ok(())
     }
@@ -170,7 +171,7 @@ impl OpenaiChatCompletionsToAnthropicFilter {
     fn profile_matches_bound(ctx: &HttpFilterContext<'_>, profile: &SelectedProfile) -> bool {
         profile_metadata(profile).into_iter().all(|(key, value)| {
             let bound_key = format!("{BOUND_PREFIX}{key}");
-            ctx.get_metadata(&bound_key) == Some(value)
+            ctx.filter_metadata.get(&bound_key) == Some(value)
         })
     }
 
@@ -226,7 +227,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
 
     /// Defer request-body mutation until `intelligent_route` has selected a provider.
     fn selected_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     /// Buffer a complete request within the configured cap before JSON translation.
@@ -238,7 +239,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
 
     /// Allow translation of complete Anthropic JSON responses.
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     /// Receive response chunks while retaining JSON only in this filter's bounded request state.
@@ -346,16 +347,16 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
                 )));
             },
         };
-        ctx.set_metadata(REQUEST_STREAM, request.stream.to_string());
-        ctx.set_metadata(CLIENT_MODEL, request.client_model);
-        ctx.set_metadata(INCLUDE_USAGE, request.include_usage.to_string());
+        ctx.record_ai_metadata(REQUEST_STREAM, request.stream.to_string());
+        ctx.record_ai_metadata(CLIENT_MODEL, request.client_model);
+        ctx.record_ai_metadata(INCLUDE_USAGE, request.include_usage.to_string());
         *body = Some(Bytes::from(translated));
         Ok(SelectedUpstreamBodyOutcome::Continue)
     }
 
     /// Arm JSON response conversion only for a successful Anthropic Messages response.
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        if ctx.get_metadata(&format!("{BOUND_PREFIX}api_format")) != Some("messages") {
+        if ctx.filter_metadata.get(&format!("{BOUND_PREFIX}api_format")) != Some("messages") {
             return Ok(FilterAction::Continue);
         }
         let Some(response) = ctx.response_header.as_ref() else {
@@ -369,7 +370,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
             .and_then(|value| value.to_str().ok())
             .is_some_and(crate::is_event_stream_content_type);
         if success && is_event_stream {
-            if ctx.get_metadata(REQUEST_STREAM) == Some("true") {
+            if ctx.filter_metadata.get(REQUEST_STREAM) == Some("true") {
                 return Ok(FilterAction::Continue);
             }
             return Ok(FilterAction::Reject(Self::openai_error_rejection(
@@ -378,7 +379,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
                 "Anthropic provider streamed a response for a non-streaming request",
             )));
         }
-        if success && ctx.get_metadata(REQUEST_STREAM) == Some("true") {
+        if success && ctx.filter_metadata.get(REQUEST_STREAM) == Some("true") {
             return Ok(FilterAction::Reject(Self::openai_error_rejection(
                 502,
                 "server_error",
@@ -400,9 +401,9 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
                 .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
             ctx.response_headers_modified = true;
         }
-        ctx.set_metadata(RESPONSE_ARMED, "true");
-        ctx.set_metadata(RESPONSE_ERROR, (!success).to_string());
-        ctx.set_metadata(RESPONSE_STATUS, status.to_string());
+        ctx.record_ai_metadata(RESPONSE_ARMED, "true");
+        ctx.record_ai_metadata(RESPONSE_ERROR, (!success).to_string());
+        ctx.record_ai_metadata(RESPONSE_STATUS, status.to_string());
         Ok(FilterAction::Continue)
     }
 
@@ -413,7 +414,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if ctx.get_metadata(RESPONSE_ARMED) != Some("true") {
+        if ctx.filter_metadata.get(RESPONSE_ARMED) != Some("true") {
             return Ok(FilterAction::Continue);
         }
 
@@ -449,14 +450,15 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
             .remove_filter_state::<BufferedJsonResponse>()
             .ok_or("Anthropic JSON response buffer state disappeared at end of stream")?;
         let raw = buffered.bytes.as_slice();
-        let translated = if ctx.get_metadata(RESPONSE_ERROR) == Some("true") {
+        let translated = if ctx.filter_metadata.get(RESPONSE_ERROR) == Some("true") {
             let status = ctx
-                .get_metadata(RESPONSE_STATUS)
+                .filter_metadata
+                .get(RESPONSE_STATUS)
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(502);
             response::translate_error(raw, status)
         } else {
-            let client_model = ctx.get_metadata(CLIENT_MODEL).unwrap_or("unknown");
+            let client_model = ctx.filter_metadata.get(CLIENT_MODEL).unwrap_or("unknown");
             match response::translate_response(raw, client_model) {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -475,7 +477,7 @@ impl HttpFilter for OpenaiChatCompletionsToAnthropicFilter {
 
 /// Resolve and validate the trusted selected candidate metadata for this request.
 fn selected_profile(ctx: &HttpFilterContext<'_>) -> Result<SelectedProfile, String> {
-    if !matches!(ctx.get_metadata(ROUTE_OUTCOME), Some("routed" | "reused")) {
+    if !matches!(ctx.filter_metadata.get(ROUTE_OUTCOME), Some("routed" | "reused")) {
         return Err("intelligent_route did not make a request-scoped provider selection".to_owned());
     }
     let stable_id = required_metadata(ctx, ROUTE_STABLE_ID)?;
@@ -545,10 +547,10 @@ struct SelectedCredential {
 /// Read the selected Secret reference from trusted routing metadata.
 fn selected_credential(ctx: &HttpFilterContext<'_>) -> SelectedCredential {
     SelectedCredential {
-        strategy: ctx.get_metadata(CREDENTIAL_STRATEGY).map(str::to_owned),
-        name: ctx.get_metadata(CREDENTIAL_NAME).map(str::to_owned),
-        namespace: ctx.get_metadata(CREDENTIAL_NAMESPACE).map(str::to_owned),
-        key: ctx.get_metadata(CREDENTIAL_KEY).map(str::to_owned),
+        strategy: ctx.filter_metadata.get(CREDENTIAL_STRATEGY).map(str::to_owned),
+        name: ctx.filter_metadata.get(CREDENTIAL_NAME).map(str::to_owned),
+        namespace: ctx.filter_metadata.get(CREDENTIAL_NAMESPACE).map(str::to_owned),
+        key: ctx.filter_metadata.get(CREDENTIAL_KEY).map(str::to_owned),
     }
 }
 
@@ -569,7 +571,8 @@ fn validate_profile_credential(api_format: &str, credential: &SelectedCredential
 
 /// Read a required non-empty field from trusted routing metadata.
 fn required_metadata(ctx: &HttpFilterContext<'_>, key: &str) -> Result<String, String> {
-    ctx.get_metadata(key)
+    ctx.filter_metadata
+        .get(key)
         .map(str::to_owned)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("selected provider profile is missing {key}"))

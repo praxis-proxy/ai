@@ -12,7 +12,7 @@
     {
       "id": "clean-rejection-is-opt-in",
       "summary": "Errors handled by fail_to_proxy's formatter are provider-shaped only when a matching filter installed a formatter. Otherwise that path emits RFC 9457 application/problem+json. Explicit filter and body-limit rejections carry their own bodies and bypass this formatting path.",
-      "evidence": "praxis-proxy-protocol-0.8.0/src/http/pingora/handler/fail_to_proxy.rs:288-307",
+      "evidence": "praxis-proxy-protocol-0.8.0/src/http/pingora/handler/fail_to_proxy.rs:299-340",
       "detail": [
         "Installers: ai_operation (apis/src/operation_classifier/mod.rs:233-246, picks the OpenAI or Anthropic formatter from the matched protocol), openai_responses_request (apis/src/openai/responses/request/mod.rs:575 via apis/src/openai/responses/mod.rs:452-460), anthropic_messages_request (apis/src/anthropic/messages_request/mod.rs:275-279).",
         "Example configurations do not necessarily install one of these formatters; inspect the selected pipeline before assuming provider-shaped errors."
@@ -400,7 +400,7 @@
           "label": "Oversized request body",
           "status": "dropped",
           "note": "See the shared oversized-body gap below.",
-          "evidence": "praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215",
+          "evidence": "praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213",
           "blocker": "https://github.com/praxis-proxy/praxis/issues/1564"
         }
       ]
@@ -624,7 +624,7 @@
           "label": "Oversized request body",
           "status": "dropped",
           "note": "See the shared oversized-body gap below.",
-          "evidence": "praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215",
+          "evidence": "praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213",
           "blocker": "https://github.com/praxis-proxy/praxis/issues/1564"
         }
       ]
@@ -846,7 +846,7 @@
           "label": "Oversized request body",
           "status": "dropped",
           "note": "See the shared oversized-body gap below.",
-          "evidence": "praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215",
+          "evidence": "praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213",
           "blocker": "https://github.com/praxis-proxy/praxis/issues/1564"
         }
       ]
@@ -1070,7 +1070,7 @@
           "label": "Oversized request body",
           "status": "dropped",
           "note": "See the shared oversized-body gap below.",
-          "evidence": "praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215",
+          "evidence": "praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213",
           "blocker": "https://github.com/praxis-proxy/praxis/issues/1564"
         }
       ]
@@ -1292,7 +1292,7 @@
           "label": "Oversized request body",
           "status": "dropped",
           "note": "See the shared oversized-body gap below.",
-          "evidence": "praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215",
+          "evidence": "praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213",
           "blocker": "https://github.com/praxis-proxy/praxis/issues/1564"
         }
       ]

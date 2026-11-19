@@ -1,7 +1,7 @@
 name: Bump Pins
 
 # ------------------------------------------------------------------------------
-# Weekly pinned-client and vLLM bump
+# Weekly pinned-client and vLLM bump, daily Praxis Core refresh
 #
 # Runs `cargo xtask bump-pins`, which moves the pinned coding clients (Claude
 # Code, OpenCode 1.x/2.x, pi, Codex) and the vLLM GPU image to their latest
@@ -9,11 +9,13 @@ name: Bump Pins
 # fixtures, and validates the result with `check-pins` (see
 # xtask/src/pins/bump.rs).
 #
-# The result is a DRAFT pull request from the `bot/bump-pins` branch whose body
+# The weekly run opens a draft PR from `bot/bump-pins` whose body
 # is the re-validation checklist. It never auto-merges: behavioral pins (tool
 # lists, exit codes, xfails, replay recordings, "verified against" claims) are
 # re-validated by a person, and the GPU acceptance lanes (`vllm-full-suite`
 # label) are the ready-for-review gate.
+#
+# The daily run opens a PR from `bot/bump-praxis-core` only when core main moves.
 #
 # The PR is opened with the praxis-bot-app token rather than github.token, so
 # CI runs on it. The commit is created through the GitHub API, which signs it
@@ -26,8 +28,13 @@ on:
   schedule:
     # Mondays, clear of the nightly, CodeQL, publish, and GPU schedules.
     - cron: "23 5 * * 1"
+    - cron: "37 5 * * *"
   workflow_dispatch:
     inputs:
+      praxis-core:
+        description: "Refresh the Praxis Core main pin"
+        type: boolean
+        default: false
       pins:
         description: "Space-separated pins to bump (claude opencode opencode-v2 pi codex vllm); empty for all"
         required: false
@@ -41,7 +48,12 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
-  BRANCH: bot/bump-pins
+  CORE_REFRESH: ${{ github.event.schedule == '37 5 * * *' || inputs.praxis-core == true }}
+  BRANCH: ${{ (github.event.schedule == '37 5 * * *' || inputs.praxis-core == true) && 'bot/bump-praxis-core' || 'bot/bump-pins' }}
+  PR_TITLE: >-
+    ${{ (github.event.schedule == '37 5 * * *' || inputs.praxis-core == true)
+        && 'chore(deps): refresh Praxis Core main pin'
+        || 'chore(pins): bump pinned clients and vLLM image' }}
 
 jobs:
   bump:
@@ -59,7 +71,30 @@ jobs:
         with:
           cache-suffix: bump-pins-cargo
 
+      - name: Refresh Praxis Core pin
+        if: env.CORE_REFRESH == 'true'
+        run: |
+          set -o pipefail
+          source='git+https://github.com/praxis-proxy/praxis?branch=main#'
+          before=$(awk -F '"' -v source="$source" 'index($2, source) == 1 {print substr($2, length(source) + 1)}' Cargo.lock | sort -u)
+          latest=$(git ls-remote --exit-code https://github.com/praxis-proxy/praxis refs/heads/main | cut -f1)
+          if [[ "$before" == "$latest" ]]; then
+            exit 0
+          fi
+
+          cargo update \
+            -p praxis-proxy -p praxis-proxy-core -p praxis-proxy-filter \
+            -p praxis-proxy-protocol -p praxis-proxy-tls
+          after=$(awk -F '"' -v source="$source" 'index($2, source) == 1 {print substr($2, length(source) + 1)}' Cargo.lock | sort -u)
+          [[ "$after" =~ ^[0-9a-f]{40}$ ]]
+          cat > "$RUNNER_TEMP/bump-report.md" <<EOF
+          Refreshes the shared Praxis Core commit pinned in Cargo.lock.
+
+          https://github.com/praxis-proxy/praxis/compare/${before}...${after}
+          EOF
+
       - name: Bump pins
+        if: env.CORE_REFRESH != 'true'
         env:
           # Lifts the anonymous GitHub API rate limit for release discovery.
           GITHUB_TOKEN: ${{ github.token }}
@@ -123,15 +158,23 @@ jobs:
             # the vLLM lanes start on the `labeled` event, so a label left in
             # place would never re-run them. Both happen before the push so its
             # synchronize event does not start the label-gated lanes either.
-            if [ "$(jq .isDraft <<<"$view")" = false ]; then
+            if [ "$CORE_REFRESH" != true ] && [ "$(jq .isDraft <<<"$view")" = false ]; then
               gh pr ready "$pr" --undo
             fi
-            if jq -e '.labels | any(.name == "vllm-full-suite")' <<<"$view" >/dev/null; then
+            if [ "$CORE_REFRESH" != true ] && jq -e '.labels | any(.name == "vllm-full-suite")' <<<"$view" >/dev/null; then
               gh pr edit "$pr" --remove-label vllm-full-suite
             fi
           else
             # No open PR: create the branch, or replace one left by a closed PR.
-            head=$(gh api "repos/$GH_REPO/git/ref/heads/$BRANCH" --jq .object.sha 2>/dev/null || echo "$zero")
+            # A successful lookup with no exact match means the branch is absent.
+            head=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/heads/$BRANCH" \
+              --jq ".[] | select(.ref == \"refs/heads/$BRANCH\") | .object.sha")
+            head=${head:-$zero}
+          fi
+
+          if [[ ! "$head" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid commit ID for $BRANCH."
+            exit 1
           fi
 
           # Build the commit on the checked-out base through the API so GitHub
@@ -156,10 +199,17 @@ jobs:
             '{base_tree: $base, tree: $tree}' |
             gh api "repos/$GH_REPO/git/trees" --input - --jq .sha)
 
-          bot_id=$(gh api "/users/${bot}" --jq .id)
-          message="chore(pins): bump pinned clients and vLLM image
+          if [ "$CORE_REFRESH" = true ] && [ -n "$pr" ]; then
+            previous_tree=$(gh api "repos/$GH_REPO/git/commits/$head" --jq .tree.sha)
+            if [ "$tree" = "$previous_tree" ]; then
+              exit 0
+            fi
+          fi
 
-          Generated by cargo xtask bump-pins; see the pull request for the re-validation checklist.
+          bot_id=$(gh api "/users/${bot}" --jq .id)
+          message="$PR_TITLE
+
+          Generated by the Bump Pins workflow. See the pull request for update details.
 
           Signed-off-by: ${bot} <${bot_id}+${bot}@users.noreply.github.com>"
           # No author or committer: GitHub only signs API commits it attributes
@@ -179,14 +229,18 @@ jobs:
               }
             }' \
             -f repo="$repo_id" -f ref="refs/heads/$BRANCH" -f before="$head" -f after="$commit" >/dev/null; then
-            echo "::error::$BRANCH moved since it was inspected; not overwriting it. Re-run the workflow."
+            echo "::error::Could not update $BRANCH from its expected head. See the GitHub API error above."
             exit 1
           fi
 
           if [ -n "$pr" ]; then
             gh pr edit "$pr" --body-file "$RUNNER_TEMP/bump-report.md"
           else
-            gh pr create --draft --base main --head "$BRANCH" \
-              --title "chore(pins): bump pinned clients and vLLM image" \
+            draft=()
+            if [ "$CORE_REFRESH" != true ]; then
+              draft+=(--draft)
+            fi
+            gh pr create "${draft[@]}" --base main --head "$BRANCH" \
+              --title "$PR_TITLE" \
               --body-file "$RUNNER_TEMP/bump-report.md"
           fi

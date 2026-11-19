@@ -82,6 +82,7 @@ reviewed revision and validation evidence.
 - [OpenAI conformance scope, report, and verification](conformance/README.md).
 - [OpenAI Responses state conformance](conformance/openai-responses-state-conformance.md).
 - [OpenResponses translation coverage](conformance/openresponses-translation.md).
+- [Hosted translation nightly](developing/hosted-translation-nightly.md).
 - [Provider translation compatibility matrix](conformance/translation-matrix.md).
 
 ### Architecture

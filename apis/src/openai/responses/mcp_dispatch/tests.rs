@@ -22,6 +22,7 @@ use super::{
     resolve_tool_entry, result_payload_limit,
 };
 use crate::{
+    RecordAiMetadata as _,
     callout_identity::McpCalloutIdentity,
     openai::responses::{
         DEFAULT_TENANT_ID,
@@ -396,14 +397,20 @@ fn parse_approval_filter_invalid_member_type_fails_closed() {
 fn filter_response_body_access() {
     let config = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
     let filter = McpDispatchFilter::from_config(&config).unwrap();
-    assert_eq!(filter.response_body_access(), praxis_filter::BodyAccess::ReadOnly);
+    assert_eq!(
+        filter.response_body_access(),
+        praxis_filter::BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    );
 }
 
 #[test]
 fn filter_request_body_access() {
     let config = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
     let filter = McpDispatchFilter::from_config(&config).unwrap();
-    assert_eq!(filter.request_body_access(), praxis_filter::BodyAccess::ReadOnly);
+    assert_eq!(
+        filter.request_body_access(),
+        praxis_filter::BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    );
 }
 
 #[test]
@@ -2942,7 +2949,7 @@ async fn on_request_body_skips_deferred_discovery_when_max_tool_calls_exhausted(
 async fn deferred_discovery_budget_failure_ends_committed_stream_with_sse_error() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.record_ai_metadata("openai_responses_format.stream", "true");
     ctx.extensions.insert(ClientResponseHeadersCommitted);
     let request = json!({"model": "gpt-4.1", "input": "hello", "stream": true, "store": false});
     let mut state = ResponsesState::from_request_body(request.clone());
@@ -3015,7 +3022,7 @@ async fn deferred_discovery_budget_failure_ends_committed_stream_with_sse_error(
     );
     assert!(!body.contains("[DONE]") && !body.starts_with('{'));
     assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
 }
 
 #[tokio::test]
@@ -3032,8 +3039,8 @@ async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.current_filter_id = Some(0);
-    ctx.set_metadata("openai_responses_request.stream", "true");
-    ctx.set_metadata("responses.response_id", "resp_deferred_listing_failure");
+    ctx.record_ai_metadata("openai_responses_request.stream", "true");
+    ctx.record_ai_metadata("responses.response_id", "resp_deferred_listing_failure");
 
     let body_json = json!({
         "model": "gpt-4o-mini",

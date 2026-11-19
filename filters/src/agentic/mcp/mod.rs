@@ -26,7 +26,7 @@ use std::borrow::Cow;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_ai_apis::promotion::contains_control_chars;
+use praxis_ai_apis::{RecordAiMetadata as _, promotion::contains_control_chars};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     builtins::http::payload_processing::{MAX_DYNAMIC_VALUE_LEN, OnInvalidBehavior, json_rpc::config::JsonRpcConfig},
@@ -123,7 +123,7 @@ impl HttpFilter for McpFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -360,28 +360,28 @@ fn write_metadata(
 
     let method_str = mcp.method.as_str();
     if !contains_control_chars(method_str) && method_str.len() <= max_len {
-        ctx.set_metadata("json_rpc.method", method_str);
-        ctx.set_metadata("mcp.method", method_str);
+        ctx.record_ai_metadata("json_rpc.method", method_str);
+        ctx.record_ai_metadata("mcp.method", method_str);
     }
-    ctx.set_metadata("json_rpc.kind", envelope.kind.as_str());
+    ctx.record_ai_metadata("json_rpc.kind", envelope.kind.as_str());
 
     if let Some(name) = &mcp.name
         && !contains_control_chars(name)
         && name.len() <= max_len
     {
-        ctx.set_metadata("mcp.name", name.clone());
+        ctx.record_ai_metadata("mcp.name", name.clone());
     }
     if let Some(sid) = &mcp.session_id
         && !contains_control_chars(sid)
         && sid.len() <= max_len
     {
-        ctx.set_metadata("mcp.session_id", sid.clone());
+        ctx.record_ai_metadata("mcp.session_id", sid.clone());
     }
     if let Some(pv) = &mcp.protocol_version
         && !contains_control_chars(pv)
         && pv.len() <= max_len
     {
-        ctx.set_metadata("mcp.protocol_version", pv.clone());
+        ctx.record_ai_metadata("mcp.protocol_version", pv.clone());
     }
 }
 

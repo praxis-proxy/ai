@@ -168,7 +168,10 @@ use super::{
     error::responses_error_rejection,
     state::{ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, is_client_executed_tool_call},
 };
-use crate::json_body::{SerializedJson, serialize_json_body};
+use crate::{
+    RecordAiMetadata as _,
+    json_body::{SerializedJson, serialize_json_body},
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -525,7 +528,7 @@ impl HttpFilter for ClientToolCompatFilter {
     fn request_body_access(&self) -> BodyAccess {
         // Lowering mutates `ResponsesState`; the outbound body is serialized by
         // `openai_responses_proxy`. The raw request bytes are not needed here.
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -535,7 +538,7 @@ impl HttpFilter for ClientToolCompatFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -562,7 +565,10 @@ impl HttpFilter for ClientToolCompatFilter {
             return Ok(FilterAction::Continue);
         }
         let streaming = request_is_streaming(ctx);
-        let stream_restoration_armed = ctx.get_metadata("responses.client_tool_stream_restoration").is_some();
+        let stream_restoration_armed = ctx
+            .filter_metadata
+            .get("responses.client_tool_stream_restoration")
+            .is_some();
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
@@ -604,7 +610,7 @@ impl HttpFilter for ClientToolCompatFilter {
         };
         if !reserve_client_tool_restoration(state, bytes) {
             *body = None;
-            ctx.set_metadata("responses.skip_persist", "true");
+            ctx.record_ai_metadata("responses.skip_persist", "true");
             return Ok(FilterAction::Reject(responses_error_rejection(
                 502,
                 "server_error",
@@ -966,7 +972,7 @@ fn restore_request_tools_and_choice(state: &mut ResponsesState, tools: Vec<Value
 /// Return the client's stream preference: the classifier metadata first, falling
 /// back to the request body's `stream` flag.
 fn request_is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_request.stream").map_or_else(
+    ctx.filter_metadata.get("openai_responses_request.stream").map_or_else(
         || {
             ctx.extensions
                 .get::<ResponsesState>()

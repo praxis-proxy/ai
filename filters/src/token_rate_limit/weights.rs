@@ -166,7 +166,7 @@ impl UsageCounts {
             cache_read: parse_u64_meta(ctx, META_TOKEN_CACHE_READ),
             cache_write: parse_u64_meta(ctx, META_TOKEN_CACHE_WRITE),
             reasoning: parse_u64_meta(ctx, META_TOKEN_REASONING),
-            overflow: ctx.get_metadata(META_TOKEN_STATUS) == Some(TOKEN_STATUS_OVERFLOW),
+            overflow: ctx.filter_metadata.get(META_TOKEN_STATUS) == Some(TOKEN_STATUS_OVERFLOW),
         }
     }
 }
@@ -174,7 +174,7 @@ impl UsageCounts {
 /// Parse a metadata value as `u64`. Missing or unparseable strings are
 /// `None`, matching the pre-M4 `token.total` path.
 pub(super) fn parse_u64_meta(ctx: &HttpFilterContext<'_>, key: &str) -> Option<u64> {
-    ctx.get_metadata(key).and_then(|value| value.parse::<u64>().ok())
+    ctx.filter_metadata.get(key).and_then(|value| value.parse::<u64>().ok())
 }
 
 /// Compute the integer cost to settle against the reservation.

@@ -186,31 +186,31 @@ fn read_metadata_identity(
     identity: &mut TenantIdentity,
 ) {
     if let Some(val) = ctx.filter_metadata.get(&format!("{namespace}{prefix_lower}group")) {
-        identity.group.clone_from(val);
+        val.clone_into(&mut identity.group);
     }
     if let Some(val) = ctx.filter_metadata.get(&format!("{namespace}{prefix_lower}model")) {
-        identity.model.clone_from(val);
+        val.clone_into(&mut identity.model);
     }
     if let Some(val) = ctx
         .filter_metadata
         .get(&format!("{namespace}{prefix_lower}cost-center"))
     {
-        identity.cost_center.clone_from(val);
+        val.clone_into(&mut identity.cost_center);
     }
     if let Some(val) = ctx
         .filter_metadata
         .get(&format!("{namespace}{prefix_lower}organization-id"))
     {
-        identity.organization_id.clone_from(val);
+        val.clone_into(&mut identity.organization_id);
     }
     if let Some(val) = ctx
         .filter_metadata
         .get(&format!("{namespace}{prefix_lower}subscription"))
     {
-        identity.subscription.clone_from(val);
+        val.clone_into(&mut identity.subscription);
     }
     if let Some(val) = ctx.filter_metadata.get(&format!("{namespace}{prefix_lower}username")) {
-        identity.username.clone_from(val);
+        val.clone_into(&mut identity.username);
     }
 }
 

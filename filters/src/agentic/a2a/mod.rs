@@ -26,7 +26,7 @@ use std::{borrow::Cow, ops::ControlFlow, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_ai_apis::{is_event_stream_content_type, promotion::contains_control_chars};
+use praxis_ai_apis::{RecordAiMetadata as _, is_event_stream_content_type, promotion::contains_control_chars};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext,
     builtins::http::payload_processing::{MAX_DYNAMIC_VALUE_LEN, OnInvalidBehavior, json_rpc::config::JsonRpcConfig},
@@ -139,7 +139,7 @@ impl HttpFilter for A2aFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -150,7 +150,7 @@ impl HttpFilter for A2aFilter {
 
     fn response_body_access(&self) -> BodyAccess {
         if self.task_route_store.is_some() {
-            BodyAccess::ReadOnly
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
         } else {
             BodyAccess::None
         }
@@ -220,7 +220,7 @@ impl HttpFilter for A2aFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let method = ctx.get_metadata("a2a.method");
+        let method = ctx.filter_metadata.get("a2a.method");
         let is_send_message = method.is_some_and(|m| m == "SendMessage");
         let is_sse_capable = method.is_some_and(|m| m == "SendStreamingMessage" || m == "SubscribeToTask");
 
@@ -247,8 +247,7 @@ impl HttpFilter for A2aFilter {
         }
 
         if is_sse {
-            ctx.filter_metadata
-                .insert("a2a.response.is_sse".to_owned(), "true".to_owned());
+            ctx.record_ai_metadata("a2a.response.is_sse".to_owned(), "true".to_owned());
             return Ok(FilterAction::Continue);
         }
 
@@ -479,9 +478,9 @@ fn lookup_task_route(
             RouteSource::Task => "task_route_hit",
             RouteSource::Context => "context_route_hit",
         };
-        ctx.set_metadata("a2a.route_decision", decision);
-        ctx.set_metadata("a2a.route_source", source.as_str());
-        ctx.set_metadata("a2a.route_cluster", &*cluster);
+        ctx.record_ai_metadata("a2a.route_decision", decision);
+        ctx.record_ai_metadata("a2a.route_source", source.as_str());
+        ctx.record_ai_metadata("a2a.route_cluster", &*cluster);
 
         debug!(
             has_task_id,
@@ -500,7 +499,7 @@ fn lookup_task_route(
         } else {
             "context_route_miss"
         };
-        ctx.set_metadata("a2a.route_decision", miss);
+        ctx.record_ai_metadata("a2a.route_decision", miss);
         debug!(
             has_task_id,
             task_id_len = task_id.map_or(0, str::len),
@@ -762,13 +761,13 @@ fn write_metadata(
     set_safe_metadata(ctx, "json_rpc.method", envelope.method.as_deref());
 
     if is_promotable(method_str) {
-        ctx.set_metadata("a2a.method", method_str);
+        ctx.record_ai_metadata("a2a.method", method_str);
     }
-    ctx.set_metadata("json_rpc.kind", envelope.kind.as_str());
+    ctx.record_ai_metadata("json_rpc.kind", envelope.kind.as_str());
 
     set_safe_metadata(ctx, "a2a.original_method", a2a.original_method.as_deref());
-    ctx.set_metadata("a2a.family", a2a.family.as_str());
-    ctx.set_metadata("a2a.streaming", if a2a.streaming { "true" } else { "false" });
+    ctx.record_ai_metadata("a2a.family", a2a.family.as_str());
+    ctx.record_ai_metadata("a2a.streaming", if a2a.streaming { "true" } else { "false" });
     set_safe_metadata(ctx, "a2a.context_id", a2a.context_id.as_deref());
     set_safe_metadata(ctx, "a2a.task_id", a2a.task_id.as_deref());
     set_safe_metadata(ctx, "a2a.version", a2a.version.as_deref());
@@ -779,7 +778,7 @@ fn set_safe_metadata(ctx: &mut HttpFilterContext<'_>, key: &str, value: Option<&
     if let Some(v) = value
         && is_promotable(v)
     {
-        ctx.set_metadata(key, v);
+        ctx.record_ai_metadata(key, v);
     }
 }
 

@@ -34,6 +34,8 @@ mod compact;
 mod credential_injection;
 mod external_metering;
 mod external_metering_file_key;
+#[cfg(feature = "policy-engine")]
+mod external_metering_policy_identity;
 #[cfg(target_os = "linux")]
 mod file_descriptor_limits;
 #[cfg(feature = "openai-agentic-loop")]

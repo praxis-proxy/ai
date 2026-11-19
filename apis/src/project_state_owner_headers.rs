@@ -213,7 +213,7 @@ impl HttpFilter for ProjectStateOwnerHeadersFilter {
     fn request_body_access(&self) -> BodyAccess {
         // Projection must be visible to destination-bound callouts that run
         // during StreamBuffer pre-read, not only to the primary upstream.
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {

@@ -42,6 +42,7 @@ filter_chains:
         # A rejection returns OpenAI JSON with Retry-After integer seconds.
         # Omit this block to disable admission. A reload starts a fresh budget.
         rate_limit:
+          scope: local
           mode: global
           rate: 100
           burst: 200

@@ -127,11 +127,11 @@ impl HttpFilter for DocExtractFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -162,7 +162,7 @@ impl HttpFilter for DocExtractFilter {
             return Ok(FilterAction::Release);
         }
 
-        if ctx.get_metadata("openai_responses_request.format") != Some("openai_responses") {
+        if ctx.filter_metadata.get("openai_responses_request.format") != Some("openai_responses") {
             trace!("skipping non-responses request");
             return Ok(FilterAction::Release);
         }
