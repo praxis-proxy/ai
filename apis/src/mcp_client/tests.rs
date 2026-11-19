@@ -2974,3 +2974,19 @@ fn classify_deadline_maps_size_signal_to_413_else_timeout() {
     let err = classify_deadline(&signal, &url, Duration::from_secs(1));
     assert!(matches!(err, McpClientError::ResponseTooLarge { .. }));
 }
+
+#[test]
+fn listing_size_preserves_partial_count_on_serialization_error() {
+    struct FailsAfterItem;
+    impl serde::Serialize for FailsAfterItem {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeSeq as _;
+            let mut sequence = serializer.serialize_seq(None)?;
+            sequence.serialize_element(&1)?;
+            Err(serde::ser::Error::custom("failed after first item"))
+        }
+    }
+    // Both serializers accepted `[1` before the failure. MCP listing charges
+    // this prefix, while core's error alone carries no partial byte count.
+    assert_eq!(measure_tools_json_bytes(&FailsAfterItem), 2);
+}

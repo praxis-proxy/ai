@@ -86,7 +86,7 @@ use crate::{
     callout_headers::effective_body_callout_headers,
     callout_identity::{McpCalloutIdentity, stage_mcp_callout_identity},
     classifier::is_responses_create,
-    json_body::{MAX_JSON_BODY_BYTES, SerializedJson, serialize_json_body, serialized_len},
+    json_body::{BoundedJsonBody, MAX_JSON_BODY_BYTES, SerializedJson, serialize_json_body_within, serialized_len},
     mcp_client,
 };
 
@@ -793,11 +793,17 @@ impl McpToolResolveFilter {
         if let Some(slot) = budget {
             preflight_tool_choice_expansion(parsed.get("tool_choice"), &tool_map, slot.map_bytes / 2)?;
         }
-        let Some(serialized) = rewrite_request_body(&mut parsed, mcp_entries, per_entry, &tool_map, &resolved_labels)?
+        let Some(serialized) = rewrite_request_body(
+            &mut parsed,
+            mcp_entries,
+            per_entry,
+            &tool_map,
+            &resolved_labels,
+            self.max_rewritten_body_bytes,
+        )?
         else {
             return Ok(FilterAction::Continue);
         };
-        check_body_size(&serialized, self.max_rewritten_body_bytes)?;
         let retained = if budget.is_some() {
             discovery_retained_charge(
                 &parsed,
@@ -1321,21 +1327,6 @@ struct McpListing {
 // Private Helpers
 // -----------------------------------------------------------------------------
 
-/// Reject the expanded body if it exceeds `max_rewritten_body_bytes`.
-fn check_body_size(serialized: &SerializedJson, max_rewritten_body_bytes: usize) -> Result<(), ResolveError> {
-    if serialized.len() > max_rewritten_body_bytes {
-        debug!(
-            actual = serialized.len(),
-            limit = max_rewritten_body_bytes,
-            "expanded request body exceeds configured limit"
-        );
-        return Err(ResolveError::BodyTooLarge {
-            actual: serialized.len(),
-            limit: max_rewritten_body_bytes,
-        });
-    }
-    Ok(())
-}
 
 /// Collect per-entry resolutions from task results.
 #[expect(
@@ -2486,8 +2477,8 @@ fn select_forward_headers(names: &[http::HeaderName], source: &http::HeaderMap) 
 ///
 /// Returns `None` only when the body cannot be rewritten at all
 /// (unparseable body, non-object root, or missing `tools` array).
-/// The caller is responsible for checking the serialized size against
-/// `max_rewritten_body_bytes` before committing.
+/// Measure the exact size before allocation and cap serialization at
+/// `max_rewritten_body_bytes`; no oversized body reaches the caller.
 ///
 /// A resolved MCP entry is always dropped from the outgoing tools
 /// array, even when it produced zero permitted tools; otherwise the
@@ -2500,12 +2491,17 @@ fn select_forward_headers(names: &[http::HeaderName], source: &http::HeaderMap) 
 /// Connector-backed deferred entries are sanitized so the
 /// pipeline-local `connector_id`, configured URL, and credentials
 /// never reach the inference backend.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "tool rewriting needs owned entries, resolved selectors, and the output cap at the serialization boundary"
+)]
 fn rewrite_request_body(
     parsed: &mut serde_json::Value,
     mcp_entries: ExtractedMcpEntries,
     per_entry: Vec<EntryResolution>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
     resolved_labels: &HashSet<String>,
+    max_rewritten_body_bytes: usize,
 ) -> Result<Option<SerializedJson>, ResolveError> {
     let Some(obj) = parsed.as_object_mut() else {
         return Ok(None);
@@ -2528,12 +2524,35 @@ fn rewrite_request_body(
     obj.insert("tools".to_owned(), serde_json::Value::Array(rewritten));
     rewrite_tool_choice(obj, tool_map, resolved_labels)?;
 
-    let serialized = serialize_json_body(parsed).map_err(|e| {
-        debug!(error = %e, "failed to serialize rewritten body");
-        ResolveError::Serialization(e)
-    })?;
+    let serialized = serialize_rewritten_body(parsed, max_rewritten_body_bytes)?;
     debug!(tool_count = rewritten_count, "rewrote MCP tools to function tools");
     Ok(Some(serialized))
+}
+
+/// Serialize the rewritten body, rejecting it with its exact size before
+/// allocating output when it exceeds `max_rewritten_body_bytes`.
+fn serialize_rewritten_body(
+    parsed: &serde_json::Value,
+    max_rewritten_body_bytes: usize,
+) -> Result<SerializedJson, ResolveError> {
+    match serialize_json_body_within(parsed, max_rewritten_body_bytes) {
+        Ok(BoundedJsonBody::Fits(serialized)) => Ok(serialized),
+        Ok(BoundedJsonBody::TooLarge { actual }) => {
+            debug!(
+                actual,
+                limit = max_rewritten_body_bytes,
+                "expanded request body exceeds configured limit"
+            );
+            Err(ResolveError::BodyTooLarge {
+                actual,
+                limit: max_rewritten_body_bytes,
+            })
+        },
+        Err(e) => {
+            debug!(error = %e, "failed to serialize rewritten body");
+            Err(ResolveError::Serialization(e))
+        },
+    }
 }
 
 /// Rewrite a tools array, replacing resolved MCP entries with

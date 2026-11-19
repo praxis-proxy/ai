@@ -3699,8 +3699,12 @@ class TestOpenAIResponsesVLLM:
             if stream is not None:
                 stream.close()
 
+    @pytest.mark.parametrize("continuation", [
+        "Continue after provider compaction.",
+        'Continue: café 東京 🦀 \n\t "quoted" \\ path',
+    ])
     def test_sdk_replays_provider_compaction_on_previous_response_id(
-        self, provider_compaction_client
+        self, provider_compaction_client, continuation
     ):
         """Native provider compaction survives SDK-driven local rehydration."""
         client, forwarded = provider_compaction_client
@@ -3711,7 +3715,7 @@ class TestOpenAIResponsesVLLM:
         )
         second = client.responses.create(
             model=VLLM_MODEL,
-            input="Continue after provider compaction.",
+            input=continuation,
             previous_response_id=first.id,
             store=True,
         )
@@ -3719,6 +3723,15 @@ class TestOpenAIResponsesVLLM:
         assert second.status == "completed"
         assert len(forwarded) == 2, forwarded
         replayed = forwarded[1]
+        assert any(
+            item.get("content") == continuation
+            or any(
+                part.get("text") == continuation
+                for part in item.get("content", [])
+                if isinstance(part, dict)
+            )
+            for item in replayed.get("input", [])
+        ), replayed
         assert replayed.get("previous_response_id") is None, replayed
         assert any(
             item.get("type") == "compaction"
