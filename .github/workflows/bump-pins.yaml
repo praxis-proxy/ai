@@ -6,14 +6,14 @@ name: Bump Pins
 # Runs `cargo xtask bump-pins`, which moves the pinned coding clients (Claude
 # Code, OpenCode 1.x/2.x, pi, Codex) and the vLLM GPU image to their latest
 # upstream releases, rewrites every site from the manifests, swaps the checksum
-# fixtures, and validates the result with `check-pins` (see
-# xtask/src/pins/bump.rs).
+# fixtures, carries the Codex WebSocket recording forward, and validates the
+# result with `check-pins` (see xtask/src/pins/bump.rs).
 #
 # The result is a DRAFT pull request from the `bot/bump-pins` branch whose body
-# is the re-validation checklist. It never auto-merges: behavioral pins (tool
-# lists, exit codes, xfails, replay recordings, "verified against" claims) are
-# re-validated by a person, and the GPU acceptance lanes (`vllm-full-suite`
-# label) are the ready-for-review gate.
+# is the re-validation checklist. It never auto-merges: lane-tested claims are
+# updated and re-proved by CI, other behavioral pins (tool lists, exit codes,
+# xfails, claims no lane exercises) are re-validated by a person, and the GPU
+# acceptance lanes (`vllm-full-suite` label) are the ready-for-review gate.
 #
 # The PR is opened with the praxis-bot-app token rather than github.token, so
 # CI runs on it. The commit is created through the GitHub API, which signs it
