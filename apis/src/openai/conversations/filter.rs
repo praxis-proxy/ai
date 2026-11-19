@@ -96,6 +96,7 @@ use crate::{
 ///   items_table: conversation_items
 ///   allow_private_database_url: true
 ///   rate_limit:
+///     scope: local
 ///     mode: global
 ///     rate: 100
 ///     burst: 200
@@ -185,8 +186,12 @@ impl OpenaiConversationsFilter {
         validate_config(&cfg)?;
         let rate_limit = cfg
             .rate_limit
-            .as_ref()
-            .map(praxis_filter::builtins::RateLimitFilter::from_config)
+            .map(|mut limiter| {
+                if let Some(fields) = limiter.as_mapping_mut() {
+                    fields.entry("scope".into()).or_insert_with(|| "local".into());
+                }
+                praxis_filter::builtins::RateLimitFilter::from_config(&limiter)
+            })
             .transpose()?;
         Ok(Box::new(Self { rate_limit }))
     }

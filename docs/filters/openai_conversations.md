@@ -17,7 +17,7 @@ For a managed `POST /v1/responses` with `conversation`, completed JSON and SSE r
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `rate_limit` | any | no | Optional request admission using the core `rate_limit` configuration. A mapping with required `mode` (`global` or `per_ip`), `rate` (positive requests per second), and `burst` (integer capacity, at least `rate`). Optional `ipv6_prefix_len` (1 to 128, default 128) groups IPv6 peers; `shadow` (boolean, default false) observes without rejecting. Global or per-IP budgets cover all eight local operations together. |
+| `rate_limit` | any | no | Optional request admission using the core `rate_limit` configuration. A mapping with required `mode` (`global` or `per_ip`), `rate` (positive requests per second), and `burst` (integer capacity, at least `rate`). `scope` defaults to `local` for existing configurations. Optional `ipv6_prefix_len` (1 to 128, default 128) groups IPv6 peers; `shadow` (boolean, default false) observes without rejecting. Global or per-IP budgets cover all eight local operations together. |
 | `backend` | `sqlite` \| `postgres` | yes | Storage backend to use. |
 | `database_url` | string (secret) | yes | Database connection URL. Wrapped in [`SecretString`] to prevent accidental logging of credentials. |
 | `conversations_table` | string | no | Table name for conversation records. |
@@ -44,6 +44,7 @@ For a managed `POST /v1/responses` with `conversation`, completed JSON and SSE r
   items_table: conversation_items
   allow_private_database_url: true
   rate_limit:
+    scope: local
     mode: global
     rate: 100
     burst: 200

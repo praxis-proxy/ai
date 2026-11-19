@@ -1304,9 +1304,9 @@ insecure_options:
                 &client,
             );
             let Some(expected) = expected else {
-                let Err(error) = pipelines else {
-                    panic!("the buffered pipeline must reject incompatible limits");
-                };
+                let error = pipelines
+                    .err()
+                    .expect("the buffered pipeline must reject incompatible limits");
                 assert!(
                     error.to_string().contains("exceeds body_limits.max_buffer_bytes"),
                     "{limits}: {error}"

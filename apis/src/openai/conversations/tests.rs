@@ -5929,7 +5929,7 @@ async fn conformance_conversations_rate_limit_rejects_every_operation_before_sto
     let validator = pinned_error_validator();
     for operation in operation_specs() {
         let config = serde_yaml::from_str(
-            "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nrate_limit: {mode: global, rate: 0.000001, burst: 1}",
+            "backend: sqlite\ndatabase_url: 'sqlite::memory:'\nrate_limit: {scope: local, mode: global, rate: 0.000001, burst: 1}",
         )
         .unwrap();
         let filter = OpenaiConversationsFilter::from_config(&config).unwrap();
@@ -6070,6 +6070,7 @@ fn rate_limit_config_reuses_core_validation_and_stays_out_of_store_config() {
         "{mode: global, rate: 0, burst: 1}",
         "{mode: global, rate: 1, burst: 0}",
         "{mode: owner, rate: 1, burst: 1}",
+        "{scope: unknown, mode: global, rate: 1, burst: 1}",
         "{mode: global, rate: 1, burst: 1, unknown: true}",
     ] {
         let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(

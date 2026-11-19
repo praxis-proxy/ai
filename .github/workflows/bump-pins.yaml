@@ -74,6 +74,7 @@ jobs:
       - name: Refresh Praxis Core pin
         if: env.CORE_REFRESH == 'true'
         run: |
+          set -o pipefail
           source='git+https://github.com/praxis-proxy/praxis?branch=main#'
           before=$(awk -F '"' -v source="$source" 'index($2, source) == 1 {print substr($2, length(source) + 1)}' Cargo.lock | sort -u)
           latest=$(git ls-remote --exit-code https://github.com/praxis-proxy/praxis refs/heads/main | cut -f1)
