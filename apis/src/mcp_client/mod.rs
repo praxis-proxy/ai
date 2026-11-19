@@ -1104,6 +1104,11 @@ fn tools_to_json(tools: Vec<rmcp::model::Tool>) -> Result<Vec<serde_json::Value>
         .collect()
 }
 
+/// Retain this error-path sink: core sizing discards progress on failure,
+/// but MCP listing charges the accepted prefix even when serialization fails.
+/// The normal successful path uses core sizing; an error is remeasured locally
+/// to preserve that caller-specific policy rather than charging zero.
+///
 /// `io::Write` sink that counts bytes written instead of retaining
 /// them, so a page's serialized size can be measured without a second
 /// heap buffer.
@@ -1128,11 +1133,13 @@ impl std::io::Write for ByteCounter {
 /// page without allocating a second buffer. A serialization error
 /// (which the caller would surface elsewhere) yields the bytes counted
 /// so far, keeping the cumulative budget conservative.
-fn measure_tools_json_bytes(tools: &[rmcp::model::Tool]) -> usize {
-    let mut counter = ByteCounter::default();
-    match serde_json::to_writer(&mut counter, tools) {
-        Ok(()) | Err(_) => counter.count,
-    }
+fn measure_tools_json_bytes<T: serde::Serialize + ?Sized>(tools: &T) -> usize {
+    crate::json_size::serialized_len(tools).unwrap_or_else(|_| {
+        let mut counter = ByteCounter::default();
+        match serde_json::to_writer(&mut counter, tools) {
+            Ok(()) | Err(_) => counter.count,
+        }
+    })
 }
 
 /// Add one page's decoded size to the running listing total and reject the

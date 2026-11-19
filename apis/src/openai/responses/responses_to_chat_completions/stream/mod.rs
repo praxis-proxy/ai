@@ -1995,7 +1995,7 @@ fn is_done_sentinel(frame: &framing::Frame) -> bool {
 /// cost nothing.
 fn logprobs_byte_cost(logprobs: &Value) -> usize {
     match logprobs {
-        Value::Array(items) if !items.is_empty() => serde_json::to_vec(logprobs).map_or(0, |bytes| bytes.len()),
+        Value::Array(items) if !items.is_empty() => crate::json_body::serialized_len(logprobs).unwrap_or(0),
         _ => 0,
     }
 }
@@ -2083,20 +2083,7 @@ fn mark_failed(resource: &mut Value, message: &str) {
 /// ceiling; counting into a sink avoids buffering a second full copy alongside
 /// the one `emit_event` serializes.
 fn serialized_json_len(value: &Value) -> Result<usize, ConvertError> {
-    struct Counter(usize);
-    impl std::io::Write for Counter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(buf.len());
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter(0);
-    serde_json::to_writer(&mut counter, value).map_err(ConvertError::Serialize)?;
-    Ok(counter.0)
+    crate::json_body::serialized_len(value).map_err(ConvertError::Serialize)
 }
 
 /// Return whether `reason` is a finish reason the converter can translate.

@@ -96,7 +96,7 @@ use crate::{
     callout_identity::{CalloutContextMissing, CalloutIdentity, credential_authority, stage_callout_identity},
     callout_policy::{MISSING_CALLOUT_CONTEXT, OnMissing},
     classifier::is_responses_create,
-    json_body::{MAX_JSON_BODY_BYTES, serialize_json_body},
+    json_body::{BoundedJsonBody, MAX_JSON_BODY_BYTES, serialize_json_body_within},
     openai::api_client::{ApiClient, ApiClientConfig, DownstreamRuntime, OutboundExecution},
     subrequest::SubRequestClient,
 };
@@ -681,21 +681,22 @@ fn rewrite_body(
     max_rewritten_body_bytes: usize,
     filter_name: &'static str,
 ) -> Result<Option<FilterAction>, FilterError> {
-    let rewritten = serialize_json_body(parsed)
-        .map_err(|e| -> FilterError { format!("{filter_name}: failed to serialize body: {e}").into() })?;
-    if rewritten.len() > max_rewritten_body_bytes {
-        warn!(
-            actual = rewritten.len(),
-            limit = max_rewritten_body_bytes,
-            "rewritten request body exceeds configured limit"
-        );
-        return Ok(Some(reject_rewritten_body_too_large(
-            rewritten.len(),
-            max_rewritten_body_bytes,
-        )));
+    match serialize_json_body_within(parsed, max_rewritten_body_bytes)
+        .map_err(|e| -> FilterError { format!("{filter_name}: failed to serialize body: {e}").into() })?
+    {
+        BoundedJsonBody::Fits(rewritten) => {
+            rewritten.commit(body, filter_name, "input");
+            Ok(None)
+        },
+        BoundedJsonBody::TooLarge { actual } => {
+            warn!(
+                actual,
+                limit = max_rewritten_body_bytes,
+                "rewritten request body exceeds configured limit"
+            );
+            Ok(Some(reject_rewritten_body_too_large(actual, max_rewritten_body_bytes)))
+        },
     }
-    rewritten.commit(body, filter_name, "input");
-    Ok(None)
 }
 
 /// Sync resolved content back into [`ResponsesState`] so that

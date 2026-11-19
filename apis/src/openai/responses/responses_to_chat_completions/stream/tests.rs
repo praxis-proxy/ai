@@ -3335,3 +3335,15 @@ fn streaming_echoes_input_reconstructed_from_state() {
         "both response.created and response.completed must be present and checked"
     );
 }
+
+#[test]
+fn logprobs_accounting_counts_escaped_unicode_without_allocating_output() {
+    let value = json!([{"token": "é 東京\n\t\"\\\u{0000}".repeat(65_536), "logprob": -0.1}]);
+    let expected = serde_json::to_vec(&value).unwrap().len();
+    let allocations = allocation_counter::measure(|| {
+        assert_eq!(logprobs_byte_cost(&value), expected);
+    });
+    assert_eq!(allocations.bytes_total, 0, "{allocations:?}");
+    assert_eq!(logprobs_byte_cost(&json!([])), 0);
+    assert_eq!(logprobs_byte_cost(&Value::Null), 0);
+}

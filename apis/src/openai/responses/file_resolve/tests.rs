@@ -2159,3 +2159,17 @@ async fn object_input_file_url_resolved_to_data_uri() {
     let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_part).unwrap();
     assert_eq!(decoded, b"Hello World", "data URI should contain the file content");
 }
+
+#[test]
+fn oversized_file_rewrite_does_not_allocate_serialized_output() {
+    let parsed = serde_json::json!({"input": "\u{0000}".repeat(1_048_576)});
+    let original = Bytes::from_static(b"original");
+    let mut body = Some(original.clone());
+    let allocations = allocation_counter::measure(|| {
+        assert!(
+            matches!(rewrite_body(&mut body, &parsed, 1024, "openai_file_resolve").unwrap(), Some(FilterAction::Reject(r)) if r.status == 413)
+        );
+    });
+    assert!(allocations.bytes_total < 16_384, "{allocations:?}");
+    assert_eq!(body.as_ref(), Some(&original));
+}

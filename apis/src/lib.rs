@@ -29,6 +29,7 @@ pub mod hash;
 mod history_allocation_tests;
 pub mod http_hop;
 pub mod json_body;
+pub mod json_size;
 #[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_client;
 pub mod openai;

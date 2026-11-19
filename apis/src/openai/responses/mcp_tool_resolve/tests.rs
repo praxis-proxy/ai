@@ -2130,9 +2130,16 @@ fn rewrite_request_body_strips_credentials_when_all_entries_resolve_empty() {
     let resolved_labels = HashSet::from(["weather".to_owned()]);
 
     let mcp_entries = extract_mcp_entries(&mut body);
-    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
-        .expect("rewrite must not error")
-        .expect("a resolved-empty entry must trigger a rewrite, not forward the original body");
+    let serialized = rewrite_request_body(
+        &mut body,
+        mcp_entries,
+        per_entry,
+        &tool_map,
+        &resolved_labels,
+        MAX_JSON_BODY_BYTES,
+    )
+    .expect("rewrite must not error")
+    .expect("a resolved-empty entry must trigger a rewrite, not forward the original body");
 
     let rewritten: serde_json::Value = serde_json::from_slice(serialized.as_bytes()).unwrap();
     assert_eq!(
@@ -2190,9 +2197,16 @@ fn rewrite_request_body_strips_only_empty_entry_credentials_in_mixed_request() {
     let resolved_labels = HashSet::from(["weather".to_owned(), "empty".to_owned()]);
 
     let mcp_entries = extract_mcp_entries(&mut body);
-    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
-        .expect("rewrite must not error")
-        .expect("mixed request must be rewritten");
+    let serialized = rewrite_request_body(
+        &mut body,
+        mcp_entries,
+        per_entry,
+        &tool_map,
+        &resolved_labels,
+        MAX_JSON_BODY_BYTES,
+    )
+    .expect("rewrite must not error")
+    .expect("mixed request must be rewritten");
 
     let rewritten: serde_json::Value = serde_json::from_slice(serialized.as_bytes()).unwrap();
     let tools = rewritten["tools"].as_array().expect("tools array");
@@ -2241,9 +2255,16 @@ fn rewrite_request_body_normalizes_to_none_keeping_unrelated_tool_when_allowed_t
     let resolved_labels = HashSet::from(["weather".to_owned()]);
 
     let mcp_entries = extract_mcp_entries(&mut body);
-    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
-        .expect("rewrite must not error")
-        .expect("resolved-empty entry must trigger a rewrite");
+    let serialized = rewrite_request_body(
+        &mut body,
+        mcp_entries,
+        per_entry,
+        &tool_map,
+        &resolved_labels,
+        MAX_JSON_BODY_BYTES,
+    )
+    .expect("rewrite must not error")
+    .expect("resolved-empty entry must trigger a rewrite");
 
     let rewritten: serde_json::Value = serde_json::from_slice(serialized.as_bytes()).unwrap();
     assert_eq!(
@@ -6750,6 +6771,7 @@ fn rewrite_preserves_request_and_choice_member_order() {
             vec![EntryResolution::Resolved(vec![function])],
             &tool_map,
             &HashSet::from(["server".to_owned()]),
+            MAX_JSON_BODY_BYTES,
         )
         .unwrap()
         .unwrap();
@@ -6815,4 +6837,30 @@ fn deferred_sanitization_preserves_public_member_order() {
         actual.to_string(),
         r#"{"type":"mcp","server_label":"drive","defer_loading":true,"server_description":"files","allowed_callers":["assistant"],"allowed_tools":["search"],"require_approval":"never"}"#
     );
+}
+
+#[test]
+fn rewritten_mcp_tools_are_measured_before_output_allocation() {
+    for cap_delta in [0, 1] {
+        let mut parsed = serde_json::json!({"input":"é 東京\n\t\"\\", "tools":[]});
+        let exact = serde_json::to_vec(&parsed).unwrap();
+        let result = rewrite_request_body(
+            &mut parsed,
+            ExtractedMcpEntries {
+                values: vec![],
+                tool_indices: vec![],
+            },
+            vec![],
+            &HashMap::new(),
+            &HashSet::new(),
+            exact.len() - cap_delta,
+        );
+        if cap_delta == 0 {
+            assert_eq!(result.unwrap().unwrap().as_bytes().as_ref(), exact);
+        } else {
+            assert!(
+                matches!(result, Err(ResolveError::BodyTooLarge { actual, limit }) if actual == exact.len() && limit == exact.len() - 1)
+            );
+        }
+    }
 }

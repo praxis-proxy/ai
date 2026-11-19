@@ -1534,3 +1534,154 @@ fn make_native_responses_pipeline() -> FilterPipeline {
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(yaml).unwrap();
     FilterPipeline::build(&mut entries, &registry).unwrap()
 }
+
+#[test]
+fn selected_body_caps_complete_raw_splice_and_preserves_exact_bytes() {
+    let body = Bytes::from_static(br#"{"opaque" : { "z":1, "a":2 }, "input": []}"#);
+    let state = ResponsesState::from_request_body(json!({"input": []}));
+    let filter = super::ResponsesProxyFilter {
+        config: super::ResponsesProxyConfig::default(),
+    };
+    let expected = br#"{"opaque" : { "z":1, "a":2 },"input": []}"#;
+    let output = filter
+        .serialize_selected_body(&body, &state, true, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(output, expected);
+    let config = serde_yaml::from_str(&format!("max_rewritten_body_bytes: {}", expected.len())).unwrap();
+    let exact = super::ResponsesProxyFilter {
+        config: super::build_config(serde_yaml::from_value(config).unwrap()).unwrap(),
+    };
+    assert_eq!(
+        exact
+            .serialize_selected_body(&body, &state, true, None)
+            .unwrap()
+            .unwrap(),
+        expected
+    );
+    let config = serde_yaml::from_str(&format!("max_rewritten_body_bytes: {}", expected.len() - 1)).unwrap();
+    let below = super::ResponsesProxyFilter {
+        config: super::build_config(serde_yaml::from_value(config).unwrap()).unwrap(),
+    };
+    assert!(
+        matches!(below.serialize_selected_body(&body, &state, true, None).unwrap(), Err(FilterAction::Reject(r)) if r.status == 413)
+    );
+    assert!(
+        matches!(exact.serialize_selected_body(&body, &state, true, Some(expected.len() - 1)).unwrap(), Err(FilterAction::Reject(r)) if r.status == 413)
+    );
+}
+
+#[test]
+fn oversized_selected_raw_splice_does_not_allocate_output() {
+    let body = Bytes::from(format!(r#"{{"opaque":"{}","input":[]}}"#, "x".repeat(1_048_576)));
+    let state = ResponsesState::from_request_body(json!({"input": []}));
+    let config = serde_yaml::from_str("max_rewritten_body_bytes: 1024").unwrap();
+    let filter = super::ResponsesProxyFilter {
+        config: super::build_config(serde_yaml::from_value(config).unwrap()).unwrap(),
+    };
+    let allocations = allocation_counter::measure(|| {
+        assert!(
+            matches!(filter.serialize_selected_body(&body, &state, true, None).unwrap(), Err(FilterAction::Reject(r)) if r.status == 413)
+        );
+    });
+    assert!(allocations.bytes_total < 16_384, "{allocations:?}");
+}
+
+#[test]
+fn oversized_selected_input_replacement_does_not_allocate_output() {
+    let body = Bytes::from_static(br#"{"input":[]}"#);
+    let mut state = ResponsesState::from_request_body(json!({"input": []}));
+    state
+        .messages
+        .push(json!({"role":"user", "content":"\u{0000}".repeat(1_048_576)}));
+    let filter = super::ResponsesProxyFilter {
+        config: super::build_config(serde_yaml::from_str("max_rewritten_body_bytes: 1024").unwrap()).unwrap(),
+    };
+    let allocations = allocation_counter::measure(|| {
+        assert!(
+            matches!(filter.serialize_selected_body(&body, &state, true, None).unwrap(), Err(FilterAction::Reject(r)) if r.status == 413)
+        );
+    });
+    assert!(allocations.bytes_total < 16_384, "{allocations:?}");
+}
+
+/// Records which sink methods a selected-body splice calls.
+#[derive(Default)]
+struct RecordingSink {
+    /// Number of input replacements emitted.
+    inputs: usize,
+    /// Number of generic JSON replacements serialized.
+    json: usize,
+}
+
+impl super::SelectedBodySink for RecordingSink {
+    fn raw(&mut self, _bytes: &[u8]) -> Result<(), praxis_filter::FilterError> {
+        Ok(())
+    }
+
+    fn json<T: serde::Serialize + ?Sized>(&mut self, _value: &T) -> Result<(), praxis_filter::FilterError> {
+        self.json += 1;
+        Ok(())
+    }
+
+    fn input(&mut self, _input: &super::SelectedMessages<'_>) -> Result<(), praxis_filter::FilterError> {
+        self.inputs += 1;
+        Ok(())
+    }
+}
+
+#[test]
+fn repeated_input_members_reuse_one_input_measurement() {
+    let body = Bytes::from_static(br#"{"input":[],"model":"m","input":[]}"#);
+    let mut state = ResponsesState::from_request_body(json!({"input": []}));
+    state
+        .messages
+        .push(json!({"role":"user", "content":"é 東京 🦀\n\t\"\\".repeat(4_096)}));
+    let members = super::scan_top_level_object(&body).unwrap();
+    let messages = super::selected_input::reconcile(&body, &members, &state, true).unwrap();
+    let input = super::SelectedMessages {
+        messages: &messages,
+        preserve_native_compaction: true,
+        provider_compaction_ids: &state.provider_compaction_ids,
+    };
+    let splice = super::SelectedBodySplice {
+        body: &body,
+        members: &members,
+        state: &state,
+        input: &input,
+        stream: None,
+    };
+    let mut sink = RecordingSink::default();
+    splice.write_to(&mut sink).unwrap();
+    assert_eq!(
+        (sink.inputs, sink.json),
+        (2, 0),
+        "input must route through the cached length"
+    );
+
+    let filter = super::ResponsesProxyFilter {
+        config: super::ResponsesProxyConfig::default(),
+    };
+    let output = filter
+        .serialize_selected_body(&body, &state, true, None)
+        .unwrap()
+        .unwrap();
+    let replacement = serde_json::to_vec(&input).unwrap();
+    assert_eq!(
+        output.len(),
+        2 * replacement.len() + br#"{"input":,"model":"m","input":}"#.len()
+    );
+
+    let limit = output.len() - 1;
+    let below = super::ResponsesProxyFilter {
+        config: super::build_config(serde_yaml::from_str(&format!("max_rewritten_body_bytes: {limit}")).unwrap())
+            .unwrap(),
+    };
+    let Err(FilterAction::Reject(rejection)) = below.serialize_selected_body(&body, &state, true, None).unwrap() else {
+        panic!("duplicate input members over the limit must be rejected");
+    };
+    assert_eq!(rejection.status, 413);
+    let message = String::from_utf8(rejection.body.unwrap().to_vec()).unwrap();
+    assert!(message.contains(&output.len().to_string()), "{message}");
+    assert!(message.contains(&limit.to_string()), "{message}");
+}

@@ -204,8 +204,6 @@ mod tests;
 
 #[cfg(feature = "openai-responses")]
 use std::borrow::Cow;
-#[cfg(feature = "openai-responses")]
-use std::io;
 
 use praxis_filter::{BoundUpstreamBodyOutcome, FilterAction, FilterError};
 #[cfg(feature = "openai-responses")]
@@ -290,17 +288,12 @@ pub(crate) fn bounded_json_size<T: serde::Serialize + ?Sized>(
     value: &T,
     max_bytes: usize,
 ) -> Result<Option<usize>, serde_json::Error> {
-    let mut counter = BoundedJsonCounter {
-        bytes: 0,
-        exceeded: false,
-        max_bytes,
-    };
-    let result = serde_json::to_writer(&mut counter, value);
-    if counter.exceeded {
-        return Ok(None);
+    use crate::json_size::{JsonSizeError, serialized_len_capped};
+    match serialized_len_capped(value, max_bytes) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(JsonSizeError::LimitExceeded | JsonSizeError::LengthOverflow) => Ok(None),
+        Err(error) => Err(crate::json_body::json_size_error(error)),
     }
-    result?;
-    Ok(Some(counter.bytes))
 }
 
 /// Read newly produced local tool results as request-rail messages.
@@ -397,37 +390,6 @@ pub fn record_local_tool_guardrail_failure(
     };
     state.dispatch_failure = Some(state::DispatchFailure { status, code, message });
     true
-}
-
-/// JSON writer that counts bytes and stops at a fixed ceiling.
-#[cfg(feature = "openai-responses")]
-struct BoundedJsonCounter {
-    /// Bytes accepted so far.
-    bytes: usize,
-    /// Whether a write crossed the configured ceiling.
-    exceeded: bool,
-    /// Maximum accepted bytes.
-    max_bytes: usize,
-}
-
-#[cfg(feature = "openai-responses")]
-impl io::Write for BoundedJsonCounter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let Some(next_bytes) = self.bytes.checked_add(buf.len()) else {
-            self.exceeded = true;
-            return Err(io::Error::other("JSON byte count overflow"));
-        };
-        if next_bytes > self.max_bytes {
-            self.exceeded = true;
-            return Err(io::Error::other("JSON byte limit exceeded"));
-        }
-        self.bytes = next_bytes;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 // -----------------------------------------------------------------------------
