@@ -20,6 +20,8 @@ mod pool;
 #[cfg(feature = "_postgres")]
 mod postgres;
 #[cfg(feature = "_postgres")]
+mod postgres_files;
+#[cfg(feature = "_postgres")]
 mod postgres_tls;
 #[cfg(feature = "_postgres")]
 pub mod postgres_url;

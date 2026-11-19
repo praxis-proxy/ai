@@ -148,8 +148,8 @@ pub trait FileCatalog: Send + Sync {
     /// Returns [`CatalogError::Backend`] on persistence failure.
     async fn complete_cleanup(&self, claim: &CleanupClaim) -> Result<bool, CatalogError>;
 
-    /// Give up a claim after a failed byte-store deletion: increments
-    /// `attempts` and delays the next claim with a capped exponential backoff.
+    /// Give up a claim after a failed byte-store deletion: delays the next
+    /// claim by the catalog's fixed retry delay. Idempotent.
     ///
     /// # Errors
     ///

@@ -24,8 +24,8 @@ use super::{
     postgres_tls::PgTlsConfig,
     retained_charge,
     schemas::{
-        ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
-        check_schema, ddl_error, events_table, expected_tables, generate_ddl, pending_approvals_table,
+        ActualKeyColumn, ActualTable, ActualUniqueIndex, ExpectedTable, SCHEMA_VERSION, SchemaCheck, SqlDialect,
+        TableNames, check_schema, ddl_error, events_table, expected_tables, generate_ddl, pending_approvals_table,
         pg_key_column_folding, schema_version_table, validate_postgres_identifiers,
     },
 };
@@ -341,10 +341,28 @@ impl PostgresResponseStore {
 /// Initialize and validate shared tables under a transaction-scoped schema lock.
 /// Called in a boxed future to bound the constructor's stack frame.
 async fn initialize_schema(pool: &sqlx::PgPool, tables: &TableNames, ddl: &[String]) -> Result<(), StoreError> {
+    let mut initialization = begin_initialization(pool).await?;
+    run_ddl(&mut initialization, ddl).await?;
+    validate_schema(&mut initialization, tables).await?;
+    let version_table = schema_version_table(&tables.responses);
+    check_schema_version(&mut initialization, &version_table, SCHEMA_VERSION).await?;
+    initialization
+        .commit()
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))
+}
+
+/// Open the schema-initialization transaction and take the shared schema lock.
+///
+/// Serializes schema setup across tenant runtimes, not just this process. The
+/// lock is shared by every store domain, so the response store and the file
+/// catalog never initialize concurrently.
+pub(crate) async fn begin_initialization(
+    pool: &sqlx::PgPool,
+) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, StoreError> {
     let mut initialization = Box::pin(pool.begin())
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
-    // Serialize schema setup across tenant runtimes, not just this process.
     sqlx::query("SET LOCAL lock_timeout = '30s'")
         .execute(&mut *initialization)
         .await
@@ -353,18 +371,18 @@ async fn initialize_schema(pool: &sqlx::PgPool, tables: &TableNames, ddl: &[Stri
         .execute(&mut *initialization)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
+    Ok(initialization)
+}
+
+/// Run generated DDL statements in order, mapping errors through [`ddl_error`].
+pub(crate) async fn run_ddl(connection: &mut sqlx::PgConnection, ddl: &[String]) -> Result<(), StoreError> {
     for statement in ddl {
         sqlx::query(AssertSqlSafe(statement.as_str()))
-            .execute(&mut *initialization)
+            .execute(&mut *connection)
             .await
             .map_err(|e| ddl_error(statement, &e))?;
     }
-    validate_schema(&mut initialization, tables).await?;
-    check_schema_version(&mut initialization, tables).await?;
-    initialization
-        .commit()
-        .await
-        .map_err(|e| StoreError::Database(e.to_string()))
+    Ok(())
 }
 
 /// Build `PostgreSQL` connection options from a URL and TLS settings.
@@ -632,9 +650,18 @@ fn pg_row_to_unique_index(row: &PgRow) -> Result<ActualUniqueIndex, StoreError> 
 /// silently lose data across tenants. The global schema version table holds no
 /// tenant data and is validated by value in [`check_schema_version`], not here.
 async fn validate_schema(connection: &mut sqlx::PgConnection, tables: &TableNames) -> Result<(), StoreError> {
-    let expected = expected_tables(tables);
+    validate_expected_tables(connection, &expected_tables(tables)).await?;
+    validate_messages_type(connection, &tables.conversations).await
+}
+
+/// Discover each expected table's schema and compare it against its contract
+/// with the single fail-closed [`check_schema`].
+pub(crate) async fn validate_expected_tables(
+    connection: &mut sqlx::PgConnection,
+    expected: &[(String, ExpectedTable)],
+) -> Result<(), StoreError> {
     let mut actuals = Vec::with_capacity(expected.len());
-    for (table_name, _) in &expected {
+    for (table_name, _) in expected {
         let columns = table_column_names(connection, table_name).await?;
         let (primary_key, primary_key_immediate) = table_primary_key(connection, table_name).await?;
         let unique_indexes = table_extra_unique_indexes(connection, table_name).await?;
@@ -651,8 +678,7 @@ async fn validate_schema(connection: &mut sqlx::PgConnection, tables: &TableName
         .zip(&actuals)
         .map(|((name, contract), actual)| (name.as_str(), *contract, actual))
         .collect();
-    check_schema(&checks)?;
-    validate_messages_type(connection, &tables.conversations).await
+    check_schema(&checks)
 }
 
 /// Require the built-in TEXT type used by string decoding and prefix guards.
@@ -684,9 +710,13 @@ async fn validate_messages_type(connection: &mut sqlx::PgConnection, table: &str
     Ok(())
 }
 
-/// Stamp or validate the schema version.
-async fn check_schema_version(connection: &mut sqlx::PgConnection, tables: &TableNames) -> Result<(), StoreError> {
-    let vt = schema_version_table(&tables.responses);
+/// Stamp or validate the schema version stored in `version_table`.
+pub(crate) async fn check_schema_version(
+    connection: &mut sqlx::PgConnection,
+    version_table: &str,
+    expected_version: i64,
+) -> Result<(), StoreError> {
+    let vt = version_table;
     let select = format!("SELECT version FROM {vt}");
     let row: Option<i64> = sqlx::query_scalar(AssertSqlSafe(select.as_str()))
         .fetch_optional(&mut *connection)
@@ -697,16 +727,16 @@ async fn check_schema_version(connection: &mut sqlx::PgConnection, tables: &Tabl
         None => {
             let insert = format!("INSERT INTO {vt} (version) VALUES ($1) ON CONFLICT (version) DO NOTHING");
             sqlx::query(AssertSqlSafe(insert.as_str()))
-                .bind(SCHEMA_VERSION)
+                .bind(expected_version)
                 .execute(connection)
                 .await
                 .map_err(|e| StoreError::Database(e.to_string()))?;
             Ok(())
         },
-        Some(v) if v == SCHEMA_VERSION => Ok(()),
+        Some(v) if v == expected_version => Ok(()),
         Some(v) => Err(StoreError::Database(format!(
             "schema version mismatch in '{vt}': stored version {v}, \
-             expected {SCHEMA_VERSION}; database recreation required"
+             expected {expected_version}; database recreation required"
         ))),
     }
 }
@@ -3435,7 +3465,6 @@ mod tests {
             .await
             .unwrap();
     }
-
 
     #[test]
     fn connect_options_defaults_to_verify_full() {
