@@ -19,7 +19,7 @@ jobs:
   pr-context:
     permissions:
       pull-requests: write
-    uses: praxis-proxy/conventions/.github/workflows/pr-conventions.yaml@dcf79c3b0dedf35f7038c87849826901bd877ead # conventions PR 47
+    uses: praxis-proxy/conventions/.github/workflows/pr-conventions.yaml@423e58c71f18c791f7d369a390d06fa6b88d9217 # conventions PR 47
     with:
       context-only: true
       description-team-bypass: false
