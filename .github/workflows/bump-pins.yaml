@@ -131,7 +131,15 @@ jobs:
             fi
           else
             # No open PR: create the branch, or replace one left by a closed PR.
-            head=$(gh api "repos/$GH_REPO/git/ref/heads/$BRANCH" --jq .object.sha 2>/dev/null || echo "$zero")
+            # A successful lookup with no exact match means the branch is absent.
+            head=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/heads/$BRANCH" \
+              --jq ".[] | select(.ref == \"refs/heads/$BRANCH\") | .object.sha")
+            head=${head:-$zero}
+          fi
+
+          if [[ ! "$head" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid commit ID for $BRANCH."
+            exit 1
           fi
 
           # Build the commit on the checked-out base through the API so GitHub
@@ -179,7 +187,7 @@ jobs:
               }
             }' \
             -f repo="$repo_id" -f ref="refs/heads/$BRANCH" -f before="$head" -f after="$commit" >/dev/null; then
-            echo "::error::$BRANCH moved since it was inspected; not overwriting it. Re-run the workflow."
+            echo "::error::Could not update $BRANCH from its expected head. See the GitHub API error above."
             exit 1
           fi
 
