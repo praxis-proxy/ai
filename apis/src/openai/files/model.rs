@@ -5,7 +5,6 @@
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use praxis_ai_store::StateOwner;
 
 use super::contracts::{FilePurpose, ListOrder as FileListOrder, UploadPurpose};
 

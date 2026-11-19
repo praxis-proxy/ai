@@ -164,6 +164,44 @@ pub enum FilePurpose {
     Evals,
 }
 
+impl FilePurpose {
+    /// Wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Assistants => "assistants",
+            Self::AssistantsOutput => "assistants_output",
+            Self::Batch => "batch",
+            Self::BatchOutput => "batch_output",
+            Self::FineTune => "fine-tune",
+            Self::FineTuneResults => "fine-tune-results",
+            Self::Vision => "vision",
+            Self::UserData => "user_data",
+            Self::Evals => "evals",
+        }
+    }
+}
+
+impl FromStr for FilePurpose {
+    type Err = InvalidField;
+
+    /// Parse a stored wire value. Matching is exact and case-sensitive.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "assistants" => Ok(Self::Assistants),
+            "assistants_output" => Ok(Self::AssistantsOutput),
+            "batch" => Ok(Self::Batch),
+            "batch_output" => Ok(Self::BatchOutput),
+            "fine-tune" => Ok(Self::FineTune),
+            "fine-tune-results" => Ok(Self::FineTuneResults),
+            "vision" => Ok(Self::Vision),
+            "user_data" => Ok(Self::UserData),
+            "evals" => Ok(Self::Evals),
+            other => Err(InvalidField::new("purpose", format!("unsupported purpose `{other}`"))),
+        }
+    }
+}
+
 impl From<UploadPurpose> for FilePurpose {
     fn from(purpose: UploadPurpose) -> Self {
         match purpose {
