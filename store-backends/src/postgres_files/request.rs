@@ -22,9 +22,9 @@ use super::{Attempt, Domain, NOW, PostgresFileCatalog, invalid, retry::PgBackend
 /// A transaction on the catalog pool.
 type Tx<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
 
-/// `(tenant_id, owner_issuer, owner_subject, storage_key, filename, bytes)`.
+/// `(tenant_id, owner_issuer, owner_subject, storage_key, filename, state, bytes)`.
 /// For a pending row `bytes` is its reservation.
-type ExistingRow = (String, String, String, String, String, i64);
+type ExistingRow = (String, String, String, String, String, String, i64);
 
 /// Columns selected for a client-visible record.
 const RECORD_COLUMNS: &str = "id, bytes, created_at, expires_at, filename, purpose";
@@ -89,9 +89,13 @@ pub(super) async fn create_pending_once(c: &PostgresFileCatalog, file: &NewFile)
     Ok(Ok(to_u64(reserve, "reserve")?))
 }
 
-/// If a row with the same `id` exists, its reservation when it is identical
-/// to `file` (a retry) or a conflict when it is not. The reservation depends
-/// on the quota at the first attempt, so it is not compared.
+/// If a row with the same `id` exists, its reservation when it is a retry of
+/// `file` or a conflict when it is not. A retry matches a *pending* row with
+/// the same owner, key and filename whose reservation does not exceed
+/// `max_bytes`. The reservation depends on the quota at the first attempt, so
+/// it is not compared for equality; a larger one proves a different request.
+/// Other states hold an actual size or a charge being released, not a
+/// reservation.
 async fn identical_pending(
     c: &PostgresFileCatalog,
     tx: &mut Tx<'_>,
@@ -106,14 +110,16 @@ async fn identical_pending(
     .fetch_optional(&mut **tx)
     .await
     .map_err(|e| c.pg_err(&e))?;
-    let Some((tenant, issuer, subject, key, filename, bytes)) = existing else {
+    let Some((tenant, issuer, subject, key, filename, state, bytes)) = existing else {
         return Ok(None);
     };
     let identical = tenant == file.owner.tenant_id()
         && issuer == file.owner.issuer()
         && subject == file.owner.subject()
         && key == file.storage_key
-        && filename == file.filename;
+        && filename == file.filename
+        && state == "pending"
+        && bytes <= to_i64(file.max_bytes, "max_bytes")?;
     if !identical {
         return Ok(Some(Err(Domain::Conflict)));
     }
