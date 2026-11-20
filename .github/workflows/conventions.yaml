@@ -7,7 +7,7 @@ name: Coding Conventions
 on:
   pull_request_target:
     branches: [main]
-    types: [opened, edited, synchronize, reopened, ready_for_review]
+    types: [opened, edited, synchronize, reopened, ready_for_review, converted_to_draft]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
@@ -19,11 +19,12 @@ jobs:
   pr-context:
     permissions:
       pull-requests: write
-    uses: praxis-proxy/conventions/.github/workflows/pr-conventions.yaml@8ba98632ca71176aa3e92b2017af2bcf5548d9d1 # v0.6.0
+    uses: praxis-proxy/conventions/.github/workflows/pr-conventions.yaml@a94d5edb2929b4e623dcfc9f1820d67eab43f748 # conventions PR 49
     with:
       context-only: true
       description-team-bypass: false
       max-open-prs: 3
+      count-draft-prs: false
       conventions-doc: https://github.com/praxis-proxy/conventions/blob/main/docs/conventions.md#pull-request-conventions
     secrets:
       PRAXIS_BOT_APP_ID: ${{ secrets.PRAXIS_BOT_APP_ID }}
