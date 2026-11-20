@@ -153,7 +153,7 @@ jobs:
         run: make test-unit-filters
 
   # ----------------------------------------------------------------------------
-  # Model-to-provider latency microbenchmark (release profile)
+  # Filter latency microbenchmarks (release profile)
   #
   # Split out of test-filters: `--release` is a separate compile profile whose
   # artifacts are not shared with the dev/test build, so running it inline
@@ -161,6 +161,10 @@ jobs:
   # critical path. Runs in parallel now, off the pole. Cache-neutral:
   # registry-only cache (cache-target: false) under the shared split suffix, so
   # it adds no new target/ cache family against the hard 10 GB cap.
+  #
+  # Both benchmarks build praxis-ai-filters in the same release profile, so the
+  # second step reuses the first step's artifacts. The job id keeps its original
+  # name because branch protection references it.
   # ----------------------------------------------------------------------------
 
   bench-model-to-provider:
@@ -181,6 +185,9 @@ jobs:
 
       - name: Model-to-provider latency benchmark (release)
         run: make bench-model-to-provider
+
+      - name: Model-to-header duplicate-model scan benchmark (release)
+        run: make bench-model-to-header
 
   test-proxy:
     runs-on: ubuntu-24.04

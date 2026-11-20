@@ -262,11 +262,23 @@ every crate, but cache hits finish in milliseconds. Check hit rates with
 Include benchmark or load-test evidence in PRs that materially change
 request processing, storage, streaming, or protocol parsing costs.
 
-`make bench-model-to-provider` runs the ignored model-to-provider request-body
-benchmark in the release profile; the Tests workflow runs it in its filter job.
-It reports nanoseconds per request over 10,000 iterations for mapped models
-with 64-byte, 1 KiB, and 16 KiB prompts, and an unknown model with 1 KiB and
-16 KiB prompts. Timings cover request-context construction, shared body
-ownership, the filter call, and cleanup, without network or backend latency.
-Shared CI runner timings are informational, not a throughput guarantee or
+Run the model-to-provider request-body benchmark with
+`make bench-model-to-provider`. The Tests workflow runs the same
+command in its filter job. It executes the ignored benchmark in the
+release profile and reports nanoseconds per request over 10,000
+iterations for mapped models with 64-byte, 1 KiB, and 16 KiB prompts,
+plus an unknown model with 1 KiB and 16 KiB prompts.
+
+Run the model-to-header benchmark with `make bench-model-to-header`.
+It isolates the top-level `model` scan that `model_to_header` runs
+before the core JSON extractor reparses the same body, reporting
+nanoseconds per request for both passes at 64-byte, 1 KiB, 16 KiB,
+256 KiB, and 1 MiB prompt sizes. The Tests workflow runs it in the
+same filter job as the model-to-provider benchmark, reusing that
+job's release build.
+
+These timings include request-context construction, shared body
+ownership, the filter call, and cleanup. They measure local filter
+cost without network or backend latency. Shared CI runner timings
+are informational; they are not a throughput guarantee or a fixed
 latency budget.
