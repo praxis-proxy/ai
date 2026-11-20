@@ -130,12 +130,6 @@ impl PostgresFileCatalog {
         Self::pg_failure(&self.redact_url, e)
     }
 
-    /// Wrap a runtime query error as a [`CatalogError`].
-    #[cfg(test)]
-    fn db_err(&self, e: &sqlx::Error) -> CatalogError {
-        Self::backend_error(&self.redact_url, e)
-    }
-
     /// Classify and redact a query error against a connection URL.
     ///
     /// Separate from [`Self::pg_err`](Self::pg_err) so redaction is testable

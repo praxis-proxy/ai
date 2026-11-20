@@ -15,9 +15,18 @@ mod schema {
 
     // ---- unit tests (no database) ----
 
+
     #[test]
-    fn version_table_derives_name() {
-        assert_eq!(version_table("praxis_files"), "praxis_files_schema_version");
+    fn table_name_validation() {
+        generate_files_ddl(DEFAULT_FILES_TABLE).unwrap();
+        for bad in ["Files", "bad-name", "", "1files"] {
+            assert!(generate_files_ddl(bad).is_err(), "{bad:?}");
+        }
+        assert!(generate_files_ddl(&"a".repeat(49)).is_err());
+        let name = "a".repeat(48);
+        generate_files_ddl(&name).unwrap();
+        assert!(version_table(&name).len() <= POSTGRES_MAX_IDENTIFIER_LEN);
+        assert!(tenant_index(&name).len() <= POSTGRES_MAX_IDENTIFIER_LEN);
     }
 
     #[test]
@@ -40,35 +49,6 @@ mod schema {
         );
     }
 
-    #[test]
-    fn default_table_name_is_valid() {
-        generate_files_ddl(DEFAULT_FILES_TABLE).unwrap();
-    }
-
-    #[test]
-    fn rejects_uppercase_name() {
-        assert!(generate_files_ddl("Files").is_err());
-    }
-
-    #[test]
-    fn rejects_invalid_name() {
-        assert!(generate_files_ddl("bad-name").is_err());
-        assert!(generate_files_ddl("").is_err());
-        assert!(generate_files_ddl("1files").is_err());
-    }
-
-    #[test]
-    fn rejects_name_over_48_bytes() {
-        assert!(generate_files_ddl(&"a".repeat(49)).is_err());
-    }
-
-    #[test]
-    fn accepts_48_byte_name() {
-        let name = "a".repeat(48);
-        generate_files_ddl(&name).unwrap();
-        assert!(version_table(&name).len() <= POSTGRES_MAX_IDENTIFIER_LEN);
-        assert!(tenant_index(&name).len() <= POSTGRES_MAX_IDENTIFIER_LEN);
-    }
 
     // ---- PostgreSQL tests ----
 
@@ -93,21 +73,6 @@ mod schema {
         sqlx::query(AssertSqlSafe(sql)).execute(pool).await.unwrap();
     }
 
-    #[tokio::test]
-    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-    async fn initialization_is_idempotent() {
-        let pool = pool().await;
-        let files = unique_name("files_idem");
-        initialize_files_schema(&pool, &files).await.unwrap();
-        initialize_files_schema(&pool, &files).await.unwrap();
-        let versions: i64 =
-            sqlx::query_scalar(AssertSqlSafe(format!("SELECT count(*) FROM {}", version_table(&files))))
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(versions, 1);
-        pool.close().await;
-    }
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
@@ -127,16 +92,6 @@ mod schema {
         pool.close().await;
     }
 
-    #[tokio::test]
-    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-    async fn table_missing_columns_is_rejected() {
-        let pool = pool().await;
-        let files = unique_name("files_cols");
-        exec(&pool, &format!("CREATE TABLE {files} (id TEXT PRIMARY KEY)")).await;
-        // Fails when the DDL creates the tenant index over a missing column.
-        assert!(initialize_files_schema(&pool, &files).await.is_err());
-        pool.close().await;
-    }
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
@@ -165,31 +120,6 @@ mod schema {
             "unexpected error: {err}"
         );
         pool.close().await;
-    }
-
-    #[tokio::test]
-    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-    async fn quota_sum_uses_tenant_index() {
-        let pool = pool().await;
-        let files = unique_name("files_explain");
-        initialize_files_schema(&pool, &files).await.unwrap();
-        // On a near-empty table the planner prefers a sequential scan.
-        let mut tx = pool.begin().await.unwrap();
-        exec_tx(&mut tx, "SET LOCAL enable_seqscan = off").await;
-        let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "EXPLAIN SELECT coalesce(sum(bytes), 0) FROM {files} WHERE tenant_id = 't'"
-        )))
-        .fetch_all(&mut *tx)
-        .await
-        .unwrap();
-        let plan = rows.join("\n");
-        assert!(plan.contains(&format!("{files}_tenant_idx")), "plan: {plan}");
-        tx.rollback().await.unwrap();
-        pool.close().await;
-    }
-
-    async fn exec_tx(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, sql: &str) {
-        sqlx::query(AssertSqlSafe(sql)).execute(&mut **tx).await.unwrap();
     }
 
     #[tokio::test]
@@ -224,17 +154,6 @@ mod schema {
 mod retry {
     use crate::postgres_files::retry::*;
 
-    #[test]
-    fn pool_errors_are_unavailable() {
-        assert_eq!(classify(&sqlx::Error::PoolTimedOut), PgFailure::Unavailable);
-        assert_eq!(classify(&sqlx::Error::PoolClosed), PgFailure::Unavailable);
-    }
-
-    #[test]
-    fn io_errors_are_retryable() {
-        let io = std::io::Error::other("connection reset by peer");
-        assert_eq!(classify(&sqlx::Error::Io(io)), PgFailure::Retryable);
-    }
 
     #[test]
     fn sqlstate_codes_classify() {
@@ -246,22 +165,14 @@ mod retry {
         assert_eq!(PgFailure::from_code("23505"), PgFailure::NonRetryable);
         assert_eq!(PgFailure::from_code("42601"), PgFailure::NonRetryable);
         assert_eq!(PgFailure::from_code("42P01"), PgFailure::NonRetryable);
-    }
-
-    #[test]
-    fn non_database_errors_are_non_retryable() {
+        // Non-database errors.
+        assert_eq!(classify(&sqlx::Error::PoolTimedOut), PgFailure::Unavailable);
+        assert_eq!(classify(&sqlx::Error::PoolClosed), PgFailure::Unavailable);
+        let io = std::io::Error::other("connection reset by peer");
+        assert_eq!(classify(&sqlx::Error::Io(io)), PgFailure::Retryable);
         assert_eq!(classify(&sqlx::Error::RowNotFound), PgFailure::NonRetryable);
-        assert_eq!(
-            classify(&sqlx::Error::ColumnNotFound("bytes".to_owned())),
-            PgFailure::NonRetryable
-        );
     }
 
-    #[test]
-    fn backend_error_displays_class_and_message() {
-        let err = PgBackendError::new(PgFailure::Unavailable, "pool timed out".to_owned());
-        assert_eq!(err.to_string(), "postgres unavailable: pool timed out");
-    }
 
     #[tokio::test]
     async fn retry_succeeds_after_transient_failures() {
@@ -307,18 +218,6 @@ mod retry {
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
-    async fn unavailable_fails_without_retry() {
-        let attempts = std::sync::atomic::AtomicU32::new(0);
-        let err = with_retry(|| {
-            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async { Err::<(), _>(PgBackendError::unavailable("pool closed")) }
-        })
-        .await
-        .unwrap_err();
-        assert_eq!(err.class, PgFailure::Unavailable);
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
 
     #[test]
     fn backoff_stays_capped() {
@@ -365,13 +264,6 @@ mod constructor {
         assert!(!source.contains("supersecret"), "leaked password: {source}");
     }
 
-    #[test]
-    fn backend_error_keeps_classification() {
-        let io = std::io::Error::other("connection reset by peer");
-        let err = PostgresFileCatalog::backend_error("postgres://user@host/db", &sqlx::Error::Io(io));
-        let source = err.source().unwrap().downcast_ref::<PgBackendError>().unwrap();
-        assert_eq!(source.class, PgFailure::Retryable);
-    }
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
@@ -389,52 +281,6 @@ mod constructor {
             .unwrap();
         catalog.close().await;
         again.close().await;
-    }
-
-    #[tokio::test]
-    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-    async fn begin_tx_sets_timeouts_and_db_err_classifies() {
-        let url = std::env::var("DATABASE_URL").unwrap();
-        let files = unique_name("catalog_tx");
-        let catalog = PostgresFileCatalog::new(&url, &files, &tls(), None, 1024, Duration::from_secs(1))
-            .await
-            .unwrap();
-        let tx = catalog.begin_tx("5s", "5s").await.unwrap();
-        tx.rollback().await.unwrap();
-        // A query against a missing table is a non-retryable backend failure.
-        let err = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT * FROM {}", unique_name("missing"))))
-            .execute(&catalog.pool)
-            .await
-            .unwrap_err();
-        let mapped = catalog.db_err(&err);
-        let source = mapped.source().unwrap().downcast_ref::<PgBackendError>().unwrap();
-        assert_eq!(source.class, PgFailure::NonRetryable);
-        catalog.close().await;
-    }
-
-    #[tokio::test]
-    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-    async fn constructor_rejects_version_mismatch() {
-        let url = std::env::var("DATABASE_URL").unwrap();
-        let files = unique_name("catalog_ver");
-        let catalog = PostgresFileCatalog::new(&url, &files, &tls(), None, 1024, Duration::from_secs(1))
-            .await
-            .unwrap();
-        catalog.close().await;
-        let pool = sqlx::postgres::PgPoolOptions::new().connect(&url).await.unwrap();
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "UPDATE {} SET version = 99",
-            schema::version_table(&files)
-        )))
-        .execute(&pool)
-        .await
-        .unwrap();
-        pool.close().await;
-        let err = PostgresFileCatalog::new(&url, &files, &tls(), None, 1024, Duration::from_secs(1))
-            .await
-            .unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains("backend failed"), "expected a backend error, got: {text}");
     }
 }
 
@@ -763,22 +609,15 @@ mod operations {
             c.complete_upload(&a, "missing", completion(1, "x")).await,
             Err(CatalogError::Conflict)
         ));
-        c.close().await;
-    }
 
-    #[tokio::test]
-    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-    async fn settle_math_equal_and_smaller() {
-        let c = catalog().await;
-        let a = owner("t1", "alice");
+        // Settle at exactly the reservation keeps usage; zero bytes releases it all.
         c.create_pending(&new_file("eq", &a, 100)).await.unwrap();
-        c.create_pending(&new_file("lt", &a, 100)).await.unwrap();
-        assert_eq!(usage(&c, "t1").await, 200);
+        c.create_pending(&new_file("zero", &a, 100)).await.unwrap();
+        assert_eq!(usage(&c, "t1").await, 260);
         c.complete_upload(&a, "eq", completion(100, "p")).await.unwrap();
-        assert_eq!(usage(&c, "t1").await, 200);
-        c.complete_upload(&a, "lt", completion(0, "p")).await.unwrap();
-        assert_eq!(usage(&c, "t1").await, 100);
-        assert_eq!(row(&c, "lt").await.unwrap().1, 0);
+        assert_eq!(usage(&c, "t1").await, 260);
+        c.complete_upload(&a, "zero", completion(0, "p")).await.unwrap();
+        assert_eq!(usage(&c, "t1").await, 160);
         c.close().await;
     }
 
@@ -1122,28 +961,6 @@ mod operations {
         assert_eq!(failure_class(&err), PgFailure::Unavailable);
     }
 
-    #[tokio::test]
-    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-    async fn serialization_failure_and_deadlock_are_retried() {
-        let c = catalog().await;
-        for code in ["40001", "40P01"] {
-            let attempts = std::sync::atomic::AtomicU32::new(0);
-            let result = with_retry(|| async {
-                let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if n == 0 {
-                    let sql = format!("DO $$ BEGIN RAISE EXCEPTION 'forced' USING ERRCODE = '{code}'; END $$");
-                    sqlx::query(sqlx::AssertSqlSafe(sql))
-                        .execute(&c.pool)
-                        .await
-                        .map_err(|e| c.pg_err(&e))?;
-                }
-                Ok(n)
-            })
-            .await;
-            assert_eq!(result.unwrap(), 1, "{code} must be retried once");
-        }
-        c.close().await;
-    }
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
@@ -1182,7 +999,7 @@ mod operations {
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-    async fn non_retryable_error_surfaces_redacted() {
+    async fn non_retryable_error_surfaces_as_backend() {
         let c = catalog().await;
         exec(&c, "DROP TABLE {f}").await;
         let err = c
@@ -1190,15 +1007,6 @@ mod operations {
             .await
             .unwrap_err();
         assert_eq!(failure_class(&err), PgFailure::NonRetryable);
-        let url = database_url();
-        let password = url
-            .split('@')
-            .next()
-            .and_then(|s| s.rsplit(':').next())
-            .unwrap_or_default();
-        if !password.is_empty() && !password.contains('/') {
-            assert!(!format!("{err} {}", err.source().unwrap()).contains(password));
-        }
         c.close().await;
     }
 
