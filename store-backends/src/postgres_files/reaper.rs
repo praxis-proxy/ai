@@ -5,10 +5,12 @@
 //!
 //! These work across tenants and never change usage except the purge in
 //! [`complete_cleanup_once`](PostgresFileCatalog::complete_cleanup_once). Each
-//! batch is its own transaction. Claims are leases (`lease_until`): they only
-//! prevent duplicate byte-store deletes and delay retries. Exactly-once release
-//! comes from the conditional purge, since cleanup states are terminal and
-//! storage keys are never reused.
+//! batch is its own transaction. Claims are leases (`lease_until`): they
+//! prevent duplicate byte-store deletes and double as the retry delay, because
+//! a worker whose delete fails does nothing and the row is claimable again when
+//! its lease expires. Only claiming writes the lease, so a stale worker cannot
+//! shorten another's. Exactly-once release comes from the conditional purge,
+//! since cleanup states are terminal and storage keys are never reused.
 
 use std::time::Duration;
 
@@ -142,23 +144,4 @@ pub(super) async fn complete_cleanup_once(
     .rows_affected();
     tx.commit().await.map_err(|e| c.pg_err(&e))?;
     Ok(deleted == 1)
-}
-
-/// Delay the claimed row's next claim by the fixed retry delay.
-pub(super) async fn release_cleanup_once(c: &PostgresFileCatalog, claim: &CleanupClaim) -> Result<(), PgBackendError> {
-    let files = &c.files;
-    let delay = secs_ceil(c.retry_delay)?;
-    let mut tx = c.begin().await?;
-    sqlx::query(AssertSqlSafe(format!(
-        "UPDATE {files} SET lease_until = {NOW} + $4 WHERE id = $1 AND state = $2 AND storage_key = $3"
-    )))
-    .bind(&claim.id)
-    .bind(state_name(claim.state))
-    .bind(&claim.storage_key)
-    .bind(delay)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| c.pg_err(&e))?;
-    tx.commit().await.map_err(|e| c.pg_err(&e))?;
-    Ok(())
 }

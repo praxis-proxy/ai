@@ -270,13 +270,13 @@ mod constructor {
     async fn constructor_creates_schema_and_is_idempotent() {
         let url = std::env::var("DATABASE_URL").unwrap();
         let files = unique_name("catalog_new");
-        let catalog = PostgresFileCatalog::new(&url, &files, &tls(), None, 1024, Duration::from_secs(1))
+        let catalog = PostgresFileCatalog::new(&url, &files, &tls(), None, 1024)
             .await
             .unwrap();
         assert_eq!(catalog.files, files);
         assert_eq!(catalog.tenant_limit_bytes, 1024);
         // A second connect over the same table validates instead of creating.
-        let again = PostgresFileCatalog::new(&url, &files, &tls(), None, 1024, Duration::from_secs(1))
+        let again = PostgresFileCatalog::new(&url, &files, &tls(), None, 1024)
             .await
             .unwrap();
         catalog.close().await;
@@ -325,7 +325,7 @@ mod operations {
             ssl_mode: Some(SslMode::Disable),
             ..PgTlsConfig::default()
         };
-        PostgresFileCatalog::new(&database_url(), &unique_name("ops"), &tls, None, limit, LONG)
+        PostgresFileCatalog::new(&database_url(), &unique_name("ops"), &tls, None, limit)
             .await
             .unwrap()
     }
@@ -917,23 +917,20 @@ mod operations {
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-    async fn released_claim_is_delayed() {
+    async fn claim_lease_is_the_retry_delay() {
         let c = catalog().await;
         deletion_pending(&c, &owner("t1", "alice"), 1).await;
-        let claims = c.claim_cleanup(Duration::ZERO, 10).await.unwrap();
-        assert_eq!(claims.len(), 1);
-        c.release_cleanup(&claims[0]).await.unwrap();
-        c.release_cleanup(&claims[0]).await.unwrap();
-        assert!(c.claim_cleanup(Duration::ZERO, 10).await.unwrap().is_empty());
-        // Once the retry delay has passed it is claimable again.
+        let first = c.claim_cleanup(LONG, 10).await.unwrap();
+        assert_eq!(first.len(), 1);
+        // A failed worker does nothing: the held lease keeps the row hidden.
+        assert!(c.claim_cleanup(LONG, 10).await.unwrap().is_empty());
+        // Once the lease expires another worker reclaims it.
         exec(&c, "UPDATE {f} SET lease_until = 1").await;
-        assert_eq!(c.claim_cleanup(LONG, 10).await.unwrap().len(), 1);
-        // Releasing a purged row is a no-op.
-        let gone = CleanupClaim {
-            id: "missing".to_owned(),
-            ..claims[0].clone()
-        };
-        c.release_cleanup(&gone).await.unwrap();
+        let second = c.claim_cleanup(LONG, 10).await.unwrap();
+        assert_eq!(second.len(), 1);
+        // The first worker's late purge succeeds once; the second finds it gone.
+        assert!(c.complete_cleanup(&first[0]).await.unwrap());
+        assert!(!c.complete_cleanup(&second[0]).await.unwrap());
         // Failed rows are claimed too.
         c.create_pending(&new_file("p", &owner("t1", "alice"), 1))
             .await

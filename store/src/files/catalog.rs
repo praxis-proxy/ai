@@ -130,8 +130,10 @@ pub trait FileCatalog: Send + Sync {
     async fn fail_abandoned_uploads(&self, abandon_after: Duration, limit: u32) -> Result<u32, CatalogError>;
 
     /// Lease up to `limit` failed and deletion-pending rows that are due, across
-    /// tenants. An expired lease makes a row claimable again, so a crashed
-    /// worker's rows are recovered.
+    /// tenants. The lease doubles as the retry delay: a worker whose byte-store
+    /// deletion fails does nothing, and the row becomes claimable again when
+    /// the lease expires, as it does for a crashed worker. Only claiming writes
+    /// a lease, so a stale worker cannot shorten another's.
     ///
     /// # Errors
     ///
@@ -147,12 +149,4 @@ pub trait FileCatalog: Send + Sync {
     ///
     /// Returns [`CatalogError::Backend`] on persistence failure.
     async fn complete_cleanup(&self, claim: &CleanupClaim) -> Result<bool, CatalogError>;
-
-    /// Give up a claim after a failed byte-store deletion: delays the next
-    /// claim by the catalog's fixed retry delay. Idempotent.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogError::Backend`] on persistence failure.
-    async fn release_cleanup(&self, claim: &CleanupClaim) -> Result<(), CatalogError>;
 }
