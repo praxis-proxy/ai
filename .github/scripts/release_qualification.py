@@ -24,7 +24,7 @@ WORKFLOWS = (
     ("postgres.yaml", "PostgreSQL store", "PostgreSQL unit and integration tests"),
     ("valkey.yaml", "Valkey rate limits", "Valkey backend unit and integration tests"),
     ("vllm-integration.yaml", "vLLM integration", "Simulator, live CPU, and optional GPU/client jobs"),
-    ("hosted-passthrough-nightly.yaml", "Hosted passthrough", "OpenAI Chat Completions and Embeddings, and Bedrock Runtime Chat Completions SDK checks"),
+    ("hosted-passthrough-nightly.yaml", "Hosted passthrough", "Official OpenAI Chat Completions, Embeddings, and Responses, plus Bedrock Runtime Chat Completions SDK checks"),
     ("anthropic-vllm-vision.yaml", "Anthropic vision", "Anthropic SDK image requests on GPU"),
     ("hosted-translation-nightly.yaml", "Hosted translation", "Live Anthropic Messages to OpenAI Chat Completions"),
     ("openai-conformance.yaml", "OpenAI conformance", "Pinned schema and conformance checks"),

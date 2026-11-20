@@ -19,7 +19,8 @@ over TLS to OpenAI. It uses OpenAI Python `3.49.0` and model
 `gpt-4.1-mini-2025-04-14`. It checks completions and token usage, streaming,
 tool result continuation, and the upstream error for an unknown model.
 It also checks embedding batch indices, requested vector dimensions, and usage
-for `text-embedding-3-small`.
+for `text-embedding-3-small`. Responses passthrough checks completed text, usage,
+and streaming text events with `store: false` on `gpt-4.1-mini-2025-04-14`.
 
 To reproduce locally, build with `cargo build --locked -p praxis-ai-proxy`,
 start `target/debug/praxis-ai -c tests/integration/fixtures/openai/chat-completions-live.yaml` from the
