@@ -1,0 +1,67 @@
+# Manual probe that makes one billable inference request.
+name: Bedrock Mantle smoke
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  smoke:
+    if: github.repository == 'praxis-proxy/ai' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
+    steps:
+      - name: Check role configuration
+        env:
+          AWS_BEDROCK_ROLE_ARN: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+        run: |
+          if [[ -z "$AWS_BEDROCK_ROLE_ARN" ]]; then
+            echo "::error::Missing AWS_BEDROCK_ROLE_ARN Actions secret."
+            exit 1
+          fi
+
+      - name: Assume Bedrock role
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: bedrock-mantle-smoke-${{ github.run_id }}
+          role-duration-seconds: 900
+
+      - name: Verify AWS session
+        run: aws sts get-caller-identity >/dev/null
+
+      - name: Verify Mantle Chat Completions
+        env:
+          BEDROCK_MODEL: openai.gpt-oss-120b
+        run: |
+          : "${AWS_ACCESS_KEY_ID:?Missing temporary access key}"
+          : "${AWS_SECRET_ACCESS_KEY:?Missing temporary secret key}"
+          : "${AWS_SESSION_TOKEN:?Missing session token}"
+          endpoint="https://bedrock-mantle.${AWS_REGION}.api.aws/v1/chat/completions"
+          request=$(jq -nc --arg model "$BEDROCK_MODEL" '{
+            model: $model,
+            messages: [{role: "user", content: "Reply with OK."}],
+            max_completion_tokens: 128
+          }')
+          response=$(mktemp)
+          trap 'rm "$response"' EXIT
+          status=$(
+            printf 'user = "%s:%s"\nheader = "x-amz-security-token: %s"\n' \
+              "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$AWS_SESSION_TOKEN" |
+              curl --config - --silent --show-error --max-time 45 \
+                --aws-sigv4 "aws:amz:${AWS_REGION}:bedrock-mantle" \
+                --header 'Content-Type: application/json' --data-binary "$request" \
+                --output "$response" --write-out '%{http_code}' "$endpoint"
+          )
+          echo "Bedrock Mantle returned HTTP $status for $BEDROCK_MODEL in $AWS_REGION."
+          if [[ "$status" != 200 ]] ||
+            ! jq -e '.object == "chat.completion" and (.choices[0].message.role == "assistant")' "$response" >/dev/null; then
+            echo "::error::Bedrock Mantle did not return a Chat Completions response."
+            exit 1
+          fi
