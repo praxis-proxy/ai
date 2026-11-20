@@ -95,12 +95,6 @@ impl PgBackendError {
     pub(crate) fn non_retryable(message: &str) -> Self {
         Self::new(PgFailure::NonRetryable, message.to_owned())
     }
-
-    /// An unavailable failure for tests.
-    #[cfg(test)]
-    pub(crate) fn unavailable(message: &str) -> Self {
-        Self::new(PgFailure::Unavailable, message.to_owned())
-    }
 }
 
 impl fmt::Display for PgBackendError {
