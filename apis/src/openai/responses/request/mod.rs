@@ -742,9 +742,12 @@ fn reject_conflicting_history_selectors(body: &serde_json::Value) -> Option<Filt
 /// Reject a non-empty vLLM `previous_input_messages` extension on managed paths.
 ///
 /// Praxis owns the history sent to inference on managed routes: it rehydrates
-/// stored turns into `input`. vLLM renders `previous_input_messages` in front of
-/// that history, so forwarding a caller-supplied array would let the model see
-/// messages Praxis never persisted. Absent, `null`, and `[]` carry no history and
+/// stored turns into `input`. On its Harmony rendering path (gpt-oss models),
+/// vLLM places `previous_input_messages` in front of that history. vLLM rejects
+/// the field alongside `previous_response_id`, but Praxis strips that selector
+/// before forwarding, so the guard never fires and the model could see messages
+/// Praxis never persisted. Praxis cannot tell which rendering path a backend
+/// uses, so it rejects the field on every managed route. Absent, `null`, and `[]` carry no history and
 /// are accepted; any other value is rejected before inference. The pre-routing
 /// fact publisher never reaches this check, so provider-owned passthrough keeps
 /// the field intact.
