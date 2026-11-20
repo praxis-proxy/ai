@@ -1138,10 +1138,15 @@ fn search_result_part_is_supported(part: &Value) -> bool {
             part,
             &["type", "title", "source", "content", "citations", "cache_control"],
         )
-        && part
-            .get("content")
-            .and_then(Value::as_array)
-            .is_none_or(|blocks| blocks.iter().all(|block| text_block_rejection(block).is_none()))
+        && part.get("content").is_none_or(|content| {
+            // A present, non-null `content` must be an array of text
+            // blocks: any other shape carries text the flattener would
+            // silently drop while keeping the title.
+            content.is_null()
+                || content
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().all(|block| text_block_rejection(block).is_none()))
+        })
         && (non_empty_string_field(part, "title")
             || non_empty_string_field(part, "source")
             || part
@@ -1185,15 +1190,37 @@ fn document_source_is_supported(source: &Value) -> bool {
     let Some(fields) = source.as_object() else {
         return false;
     };
-    match fields.get("type").and_then(Value::as_str) {
-        Some("text") => non_empty_string_field(source, "data"),
-        Some("content") => fields.get("content").and_then(Value::as_array).is_some_and(|blocks| {
-            blocks.iter().all(|block| text_block_rejection(block).is_none()) && blocks.iter().any(text_block_has_text)
-        }),
-        Some("url") => non_empty_string_field(source, "url"),
-        Some("file") => non_empty_string_field(source, "file_id"),
-        _ => false,
+    let variant = fields.get("type").and_then(Value::as_str);
+    // Each source variant carries only the keys its schema allows, so a
+    // field the flattener would silently drop — a source-level
+    // `cache_control`, for example — fails closed here instead.
+    let keys_supported = match variant {
+        Some("text") => has_only_keys(source, &["type", "data", "media_type"]),
+        Some("content") => has_only_keys(source, &["type", "content"]),
+        Some("url") => has_only_keys(source, &["type", "url"]),
+        Some("file") => has_only_keys(source, &["type", "file_id"]),
+        _ => return false,
+    };
+    // A present, non-null `content` must be an array: any other shape
+    // carries text the flattener would drop.
+    if variant == Some("content")
+        && !source
+            .get("content")
+            .is_none_or(|content| content.is_null() || content.is_array())
+    {
+        return false;
     }
+    keys_supported
+        && match variant {
+            Some("text") => non_empty_string_field(source, "data"),
+            Some("content") => source.get("content").and_then(Value::as_array).is_some_and(|blocks| {
+                blocks.iter().all(|block| text_block_rejection(block).is_none())
+                    && blocks.iter().any(text_block_has_text)
+            }),
+            Some("url") => non_empty_string_field(source, "url"),
+            Some("file") => non_empty_string_field(source, "file_id"),
+            _ => false,
+        }
 }
 
 /// Whether a block is a text block with non-empty text.
@@ -1389,6 +1416,14 @@ fn convert_messages(messages: &mut Vec<Value>, source: Option<Value>) {
         return;
     };
 
+    // Images promoted out of `tool_result` parts are held until no further
+    // tool reply can arrive: Anthropic combines consecutive user messages
+    // into one turn, so parallel tool results may span several of them, and
+    // Chat Completions requires every tool reply to follow the assistant
+    // `tool_calls` message directly — a user message may only appear after
+    // the last tool message of the group, never between two of them.
+    let mut pending_images = Vec::new();
+
     for msg in anthropic_messages {
         let Value::Object(mut msg) = msg else {
             continue;
@@ -1399,30 +1434,55 @@ fn convert_messages(messages: &mut Vec<Value>, source: Option<Value>) {
 
         match msg.remove("content") {
             Some(Value::String(text)) => {
+                flush_pending_images(messages, &mut pending_images);
                 messages.push(text_message(role, text));
             },
             Some(Value::Array(blocks)) => {
-                convert_content_blocks(messages, &role, blocks);
+                // A user message carrying a `tool_result` may extend the
+                // ongoing tool-reply group, so the promoted images must be
+                // held back past it; anything else ends the group.
+                if !adds_tool_replies(&role, &blocks) {
+                    flush_pending_images(messages, &mut pending_images);
+                }
+                convert_content_blocks(messages, &role, blocks, &mut pending_images);
             },
             _ => {
+                flush_pending_images(messages, &mut pending_images);
                 messages.push(text_message(role, String::new()));
             },
         }
     }
+
+    flush_pending_images(messages, &mut pending_images);
+}
+
+/// Whether converting this message can append tool replies to the ongoing
+/// group: only a `user` message with a `tool_result` block does.
+fn adds_tool_replies(role: &str, blocks: &[Value]) -> bool {
+    role == "user"
+        && blocks
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+}
+
+/// Emit the deferred `tool_result` images as one user message.
+fn flush_pending_images(messages: &mut Vec<Value>, pending_images: &mut Vec<Value>) {
+    if pending_images.is_empty() {
+        return;
+    }
+    let mut image_message = Map::new();
+    image_message.insert("role".to_owned(), Value::String("user".to_owned()));
+    image_message.insert("content".to_owned(), Value::Array(std::mem::take(pending_images)));
+    messages.push(Value::Object(image_message));
 }
 
 /// Convert typed content blocks to Chat Completions-compatible format.
 /// Consumes the blocks to move their payloads into the translated message.
-fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
+/// Images promoted out of `tool_result` parts accumulate in `pending_images`
+/// for the caller to flush once the whole tool-reply group has been emitted.
+fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>, pending_images: &mut Vec<Value>) {
     let mut content_parts = Vec::new();
     let mut tool_calls = Vec::new();
-    // Images promoted out of `tool_result` parts are deferred until every
-    // tool message of this Anthropic message has been emitted: Chat
-    // Completions requires all tool replies to follow the assistant
-    // `tool_calls` message directly, so with parallel tool calls a user
-    // message may only appear after the last tool message, never between
-    // two of them.
-    let mut promoted_images = Vec::new();
 
     for block in blocks {
         let mut block = match block {
@@ -1437,15 +1497,8 @@ fn convert_content_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Val
             role,
             &mut content_parts,
             &mut tool_calls,
-            &mut promoted_images,
+            pending_images,
         );
-    }
-
-    if !promoted_images.is_empty() {
-        let mut image_message = Map::new();
-        image_message.insert("role".to_owned(), Value::String("user".to_owned()));
-        image_message.insert("content".to_owned(), Value::Array(promoted_images));
-        messages.push(Value::Object(image_message));
     }
 
     finalize_content_blocks(messages, role, &mut content_parts, tool_calls);
@@ -2856,6 +2909,84 @@ mod tests {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","title":"Contract","source":{"type":"unknown","data":"ignored"}}]}]}]}"#;
         let error = transform_bytes(body).unwrap_err();
         assert!(error.contains("document"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_search_result_non_array_content_is_rejected() {
+        // A string `content` carries text the flattener would silently drop
+        // while keeping the title, so a present, non-null `content` must be
+        // an array of text blocks.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"search_result","title":"KB","content":"Important result"}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("search_result"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_document_source_unknown_field_is_rejected() {
+        // A source-level field outside the variant's schema — a
+        // `cache_control` marker, for example — is dropped by the flattener
+        // without the prompt-caching allowlist ever seeing it, so it fails
+        // closed even when the source otherwise carries valid text.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","title":"Contract","source":{"type":"content","content":[{"type":"text","text":"Valid fact."}],"cache_control":{"type":"ephemeral"}}}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("document"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_document_source_non_array_content_is_rejected() {
+        // A string `source.content` carries text the flattener would drop
+        // while the title survives, mirroring the search_result rule.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","title":"Contract","source":{"type":"content","content":"The full contract text."}}]}]}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+        assert!(error.contains("document"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_document_text_source_media_type_is_accepted() {
+        // `media_type` is part of the plain-text source schema, so it stays
+        // accepted even though the flattener only forwards the `data` text.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"The grass is green."}}]}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(
+            parsed["messages"][0]["content"], "Document\nContent:\nThe grass is green.",
+            "text source with media_type flattens its data"
+        );
+    }
+
+    #[test]
+    fn parallel_tool_result_images_across_consecutive_user_messages() {
+        // Anthropic combines consecutive user messages into one turn, so a
+        // client may return parallel tool results in two separate user
+        // messages. The promoted image may only appear as a user message
+        // after the last tool reply of the whole group.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"render_chart","input":{}},{"type":"tool_use","id":"call_2","name":"get_status","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"chart"},{"type":"image","source":{"type":"url","url":"https://example.com/chart.png"}}]}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_2","content":"ready"}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        let roles: Vec<&str> = parsed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            ["assistant", "tool", "tool", "user"],
+            "both tool replies precede the promoted image: {roles:?}"
+        );
+        assert_eq!(
+            parsed["messages"][1]["tool_call_id"], "call_1",
+            "first tool reply keeps its id"
+        );
+        assert_eq!(
+            parsed["messages"][2]["tool_call_id"], "call_2",
+            "second tool reply keeps its id"
+        );
+        assert_eq!(
+            parsed["messages"][3]["content"][0]["image_url"]["url"], "https://example.com/chart.png",
+            "promoted image follows the last tool reply of the group"
+        );
     }
 
     #[test]
