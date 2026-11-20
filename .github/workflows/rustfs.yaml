@@ -1,0 +1,110 @@
+name: Tests (RustFS S3 File Store)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apis/src/openai/files/**"
+      - "apis/tests/s3_file_store.rs"
+      - "apis/Cargo.toml"
+      - "tests/integration/fixtures/s3/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - ".github/workflows/rustfs.yaml"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - "apis/src/openai/files/**"
+      - "apis/tests/s3_file_store.rs"
+      - "apis/Cargo.toml"
+      - "tests/integration/fixtures/s3/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile"
+      - ".github/workflows/rustfs.yaml"
+  merge_group:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: "Enable verbose test output (V=1)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CONTAINER_ENGINE: docker
+  V: ${{ inputs.debug && '1' || '' }}
+
+jobs:
+  # merge_group does not support on.paths; match the PR and push path gate.
+  changes:
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect relevant path changes
+        id: filter
+        run: |
+          CHANGED=$(git diff --name-only "${{ github.event.merge_group.base_sha }}" \
+                                         "${{ github.event.merge_group.head_sha }}" -- \
+            'apis/src/openai/files/' \
+            'apis/tests/s3_file_store.rs' \
+            'apis/Cargo.toml' \
+            'tests/integration/fixtures/s3/' \
+            'Cargo.toml' \
+            'Cargo.lock' \
+            'Makefile' \
+            '.github/workflows/rustfs.yaml')
+          if [ -n "$CHANGED" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  file-store:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        with:
+          cache-suffix: rustfs-file-store-cargo
+
+      - name: Install independent S3 client
+        run: |
+          curl -fsSL https://awscli.amazonaws.com/v2/install.sh -o "$RUNNER_TEMP/install-aws-cli.sh"
+          bash "$RUNNER_TEMP/install-aws-cli.sh"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/aws" --version
+
+      - name: S3 unit tests and live RustFS FileStore contract
+        run: make test-s3-file-store

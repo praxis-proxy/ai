@@ -5,8 +5,10 @@
 - Rust stable 1.96+
 - Rust nightly
 - CMake 3.31+
-- Docker 29.3.0+ or Podman (for container builds; the FIPS image, its
-  compliance check and Red Hat's scanner need podman on Linux)
+- Docker 29.3.0+ or Podman (for container builds and RustFS S3 integration
+  tests; the FIPS image, its compliance check and Red Hat's scanner need
+  podman on Linux)
+- AWS CLI v2 (for `make test-integration` and `make test-s3-file-store-e2e`)
 - Go 1.26+ (`make fips-scanner`, optional)
 
 Install the development-only Cargo tools used by the Make targets:
@@ -48,9 +50,11 @@ make test
 make test-integration
 ```
 
-`make test-integration` runs both the store-all suite and its experimental
-filter permutation. CI runs those permutations separately with
-`make test-integration-core` and `make test-integration-experimental`.
+`make test-integration` runs the store-all suite, its experimental filter
+permutation, and live RustFS S3 FileStore tests. The RustFS container binds to
+`127.0.0.1:9000`, so that port must be available. CI runs the three suites
+separately with `make test-integration-core`,
+`make test-integration-experimental`, and `make test-s3-file-store`.
 Likewise, `make test-inference-fixtures` includes the xtask fixture tests;
 `make test-inference-fixtures-core` and `make test-inference-xtask` are the
 separate CI targets. `make test-environment-suite` runs the llmd-ext-proc
