@@ -43,18 +43,21 @@ use crate::owner::StateOwner;
 /// clock for every timestamp.
 #[async_trait]
 pub trait FileCatalog: Send + Sync {
-    /// Insert a pending row and reserve `file.reserve_bytes` against the
-    /// tenant limit, atomically. Returns the creation timestamp (Unix seconds)
-    /// assigned by the database. Purpose and expiration arrive later.
+    /// Insert a pending row and atomically reserve
+    /// `R = min(file.max_bytes, remaining_quota)` against the tenant limit,
+    /// where `remaining_quota` is the limit minus current usage, floored at
+    /// zero. Returns `R`, which the service passes to the byte-store writer
+    /// and retains in the upload session. Purpose and expiration arrive later.
     ///
-    /// An identical retry returns `Ok` without reserving again.
+    /// An identical retry returns the stored reservation without reserving
+    /// again, even if the remaining quota has changed since.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogError::QuotaExceeded`] when the reservation does not
-    /// fit, [`CatalogError::Conflict`] for a duplicate ID or storage key with
+    /// Returns [`CatalogError::QuotaExceeded`] without inserting when `R` is
+    /// zero, [`CatalogError::Conflict`] for a duplicate ID or storage key with
     /// different fields, or [`CatalogError::Backend`] on persistence failure.
-    async fn create_pending(&self, file: &NewFile) -> Result<i64, CatalogError>;
+    async fn create_pending(&self, file: &NewFile) -> Result<u64, CatalogError>;
 
     /// Transition a pending file to ready and settle its charge from the
     /// reservation to the actual size (`used -= reserved - actual`). The

@@ -28,7 +28,7 @@ fn backend<T>(result: Result<T, super::retry::PgBackendError>) -> Result<T, Cata
 
 #[async_trait]
 impl FileCatalog for PostgresFileCatalog {
-    async fn create_pending(&self, file: &NewFile) -> Result<i64, CatalogError> {
+    async fn create_pending(&self, file: &NewFile) -> Result<u64, CatalogError> {
         finish(with_retry(|| request::create_pending_once(self, file)).await)
     }
 

@@ -15,7 +15,6 @@ mod schema {
 
     // ---- unit tests (no database) ----
 
-
     #[test]
     fn table_name_validation() {
         generate_files_ddl(DEFAULT_FILES_TABLE).unwrap();
@@ -49,7 +48,6 @@ mod schema {
         );
     }
 
-
     // ---- PostgreSQL tests ----
 
     /// Connect to the disposable test database.
@@ -73,7 +71,6 @@ mod schema {
         sqlx::query(AssertSqlSafe(sql)).execute(pool).await.unwrap();
     }
 
-
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
     async fn concurrent_initialization_succeeds() {
@@ -91,7 +88,6 @@ mod schema {
         assert_eq!(versions, 1);
         pool.close().await;
     }
-
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
@@ -154,7 +150,6 @@ mod schema {
 mod retry {
     use crate::postgres_files::retry::*;
 
-
     #[test]
     fn sqlstate_codes_classify() {
         assert_eq!(PgFailure::from_code("40001"), PgFailure::Retryable);
@@ -172,7 +167,6 @@ mod retry {
         assert_eq!(classify(&sqlx::Error::Io(io)), PgFailure::Retryable);
         assert_eq!(classify(&sqlx::Error::RowNotFound), PgFailure::NonRetryable);
     }
-
 
     #[tokio::test]
     async fn retry_succeeds_after_transient_failures() {
@@ -218,7 +212,6 @@ mod retry {
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-
     #[test]
     fn backoff_stays_capped() {
         for attempts in 1..10 {
@@ -263,7 +256,6 @@ mod constructor {
         let source = err.source().unwrap().to_string();
         assert!(!source.contains("supersecret"), "leaked password: {source}");
     }
-
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
@@ -338,13 +330,13 @@ mod operations {
         StateOwner::from_trusted_parts(tenant, "issuer", subject).unwrap()
     }
 
-    fn new_file(id: &str, owner: &StateOwner, reserve: u64) -> NewFile {
+    fn new_file(id: &str, owner: &StateOwner, max_bytes: u64) -> NewFile {
         NewFile {
             id: id.to_owned(),
             owner: owner.clone(),
             storage_key: format!("key-{id}"),
             filename: format!("{id}.txt"),
-            reserve_bytes: reserve,
+            max_bytes,
         }
     }
 
@@ -544,6 +536,7 @@ mod operations {
         let file = new_file("f1", &a, 100);
         let created = c.create_pending(&file).await.unwrap();
         assert_eq!(c.create_pending(&file).await.unwrap(), created);
+        assert_eq!(created, 100);
         assert_eq!(usage(&c, "t1").await, 100, "an identical retry must not reserve again");
 
         let mut different = file.clone();
@@ -562,6 +555,34 @@ mod operations {
         // Reservation above i64::MAX is rejected, not wrapped.
         let huge = new_file("f3", &a, u64::MAX);
         assert!(matches!(c.create_pending(&huge).await, Err(CatalogError::Backend(_))));
+        c.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    async fn reservation_is_capped_by_the_remaining_quota() {
+        let c = catalog_with(100).await;
+        let a = owner("t1", "alice");
+        // Below the quota the per-file maximum is granted.
+        assert_eq!(c.create_pending(&new_file("f1", &a, 30)).await.unwrap(), 30);
+        // The per-file maximum exceeds the remainder: the remainder is granted.
+        assert_eq!(c.create_pending(&new_file("f2", &a, 500)).await.unwrap(), 70);
+        assert_eq!(usage(&c, "t1").await, 100);
+        // Nothing left: rejected without inserting a row.
+        assert!(matches!(
+            c.create_pending(&new_file("f3", &a, 500)).await,
+            Err(CatalogError::QuotaExceeded)
+        ));
+        assert!(row(&c, "f3").await.is_none());
+        // A zero per-file maximum can never reserve.
+        assert!(matches!(
+            c.create_pending(&new_file("f4", &owner("t2", "bob"), 0)).await,
+            Err(CatalogError::QuotaExceeded)
+        ));
+        // A retry returns the stored grant, not a new decision, after room frees up.
+        exec(&c, "DELETE FROM {f} WHERE id = 'f1'").await;
+        assert_eq!(c.create_pending(&new_file("f2", &a, 500)).await.unwrap(), 70);
+        assert_eq!(usage(&c, "t1").await, 70);
         c.close().await;
     }
 
@@ -957,7 +978,6 @@ mod operations {
         let err = c.get_ready(&owner("t1", "a"), "f1").await.unwrap_err();
         assert_eq!(failure_class(&err), PgFailure::Unavailable);
     }
-
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]

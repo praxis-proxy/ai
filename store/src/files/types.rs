@@ -23,7 +23,7 @@ pub enum SortDirection {
 /// Metadata inserted before any upload bytes are written.
 ///
 /// Purpose and expiration are recorded only when the upload completes. The
-/// creation timestamp is assigned by the catalog.
+/// creation timestamp and the reservation are assigned by the catalog.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NewFile {
     /// New public file identifier, unique across all tenants.
@@ -34,9 +34,11 @@ pub struct NewFile {
     pub storage_key: String,
     /// Original client filename.
     pub filename: String,
-    /// Bytes reserved against the tenant quota: the `Content-Length` hint, or
-    /// the per-file maximum when there is none. Also the byte-store limit.
-    pub reserve_bytes: u64,
+    /// Most the upload may reserve: the service passes the smaller of the
+    /// declared size hint and the API-wide per-file limit. The catalog
+    /// reserves `min(max_bytes, remaining tenant quota)`, which is also the
+    /// byte-store limit.
+    pub max_bytes: u64,
 }
 
 /// Final metadata and actual byte count committed with a completed upload.

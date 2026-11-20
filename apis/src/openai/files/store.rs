@@ -12,8 +12,8 @@ use super::FileStream;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FileStoreError {
-    /// The upload exceeded the writer's byte limit, which may be a declared
-    /// size hint smaller than the per-file size limit.
+    /// The upload exceeded the writer's byte limit, which may be a quota
+    /// reservation smaller than the per-file size limit.
     #[error("file exceeds the writer byte limit")]
     UploadTooLarge,
     /// The byte store failed; its original error remains available.
