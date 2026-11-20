@@ -102,13 +102,13 @@ status checks.
 
 ## Pull Request Review Assignment
 
-Contributors may have at most three open pull requests in this
-repository at a time, including drafts. If opening a PR takes the
-author over that limit, the bot comments on the PR and fails its
-limit check. The PR receives no review attention until enough of the
-author's other PRs are merged to bring the open count back to three
-or fewer. Edit or update the PR to refresh the limit check and reviewer
-assignment after merging other PRs.
+Contributors may have at most three open pull requests ready for
+review in this repository at a time. Drafts are excluded. Opening
+a ready PR or marking a draft ready can take the author over that
+limit. The bot then comments on the PR, fails its limit check, and
+skips reviewer assignment. When the count returns to three or fewer,
+edit or update the waiting PR to refresh the check and reviewer
+assignment.
 
 Every pull request must link the issue it addresses. Use
 `Closes #123` when merging the PR completes the issue, or

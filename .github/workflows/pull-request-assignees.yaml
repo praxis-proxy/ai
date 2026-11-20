@@ -4,8 +4,8 @@ name: Pull Request Assignees
 # Workflow Settings
 # ------------------------------------------------------------------------------
 #
-# Gives each ready-for-review PR within the author's three-open-PR limit a
-# reviewer from ai-reviewers. Over-limit PRs wait without reviewer assignment.
+# Assigns an ai-reviewers member when the author has at most three PRs
+# ready for review. Over-limit PRs wait without reviewer assignment.
 # Maintainers are assigned deliberately after required CI passes; a maintainer
 # assignment signals that review has started.
 #
@@ -34,10 +34,11 @@ permissions: {}
 
 jobs:
   assign:
-    uses: praxis-proxy/conventions/.github/workflows/pr-assignees.yaml@8ba98632ca71176aa3e92b2017af2bcf5548d9d1 # v0.6.0
+    uses: praxis-proxy/conventions/.github/workflows/pr-assignees.yaml@a94d5edb2929b4e623dcfc9f1820d67eab43f748 # conventions PR 49
     with:
       auto-assign-maintainer: false
       max-open-prs: 3
+      count-draft-prs: false
       reviewer-teams: ai-reviewers
     secrets:
       PRAXIS_BOT_APP_ID: ${{ secrets.PRAXIS_BOT_APP_ID }}
