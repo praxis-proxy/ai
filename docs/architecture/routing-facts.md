@@ -31,6 +31,7 @@ header is never a fact.
 | Fact | Producer | Carrier | Remove-then-set | Read by routing |
 |---|---|---|---|---|
 | Model name | `model_to_header` | header `X-Model` (configurable) | yes (#1039) | `intelligent_route`, `provider_route`, `token_rate_limit` |
+| Prompt overflow route | `prompt_length_to_header` | header `X-Prompt-Route` (configurable); metadata `prompt_length_to_header.estimated_tokens`, `.overflow_route` | yes | core `router` |
 | MCP method and tool name | `mcp` | metadata `mcp.method`, `mcp.name`; headers `x-praxis-mcp-*` | reserved prefix stripped at ingress | `intelligent_route` (tool routing takes precedence over the model header) |
 | A2A context/task owner | `a2a` | header `x-praxis-a2a-route-cluster` | reserved prefix stripped at ingress | core `router` |
 | Operation and protocol | `ai_operation` | headers `x-praxis-ai-operation`, `x-praxis-ai-application-protocol`; metadata `ai_operation.*` | yes (removed on no match) | branch conditions only |
@@ -41,9 +42,9 @@ header is never a fact.
 | Guardrail verdict | `ai_guardrails`, `http_callout` | `filter_results` (ephemeral) | not applicable | branch chains only |
 
 Facts that do not exist yet, and would be produced in the same
-pre-read pass that `model_to_header` already performs: prompt
-size, modality, and a tools-present flag for routing (tracked in
-praxis-proxy/ai#106, #107, #108).
+pre-read pass that `model_to_header` already performs: modality
+and a tools-present flag for routing (tracked in praxis-proxy/ai#106
+and #108).
 
 ## Rules
 
