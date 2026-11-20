@@ -38,17 +38,17 @@
 # and the anthropics/claude-code CHANGELOG head); it clears the intermediate
 # 2.1.265-2.1.267 and 2.1.275 self-hosted ANTHROPIC_BASE_URL regressions that
 # returned blanket HTTP 400s.
-version = "2.1.328"
+version = "2.1.278"
 # Platform triple the pinned archive targets (e.g. "x86_64-unknown-linux-gnu").
 platform = "x86_64-unknown-linux-gnu"
 # Download URL for the pinned executable. Native Claude Code binaries are served
 # per-version from downloads.claude.ai; "linux-x64" is the glibc x86_64 slug that
 # corresponds to the platform triple above. The matching sha256 is published at
-# https://downloads.claude.ai/claude-code-releases/2.1.328/manifest.json
+# https://downloads.claude.ai/claude-code-releases/2.1.278/manifest.json
 # (.platforms["linux-x64"].checksum) and is verified against the download in CI.
-url = "https://downloads.claude.ai/claude-code-releases/2.1.328/linux-x64/claude"
+url = "https://downloads.claude.ai/claude-code-releases/2.1.278/linux-x64/claude"
 # SHA-256 of the downloaded executable; CI verifies this before running.
-sha256 = "a982d38030b97e750848add2cbb2df6d9a70d5544a22ca9b216a349ba25865e8"
+sha256 = "5c4735937844e84f8a93306e841a5b0e12252909b07870f789b190468da147ab"
 # Major release line the pinned launch contract was validated against. Crossing
 # it must re-validate the manifest, not just bump the version.
 major_series = 2

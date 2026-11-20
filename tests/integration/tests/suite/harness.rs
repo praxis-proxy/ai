@@ -19,7 +19,7 @@ use tempfile::TempDir;
 /// of `claude --version`. Kept in sync with
 /// `tests/integration/fixtures/claude-code-cli/pin.toml` by
 /// `claude_code::pin_toml_version_matches_harness_const`.
-pub(crate) const CLAUDE_CODE_PINNED_VERSION: &str = "2.1.328";
+pub(crate) const CLAUDE_CODE_PINNED_VERSION: &str = "2.1.278";
 
 /// Pinned version of the Codex CLI executable used for E2E acceptance tests.
 ///

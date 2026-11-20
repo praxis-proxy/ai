@@ -215,7 +215,7 @@ jobs:
           # Keep in sync with tests/integration/fixtures/claude-code-cli/pin.toml;
           # the offline test `claude_code::claude_code_lane_is_wired_in_ci`
           # enforces it.
-          CLAUDE_CODE_PINNED_VERSION: "2.1.328"
+          CLAUDE_CODE_PINNED_VERSION: "2.1.278"
         run: |
           npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_PINNED_VERSION}"
           claude --version | grep -F "$CLAUDE_CODE_PINNED_VERSION"
