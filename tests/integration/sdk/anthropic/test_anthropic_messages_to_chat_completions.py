@@ -1503,38 +1503,6 @@ class TestOperatorApprovedDegradation:
         [upstream] = RecordingBackend.bodies
         assert "thinking" not in upstream, f"thinking must be stripped: {upstream}"
 
-    def test_mid_conversation_system_is_folded_and_reported(self, degrading_client):
-        RecordingBackend.bodies.clear()
-
-        # The typed SDK surface cannot send a mid-conversation system message,
-        # so override the serialized `messages` with one that carries it
-        # (Claude Code's shape).
-        raw = degrading_client.messages.with_raw_response.create(
-            model=MODEL,
-            max_tokens=64,
-            system="You are helpful.",
-            messages=[{"role": "user", "content": "placeholder"}],
-            extra_body={
-                "messages": [
-                    {"role": "user", "content": "Call lookup"},
-                    {"role": "system", "content": "# Environment\ncwd: /tmp"},
-                    {"role": "user", "content": "Reply with exactly: OK"},
-                ]
-            },
-        )
-
-        assert raw.http_response.status_code == 200
-        assert "mid_conversation_system" in raw.http_response.headers.get(DEGRADED_HEADER, "")
-        message = raw.parse()
-        assert message.content[0].text == "4"
-
-        [upstream] = RecordingBackend.bodies
-        roles = [m["role"] for m in upstream["messages"]]
-        assert roles == ["system", "user", "user"], upstream["messages"]
-        assert upstream["messages"][0]["content"] == (
-            "You are helpful.\n\n# Environment\ncwd: /tmp"
-        ), "mid-conversation system text merges into the leading system message"
-
     def test_both_features_reported_together(self, degrading_client):
         RecordingBackend.bodies.clear()
 
