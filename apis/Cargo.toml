@@ -134,3 +134,7 @@ tracing-subscriber = { workspace = true }
 [[bench]]
 name = "translation_overhead"
 harness = false
+
+[[test]]
+name = "s3_file_store"
+required-features = ["openai-files-s3"]

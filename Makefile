@@ -63,6 +63,7 @@ endif
 	test-store-features test-store-features-check test-store-features-clippy \
 	test-store-features-clippy-group test-store-features-test print-store-clippy-groups \
 	test-responses-features \
+	test-s3-file-store test-s3-file-store-unit test-s3-file-store-e2e \
 	test-postgres-unit test-postgres-integration test-environment test-environment-suite \
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
 	test-token-rate-limit-sentinel-integration \
@@ -124,7 +125,9 @@ container-run: | require-container-engine
 # Test
 # -------------------------------------------------------------------
 
-test:
+# S3 is outside openai-all/store-all, so the workspace and API unit suites
+# both depend on the explicit S3 feature test.
+test: test-s3-file-store-unit
 	cargo build -p praxis-ai-proxy --bin praxis-ai --features openai-all,store-all
 	PRAXIS_AI_BIN=$(abspath $(or $(CARGO_TARGET_DIR),target)/debug/praxis-ai) \
 	cargo test --workspace --features $(STORE_ALL_WORKSPACE_FEATURES) $(_NOCAPTURE)
@@ -135,7 +138,7 @@ test:
 # recompile chain (which was the ~38m long pole of the Tests workflow).
 test-unit: test-unit-apis test-unit-filters test-unit-proxy
 
-test-unit-apis:
+test-unit-apis: test-s3-file-store-unit
 	cargo test -p praxis-ai-apis $(_NOCAPTURE)
 	cargo test -p praxis-ai-apis --features full,openai-all,store-postgres $(_NOCAPTURE)
 	cargo test -p praxis-ai-apis --features full,openai-all,store-postgres,$(APIS_EXPERIMENTAL_FEATURES) $(_NOCAPTURE)
@@ -259,7 +262,7 @@ test-schema:
 # the harness refuses to build it from inside a test (see praxis_ai_bin in
 # tests/utils), because a nested cargo build inherits the outer run's
 # instrumentation and target-dir locks and can run for minutes.
-test-integration: test-integration-core test-integration-experimental
+test-integration: test-integration-core test-integration-experimental test-s3-file-store-e2e
 
 test-integration-core:
 	cargo build -p praxis-ai-proxy --bin praxis-ai --features openai-all,store-all
@@ -327,6 +330,19 @@ test-postgres-integration:
 		openai_responses_store_postgres \
 		openai_responses_store_postgres_mtls \
 		openai_conversations_postgres_mtls $(if $(V),--nocapture)
+
+# The API unit tests use an in-memory store but compile only with the S3 gate.
+# The live lane supplies HTTP transport and crypto only in this explicit test
+# command; the production openai-files-s3 feature remains aws-base only.
+test-s3-file-store: test-s3-file-store-unit test-s3-file-store-e2e
+
+test-s3-file-store-unit:
+	cargo test -p praxis-ai-apis --no-default-features --features openai-files-s3 \
+		--lib openai::files::store $(if $(V),-- --nocapture)
+
+test-s3-file-store-e2e: | require-container-engine
+	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" V="$(V)" \
+		bash tests/integration/fixtures/s3/run-rustfs-file-store.sh
 
 test-token-rate-limit-sentinel-integration:
 	@test -n "$(SENTINEL_IMAGE)" || { echo "SENTINEL_IMAGE must be an immutable @sha256 image reference" >&2; exit 2; }
@@ -414,6 +430,10 @@ lint-clippy: setup-lint-toolchains
 	$(LINT_CARGO) clippy --workspace --all-targets \
 		--features $(STORE_ALL_WORKSPACE_FEATURES),xtask/openai-all,praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/basic-auth-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-ai-proxy/token-rate-limit-filter,praxis-ai-proxy/token-quota-filter,praxis-ai-proxy/token-ceiling-filter,praxis-ai-proxy/inflight-tracker-filter,praxis-ai-proxy/vertex-anthropic-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/basic-auth-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter,praxis-tests-integration/token-rate-limit-filter,praxis-tests-integration/token-quota-filter,praxis-tests-integration/token-ceiling-filter,praxis-tests-integration/inflight-tracker-filter,praxis-tests-integration/vertex-anthropic-filter \
 		-- -D warnings
+	$(LINT_CARGO) clippy -p praxis-ai-apis --all-targets --no-default-features \
+		--features openai-files-s3 -- -D warnings
+	$(LINT_CARGO) clippy -p praxis-ai-apis --test s3_file_store --no-default-features \
+		--features openai-files-s3,object_store/aws -- -D warnings
 	$(MAKE) lint-lean
 	$(MAKE) check-dep-budget
 	$(LINT_FMT_CARGO) fmt --all -- --check
@@ -1022,7 +1042,7 @@ help:
 	@echo "  test-store-features-test        run store API tests and TLS graph checks"
 	@echo "  test-responses-features  independent experimental gates and Responses-only SDK smoke tests"
 	@echo "  test-schema          schema validation tests"
-	@echo "  test-integration          full integration suite (core + experimental)"
+	@echo "  test-integration          full integration suite (core + experimental + RustFS S3)"
 	@echo "  test-integration-core     store-all integration suite"
 	@echo "  test-integration-experimental experimental-filter integration suite"
 	@echo "  test-inference-fixtures   inference fixtures, replay, and xtask tests"
@@ -1033,6 +1053,9 @@ help:
 	@echo "  bench-model-to-provider  optimized mapped and fallback request-body timings"
 	@echo "  test-postgres-unit       postgres store unit tests (needs DATABASE_URL)"
 	@echo "  test-postgres-integration postgres store integration tests (needs container engine)"
+	@echo "  test-s3-file-store       S3 unit tests and live RustFS FileStore E2E (needs Docker/Podman and AWS CLI)"
+	@echo "  test-s3-file-store-unit  S3 adapter unit tests with production aws-base feature"
+	@echo "  test-s3-file-store-e2e   live RustFS FileStore E2E (needs Docker/Podman and AWS CLI; port 9000)"
 	@echo "  test-token-rate-limit-valkey-unit        token_rate_limit Valkey unit tests (needs TOKEN_RATE_LIMIT_VALKEY_URL)"
 	@echo "  test-token-rate-limit-valkey-integration token_rate_limit Valkey integration test (needs TOKEN_RATE_LIMIT_VALKEY_URL)"
 	@echo "  test-token-rate-limit-sentinel-integration Sentinel fixture smoke (needs SENTINEL_IMAGE; failover with SENTINEL_FAILOVER_BEFORE_COMMAND=1)"
