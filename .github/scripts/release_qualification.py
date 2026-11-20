@@ -26,7 +26,7 @@ WORKFLOWS = (
     ("vllm-integration.yaml", "vLLM integration", "Simulator, live CPU, and optional GPU/client jobs"),
     ("hosted-passthrough-nightly.yaml", "Hosted passthrough", "Official OpenAI Chat Completions, Embeddings, and Responses, plus Bedrock Runtime Chat Completions SDK checks"),
     ("anthropic-vllm-vision.yaml", "Anthropic vision", "Anthropic SDK image requests on GPU"),
-    ("hosted-translation-nightly.yaml", "Hosted translation", "Live Anthropic Messages to OpenAI Chat Completions"),
+    ("hosted-translation-nightly.yaml", "Hosted translation", "Live Anthropic Messages and OpenAI Responses to official OpenAI Chat Completions"),
     ("openai-conformance.yaml", "OpenAI conformance", "Pinned schema and conformance checks"),
     ("openresponses-conformance.yaml", "OpenResponses conformance", "Responses translation against CPU vLLM"),
     ("container.yaml", "Container", "Container build and runtime smoke tests"),
