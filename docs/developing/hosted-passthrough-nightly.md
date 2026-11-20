@@ -4,7 +4,11 @@
 
 [Hosted Passthrough Nightly](../../.github/workflows/hosted-passthrough-nightly.yaml) runs on
 `ubuntu-24.04` at cron `43 5 * * *` (UTC) and supports manual dispatch.
-It builds Praxis from the workflow checkout and uses the
+Each job builds Praxis from the workflow checkout.
+
+## Official OpenAI
+
+The OpenAI job uses the
 `OPENAI_API_KEY` Actions secret to call official OpenAI. A missing
 secret fails the credential check before the build. Fork schedules skip
 the job. Manual runs require the secret in the repository running the job.
@@ -31,5 +35,17 @@ qualification records this lane when it finds a run for the exact release
 commit. A release with no matching run shows `not_run`. Update the pinned
 model snapshot in the SDK suite when OpenAI retires it.
 
-The tests forward the caller's provider key. Gateway authorization,
-tenant isolation, credential injection, and retries are outside this suite.
+The OpenAI tests forward the caller's provider key. Gateway authorization,
+tenant isolation, credential injection, and retries are outside the OpenAI suite.
+
+## Bedrock Runtime
+
+On upstream main, a separate job assumes the CI role using
+`AWS_BEDROCK_ROLE_ARN` and sends one billable completion through the
+[loopback gateway](../../tests/integration/fixtures/bedrock/runtime-chat-live.yaml) for `openai.gpt-oss-120b-1:0` in
+`us-east-1`. Praxis rewrites the client path and signs the upstream request
+using temporary AWS credentials. The check requires HTTP 200 and an assistant
+completion envelope. The release qualification report lists the job outcome
+under Hosted passthrough. Streaming, tool calls, tenant isolation, and retries
+are outside this check. The separate [direct connectivity probe](../../.github/workflows/bedrock-runtime-smoke.yaml)
+exercises AWS credentials and inference independently of the gateway.
