@@ -91,3 +91,59 @@ jobs:
             ${{ runner.temp }}/hosted-openai-junit.xml
             ${{ runner.temp }}/hosted-openai-praxis.log
           if-no-files-found: ignore
+
+  bedrock-runtime:
+    name: Bedrock Runtime Chat Completions passthrough
+    if: github.repository == 'praxis-proxy/ai' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
+
+      - name: Build Praxis
+        run: cargo build --locked -p praxis-ai-proxy
+
+      - name: Assume Bedrock role
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: bedrock-gateway-${{ github.run_id }}
+          role-duration-seconds: 900
+
+      - name: Verify signed gateway completion
+        env:
+          BEDROCK_MODEL: openai.gpt-oss-120b-1:0
+          GATEWAY_CONFIG: tests/integration/fixtures/bedrock/runtime-chat-live.yaml
+        run: |
+          target/debug/praxis-ai -c "$GATEWAY_CONFIG" >"$RUNNER_TEMP/bedrock-gateway.log" 2>&1 &
+          gateway_pid=$!
+          trap 'kill "$gateway_pid" 2>/dev/null || true; wait "$gateway_pid" 2>/dev/null || true' EXIT
+          for _ in {1..30}; do
+            kill -0 "$gateway_pid" || exit 1
+            if curl --silent --output /dev/null --max-time 1 http://127.0.0.1:8080/; then
+              break
+            fi
+            sleep 1
+          done
+          request=$(jq -nc --arg model "$BEDROCK_MODEL" '{
+            model: $model, messages: [{role: "user", content: "Reply with OK."}], max_completion_tokens: 128
+          }')
+          response=$(mktemp)
+          status=$(curl --silent --show-error --max-time 60 --output "$response" --write-out '%{http_code}' \
+            --json "$request" http://127.0.0.1:8080/v1/chat/completions)
+          echo "Gateway returned HTTP $status for $BEDROCK_MODEL."
+          test "$status" = 200
+          jq -e '.object == "chat.completion" and .choices[0].message.role == "assistant"' "$response" >/dev/null
+          echo "Passed signed gateway completion for $BEDROCK_MODEL in us-east-1 at $GITHUB_SHA ($GATEWAY_CONFIG)." >> "$GITHUB_STEP_SUMMARY"
