@@ -892,6 +892,44 @@ class TestRequestFieldHandling:
             'Document: "Nested Doc"\nContent:\nNested document fact.'
         )
 
+    def test_tool_result_document_string_content_is_flattened(self, anthropic_client):
+        # The ContentBlockSource schema allows `source.content` to be a
+        # string as well as an array of text blocks; the string form is
+        # valid client output and must translate, not fail closed.
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{
+                            "type": "document",
+                            "title": "Contract",
+                            "source": {"type": "content", "content": "The full contract text."},
+                        }],
+                    }],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tool_message = upstream["messages"][2]
+        assert tool_message["role"] == "tool"
+        assert tool_message["content"] == (
+            'Document: "Contract"\nContent:\nThe full contract text.'
+        )
+
     def test_tool_result_empty_document_part_is_rejected(self, anthropic_client):
         # A document part whose source carries nothing extractable flattens
         # to nothing; it must fail closed instead of silently disappearing

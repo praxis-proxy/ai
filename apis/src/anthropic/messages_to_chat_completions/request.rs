@@ -1130,10 +1130,14 @@ fn tool_result_part_is_supported(part: &Value) -> bool {
 /// is likewise rejected rather than silently discarded, as is a `content`
 /// holding non-text blocks or blocks carrying fields the flattener drops:
 /// the pinned spec allows only `text` items there, and `extract_text_blocks`
-/// keeps just each block's `text`.
+/// keeps just each block's `text`. Present `title` or `source` metadata must
+/// be a string, so a malformed value the flattener would silently drop
+/// fails closed instead.
 fn search_result_part_is_supported(part: &Value) -> bool {
     null_or_absent(part, "citations")
         && null_or_absent(part, "cache_control")
+        && field_is_absent_or_string(part, "title")
+        && field_is_absent_or_string(part, "source")
         && has_only_keys(
             part,
             &["type", "title", "source", "content", "citations", "cache_control"],
@@ -1162,9 +1166,13 @@ fn search_result_part_is_supported(part: &Value) -> bool {
 /// flattener would drop. A present `source` must itself be translatable:
 /// the flattener drops an unsupported source even when a `title` or
 /// `context` survives, so the whole part fails closed rather than lose it.
+/// Present `title` or `context` metadata must be a string, so a malformed
+/// value the flattener would silently drop fails closed instead.
 fn document_part_is_supported(part: &Value) -> bool {
     null_or_absent(part, "citations")
         && null_or_absent(part, "cache_control")
+        && field_is_absent_or_string(part, "title")
+        && field_is_absent_or_string(part, "context")
         && has_only_keys(
             part,
             &["type", "title", "context", "source", "citations", "cache_control"],
@@ -1183,9 +1191,10 @@ fn document_part_is_supported(part: &Value) -> bool {
 /// field. A `base64` source is rejected because the flattener keeps only its
 /// media type and drops the encoded payload, which would silently empty the
 /// document; `url` and `file` sources keep their reference string and stay
-/// accepted. A `content` source must hold only strictly translatable text
-/// blocks, so nested `citations`, `cache_control`, or unknown fields that the
-/// flattener would drop fail closed instead.
+/// accepted. A `content` source — whose schema (`ContentBlockSource`) allows
+/// a string or an array of text blocks — must hold only strictly
+/// translatable content, so nested `citations`, `cache_control`, or unknown
+/// fields that the flattener would drop fail closed instead.
 fn document_source_is_supported(source: &Value) -> bool {
     let Some(fields) = source.as_object() else {
         return false;
@@ -1201,22 +1210,20 @@ fn document_source_is_supported(source: &Value) -> bool {
         Some("file") => has_only_keys(source, &["type", "file_id"]),
         _ => return false,
     };
-    // A present, non-null `content` must be an array: any other shape
-    // carries text the flattener would drop.
-    if variant == Some("content")
-        && !source
-            .get("content")
-            .is_none_or(|content| content.is_null() || content.is_array())
-    {
-        return false;
-    }
     keys_supported
         && match variant {
             Some("text") => non_empty_string_field(source, "data"),
-            Some("content") => source.get("content").and_then(Value::as_array).is_some_and(|blocks| {
-                blocks.iter().all(|block| text_block_rejection(block).is_none())
-                    && blocks.iter().any(text_block_has_text)
-            }),
+            // A `content` source may be the schema's string form or an
+            // array of text blocks; both flatten without loss, and any
+            // other shape carries text the flattener would drop.
+            Some("content") => match source.get("content") {
+                Some(Value::String(_)) => non_empty_string_field(source, "content"),
+                Some(Value::Array(blocks)) => {
+                    blocks.iter().all(|block| text_block_rejection(block).is_none())
+                        && blocks.iter().any(text_block_has_text)
+                },
+                _ => false,
+            },
             Some("url") => non_empty_string_field(source, "url"),
             Some("file") => non_empty_string_field(source, "file_id"),
             _ => false,
@@ -1238,6 +1245,13 @@ fn non_empty_string_field(value: &Value, key: &str) -> bool {
         .get(key)
         .and_then(Value::as_str)
         .is_some_and(|field| !field.is_empty())
+}
+
+/// A present, non-null metadata field must be a string: the flattener keeps
+/// string metadata only, so any other shape would be silently discarded
+/// while the rest of the part still translates.
+fn field_is_absent_or_string(value: &Value, key: &str) -> bool {
+    value.get(key).is_none_or(|field| field.is_null() || field.is_string())
 }
 
 /// A direct caller is the only caller form this translator emits and consumes.
@@ -1843,7 +1857,12 @@ fn flatten_document_source(source: Option<Value>) -> Option<String> {
             .filter(|data| !data.is_empty())
             .map(|data| format!("Content:\n{data}")),
         "content" => {
-            let lines = extract_text_blocks(source.remove("content"));
+            // The schema allows the string form as well as an array of
+            // text blocks; both carry text the flattener keeps.
+            let lines = match source.remove("content") {
+                Some(Value::String(text)) => vec![text],
+                other => extract_text_blocks(other),
+            };
             non_empty_lines(&lines).map(|content| format!("Content:\n{content}"))
         },
         "url" => take_string(&mut source, "url")
@@ -2933,12 +2952,76 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_document_source_non_array_content_is_rejected() {
-        // A string `source.content` carries text the flattener would drop
-        // while the title survives, mirroring the search_result rule.
+    fn tool_result_document_source_string_content_is_flattened() {
+        // The ContentBlockSource schema allows `content` to be a string or
+        // an array of text blocks; the string form is valid client output,
+        // so it flattens instead of failing closed.
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","title":"Contract","source":{"type":"content","content":"The full contract text."}}]}]}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(
+            parsed["messages"][0]["content"], "Document: \"Contract\"\nContent:\nThe full contract text.",
+            "string-form source.content flattens into the tool message"
+        );
+    }
+
+    #[test]
+    fn tool_result_document_source_non_text_content_is_rejected() {
+        // Neither the string nor the array form: a numeric `content` carries
+        // text the flattener would drop, so it fails closed.
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"document","source":{"type":"content","content":42}}]}]}]}"#;
         let error = transform_bytes(body).unwrap_err();
         assert!(error.contains("document"), "{error}");
+    }
+
+    #[test]
+    fn tool_result_search_result_malformed_metadata_is_rejected() {
+        // A non-string `title` (or `source`) would be silently dropped by
+        // the flattener while the rest of the part translates, so present
+        // metadata must be a string.
+        for field in ["title", "source"] {
+            let mut part = json!({
+                "type": "search_result",
+                "content": [{"type": "text", "text": "Timeouts default to 30 seconds."}]
+            });
+            part.as_object_mut().unwrap().insert(field.to_owned(), json!(42));
+            let body = json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": [part]
+                }]}]
+            });
+            let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+            assert!(error.contains("search_result"), "{error}");
+        }
+    }
+
+    #[test]
+    fn tool_result_document_malformed_metadata_is_rejected() {
+        // A non-string `title` or `context` would be silently dropped by
+        // the flattener while the source still translates, so present
+        // metadata must be a string.
+        for field in ["title", "context"] {
+            let mut part = json!({
+                "type": "document",
+                "source": {"type": "text", "data": "Contract text."}
+            });
+            part.as_object_mut().unwrap().insert(field.to_owned(), json!(42));
+            let body = json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_1",
+                    "content": [part]
+                }]}]
+            });
+            let error = transform_bytes(body.to_string().as_bytes()).unwrap_err();
+            assert!(error.contains("document"), "{error}");
+        }
     }
 
     #[test]
