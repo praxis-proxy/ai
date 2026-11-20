@@ -40,6 +40,12 @@ const VECTOR_STORES_MARKER: &str = "{\"selected\":\"vector-stores-backend\"}";
 /// Body returned by the Anthropic Messages backend, proving it was selected.
 const ANTHROPIC_MARKER: &str = "{\"selected\":\"anthropic-backend\"}";
 
+/// Body returned by the Gemini backend, proving it was selected.
+const GEMINI_MARKER: &str = "{\"selected\":\"gemini-backend\"}";
+
+/// Body returned by the Bedrock backend, proving it was selected.
+const BEDROCK_MARKER: &str = "{\"selected\":\"bedrock-backend\"}";
+
 /// Started example: a header-echoing default backend and marker-returning
 /// family backends.
 struct Harness {
@@ -55,6 +61,10 @@ struct Harness {
     _vector_stores: praxis_test_utils::CapturingBackendGuard,
     /// Anthropic Messages backend, which returns [`ANTHROPIC_MARKER`].
     _anthropic: praxis_test_utils::CapturingBackendGuard,
+    /// Gemini backend, which returns [`GEMINI_MARKER`].
+    _gemini: praxis_test_utils::CapturingBackendGuard,
+    /// Bedrock backend, which returns [`BEDROCK_MARKER`].
+    _bedrock: praxis_test_utils::CapturingBackendGuard,
     /// The running proxy.
     proxy: praxis_test_utils::ProxyGuard,
 }
@@ -67,6 +77,8 @@ fn start() -> Harness {
     let files = start_capturing_backend(FILES_MARKER);
     let vector_stores = start_capturing_backend(VECTOR_STORES_MARKER);
     let anthropic = start_capturing_backend(ANTHROPIC_MARKER);
+    let gemini = start_capturing_backend(GEMINI_MARKER);
+    let bedrock = start_capturing_backend(BEDROCK_MARKER);
     let proxy_port = free_port();
     let config = load_example_config(
         "openai/operation-classifier.yaml",
@@ -78,6 +90,8 @@ fn start() -> Harness {
             ("127.0.0.1:3004", files.port()),
             ("127.0.0.1:3005", vector_stores.port()),
             ("127.0.0.1:3006", anthropic.port()),
+            ("127.0.0.1:3007", gemini.port()),
+            ("127.0.0.1:3008", bedrock.port()),
         ]),
     );
     let proxy = start_proxy(&config);
@@ -88,6 +102,8 @@ fn start() -> Harness {
         _files: files,
         _vector_stores: vector_stores,
         _anthropic: anthropic,
+        _gemini: gemini,
+        _bedrock: bedrock,
         proxy,
     }
 }
@@ -515,6 +531,64 @@ fn a_classified_anthropic_messages_operation_selects_the_anthropic_backend() {
         ANTHROPIC_MARKER,
         "anthropic_messages must branch to the Anthropic backend"
     );
+}
+
+/// A Gemini head selects the Gemini backend, with the action verb carried in
+/// the model segment after a colon.
+#[test]
+fn a_classified_gemini_operation_selects_the_gemini_backend() {
+    let h = start();
+
+    let raw = http_send(
+        h.proxy.addr(),
+        &json_post("/v1/models/gemini-2.0-flash:generateContent", r#"{"contents":[]}"#),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "generateContent should be forwarded");
+    assert_eq!(
+        parse_body(&raw),
+        GEMINI_MARKER,
+        "google_gemini must branch to the Gemini backend"
+    );
+}
+
+/// A Bedrock head selects the Bedrock backend, with the model in its own
+/// path segment.
+#[test]
+fn a_classified_bedrock_operation_selects_the_bedrock_backend() {
+    let h = start();
+
+    let raw = http_send(
+        h.proxy.addr(),
+        &json_post("/model/us.anthropic.claude-3-7-sonnet/converse", r#"{"messages":[]}"#),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "Converse should be forwarded");
+    assert_eq!(
+        parse_body(&raw),
+        BEDROCK_MARKER,
+        "amazon_bedrock must branch to the Bedrock backend"
+    );
+}
+
+/// A model path with no action verb classifies as nothing, so it falls
+/// through to the default backend rather than entering a family route a path
+/// prefix would have matched.
+#[test]
+fn verbless_model_paths_fall_through() {
+    let h = start();
+
+    for path in ["/v1/models/gemini-2.0-flash", "/model/us.anthropic.claude-3-7-sonnet"] {
+        let raw = http_send(h.proxy.addr(), &json_post(path, r#"{}"#));
+        assert_eq!(parse_status(&raw), 200, "POST {path} should be forwarded");
+        let body = parse_body(&raw);
+        assert_ne!(body, GEMINI_MARKER, "POST {path} must not reach the Gemini backend");
+        assert_ne!(body, BEDROCK_MARKER, "POST {path} must not reach the Bedrock backend");
+        assert!(
+            echoed(&raw).contains("content-type: application/json"),
+            "POST {path} must fall through to the header-echoing default backend"
+        );
+    }
 }
 
 /// The body cannot change which operation `POST /v1/messages` resolves to.

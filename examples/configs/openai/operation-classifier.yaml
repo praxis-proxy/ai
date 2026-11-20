@@ -22,7 +22,8 @@
 #
 # One filter serves every provider: each protocol declares its own
 # operation registry and the classifier aggregates them. This example
-# branches the OpenAI protocols and Anthropic Messages.
+# branches the OpenAI protocols, Anthropic Messages, Google Gemini, and
+# Bedrock.
 #
 # Consuming the classification:
 #   The classifier runs in the request-head phase, before any filter's
@@ -91,6 +92,15 @@
 #   curl -X POST http://localhost:8080/v1/messages \
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"claude-opus-4-8","max_tokens":16,"messages":[]}'
+#
+#   # classified google_gemini/generateContent -> gemini backend. The action
+#   # verb lives in the model segment after a colon.
+#   curl -X POST http://localhost:8080/v1/models/gemini-2.0-flash:generateContent \
+#     -H "Content-Type: application/json" -d '{"contents":[]}'
+#
+#   # classified amazon_bedrock/Converse -> bedrock backend
+#   curl -X POST http://localhost:8080/model/us.anthropic.claude-3-7-sonnet/converse \
+#     -H "Content-Type: application/json" -d '{"messages":[]}'
 #
 #   # spoofing attempt: the supplied header is replaced, not honored
 #   curl -X POST http://localhost:8080/v1/responses \
@@ -185,6 +195,32 @@ filter_chains:
                       - path_prefix: "/"
                         cluster: "anthropic-backend"
             rejoin: shared_load_balancer
+          - name: gemini
+            on_result:
+              filter: ai_operation
+              key: application_protocol
+              result: google_gemini
+            chains:
+              - name: gemini-chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: "gemini-backend"
+            rejoin: shared_load_balancer
+          - name: bedrock
+            on_result:
+              filter: ai_operation
+              key: application_protocol
+              result: amazon_bedrock
+            chains:
+              - name: bedrock-chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: "bedrock-backend"
+            rejoin: shared_load_balancer
 
       # Default: anything that did not branch, classified or not.
       - filter: router
@@ -213,6 +249,12 @@ filter_chains:
           - name: "anthropic-backend"
             endpoints:
               - "127.0.0.1:3006"
+          - name: "gemini-backend"
+            endpoints:
+              - "127.0.0.1:3007"
+          - name: "bedrock-backend"
+            endpoints:
+              - "127.0.0.1:3008"
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends
