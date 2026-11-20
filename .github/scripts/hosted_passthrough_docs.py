@@ -89,6 +89,11 @@ under Hosted passthrough. The [OpenAI SDK suite](../../tests/integration/sdk/ope
 checks streaming text, finish reason, usage, a tool result followed by a final
 assistant response, and an upstream validation error. The
 `hosted-bedrock-passthrough-results` artifact contains JUnit results.
+The job also runs one non-streaming Responses request with `store: false`
+through the [Bedrock translation fixture](../../tests/integration/fixtures/bedrock/responses-to-runtime-live.yaml).
+Praxis translates it to Chat Completions and signs the final request body
+for Bedrock Runtime.
+The check requires a completed Responses resource with output text.
 Tenant isolation and retries remain unqualified by this job. The separate [direct connectivity probe](../../.github/workflows/bedrock-runtime-smoke.yaml)
 exercises AWS credentials and inference independently of the gateway.
 """

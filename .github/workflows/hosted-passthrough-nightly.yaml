@@ -112,12 +112,13 @@ jobs:
           cache-target: "false"
 
       - name: Build Praxis
-        run: cargo build --locked -p praxis-ai-proxy
+        run: cargo build --locked -p praxis-ai-proxy --features openai-responses
 
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Assume Bedrock role
+        id: bedrock-role
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
           role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
@@ -155,6 +156,34 @@ jobs:
           env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
             uv run --script tests/integration/sdk/openai/test_bedrock_runtime_live.py \
               --junitxml="$RUNNER_TEMP/hosted-bedrock-junit.xml" --tb=line
+
+      - name: Smoke Responses translation to Bedrock Runtime
+        if: ${{ !cancelled() && steps.bedrock-role.outcome == 'success' }}
+        env:
+          BEDROCK_MODEL: openai.gpt-oss-120b-1:0
+        run: |
+          target/debug/praxis-ai -c tests/integration/fixtures/bedrock/responses-to-runtime-live.yaml \
+            >"$RUNNER_TEMP/bedrock-responses-gateway.log" 2>&1 &
+          gateway_pid=$!
+          response=$(mktemp)
+          trap 'kill "$gateway_pid" 2>/dev/null || true; wait "$gateway_pid" 2>/dev/null || true; rm "$response"' EXIT
+          for _ in {1..30}; do
+            kill -0 "$gateway_pid" || exit 1
+            if curl --silent --output /dev/null --max-time 1 http://127.0.0.1:8080/; then
+              break
+            fi
+            sleep 1
+          done
+          request=$(jq -nc --arg model "$BEDROCK_MODEL" '{
+            model: $model, input: "Reply with OK.", store: false, max_output_tokens: 512
+          }')
+          status=$(curl --silent --show-error --max-time 90 --output "$response" --write-out '%{http_code}' \
+            --json "$request" http://127.0.0.1:8080/v1/responses)
+          echo "Bedrock Responses translation returned HTTP $status."
+          test "$status" = 200
+          jq -e '.object == "response" and .status == "completed" and
+            any(.output[] | select(.type == "message") | .content[];
+                .type == "output_text" and (.text | length > 0))' "$response" >/dev/null
 
       - name: Upload Bedrock test results
         if: ${{ !cancelled() }}
