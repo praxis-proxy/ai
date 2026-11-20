@@ -6,7 +6,8 @@
 //! `sqlx` errors are classified into [`PgFailure`] classes before they are
 //! mapped onto [`CatalogError`](praxis_ai_store::CatalogError), so the retry
 //! wrapper can repeat only the failures a repeat can fix. The classified error
-//! itself travels inside the [`CatalogError::Backend`] variant as a
+//! itself travels inside the
+//! [`CatalogError::Backend`](praxis_ai_store::CatalogError::Backend) variant as a
 //! [`PgBackendError`], keeping the connection URL and its credentials out of
 //! the message.
 

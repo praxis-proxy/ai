@@ -3,8 +3,8 @@
 
 //! [`FileCatalog`] implementation.
 //!
-//! The SQL lives in [`request`](super::request) and
-//! [`reaper`](super::reaper); this module wires each operation to the trait
+//! The SQL lives in [`request`] and
+//! [`reaper`]; this module wires each operation to the trait
 //! and applies the bounded retry only where a repeat is a no-op by state check:
 //! `create_pending`, `complete_upload`, `fail_upload`, `mark_for_deletion`,
 //! and `complete_cleanup`. `claim_cleanup` and the batch

@@ -4,7 +4,7 @@
 //! Reaper-facing operations of the [`FileCatalog`](praxis_ai_store::FileCatalog).
 //!
 //! These work across tenants and never change usage except the purge in
-//! [`complete_cleanup_once`](PostgresFileCatalog::complete_cleanup_once). Each
+//! [`complete_cleanup_once`]. Each
 //! batch is its own transaction. Claims are leases (`lease_until`): they
 //! prevent duplicate byte-store deletes and double as the retry delay, because
 //! a worker whose delete fails does nothing and the row is claimable again when
