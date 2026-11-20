@@ -34,7 +34,7 @@ pub(crate) enum PgFailure {
 
 impl PgFailure {
     /// Classify a `PostgreSQL` SQLSTATE code.
-    fn from_code(code: &str) -> Self {
+    pub(super) fn from_code(code: &str) -> Self {
         match code {
             // serialization failure
             "40001" |
@@ -126,13 +126,13 @@ impl fmt::Display for PgFailure {
 // -----------------------------------------------------------------------------
 
 /// Maximum attempts per retried operation, including the first.
-const MAX_ATTEMPTS: u32 = 3;
+pub(super) const MAX_ATTEMPTS: u32 = 3;
 
 /// Backoff before the first retry.
-const BASE_BACKOFF: Duration = Duration::from_millis(50);
+pub(super) const BASE_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Upper bound of the backoff, before jitter.
-const MAX_BACKOFF: Duration = Duration::from_millis(500);
+pub(super) const MAX_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Run `op`, retrying while it fails retryably.
 ///
@@ -169,7 +169,7 @@ where
 /// Jitter is derived from the wall clock rather than a random source, keeping
 /// the crate free of a `rand` dependency; uniformity is not load-bearing here,
 /// only decorrelation between workers.
-fn backoff_delay(failed_attempts: u32) -> Duration {
+pub(super) fn backoff_delay(failed_attempts: u32) -> Duration {
     let shift = (failed_attempts - 1).min(4);
     let exponential = BASE_BACKOFF.saturating_mul(1 << shift);
     let capped = exponential.min(MAX_BACKOFF);
@@ -185,121 +185,4 @@ fn backoff_delay(failed_attempts: u32) -> Duration {
         u64::try_from(nanos % (max_jitter_millis + 1)).unwrap_or_default()
     };
     capped + Duration::from_millis(jitter_millis)
-}
-
-// -----------------------------------------------------------------------------
-// Tests
-// -----------------------------------------------------------------------------
-
-#[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pool_errors_are_unavailable() {
-        assert_eq!(classify(&sqlx::Error::PoolTimedOut), PgFailure::Unavailable);
-        assert_eq!(classify(&sqlx::Error::PoolClosed), PgFailure::Unavailable);
-    }
-
-    #[test]
-    fn io_errors_are_retryable() {
-        let io = std::io::Error::other("connection reset by peer");
-        assert_eq!(classify(&sqlx::Error::Io(io)), PgFailure::Retryable);
-    }
-
-    #[test]
-    fn sqlstate_codes_classify() {
-        assert_eq!(PgFailure::from_code("40001"), PgFailure::Retryable);
-        assert_eq!(PgFailure::from_code("40P01"), PgFailure::Retryable);
-        assert_eq!(PgFailure::from_code("55P03"), PgFailure::Retryable);
-        assert_eq!(PgFailure::from_code("57P01"), PgFailure::Retryable);
-        // Unique violation, syntax error, undefined table: not retryable.
-        assert_eq!(PgFailure::from_code("23505"), PgFailure::NonRetryable);
-        assert_eq!(PgFailure::from_code("42601"), PgFailure::NonRetryable);
-        assert_eq!(PgFailure::from_code("42P01"), PgFailure::NonRetryable);
-    }
-
-    #[test]
-    fn non_database_errors_are_non_retryable() {
-        assert_eq!(classify(&sqlx::Error::RowNotFound), PgFailure::NonRetryable);
-        assert_eq!(
-            classify(&sqlx::Error::ColumnNotFound("bytes".to_owned())),
-            PgFailure::NonRetryable
-        );
-    }
-
-    #[test]
-    fn backend_error_displays_class_and_message() {
-        let err = PgBackendError::new(PgFailure::Unavailable, "pool timed out".to_owned());
-        assert_eq!(err.to_string(), "postgres unavailable: pool timed out");
-    }
-
-    #[tokio::test]
-    async fn retry_succeeds_after_transient_failures() {
-        let attempts = std::sync::atomic::AtomicU32::new(0);
-        let result = with_retry(|| {
-            let count = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async move {
-                if count < 2 {
-                    Err(PgBackendError::retryable("deadlock"))
-                } else {
-                    Ok(count)
-                }
-            }
-        })
-        .await;
-        assert_eq!(result.unwrap(), 2);
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
-    }
-
-    #[tokio::test]
-    async fn retry_gives_up_after_max_attempts() {
-        let attempts = std::sync::atomic::AtomicU32::new(0);
-        let err = with_retry(|| {
-            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async { Err::<(), _>(PgBackendError::retryable("serialization failure")) }
-        })
-        .await
-        .unwrap_err();
-        assert_eq!(err.class, PgFailure::Retryable);
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), MAX_ATTEMPTS);
-    }
-
-    #[tokio::test]
-    async fn non_retryable_fails_without_retry() {
-        let attempts = std::sync::atomic::AtomicU32::new(0);
-        let err = with_retry(|| {
-            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async { Err::<(), _>(PgBackendError::non_retryable("unique violation")) }
-        })
-        .await
-        .unwrap_err();
-        assert_eq!(err.class, PgFailure::NonRetryable);
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn unavailable_fails_without_retry() {
-        let attempts = std::sync::atomic::AtomicU32::new(0);
-        let err = with_retry(|| {
-            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async { Err::<(), _>(PgBackendError::unavailable("pool closed")) }
-        })
-        .await
-        .unwrap_err();
-        assert_eq!(err.class, PgFailure::Unavailable);
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn backoff_stays_capped() {
-        for attempts in 1..10 {
-            let delay = backoff_delay(attempts);
-            let max = MAX_BACKOFF + MAX_BACKOFF / 2;
-            assert!(delay <= max, "attempt {attempts}: {delay:?} exceeds {max:?}");
-            assert!(delay >= BASE_BACKOFF, "attempt {attempts}: {delay:?} below base");
-        }
-    }
 }
