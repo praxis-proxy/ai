@@ -35,6 +35,10 @@ use serde::Deserialize;
 /// `POST /v1/responses` and `POST /v1/chat/completions` request bodies and
 /// leaves every other path untouched. The filter name keeps its
 /// `openai_responses_` prefix for config compatibility.
+///
+/// A body that repeats its top-level `model` is refused with HTTP 400 under
+/// every `on_invalid` setting, before any alias is resolved or fact is
+/// promoted.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ModelRewriteConfig {

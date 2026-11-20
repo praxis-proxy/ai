@@ -162,6 +162,11 @@ struct Summarization {
 /// `state.input == state.messages` - there is no separable "current turn" to preserve after summarization.
 /// Requests without rehydrated history are released without compaction.
 ///
+/// Explicit compact owns its body parse, including the budgeted handoff where
+/// `openai_responses_request` releases before its duplicate-model check. A
+/// compact body that repeats its top-level `model` is refused with HTTP 400
+/// before any stored history is loaded or summarization call is made.
+///
 /// On listeners with `openai_agentic_loop.max_retained_bytes`, explicit compact
 /// uses a bounded Store read and caps the summarization response before it is
 /// buffered. Source expansion and persistence are charged to one request-wide
