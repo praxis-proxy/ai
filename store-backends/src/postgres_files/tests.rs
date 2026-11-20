@@ -552,9 +552,32 @@ mod operations {
         // Same id from another tenant.
         let foreign = new_file("f1", &owner("t2", "alice"), 100);
         assert!(matches!(c.create_pending(&foreign).await, Err(CatalogError::Conflict)));
+        // A retry asking for less than the stored reservation is a different request.
+        let smaller = new_file("f1", &a, 10);
+        assert!(matches!(c.create_pending(&smaller).await, Err(CatalogError::Conflict)));
         // Reservation above i64::MAX is rejected, not wrapped.
         let huge = new_file("f3", &a, u64::MAX);
         assert!(matches!(c.create_pending(&huge).await, Err(CatalogError::Backend(_))));
+        c.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    async fn create_pending_retry_requires_a_pending_row() {
+        let c = catalog().await;
+        let a = owner("t1", "alice");
+        let file = new_file("f1", &a, 100);
+        c.create_pending(&file).await.unwrap();
+        c.complete_upload(&a, "f1", completion(40, "assistants")).await.unwrap();
+        // A ready row's size is not a reservation.
+        assert!(matches!(c.create_pending(&file).await, Err(CatalogError::Conflict)));
+
+        c.create_pending(&new_file("f2", &a, 100)).await.unwrap();
+        exec(&c, "UPDATE {f} SET state = 'failed' WHERE id = 'f2'").await;
+        assert!(matches!(
+            c.create_pending(&new_file("f2", &a, 100)).await,
+            Err(CatalogError::Conflict)
+        ));
         c.close().await;
     }
 

@@ -50,13 +50,14 @@ pub trait FileCatalog: Send + Sync {
     /// and retains in the upload session. Purpose and expiration arrive later.
     ///
     /// An identical retry returns the stored reservation without reserving
-    /// again, even if the remaining quota has changed since.
+    /// again, even if the remaining quota has changed since. A retry matches
+    /// only a pending file whose reservation does not exceed `max_bytes`.
     ///
     /// # Errors
     ///
     /// Returns [`CatalogError::QuotaExceeded`] without inserting when `R` is
     /// zero, [`CatalogError::Conflict`] for a duplicate ID or storage key with
-    /// different fields, or [`CatalogError::Backend`] on persistence failure.
+    /// different fields, a non-pending file, or a reservation above `max_bytes`, or [`CatalogError::Backend`] on persistence failure.
     async fn create_pending(&self, file: &NewFile) -> Result<u64, CatalogError>;
 
     /// Transition a pending file to ready and settle its charge from the
