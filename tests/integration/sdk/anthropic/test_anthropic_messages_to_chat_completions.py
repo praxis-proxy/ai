@@ -960,6 +960,137 @@ class TestRequestFieldHandling:
         assert "document" in str(excinfo.value), "error message must name the document part"
         assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
 
+    def test_tool_result_search_result_non_array_content_is_rejected(self, anthropic_client):
+        # A string `content` carries text the flattener would silently drop
+        # while keeping the title, so a present, non-null `content` must be
+        # an array of text blocks.
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[
+                    {"role": "user", "content": "Call lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{
+                                "type": "search_result",
+                                "title": "Timeout KB",
+                                "content": "Timeouts default to 30 seconds.",
+                            }],
+                        }],
+                    },
+                ],
+            )
+
+        assert "search_result" in str(excinfo.value), "error message must name the search_result part"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
+
+    def test_tool_result_document_source_field_is_rejected(self, anthropic_client):
+        # A source-level field outside the variant's schema — a cache_control
+        # marker, for example — is dropped by the flattener without the
+        # prompt-caching allowlist ever seeing it, so it fails closed even
+        # when the source otherwise carries valid text.
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[
+                    {"role": "user", "content": "Call lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{
+                                "type": "document",
+                                "title": "Contract",
+                                "source": {
+                                    "type": "content",
+                                    "content": [{"type": "text", "text": "Valid fact."}],
+                                    "cache_control": {"type": "ephemeral"},
+                                },
+                            }],
+                        }],
+                    },
+                ],
+            )
+
+        assert "document" in str(excinfo.value), "error message must name the document part"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
+
+    def test_parallel_tool_result_images_across_consecutive_user_messages(self, anthropic_client):
+        # Anthropic combines consecutive user messages into one turn, so a
+        # client may return parallel tool results in two separate user
+        # messages. The image promoted out of the first result may only
+        # appear as a user message after the last tool reply of the group.
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}},
+                        {"type": "tool_use", "id": "toolu_2", "name": "lookup", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [
+                                {"type": "text", "text": "chart"},
+                                {
+                                    "type": "image",
+                                    "source": {"type": "url", "url": "https://example.com/chart.png"},
+                                },
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_2",
+                            "content": "ready",
+                        },
+                    ],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        roles = [message["role"] for message in upstream["messages"]]
+        assert roles == ["user", "assistant", "tool", "tool", "user"], upstream["messages"]
+        assert upstream["messages"][2]["tool_call_id"] == "toolu_1"
+        assert upstream["messages"][3]["tool_call_id"] == "toolu_2"
+        image_message = upstream["messages"][4]
+        assert image_message["role"] == "user"
+        assert image_message["content"][0]["image_url"]["url"] == "https://example.com/chart.png"
+
     def test_empty_string_tool_arguments_become_empty_input(self, anthropic_client):
         RecordingBackend.bodies.clear()
         RecordingBackend.send_tool_reply_once = True
