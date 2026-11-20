@@ -634,13 +634,10 @@ fn prepend_leading_system(retained: &mut Vec<Value>, moved: Vec<SystemParts>) ->
 /// Consume a message into its text-only system content parts when it is a
 /// movable system message, or hand the untouched message back.
 ///
-/// Movable means: a `system`-role message that follows a non-system turn,
-/// carries no field beyond `role`/`content`, and whose content is a string
-/// or an array of text blocks the strict validator accepts (apart from a
-/// `cache_control` marker, which is carried). Anything else — including a
-/// field or block shape the strict validator would reject — is returned
-/// unchanged so the strict validator produces its own error instead of the
-/// fold silently dropping it.
+/// Movable means: a `system`-role message that follows a non-system turn and
+/// whose content is a string or an array of text blocks. Anything else —
+/// including a non-text content a strict backend would also reject — is
+/// returned unchanged so the strict validator produces its own error.
 fn take_movable_system_content(message: Value, seen_non_system: bool) -> Result<SystemParts, Value> {
     // The message field set is part of the gate: a message carrying anything
     // beyond `role` and `content` is never moved, so it still fails closed in
@@ -1135,7 +1132,7 @@ fn search_result_part_is_supported(part: &Value) -> bool {
         && part
             .get("content")
             .and_then(Value::as_array)
-            .is_none_or(|blocks| blocks.iter().all(text_block_is_supported))
+            .is_none_or(|blocks| blocks.iter().all(|block| text_block_rejection(block).is_none()))
         && (non_empty_string_field(part, "title")
             || non_empty_string_field(part, "source")
             || part
@@ -1181,10 +1178,9 @@ fn document_source_is_supported(source: &Value) -> bool {
     };
     match fields.get("type").and_then(Value::as_str) {
         Some("text") => non_empty_string_field(source, "data"),
-        Some("content") => fields
-            .get("content")
-            .and_then(Value::as_array)
-            .is_some_and(|blocks| blocks.iter().all(text_block_is_supported) && blocks.iter().any(text_block_has_text)),
+        Some("content") => fields.get("content").and_then(Value::as_array).is_some_and(|blocks| {
+            blocks.iter().all(|block| text_block_rejection(block).is_none()) && blocks.iter().any(text_block_has_text)
+        }),
         Some("url") => non_empty_string_field(source, "url"),
         Some("file") => non_empty_string_field(source, "file_id"),
         _ => false,
