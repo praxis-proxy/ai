@@ -47,8 +47,6 @@ pub struct PostgresFileCatalog {
     files: String,
     /// Per-tenant byte limit enforced at reservation time.
     tenant_limit_bytes: u64,
-    /// Delay before a released cleanup claim becomes claimable again.
-    retry_delay: Duration,
     /// Connection URL, held only to redact it from runtime query errors.
     redact_url: String,
 }
@@ -69,26 +67,19 @@ impl PostgresFileCatalog {
     /// certificate-authentication compliance profile.
     ///
     /// `tenant_limit_bytes` is the single per-tenant quota: one limit for
-    /// every tenant, no overrides and no file-count limit. `retry_delay` is the
-    /// fixed delay before a released (failed) cleanup claim can be claimed
-    /// again.
+    /// every tenant, no overrides and no file-count limit.
     ///
     /// # Errors
     ///
     /// Returns [`CatalogError::Backend`] if the connection fails (classified
     /// unavailable) or schema initialization fails (classified
     /// non-retryable), with the connection URL redacted.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "connection settings plus the quota limit and retry delay"
-    )]
     pub async fn new(
         database_url: &str,
         files_table: &str,
         tls: &PgTlsConfig<'_>,
         pool_config: Option<&PoolConfig>,
         tenant_limit_bytes: u64,
-        retry_delay: Duration,
     ) -> Result<Self, CatalogError> {
         let options = pg_connect_options(database_url, tls).map_err(|e| {
             CatalogError::Backend(Box::new(PgBackendError::new(PgFailure::NonRetryable, e.to_string())))
@@ -114,7 +105,6 @@ impl PostgresFileCatalog {
             pool,
             files: files_table.to_owned(),
             tenant_limit_bytes,
-            retry_delay,
             redact_url: database_url.to_owned(),
         })
     }

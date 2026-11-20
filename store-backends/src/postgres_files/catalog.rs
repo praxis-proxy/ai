@@ -7,7 +7,7 @@
 //! [`reaper`](super::reaper); this module wires each operation to the trait
 //! and applies the bounded retry only where a repeat is a no-op by state check:
 //! `create_pending`, `complete_upload`, `fail_upload`, `mark_for_deletion`,
-//! `complete_cleanup` and `release_cleanup`. `claim_cleanup` and the batch
+//! and `complete_cleanup`. `claim_cleanup` and the batch
 //! markers are not retried: a repeat after an ambiguous commit would duplicate
 //! work, and the reaper retries on its next sweep.
 
@@ -71,9 +71,5 @@ impl FileCatalog for PostgresFileCatalog {
 
     async fn complete_cleanup(&self, claim: &CleanupClaim) -> Result<bool, CatalogError> {
         backend(with_retry(|| reaper::complete_cleanup_once(self, claim)).await)
-    }
-
-    async fn release_cleanup(&self, claim: &CleanupClaim) -> Result<(), CatalogError> {
-        backend(with_retry(|| reaper::release_cleanup_once(self, claim)).await)
     }
 }
