@@ -114,6 +114,9 @@ jobs:
       - name: Build Praxis
         run: cargo build --locked -p praxis-ai-proxy
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
       - name: Assume Bedrock role
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
@@ -122,8 +125,9 @@ jobs:
           role-session-name: bedrock-gateway-${{ github.run_id }}
           role-duration-seconds: 900
 
-      - name: Verify signed gateway completion
+      - name: Verify Bedrock Runtime passthrough
         env:
+          PRAXIS_LIVE_BEDROCK: "1"
           BEDROCK_MODEL: openai.gpt-oss-120b-1:0
           GATEWAY_CONFIG: tests/integration/fixtures/bedrock/runtime-chat-live.yaml
         run: |
@@ -147,3 +151,15 @@ jobs:
           test "$status" = 200
           jq -e '.object == "chat.completion" and .choices[0].message.role == "assistant"' "$response" >/dev/null
           echo "Passed signed gateway completion for $BEDROCK_MODEL in us-east-1 at $GITHUB_SHA ($GATEWAY_CONFIG)." >> "$GITHUB_STEP_SUMMARY"
+
+          env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
+            uv run --script tests/integration/sdk/openai/test_bedrock_runtime_live.py \
+              --junitxml="$RUNNER_TEMP/hosted-bedrock-junit.xml" --tb=line
+
+      - name: Upload Bedrock test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hosted-bedrock-passthrough-results
+          path: ${{ runner.temp }}/hosted-bedrock-junit.xml
+          if-no-files-found: ignore
