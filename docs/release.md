@@ -65,6 +65,23 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
+## Releasing during a FIPS runner outage
+
+A maintainer can explicitly bypass FIPS host validation when the runner is
+unavailable. Dispatch the Release workflow on the release tag:
+
+```console
+gh workflow run release.yaml --repo praxis-proxy/ai --ref v0.12.1 \
+  -f skip-fips-proof=true
+```
+
+This skips both the recorded FIPS proof gate and post-publish FIPS host
+attestation. It does not skip the FIPS image build or hosted image checks.
+The dispatch input records the maintainer's decision, and the release CI
+report must not be interpreted as successful FIPS host validation.
+The test job has a 90-minute limit for unit, schema, and integration tests;
+all three steps must pass before container publication.
+
 ## Recovering Publication
 
 If the tests and container publishing passed but GitHub Release creation failed,
