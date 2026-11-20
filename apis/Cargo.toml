@@ -49,6 +49,9 @@ openai-conversations = ["store", "dep:jsonschema", "dep:utoipa"]
 # Files API contract and service-layer traits; concrete backends and handlers
 # are not part of this feature yet.
 openai-files = ["experimental", "dep:utoipa"]
+# Streaming S3 byte storage for Files. The caller supplies a configured S3
+# client, including its HTTP transport and cryptography provider.
+openai-files-s3 = ["openai-files", "dep:object_store", "object_store/aws-base"]
 # Context compaction with tiktoken token estimation.
 openai-compact = ["store", "dep:tiktoken-rs"]
 # MCP tool resolution and dispatch through the rmcp client (approvals persist).
@@ -80,6 +83,7 @@ humantime-serde = { workspace = true }
 jsonschema = { workspace = true, optional = true }
 metrics = { workspace = true }
 notify = { workspace = true }
+object_store = { workspace = true, optional = true }
 openssl = { workspace = true }
 percent-encoding = { workspace = true }
 praxis-ai-store = { workspace = true }
