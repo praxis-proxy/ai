@@ -580,14 +580,25 @@ insecure_options:
 
 /// Rewrite-only config: no earlier `openai_responses_request` classifier.
 ///
-/// The model-rewrite filter checks method and path directly, so the duplicate
-/// rejection tests must exercise it without an earlier body classifier that
-/// would reject the same request first.
+/// This is the standard-build shape: `openai_responses_request` is experimental,
+/// so model rewrite is the first filter to read the body model on both endpoints
+/// and owns the duplicate-model check there.
 fn rewrite_without_request_classifier_yaml(proxy_port: u16, backend_port: u16) -> String {
-    rewrite_yaml(proxy_port, backend_port).replace(
-        "      - filter: openai_responses_request\n        initialize_state: false\n",
-        "",
-    )
+    without_request_classifier(&rewrite_yaml(proxy_port, backend_port))
+}
+
+/// Remove the `openai_responses_request` classifier from a test config.
+///
+/// Panics if the classifier entry is absent, so a drifted config cannot
+/// silently leave the classifier answering in model rewrite's place.
+fn without_request_classifier(yaml: &str) -> String {
+    const CLASSIFIER: &str = "      - filter: openai_responses_request\n        initialize_state: false\n";
+    assert_eq!(
+        yaml.matches(CLASSIFIER).count(),
+        1,
+        "test config must contain exactly one request classifier entry to remove"
+    );
+    yaml.replace(CLASSIFIER, "")
 }
 
 /// YAML config with header-echo backend for content-length verification.
@@ -678,8 +689,10 @@ fn effective_model_routing_without_request_classifier_yaml(
     qwen_port: u16,
     default_port: u16,
 ) -> String {
-    effective_model_routing_yaml(proxy_port, llama_port, qwen_port, default_port).replace(
-        "      - filter: openai_responses_request\n        initialize_state: false\n",
-        "",
-    )
+    without_request_classifier(&effective_model_routing_yaml(
+        proxy_port,
+        llama_port,
+        qwen_port,
+        default_port,
+    ))
 }

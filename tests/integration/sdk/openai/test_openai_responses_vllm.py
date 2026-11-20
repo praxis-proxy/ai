@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27,<1",
-#     "openai>=2.0,<4",
+#     "openai>=2.16,<4",
 #     "pytest>=8.0,<9",
 # ]
 # ///
