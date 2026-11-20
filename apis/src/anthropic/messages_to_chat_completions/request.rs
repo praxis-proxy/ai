@@ -1066,6 +1066,29 @@ fn direct_caller_is_supported(caller: &Value) -> bool {
             .is_some_and(|fields| fields.len() == 1 && fields.get("type").and_then(Value::as_str) == Some("direct"))
 }
 
+/// Whether any message carries an Anthropic `image` block, either directly in
+/// its content or nested in a `tool_result` block's content.
+///
+/// Scans borrowed JSON only, so the selected-cluster image policy can reject a
+/// request before translation without copying image data.
+pub(crate) fn contains_image(body: &Value) -> bool {
+    let is_image = |block: &Value| block.get("type").and_then(Value::as_str) == Some("image");
+    body.get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.get("content").and_then(Value::as_array))
+        .flatten()
+        .any(|block| {
+            is_image(block)
+                || (block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    && block
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|parts| parts.iter().any(is_image)))
+        })
+}
+
 /// Check the fields used by `convert_image_source` without copying image data.
 fn image_source_is_supported(source: &Value) -> bool {
     match source.get("type").and_then(Value::as_str) {
@@ -2311,6 +2334,40 @@ mod tests {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"chart"},{"type":"image","source":{"type":"url","url":"https://example.com/chart.png"}}]}]}]}"#;
         let error = transform_bytes(body).unwrap_err();
         assert!(error.contains("tool_result"), "{error}");
+    }
+
+    #[test]
+    fn contains_image_detects_message_and_tool_result_images() {
+        for (body, expected, case) in [
+            (
+                json!({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]}]}),
+                true,
+                "base64 message image",
+            ),
+            (
+                json!({"messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image","source":{"type":"url","url":"https://example.test/i.png"}}]}]}),
+                true,
+                "url message image",
+            ),
+            (
+                json!({"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"image","source":{"type":"url","url":"https://example.test/i.png"}}]}]}]}),
+                true,
+                "nested tool_result image",
+            ),
+            (
+                json!({"messages":[{"role":"user","content":"image"},{"role":"user","content":[{"type":"text","text":"image"}]}]}),
+                false,
+                "text mentioning images",
+            ),
+            (
+                json!({"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"image"}]}]}),
+                false,
+                "string tool_result",
+            ),
+            (json!({"messages":"not-an-array"}), false, "malformed messages"),
+        ] {
+            assert_eq!(contains_image(&body), expected, "{case}");
+        }
     }
 
     #[test]

@@ -1,0 +1,38 @@
+version: 1
+id: messages/image-text-only
+description: A text-only selected cluster rejects message images before any Chat Completions backend call.
+protocol: anthropic_messages
+example_config: anthropic/messages-to-openai-text-only-fixture.yaml
+upstream_authority: 127.0.0.1:8000
+features:
+  - messages.request.image_text_only_rejection
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/messages
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 64
+          stream: false
+          messages:
+            - role: user
+              content:
+                - type: image
+                  source:
+                    type: url
+                    url: https://images.example.test/chart.png
+                - type: text
+                  text: Describe the chart.
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ""
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []

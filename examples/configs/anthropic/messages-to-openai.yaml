@@ -26,6 +26,16 @@
 # Credentials: this chain has no gateway authentication and injects no backend
 # token. Add `basic_auth` and `credential_injection` as in
 # `messages-to-openai-vllm.yaml` for a deployment.
+#
+# Images: the cluster declares `application_provider: openai` and the
+# translator lists `openai` in `image_input_providers`, so Anthropic image
+# blocks in message content become Chat Completions `image_url` parts for this
+# image-capable backend (for example `api.openai.com`). `base64` sources become
+# data URLs; `url` sources are forwarded for the backend to fetch, and Praxis
+# never fetches them. Trust comes from that cluster declaration, never from the
+# endpoint address: a cluster without a listed provider rejects image requests
+# with a 400. Images nested in `tool_result` content are rejected for every
+# backend because a Chat Completions tool message cannot carry them.
 
 listeners:
   - name: anthropic-gateway
@@ -40,6 +50,10 @@ filter_chains:
 
       - filter: anthropic_messages_to_chat_completions
         max_body_bytes: 1048576
+        # Selected clusters whose `application_provider` is listed here may
+        # receive translated images; every other cluster fails closed.
+        image_input_providers:
+          - openai
 
       # response_conditions is optional: the filter self-arms via
       # metadata and Content-Type checks internally. Adding it
@@ -72,6 +86,10 @@ filter_chains:
       - filter: load_balancer
         clusters:
           - name: "chat-completions-backend"
+            http:
+              # An image-capable Chat Completions backend; listed in the
+              # translator's `image_input_providers` above.
+              application_provider: openai
             endpoints:
               - "127.0.0.1:8000"
 

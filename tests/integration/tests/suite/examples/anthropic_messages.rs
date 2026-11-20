@@ -377,6 +377,58 @@ fn anthropic_messages_to_chat_completions_transforms_tool_cycle_request_body() {
 }
 
 #[test]
+fn anthropic_messages_to_chat_completions_forwards_images_to_image_capable_cluster() {
+    let chat_response = serde_json::json!({
+        "id": "chatcmpl_image",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "A bar chart."},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 50, "completion_tokens": 4, "total_tokens": 54}
+    });
+    let backend = start_capturing_backend(&chat_response.to_string());
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "anthropic/messages-to-openai.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:8000", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4o",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "url", "url": "https://images.example.test/chart.png"}},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+            {"type": "text", "text": "Describe the charts."}
+        ]}]
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/messages", &request.to_string()));
+    let forwarded: serde_json::Value =
+        serde_json::from_str(&backend.body()).expect("captured backend body should be JSON");
+    let content = &forwarded["messages"][0]["content"];
+
+    assert_eq!(parse_status(&raw), 200, "image translation should return 200");
+    assert_eq!(
+        content[0],
+        serde_json::json!({"type": "image_url", "image_url": {"url": "https://images.example.test/chart.png"}}),
+        "url sources should reach the image-capable backend unchanged"
+    );
+    assert_eq!(
+        content[1],
+        serde_json::json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}),
+        "base64 sources should become data URLs"
+    );
+
+    drop(proxy);
+}
+
+#[test]
 fn anthropic_messages_to_chat_completions_transforms_streaming_response_body() {
     let recording = Recording::load("anthropic/messages/to_openai_streaming.json");
     let response_body = recording.response_body();

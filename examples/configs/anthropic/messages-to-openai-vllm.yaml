@@ -57,6 +57,14 @@
 # translated identically: sampling fields are kept, while `document` blocks and
 # non-empty citations are rejected with a 400.
 #
+# Images: this vLLM path is text-only. The cluster declares
+# `application_provider: vllm`, and the translator leaves
+# `image_input_providers` empty, so any request carrying an Anthropic image
+# block (in message content or nested in `tool_result` content) is rejected
+# with a 400 at the proxy and no `image_url` reaches vLLM. To serve a
+# vision-capable model, add `image_input_providers: [vllm]` to the translator;
+# images in message content are then translated to `image_url` parts.
+#
 # The gateway password is resolved from `GATEWAY_AUTH_PASSWORD` at pipeline
 # build time; set it (and `VLLM_API_KEY`) in the proxy's environment.
 #
@@ -177,6 +185,10 @@ filter_chains:
       - filter: load_balancer
         clusters:
           - name: "chat-completions-backend"
+            http:
+              # Text-only: not listed in `image_input_providers`, so image
+              # requests fail closed before reaching vLLM.
+              application_provider: vllm
             endpoints:
               - "127.0.0.1:8000"
 

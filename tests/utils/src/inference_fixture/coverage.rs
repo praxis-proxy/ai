@@ -1330,6 +1330,9 @@ mod tests {
                 vec!["responses_native_passthrough"],
                 vec!["responses_agentic_loop"],
                 vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
             ]
         );
         assert_eq!(
@@ -1438,11 +1441,14 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 99, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 76, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 81, "manifest recording inventory count");
+        assert_eq!(report.features_total, 102, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 79, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 84, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1454,6 +1460,8 @@ mod tests {
                 "messages/basic-stream",
                 "messages/degrade-features",
                 "messages/empty-string-tool-arguments",
+                "messages/image-input",
+                "messages/image-text-only",
                 "messages/invalid-tool-id",
                 "messages/malformed-success",
                 "messages/malformed-tool-arguments",
@@ -1467,6 +1475,7 @@ mod tests {
                 "messages/stop-sequence-nonstream",
                 "messages/stop-sequence-stream",
                 "messages/tool-input-presence",
+                "messages/tool-result-image",
                 "messages/typed-server-tools",
                 "messages/unrepresentable-parameters",
                 "messages/upstream-error",
@@ -1524,7 +1533,7 @@ mod tests {
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 99, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 102, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1977,6 +1986,18 @@ mod tests {
                     &"messages.request.degrade_mid_conversation_system".to_owned(),
                     &vec!["messages/degrade-features".to_owned()]
                 ),
+                (
+                    &"messages.request.image_input".to_owned(),
+                    &vec!["messages/image-input".to_owned()]
+                ),
+                (
+                    &"messages.request.image_text_only_rejection".to_owned(),
+                    &vec!["messages/image-text-only".to_owned()]
+                ),
+                (
+                    &"messages.request.tool_result_image_rejection".to_owned(),
+                    &vec!["messages/tool-result-image".to_owned()]
+                ),
             ]
         );
         for feature in &manifest.features[0..2] {
@@ -2147,7 +2168,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)],
         );
-        for feature in &manifest.features[63..99] {
+        for feature in &manifest.features[63..102] {
             assert_eq!(
                 feature
                     .providers

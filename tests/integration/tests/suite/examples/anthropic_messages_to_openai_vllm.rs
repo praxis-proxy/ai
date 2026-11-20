@@ -15,6 +15,7 @@
 //!    message.
 //! 3. Client credentials are stripped and the backend's own Bearer token is injected.
 //! 4. Native token counting remains untouched when the backend also serves that endpoint.
+//! 5. The text-only vLLM cluster rejects image content before any backend call.
 //!
 //! Like the native tests, `credential_injection` and `basic_auth` resolve their
 //! secrets at pipeline-build time. `std::env::set_var` is `unsafe` (and
@@ -211,6 +212,58 @@ fn transform_vllm_rewrites_message_path_and_translates_response() {
         forwarded.uri, "/v1/chat/completions",
         "POST /v1/messages must be rewritten to /v1/chat/completions, got: {}",
         forwarded.uri
+    );
+
+    drop(proxy);
+}
+
+#[test]
+fn transform_vllm_rejects_images_before_text_only_backend() {
+    let backend = start_chat_backend();
+    let proxy_port = free_port();
+    let config = transform_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    for source in [
+        json!({"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}),
+        json!({"type": "url", "url": "https://images.example.test/chart.png"}),
+    ] {
+        let image = json!({"type": "image", "source": source});
+        for (location, messages) in [
+            (
+                "message",
+                json!([{"role": "user", "content": [image, {"type": "text", "text": "Describe it."}]}]),
+            ),
+            (
+                "tool_result",
+                json!([
+                    {"role": "user", "content": "Plot it."},
+                    {"role": "assistant", "content": [{"type": "tool_use", "id": "call_1", "name": "plot", "input": {}}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": [image]}]},
+                ]),
+            ),
+        ] {
+            let request = json!({"model": "claude-opus-4-8", "max_tokens": 64, "messages": messages});
+            let raw = http_send(
+                proxy.addr(),
+                &json_post_with_header("/v1/messages", &request.to_string(), &gateway_auth_line()),
+            );
+
+            assert_eq!(parse_status(&raw), 400, "{location} image must be rejected: {source}");
+            let error: Value = serde_json::from_str(&parse_body(&raw)).expect("error should be JSON");
+            assert_eq!(error["error"]["type"], "invalid_request_error", "{location}: {source}");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("selected backend")),
+                "{location} rejection should name the image policy: {error}"
+            );
+        }
+    }
+
+    assert!(
+        backend.requests().iter().all(|request| request.method != "POST"),
+        "no image request may reach the text-only vLLM backend"
     );
 
     drop(proxy);

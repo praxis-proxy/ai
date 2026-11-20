@@ -99,6 +99,19 @@ pub(crate) struct AnthropicMessagesToChatCompletionsConfig {
     #[serde(default)]
     pub allow_lossy_features: Vec<LossyFeature>,
 
+    /// Selected-cluster `application_provider` values whose backends receive
+    /// translated image content.
+    ///
+    /// Empty by default, which rejects every request carrying an Anthropic
+    /// `image` block, in message content or nested in `tool_result` content,
+    /// with a 400 before any backend call. Images are translated to Chat
+    /// Completions `image_url` parts only when the cluster selected for the
+    /// request declares an `http.application_provider` listed here; a cluster
+    /// without a provider, or with an unlisted one, fails closed. Trust comes
+    /// from the cluster declaration, never from its endpoint address.
+    #[serde(default)]
+    pub image_input_providers: Vec<String>,
+
     /// Maximum body size in bytes for `StreamBuffer` mode.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
@@ -133,6 +146,9 @@ pub(crate) fn build_config(
     cfg: AnthropicMessagesToChatCompletionsConfig,
 ) -> Result<AnthropicMessagesToChatCompletionsConfig, FilterError> {
     validate_max_body_bytes("anthropic_messages_to_chat_completions", cfg.max_body_bytes)?;
+    if cfg.image_input_providers.iter().any(String::is_empty) {
+        return Err("anthropic_messages_to_chat_completions: image_input_providers entries must be non-empty".into());
+    }
     Ok(cfg)
 }
 
@@ -204,6 +220,30 @@ mod tests {
         assert!(
             error.to_string().contains("allow_lossy") || error.to_string().contains("unknown field"),
             "unknown top-level field must fail config loading: {error}"
+        );
+    }
+
+    #[test]
+    fn absent_image_input_providers_allow_none() {
+        let cfg = parse("max_body_bytes: 1024").unwrap();
+        assert!(
+            cfg.image_input_providers.is_empty(),
+            "images must fail closed by default"
+        );
+    }
+
+    #[test]
+    fn image_input_providers_parse() {
+        let cfg = parse("image_input_providers:\n  - openai\n  - vllm").unwrap();
+        assert_eq!(cfg.image_input_providers, ["openai", "vllm"]);
+    }
+
+    #[test]
+    fn empty_image_input_provider_fails_config_loading() {
+        let error = parse("image_input_providers: [\"\"]").unwrap_err();
+        assert!(
+            error.to_string().contains("image_input_providers"),
+            "empty provider must fail config loading: {error}"
         );
     }
 

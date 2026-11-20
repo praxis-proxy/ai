@@ -11,6 +11,8 @@ Request fields the translation does not map are forwarded untouched for the back
 
 `allow_lossy_features` opts specific Anthropic-only features into operator-approved degradation instead of that 400. Each listed feature is validated and then degraded as the feature requires — most have their wire markers stripped, while `mid_conversation_system` folds mid-conversation `system` messages into the leading system message — so an unmodified client (for example Claude Code, which always sends `cache_control` and `thinking`) can still drive a Chat Completions backend. Each degradation is reported to the operator — one `WARN` log per request, a `praxis_anthropic_messages_to_chat_completions_degraded_total` counter per feature, and an `x-degraded-features` response header — because the request succeeds but the feature was silently dropped. `prompt_caching` removes `cache_control` markers (prompt and tool content are preserved, but explicit cache breakpoints are not honored, so cost and latency may differ); `extended_thinking` removes `thinking` and thinking-only `context_management` edits (the translated response carries no thinking blocks); `mid_conversation_system` folds each eligible text-only `system` message with exactly `role` and `content` fields that appears after the first non-system turn into the single leading system message; other message or content shapes remain subject to strict validation and can be rejected with a 400. Features absent from the allowlist, malformed markers, and other `context_management` edits are still rejected with a 400 — except that without `mid_conversation_system` the translator does not reject in-array `system` messages itself: it preserves them in their original positions (Chat Completions represents them directly) and the backend decides whether to accept that ordering.
 
+Image input follows the cluster the router selected. `image_input_providers` lists the `http.application_provider` values whose clusters may receive images; the list is empty by default. A request carrying an Anthropic `image` block, in message content or nested in `tool_result` content, is rejected with a 400 `invalid_request_error` before any backend call unless the selected cluster declares a listed provider. A cluster without a provider, or with an unlisted one, fails closed, so a text-only backend such as the default vLLM example never receives `image_url` content. For a listed provider, `base64` sources become data URLs and `url` sources are forwarded unchanged for the backend to fetch; Praxis never fetches them. Images nested in `tool_result` content are still rejected for every provider, because a Chat Completions tool message cannot carry them.
+
 Translation ends the Anthropic wire contract, so the filter removes `anthropic-version` and both Anthropic credential forms (`x-api-key` from SDK v1 and `authorization: Bearer` from SDK v2) before the request reaches the Chat Completions backend. Use `credential_injection` to add the backend's own token. The caller's API version does not change translation: `temperature`, `top_p`, and `top_k` are forwarded under either version, and `document` blocks and non-empty citations are rejected under either version.
 
 ## Configuration
@@ -18,6 +20,7 @@ Translation ends the Anthropic wire contract, so the filter removes `anthropic-v
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `allow_lossy_features` | (`extended_thinking` \| `prompt_caching` \| `mid_conversation_system`)[] | no | Anthropic features the operator allows the translator to degrade. Empty by default, which keeps the strict reject behavior for every feature. Unknown names fail config loading (`deny_unknown_fields` plus the validated `LossyFeature` enum), so a typo cannot silently widen what the translator will drop. |
+| `image_input_providers` | string[] | no | Selected-cluster `application_provider` values whose backends receive translated image content. Empty by default, which rejects every request carrying an Anthropic `image` block, in message content or nested in `tool_result` content, with a 400 before any backend call. Images are translated to Chat Completions `image_url` parts only when the cluster selected for the request declares an `http.application_provider` listed here; a cluster without a provider, or with an unlisted one, fails closed. Trust comes from the cluster declaration, never from its endpoint address. |
 | `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer` mode. |
 
 ## Examples
@@ -36,4 +39,6 @@ max_body_bytes: 1048576
 allow_lossy_features:
   - prompt_caching
   - extended_thinking
+image_input_providers:
+  - openai
 ```
