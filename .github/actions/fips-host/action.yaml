@@ -12,8 +12,8 @@ description: >-
 # Runner prerequisites (docs/developing/fips.md): a RHEL 9 host in FIPS mode
 # with git, make, podman, gnupg2, gcc, gcc-c++, cmake and openssl-devel
 # installed, checked up front by .github/actions/fips-runner-check; the Rust
-# toolchain is set up here. The host-side commands (make fips-host-check, the
-# probe orchestration) are `cargo xtask fips` and compile on the host; the
+# toolchain is set up here. The shared cargo-fips-check tool attests the
+# host and xtask drives the runtime probe. Both compile on the host; the
 # test suites compile and run inside the toolchain image. The PostgreSQL
 # boundary test runs on the host so it can start a sibling container through
 # rootless podman.
@@ -35,8 +35,7 @@ inputs:
 runs:
   using: composite
   steps:
-      # xtask (make fips-host-check, make fips-runtime-probe) compiles on the
-      # host; the suites do not.
+      # The attestation tool and runtime probe build on the host.
     - name: Set up Rust
       uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
       with:

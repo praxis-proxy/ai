@@ -227,7 +227,8 @@ Three facts stay outside what this repository can prove:
   that is still in validation with NIST; `fips-host-check` says so on every
   run (a warning, or a failure under `--require-certified`) rather than
   letting the package name imply a certificate. See
-  `xtask/assets/fips/certified-modules.json` for the builds and sources.
+  the [shared tool’s certified-module inventory](https://github.com/praxis-proxy/cargo-fips-check/blob/a8dae23f90eb77e6890cc86df5ec6cf6da4e2e79/assets/certified-modules.json)
+  for the builds and sources.
 - **The operating environment.** The certificate lists tested operating
   environments; running elsewhere relies on the CMVP porting rules.
 - **The architecture.** rustls performing the TLS handshake over the
