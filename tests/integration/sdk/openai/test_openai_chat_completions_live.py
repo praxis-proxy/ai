@@ -19,6 +19,7 @@ import pytest
 from openai import NotFoundError, OpenAI
 
 MODEL = "gpt-4.1-mini-2025-04-14"
+EMBEDDING_MODEL = "text-embedding-3-small"
 
 
 @pytest.fixture(scope="module")
@@ -102,6 +103,19 @@ def test_unknown_model_preserves_openai_error(client):
             messages=[{"role": "user", "content": "Reply with OK."}],
         )
     assert exc.value.code == "model_not_found"
+
+
+def test_embeddings_batch_preserves_order_dimensions_and_usage(client):
+    response = client.embeddings.create(
+        model=EMBEDDING_MODEL, input=["A blue sky.", "A deep ocean."],
+        dimensions=64, encoding_format="float",
+    )
+    assert response.model == EMBEDDING_MODEL
+    assert [item.index for item in response.data] == [0, 1]
+    assert all(len(item.embedding) == 64 for item in response.data)
+    assert response.data[0].embedding != response.data[1].embedding
+    assert response.usage.prompt_tokens > 0
+    assert response.usage.total_tokens == response.usage.prompt_tokens
 
 
 if __name__ == "__main__":
