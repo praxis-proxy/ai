@@ -47,7 +47,7 @@ spec:
               "allowed-capabilities":
                 # OPEN DISCOVERY (Part 3 A3): static wristband lists ALL tools so the tool
                 # is DISCOVERED regardless of roles; per-call tool-access-check still enforces.
-                value: '{"tools":{"weather":["get_forecast","get_alerts"]}}' 
+                value: '{"tools":{"weather":["get_forecast","get_alerts"]}}'
             signingKeyRefs:
               - name: wristband-signing-key
                 algorithm: ES256

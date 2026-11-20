@@ -128,6 +128,7 @@ praxis-filter = { git = "https://github.com/praxis-proxy/praxis", branch = "main
 praxis-protocol = { git = "https://github.com/praxis-proxy/praxis", branch = "main", package = "praxis-proxy-protocol" }
 praxis-tls = { git = "https://github.com/praxis-proxy/praxis", branch = "main", package = "praxis-proxy-tls" }
 praxis = { git = "https://github.com/praxis-proxy/praxis", branch = "main", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api", "pingora"] }
+ppe = { version = "0.6.0", package = "praxis-policy" }
 praxis-test-utils = { path = "tests/utils", default-features = false }
 
 # AI-owned llm-d ext_proc compatibility layer

@@ -13,6 +13,8 @@ mod ceiling;
 mod count;
 mod headers;
 mod metrics;
+#[cfg(any(feature = "token-quota-filter", feature = "token-rate-limit-filter"))]
+pub(crate) mod normalized;
 mod providers;
 mod stream_usage;
 mod streaming;
