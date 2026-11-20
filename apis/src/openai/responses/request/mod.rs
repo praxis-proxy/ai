@@ -83,9 +83,7 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// API traffic. `on_invalid` governs only bodies that fail to parse.
 ///
 /// On managed paths, rejects `code_interpreter`, `background=true`, and non-null
-/// `prompt` with a 400 because the gateway does not implement them. It also
-/// rejects a non-empty vLLM `previous_input_messages` on creates, because
-/// Praxis owns the history sent to inference. The
+/// `prompt` with a 400 because the gateway does not implement them. The
 /// pre-routing fact publisher leaves these fields intact for direct upstreams.
 /// A non-null `prompt` is the
 /// deprecated OpenAI reusable prompt object (`{ id, version, variables }`);
@@ -93,6 +91,13 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// should move its content into `input` rather than rely on the gateway to
 /// resolve the saved object. Prefer `input` over top-level `instructions`,
 /// which managed-path content-policy extraction does not screen.
+///
+/// On managed Responses creates, omit `previous_input_messages` or set it to
+/// `null` or `[]`, including on the first turn and with `store: false`. Any
+/// other value returns HTTP 400. To supply earlier messages yourself, include
+/// them in `input`. To resume stored history, use either `previous_response_id`
+/// or `conversation`. Provider-owned routes forward `previous_input_messages`
+/// unchanged.
 ///
 /// Promotes `openai_responses_request.*` metadata, publishes filter results
 /// under `openai_responses_request`, and generates
