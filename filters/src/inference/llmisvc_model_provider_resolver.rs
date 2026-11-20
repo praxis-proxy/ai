@@ -8,11 +8,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderName;
-use praxis_ai_apis::{
-    RecordAiMetadata as _,
-    json_body::replace_json_body,
-    model_field::{self, ParseError},
-};
+use praxis_ai_apis::{RecordAiMetadata as _, json_body::replace_json_body};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, PendingHeaderResult, Rejection,
     builtins::http::payload_processing::config_validation::validate_max_body_bytes, parse_filter_config,
@@ -76,9 +72,9 @@ fn default_header() -> String {
 /// modified -- `KServe` routes on the publisher ID.
 ///
 /// If the header is absent/empty, or the body has no `"model"` field,
-/// this filter is a no-op (it does not invent a body `"model"`). A body whose
-/// top-level `"model"` occurs more than once is refused with HTTP 400 rather
-/// than collapsed into one rewritten value.
+/// this filter is a no-op (it does not invent a body `"model"`). It relies on
+/// the earlier `model_to_header` to refuse a body that repeats its top-level
+/// `"model"`, so it rewrites a single, unambiguous field.
 ///
 /// Does **not** resolve `ExternalModel` / `ExternalProvider` CRDs, perform
 /// weighted provider selection, rewrite `Host`, or inject credentials.
@@ -174,10 +170,6 @@ impl LlmisvcModelProviderResolverFilter {
 
         match rewrite_publisher_body_model(body, short_name, self.name())? {
             PublisherBodyRewrite::Noop => {},
-            PublisherBodyRewrite::DuplicateModel => {
-                debug!("LLMISvc: refusing a repeated top-level model");
-                return Ok(FilterAction::Reject(Rejection::status(400)));
-            },
             PublisherBodyRewrite::Matched { rewritten } => {
                 ctx.record_ai_metadata(META_PUBLISHER_ID, model_name.as_str());
                 if rewritten {
@@ -241,8 +233,6 @@ impl HttpFilter for LlmisvcModelProviderResolverFilter {
 enum PublisherBodyRewrite {
     /// Body was not a JSON object with a `"model"` field.
     Noop,
-    /// Body repeated its top-level `"model"`; nothing was rewritten.
-    DuplicateModel,
     /// Body `"model"` matched the publisher ID; `rewritten` is `false`
     /// when the short name was already present.
     Matched {
@@ -261,10 +251,13 @@ fn rewrite_publisher_body_model(
         return Ok(PublisherBodyRewrite::Noop);
     };
 
-    let mut obj = match model_field::parse_object(raw) {
-        Ok(obj) => obj,
-        Err(ParseError::DuplicateModel) => return Ok(PublisherBodyRewrite::DuplicateModel),
-        Err(ParseError::Json(_) | ParseError::NotObject) => return Ok(PublisherBodyRewrite::Noop),
+    let mut value: serde_json::Value = match serde_json::from_slice(raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(PublisherBodyRewrite::Noop),
+    };
+
+    let Some(obj) = value.as_object_mut() else {
+        return Ok(PublisherBodyRewrite::Noop);
     };
 
     if !obj.contains_key("model") {
@@ -277,7 +270,7 @@ fn rewrite_publisher_body_model(
 
     obj.insert("model".to_owned(), serde_json::Value::String(short_name.to_owned()));
 
-    replace_json_body(body, &serde_json::Value::Object(obj), filter_name, "model").map_err(|e| -> FilterError {
+    replace_json_body(body, &value, filter_name, "model").map_err(|e| -> FilterError {
         format!("{filter_name}: failed to re-serialize rewritten request body: {e}").into()
     })?;
 
@@ -500,33 +493,6 @@ bogus_field: true
         assert!(ctx.extra_request_headers.is_empty());
         assert!(ctx.request_headers_to_set.is_empty());
         assert!(ctx.request_headers_to_remove.is_empty());
-    }
-
-    #[tokio::test]
-    async fn rejects_repeated_top_level_model_without_rewriting() {
-        let filter = filter_default();
-        let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-        req.headers.insert(
-            "X-Model",
-            HeaderValue::from_static("publishers/rhoai/models/granite-3.1-8b"),
-        );
-        let mut ctx = crate::test_utils::make_filter_context(&req);
-        let original = Bytes::from_static(
-            br#"{"model":"publishers/rhoai/models/granite-3.1-8b","model":"publishers/rhoai/models/granite-3.1-8b"}"#,
-        );
-        let mut body = Some(original.clone());
-
-        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-
-        assert!(
-            matches!(&action, FilterAction::Reject(r) if r.status == 400),
-            "repeated model must be refused"
-        );
-        assert_eq!(body, Some(original), "a refused body is not rewritten");
-        assert!(
-            !ctx.filter_metadata.contains_key(META_PUBLISHER_ID),
-            "no publisher ID is published"
-        );
     }
 
     #[tokio::test]
