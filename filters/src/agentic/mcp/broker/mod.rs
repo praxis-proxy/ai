@@ -136,10 +136,13 @@ struct BackendSessions {
     handshake_timeout: Duration,
     /// Gateway → backend session map.
     store: BackendSessionStore,
+    /// Protocol versions a backend may negotiate.
+    supported_versions: Vec<String>,
 }
 
 /// Per-request record of a forwarded current-profile `tools/call`, read by
-/// `on_response` to invalidate a backend session the backend rejected.
+/// `on_response` (backend answered) or `on_request_complete` (it never did)
+/// to invalidate a session that expired or whose endpoint is unreachable.
 struct ForwardedCall {
     /// Session map key.
     key: BackendSessionKey,
@@ -270,7 +273,12 @@ impl McpBrokerFilter {
                     settings.max_response_bytes,
                     settings.handshake_timeout,
                 ));
-                Some(BackendSessions::new(client, fallback_client, settings))
+                Some(BackendSessions::new(
+                    client,
+                    fallback_client,
+                    settings,
+                    validated.supported_versions.clone(),
+                ))
             },
             _ => None,
         };
@@ -781,24 +789,42 @@ impl HttpFilter for McpBrokerFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // Without response headers no backend answered (core runs this hook
+        // during cleanup after an upstream failure); `on_request_complete`
+        // settles the call with the status the client received.
+        let Some(status) = ctx.response_header.as_ref().map(|response| response.status) else {
+            return Ok(FilterAction::Continue);
+        };
         let Some(call) = ctx.remove_filter_state::<ForwardedCall>() else {
             return Ok(FilterAction::Continue);
         };
-        let status = ctx.response_header.as_ref().map(|response| response.status);
-        // 404: the backend forgot the session. 502: the pinned endpoint is
-        // unreachable, and the session cannot be served anywhere else.
-        if matches!(
-            status,
-            Some(http::StatusCode::NOT_FOUND | http::StatusCode::BAD_GATEWAY)
-        ) && let Some(backend) = self.backend.as_ref()
-            && backend.store.invalidate(&call.key, &call.session_id)
+        // 404: the backend forgot the session. 502: an intermediary reports
+        // the pinned endpoint unreachable; the session cannot move elsewhere.
+        if matches!(status, http::StatusCode::NOT_FOUND | http::StatusCode::BAD_GATEWAY)
+            && let Some(backend) = self.backend.as_ref()
         {
-            debug!(
-                server = call.key.server,
-                "mcp backend session expired or unreachable; mapping invalidated"
-            );
+            backend.invalidate_forwarded(&call, "mcp backend session expired or unreachable; mapping invalidated");
         }
         Ok(FilterAction::Continue)
+    }
+
+    fn observes_request_completion(&self) -> bool {
+        self.backend.is_some()
+    }
+
+    fn on_request_complete(&self, ctx: &mut HttpFilterContext<'_>, status: u16) {
+        // A call still recorded here never got a backend response. A proxy
+        // 502 or 504 then means the pinned endpoint could not be reached
+        // (refused, reset, TLS failure, or timed out), so the session it holds
+        // is unusable; local rejections keep it.
+        let Some(call) = ctx.remove_filter_state::<ForwardedCall>() else {
+            return;
+        };
+        if matches!(status, 502 | 504)
+            && let Some(backend) = self.backend.as_ref()
+        {
+            backend.invalidate_forwarded(&call, "mcp backend endpoint unreachable; mapping invalidated");
+        }
     }
 }
 
@@ -808,6 +834,7 @@ impl BackendSessions {
         client: Arc<dyn McpBackendClient>,
         fallback_client: Option<SubRequestClient>,
         settings: &ValidatedBackendSessions,
+        supported_versions: Vec<String>,
     ) -> Self {
         Self {
             client,
@@ -815,6 +842,14 @@ impl BackendSessions {
             forward_headers: settings.forward_headers.clone(),
             handshake_timeout: settings.handshake_timeout,
             store: BackendSessionStore::new(settings.max_sessions, settings.idle_timeout),
+            supported_versions,
+        }
+    }
+
+    /// Drop the mapping a forwarded call used, if it still holds that session.
+    fn invalidate_forwarded(&self, call: &ForwardedCall, message: &'static str) {
+        if self.store.invalidate(&call.key, &call.session_id) {
+            debug!(server = call.key.server, "{message}");
         }
     }
 
@@ -867,7 +902,7 @@ impl BackendSessions {
         callout: &BackendCallout,
     ) -> Result<BackendInit, McpBackendError> {
         let credential = credential_fingerprint(&callout.forwarded_headers);
-        let slot = self.store.slot(key);
+        let slot = self.store.slot(key).ok_or(McpBackendError::Capacity)?;
         let mut state = tokio::time::timeout_at(callout.deadline.into(), slot.state.lock())
             .await
             .map_err(|_elapsed| McpBackendError::Timeout)?;
@@ -877,19 +912,47 @@ impl BackendSessions {
             return Ok(bound.init.clone());
         }
 
-        let init = self.client.initialize(target, protocol_version, callout).await?;
-        if let Err(error) = self.client.send_initialized(target, &init, callout).await {
-            if let Err(cleanup) = self.client.terminate(target, &init, callout).await {
-                debug!(reason = cleanup.reason(), "mcp backend session cleanup failed");
-            }
-            return Err(error);
-        }
+        let init = self.handshake(target, protocol_version, callout).await?;
         *state = Some(BoundSession {
             credential,
             init: init.clone(),
         });
         drop(state);
         Ok(init)
+    }
+
+    /// Run `initialize` and `notifications/initialized` for a new session.
+    ///
+    /// A backend that answers `initialize` with a version outside
+    /// `supported_versions` is never confirmed: its session is terminated and
+    /// no call is forwarded.
+    async fn handshake(
+        &self,
+        target: BackendTarget<'_>,
+        protocol_version: &str,
+        callout: &BackendCallout,
+    ) -> Result<BackendInit, McpBackendError> {
+        let init = self.client.initialize(target, protocol_version, callout).await?;
+        if !self
+            .supported_versions
+            .iter()
+            .any(|v| v.as_str() == &*init.protocol_version)
+        {
+            self.abandon(target, &init, callout).await;
+            return Err(McpBackendError::UnsupportedVersion);
+        }
+        if let Err(error) = self.client.send_initialized(target, &init, callout).await {
+            self.abandon(target, &init, callout).await;
+            return Err(error);
+        }
+        Ok(init)
+    }
+
+    /// Best-effort termination of a backend session that will not be used.
+    async fn abandon(&self, target: BackendTarget<'_>, init: &BackendInit, callout: &BackendCallout) {
+        if let Err(cleanup) = self.client.terminate(target, init, callout).await {
+            debug!(reason = cleanup.reason(), "mcp backend session cleanup failed");
+        }
     }
 }
 

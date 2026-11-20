@@ -147,8 +147,19 @@ every forwarded call to it through core's
 connection settings still apply). Clusters with
 several endpoints therefore keep each session on one
 replica. A `502` from the pinned endpoint drops the
-mapping like a `404`. Sessionless backends are not
-pinned.
+mapping like a `404`, and so does a proxy `502` or
+`504` for a call that got no backend response at all
+(refused connection, reset, TLS failure, or timeout),
+so the next call initializes on a reachable replica.
+Sessionless backends are not pinned.
+
+A backend that answers `initialize` with a protocol
+version outside the broker's `supported_versions` is
+never confirmed: the broker terminates that session and
+returns a `unsupported_protocol_version` error instead
+of forwarding the call. SSE replies are decoded with the
+shared conforming parser (CR, LF, or CRLF line endings
+and an optional leading BOM).
 
 Concurrent first calls for one pair share a single
 handshake. A mapping is bound to a SHA-256 fingerprint
@@ -158,7 +169,11 @@ handshake. A gateway `DELETE` terminates only the
 backend sessions created with the caller's own
 credentials. The map is in memory, per filter instance,
 capped by `max_sessions` (least recently used entries
-are evicted) and expired after `idle_timeout_ms`.
+are evicted) and expired after `idle_timeout_ms`. A
+mapping in use by an in-flight handshake or lookup is
+never evicted or expired, so one pair cannot end up on
+two backend sessions; when every mapping is in use, a
+call for a new pair fails with `session_capacity`.
 Distributed session storage is tracked separately.
 
 ### Filter Results

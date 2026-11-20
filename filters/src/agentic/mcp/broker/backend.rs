@@ -124,6 +124,10 @@ pub(crate) enum McpBackendError {
     },
     /// The backend response is not a valid MCP lifecycle reply.
     Malformed(&'static str),
+    /// The backend negotiated a protocol version the broker does not support.
+    UnsupportedVersion,
+    /// Every session slot is busy with an in-flight exchange.
+    Capacity,
 }
 
 impl McpBackendError {
@@ -136,6 +140,8 @@ impl McpBackendError {
             Self::Rejected { .. } => "rejected",
             Self::JsonRpc { .. } => "json_rpc_error",
             Self::Malformed(_) => "malformed_response",
+            Self::UnsupportedVersion => "unsupported_protocol_version",
+            Self::Capacity => "session_capacity",
         }
     }
 }
@@ -149,6 +155,8 @@ impl fmt::Display for McpBackendError {
             Self::Rejected { status } => write!(f, "backend rejected the exchange with HTTP {status}"),
             Self::JsonRpc { code } => write!(f, "backend returned JSON-RPC error {code}"),
             Self::Malformed(detail) => write!(f, "malformed backend response: {detail}"),
+            Self::UnsupportedVersion => f.write_str("backend negotiated an unsupported protocol version"),
+            Self::Capacity => f.write_str("backend session capacity exhausted"),
         }
     }
 }
@@ -433,30 +441,15 @@ fn backend_session_id(headers: &HeaderMap) -> Result<Option<HeaderValue>, McpBac
 
 /// Find the JSON-RPC reply to the broker's `initialize` in an SSE body.
 fn find_sse_response(body: &[u8]) -> Result<serde_json::Value, McpBackendError> {
-    let text = std::str::from_utf8(body).map_err(|_e| McpBackendError::Malformed("initialize stream is not UTF-8"))?;
-    let mut data = String::new();
-    for line in text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)) {
-        if line.is_empty() {
-            if let Some(message) = initialize_reply(&data) {
-                return Ok(message);
-            }
-            data.clear();
-        } else if let Some(rest) = line.strip_prefix("data:") {
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
-        }
-    }
-    initialize_reply(&data).ok_or(McpBackendError::Malformed("initialize stream has no reply"))
+    praxis_ai_apis::buffered_sse_event_data(body)
+        .iter()
+        .find_map(|data| initialize_reply(data))
+        .ok_or(McpBackendError::Malformed("initialize stream has no reply"))
 }
 
 /// Parse one SSE event payload when it answers the broker's `initialize`.
-fn initialize_reply(data: &str) -> Option<serde_json::Value> {
-    if data.is_empty() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+fn initialize_reply(data: &[u8]) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_slice(data).ok()?;
     (value.get("id").and_then(serde_json::Value::as_str) == Some(INITIALIZE_REQUEST_ID)).then_some(value)
 }
 
@@ -560,6 +553,26 @@ mod tests {
         assert!(
             parse_initialize_response(&response(200, "text/event-stream", Some("s"), &body)).is_ok(),
             "final unterminated event must be parsed"
+        );
+    }
+
+    #[test]
+    fn sse_initialize_accepts_cr_only_framing() {
+        let body = format!("event: message\rdata: {}\r\r", init_reply("2025-06-18"));
+        let init = parse_initialize_response(&response(200, "text/event-stream", Some("s"), &body)).unwrap();
+        assert_eq!(
+            &*init.protocol_version, "2025-06-18",
+            "bare CR line endings must frame events"
+        );
+    }
+
+    #[test]
+    fn sse_initialize_accepts_leading_bom() {
+        let body = format!("\u{feff}data: {}\n\n", init_reply("2025-06-18"));
+        let init = parse_initialize_response(&response(200, "text/event-stream", Some("s"), &body)).unwrap();
+        assert_eq!(
+            &*init.protocol_version, "2025-06-18",
+            "a leading BOM must not hide data:"
         );
     }
 

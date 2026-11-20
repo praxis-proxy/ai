@@ -211,6 +211,64 @@ fn current_profile_pins_backend_session_to_its_endpoint() {
 }
 
 #[test]
+fn current_profile_unreachable_pinned_replica_reinitializes_on_survivor() {
+    // The replica that issued the session goes away. Core answers the pinned
+    // call with a 502 from its connect-failure path, which never reaches the
+    // response hook; the session must still be dropped so the next call
+    // initializes on the surviving replica instead of retrying the dead one.
+    let replica_a = start_session_backend("get_weather");
+    let replica_b = start_session_backend("get_weather");
+    let calendar = start_session_backend("create_event");
+    let yaml = session_broker_yaml(&replica_a, &calendar, "").replacen(
+        &format!("endpoints: [\"{}\"]", replica_a.endpoint()),
+        &format!(
+            "endpoints: [\"{}\", \"{}\"]",
+            replica_a.endpoint(),
+            replica_b.endpoint()
+        ),
+        1,
+    );
+    let proxy = start_proxy(&Config::from_yaml(&yaml).unwrap());
+    let gateway = initialize_gateway(proxy.addr());
+
+    let first = http_send(proxy.addr(), &tools_call(&gateway, 1, "weather_get_weather"));
+    assert_eq!(parse_status(&first), 200, "first call must succeed: {first}");
+
+    let (owner, survivor) = if replica_a.sessions_minted() == 1 {
+        (replica_a, replica_b)
+    } else {
+        (replica_b, replica_a)
+    };
+    let owner_endpoint = owner.endpoint();
+    drop(owner);
+    wait_until_refused(&owner_endpoint);
+
+    let failed = http_send(proxy.addr(), &tools_call(&gateway, 2, "weather_get_weather"));
+    assert_eq!(
+        parse_status(&failed),
+        502,
+        "a call pinned to the stopped replica must fail: {failed}"
+    );
+
+    let recovered = http_send(proxy.addr(), &tools_call(&gateway, 3, "weather_get_weather"));
+    assert_eq!(
+        parse_status(&recovered),
+        200,
+        "the next call must initialize on the surviving replica: {recovered}"
+    );
+    assert_eq!(
+        survivor.sessions_minted(),
+        1,
+        "the surviving replica must mint the replacement session"
+    );
+    assert_eq!(
+        survivor.tool_call_count("get_weather"),
+        1,
+        "the recovered call must reach the surviving replica"
+    );
+}
+
+#[test]
 fn current_profile_rejects_oversized_chunked_handshake() {
     let weather = start_mcp_mock_server_with_config(McpMockConfig {
         enforce_sessions: true,
@@ -356,6 +414,18 @@ insecure_options:
         weather = weather.endpoint(),
         calendar = calendar.endpoint(),
     )
+}
+
+/// Wait until a stopped mock no longer accepts connections on `endpoint`.
+fn wait_until_refused(endpoint: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::net::TcpStream::connect(endpoint).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stopped replica {endpoint} still accepts connections"
+        );
+        std::thread::yield_now();
+    }
 }
 
 /// Initialize with the broker and return the gateway session id.
