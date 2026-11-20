@@ -8,47 +8,45 @@ mod default;
 use async_trait::async_trait;
 use bytes::Bytes;
 pub use default::DefaultFileService;
-use praxis_ai_store::StateOwner;
+use praxis_ai_store::{CatalogError, StateOwner};
 
-use super::{
-    FileInfo, FileList, FilePage, FileStream, FileUploadMetadata, registry::FileRegistryError, store::FileStoreError,
-};
+use super::{FileInfo, FileList, FilePage, FileStream, FileUploadMetadata, store::FileStoreError};
 
 /// Failures exposed by the Files service to its handler.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FileServiceError {
-    /// No ready file exists in the authorized owner scope.
+    /// No ready file exists in the authorized tenant scope.
     #[error("file not found")]
     NotFound,
     /// A request field is invalid.
     #[error("invalid file request: {0}")]
     InvalidInput(String),
-    /// The upload crossed its reserved bound at the per-file size limit.
+    /// The upload crossed the per-file size limit.
     #[error("file exceeds the upload size limit")]
     UploadTooLarge,
-    /// No capacity could be reserved, or the upload crossed a reservation
-    /// smaller than the per-file size limit.
+    /// No capacity could be reserved in the tenant's remaining quota, or the
+    /// upload crossed a reservation smaller than the per-file limit.
     #[error("project file storage limit exceeded")]
     QuotaExceeded,
     /// Reading the incoming HTTP upload body failed.
     #[error("file upload body failed")]
     Stream(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// A metadata operation failed.
-    #[error("file registry error")]
-    Registry(#[source] FileRegistryError),
+    #[error("file catalog error")]
+    Catalog(#[source] CatalogError),
     /// A byte-store operation failed or rejected its writer bound. The upload
-    /// session classifies expected bound violations using its reservation.
+    /// session classifies expected bound violations before the writer sees them.
     #[error("file store error")]
     Store(#[source] FileStoreError),
 }
 
-impl From<FileRegistryError> for FileServiceError {
-    fn from(error: FileRegistryError) -> Self {
+impl From<CatalogError> for FileServiceError {
+    fn from(error: CatalogError) -> Self {
         match error {
-            FileRegistryError::QuotaExceeded => Self::QuotaExceeded,
-            FileRegistryError::InvalidCursor => Self::InvalidInput("invalid `after` cursor".to_owned()),
-            other => Self::Registry(other),
+            CatalogError::QuotaExceeded => Self::QuotaExceeded,
+            CatalogError::InvalidCursor => Self::InvalidInput("invalid `after` cursor".to_owned()),
+            other => Self::Catalog(other),
         }
     }
 }
@@ -75,9 +73,12 @@ pub struct FileDownload {
 pub trait FileUploadSession: Send {
     /// Before passing a chunk to the byte-store writer, reject it if the
     /// cumulative byte count would exceed the reservation `R`. Return
-    /// [`FileServiceError::QuotaExceeded`] when `R < max_file_size`, otherwise
-    /// [`FileServiceError::UploadTooLarge`]. This classification depends on the
-    /// reserved bound even if one chunk crosses both limits. Never forward a
+    /// [`FileServiceError::QuotaExceeded`] when `R < ask`, where
+    /// `ask = min(size_hint, max_file_size)` is the capacity requested from the
+    /// catalog, otherwise [`FileServiceError::UploadTooLarge`]; the
+    /// classification depends on the reserved bound even if one chunk crosses
+    /// both limits. A body cannot exceed its declared `Content-Length`, so a
+    /// crossing at `R == ask` can only be the per-file limit. Never forward a
     /// chunk that exceeds `R`; the writer also enforces `R` as a safety bound
     /// and applies backpressure. When `R < max_file_size`, earlier chunks may
     /// already have been written before a later chunk reaches the quota bound.
@@ -87,12 +88,12 @@ pub trait FileUploadSession: Send {
     /// Returns the bound-specific error described above or
     /// [`FileServiceError::Store`] for a byte-store failure. Body-read failures
     /// remain [`FileServiceError::Stream`] at the handler boundary. On failure,
-    /// stop the writer and arrange byte deletion while retaining the registry
+    /// stop the writer and arrange byte deletion while retaining the catalog
     /// reservation until cleanup is confirmed.
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), FileServiceError>;
 
     /// Validate the complete form, finish the byte write, then commit the
-    /// file with the writer's actual byte count `A <= R`. The registry replaces
+    /// file with the writer's actual byte count `A <= R`. The catalog replaces
     /// the reservation `R` with `A` without a new quota decision. The handler
     /// calls this after parsing all form fields. Batch uploads without an
     /// explicit expiration default to 30 days from the pending file's creation
@@ -101,9 +102,9 @@ pub trait FileUploadSession: Send {
     /// # Errors
     ///
     /// Returns [`FileServiceError`] for invalid metadata or a failed byte or
-    /// registry operation. On failure, stop the writer where possible and
+    /// catalog operation. On failure, stop the writer where possible and
     /// arrange byte deletion. Retain the reservation until cleanup is
-    /// confirmed. Ambiguous registry completion must be reconciled before
+    /// confirmed. Ambiguous catalog completion must be reconciled before
     /// marking the pending file failed; a successful retry returns the ready
     /// file when all completion fields match.
     async fn finish(self: Box<Self>, metadata: FileUploadMetadata) -> Result<FileInfo, FileServiceError>;
@@ -119,33 +120,41 @@ pub trait FileUploadSession: Send {
     async fn abort(self: Box<Self>) -> Result<(), FileServiceError>;
 }
 
-/// Coordinates the metadata registry and byte store for HTTP handlers.
+/// Coordinates the metadata catalog and byte store for HTTP handlers.
 ///
-/// An upload first inserts a pending registry entry and atomically reserves
-/// `R = min(max_file_size, remaining_quota)` without purpose or expiration.
-/// It opens a byte-store writer limited to `R`, checks each chunk against that
-/// bound before writing, then atomically replaces `R` with the actual byte
-/// count after the writer publishes the file. Pending and failed entries are
-/// never returned by read methods. Failed uploads and hidden or expired files
-/// keep their quota charge until their bytes are deleted. A delete only makes
-/// the registry marker durable and may signal a reaper; it does not wait for
-/// physical byte deletion.
+/// Scoping is per tenant: any subject in a tenant can retrieve, list, download
+/// and delete that tenant's files, and all subjects share one quota.
+///
+/// An upload first inserts a pending catalog entry and atomically reserves
+/// `R = min(ask, remaining_quota)` without purpose or expiration, where
+/// `ask = min(size_hint, max_file_size)` and `size_hint` is the request's
+/// `Content-Length` when present. The hint is only an upper bound on the file:
+/// for multipart it measures the whole body. Without a hint
+/// `ask = max_file_size`. The service opens a byte-store writer limited to
+/// `R`, checks each chunk against that bound before writing, then atomically
+/// replaces `R` with the actual byte count after the writer publishes the file.
+/// Pending and failed entries are never returned by read methods. Failed
+/// uploads and hidden or expired files keep their quota charge until their
+/// bytes are deleted. A delete only makes the catalog marker durable and may
+/// signal a reaper; it does not wait for physical byte deletion.
 /// Implementations must bound the time an upload can remain active so a
 /// scheduled reaper can safely recover abandoned pending entries.
 #[async_trait]
 pub trait FileService: Send + Sync {
     /// Start an upload before all multipart fields are known. The filename
     /// comes from the file part's headers and is never used as a storage key.
-    /// Pass the configured per-file and project limits to the registry and
-    /// retain its durable reservation `R` in the returned session. Reject
-    /// zero capacity before opening a writer; otherwise open it with `R` as
-    /// its limit.
+    /// `size_hint` is the declared `Content-Length`, if any. It bounds the file
+    /// from above, so never reject a hint above the per-file maximum; clamp it.
+    /// Pass `ask = min(size_hint, max_file_size)` (`max_file_size` when absent)
+    /// to the catalog and retain its durable reservation `R` in the returned
+    /// session. The catalog never reserves more than the tenant's remaining
+    /// quota; the service opens the writer with `R` as its limit.
     ///
     /// # Errors
     ///
     /// Returns [`FileServiceError::QuotaExceeded`] if no capacity can be
     /// reserved, or another [`FileServiceError`] for invalid input or a
-    /// registry or store failure. If opening the store writer fails after the
+    /// catalog or store failure. If opening the store writer fails after the
     /// pending entry is inserted, mark that entry failed and arrange byte
     /// deletion; retain its reservation until cleanup is confirmed. The
     /// returned session owns its state across body callbacks.
@@ -153,22 +162,23 @@ pub trait FileService: Send + Sync {
         &self,
         owner: &StateOwner,
         filename: String,
+        size_hint: Option<u64>,
     ) -> Result<Box<dyn FileUploadSession + 'static>, FileServiceError>;
 
-    /// Retrieve completed file metadata for this exact owner.
+    /// Retrieve completed file metadata for this tenant.
     ///
     /// # Errors
     ///
     /// Returns [`FileServiceError::NotFound`] for missing, hidden, or
-    /// differently owned files, or another [`FileServiceError`] on registry
+    /// other tenants' files, or another [`FileServiceError`] on catalog
     /// failure.
     async fn retrieve(&self, owner: &StateOwner, id: &str) -> Result<FileInfo, FileServiceError>;
 
-    /// List completed files for this exact owner.
+    /// List completed files for this tenant.
     ///
     /// # Errors
     ///
-    /// Returns [`FileServiceError`] when the query or registry operation fails.
+    /// Returns [`FileServiceError`] when the query or catalog operation fails.
     async fn list(&self, owner: &StateOwner, options: &FileList) -> Result<FilePage, FileServiceError>;
 
     /// Open a completed file as a stream. Errors can also occur while the
@@ -190,7 +200,7 @@ pub trait FileService: Send + Sync {
     /// # Errors
     ///
     /// Returns [`FileServiceError::NotFound`] for missing, hidden, or
-    /// differently owned files, or another [`FileServiceError`] on registry
+    /// other tenants' files, or another [`FileServiceError`] on catalog
     /// failure.
     async fn delete(&self, owner: &StateOwner, id: &str) -> Result<(), FileServiceError>;
 }

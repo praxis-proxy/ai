@@ -596,7 +596,7 @@ fn validate_items_table<'a>(items: &'a str, responses: &str, conversations: &str
 
 /// Reject a `PostgreSQL` identifier that would be truncated.
 #[cfg(feature = "_postgres")]
-fn validate_postgres_identifier_len(kind: &str, name: &str, max_len: usize) -> Result<(), StoreError> {
+pub(crate) fn validate_postgres_identifier_len(kind: &str, name: &str, max_len: usize) -> Result<(), StoreError> {
     if name.len() > max_len {
         return Err(StoreError::Database(format!(
             "{kind} exceeds PostgreSQL identifier limit of {max_len} bytes: {name}"
@@ -620,7 +620,7 @@ fn validate_postgres_identifier_len(kind: &str, name: &str, max_len: usize) -> R
 /// This is `PostgreSQL`-only. `SQLite` compares table names case-insensitively,
 /// so a mixed-case name resolves to the same table on both paths there.
 #[cfg(feature = "_postgres")]
-fn validate_postgres_identifier_case(kind: &str, name: &str) -> Result<(), StoreError> {
+pub(crate) fn validate_postgres_identifier_case(kind: &str, name: &str) -> Result<(), StoreError> {
     if name.bytes().any(|b| b.is_ascii_uppercase()) {
         return Err(StoreError::Database(format!(
             "{kind} must be lowercase for PostgreSQL, which folds unquoted identifiers: {name}"
