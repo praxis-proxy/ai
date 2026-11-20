@@ -118,7 +118,7 @@ def test_embeddings_batch_preserves_order_dimensions_and_usage(client):
     assert response.usage.total_tokens == response.usage.prompt_tokens
 
 
-def test_responses_passthrough_reports_text_and_usage(client):
+def test_responses_reports_text_and_usage(client):
     response = client.responses.create(
         model=MODEL, input="Reply with OK.", max_output_tokens=32, store=False,
     )
@@ -137,6 +137,33 @@ def test_responses_stream_reports_text_and_completion(client):
         event_types = [event.type for event in stream]
     assert "response.output_text.delta" in event_types
     assert event_types[-1] == "response.completed"
+
+
+def test_responses_function_result_continues_without_storage(client):
+    conversation = [{"role": "user", "content": "Call status, then copy its result verbatim."}]
+    response = client.responses.create(
+        model=MODEL,
+        input=conversation,
+        store=False,
+        tools=[{"type": "function", "name": "status", "parameters": {
+            "type": "object", "properties": {}, "additionalProperties": False,
+        }}],
+        tool_choice={"type": "function", "name": "status"},
+    )
+    call, = [item for item in response.output if item.type == "function_call"]
+    assert call.name == "status"
+    assert json.loads(call.arguments) == {}
+    result = secrets.token_hex(4)
+    conversation.extend([
+        {"type": "function_call", "call_id": call.call_id,
+         "name": call.name, "arguments": call.arguments},
+        {"type": "function_call_output", "call_id": call.call_id, "output": result},
+    ])
+    followup = client.responses.create(
+        model=MODEL, input=conversation, max_output_tokens=64, store=False,
+    )
+    assert followup.status == "completed"
+    assert result in followup.output_text
 
 
 if __name__ == "__main__":

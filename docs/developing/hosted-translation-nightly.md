@@ -42,5 +42,5 @@ It runs the Responses completion and streaming cases from the
 [OpenAI SDK suite](../../tests/integration/sdk/openai/test_openai_chat_completions_live.py).
 Praxis injects the provider key and translates requests to official OpenAI
 Chat Completions. The checks cover completed text and usage, streaming text
-and the terminal completion event, with `store: false`. The
+the terminal completion event, and stateless tool-result continuation, with `store: false`. The
 `hosted-responses-to-chat-results` artifact contains JUnit results and gateway logs.
