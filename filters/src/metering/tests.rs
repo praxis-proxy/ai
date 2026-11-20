@@ -429,16 +429,14 @@ fn billing_only(fail_open: bool) -> AdmissionPolicy {
     AdmissionPolicy {
         billing_fail_open: fail_open,
         model_policy_check: false,
-        model_policy_fail_open: false,
     }
 }
 
 /// Model-policy-enabled policy.
-fn model_policy(billing_fail_open: bool, model_policy_fail_open: bool) -> AdmissionPolicy {
+fn model_policy(billing_fail_open: bool) -> AdmissionPolicy {
     AdmissionPolicy {
         billing_fail_open,
         model_policy_check: true,
-        model_policy_fail_open,
     }
 }
 
@@ -468,9 +466,23 @@ metering_url: "http://metering:8080"
     let filter = build_filter(&yaml).unwrap();
 
     assert!(!filter.model_policy_check, "model policy must default to disabled");
+}
+
+#[test]
+fn model_policy_fail_open_field_is_rejected() {
+    // The model gate is always fail-closed, so the removed availability
+    // knob must fail config loading rather than silently widen admission.
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+model_policy_check: true
+model_policy_fail_open: true
+"#,
+    )
+    .unwrap();
     assert!(
-        !filter.model_policy_fail_open,
-        "model policy must default to fail-closed"
+        build_filter(&yaml).is_err(),
+        "deny_unknown_fields must reject the removed model_policy_fail_open field"
     );
 }
 
@@ -480,42 +492,40 @@ fn model_policy_fields_parse() {
         r#"
 metering_url: "http://metering:8080"
 model_policy_check: true
-model_policy_fail_open: true
 "#,
     )
     .unwrap();
     let filter = build_filter(&yaml).unwrap();
 
     assert!(filter.model_policy_check);
-    assert!(filter.model_policy_fail_open);
 }
 
 #[test]
 fn model_denial_rejects_despite_budget_and_billing_fail_open() {
     // The headline case of issue #1719: budget remains, the model is denied.
     let body = br#"{"hasAccess": true, "modelAllowed": false}"#;
-    let action = parse_balance_result(body, model_policy(true, false));
+    let action = parse_balance_result(body, model_policy(true));
     assert_reject(action, 403, "model not allowed for this user");
 }
 
 #[test]
 fn model_denial_takes_precedence_over_budget_exhaustion() {
     let body = br#"{"hasAccess": false, "modelAllowed": false}"#;
-    let action = parse_balance_result(body, model_policy(false, true));
+    let action = parse_balance_result(body, model_policy(false));
     assert_reject(action, 403, "model not allowed for this user");
 }
 
 #[test]
 fn budget_denial_with_model_allow_rejects_429() {
     let body = br#"{"hasAccess": false, "modelAllowed": true}"#;
-    let action = parse_balance_result(body, model_policy(true, false));
+    let action = parse_balance_result(body, model_policy(true));
     assert_reject(action, 429, "token budget exhausted");
 }
 
 #[test]
 fn model_and_budget_allow_continues() {
     let body = br#"{"hasAccess": true, "modelAllowed": true}"#;
-    let action = parse_balance_result(body, model_policy(false, false));
+    let action = parse_balance_result(body, model_policy(false));
     assert!(
         matches!(action, FilterAction::Continue),
         "both gates allow, so the request continues"
@@ -525,20 +535,11 @@ fn model_and_budget_allow_continues() {
 #[test]
 fn missing_model_verdict_fails_closed_when_policy_enabled() {
     // A legacy response carrying only `hasAccess` leaves the model gate
-    // without a verdict — never an implicit allow.
+    // without a verdict — never an implicit allow, and never admitted by
+    // the billing gate failing open.
     let body = br#"{"hasAccess": true}"#;
-    let action = parse_balance_result(body, model_policy(true, false));
+    let action = parse_balance_result(body, model_policy(true));
     assert_reject(action, 503, "metering system unavailable");
-}
-
-#[test]
-fn missing_model_verdict_fails_open_when_configured() {
-    let body = br#"{"hasAccess": true}"#;
-    let action = parse_balance_result(body, model_policy(true, true));
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "the model gate fails open as configured"
-    );
 }
 
 #[test]
@@ -548,7 +549,7 @@ fn null_and_wrong_typed_model_verdicts_are_unavailable() {
         r#"{"hasAccess": true, "modelAllowed": "yes"}"#,
         r#"{"hasAccess": true, "modelAllowed": 1}"#,
     ] {
-        let action = parse_balance_result(body.as_bytes(), model_policy(true, false));
+        let action = parse_balance_result(body.as_bytes(), model_policy(true));
         assert_reject(action, 503, "metering system unavailable");
     }
 }
@@ -558,24 +559,16 @@ fn wrong_typed_model_verdict_preserves_budget_verdict() {
     // Per-gate parsing: an unusable `modelAllowed` must not discard a valid
     // explicit budget denial.
     let body = br#"{"hasAccess": false, "modelAllowed": "yes"}"#;
-    let action = parse_balance_result(body, model_policy(true, true));
+    let action = parse_balance_result(body, model_policy(true));
     assert_reject(action, 429, "token budget exhausted");
 }
 
 #[test]
-fn billing_fail_open_with_model_fail_closed_rejects_on_unusable_payload() {
-    // Independence check: billing fail-open must not drag the model gate open.
-    let action = parse_balance_result(b"", model_policy(true, false));
+fn billing_fail_open_with_model_gate_rejects_on_unusable_payload() {
+    // Independence check: billing fail-open must not drag the model gate
+    // open — and the model gate can no longer be configured open at all.
+    let action = parse_balance_result(b"", model_policy(true));
     assert_reject(action, 503, "metering system unavailable");
-}
-
-#[test]
-fn unusable_payload_admits_only_when_all_gates_fail_open() {
-    let action = parse_balance_result(b"", model_policy(true, true));
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "an unusable payload admits only when every gate fails open"
-    );
 }
 
 // -----------------------------------------------------------------------------
@@ -592,27 +585,28 @@ fn sub_response(status: u16, body: &str) -> SubResponse {
     }
 }
 
-/// A model-policy filter with the given billing and model-gate availability
-/// policies; `metering_url` points nowhere because these tests inject the
+/// A model-policy filter with the given billing availability policy;
+/// `metering_url` points nowhere because these tests inject the
 /// callout result directly.
-fn availability_filter(billing_fail_open: bool, model_policy_fail_open: bool) -> ExternalMeteringFilter {
+fn availability_filter(billing_fail_open: bool) -> ExternalMeteringFilter {
     filter_from_yaml(&format!(
-        "metering_url: \"http://127.0.0.1:1\"\nallow_private_endpoint: true\nfail_open: {billing_fail_open}\nmodel_policy_check: true\nmodel_policy_fail_open: {model_policy_fail_open}\n"
+        "metering_url: \"http://127.0.0.1:1\"\nallow_private_endpoint: true\nfail_open: {billing_fail_open}\nmodel_policy_check: true\n"
     ))
 }
 
 /// Every transport-level failure leaves both gates without verdicts, so
-/// billing fail-open with model-policy fail-closed must reject with 503.
+/// billing fail-open with the always-fail-closed model gate must reject
+/// with 503.
 #[test]
 fn model_gate_fails_closed_on_timeout_despite_billing_fail_open() {
-    let filter = availability_filter(true, false);
+    let filter = availability_filter(true);
     let action = filter.interpret_balance(Err(SubRequestError::DeadlineExceeded));
     assert_reject(action, 503, "metering system unavailable");
 }
 
 #[test]
 fn model_gate_fails_closed_on_non_2xx_despite_billing_fail_open() {
-    let filter = availability_filter(true, false);
+    let filter = availability_filter(true);
     let action = filter.interpret_balance(Ok(sub_response(500, "internal error")));
     assert_reject(action, 503, "metering system unavailable");
 }
@@ -622,7 +616,7 @@ fn model_gate_fails_closed_on_oversized_response_despite_billing_fail_open() {
     // A metering response above the 64 KiB callout cap is truncated by the
     // transport and surfaces as a `ResponseTooLarge` error, never as
     // verdicts.
-    let filter = availability_filter(true, false);
+    let filter = availability_filter(true);
     let action = filter.interpret_balance(Err(SubRequestError::ResponseTooLarge {
         actual: MAX_CALLOUT_RESPONSE_BYTES + 1,
         limit: MAX_CALLOUT_RESPONSE_BYTES,
@@ -631,9 +625,9 @@ fn model_gate_fails_closed_on_oversized_response_despite_billing_fail_open() {
 }
 
 #[test]
-fn transport_failures_admit_only_when_every_gate_fails_open() {
-    // Independence in the other direction: a model gate failing open must
-    // not drag the billing gate open with it.
+fn transport_failures_reject_under_the_model_gate_regardless_of_billing() {
+    // The model gate is always fail-closed, so a shared callout failure
+    // rejects with 503 no matter how the billing gate is configured.
     let make_failure = |case: usize| match case {
         0 => Err(SubRequestError::DeadlineExceeded),
         1 => Err(SubRequestError::ResponseTooLarge {
@@ -643,17 +637,14 @@ fn transport_failures_admit_only_when_every_gate_fails_open() {
         _ => Ok(sub_response(503, "overloaded")),
     };
     for case in 0..3 {
-        let both_open = availability_filter(true, true);
-        assert!(
-            matches!(both_open.interpret_balance(make_failure(case)), FilterAction::Continue),
-            "a shared callout failure admits only when every gate fails open"
-        );
-        let billing_closed = availability_filter(false, true);
-        assert_reject(
-            billing_closed.interpret_balance(make_failure(case)),
-            503,
-            "metering system unavailable",
-        );
+        for billing_fail_open in [true, false] {
+            let filter = availability_filter(billing_fail_open);
+            assert_reject(
+                filter.interpret_balance(make_failure(case)),
+                503,
+                "metering system unavailable",
+            );
+        }
     }
 }
 
@@ -661,7 +652,7 @@ fn transport_failures_admit_only_when_every_gate_fails_open() {
 fn transport_failures_never_authorize_an_explicit_denial_path() {
     // Sanity: an explicit `modelAllowed: false` on a usable 2xx payload still
     // wins over every availability policy.
-    let filter = availability_filter(true, true);
+    let filter = availability_filter(true);
     let action = filter.interpret_balance(Ok(sub_response(200, r#"{"hasAccess": true, "modelAllowed": false}"#)));
     assert_reject(action, 403, "model not allowed for this user");
 }
@@ -738,9 +729,15 @@ fn verdicts_on_unparseable_body_are_all_unavailable() {
 // -----------------------------------------------------------------------------
 
 fn model_policy_filter_yaml(extra: &str) -> serde_yaml::Value {
+    model_policy_filter_yaml_at("http://127.0.0.1:1", extra)
+}
+
+/// Like [`model_policy_filter_yaml`], but pointing the metering callout at
+/// the given URL instead of a dead port.
+fn model_policy_filter_yaml_at(metering_url: &str, extra: &str) -> serde_yaml::Value {
     serde_yaml::from_str(&format!(
         r#"
-metering_url: "http://127.0.0.1:1"
+metering_url: "{metering_url}"
 allow_private_endpoint: true
 fail_open: true
 identity_header_prefix: "x-tenant-"
@@ -751,6 +748,30 @@ model_policy_check: true
 "#
     ))
     .unwrap()
+}
+
+/// Serve one canned entitlement response admitting both gates on an
+/// ephemeral loopback port, returning that port. The model gate is always
+/// fail-closed, so admission paths need a live verdict; single-shot server
+/// pattern mirroring `gcp/tests.rs`.
+fn spawn_admitting_metering() -> u16 {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0_u8; 4096];
+        let _ = stream.read(&mut buf).unwrap();
+        let body = r#"{"hasAccess": true, "modelAllowed": true}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    port
 }
 
 #[tokio::test]
@@ -781,18 +802,19 @@ async fn model_policy_rejects_unresolvable_model() {
 
 #[tokio::test]
 async fn model_policy_resolves_model_from_buffered_body() {
-    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    let port = spawn_admitting_metering();
+    let filter = build_filter(&model_policy_filter_yaml_at(&format!("http://127.0.0.1:{port}"), "")).unwrap();
     let mut req = make_request(http::Method::POST, "/v1/chat/completions");
     req.headers
         .insert("x-tenant-username", http::HeaderValue::from_static("alice"));
     let mut ctx = make_filter_context(&req);
     ctx.buffered_request_body = Some(Bytes::from_static(br#"{"model": "gpt-4o", "messages": []}"#));
 
-    // metering_url points at a dead port, so the callout fails.
+    // The admitting metering service returns allow verdicts for both gates.
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "both gates fail open against the dead metering port"
+        "both gates allow through the live admitting metering service"
     );
     let state = ctx
         .filter_state
@@ -923,8 +945,9 @@ async fn model_policy_rejects_escaped_body_model_key_alongside_identity_model() 
 async fn model_policy_allows_absent_body_model_alongside_identity_model() {
     // Control for the unusable-body rejections: a body with no `model`
     // member at all is genuinely absent, so the identity model alone
-    // authorizes (here through the fail-open gates).
-    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    // authorizes (here through the admitting metering service).
+    let port = spawn_admitting_metering();
+    let filter = build_filter(&model_policy_filter_yaml_at(&format!("http://127.0.0.1:{port}"), "")).unwrap();
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
     ctx.filter_metadata
@@ -999,8 +1022,9 @@ async fn model_policy_rejects_body_above_pre_read_bound_regardless_of_pipeline_b
 #[tokio::test]
 async fn model_policy_allows_body_at_pre_read_bound() {
     // Control: a body exactly at the bound is within the documented cap and
-    // must flow through the (fail-open) gates, not reject.
-    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    // must flow through the admitting metering service, not reject.
+    let port = spawn_admitting_metering();
+    let filter = build_filter(&model_policy_filter_yaml_at(&format!("http://127.0.0.1:{port}"), "")).unwrap();
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
     ctx.filter_metadata
@@ -1032,7 +1056,8 @@ async fn model_policy_ignores_body_once_client_model_is_recorded() {
     // different (provider) model. The body is not a comparison source once
     // a client-facing model exists: the preflight must authorize the
     // client-facing alias — the model the provider rewrite preserves.
-    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    let port = spawn_admitting_metering();
+    let filter = build_filter(&model_policy_filter_yaml_at(&format!("http://127.0.0.1:{port}"), "")).unwrap();
     let req = make_request(http::Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&req);
     ctx.filter_metadata
@@ -1049,7 +1074,7 @@ async fn model_policy_ignores_body_once_client_model_is_recorded() {
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "a provider-side rewrite is not a model conflict; both gates fail open here"
+        "a provider-side rewrite is not a model conflict; the admitting service authorizes it"
     );
     let state = ctx
         .filter_state
@@ -1068,7 +1093,8 @@ async fn model_policy_agreeing_model_sources_authorize_the_requested_model() {
     // same model, the preflight authorizes exactly that model — the one the
     // provider receives (modulo the provider-side rewrite, which preserves
     // the client-facing alias).
-    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    let port = spawn_admitting_metering();
+    let filter = build_filter(&model_policy_filter_yaml_at(&format!("http://127.0.0.1:{port}"), "")).unwrap();
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
     ctx.filter_metadata
@@ -1085,7 +1111,7 @@ async fn model_policy_agreeing_model_sources_authorize_the_requested_model() {
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "agreeing sources must admit through the fail-open gates"
+        "agreeing sources must be admitted by the authorizing service"
     );
     let state = ctx
         .filter_state
@@ -1135,7 +1161,8 @@ async fn model_policy_disabled_preserves_identity_model_precedence_for_reporting
 
 #[tokio::test]
 async fn model_policy_verified_identity_model_wins_over_forged_header() {
-    let filter = build_filter(&model_policy_filter_yaml("model_policy_fail_open: true")).unwrap();
+    let port = spawn_admitting_metering();
+    let filter = build_filter(&model_policy_filter_yaml_at(&format!("http://127.0.0.1:{port}"), "")).unwrap();
     let mut req = make_request(http::Method::POST, "/v1/chat/completions");
     // Forged raw header, lower trust tier than verified metadata.
     req.headers
@@ -1155,7 +1182,7 @@ async fn model_policy_verified_identity_model_wins_over_forged_header() {
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "the verified identity model must pass the fail-open gates"
+        "the verified identity model must be admitted by the authorizing service"
     );
     let state = ctx
         .filter_state

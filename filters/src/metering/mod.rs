@@ -182,10 +182,12 @@ const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
 ///
 /// Response contract (stable bodies): an explicit budget denial rejects with
 /// 429 and body `token budget exhausted`; an explicit model denial rejects
-/// with 403 and body `model not allowed for this user`, regardless of either
-/// `fail_open` setting and with precedence over budget exhaustion; a verdict
-/// unavailable under a fail-closed gate rejects with 503 and body
-/// `metering system unavailable`. With model policy enabled, a missing trusted
+/// with 403 and body `model not allowed for this user`, regardless of the
+/// billing `fail_open` setting and with precedence over budget exhaustion; a
+/// verdict unavailable under a fail-closed gate rejects with 503 and body
+/// `metering system unavailable` — and the model gate is always fail-closed,
+/// so any unavailable model verdict rejects with 503. With model policy
+/// enabled, a missing trusted
 /// identity rejects with 403 and body `tenant identity required for model
 /// authorization`; an unresolvable model rejects with 403 and body `request
 /// model required for model authorization`; conflicting or ambiguous model
@@ -213,9 +215,9 @@ const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
 /// - `modelAllowed: false` rejects with **403** before any provider request, regardless of the billing `fail_open` and
 ///   with precedence over budget exhaustion (`hasAccess: false` still rejects with 429 on its own).
 /// - An unavailable model verdict — missing, `null`, wrongly typed, an unusable payload, a non-2xx response, a timeout,
-///   or a transport error — is governed by `model_policy_fail_open` (default **fail-closed, 503**), independent of the
-///   billing `fail_open`. Admission on a shared callout failure requires every enabled gate's availability policy to
-///   permit it.
+///   or a transport error — always rejects with 503 before any provider request: model authorization is fail-closed,
+///   independent of the billing `fail_open`. An explicit `modelAllowed: false` rejection is never affected by either
+///   setting.
 /// - Every metered request then needs a trusted tenant identity and a resolvable public model. If the identity comes
 ///   from raw `{prefix}*` request headers, the ingress boundary must delete client-supplied copies and set those
 ///   headers from authenticated data before this filter runs: the filter cannot distinguish client-supplied headers
@@ -246,7 +248,6 @@ const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
 /// default_username: "anonymous"
 /// default_model: "unknown"
 /// model_policy_check: true
-/// model_policy_fail_open: false
 /// ```
 ///
 /// # End-to-end identity metering with the Praxis Policy Engine (YAML)
@@ -346,10 +347,6 @@ const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
 ///   authentication:
 ///     - jwt-user
 /// ```
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "independent billing and model-policy fail-open controls"
-)]
 pub struct ExternalMeteringFilter {
     /// Connect-time policy for the metering endpoint. Rejects non-public
     /// addresses unless the operator sets `allow_private_endpoint`.
@@ -402,11 +399,6 @@ pub struct ExternalMeteringFilter {
     /// Whether the entitlement preflight enforces the model-policy verdict
     /// (`modelAllowed`). See [`ExternalMeteringConfig::model_policy_check`].
     model_policy_check: bool,
-
-    /// Availability policy for the model-policy gate, independent of the
-    /// billing `fail_open`. See
-    /// [`ExternalMeteringConfig::model_policy_fail_open`].
-    model_policy_fail_open: bool,
 
     /// Static provider name for emitted events. Takes precedence over the
     /// routed cluster name; the only source of provider attribution on the
@@ -476,7 +468,6 @@ impl ExternalMeteringFilter {
             identity_group_claim: cfg.identity_group_claim,
             metering_url: cfg.metering_url,
             model_policy_check: cfg.model_policy_check,
-            model_policy_fail_open: cfg.model_policy_fail_open,
             provider: cfg.provider,
             source: cfg.source,
             subrequest_client,
@@ -552,7 +543,6 @@ impl ExternalMeteringFilter {
         AdmissionPolicy {
             billing_fail_open: self.fail_open,
             model_policy_check: self.model_policy_check,
-            model_policy_fail_open: self.model_policy_fail_open,
         }
     }
 
@@ -984,14 +974,11 @@ impl BalanceVerdicts {
 
 /// Per-gate admission settings resolved from the filter config.
 ///
-/// The billing gate is always enabled; the model-policy gate is opt-in and
-/// carries its own availability policy, so a billing `fail_open` can never
-/// silently drag the model gate open (or closed).
+/// The billing gate is always enabled and follows its own availability
+/// policy (`fail_open`); the model-policy gate is opt-in and always
+/// fail-closed, so a billing `fail_open` can never silently drag the
+/// model gate open.
 #[derive(Clone, Copy)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "per-gate enable and availability controls that must stay independent"
-)]
 struct AdmissionPolicy {
     /// Billing-gate availability: admit when the budget verdict is
     /// unavailable (the legacy `fail_open` setting).
@@ -999,10 +986,6 @@ struct AdmissionPolicy {
 
     /// Whether the model-policy verdict (`modelAllowed`) is enforced.
     model_policy_check: bool,
-
-    /// Model-gate availability: admit when the model verdict is
-    /// unavailable. Independent of `billing_fail_open`.
-    model_policy_fail_open: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -1194,7 +1177,8 @@ fn parse_balance_verdicts(body: &[u8]) -> BalanceVerdicts {
 /// Order matters: an explicit model denial wins over budget exhaustion and
 /// over every availability policy, a budget denial beats every availability
 /// policy, and admission on unavailable verdicts requires *every* enabled
-/// gate's own fail-open setting to permit it.
+/// gate to permit it — the billing gate via its `fail_open` setting, the
+/// model gate never (it is always fail-closed).
 fn decide_admission(verdicts: &BalanceVerdicts, policy: AdmissionPolicy) -> FilterAction {
     if policy.model_policy_check && verdicts.model_allowed == Some(false) {
         return reject_model_not_allowed();
@@ -1208,7 +1192,10 @@ fn decide_admission(verdicts: &BalanceVerdicts, policy: AdmissionPolicy) -> Filt
         return reject_unavailable();
     }
 
-    if policy.model_policy_check && verdicts.model_allowed.is_none() && !policy.model_policy_fail_open {
+    // Model authorization is always fail-closed: with the gate enabled, an
+    // unavailable model verdict can never admit the request, even when the
+    // billing gate fails open on the same callout failure.
+    if policy.model_policy_check && verdicts.model_allowed.is_none() {
         return reject_unavailable();
     }
 

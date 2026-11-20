@@ -151,7 +151,6 @@ filter_chains:
         fail_open: true
         identity_header_prefix: "x-tenant-"
         model_policy_check: true
-        model_policy_fail_open: false
       - filter: model_to_provider
         models:
           - model: claude-sonnet-4-5
@@ -452,7 +451,6 @@ filter_chains:
         fail_open: true
         identity_header_prefix: "x-tenant-"
         model_policy_check: true
-        model_policy_fail_open: false
       - filter: load_balancer
         clusters:
           - name: backend
@@ -529,7 +527,6 @@ filter_chains:
         fail_open: true
         identity_header_prefix: "x-tenant-"
         model_policy_check: true
-        model_policy_fail_open: false
       - filter: model_to_provider
         models:
           - model: claude-sonnet-4-5

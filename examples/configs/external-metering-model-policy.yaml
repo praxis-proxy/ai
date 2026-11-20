@@ -20,10 +20,10 @@
 #                                       regardless of billing fail_open, and
 #                                       taking precedence over budget denial
 #   - hasAccess: false               -> 429 token budget exhausted
-#   - verdict unavailable (missing,  -> model_policy_fail_open decides:
-#     null, wrong type, unusable        503 by default (fail-closed); the
-#     payload, non-2xx, timeout,        setting is independent of the billing
-#     transport error)                  fail_open below
+#   - verdict unavailable (missing,  -> 503 metering system unavailable:
+#     null, wrong type, unusable        model authorization is always
+#     payload, non-2xx, timeout,        fail-closed, independent of the
+#     transport error)                  billing fail_open below
 #
 # Model resolution for the preflight: the trusted {prefix}model identity
 # header, the model_to_provider client model, and (when no client model was
@@ -78,12 +78,10 @@ filter_chains:
         identity_header_prefix: "x-tenant-"
         # Model-policy gate: enforce the modelAllowed verdict. Disabled by
         # default; enabling it requires a trusted tenant identity and a
-        # resolvable public model on every metered request.
+        # resolvable public model on every metered request. The gate is
+        # always fail-closed: an unavailable model verdict rejects with 503
+        # regardless of billing fail_open above.
         model_policy_check: true
-        # Model-gate availability, independent of billing fail_open above:
-        # fail closed (503) when the model verdict is unavailable. Set to
-        # true to admit instead — an explicit model denial still rejects.
-        model_policy_fail_open: false
 
       - filter: token_count
         provider: openai

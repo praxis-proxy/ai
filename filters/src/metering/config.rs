@@ -34,13 +34,12 @@ const DEFAULT_SOURCE: &str = "ai-gateway";
 /// default_username: "anonymous"
 /// default_model: "unknown"
 /// model_policy_check: true
-/// model_policy_fail_open: false
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "independent billing and model-policy availability controls"
+    reason = "independent billing and model-policy controls"
 )]
 pub(super) struct ExternalMeteringConfig {
     /// Base URL of the external metering service (required).
@@ -98,16 +97,6 @@ pub(super) struct ExternalMeteringConfig {
     /// data: this filter cannot distinguish client-set headers.
     #[serde(default)]
     pub model_policy_check: bool,
-
-    /// Availability policy for the model-policy gate when
-    /// `model_policy_check` is enabled, independent of the billing
-    /// `fail_open`: when the model verdict is unavailable (missing, `null`,
-    /// wrongly typed, unusable payload, non-2xx, timeout, transport error),
-    /// `true` admits the request and `false` (default) rejects with 503.
-    /// An explicit `modelAllowed: false` rejection is never affected by
-    /// this setting.
-    #[serde(default)]
-    pub model_policy_fail_open: bool,
 
     /// Prefix for tenant identity headers to capture and strip.
     /// Expected headers: `{prefix}username`, `{prefix}group`,
