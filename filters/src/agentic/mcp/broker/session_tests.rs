@@ -39,6 +39,8 @@ struct MockBackend {
     initialize_delay: Option<std::time::Duration>,
     /// Mint no session id (stateless backend).
     sessionless: bool,
+    /// Version the backend negotiates instead of echoing the requested one.
+    negotiated_version: Option<&'static str>,
 }
 
 impl MockBackend {
@@ -83,7 +85,7 @@ impl McpBackendClient for MockBackend {
         }
         let n = self.minted.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(BackendInit {
-            protocol_version: Box::from("2025-06-18"),
+            protocol_version: Box::from(self.negotiated_version.unwrap_or(protocol_version)),
             session_id: (!self.sessionless).then(|| HeaderValue::from_str(&format!("backend-{n}")).unwrap()),
             endpoint: Some(Arc::from(format!("10.0.0.{n}:3001"))),
         })
@@ -146,7 +148,12 @@ fn broker_with(mock: Arc<MockBackend>) -> McpBrokerFilter {
     let servers = cfg.servers.clone();
     let (validated, catalog) = build_config(cfg).unwrap();
     let settings = validated.backend_sessions.clone().unwrap();
-    let backend = BackendSessions::new(mock, Some(crate::isolated_subrequest_client(1)), &settings);
+    let backend = BackendSessions::new(
+        mock,
+        Some(crate::isolated_subrequest_client(1)),
+        &settings,
+        validated.supported_versions.clone(),
+    );
     McpBrokerFilter::build(&validated, catalog, &servers, Some(backend))
 }
 
@@ -237,6 +244,23 @@ async fn route_with_response(
     );
 }
 
+/// Route a call that never gets a backend response, the way core finishes a
+/// request after an upstream connect failure: the response hook runs without
+/// headers during cleanup, then completion reports the proxy's `status`.
+async fn route_without_response(filter: &McpBrokerFilter, req: &praxis_filter::Request, tool: &str, status: u16) {
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.current_filter_id = Some(0);
+    let mut body = Some(call_body(tool));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release), "call must be forwarded");
+    let _cleanup = filter.on_response(&mut ctx).await.unwrap();
+    assert!(
+        filter.observes_request_completion(),
+        "the broker must observe completion"
+    );
+    filter.on_request_complete(&mut ctx, status);
+}
+
 fn header<'a>(routed: &'a Routed, name: &str) -> Option<&'a str> {
     routed
         .set_headers
@@ -295,7 +319,7 @@ async fn missing_backend_session_runs_handshake_then_forwards() {
     );
     assert_eq!(
         header(&routed, "mcp-protocol-version"),
-        Some("2025-06-18"),
+        Some("2025-03-26"),
         "negotiated backend version must be forwarded"
     );
     let forwarded: serde_json::Value = serde_json::from_slice(routed.body.as_ref().unwrap()).unwrap();
@@ -416,6 +440,45 @@ async fn backend_502_invalidates_and_next_call_reinitializes() {
         next.pinned_endpoint.as_deref(),
         Some("10.0.0.2:3001"),
         "the new session's endpoint must be pinned"
+    );
+}
+
+#[tokio::test]
+async fn unreachable_endpoint_without_response_invalidates() {
+    for status in [502, 504] {
+        let mock = Arc::new(MockBackend::default());
+        let filter = broker_with(Arc::clone(&mock));
+        let req = call_request(Some("gw-1"), None);
+
+        route_without_response(&filter, &req, "weather_get_weather", status).await;
+        let next = route(&filter, &req, "weather_get_weather").await;
+
+        assert_eq!(
+            mock.count("initialize"),
+            2,
+            "a proxy {status} with no backend response must force a fresh handshake"
+        );
+        assert_eq!(
+            next.pinned_endpoint.as_deref(),
+            Some("10.0.0.2:3001"),
+            "the new session's endpoint must be pinned"
+        );
+    }
+}
+
+#[tokio::test]
+async fn local_rejection_without_response_keeps_mapping() {
+    let mock = Arc::new(MockBackend::default());
+    let filter = broker_with(Arc::clone(&mock));
+    let req = call_request(Some("gw-1"), None);
+
+    route_without_response(&filter, &req, "weather_get_weather", 403).await;
+    route(&filter, &req, "weather_get_weather").await;
+
+    assert_eq!(
+        mock.count("initialize"),
+        1,
+        "a local rejection must not drop the session"
     );
 }
 
@@ -650,6 +713,33 @@ async fn initialized_failure_terminates_new_session() {
         1,
         "a half-initialized session must be terminated"
     );
+}
+
+#[tokio::test]
+async fn unsupported_backend_version_is_never_confirmed() {
+    let mock = Arc::new(MockBackend {
+        negotiated_version: Some("2099-01-01"),
+        ..MockBackend::default()
+    });
+    let filter = broker_with(Arc::clone(&mock));
+
+    let routed = route(&filter, &call_request(Some("gw-1"), None), "weather_get_weather").await;
+
+    let (_, body) = rejection_json(&routed.action);
+    assert_eq!(
+        body["error"]["data"]["reason"], "unsupported_protocol_version",
+        "an unsupported fallback must be classified"
+    );
+    assert_eq!(mock.count("initialized"), 0, "the handshake must not be confirmed");
+    assert_eq!(mock.count("terminate"), 1, "the unusable session must be terminated");
+    assert!(routed.cluster.is_none(), "no tool call may be forwarded");
+
+    let retried = route(&filter, &call_request(Some("gw-1"), None), "weather_get_weather").await;
+    assert!(
+        !matches!(retried.action, FilterAction::Release),
+        "the rejected session must not be cached"
+    );
+    assert_eq!(mock.count("initialize"), 2, "the next call must retry the handshake");
 }
 
 #[tokio::test]

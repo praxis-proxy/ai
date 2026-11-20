@@ -19,3 +19,51 @@ pub(crate) mod responses;
 #[cfg(feature = "openai-responses")]
 pub(crate) use config::SseParserConfig;
 pub(crate) use frame::{SseFrame, SseFrameParser, SseParseError};
+
+/// Decode a complete, already-buffered SSE body into each event's joined
+/// `data` payload, in order.
+///
+/// Runs the conforming [`SseFrameParser`]: CR, LF, and CRLF line endings, an
+/// optional leading UTF-8 BOM, comments, and colonless fields. Because the
+/// caller has read the body to its end, a final event without a terminating
+/// blank line is still returned.
+pub fn buffered_sse_event_data(body: &[u8]) -> Vec<Vec<u8>> {
+    // The limit covers the whole body plus the flushing terminator, so the
+    // parser cannot overflow on input the caller already bounded.
+    let mut parser = SseFrameParser::new(body.len().saturating_add(2));
+    let mut frames = parser.parse_chunk(body).unwrap_or_default();
+    if parser.has_incomplete_frame() {
+        frames.extend(parser.parse_chunk(b"\n\n").unwrap_or_default());
+    }
+    frames.into_iter().map(|frame| frame.data).collect()
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::indexing_slicing, reason = "tests")]
+mod buffered_tests {
+    use super::buffered_sse_event_data;
+
+    #[test]
+    fn decodes_cr_only_framing() {
+        let events = buffered_sse_event_data(b"event: message\rdata: {\"a\":1}\r\r");
+        assert_eq!(events, vec![b"{\"a\":1}".to_vec()], "bare CR must end lines and events");
+    }
+
+    #[test]
+    fn skips_leading_bom() {
+        let events = buffered_sse_event_data(b"\xEF\xBB\xBFdata: x\n\n");
+        assert_eq!(
+            events,
+            vec![b"x".to_vec()],
+            "a leading BOM must not hide the first field"
+        );
+    }
+
+    #[test]
+    fn returns_unterminated_final_event() {
+        let events = buffered_sse_event_data(b"data: first\n\ndata: last");
+        assert_eq!(events.len(), 2, "a complete body's final event must be returned");
+        assert_eq!(events[1], b"last".to_vec(), "final event data must be kept");
+    }
+}
