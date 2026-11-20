@@ -1,14 +1,21 @@
-# Manual probe that makes one billable inference request.
+# Access probe that makes one billable inference request.
 name: Bedrock Mantle smoke
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/bedrock-mantle-smoke.yaml]
 
 permissions: {}
 
 jobs:
   smoke:
-    if: github.repository == 'praxis-proxy/ai' && github.ref == 'refs/heads/main'
+    if: >-
+      github.repository == 'praxis-proxy/ai' &&
+      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+       (github.event_name == 'pull_request' && github.event.pull_request.number == 2076 &&
+        github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
