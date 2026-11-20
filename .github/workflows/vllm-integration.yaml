@@ -137,7 +137,7 @@ env:
   VLLM_MODEL: "Qwen/Qwen3-0.6B"
   # Use the CUDA 13 default image. The v0.32.0-cu129 image resolves a CUDA 13
   # torchcodec wheel, which fails to import because libnvrtc.so.13 is absent.
-  VLLM_GPU_IMAGE: "docker.io/vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34"
+  VLLM_GPU_IMAGE: "docker.io/vllm/vllm-openai:v0.34.0@sha256:20fdb089454afbb324efa4110a2c025ff7b27cc1a086e07aa580b18df8ad1ce1"
   # The full suite's model-baked image is NOT pinned here: it is described by
   # vllm/images.json and published by vllm-gpu-container.yaml. The job reads the
   # manifest, reuses the published build when it matches this checkout, and
@@ -1340,7 +1340,7 @@ jobs:
     env:
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
-      CODEX_VERSION: "0.167.0"
+      CODEX_VERSION: "0.170.0"
       CODEX_VLLM_MODEL: qwen3-8b
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

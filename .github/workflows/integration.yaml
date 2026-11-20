@@ -571,7 +571,7 @@ jobs:
     env:
       # Keep in sync with tests/integration/fixtures/codex-cli/pin.toml; the
       # offline test `codex_pin::codex_lanes_are_wired_in_ci` enforces it.
-      CODEX_VERSION: "0.167.0"
+      CODEX_VERSION: "0.170.0"
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
     steps:
@@ -708,7 +708,7 @@ jobs:
     permissions:
       contents: read
     env:
-      OPENCODE_VERSION: "1.19.3"
+      OPENCODE_VERSION: "1.19.6"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -811,7 +811,7 @@ jobs:
     permissions:
       contents: read
     env:
-      OPENCODE_V2_VERSION: "2.1.2"
+      OPENCODE_V2_VERSION: "2.3.2"
       OPENCODE_V2_PLATFORM: "linux-x64"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -936,7 +936,7 @@ jobs:
     permissions:
       contents: read
     env:
-      PI_VERSION: "1.4.0"
+      PI_VERSION: "1.5.2"
       PI_PLATFORM: "linux-x64"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1115,7 +1115,7 @@ jobs:
     env:
       # Keep in sync with tests/integration/fixtures/codex-cli/pin.toml; the
       # offline test `codex_pin::codex_lanes_are_wired_in_ci` enforces it.
-      CODEX_VERSION: "0.167.0"
+      CODEX_VERSION: "0.170.0"
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
     steps:
