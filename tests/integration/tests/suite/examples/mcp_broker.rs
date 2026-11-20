@@ -6,13 +6,69 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    free_port, http_send, load_example_config, parse_body, parse_status, start_backend_with_shutdown,
-    start_echo_backend, start_proxy,
+    McpMockConfig, McpToolFixture, free_port, http_send, load_example_config, parse_body, parse_header, parse_status,
+    start_backend_with_shutdown, start_echo_backend, start_mcp_mock_server_with_config, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
+
+#[test]
+fn mcp_session_broker_example_initializes_backend_session() {
+    let weather = start_mcp_mock_server_with_config(McpMockConfig {
+        enforce_sessions: true,
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
+    let calendar = start_mcp_mock_server_with_config(McpMockConfig {
+        enforce_sessions: true,
+        tools: vec![McpToolFixture::new("create_event")],
+        ..McpMockConfig::default()
+    });
+    let proxy_port = free_port();
+    let config = load_example_config(
+        "mcp-session-broker.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3001", weather.port()), ("127.0.0.1:3002", calendar.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let init = http_send(
+        proxy.addr(),
+        &json_post(
+            "/mcp",
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{}}}"#,
+        ),
+    );
+    assert_eq!(parse_status(&init), 200, "initialize should return 200");
+    let gateway = parse_header(&init, "mcp-session-id").expect("gateway session must be issued");
+
+    let body = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cal_create_event","arguments":{}}}"#;
+    let call = format!(
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nMcp-Session-Id: {gateway}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let raw = http_send(proxy.addr(), &call);
+
+    assert_eq!(parse_status(&raw), 200, "tools/call should succeed: {raw}");
+    assert!(
+        parse_body(&raw).contains("mock result for create_event"),
+        "backend result must reach the client: {raw}"
+    );
+    assert_eq!(
+        calendar.method_count("initialize"),
+        1,
+        "calendar backend must be initialized"
+    );
+    assert_eq!(
+        calendar.session_ids_for("tools/call"),
+        vec![Some("mock-mcp-session-1".to_owned())],
+        "the call must carry the backend session"
+    );
+}
 
 #[test]
 fn mcp_static_catalog_example_serves_prefixed_catalog() {
