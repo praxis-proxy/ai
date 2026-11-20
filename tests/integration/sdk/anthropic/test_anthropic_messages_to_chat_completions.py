@@ -696,6 +696,439 @@ class TestRequestFieldHandling:
         assert upstream["messages"][1]["tool_calls"][0]["function"]["name"] == "lookup"
         assert upstream["messages"][2]["content"] == ""
 
+    def test_errored_tool_result_is_translated_not_rejected(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "cat: missing.txt: No such file or directory",
+                        "is_error": True,
+                    }],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tool_message = upstream["messages"][2]
+        assert tool_message["role"] == "tool"
+        assert tool_message["tool_call_id"] == "toolu_1"
+        assert tool_message["content"] == (
+            "Anthropic tool_result error:\ncat: missing.txt: No such file or directory"
+        )
+
+    def test_tool_result_image_content_is_promoted_to_user_message(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [
+                            {"type": "text", "text": "chart"},
+                            {
+                                "type": "image",
+                                "source": {"type": "url", "url": "https://example.com/chart.png"},
+                            },
+                        ],
+                    }],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tool_message = upstream["messages"][2]
+        assert tool_message["role"] == "tool"
+        assert tool_message["content"] == "chart"
+        image_message = upstream["messages"][3]
+        assert image_message["role"] == "user"
+        assert image_message["content"][0]["type"] == "image_url"
+        assert image_message["content"][0]["image_url"]["url"] == "https://example.com/chart.png"
+
+    def test_parallel_tool_result_images_follow_all_tool_messages(self, anthropic_client):
+        # Chat Completions requires every tool reply to follow the assistant
+        # `tool_calls` message directly, so an image promoted out of the first
+        # of two parallel tool results may only appear as a user message after
+        # the last tool message — never between two tool messages.
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}},
+                        {"type": "tool_use", "id": "toolu_2", "name": "lookup", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [
+                                {"type": "text", "text": "chart"},
+                                {
+                                    "type": "image",
+                                    "source": {"type": "url", "url": "https://example.com/chart.png"},
+                                },
+                            ],
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_2",
+                            "content": "ready",
+                        },
+                    ],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        roles = [message["role"] for message in upstream["messages"]]
+        assert roles == ["user", "assistant", "tool", "tool", "user"], upstream["messages"]
+        assert upstream["messages"][2]["tool_call_id"] == "toolu_1"
+        assert upstream["messages"][3]["tool_call_id"] == "toolu_2"
+        image_message = upstream["messages"][4]
+        assert image_message["role"] == "user"
+        assert image_message["content"][0]["image_url"]["url"] == "https://example.com/chart.png"
+
+    def test_tool_result_search_result_part_is_flattened(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{
+                            "type": "search_result",
+                            "source": "kb://timeouts",
+                            "title": "Timeout KB",
+                            "content": [{"type": "text", "text": "Timeouts default to 30 seconds."}],
+                        }],
+                    }],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tool_message = upstream["messages"][2]
+        assert tool_message["role"] == "tool"
+        assert tool_message["content"] == (
+            'Search result: "Timeout KB"\nSource: "kb://timeouts"\nContent:\nTimeouts default to 30 seconds.'
+        )
+
+    def test_tool_result_document_part_is_flattened(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{
+                            "type": "document",
+                            "title": "Nested Doc",
+                            "source": {"type": "content", "content": [{"type": "text", "text": "Nested document fact."}]},
+                        }],
+                    }],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tool_message = upstream["messages"][2]
+        assert tool_message["role"] == "tool"
+        assert tool_message["content"] == (
+            'Document: "Nested Doc"\nContent:\nNested document fact.'
+        )
+
+    def test_tool_result_document_string_content_is_flattened(self, anthropic_client):
+        # The ContentBlockSource schema allows `source.content` to be a
+        # string as well as an array of text blocks; the string form is
+        # valid client output and must translate, not fail closed.
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{
+                            "type": "document",
+                            "title": "Contract",
+                            "source": {"type": "content", "content": "The full contract text."},
+                        }],
+                    }],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        tool_message = upstream["messages"][2]
+        assert tool_message["role"] == "tool"
+        assert tool_message["content"] == (
+            'Document: "Contract"\nContent:\nThe full contract text.'
+        )
+
+    def test_tool_result_empty_document_part_is_rejected(self, anthropic_client):
+        # A document part whose source carries nothing extractable flattens
+        # to nothing; it must fail closed instead of silently disappearing
+        # from the tool message.
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[
+                    {"role": "user", "content": "Call lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{"type": "document", "source": {"type": "url", "url": ""}}],
+                        }],
+                    },
+                ],
+            )
+
+        assert "document" in str(excinfo.value), "error message must name the document part"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
+
+    def test_tool_result_document_base64_source_is_rejected(self, anthropic_client):
+        # A base64 document source keeps only its media type when flattened,
+        # dropping the encoded payload, so the part must fail closed instead
+        # of forwarding a document label with no content.
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[
+                    {"role": "user", "content": "Call lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{
+                                "type": "document",
+                                "title": "Contract",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "application/pdf",
+                                    "data": "JVBERi0xLjcK",
+                                },
+                            }],
+                        }],
+                    },
+                ],
+            )
+
+        assert "document" in str(excinfo.value), "error message must name the document part"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
+
+    def test_tool_result_search_result_non_array_content_is_rejected(self, anthropic_client):
+        # A string `content` carries text the flattener would silently drop
+        # while keeping the title, so a present, non-null `content` must be
+        # an array of text blocks.
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[
+                    {"role": "user", "content": "Call lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{
+                                "type": "search_result",
+                                "title": "Timeout KB",
+                                "content": "Timeouts default to 30 seconds.",
+                            }],
+                        }],
+                    },
+                ],
+            )
+
+        assert "search_result" in str(excinfo.value), "error message must name the search_result part"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
+
+    def test_tool_result_document_source_field_is_rejected(self, anthropic_client):
+        # A source-level field outside the variant's schema — a cache_control
+        # marker, for example — is dropped by the flattener without the
+        # prompt-caching allowlist ever seeing it, so it fails closed even
+        # when the source otherwise carries valid text.
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[
+                    {"role": "user", "content": "Call lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{
+                                "type": "document",
+                                "title": "Contract",
+                                "source": {
+                                    "type": "content",
+                                    "content": [{"type": "text", "text": "Valid fact."}],
+                                    "cache_control": {"type": "ephemeral"},
+                                },
+                            }],
+                        }],
+                    },
+                ],
+            )
+
+        assert "document" in str(excinfo.value), "error message must name the document part"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
+
+    def test_parallel_tool_result_images_across_consecutive_user_messages(self, anthropic_client):
+        # Anthropic combines consecutive user messages into one turn, so a
+        # client may return parallel tool results in two separate user
+        # messages. The image promoted out of the first result may only
+        # appear as a user message after the last tool reply of the group.
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}},
+                        {"type": "tool_use", "id": "toolu_2", "name": "lookup", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [
+                                {"type": "text", "text": "chart"},
+                                {
+                                    "type": "image",
+                                    "source": {"type": "url", "url": "https://example.com/chart.png"},
+                                },
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_2",
+                            "content": "ready",
+                        },
+                    ],
+                },
+            ],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        roles = [message["role"] for message in upstream["messages"]]
+        assert roles == ["user", "assistant", "tool", "tool", "user"], upstream["messages"]
+        assert upstream["messages"][2]["tool_call_id"] == "toolu_1"
+        assert upstream["messages"][3]["tool_call_id"] == "toolu_2"
+        image_message = upstream["messages"][4]
+        assert image_message["role"] == "user"
+        assert image_message["content"][0]["image_url"]["url"] == "https://example.com/chart.png"
+
     def test_empty_string_tool_arguments_become_empty_input(self, anthropic_client):
         RecordingBackend.bodies.clear()
         RecordingBackend.send_tool_reply_once = True
@@ -1125,6 +1558,101 @@ class TestOperatorApprovedDegradation:
         assert "cache_control" not in serialized, f"cache_control must be stripped: {serialized}"
         # The prompt content survives the degradation.
         assert any(m["role"] == "system" and m["content"] == "Be brief" for m in upstream["messages"])
+
+    def test_tool_result_nested_cache_markers_are_degraded_and_reported(self, degrading_client):
+        RecordingBackend.bodies.clear()
+
+        raw = degrading_client.messages.with_raw_response.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Call lookup"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [
+                            {
+                                "type": "search_result",
+                                "title": "Timeout KB",
+                                "content": [
+                                    {"type": "text", "text": "Timeouts default to 30 seconds.", "cache_control": {"type": "ephemeral"}},
+                                ],
+                            },
+                            {
+                                "type": "document",
+                                "title": "Nested Doc",
+                                "source": {
+                                    "type": "content",
+                                    "content": [
+                                        {"type": "text", "text": "Nested fact.", "cache_control": {"type": "ephemeral"}},
+                                    ],
+                                },
+                            },
+                        ],
+                    }],
+                },
+            ],
+        )
+
+        assert raw.http_response.status_code == 200
+        assert "prompt_caching" in raw.http_response.headers.get(DEGRADED_HEADER, "")
+        message = raw.parse()
+        assert message.content[0].text == "4"
+
+        [upstream] = RecordingBackend.bodies
+        serialized = json.dumps(upstream)
+        assert "cache_control" not in serialized, f"nested markers must be stripped: {serialized}"
+        tool_message = upstream["messages"][2]
+        assert tool_message["content"] == (
+            'Search result: "Timeout KB"\nContent:\nTimeouts default to 30 seconds.\n'
+            'Document: "Nested Doc"\nContent:\nNested fact.'
+        )
+
+    def test_tool_result_nested_block_citations_are_rejected(self, anthropic_client):
+        # A citations config on a nested search_result text block is dropped
+        # by the flattener, so it must fail closed instead.
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[
+                    {"role": "user", "content": "Call lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{
+                                "type": "search_result",
+                                "title": "Timeout KB",
+                                "content": [
+                                    {"type": "text", "text": "Timeouts default to 30 seconds.", "citations": []},
+                                    {
+                                        "type": "text",
+                                        "text": "Cited fact.",
+                                        "citations": [{"type": "char_location", "cited_text": "t", "start_index": 0, "end_index": 1}],
+                                    },
+                                ],
+                            }],
+                        }],
+                    },
+                ],
+            )
+
+        assert "search_result" in str(excinfo.value), "error message must name the search_result part"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
 
     def test_extended_thinking_is_degraded_and_reported(self, degrading_client):
         RecordingBackend.bodies.clear()
