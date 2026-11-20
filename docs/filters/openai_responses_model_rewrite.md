@@ -13,6 +13,8 @@ Quote wildcard alias keys in YAML, such as `"gpt-4.1-*"`, so `*` is parsed as a 
 
 One alias table serves both create endpoints: the filter rewrites `POST /v1/responses` and `POST /v1/chat/completions` request bodies and leaves every other path untouched. The filter name keeps its `openai_responses_` prefix for config compatibility.
 
+A body that repeats its top-level `model` is refused with HTTP 400 under every `on_invalid` setting, before any alias is resolved or fact is promoted.
+
 ## Configuration
 
 | Field | Type | Required | Description |

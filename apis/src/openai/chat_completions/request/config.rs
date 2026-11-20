@@ -26,8 +26,10 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576; // 1 MiB
 /// YAML configuration for the [`OpenaiChatCompletionsRequestFilter`].
 ///
 /// The filter is a transparent fact producer: it reads the model from the
-/// buffered body and never rejects a request, so it carries no `on_invalid`
-/// behavior and no promotion headers — only the buffer bound.
+/// buffered body and publishes only the buffer bound, so it carries no
+/// `on_invalid` behavior and no promotion headers. A body that repeats its
+/// top-level `model` is the one exception: no single model fact exists, so the
+/// request is refused with HTTP 400 before any fact is published.
 ///
 /// [`OpenaiChatCompletionsRequestFilter`]: super::OpenaiChatCompletionsRequestFilter
 #[derive(Debug, Deserialize)]
