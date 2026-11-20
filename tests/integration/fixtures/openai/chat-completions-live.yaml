@@ -13,6 +13,8 @@ filter_chains:
             cluster: openai
           - path_prefix: /v1/embeddings
             cluster: openai
+          - path_prefix: /v1/responses
+            cluster: openai
       - filter: load_balancer
         clusters:
           - name: openai
