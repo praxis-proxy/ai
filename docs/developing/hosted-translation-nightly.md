@@ -33,3 +33,14 @@ model snapshot in the SDK suite when OpenAI retires it.
 
 Praxis injects the OpenAI key upstream and the SDK uses a dummy local key.
 Gateway authorization, tenant isolation, and retries are outside this suite.
+
+## OpenAI Responses to Chat Completions
+
+A separate job builds with `--features openai-responses` and uses the
+[Responses translation fixture](../../tests/integration/fixtures/openai/responses-to-chat-live.yaml).
+It runs the Responses completion and streaming cases from the
+[OpenAI SDK suite](../../tests/integration/sdk/openai/test_openai_chat_completions_live.py).
+Praxis injects the provider key and translates requests to official OpenAI
+Chat Completions. The checks cover completed text and usage, streaming text
+and the terminal completion event, with `store: false`. The
+`hosted-responses-to-chat-results` artifact contains JUnit results and gateway logs.
