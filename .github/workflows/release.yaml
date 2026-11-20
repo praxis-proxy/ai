@@ -8,24 +8,19 @@ on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
-  # Dispatch with tag to use corrected tooling without moving that tag.
-  # skip-fips-proof exists for one
+  # Dispatching on a tag re-runs its release. skip-fips-proof exists for one
   # case: a release that cannot wait while the FIPS runner is out of service
   # and the commit's proof of record is missing because of that outage. The
   # decision is a maintainer's and stays recorded on the run.
   workflow_dispatch:
     inputs:
-      tag:
-        description: Existing release tag to build using this workflow revision
-        type: string
-        default: ""
       skip-fips-proof:
         description: Release without the recorded FIPS host proof (runner outage only)
         type: boolean
         default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 permissions: {}
@@ -41,31 +36,18 @@ jobs:
     permissions:
       contents: read
     outputs:
-      tag: ${{ steps.version.outputs.tag }}
-      sha: ${{ steps.version.outputs.sha }}
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Extract version from tag
         id: version
         env:
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ github.ref_name }}
         run: |
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Expected an existing release version tag"
-            exit 1
-          fi
-          git fetch --no-tags origin "refs/tags/$TAG"
-          sha=$(git rev-parse 'FETCH_HEAD^{commit}')
-          test "$sha" = "$(git rev-parse HEAD)"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $TAG; source commit: $sha; workflow commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
           TAG_VERSION="${TAG#v}"
           CARGO_VERSION=$(perl -ne 'print $1 if /^version\s*=\s*"(.+)"/' Cargo.toml)
           if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
@@ -92,12 +74,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: refs/tags/${{ needs.validate.outputs.tag }}
-
-      - name: Verify immutable release checkout
-        env:
-          RELEASE_SHA: ${{ needs.validate.outputs.sha }}
-        run: test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
 
 
       - name: Setup Rust
@@ -127,12 +103,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: refs/tags/${{ needs.validate.outputs.tag }}
-
-      - name: Verify immutable release checkout
-        env:
-          RELEASE_SHA: ${{ needs.validate.outputs.sha }}
-        run: test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
 
 
       - name: Set up Docker Buildx
@@ -142,7 +112,6 @@ jobs:
         uses: praxis-proxy/conventions/.github/actions/ghcr-publish@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
         with:
           image-name: ${{ github.repository }}
-          metadata-context: git
 
   # ----------------------------------------------------------------------------
   # Experimental Container Build & Publish
@@ -163,12 +132,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: refs/tags/${{ needs.validate.outputs.tag }}
-
-      - name: Verify immutable release checkout
-        env:
-          RELEASE_SHA: ${{ needs.validate.outputs.sha }}
-        run: test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -184,7 +147,6 @@ jobs:
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          context: git
           images: ghcr.io/${{ github.repository }}
           # onlatest=true keeps the release's latest tag as latest-experimental
           # so it never overwrites the standard image's latest.
@@ -234,12 +196,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: refs/tags/${{ needs.validate.outputs.tag }}
-
-      - name: Verify immutable release checkout
-        env:
-          RELEASE_SHA: ${{ needs.validate.outputs.sha }}
-        run: test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
 
       - name: Set up Rust (for the Red Hat image verification)
         uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
@@ -286,7 +242,6 @@ jobs:
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          context: git
           images: ghcr.io/${{ github.repository }}
           # latest=auto tags this release as latest-fips too, mirroring the
           # standard image's latest tag. onlatest=true is what applies the
@@ -368,12 +323,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: refs/tags/${{ needs.validate.outputs.tag }}
-
-      - name: Verify immutable release checkout
-        env:
-          RELEASE_SHA: ${{ needs.validate.outputs.sha }}
-        run: test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
 
       - name: Require a green fips-host suites run for this commit
         env:
@@ -457,12 +406,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: refs/tags/${{ needs.validate.outputs.tag }}
-
-      - name: Verify immutable release checkout
-        env:
-          RELEASE_SHA: ${{ needs.validate.outputs.sha }}
-        run: test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          ref: ${{ github.ref_name }}
 
       - uses: ./.github/actions/fips-runner-check
 
@@ -512,38 +456,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: refs/tags/${{ needs.validate.outputs.tag }}
-
-      - name: Verify immutable release checkout
-        env:
-          RELEASE_SHA: ${{ needs.validate.outputs.sha }}
-        run: test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
 
       - name: Generate CI evidence and verify recent GPU nightly qualification
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.validate.outputs.tag }}
-          RELEASE_SHA: ${{ needs.validate.outputs.sha }}
-          FIPS_BYPASSED: ${{ inputs.skip-fips-proof || false }}
+          TAG: ${{ github.ref_name }}
           PRERELEASE: ${{ needs.validate.outputs.prerelease }}
         run: |
           bash .github/scripts/publish-release.sh
-          # Cross-ref dispatches have a tooling head SHA distinct from the
-          # tested checkout. Keep the strict report collector unchanged and
-          # disclose that distinction instead of borrowing head-SHA evidence.
-          gh release view "$TAG" --repo "$GH_REPO" --json body --jq .body > "$RUNNER_TEMP/release-notes.md"
-          python3 - "$RUNNER_TEMP/release-notes.md" <<'PYNOTES'
-          import pathlib, sys
-          path = pathlib.Path(sys.argv[1])
-          path.write_text(path.read_text().split("\n### Release execution\n", 1)[0].rstrip() + "\n")
-          PYNOTES
-          {
-            echo
-            echo "### Release execution"
-            echo "Source commit: \`$RELEASE_SHA\`. Workflow commit: \`$GITHUB_SHA\`."
-            echo "Unit, schema, and integration tests passed in https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID."
-            echo "FIPS host validation bypassed: \`$FIPS_BYPASSED\`."
-            echo "For cross-ref dispatches, the automated CI table reports the release gate as unavailable because its workflow head differs from the tested tag; the execution link above records this run."
-          } >> "$RUNNER_TEMP/release-notes.md"
-          gh release edit "$TAG" --repo "$GH_REPO" --notes-file "$RUNNER_TEMP/release-notes.md"

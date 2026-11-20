@@ -65,29 +65,22 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-## Rebuilding an existing tag with corrected release tooling
+## Releasing during a FIPS runner outage
 
-If a tagged workflow needs a tooling fix, merge the fix on `main` and
-explicitly select the existing release tag. This keeps newer application
-changes out of the release and does not move the tag:
+A maintainer can explicitly bypass FIPS host validation when the runner is
+unavailable. Dispatch the Release workflow on the release tag:
 
 ```console
-gh workflow run release.yaml --repo praxis-proxy/ai --ref main \
-  -f tag=v0.12.0 -f skip-fips-proof=true
+gh workflow run release.yaml --repo praxis-proxy/ai --ref v0.12.1 \
+  -f skip-fips-proof=true
 ```
 
-Use `skip-fips-proof=true` only for a maintainer-approved FIPS runner outage.
-It skips both recorded host proof and the post-publish host attestation;
-the FIPS image build and hosted checks still run. The test job has a
-90-minute budget and must pass unit, schema, and integration tests.
-Every source checkout must match the commit resolved during validation.
-Image metadata comes from the checked-out tag, not the workflow branch.
-
-For cross-ref dispatches, the strict CI report cannot attribute the release
-run's workflow head to the tagged source and reports that gate as unavailable.
-Release execution notes separately record the source commit, tooling commit,
-test run link, and FIPS bypass decision. Other CI evidence still requires
-an exact source-commit match.
+This skips both the recorded FIPS proof gate and post-publish FIPS host
+attestation. It does not skip the FIPS image build or hosted image checks.
+The dispatch input records the maintainer's decision, and the release CI
+report must not be interpreted as successful FIPS host validation.
+The test job has a 90-minute limit for unit, schema, and integration tests;
+all three steps must pass before container publication.
 
 ## Recovering Publication
 
