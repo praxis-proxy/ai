@@ -815,10 +815,14 @@ async fn model_policy_rejects_identity_model_conflicting_with_client_model() {
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
     ctx.filter_metadata
-        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+        .insert("x-tenant-username".to_owned(), "alice".to_owned())
+        .unwrap();
     ctx.filter_metadata
-        .insert("x-tenant-model".to_owned(), "identity-model".to_owned());
-    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "requested-model");
+        .insert("x-tenant-model".to_owned(), "identity-model".to_owned())
+        .unwrap();
+    ctx.filter_metadata
+        .insert(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "requested-model")
+        .unwrap();
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert_reject(action, 403, "conflicting model inputs for model authorization");
@@ -834,9 +838,11 @@ async fn model_policy_rejects_identity_model_conflicting_with_body_model() {
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
     ctx.filter_metadata
-        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+        .insert("x-tenant-username".to_owned(), "alice".to_owned())
+        .unwrap();
     ctx.filter_metadata
-        .insert("x-tenant-model".to_owned(), "identity-model".to_owned());
+        .insert("x-tenant-model".to_owned(), "identity-model".to_owned())
+        .unwrap();
     ctx.buffered_request_body = Some(Bytes::from_static(br#"{"model": "body-model", "messages": []}"#));
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -853,9 +859,11 @@ async fn model_policy_rejects_escaped_body_model_value_alongside_identity_model(
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
     ctx.filter_metadata
-        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+        .insert("x-tenant-username".to_owned(), "alice".to_owned())
+        .unwrap();
     ctx.filter_metadata
-        .insert("x-tenant-model".to_owned(), "gpt-4o-mini".to_owned());
+        .insert("x-tenant-model".to_owned(), "gpt-4o-mini".to_owned())
+        .unwrap();
     ctx.buffered_request_body = Some(Bytes::from_static(br#"{"model":"gpt\u002d4o","messages":[]}"#));
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -875,9 +883,11 @@ async fn model_policy_rejects_duplicate_body_model_keys_alongside_identity_model
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
     ctx.filter_metadata
-        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+        .insert("x-tenant-username".to_owned(), "alice".to_owned())
+        .unwrap();
     ctx.filter_metadata
-        .insert("x-tenant-model".to_owned(), "gpt-4o-mini".to_owned());
+        .insert("x-tenant-model".to_owned(), "gpt-4o-mini".to_owned())
+        .unwrap();
     ctx.buffered_request_body = Some(Bytes::from_static(
         br#"{"model":"gpt-4o-mini","model":"gpt-4o","messages":[]}"#,
     ));
@@ -898,9 +908,11 @@ async fn model_policy_rejects_escaped_body_model_key_alongside_identity_model() 
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
     ctx.filter_metadata
-        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+        .insert("x-tenant-username".to_owned(), "alice".to_owned())
+        .unwrap();
     ctx.filter_metadata
-        .insert("x-tenant-model".to_owned(), "gpt-4o-mini".to_owned());
+        .insert("x-tenant-model".to_owned(), "gpt-4o-mini".to_owned())
+        .unwrap();
     ctx.buffered_request_body = Some(Bytes::from_static(br#"{ "stream": true, "\u006dodel": "gpt-4o" }"#));
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -916,9 +928,11 @@ async fn model_policy_allows_absent_body_model_alongside_identity_model() {
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
     ctx.filter_metadata
-        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+        .insert("x-tenant-username".to_owned(), "alice".to_owned())
+        .unwrap();
     ctx.filter_metadata
-        .insert("x-tenant-model".to_owned(), "gpt-4o-mini".to_owned());
+        .insert("x-tenant-model".to_owned(), "gpt-4o-mini".to_owned())
+        .unwrap();
     ctx.buffered_request_body = Some(Bytes::from_static(br#"{"prompt": "hi"}"#));
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -958,7 +972,8 @@ async fn model_policy_rejects_body_above_pre_read_bound_regardless_of_pipeline_b
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
     ctx.filter_metadata
-        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+        .insert("x-tenant-username".to_owned(), "alice".to_owned())
+        .unwrap();
     ctx.buffered_request_body = Some(Bytes::from(vec![b'x'; DEFAULT_JSON_BODY_MAX_BYTES + 1]));
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -989,7 +1004,8 @@ async fn model_policy_allows_body_at_pre_read_bound() {
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
     ctx.filter_metadata
-        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+        .insert("x-tenant-username".to_owned(), "alice".to_owned())
+        .unwrap();
     ctx.buffered_request_body = Some(padded_json_body(DEFAULT_JSON_BODY_MAX_BYTES));
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -1020,8 +1036,11 @@ async fn model_policy_ignores_body_once_client_model_is_recorded() {
     let req = make_request(http::Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&req);
     ctx.filter_metadata
-        .insert("x-tenant-username".to_owned(), "alice".to_owned());
-    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5");
+        .insert("x-tenant-username".to_owned(), "alice".to_owned())
+        .unwrap();
+    ctx.filter_metadata
+        .insert(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5")
+        .unwrap();
     // The body as it looks after model_to_provider rewrote it to the target.
     ctx.buffered_request_body = Some(Bytes::from_static(
         br#"{"model": "claude-sonnet-4-5@20250929", "messages": []}"#,
@@ -1053,10 +1072,14 @@ async fn model_policy_agreeing_model_sources_authorize_the_requested_model() {
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
     ctx.filter_metadata
-        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+        .insert("x-tenant-username".to_owned(), "alice".to_owned())
+        .unwrap();
     ctx.filter_metadata
-        .insert("x-tenant-model".to_owned(), "requested-model".to_owned());
-    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "requested-model");
+        .insert("x-tenant-model".to_owned(), "requested-model".to_owned())
+        .unwrap();
+    ctx.filter_metadata
+        .insert(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "requested-model")
+        .unwrap();
     ctx.buffered_request_body = Some(Bytes::from_static(br#"{"model": "requested-model", "messages": []}"#));
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -1085,10 +1108,14 @@ async fn model_policy_disabled_preserves_identity_model_precedence_for_reporting
     let req = make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_filter_context(&req);
     ctx.filter_metadata
-        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+        .insert("x-tenant-username".to_owned(), "alice".to_owned())
+        .unwrap();
     ctx.filter_metadata
-        .insert("x-tenant-model".to_owned(), "identity-model".to_owned());
-    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "requested-model");
+        .insert("x-tenant-model".to_owned(), "identity-model".to_owned())
+        .unwrap();
+    ctx.filter_metadata
+        .insert(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "requested-model")
+        .unwrap();
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
@@ -1119,9 +1146,11 @@ async fn model_policy_verified_identity_model_wins_over_forged_header() {
     // A verification filter mapped both claims; the raw forged model header
     // is in a lower trust tier and must be ignored entirely.
     ctx.filter_metadata
-        .insert("x-tenant-model".to_owned(), "verified-model".to_owned());
+        .insert("x-tenant-model".to_owned(), "verified-model".to_owned())
+        .unwrap();
     ctx.filter_metadata
-        .insert("x-tenant-username".to_owned(), "alice".to_owned());
+        .insert("x-tenant-username".to_owned(), "alice".to_owned())
+        .unwrap();
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(

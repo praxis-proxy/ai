@@ -139,12 +139,14 @@ const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
 /// checks and post-response token usage reporting.
 ///
 /// Tenant identity is resolved from the highest-trust source available:
-/// verified `{prefix}*` metadata written by an authentication filter,
-/// then the `identity_header_guard` filter's namespaced
-/// `{namespace}.{prefix}*` metadata, then raw `{prefix}*` request
-/// headers. A higher tier always wins, so forged client headers can
-/// never override verified claims, and identity headers plus client
-/// credentials are always stripped before the request is forwarded.
+/// an `AuthenticatedIdentity` extension published by a policy/auth filter
+/// from a cryptographically verified token, then verified `{prefix}*`
+/// metadata written by an authentication filter, then the
+/// `identity_header_guard` filter's namespaced `{namespace}.{prefix}*`
+/// metadata, then raw `{prefix}*` request headers. A higher tier always
+/// wins, so forged client headers can never override verified claims, and
+/// identity headers plus client credentials are always stripped before
+/// the request is forwarded.
 /// Both event types carry `data.organization_id` and `data.cost_center`
 /// from `{prefix}organization-id` and `{prefix}cost-center`. When absent,
 /// those fields are empty strings rather than invented defaults.
@@ -154,6 +156,22 @@ const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
 /// the client-facing model ID it recorded rather than the provider target.
 /// That filter buffers the request body, so its body pass completes before
 /// this filter's request hook runs the balance check.
+///
+/// Usage events include the optional `quota_value`, `quota_formula`,
+/// `quota_unit`, and `quota_status` fields when PPE quota policy runs earlier
+/// in the response phase. `quota_usage` and `quota_context` preserve the exact
+/// normalized policy inputs, including missing-field presence flags, so the
+/// result can be audited and recomputed. Declare `external_metering` before
+/// `policy`, and `policy` before `token_count`, because response hooks run in
+/// reverse filter order. Quota fields are enforcement/audit data, never
+/// currency.
+///
+/// For a complete setup where the Praxis Policy Engine (`policy` filter) verifies
+/// a JWT and this filter meters on the resulting tier-0 `AuthenticatedIdentity` —
+/// no `{prefix}*` header involved — see the end-to-end example below (a gateway
+/// config plus the PPE policy document it loads). A metered request then carries
+/// only `Authorization: Bearer <jwt>`, and usage is billed to the token's
+/// verified `identity_username_claim` within its `identity_group_claim`.
 ///
 /// Ordering: declare `external_metering` *before* `token_count` in the filter
 /// chain so response hooks (which run in reverse order) execute after token
@@ -212,41 +230,6 @@ const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
 /// With `model_policy_check: false` (default), the legacy contract is
 /// preserved exactly: only `hasAccess` decides, budget denial is 429, and
 /// the billing `fail_open` governs availability.
-///
-/// Tenant identity is resolved from the highest-trust source available:
-/// an `AuthenticatedIdentity` extension published by a policy/auth filter
-/// from a cryptographically verified token, then verified `{prefix}*`
-/// metadata written by an authentication filter, then the
-/// `identity_header_guard` filter's namespaced `{namespace}.{prefix}*`
-/// metadata, then raw `{prefix}*` request headers. A higher tier always
-/// wins, so forged client headers can never override verified claims, and
-/// identity headers plus client credentials are always stripped before the
-/// request is forwarded.
-/// Both event types carry `data.organization_id` and `data.cost_center`
-/// from `{prefix}organization-id` and `{prefix}cost-center`. When absent,
-/// those fields are empty strings rather than invented defaults.
-///
-/// When no `{prefix}model` identity header names the model and
-/// `model_to_provider` mapped the request, balance checks and usage events use
-/// the client-facing model ID it recorded rather than the provider target.
-/// That filter buffers the request body, so its body pass completes before
-/// this filter's request hook runs the balance check.
-///
-/// Usage events include the optional `quota_value`, `quota_formula`,
-/// `quota_unit`, and `quota_status` fields when PPE quota policy runs earlier
-/// in the response phase. `quota_usage` and `quota_context` preserve the exact
-/// normalized policy inputs, including missing-field presence flags, so the
-/// result can be audited and recomputed. Declare `external_metering` before
-/// `policy`, and `policy` before `token_count`, because response hooks run in
-/// reverse filter order. Quota fields are enforcement/audit data, never
-/// currency.
-///
-/// For a complete setup where the Praxis Policy Engine (`policy` filter) verifies
-/// a JWT and this filter meters on the resulting tier-0 `AuthenticatedIdentity` —
-/// no `{prefix}*` header involved — see the end-to-end example below (a gateway
-/// config plus the PPE policy document it loads). A metered request then carries
-/// only `Authorization: Bearer <jwt>`, and usage is billed to the token's
-/// verified `identity_username_claim` within its `identity_group_claim`.
 ///
 /// # YAML
 ///
@@ -363,7 +346,6 @@ const STATUS_PAYLOAD_TOO_LARGE: u16 = 413;
 ///   authentication:
 ///     - jwt-user
 /// ```
-```
 #[expect(
     clippy::struct_excessive_bools,
     reason = "independent billing and model-policy fail-open controls"
@@ -656,6 +638,27 @@ impl ExternalMeteringFilter {
     }
 }
 
+/// Capture the tenant identity and resolve the public request model for
+/// the entitlement preflight, rejecting when the identity claim and the
+/// `model_to_provider`-recorded client model conflict.
+fn capture_metering_state(
+    filter: &ExternalMeteringFilter,
+    ctx: &mut HttpFilterContext<'_>,
+) -> (MeteringState, Option<FilterAction>) {
+    let mut state = capture_identity(
+        ctx,
+        &filter.identity_header_prefix,
+        &filter.identity_metadata_namespace,
+        filter.identity_username_claim.as_deref(),
+        filter.identity_group_claim.as_deref(),
+    );
+    if resolve_request_model(ctx, &mut state, filter.model_policy_check) == ModelResolution::Conflict {
+        (state, Some(reject_model_conflict()))
+    } else {
+        (state, None)
+    }
+}
+
 #[async_trait]
 impl HttpFilter for ExternalMeteringFilter {
     fn name(&self) -> &'static str {
@@ -670,15 +673,9 @@ impl HttpFilter for ExternalMeteringFilter {
             return Ok(reject_body_too_large());
         }
 
-        let mut state = capture_identity(
-            ctx,
-            &self.identity_header_prefix,
-            &self.identity_metadata_namespace,
-            self.identity_username_claim.as_deref(),
-            self.identity_group_claim.as_deref(),
-        );
-        if resolve_request_model(ctx, &mut state, self.model_policy_check) == ModelResolution::Conflict {
-            return Ok(reject_model_conflict());
+        let (mut state, rejection) = capture_metering_state(self, ctx);
+        if let Some(rejection) = rejection {
+            return Ok(rejection);
         }
 
         if state.username.is_empty() {
@@ -1049,7 +1046,8 @@ fn resolve_request_model(
     model_policy_check: bool,
 ) -> ModelResolution {
     let client_model = ctx
-        .get_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
+        .filter_metadata
+        .get(MODEL_PROVIDER_CLIENT_MODEL_METADATA)
         .filter(|model| !model.is_empty());
     let body_model = match ctx.buffered_request_body.as_ref() {
         Some(body) if client_model.is_none() && model_policy_check => extract_model_from_bytes(body),
