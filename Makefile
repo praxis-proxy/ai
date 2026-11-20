@@ -81,7 +81,7 @@ endif
 	fips-host-check fips-runtime-probe fips-image-save fips-image-load fips-image-tag fips-version \
 	container-fips container-fips-run \
 	fips-check fips-check-ubi fips-deps fips-report fips-signature-store fips-verify-image \
-	fips-image-ref fips-oc fips-scan fips-scanner fips-smoke
+	fips-image-ref fips-oc fips-scan fips-scanner fips-smoke fips-ci-inputs fips-check-pins
 
 # -------------------------------------------------------------------
 # All
@@ -535,7 +535,7 @@ coverage-check:
 #   make release-fips FIPS_FEATURES=aws-sigv4-filter,openai-responses,openai-file-resolve-filter,openai-conversations,store-postgres-cert-auth
 # General SQLx password authentication, SQLite, compaction, and
 # MCP dependencies have not been cleared for the FIPS profile.
-# FIPS_FEATURES mirrors Containerfile.fips and xtask/src/fips.rs.
+# The default profile mirrors Containerfile.fips, fips-check.toml and the runtime probe.
 #
 # The FIPS build goes to its own target directory so it never overwrites,
 # or is mistaken for, the standard build.
@@ -564,14 +564,14 @@ coverage-check:
 #                          point podman at Red Hat's signature store; needed
 #                          once on Debian/Ubuntu hosts, a no-op elsewhere
 #
-# The report, the image verification and the signature-store setup are
-# `cargo xtask fips` commands (xtask/src/fips/). XTASK_FIPS builds xtask
-# without its default features, so these targets never compile the standard
-# proxy build to run.
+# The shared cargo-fips-check tool handles the report, image verification,
+# signature-store setup and host attestation. Make installs the pinned
+# revision on first use. XTASK_FIPS still drives the AI listener probe.
 #
 # See docs/developing/fips.md and docs/developing/getting-started.md.
 
-FIPS_FEATURES           ?= aws-sigv4-filter
+FIPS_DEFAULT_FEATURES   := aws-sigv4-filter
+FIPS_FEATURES           ?= $(FIPS_DEFAULT_FEATURES)
 # The same list qualified for a multi-package cargo invocation.
 _COMMA                  := ,
 FIPS_FEATURES_QUALIFIED := $(subst $(_COMMA),$(_COMMA)praxis-ai-proxy/,praxis-ai-proxy/$(FIPS_FEATURES))
@@ -584,6 +584,12 @@ FIPS_BIN                ?= $(FIPS_TARGET_DIR)/release/praxis-ai
 # workspace's rust-version.
 FIPS_CARGO_EXTRA        ?=
 FIPS_CARGO_ARGS         := -p praxis-ai-proxy --no-default-features --features $(FIPS_FEATURES) --target-dir $(FIPS_TARGET_DIR)
+FIPS_CHECK_REPO         := https://github.com/praxis-proxy/cargo-fips-check
+FIPS_CHECK_REV          := a8dae23f90eb77e6890cc86df5ec6cf6da4e2e79
+FIPS_TOOLS_DIR          := $(FIPS_TARGET_DIR)/tools/$(FIPS_CHECK_REV)
+FIPS_CHECK_INSTALLED    := $(FIPS_TOOLS_DIR)/bin/cargo-fips-check
+FIPS_CHECK              ?= $(FIPS_CHECK_INSTALLED)
+_FIPS_CHECK_DEP         := $(if $(filter $(FIPS_CHECK_INSTALLED),$(FIPS_CHECK)),$(FIPS_CHECK_INSTALLED))
 # Red Hat's scanner reads the crate list that `cargo auditable` embeds in the
 # binary (the .dep-v0 section); without it a binary is graded inconclusive.
 # `make release-fips` embeds it when cargo-auditable is installed (`cargo
@@ -641,10 +647,15 @@ UNAME_S                 := $(shell uname -s | tr '[:upper:]' '[:lower:]')
 UNAME_M                 := $(shell uname -m)
 SHA256SUM               := $(if $(filter darwin,$(UNAME_S)),gsha256sum,sha256sum)
 OC_VERSION              := 4.22.14
+OC_URL                  := https://mirror.openshift.com/pub/openshift-v4/$(UNAME_M)/clients/ocp/$(OC_VERSION)/openshift-client-linux-$(OC_VERSION).tar.gz
 OC_DIR                  := $(FIPS_TARGET_DIR)/bin
 OC                      := $(OC_DIR)/oc
 OC_SHA256_linux_x86_64  := 7dbe8c2813bc09e18a666155eb4fa88dc3260c3832c553aa16d86c7c4277ba03
 OC_SHA256               := $(OC_SHA256_$(UNAME_S)_$(UNAME_M))
+
+$(FIPS_CHECK_INSTALLED):
+	cargo install --locked --git $(FIPS_CHECK_REPO) --rev $(FIPS_CHECK_REV) \
+		--root $(FIPS_TOOLS_DIR) cargo-fips-check
 
 require-podman:
 	@command -v podman >/dev/null || { echo "podman is required: Red Hat image signatures can only be verified with podman"; exit 1; }
@@ -657,8 +668,7 @@ require-oc:
 
 $(OC):
 	@mkdir -p $(OC_DIR)
-	curl -sSfL -o $(OC_DIR)/oc.tar.gz \
-		https://mirror.openshift.com/pub/openshift-v4/$(UNAME_M)/clients/ocp/$(OC_VERSION)/openshift-client-linux-$(OC_VERSION).tar.gz
+	curl -sSfL -o $(OC_DIR)/oc.tar.gz $(OC_URL)
 	$(if $(OC_SHA256),echo "$(OC_SHA256)  $(OC_DIR)/oc.tar.gz" | $(SHA256SUM) -c,$(error no pinned SHA256 for oc on $(UNAME_S)/$(UNAME_M); refusing to use an unverified download))
 	tar xz -C $(OC_DIR) -f $(OC_DIR)/oc.tar.gz oc
 	rm -f $(OC_DIR)/oc.tar.gz
@@ -769,12 +779,18 @@ test-fips-provider:
 # every Red Hat image looks unsigned. This installs the bundled entry for the
 # current user when the registries.d podman reads names none, and does
 # nothing otherwise. CI runs it before fips-verify-image.
-fips-signature-store:
-	$(XTASK_FIPS) fips signature-store --install
+fips-signature-store: $(_FIPS_CHECK_DEP)
+	$(FIPS_CHECK) signature-store --install
 
-fips-verify-image: | require-podman
-	$(XTASK_FIPS) fips verify-image --pinned-in Containerfile.fips $(FIPS_UBI9_IMAGE)
-	$(XTASK_FIPS) fips verify-image --pinned-in Containerfile.fips $(FIPS_UBI9_MINIMAL_IMAGE)
+fips-verify-image: $(_FIPS_CHECK_DEP) | require-podman
+	$(FIPS_CHECK) verify-image --pinned-in Containerfile.fips $(FIPS_UBI9_IMAGE)
+	$(FIPS_CHECK) verify-image --pinned-in Containerfile.fips $(FIPS_UBI9_MINIMAL_IMAGE)
+
+# Emit the outputs consumed by the hosted cargo-fips-check action.
+fips-ci-inputs: fips-check-pins
+	@printf '%s\n' 'base-images<<EOF' '$(FIPS_UBI9_IMAGE)' '$(FIPS_UBI9_MINIMAL_IMAGE)' 'EOF' \
+		'image=$(FIPS_IMAGE_REF)' 'scanner-rev=$(CHECK_PAYLOAD_REV)' \
+		'oc-url=$(OC_URL)' 'oc-sha256=$(OC_SHA256)'
 
 fips-image-ref:
 	@printf '%s\n' '$(FIPS_IMAGE_REF)'
@@ -846,14 +862,14 @@ fips-host-facts:
 # The FIPS-host attestation: kernel flag, boot parameter, crypto policy and
 # the module the host's OpenSSL loads, then the same questions of the FIPS
 # image (the crypto policy podman propagates into it, and the build of
-# fips.so it carries, looked up in xtask/assets/fips/certified-modules.json).
+# fips.so it carries, looked up in the shared tool).
 # Exit 1 on any unmet requirement; a module build still in validation is a
 # warning unless FIPS_HOST_CHECK_ARGS adds --require-certified. Writes the
 # attestation to target/fips/ for CI to keep.
 FIPS_HOST_CHECK_ARGS    ?=
-fips-host-check: | require-podman
+fips-host-check: $(_FIPS_CHECK_DEP) | require-podman
 	@mkdir -p $(FIPS_TARGET_DIR)
-	$(XTASK_FIPS) fips host-check --image $(FIPS_IMAGE_REF) \
+	$(FIPS_CHECK) host-check --image $(FIPS_IMAGE_REF) \
 		--out $(FIPS_TARGET_DIR)/host-attestation.txt \
 		--json $(FIPS_TARGET_DIR)/host-attestation.json $(FIPS_HOST_CHECK_ARGS)
 
@@ -907,15 +923,24 @@ fips-check-ubi: fips-verify-image
 		-t $(FIPS_CHECK_IMAGE) .
 	podman run --rm $(FIPS_CHECK_IMAGE)
 
-fips-report:
-	$(XTASK_FIPS) fips report --features $(FIPS_FEATURES) $(FIPS_BIN)
+fips-report: $(_FIPS_CHECK_DEP)
+	$(FIPS_CHECK) report --features $(FIPS_FEATURES) $(FIPS_BIN)
 
-# The graph check is `cargo xtask fips report` (cargo tree scoped to the
+fips-check-pins:
+	@grep -qx 'ARG CARGO_FEATURES="$(FIPS_DEFAULT_FEATURES)"' Containerfile.fips && \
+		grep -qx 'features = "$(FIPS_DEFAULT_FEATURES)"' fips-check.toml || { \
+		echo "Containerfile.fips and fips-check.toml must default to $(FIPS_DEFAULT_FEATURES)"; exit 1; }
+	@grep -qx 'ARG CARGO_FIPS_CHECK_REV=$(FIPS_CHECK_REV)' Containerfile.fips || { \
+		echo "Containerfile.fips CARGO_FIPS_CHECK_REV differs from FIPS_CHECK_REV ($(FIPS_CHECK_REV))"; exit 1; }
+	@grep -q 'uses: praxis-proxy/cargo-fips-check@$(FIPS_CHECK_REV) ' .github/workflows/fips.yaml || { \
+		echo "FIPS workflow cargo-fips-check action differs from FIPS_CHECK_REV ($(FIPS_CHECK_REV))"; exit 1; }
+
+# The graph check is `cargo fips-check report` (cargo tree scoped to the
 # binary and its feature set) rather than cargo-deny: cargo-deny resolves
 # features workspace-wide, and the test crates enable the policy engine and
 # the stores on the binary, so it cannot see the FIPS build's real graph.
-fips-deps:
-	$(XTASK_FIPS) fips report --deps-only --features $(FIPS_FEATURES)
+fips-deps: fips-check-pins $(_FIPS_CHECK_DEP)
+	$(FIPS_CHECK) report --deps-only --features $(FIPS_FEATURES)
 
 # --fail-on-warnings makes an inconclusive verdict (for example a binary
 # without a crate manifest) fail, as Red Hat's gated scans do. Needs a Linux

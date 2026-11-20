@@ -13,7 +13,7 @@ provider story from silently regressing live in two places:
   `[[bans.features]]` in [`deny.toml`](../../deny.toml), run on every PR by
   `cargo deny check` (Supply Chain workflow).
 - **A non-OpenSSL crypto backend crate entering the FIPS image** is caught by
-  `cargo xtask fips` (`xtask/src/fips/graph.rs::DENIED`), run on every PR via
+  `cargo fips-check report`, run on every PR via
   `make lint` (`fips-deps`) and the FIPS workflow.
 
 Pinned crate versions below are documentary — `Cargo.lock` is the source of
@@ -177,7 +177,7 @@ standalone operations — support/trait layers (`digest`, `crypto-common`,
 key). None executes a security primitive on
 the request path. A crate on the FIPS denylist may never be classified here — a
 denied name is a real primitive and is tracked as an operation or blocked by
-`cargo xtask fips`.
+`cargo fips-check report`.
 
 `rand_xoshiro` is present through `metrics-util`, but the pinned
 `metrics-exporter-prometheus` uses `AtomicBucketInstant` for histograms and

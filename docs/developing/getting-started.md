@@ -178,12 +178,11 @@ make fips-oc       # download the OpenShift CLI the scanner insists on, checksum
 make fips-scan     # run that scanner on the FIPS image, warnings fatal: the gate
 ```
 
-The report and the image verification are `cargo xtask fips` commands; the
-Makefile targets wrap them. `make container-fips`, `make fips-check`,
+The Makefile targets install and use the pinned `cargo-fips-check` tool.
+`make container-fips`, `make fips-check`,
 `make fips-smoke` and `make fips-scan` need a Linux podman (rootless or
 root): the UBI 9 base images are pinned by digest and their Red Hat
-signatures are verified before every build (`cargo xtask fips
-verify-image`), and the scanner reads podman's image store. On Debian
+signatures are verified before every build (`cargo fips-check verify-image`), and the scanner reads podman's image store. On Debian
 and Ubuntu, whose podman packaging ships no `registries.d` entry for Red
 Hat's registry, run `make fips-signature-store` once first. The FIPS
 image is built with Red Hat's `rust-toolset` and links the system
