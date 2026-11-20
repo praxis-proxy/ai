@@ -47,6 +47,9 @@ gcp-adc-filter = ["praxis-ai-proxy/gcp-adc-filter"]
 # anthropic_messages_to_vertexai_anthropic filter registered in the in-process
 # proxy registry.
 vertex-anthropic-filter = ["praxis-ai-proxy/vertex-anthropic-filter", "praxis-test-utils/vertex-anthropic-filter"]
+# Experimental: gates the anthropic_mcp_connector example test, which needs the
+# filter registered in the in-process proxy registry.
+anthropic-mcp-connector-filter = ["praxis-ai-proxy/anthropic-mcp-connector-filter", "praxis-test-utils/anthropic-mcp-connector-filter"]
 # Experimental: gates authenticated-subject token-rate-limit tests, which need
 # Praxis's released Basic Auth filter registered in the in-process registry.
 basic-auth-filter = ["praxis-ai-proxy/basic-auth-filter"]

@@ -26,17 +26,17 @@
 //! explicit dispatch rejection rather than mis-classifying it as a client
 //! function.
 
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 use std::collections::{HashMap, HashSet};
 
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 use serde_json::Value;
 
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 use super::naming::encode_function_name;
 
 /// Operator admission mode for MCP tool metadata.
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum McpAdmissionMode {
     /// Standard advisory behavior. The client selector `allowed_tools.read_only`
@@ -55,14 +55,14 @@ pub(crate) enum McpAdmissionMode {
 /// Carries only the operator decision, never any server- or client-supplied
 /// value. Mirrors the `McpConnectorContextPolicy` snapshot pattern so the
 /// dispatch filter can re-enforce without re-reading filter configuration.
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct McpAdmissionPolicy {
     /// Admission mode.
     pub mode: McpAdmissionMode,
 }
 
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 impl McpAdmissionPolicy {
     /// Whether protected-mode admission applies.
     pub(crate) fn is_protected(self) -> bool {
@@ -71,7 +71,7 @@ impl McpAdmissionPolicy {
 }
 
 /// Operator-selected behavior for tools supplied by one connector.
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ConnectorToolPolicy {
     /// Exclude the connector without contacting it. This is the default.
@@ -84,7 +84,7 @@ pub(crate) enum ConnectorToolPolicy {
 }
 
 /// Why a discovered tool was denied admission under protected mode.
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum McpDenyReason {
     /// The resolving target has no operator permission — a client-selected
@@ -97,7 +97,7 @@ pub(crate) enum McpDenyReason {
     UnverifiedReadOnly,
 }
 
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 impl McpDenyReason {
     /// Client-safe explanation used in a truthful dispatch rejection.
     pub(crate) fn message(self) -> &'static str {
@@ -117,7 +117,7 @@ impl McpDenyReason {
 /// admitted states (a `deny` policy, or an unclassified `read_only` admission)
 /// are unrepresentable: the only admitting policies are `allow_all` and a
 /// `read_only` policy with an affirmative classification.
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionBasis {
     /// Admitted under `tool_policy: allow_all`; read-only classification is not
@@ -129,7 +129,7 @@ pub(crate) enum AdmissionBasis {
 }
 
 /// Admission verdict for one discovered tool.
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum McpToolVerdict {
     /// The tool is admitted; the basis records which policy admitted it.
@@ -139,7 +139,7 @@ pub(crate) enum McpToolVerdict {
 }
 
 /// Read-only classification of a single tool definition.
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadOnlyClass {
     /// The tool is affirmatively classified as read-only.
@@ -156,7 +156,7 @@ enum ReadOnlyClass {
 /// `readOnlyHint: true` is
 /// affirmative unless contradicted by `destructiveHint: true` (conflicting);
 /// `readOnlyHint: false` is writable; absent or non-boolean is unverified.
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 fn classify_read_only(tool_def: &Value) -> ReadOnlyClass {
     let annotations = tool_def.get("annotations");
     let Some(hint) = annotations.and_then(|a| a.get("readOnlyHint")) else {
@@ -185,7 +185,7 @@ fn classify_read_only(tool_def: &Value) -> ReadOnlyClass {
 ///
 /// Advisory mode never reaches here — callers skip verdict construction entirely
 /// so existing behavior is byte-for-byte unchanged.
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 pub(crate) fn evaluate_tool(
     policy: McpAdmissionPolicy,
     tool_policy: ConnectorToolPolicy,
@@ -215,7 +215,7 @@ pub(crate) fn evaluate_tool(
 /// loop and dispatcher recognize a model-generated call to a denied tool by the
 /// lossy name the model actually emits, failing closed on encoded-name
 /// collisions.
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct McpAdmissionDecisions {
     /// The operator policy snapshot this request was evaluated under.
@@ -241,7 +241,7 @@ pub(crate) struct McpAdmissionDecisions {
     available_encoded: HashSet<String>,
 }
 
-#[cfg(feature = "openai-mcp-tools")]
+#[cfg(feature = "mcp")]
 impl McpAdmissionDecisions {
     /// Create an empty decision set bound to an operator policy snapshot.
     pub(crate) fn new(policy: McpAdmissionPolicy) -> Self {
@@ -299,6 +299,13 @@ impl McpAdmissionDecisions {
         }) {
             self.available_encoded.insert(name.to_owned());
         }
+    }
+
+    /// Record one model-visible tool name, for adapters whose tools are not
+    /// Responses `function` entries.
+    #[cfg(feature = "anthropic-mcp-connector")]
+    pub(crate) fn mark_available_name(&mut self, name: &str) {
+        self.available_encoded.insert(name.to_owned());
     }
 
     /// Look up a verdict by canonical tool identity.

@@ -513,9 +513,16 @@ fn limited_error<R: McpCallOutcome>(call: &McpCallIdentity<'_>, message: &str, l
 /// Execute a single MCP tool call.
 #[expect(
     clippy::too_many_lines,
+    reason = "linear validation, dispatch-time admission re-enforcement, and async call"
+)]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the two lints below depend on the adapter result type"
+)]
+#[allow(
     clippy::cognitive_complexity,
     clippy::large_stack_frames,
-    reason = "linear validation, dispatch-time admission re-enforcement, and async call"
+    reason = "generic over adapter result types; whether each fires depends on which adapters are compiled"
 )]
 pub(crate) async fn execute_single_call<R: McpCallOutcome>(
     call: &McpToolCall<'_>,
