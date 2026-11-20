@@ -273,6 +273,13 @@ impl praxis_filter::HttpFilter for Sigv4SignFilter {
         }
     }
 
+    async fn on_request(
+        &self,
+        _ctx: &mut praxis_filter::HttpFilterContext<'_>,
+    ) -> Result<praxis_filter::FilterAction, FilterError> {
+        Ok(praxis_filter::FilterAction::Continue)
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "the linear path/uri/sign/fail-closed/header-set sequence exceeds the 30-line limit"
