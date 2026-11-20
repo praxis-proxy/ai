@@ -134,6 +134,29 @@ When a change starts in one protocol, identify the underlying operation and trac
 - Apply the shared behavior to every existing path whose contract requires it. Check that each path can use the implementation with its own feature flags. If a related path is outside the change, explain why in the PR.
 - Test the common behavior once at its owner, then test each affected protocol through its normal entry point. For web-search domain restrictions, verify which results reach the model through each adapter.
 
+## Filter ordering and dependencies
+
+When implementing or reviewing behavior that spans filters, trace each
+supported pipeline from the input through the decision that depends on it.
+Use the documented filter contracts, example configurations, and hook
+implementations to establish which filter sees the input first, what it
+guarantees, and which later filters rely on that guarantee. Account for
+branches and operations where an earlier filter skips processing or hands
+the body to another filter.
+
+Give each check one owner per execution path. A downstream filter may rely
+on a required predecessor while its guarantee still holds. For example, if
+a request filter validates the body model and publishes it for routing,
+the router can consume that fact directly. A supported pipeline that
+selects a provider directly from the body needs an owner for the same
+check on that path.
+
+Make required ordering explicit in the filter contract. An example shows
+one supported order; establishing a new prerequisite for a filter that
+already supports standalone use is a compatibility change. Cover edge
+cases at the owning filter and verify the client-visible outcome through
+the supported pipeline.
+
 ## Conventions
 
 Follows the same conventions as
