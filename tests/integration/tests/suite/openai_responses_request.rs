@@ -330,6 +330,38 @@ fn model_header_routes_to_specific_backend() {
 }
 
 #[test]
+fn repeated_model_is_rejected_before_model_routing() {
+    let model_a_guard = start_backend_with_shutdown("model-a-backend");
+    let model_b_guard = start_backend_with_shutdown("model-b-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let yaml = model_routing_yaml(
+        proxy_port,
+        model_a_guard.port(),
+        model_b_guard.port(),
+        default_guard.port(),
+    );
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    for body in [
+        r#"{"model":"model-a","input":"test","model":"model-b"}"#,
+        r#"{"model":"model-a","model":"model-a","input":"test"}"#,
+    ] {
+        let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+        assert_eq!(parse_status(&raw), 400, "a repeated model must be refused: {body}");
+        let error: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+        assert_eq!(
+            error["error"]["type"].as_str(),
+            Some("invalid_request_error"),
+            "the refusal uses the OpenAI error shape: {body}"
+        );
+    }
+}
+
+#[test]
 fn stream_header_routes_streaming_traffic() {
     let stream_guard = start_backend_with_shutdown("stream-backend");
     let default_guard = start_backend_with_shutdown("default-backend");

@@ -6,8 +6,9 @@
 //! An exact model/path match selects a configured cluster, rewrites the request
 //! body's `model`, and preserves the public model ID for metering and response
 //! adapters. Unmatched bodies remain unchanged; `fallback_upstream` optionally
-//! selects their cluster. The load balancer owns endpoint selection and retries.
-//! Configuration is local to the filter pipeline; this filter does not watch
+//! selects their cluster. A body on a configured path that repeats its
+//! top-level `model` is refused with HTTP 400 before any cluster is selected. The load balancer owns endpoint selection
+//! and retries. Configuration is local to the filter pipeline; this filter does not watch
 //! Kubernetes resources or perform request-time control-plane lookups.
 
 use std::{
@@ -17,15 +18,17 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_ai_apis::{MODEL_PROVIDER_CLIENT_MODEL_METADATA, RecordAiMetadata as _, json_body::replace_json_body};
+use praxis_ai_apis::{
+    MODEL_PROVIDER_CLIENT_MODEL_METADATA, RecordAiMetadata as _,
+    json_body::replace_json_body,
+    model_field::{self, ModelScan},
+};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     builtins::http::payload_processing::config_validation::validate_max_body_bytes, parse_filter_config,
 };
 use serde::Deserialize;
 use serde_json::Value;
-
-mod model;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -95,6 +98,10 @@ struct ModelProviderMapping {
 /// phase, the filter selects the mapping's `upstream` cluster. A following
 /// `load_balancer` owns endpoint selection, health checks, and retries; no
 /// header-matching `router` or provider registry is needed.
+///
+/// A body on a configured path whose top-level `model` occurs more than once
+/// is refused with HTTP 400, including identical repeats, so neither a mapping
+/// nor `fallback_upstream` is selected from an ambiguous model.
 ///
 /// Unknown models and paths keep their bodies unchanged and select
 /// `fallback_upstream` when configured. Without it, this filter leaves cluster
@@ -337,7 +344,12 @@ impl HttpFilter for ModelToProviderFilter {
         let Some(raw) = body.as_ref() else {
             return Ok(FilterAction::Continue);
         };
-        let Some(client_model) = model::peek(raw) else {
+        let scan = model_field::scan(raw);
+        if matches!(scan, ModelScan::Duplicate) {
+            tracing::debug!("model_to_provider: refusing a repeated top-level model");
+            return Ok(FilterAction::Reject(Rejection::status(400)));
+        }
+        let Some(client_model) = scan.as_str() else {
             return Ok(FilterAction::Continue);
         };
         let Some(mapping) = self.models.get(client_model.as_ref()) else {

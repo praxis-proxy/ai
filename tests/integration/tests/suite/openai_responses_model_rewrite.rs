@@ -429,6 +429,83 @@ fn malformed_json_continues_in_continue_mode() {
 }
 
 // -----------------------------------------------------------------------------
+// Repeated Model Rejection
+// -----------------------------------------------------------------------------
+
+#[test]
+fn repeated_model_rejected_in_continue_mode_on_both_endpoints() {
+    let echo_guard = start_echo_backend();
+    let proxy_port = free_port();
+
+    let config = Config::from_yaml(&rewrite_without_request_classifier_yaml(proxy_port, echo_guard.port())).unwrap();
+    let proxy = start_proxy(&config);
+
+    for (path, body) in [
+        (
+            "/v1/responses",
+            r#"{"model":"codex-mini-latest","input":"hi","model":"gpt-4.1-mini"}"#,
+        ),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"codex-mini-latest","model":"codex-mini-latest","messages":[]}"#,
+        ),
+    ] {
+        let raw = http_send(proxy.addr(), &json_post(path, body));
+
+        assert_eq!(parse_status(&raw), 400, "{path}: a repeated model must be refused");
+        let error_body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+        assert_eq!(
+            error_body["error"]["type"].as_str(),
+            Some("invalid_request_error"),
+            "{path}: rejection should have structured error type"
+        );
+    }
+}
+
+#[test]
+fn repeated_model_never_reaches_an_effective_model_route() {
+    let llama_guard = start_backend_with_shutdown("llama-backend");
+    let qwen_guard = start_backend_with_shutdown("qwen-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let config = Config::from_yaml(&effective_model_routing_without_request_classifier_yaml(
+        proxy_port,
+        llama_guard.port(),
+        qwen_guard.port(),
+        default_guard.port(),
+    ))
+    .unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1-mini","input":"ambiguous","model":"codex-mini-2026-06-24"}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "a repeated model must be refused before routing"
+    );
+    let response = parse_body(&raw);
+    for backend in ["llama-backend", "qwen-backend", "default-backend"] {
+        assert_ne!(response, backend, "{backend} must not answer an ambiguous model");
+    }
+
+    // Control: the same route configuration still serves an unambiguous model.
+    let body = r#"{"model":"gpt-4.1-mini","input":"control"}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "an unambiguous model must still reach its route"
+    );
+    assert_eq!(
+        parse_body(&raw),
+        "qwen-backend",
+        "the control request must route through the effective model header"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 
@@ -499,6 +576,29 @@ insecure_options:
   allow_private_endpoints: true
 "#
     )
+}
+
+/// Rewrite-only config: no earlier `openai_responses_request` classifier.
+///
+/// This is the standard-build shape: `openai_responses_request` is experimental,
+/// so model rewrite is the first filter to read the body model on both endpoints
+/// and owns the duplicate-model check there.
+fn rewrite_without_request_classifier_yaml(proxy_port: u16, backend_port: u16) -> String {
+    without_request_classifier(&rewrite_yaml(proxy_port, backend_port))
+}
+
+/// Remove the `openai_responses_request` classifier from a test config.
+///
+/// Panics if the classifier entry is absent, so a drifted config cannot
+/// silently leave the classifier answering in model rewrite's place.
+fn without_request_classifier(yaml: &str) -> String {
+    const CLASSIFIER: &str = "      - filter: openai_responses_request\n        initialize_state: false\n";
+    assert_eq!(
+        yaml.matches(CLASSIFIER).count(),
+        1,
+        "test config must contain exactly one request classifier entry to remove"
+    );
+    yaml.replace(CLASSIFIER, "")
 }
 
 /// YAML config with header-echo backend for content-length verification.
@@ -580,4 +680,19 @@ insecure_options:
   allow_private_endpoints: true
 "#
     )
+}
+
+/// Effective-model routing config with no earlier request classifier.
+fn effective_model_routing_without_request_classifier_yaml(
+    proxy_port: u16,
+    llama_port: u16,
+    qwen_port: u16,
+    default_port: u16,
+) -> String {
+    without_request_classifier(&effective_model_routing_yaml(
+        proxy_port,
+        llama_port,
+        qwen_port,
+        default_port,
+    ))
 }

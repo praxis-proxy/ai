@@ -322,6 +322,14 @@ release profile and reports nanoseconds per request over 10,000
 iterations for mapped models with 64-byte, 1 KiB, and 16 KiB prompts,
 plus an unknown model with 1 KiB and 16 KiB prompts.
 
+Run the model-to-header benchmark with `make bench-model-to-header`.
+It isolates the top-level `model` scan that `model_to_header` runs
+before the core JSON extractor reparses the same body, reporting
+nanoseconds per request for both passes at 64-byte, 1 KiB, 16 KiB,
+256 KiB, and 1 MiB prompt sizes. The Tests workflow runs it in the
+same filter job as the model-to-provider benchmark, reusing that
+job's release build.
+
 These timings include request-context construction, shared body
 ownership, the filter call, and cleanup. They measure local filter
 cost without network or backend latency. Shared CI runner timings

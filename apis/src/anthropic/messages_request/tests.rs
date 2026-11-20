@@ -227,6 +227,58 @@ async fn the_default_policy_forwards_a_bad_envelope() {
     assert!(matches!(action, FilterAction::Release));
 }
 
+/// A repeated top-level `model` is refused under every `on_invalid` setting.
+///
+/// Forwarding it would let the router act on one occurrence while the backend
+/// honors another, so `continue` does not apply.
+#[tokio::test]
+async fn a_repeated_top_level_model_is_refused_under_every_policy() {
+    let request = create_request();
+    for yaml in ["on_invalid: reject\n", "on_invalid: continue\n", "{}"] {
+        let filter = filter(yaml);
+        for body in [
+            br#"{"model":"claude-opus-4-8","max_tokens":1,"messages":[],"model":"claude-haiku-4-5"}"#.as_slice(),
+            br#"{"model":"claude-opus-4-8","model":"claude-opus-4-8"}"#,
+        ] {
+            let (action, ctx) = run_with(filter.as_ref(), &request, Some(body)).await;
+            let FilterAction::Reject(rejection) = action else {
+                panic!("{yaml}: repeated model must be refused");
+            };
+            assert_eq!(rejection.status, 400);
+            let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+            assert_eq!(error["error"]["type"], "invalid_request_error", "Anthropic error shape");
+            assert!(
+                !ctx.filter_metadata.contains_key("anthropic_messages_request.model"),
+                "{yaml}: no model fact is published"
+            );
+            assert!(
+                ctx.request_headers_to_set.is_empty(),
+                "{yaml}: no routing header is promoted"
+            );
+            assert!(
+                ctx.extensions.get::<AnthropicMessagesState>().is_none(),
+                "{yaml}: no state is published"
+            );
+        }
+    }
+}
+
+/// A `model` key inside a message or tool is not a repeat.
+#[tokio::test]
+async fn nested_model_keys_do_not_count_as_repeats() {
+    let filter = filter("on_invalid: reject\n");
+    let request = create_request();
+    let mut body = anthropic_body();
+    body["metadata"] = json!({"model": "nested"});
+    let raw = serde_json::to_vec(&body).unwrap();
+    let (action, ctx) = run_with(filter.as_ref(), &request, Some(&raw)).await;
+    assert!(matches!(action, FilterAction::Release));
+    assert_eq!(
+        ctx.filter_metadata.get("anthropic_messages_request.model"),
+        Some("claude-opus-4-8")
+    );
+}
+
 // -----------------------------------------------------------------------------
 // The head decides the operation
 // -----------------------------------------------------------------------------

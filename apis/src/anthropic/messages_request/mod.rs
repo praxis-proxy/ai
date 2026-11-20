@@ -69,6 +69,7 @@ use crate::{
         wire,
     },
     classifier::{AiRequestFormat, ClassifiedRequest, classify_object},
+    model_field::{self, DUPLICATE_MODEL_MESSAGE, ParseError},
     promotion::is_promotable_value,
 };
 
@@ -93,7 +94,9 @@ pub(crate) const MCP_CONNECTOR_METADATA_KEY: &str = "anthropic_messages_request.
 ///
 /// `on_invalid` governs the envelope: a missing, malformed, or non-object body
 /// is refused with an Anthropic-compatible client error under `reject`, or
-/// forwarded for the backend to answer under `continue`.
+/// forwarded for the backend to answer under `continue`. A body that repeats its
+/// top-level `model` is refused under either setting, because no single model
+/// fact exists for routing to act on.
 pub struct AnthropicMessagesRequestFilter {
     /// Parsed and validated configuration.
     config: AnthropicMessagesRequestConfig,
@@ -110,12 +113,12 @@ impl AnthropicMessagesRequestFilter {
     /// for a gateway that refuses malformed payloads, `continue` for a chain
     /// that forwards them unchanged.
     fn handle_bad_envelope(&self, ctx: &mut HttpFilterContext<'_>, reason: &BadEnvelope) -> FilterAction {
-        match self.config.on_invalid {
-            OnInvalidBehavior::Reject | OnInvalidBehavior::Error => {
+        match (reason, self.config.on_invalid) {
+            (BadEnvelope::DuplicateModel, _) | (_, OnInvalidBehavior::Reject | OnInvalidBehavior::Error) => {
                 debug!(reason = reason.message(), "rejecting create-message envelope");
                 FilterAction::Reject(wire::invalid_request_rejection(reason.message()))
             },
-            OnInvalidBehavior::Continue => {
+            (_, OnInvalidBehavior::Continue) => {
                 // The head still identified Anthropic traffic, so the error
                 // shape is installed even though the payload is forwarded.
                 trace!(reason = reason.message(), "forwarding malformed create-message body");
@@ -299,6 +302,8 @@ enum BadEnvelope {
     NotJson,
     /// Valid JSON that is not a top-level object.
     NotObject,
+    /// A top-level object that repeats `model`.
+    DuplicateModel,
 }
 
 impl BadEnvelope {
@@ -308,6 +313,7 @@ impl BadEnvelope {
             Self::Missing => "request body is required",
             Self::NotJson => "request body is not valid JSON",
             Self::NotObject => "request body is not a JSON object",
+            Self::DuplicateModel => DUPLICATE_MODEL_MESSAGE,
         }
     }
 }
@@ -321,14 +327,14 @@ fn parse_envelope(body: &Option<Bytes>) -> Result<serde_json::Map<String, serde_
         .as_deref()
         .filter(|chunk| !chunk.is_empty())
         .ok_or(BadEnvelope::Missing)?;
-    let parsed = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|error| {
-        debug!(%error, "create-message body is not valid JSON");
-        BadEnvelope::NotJson
-    })?;
-    match parsed {
-        serde_json::Value::Object(object) => Ok(object),
-        _ => Err(BadEnvelope::NotObject),
-    }
+    model_field::parse_object(bytes).map_err(|error| match error {
+        ParseError::Json(error) => {
+            debug!(%error, "create-message body is not valid JSON");
+            BadEnvelope::NotJson
+        },
+        ParseError::NotObject => BadEnvelope::NotObject,
+        ParseError::DuplicateModel => BadEnvelope::DuplicateModel,
+    })
 }
 
 /// Whether the body uses the Anthropic MCP connector.

@@ -13,7 +13,9 @@
 //! body facts for downstream consumers.
 //!
 //! The filter is transparent: a body that fails to classify simply yields no model
-//! fact — it never rejects the request — so native Chat traffic forwards unchanged.
+//! fact, so native Chat traffic forwards unchanged. The one exception is a body
+//! that repeats its top-level `model`: no single model fact exists for routing
+//! to act on, so it is refused with HTTP 400 before any fact is published.
 //!
 //! [`AiOperationMatch`]: crate::operation_classifier::AiOperationMatch
 
@@ -44,7 +46,8 @@ use self::config::{ChatCompletionsRequestConfig, FILTER_NAME, build_config};
 use crate::{
     RecordAiMetadata as _,
     classifier::{AiRequestFormat, ClassifiedRequest, classify_request_body},
-    openai::chat_completions::routes as chat_completions_routes,
+    model_field::DUPLICATE_MODEL_MESSAGE,
+    openai::{chat_completions::routes as chat_completions_routes, responses::error::responses_error_rejection},
     operation_classifier::AiOperationMatch,
     promotion::is_promotable_value,
 };
@@ -132,7 +135,9 @@ impl HttpFilter for OpenaiChatCompletionsRequestFilter {
             None => &[],
         };
 
-        let classified = classify_request_body(bytes);
+        let Ok(classified) = classify_request_body(bytes) else {
+            return Ok(duplicate_model_rejection());
+        };
 
         debug!(
             model = ?classified.model,
@@ -150,6 +155,16 @@ impl HttpFilter for OpenaiChatCompletionsRequestFilter {
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+/// Refuse a body whose top-level `model` occurs more than once.
+fn duplicate_model_rejection() -> FilterAction {
+    debug!("refusing chat completions request with a repeated top-level model");
+    FilterAction::Reject(responses_error_rejection(
+        400,
+        "invalid_request_error",
+        DUPLICATE_MODEL_MESSAGE,
+    ))
+}
 
 /// Whether `ai_operation` matched this request head to the Chat Completions
 /// create call.

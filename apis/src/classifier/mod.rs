@@ -6,6 +6,8 @@
 //! Disambiguates Responses API, Anthropic Messages, and Chat
 //! Completions from a single JSON body parse.
 
+use crate::model_field::{self, ParseError};
+
 // -----------------------------------------------------------------------------
 // AiRequestFormat
 // -----------------------------------------------------------------------------
@@ -135,24 +137,32 @@ pub(crate) fn is_chat_completions_create(method: &http::Method, path: &str) -> b
 ///
 /// This function is pure: no I/O, no side effects, no mutation of
 /// the input bytes.
-pub(crate) fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
+///
+/// # Errors
+///
+/// Returns [`DuplicateModel`] when the body repeats its top-level `model`,
+/// which leaves the routing model ambiguous. Every other unclassifiable body
+/// is reported through the returned format instead.
+pub(crate) fn classify_request_body(body: &[u8]) -> Result<ClassifiedRequest, DuplicateModel> {
     if body.is_empty() {
-        return empty_result(AiRequestFormat::NonJson);
+        return Ok(empty_result(AiRequestFormat::NonJson));
     }
 
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return empty_result(AiRequestFormat::InvalidJson);
-    };
-
-    let Some(obj) = value.as_object_mut() else {
-        return empty_result(AiRequestFormat::InvalidJson);
+    let mut obj = match model_field::parse_object(body) {
+        Ok(obj) => obj,
+        Err(ParseError::DuplicateModel) => return Err(DuplicateModel),
+        Err(ParseError::Json(_) | ParseError::NotObject) => return Ok(empty_result(AiRequestFormat::InvalidJson)),
     };
 
     // This parse is a throwaway owned by this function, so the model string is
     // moved out rather than copied.
-    let model = take_string(obj, "model");
-    classify_fields(obj, model)
+    let model = take_string(&mut obj, "model");
+    Ok(classify_fields(&obj, model))
 }
+
+/// A request body repeated its top-level `model`, so no routing model exists.
+#[derive(Debug)]
+pub(crate) struct DuplicateModel;
 
 /// Extract routing facts from an already-parsed request object.
 ///
@@ -333,7 +343,7 @@ mod tests {
     #[test]
     fn the_owned_path_moves_the_model_out_of_its_throwaway_parse() {
         let body = br#"{"model":"gpt-4.1","input":"hi"}"#;
-        assert_eq!(classify_request_body(body).model.as_deref(), Some("gpt-4.1"));
+        assert_eq!(classify_request_body(body).unwrap().model.as_deref(), Some("gpt-4.1"));
     }
 
     #[cfg(feature = "openai-responses")]
@@ -358,7 +368,7 @@ mod tests {
     #[test]
     fn responses_string_input() {
         let body = br#"{"model":"gpt-4.1-mini","input":"Hello, world!"}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -375,7 +385,7 @@ mod tests {
     #[test]
     fn responses_array_input() {
         let body = br#"{"model":"gpt-4.1","input":[{"type":"message","role":"user","content":"Hi"}]}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -388,7 +398,7 @@ mod tests {
     #[test]
     fn responses_null_input_classifies_as_responses() {
         let body = br#"{"model":"gpt-4.1","input":null}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -402,7 +412,7 @@ mod tests {
     fn responses_with_stream_store_previous_response_id() {
         let body =
             br#"{"model":"gpt-4.1","input":"test","stream":true,"store":false,"background":true,"previous_response_id":"resp_abc"}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(result.format, AiRequestFormat::Responses, "should be responses");
         assert_eq!(result.stream, Some(true), "stream should be extracted");
@@ -417,7 +427,7 @@ mod tests {
     #[test]
     fn responses_max_output_tokens_extracted() {
         let body = br#"{"model":"gpt-4.1","input":"test","max_output_tokens":2048}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(result.format, AiRequestFormat::Responses, "should be responses");
         assert_eq!(
@@ -431,7 +441,7 @@ mod tests {
     #[test]
     fn responses_absent_max_output_tokens_is_none() {
         let body = br#"{"model":"gpt-4.1","input":"test"}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(
             result.max_output_tokens.is_none(),
@@ -442,7 +452,7 @@ mod tests {
     #[test]
     fn responses_with_conversation() {
         let body = br#"{"model":"gpt-4.1","input":"test","conversation":{"id":"conv_123"}}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(result.format, AiRequestFormat::Responses, "should be responses");
         assert!(result.has_conversation, "conversation should be detected");
@@ -452,7 +462,7 @@ mod tests {
     #[test]
     fn chat_completions_messages_without_max_tokens() {
         let body = br#"{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -465,7 +475,7 @@ mod tests {
     #[test]
     fn chat_completions_with_stream() {
         let body = br#"{"model":"gpt-4","messages":[],"stream":true}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -478,7 +488,7 @@ mod tests {
     #[test]
     fn anthropic_messages_with_system() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"system":"Be helpful.","messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -496,7 +506,7 @@ mod tests {
     #[test]
     fn anthropic_messages_with_typed_content_blocks() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":512,"messages":[{"role":"user","content":[{"type":"text","text":"Hi"}]}],"stream":true}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -509,7 +519,7 @@ mod tests {
     #[test]
     fn chat_completions_with_max_tokens_not_misclassified() {
         let body = br#"{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}],"max_tokens":100}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -521,7 +531,7 @@ mod tests {
     #[test]
     fn anthropic_messages_max_tokens_without_signals_is_chat() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -533,7 +543,7 @@ mod tests {
     #[test]
     fn chat_completions_with_null_system_not_misclassified() {
         let body = br#"{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}],"max_tokens":100,"system":null}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -545,7 +555,7 @@ mod tests {
     #[test]
     fn unknown_json_no_input_no_messages() {
         let body = br#"{"model":"gpt-4","prompt":"hello"}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -562,7 +572,7 @@ mod tests {
     #[test]
     fn invalid_json() {
         let body = b"not json at all {{{";
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -574,7 +584,7 @@ mod tests {
 
     #[test]
     fn empty_body() {
-        let result = classify_request_body(b"");
+        let result = classify_request_body(b"").unwrap();
 
         assert_eq!(result.format, AiRequestFormat::NonJson, "empty body should be non_json");
     }
@@ -582,7 +592,7 @@ mod tests {
     #[test]
     fn json_array_is_invalid() {
         let body = b"[1, 2, 3]";
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -594,7 +604,7 @@ mod tests {
     #[test]
     fn null_previous_response_id_not_detected() {
         let body = br#"{"model":"gpt-4.1","input":"test","previous_response_id":null}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(
             !result.has_previous_response_id,
@@ -605,7 +615,7 @@ mod tests {
     #[test]
     fn null_conversation_not_detected() {
         let body = br#"{"model":"gpt-4.1","input":"test","conversation":null}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(
             !result.has_conversation,
@@ -616,7 +626,7 @@ mod tests {
     #[test]
     fn missing_model_returns_none() {
         let body = br#"{"input":"test"}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -629,7 +639,7 @@ mod tests {
     #[test]
     fn stream_and_store_absent_returns_none() {
         let body = br#"{"model":"gpt-4.1","input":"test"}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(result.stream.is_none(), "absent stream should be None");
         assert!(result.store.is_none(), "absent store should be None");
@@ -639,7 +649,7 @@ mod tests {
     #[test]
     fn background_false_extracted() {
         let body = br#"{"model":"gpt-4.1","input":"test","background":false}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.background,
@@ -651,7 +661,7 @@ mod tests {
     #[test]
     fn null_background_not_detected() {
         let body = br#"{"model":"gpt-4.1","input":"test","background":null}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(
             result.background.is_none(),
@@ -662,7 +672,7 @@ mod tests {
     #[test]
     fn tools_non_empty_array_detected() {
         let body = br#"{"model":"gpt-4.1","input":"test","tools":[{"type":"function"}]}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(result.has_tools, "non-empty tools array should be detected");
     }
@@ -670,7 +680,7 @@ mod tests {
     #[test]
     fn tools_empty_array_not_detected() {
         let body = br#"{"model":"gpt-4.1","input":"test","tools":[]}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(!result.has_tools, "empty tools array should not be detected");
     }
@@ -678,7 +688,7 @@ mod tests {
     #[test]
     fn tools_absent_not_detected() {
         let body = br#"{"model":"gpt-4.1","input":"test"}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(!result.has_tools, "absent tools should not be detected");
     }
@@ -686,7 +696,7 @@ mod tests {
     #[test]
     fn tools_null_not_detected() {
         let body = br#"{"model":"gpt-4.1","input":"test","tools":null}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(!result.has_tools, "null tools should not be detected");
     }
@@ -694,7 +704,7 @@ mod tests {
     #[test]
     fn prompt_id_nested_detected() {
         let body = br#"{"model":"gpt-4.1","input":"test","prompt":{"id":"pmpt_123"}}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(result.has_prompt_id, "nested prompt.id should be detected");
     }
@@ -702,7 +712,7 @@ mod tests {
     #[test]
     fn prompt_id_absent_not_detected() {
         let body = br#"{"model":"gpt-4.1","input":"test"}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(!result.has_prompt_id, "absent prompt should not be detected");
     }
@@ -710,7 +720,7 @@ mod tests {
     #[test]
     fn prompt_id_null_not_detected() {
         let body = br#"{"model":"gpt-4.1","input":"test","prompt":{"id":null}}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(!result.has_prompt_id, "null prompt.id should not be detected");
     }
@@ -718,7 +728,7 @@ mod tests {
     #[test]
     fn prompt_object_without_prompt_id_not_detected() {
         let body = br#"{"model":"gpt-4.1","input":"test","prompt":{"variables":{"city":"SF"}}}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(
             !result.has_prompt_id,
@@ -729,7 +739,7 @@ mod tests {
     #[test]
     fn prompt_object_prompt_id_field_detected() {
         let body = br#"{"model":"gpt-4.1","input":"test","prompt":{"id":"pmpt_123"}}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(
             result.has_prompt_id,
@@ -740,7 +750,7 @@ mod tests {
     #[test]
     fn prompt_string_not_detected_as_prompt_id() {
         let body = br#"{"model":"gpt-4.1","input":"test","prompt":"some string"}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(
             !result.has_prompt_id,
@@ -751,7 +761,7 @@ mod tests {
     #[test]
     fn prompt_object_classifies_as_responses() {
         let body = br#"{"model":"gpt-4.1","prompt":{"id":"pmpt_123","variables":{"city":"SF"}}}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -764,7 +774,7 @@ mod tests {
     #[test]
     fn top_level_prompt_id_not_detected() {
         let body = br#"{"model":"gpt-4.1","input":"test","prompt_id":"pmpt_123"}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(
             !result.has_prompt_id,
@@ -775,7 +785,7 @@ mod tests {
     #[test]
     fn non_boolean_background_not_detected() {
         let body = br#"{"model":"gpt-4.1","input":"test","background":"true"}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(
             result.background.is_none(),
@@ -786,7 +796,7 @@ mod tests {
     #[test]
     fn nested_background_not_detected() {
         let body = br#"{"model":"gpt-4.1","input":[{"type":"input_image","background":true}]}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert!(
             result.background.is_none(),
@@ -798,7 +808,7 @@ mod tests {
     fn oversized_model_extracted() {
         let long_model = "x".repeat(1024);
         let body = format!(r#"{{"model":"{long_model}","input":"test"}}"#);
-        let result = classify_request_body(body.as_bytes());
+        let result = classify_request_body(body.as_bytes()).unwrap();
 
         assert_eq!(
             result.model.as_deref(),
@@ -810,7 +820,7 @@ mod tests {
     #[test]
     fn both_input_and_messages_classifies_as_responses() {
         let body = br#"{"model":"gpt-4.1","input":"test","messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -823,7 +833,7 @@ mod tests {
     fn previous_response_id_with_messages_classifies_as_responses() {
         let body =
             br#"{"model":"gpt-4.1","previous_response_id":"resp_abc","messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -835,7 +845,7 @@ mod tests {
     #[test]
     fn conversation_with_messages_classifies_as_responses() {
         let body = br#"{"model":"gpt-4.1","conversation":{"id":"conv_123"},"messages":[{"role":"user","content":"Hi"}],"max_tokens":1024,"system":"Be helpful."}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -955,7 +965,7 @@ mod tests {
     #[test]
     fn previous_response_id_only_classifies_as_responses() {
         let body = br#"{"model":"gpt-4.1","previous_response_id":"resp_abc"}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -971,7 +981,7 @@ mod tests {
     #[test]
     fn previous_response_id_with_input_classifies_as_responses() {
         let body = br#"{"model":"gpt-4.1","previous_response_id":"resp_abc","input":"hello"}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -983,7 +993,7 @@ mod tests {
     #[test]
     fn conversation_only_classifies_as_responses() {
         let body = br#"{"model":"gpt-4.1","conversation":{"id":"conv_123"}}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -996,7 +1006,7 @@ mod tests {
     #[test]
     fn null_previous_response_id_still_classifies_as_responses() {
         let body = br#"{"model":"gpt-4.1","previous_response_id":null}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -1012,7 +1022,7 @@ mod tests {
     #[test]
     fn null_conversation_still_classifies_as_responses() {
         let body = br#"{"model":"gpt-4.1","conversation":null}"#;
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.format,
@@ -1028,7 +1038,7 @@ mod tests {
     #[test]
     fn control_char_model_extracted() {
         let body = b"{\"model\":\"bad\\nmodel\",\"input\":\"test\"}";
-        let result = classify_request_body(body);
+        let result = classify_request_body(body).unwrap();
 
         assert_eq!(
             result.model.as_deref(),
