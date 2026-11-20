@@ -103,7 +103,7 @@ async fn identical_pending(
 ) -> Result<Option<Result<u64, Domain>>, PgBackendError> {
     let files = &c.files;
     let existing: Option<ExistingRow> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT tenant_id, owner_issuer, owner_subject, storage_key, filename, bytes \
+        "SELECT tenant_id, owner_issuer, owner_subject, storage_key, filename, state, bytes \
          FROM {files} WHERE id = $1"
     )))
     .bind(&file.id)
