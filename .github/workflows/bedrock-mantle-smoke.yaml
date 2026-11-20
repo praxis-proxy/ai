@@ -68,10 +68,17 @@ jobs:
               error_type=$(jq -r 'first((.error.code, .error.type, .code, .__type) | strings | select(length > 0)) // empty' "$response" 2>/dev/null || true)
             fi
             request_id=$(awk 'tolower($1) ~ /^x-amz(n)?-request-?id:$/ {print $2}' "$headers" | tr -d '\r' | tail -1)
-            if [[ ! "$error_type" =~ ^[A-Za-z0-9_.#:-]{1,128}$ ]]; then
-              error_type=unavailable
-            fi
-            if [[ ! "$request_id" =~ ^[A-Za-z0-9_-]{1,128}$ ]]; then
+            error_type=${error_type##*#}
+            error_type=${error_type%%:*}
+            case "$error_type" in
+              AccessDenied|AccessDeniedException|ExpiredToken|ExpiredTokenException|\
+              IncompleteSignature|InvalidClientTokenId|InvalidSignatureException|\
+              MissingAuthenticationToken|ResourceNotFoundException|SignatureDoesNotMatch|\
+              ThrottlingException|UnrecognizedClientException|ValidationException)
+                ;;
+              *) error_type=unavailable ;;
+            esac
+            if [[ ! "$request_id" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
               request_id=unavailable
             fi
             echo "::error::Bedrock Mantle returned no valid completion (HTTP $status, error type $error_type, request ID $request_id)."
