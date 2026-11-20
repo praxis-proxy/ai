@@ -52,7 +52,10 @@ async fn run_with<'a>(
 #[test]
 fn declares_read_only_buffered_body_access() {
     let filter = default_filter();
-    assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(
+        filter.request_body_access(),
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    );
     assert!(matches!(filter.request_body_mode(), BodyMode::StreamBuffer { .. }));
 }
 
@@ -106,13 +109,14 @@ async fn publishes_routing_metadata_and_filter_results() {
     .unwrap();
     let (_, ctx) = run_with(filter.as_ref(), &request, Some(&body)).await;
 
-    assert_eq!(
-        ctx.get_metadata("anthropic_messages_request.model"),
-        Some("claude-opus-4-8")
-    );
-    assert_eq!(ctx.get_metadata("anthropic_messages_request.stream"), Some("true"));
-    assert_eq!(ctx.get_metadata("anthropic_messages_request.max_tokens"), Some("64"));
-    assert_eq!(ctx.get_metadata("anthropic_messages_request.has_tools"), Some("true"));
+    for (key, value) in [
+        ("anthropic_messages_request.model", "claude-opus-4-8"),
+        ("anthropic_messages_request.stream", "true"),
+        ("anthropic_messages_request.max_tokens", "64"),
+        ("anthropic_messages_request.has_tools", "true"),
+    ] {
+        assert_eq!(ctx.filter_metadata.get(key), Some(value), "{key}");
+    }
 
     let results = ctx
         .filter_results
@@ -266,8 +270,8 @@ async fn the_anthropic_version_header_does_not_decide_the_operation() {
     assert!(matches!(plain_action, FilterAction::Release));
     assert!(matches!(header_action, FilterAction::Release));
     assert_eq!(
-        plain_ctx.get_metadata("anthropic_messages_request.model"),
-        header_ctx.get_metadata("anthropic_messages_request.model"),
+        plain_ctx.filter_metadata.get("anthropic_messages_request.model"),
+        header_ctx.filter_metadata.get("anthropic_messages_request.model"),
         "the version header is contract validation, not operation identity"
     );
 }
@@ -378,7 +382,88 @@ async fn the_endpoint_decides_the_published_format() {
         "an ordinary Anthropic body must not be refused by a rejecting chain"
     );
     assert_eq!(
-        ctx.get_metadata("anthropic_messages_request.format"),
+        ctx.filter_metadata.get("anthropic_messages_request.format"),
         Some("anthropic_messages")
+    );
+}
+
+// -----------------------------------------------------------------------------
+// MCP Connector Detection
+// -----------------------------------------------------------------------------
+
+/// Run a body that extends [`anthropic_body`] with `extra` and return whether
+/// the MCP connector fact was published, asserting its three forms agree.
+async fn mcp_connector_published(extra: serde_json::Value) -> bool {
+    let filter = default_filter();
+    let request = create_request();
+    let mut body = anthropic_body();
+    for (key, value) in extra.as_object().unwrap() {
+        body[key] = value.clone();
+    }
+    let body = serde_json::to_vec(&body).unwrap();
+    let (action, ctx) = run_with(filter.as_ref(), &request, Some(&body)).await;
+    assert!(
+        matches!(action, FilterAction::Release),
+        "detection must not change the action"
+    );
+
+    let metadata = ctx.filter_metadata.get(MCP_CONNECTOR_METADATA_KEY) == Some("true");
+    let result = ctx
+        .filter_results
+        .get("anthropic_messages_request")
+        .and_then(|results| results.get("mcp_connector"))
+        == Some("true");
+    let state = ctx
+        .extensions
+        .get::<AnthropicMessagesState>()
+        .unwrap()
+        .uses_mcp_connector;
+    assert_eq!(metadata, state, "metadata and state must agree");
+    assert_eq!(result, state, "filter result and state must agree");
+    state
+}
+
+#[tokio::test]
+async fn detects_non_empty_mcp_servers() {
+    assert!(
+        mcp_connector_published(json!({
+            "mcp_servers": [{"type": "url", "url": "https://mcp.example.com/sse", "name": "example"}],
+        }))
+        .await
+    );
+}
+
+#[tokio::test]
+async fn detects_mcp_toolset_tool() {
+    assert!(
+        mcp_connector_published(json!({
+            "tools": [
+                {"name": "lookup", "input_schema": {"type": "object"}},
+                {"type": "mcp_toolset", "mcp_server_name": "example"},
+            ],
+        }))
+        .await
+    );
+}
+
+#[tokio::test]
+async fn detects_malformed_mcp_servers_as_connector_intent() {
+    assert!(mcp_connector_published(json!({"mcp_servers": {"name": "example"}})).await);
+}
+
+#[tokio::test]
+async fn empty_or_null_mcp_servers_is_not_the_connector() {
+    assert!(!mcp_connector_published(json!({"mcp_servers": []})).await);
+    assert!(!mcp_connector_published(json!({"mcp_servers": null})).await);
+}
+
+#[tokio::test]
+async fn ordinary_tools_are_not_the_connector() {
+    assert!(
+        !mcp_connector_published(json!({
+            "tools": [{"name": "mcp__example__lookup", "input_schema": {"type": "object"}}],
+        }))
+        .await,
+        "a client-side tool named like an MCP tool (Claude Code) is an ordinary tool"
     );
 }

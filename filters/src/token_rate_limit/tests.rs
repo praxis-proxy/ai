@@ -5,13 +5,61 @@
 
 use std::future::Future;
 
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{FilterAction, HttpFilter};
 
-use super::{META_FAIL_OPEN, META_RESERVATION_ID, TokenRateLimitFilter};
+#[cfg(feature = "token-quota-filter")]
+use super::shared_quota_cost;
+#[cfg(feature = "token-quota-filter")]
+use super::weights::{UsageCounts, weighted_cost};
+use super::{ExchangeHolds, TokenRateLimitFilter};
+#[cfg(feature = "token-quota-filter")]
+use crate::token_quota::{TokenQuotaDecision, TokenQuotaResultStatus};
 use crate::token_usage::{
     META_TOKEN_CACHE_READ, META_TOKEN_CACHE_WRITE, META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_REASONING,
     META_TOKEN_STATUS, META_TOKEN_TOTAL, TOKEN_STATUS_OVERFLOW,
 };
+#[cfg(feature = "token-quota-filter")]
+pub(crate) fn legacy_weighted_cost_parity_fixture() -> Option<u64> {
+    let usage = UsageCounts {
+        input: Some(100),
+        output: Some(50),
+        total: Some(150),
+        cache_read: Some(10),
+        cache_write: Some(5),
+        reasoning: Some(10),
+        ..UsageCounts::default()
+    };
+    let weights = super::TokenWeights {
+        input: 1.0,
+        output: 1.0,
+        cached_input: 0.1,
+        cache_write: 2.4,
+        reasoning: 1.0,
+    };
+
+    weighted_cost(usage, weights)
+}
+
+/// A filter context with a filter ID, as in a pipeline, so the holds the
+/// filter keeps in `filter_state` survive from admission to settlement.
+fn filter_context(req: &praxis_filter::Request) -> praxis_filter::HttpFilterContext<'_> {
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.current_filter_id = Some(0);
+    ctx
+}
+
+/// Whether the filter holds a rule reservation to settle for this exchange.
+fn holds_reservation(ctx: &praxis_filter::HttpFilterContext<'_>) -> bool {
+    ctx.get_filter_state::<ExchangeHolds>()
+        .is_some_and(|holds| holds.reservation.is_some())
+}
+
+/// The outcome of this exchange's explicit fail-open admission, if any.
+fn fail_open(ctx: &praxis_filter::HttpFilterContext<'_>) -> Option<&'static str> {
+    ctx.get_filter_state::<ExchangeHolds>()
+        .and_then(|holds| holds.fail_open)
+}
 
 /// Parse fixtures that exercise unrelated fields with an explicit memory backend.
 fn parse_filter_yaml(yaml: &str) -> Result<serde_yaml::Value, serde_yaml::Error> {
@@ -107,7 +155,7 @@ async fn authenticated_subject_keying_fails_closed_without_identity() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
 
@@ -198,21 +246,21 @@ async fn header_keys_give_each_value_its_own_bucket() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let alpha_req = make_request_with_header("x-tenant-id", "alpha");
-    let mut alpha_ctx = crate::test_utils::make_filter_context(&alpha_req);
+    let mut alpha_ctx = filter_context(&alpha_req);
     assert!(matches!(
         filter.on_request(&mut alpha_ctx).await.unwrap(),
         FilterAction::Continue
     ));
 
     let beta_req = make_request_with_header("x-tenant-id", "beta");
-    let mut beta_ctx = crate::test_utils::make_filter_context(&beta_req);
+    let mut beta_ctx = filter_context(&beta_req);
     assert!(
         matches!(filter.on_request(&mut beta_ctx).await.unwrap(), FilterAction::Continue),
         "a different header value must not share alpha's exhausted-looking 10-token bucket"
     );
 
     let alpha_again_req = make_request_with_header("x-tenant-id", "alpha");
-    let mut alpha_again_ctx = crate::test_utils::make_filter_context(&alpha_again_req);
+    let mut alpha_again_ctx = filter_context(&alpha_again_req);
     assert!(
         matches!(
             filter.on_request(&mut alpha_again_ctx).await.unwrap(),
@@ -230,7 +278,7 @@ async fn missing_header_rejects_by_default_and_can_fall_back() {
     );
     let filter = TokenRateLimitFilter::from_config(&reject_yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     assert!(matches!(
         filter.on_request(&mut ctx).await.unwrap(),
         FilterAction::Reject(rejection) if rejection.status == 400
@@ -242,12 +290,12 @@ async fn missing_header_rejects_by_default_and_can_fall_back() {
     );
     let filter = TokenRateLimitFilter::from_config(&fallback_yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut first = crate::test_utils::make_filter_context(&req);
+    let mut first = filter_context(&req);
     assert!(matches!(
         filter.on_request(&mut first).await.unwrap(),
         FilterAction::Continue
     ));
-    let mut second = crate::test_utils::make_filter_context(&req);
+    let mut second = filter_context(&req);
     assert!(
         matches!(
             filter.on_request(&mut second).await.unwrap(),
@@ -266,21 +314,21 @@ async fn ip_keys_partition_by_client_address() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
 
-    let mut alice = crate::test_utils::make_filter_context(&req);
+    let mut alice = filter_context(&req);
     alice.client_addr = Some("203.0.113.10".parse().unwrap());
     assert!(matches!(
         filter.on_request(&mut alice).await.unwrap(),
         FilterAction::Continue
     ));
 
-    let mut bob = crate::test_utils::make_filter_context(&req);
+    let mut bob = filter_context(&req);
     bob.client_addr = Some("203.0.113.11".parse().unwrap());
     assert!(matches!(
         filter.on_request(&mut bob).await.unwrap(),
         FilterAction::Continue
     ));
 
-    let mut alice_again = crate::test_utils::make_filter_context(&req);
+    let mut alice_again = filter_context(&req);
     alice_again.client_addr = Some("203.0.113.10".parse().unwrap());
     assert!(matches!(
         filter.on_request(&mut alice_again).await.unwrap(),
@@ -296,7 +344,7 @@ async fn missing_ip_rejects_when_client_addr_is_absent() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     assert!(matches!(
         filter.on_request(&mut ctx).await.unwrap(),
         FilterAction::Reject(rejection) if rejection.status == 400
@@ -312,20 +360,20 @@ async fn model_keys_prefer_header_and_isolate_models() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let gpt_req = make_request_with_header("x-model", "gpt-4");
-    let mut gpt = crate::test_utils::make_filter_context(&gpt_req);
+    let mut gpt = filter_context(&gpt_req);
     assert!(matches!(
         filter.on_request(&mut gpt).await.unwrap(),
         FilterAction::Continue
     ));
 
     let llama_req = make_request_with_header("x-model", "llama-3");
-    let mut llama = crate::test_utils::make_filter_context(&llama_req);
+    let mut llama = filter_context(&llama_req);
     assert!(matches!(
         filter.on_request(&mut llama).await.unwrap(),
         FilterAction::Continue
     ));
 
-    let mut gpt_again = crate::test_utils::make_filter_context(&gpt_req);
+    let mut gpt_again = filter_context(&gpt_req);
     assert!(matches!(
         filter.on_request(&mut gpt_again).await.unwrap(),
         FilterAction::Reject(rejection) if rejection.status == 429
@@ -340,7 +388,7 @@ async fn missing_model_rejects_when_body_and_header_are_absent() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     assert!(matches!(
         filter.on_request(&mut ctx).await.unwrap(),
         FilterAction::Reject(rejection) if rejection.status == 400
@@ -355,12 +403,12 @@ async fn header_mapping_with_missing_fallback_shares_the_global_bucket() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut first = crate::test_utils::make_filter_context(&req);
+    let mut first = filter_context(&req);
     assert!(matches!(
         filter.on_request(&mut first).await.unwrap(),
         FilterAction::Continue
     ));
-    let mut second = crate::test_utils::make_filter_context(&req);
+    let mut second = filter_context(&req);
     assert!(
         matches!(
             filter.on_request(&mut second).await.unwrap(),
@@ -379,14 +427,14 @@ async fn composite_header_and_model_are_isolated_from_header_only() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = make_request_with_header("x-tenant-id", "acme");
 
-    let mut gpt = crate::test_utils::make_filter_context(&req);
+    let mut gpt = filter_context(&req);
     let mut gpt_body = Some(bytes::Bytes::from(r#"{"model":"gpt-4"}"#));
     assert!(matches!(
         filter.on_request_body(&mut gpt, &mut gpt_body, true).await.unwrap(),
         FilterAction::Continue
     ));
 
-    let mut llama = crate::test_utils::make_filter_context(&req);
+    let mut llama = filter_context(&req);
     let mut llama_body = Some(bytes::Bytes::from(r#"{"model":"llama-3"}"#));
     assert!(
         matches!(
@@ -405,7 +453,7 @@ async fn whitespace_header_is_treated_as_missing() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = make_request_with_header("x-tenant-id", "   ");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     assert!(matches!(
         filter.on_request(&mut ctx).await.unwrap(),
         FilterAction::Reject(rejection) if rejection.status == 400
@@ -427,14 +475,14 @@ async fn assert_max_keys_cap(algorithm_body: &str) {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let first_req = make_request_with_header("x-tenant-id", "alpha");
-    let mut first = crate::test_utils::make_filter_context(&first_req);
+    let mut first = filter_context(&first_req);
     assert!(
         matches!(filter.on_request(&mut first).await.unwrap(), FilterAction::Continue),
         "first distinct key must be admitted"
     );
 
     let second_req = make_request_with_header("x-tenant-id", "beta");
-    let mut second = crate::test_utils::make_filter_context(&second_req);
+    let mut second = filter_context(&second_req);
     assert!(
         matches!(
             filter.on_request(&mut second).await.unwrap(),
@@ -443,7 +491,7 @@ async fn assert_max_keys_cap(algorithm_body: &str) {
         "a second distinct header key must be denied once max_keys is exhausted"
     );
 
-    let mut alpha_again = crate::test_utils::make_filter_context(&first_req);
+    let mut alpha_again = filter_context(&first_req);
     assert!(
         matches!(
             filter.on_request(&mut alpha_again).await.unwrap(),
@@ -482,7 +530,7 @@ async fn max_keys_is_enforced_per_rule_not_across_rules() {
 
     let mut alpha_one = make_request_with_header("x-tenant-id", "one");
     alpha_one.headers.insert("x-app-id", "alpha".parse().unwrap());
-    let mut ctx = crate::test_utils::make_filter_context(&alpha_one);
+    let mut ctx = filter_context(&alpha_one);
     assert!(matches!(
         filter.on_request(&mut ctx).await.unwrap(),
         FilterAction::Continue
@@ -490,7 +538,7 @@ async fn max_keys_is_enforced_per_rule_not_across_rules() {
 
     let mut alpha_two = make_request_with_header("x-tenant-id", "two");
     alpha_two.headers.insert("x-app-id", "alpha".parse().unwrap());
-    let mut ctx = crate::test_utils::make_filter_context(&alpha_two);
+    let mut ctx = filter_context(&alpha_two);
     assert!(
         matches!(
             filter.on_request(&mut ctx).await.unwrap(),
@@ -501,7 +549,7 @@ async fn max_keys_is_enforced_per_rule_not_across_rules() {
 
     let mut beta_one = make_request_with_header("x-tenant-id", "one");
     beta_one.headers.insert("x-app-id", "beta".parse().unwrap());
-    let mut ctx = crate::test_utils::make_filter_context(&beta_one);
+    let mut ctx = filter_context(&beta_one);
     assert!(
         matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
         "beta must have its own max_keys budget, independent of alpha"
@@ -876,12 +924,12 @@ async fn admits_request_within_budget() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue), "should admit within budget");
     assert!(
-        ctx.get_metadata("token_rate_limit.reservation_id").is_some(),
+        holds_reservation(&ctx),
         "reservation id should be stashed for reconciliation"
     );
 }
@@ -892,8 +940,8 @@ async fn rejects_with_429_when_budget_exhausted() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut first_ctx = crate::test_utils::make_filter_context(&req);
-    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let mut first_ctx = filter_context(&req);
+    let mut second_ctx = filter_context(&req);
 
     // First request consumes 60 of 100; second needs another 60, only 40 left.
     let first = filter.on_request(&mut first_ctx).await.unwrap();
@@ -932,7 +980,7 @@ async fn rejection_does_not_consume_budget() {
     // First request consumes the entire capacity; every request after
     // that should be rejected, and rejecting must not partially drain
     // (or otherwise corrupt) the already-exhausted budget.
-    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    let mut first_ctx = filter_context(&req);
     let first = filter.on_request(&mut first_ctx).await.unwrap();
     assert!(
         matches!(first, FilterAction::Continue),
@@ -940,7 +988,7 @@ async fn rejection_does_not_consume_budget() {
     );
 
     for _ in 0..3 {
-        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut ctx = filter_context(&req);
         let action = filter.on_request(&mut ctx).await.unwrap();
         assert!(
             matches!(action, FilterAction::Reject(_)),
@@ -971,7 +1019,7 @@ async fn a_request_matching_no_rule_is_not_rate_limited() {
 
     let unmatched_req = make_request_with_header("x-app-id", "beta");
     for _ in 0..5 {
-        let mut ctx = crate::test_utils::make_filter_context(&unmatched_req);
+        let mut ctx = filter_context(&unmatched_req);
         assert!(
             matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
             "traffic matching no configured rule must pass through, even repeatedly"
@@ -989,17 +1037,17 @@ async fn reconcile_releases_unused_tokens_on_overestimate() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     drop(filter.on_request(&mut ctx).await.unwrap()); // reserves 50, 50 left
-    ctx.set_metadata(META_TOKEN_TOTAL, "30"); // actual usage was only 30
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "30"); // actual usage was only 30
 
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
     // Reserved 50, actual 30 -> release 20 back -> 70 should now remain.
     // A next 50-token request should succeed (70 >= 50, leaving 20)...
-    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let mut second_ctx = filter_context(&req);
     let second = filter.on_request(&mut second_ctx).await.unwrap();
     assert!(
         matches!(second, FilterAction::Continue),
@@ -1007,7 +1055,7 @@ async fn reconcile_releases_unused_tokens_on_overestimate() {
     );
 
     // ...but a third 50-token request should now fail (only 20 left).
-    let mut third_ctx = crate::test_utils::make_filter_context(&req);
+    let mut third_ctx = filter_context(&req);
     let third = filter.on_request(&mut third_ctx).await.unwrap();
     assert!(
         matches!(third, FilterAction::Reject(_)),
@@ -1021,16 +1069,16 @@ async fn reconcile_draws_more_tokens_on_underestimate_and_can_starve_next_reques
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     drop(filter.on_request(&mut ctx).await.unwrap()); // reserves 50, 50 left
-    ctx.set_metadata(META_TOKEN_TOTAL, "90"); // actual usage exceeded the estimate
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "90"); // actual usage exceeded the estimate
 
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
     // Reserved 50, actual 90 -> the window now holds 90 of 100 -> only 10 left.
-    let mut next_ctx = crate::test_utils::make_filter_context(&req);
+    let mut next_ctx = filter_context(&req);
     let next_action = filter.on_request(&mut next_ctx).await.unwrap();
     assert!(
         matches!(next_action, FilterAction::Reject(_)),
@@ -1044,7 +1092,7 @@ async fn reconcile_charges_the_estimate_without_token_total_metadata() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     drop(filter.on_request(&mut ctx).await.unwrap()); // reserves 50, 50 left
     // No token.total metadata set (e.g. token_count filter not configured upstream).
@@ -1054,7 +1102,7 @@ async fn reconcile_charges_the_estimate_without_token_total_metadata() {
 
     // Settled at the estimate (50 of 100 used): a second 50-token request
     // should still fit exactly...
-    let mut next_ctx = crate::test_utils::make_filter_context(&req);
+    let mut next_ctx = filter_context(&req);
     let next_action = filter.on_request(&mut next_ctx).await.unwrap();
     assert!(
         matches!(next_action, FilterAction::Continue),
@@ -1062,7 +1110,7 @@ async fn reconcile_charges_the_estimate_without_token_total_metadata() {
     );
 
     // ...but a third would exceed the window's capacity.
-    let mut third_ctx = crate::test_utils::make_filter_context(&req);
+    let mut third_ctx = filter_context(&req);
     let third_action = filter.on_request(&mut third_ctx).await.unwrap();
     assert!(
         matches!(third_action, FilterAction::Reject(_)),
@@ -1076,10 +1124,10 @@ async fn does_not_reconcile_before_end_of_stream() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     drop(filter.on_request(&mut ctx).await.unwrap());
-    ctx.set_metadata(META_TOKEN_TOTAL, "5");
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "5");
 
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
@@ -1088,14 +1136,14 @@ async fn does_not_reconcile_before_end_of_stream() {
     // reservation (not settled down to actual=5), so a fresh 50-token
     // request only has the remaining 50 of capacity=100 to draw from, and
     // a second one on top of that should fail.
-    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let mut second_ctx = filter_context(&req);
     let second = filter.on_request(&mut second_ctx).await.unwrap();
     assert!(
         matches!(second, FilterAction::Continue),
         "50 remaining should admit one more 50-token request"
     );
 
-    let mut third_ctx = crate::test_utils::make_filter_context(&req);
+    let mut third_ctx = filter_context(&req);
     let third = filter.on_request(&mut third_ctx).await.unwrap();
     assert!(
         matches!(third, FilterAction::Reject(_)),
@@ -1106,44 +1154,43 @@ async fn does_not_reconcile_before_end_of_stream() {
 /// End-of-stream on an exchange that was never admitted by this filter
 /// (e.g. it matched no rule, or a prior filter already short-circuited
 /// the request) must not panic or reconcile phantom state -- `reconcile`
-/// no-ops when `on_request` never stashed reservation/key/rule metadata.
+/// no-ops when `on_request` never stored a reservation.
 #[tokio::test]
 async fn reconcile_is_a_noop_without_prior_admission_metadata() {
     let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 50");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    // Deliberately skip `on_request` -- no reservation/key/rule metadata
-    // is present on `ctx`.
+    let mut ctx = filter_context(&req);
+    // Deliberately skip `on_request` -- `ctx` holds no reservation.
     let mut body = None;
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
     // The full 100-token budget must still be there for a real request --
     // the no-op above must not have reserved or settled anything against it.
-    let mut fresh_ctx = crate::test_utils::make_filter_context(&req);
+    let mut fresh_ctx = filter_context(&req);
     assert!(matches!(
         filter.on_request(&mut fresh_ctx).await.unwrap(),
         FilterAction::Continue
     ));
 }
 
-/// Missing `META_RESERVATION_ID` must skip settlement: without the id
-/// there is nothing to settle, so the reservation stands at its estimate.
+/// A missing rule reservation must skip settlement: without its id there
+/// is nothing to settle, so the reservation stands at its estimate.
 #[tokio::test]
 async fn missing_reservation_id_skips_reconciliation() {
     let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 400");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
         "the first 400-token request fits"
     );
-    ctx.filter_metadata.remove(META_RESERVATION_ID);
-    ctx.set_metadata(META_TOKEN_TOTAL, "200");
+    ctx.get_filter_state_mut::<ExchangeHolds>().unwrap().reservation = None;
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "200");
     let mut body = None;
     assert!(
         matches!(
@@ -1153,16 +1200,53 @@ async fn missing_reservation_id_skips_reconciliation() {
         "a skipped settlement still lets the response through"
     );
 
-    let mut second = crate::test_utils::make_filter_context(&req);
+    let mut second = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut second).await.unwrap(), FilterAction::Continue),
         "400 + 400 fits in 1000"
     );
-    let mut third = crate::test_utils::make_filter_context(&req);
+    let mut third = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut third).await.unwrap(), FilterAction::Reject(_)),
         "the unsettled 400 still counts; settling it at 200 would have let a third 400 in"
     );
+}
+
+/// Two instances in one pipeline share the request context: each must
+/// settle its own reservation, whichever runs first.
+#[tokio::test]
+async fn two_instances_in_one_pipeline_each_settle_their_own_reservation() {
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 400");
+    let filters = [
+        TokenRateLimitFilter::from_config(&yaml).unwrap(),
+        TokenRateLimitFilter::from_config(&yaml).unwrap(),
+    ];
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    for (id, filter) in filters.iter().enumerate() {
+        ctx.current_filter_id = Some(id);
+        assert!(
+            matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
+            "instance {id}: the first 400-token request fits"
+        );
+    }
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "200");
+    for (id, filter) in filters.iter().enumerate().rev() {
+        ctx.current_filter_id = Some(id);
+        let mut body = None;
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+    }
+
+    for (id, filter) in filters.iter().enumerate() {
+        for attempt in 1..=2 {
+            let mut next = filter_context(&req);
+            assert!(
+                matches!(filter.on_request(&mut next).await.unwrap(), FilterAction::Continue),
+                "instance {id}, attempt {attempt}: settled at 200, so 200 + 400 + 400 fits in 1000"
+            );
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1187,7 +1271,7 @@ async fn lost_request_is_charged_at_its_estimate_and_cannot_bypass_the_budget() 
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
         "first request should be admitted, reserving the entire 50-token capacity"
@@ -1198,7 +1282,7 @@ async fn lost_request_is_charged_at_its_estimate_and_cannot_bypass_the_budget() 
 
     tokio::time::sleep(std::time::Duration::from_millis(80)).await; // past reservation_timeout, still inside window
 
-    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let mut second_ctx = filter_context(&req);
     let second = filter.on_request(&mut second_ctx).await.unwrap();
     assert!(
         matches!(second, FilterAction::Reject(_)),
@@ -1208,7 +1292,7 @@ async fn lost_request_is_charged_at_its_estimate_and_cannot_bypass_the_budget() 
 
     tokio::time::sleep(std::time::Duration::from_millis(250)).await; // past the window's own expiry too
 
-    let mut third_ctx = crate::test_utils::make_filter_context(&req);
+    let mut third_ctx = filter_context(&req);
     let third = filter.on_request(&mut third_ctx).await.unwrap();
     assert!(
         matches!(third, FilterAction::Continue),
@@ -1272,6 +1356,7 @@ fn debug_format_lists_configured_rule_names() {
         epoch: std::time::Instant::now(),
         valkey_clock: false,
         hierarchy: None,
+        reconciliation_source: super::ReconciliationSource::LegacyWeights,
         on_failure: super::config::BackendOnFailure::Closed,
     };
     let debug = format!("{filter:?}");
@@ -1333,12 +1418,12 @@ async fn dispatches_to_the_first_matching_rule_by_algorithm_and_enforces_its_own
     let filter = TokenRateLimitFilter::from_config(&two_algorithm_rules_yaml()).unwrap();
 
     let alpha_req = make_request_with_header("x-app-id", "alpha");
-    let mut ctx = crate::test_utils::make_filter_context(&alpha_req);
+    let mut ctx = filter_context(&alpha_req);
     assert!(
         matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
         "alpha's sliding-window rule should admit its first 100-token request"
     );
-    let mut ctx = crate::test_utils::make_filter_context(&alpha_req);
+    let mut ctx = filter_context(&alpha_req);
     assert!(
         matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(_)),
         "alpha's sliding-window budget is now exhausted"
@@ -1348,12 +1433,12 @@ async fn dispatches_to_the_first_matching_rule_by_algorithm_and_enforces_its_own
     // by alpha's exhaustion, proving the two rules (and algorithms) are
     // fully isolated from one another.
     let beta_req = make_request_with_header("x-app-id", "beta");
-    let mut ctx = crate::test_utils::make_filter_context(&beta_req);
+    let mut ctx = filter_context(&beta_req);
     assert!(
         matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
         "beta's token-bucket rule must be unaffected by alpha's exhausted sliding-window rule"
     );
-    let mut ctx = crate::test_utils::make_filter_context(&beta_req);
+    let mut ctx = filter_context(&beta_req);
     assert!(
         matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Reject(_)),
         "beta's token-bucket budget is now exhausted too"
@@ -1371,7 +1456,7 @@ async fn on_request_with_no_matching_rule_admits_without_reserving_any_budget() 
 
     let unmatched = crate::test_utils::make_request(http::Method::GET, "/healthz");
     for _ in 0..5 {
-        let mut ctx = crate::test_utils::make_filter_context(&unmatched);
+        let mut ctx = filter_context(&unmatched);
         assert!(
             matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
             "a request matching no rule's `match:` condition must never be rejected by this filter"
@@ -1381,7 +1466,7 @@ async fn on_request_with_no_matching_rule_admits_without_reserving_any_budget() 
     // Prove the five unmatched requests above didn't silently draw down
     // alpha's budget: it must still have its full 100-token capacity.
     let alpha_req = make_request_with_header("x-app-id", "alpha");
-    let mut ctx = crate::test_utils::make_filter_context(&alpha_req);
+    let mut ctx = filter_context(&alpha_req);
     assert!(
         matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
         "alpha's full budget must be untouched by requests that matched no rule"
@@ -1425,7 +1510,7 @@ async fn reconciliation_settles_against_the_same_rule_that_admitted_the_request(
 
     let beta_req = make_request_with_header("x-app-id", "beta");
     // 100 - 40 - 40 = 20 remaining, then denied on a third 40-token ask.
-    let mut first_ctx = crate::test_utils::make_filter_context(&beta_req);
+    let mut first_ctx = filter_context(&beta_req);
     assert!(matches!(
         filter.on_request(&mut first_ctx).await.unwrap(),
         FilterAction::Continue
@@ -1442,7 +1527,10 @@ async fn reconciliation_settles_against_the_same_rule_that_admitted_the_request(
     // Reconcile the *first* reservation down to actual usage of 10
     // (refunding 30): if this credited the wrong rule, or no-op'd, beta's
     // bucket would still be stuck at 20 and stay denied below.
-    first_ctx.set_metadata(META_TOKEN_TOTAL, "10");
+    first_ctx
+        .filter_metadata
+        .insert(META_TOKEN_TOTAL, "10")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let mut body = None;
     drop(filter.on_response_body(&mut first_ctx, &mut body, true).unwrap());
 
@@ -1525,13 +1613,13 @@ async fn token_bucket_rule_admits_within_capacity_and_denies_over_it() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     assert!(matches!(
         filter.on_request(&mut ctx).await.unwrap(),
         FilterAction::Continue
     ));
 
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     assert!(matches!(
         filter.on_request(&mut ctx).await.unwrap(),
         FilterAction::Reject(_)
@@ -1551,7 +1639,7 @@ async fn input_plus_max_tokens_strategy_computes_from_body_and_content_length() 
         http::header::CONTENT_LENGTH,
         http::HeaderValue::from_str(&body_bytes.len().to_string()).unwrap(),
     );
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
@@ -1565,10 +1653,7 @@ async fn input_plus_max_tokens_strategy_computes_from_body_and_content_length() 
         matches!(action, FilterAction::Continue),
         "estimate = ceil(body_len/4) + 200 should be within capacity"
     );
-    assert!(
-        ctx.get_metadata("token_rate_limit.reservation_id").is_some(),
-        "reservation should have been created"
-    );
+    assert!(holds_reservation(&ctx), "reservation should have been created");
 }
 
 #[tokio::test]
@@ -1579,7 +1664,7 @@ async fn malformed_json_body_uses_fallback_estimate() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -1589,10 +1674,7 @@ async fn malformed_json_body_uses_fallback_estimate() {
         matches!(action, FilterAction::Continue),
         "malformed JSON should fall back to fallback_estimate=100 and admit"
     );
-    assert!(
-        ctx.get_metadata("token_rate_limit.reservation_id").is_some(),
-        "fallback estimate should create a reservation"
-    );
+    assert!(holds_reservation(&ctx), "fallback estimate should create a reservation");
 }
 
 // -----------------------------------------------------------------------------
@@ -1616,7 +1698,7 @@ fn single_rule_valkey_yaml(algorithm_body: &str, url: &str, namespace: &str) -> 
 
 /// `filter.on_request` against a fresh context for one test request.
 async fn request_action(filter: &dyn HttpFilter, req: &praxis_filter::Request) -> FilterAction {
-    let mut ctx = crate::test_utils::make_filter_context(req);
+    let mut ctx = filter_context(req);
     filter.on_request(&mut ctx).await.unwrap()
 }
 
@@ -1658,7 +1740,7 @@ async fn request_with_max_tokens_action(
     req: &praxis_filter::Request,
     max_tokens: u64,
 ) -> FilterAction {
-    let mut ctx = crate::test_utils::make_filter_context(req);
+    let mut ctx = filter_context(req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     let mut body = Some(bytes::Bytes::from(format!(r#"{{"max_tokens":{max_tokens}}}"#)));
     filter.on_request_body(&mut ctx, &mut body, true).await.unwrap()
@@ -1951,12 +2033,12 @@ async fn valkey_worker_reconciles_usage_off_the_response_path() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     let mut body = Some(bytes::Bytes::from_static(br#"{"max_tokens":50}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
-    ctx.set_metadata(META_TOKEN_TOTAL, "10"); // actual usage far below the 50-token estimate
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "10"); // actual usage far below the 50-token estimate
 
     // Reconciliation for a Valkey backend is enqueued onto a background
     // worker rather than awaited inline (the response must not be held
@@ -1998,7 +2080,7 @@ async fn valkey_failure_fails_closed() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     match filter.on_request(&mut ctx).await.unwrap() {
         FilterAction::Reject(rejection) => {
             assert_eq!(rejection.status, 503, "unreachable backend should fail closed with 503");
@@ -2016,21 +2098,21 @@ async fn valkey_failure_open_forwards_once_without_a_reservation_handle() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     assert!(matches!(
         filter.on_request(&mut ctx).await.unwrap(),
         FilterAction::Continue
     ));
     assert!(
-        ctx.get_metadata(META_RESERVATION_ID).is_none(),
+        !holds_reservation(&ctx),
         "open mode must not fabricate a reservation ID"
     );
-    assert_eq!(ctx.get_metadata(META_FAIL_OPEN), Some("bypassed"));
+    assert_eq!(fail_open(&ctx), Some("bypassed"));
 
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
     assert!(
-        ctx.get_metadata(META_FAIL_OPEN).is_none(),
+        fail_open(&ctx).is_none(),
         "fail-open marker must not leak across exchanges"
     );
 }
@@ -2148,7 +2230,7 @@ async fn valkey_token_bucket_failure_fails_closed() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     match filter.on_request(&mut ctx).await.unwrap() {
         FilterAction::Reject(rejection) => {
             assert_eq!(rejection.status, 503, "unreachable backend should fail closed with 503");
@@ -2165,13 +2247,13 @@ async fn valkey_token_bucket_failure_open_forwards_without_reconciliation_metada
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     assert!(matches!(
         filter.on_request(&mut ctx).await.unwrap(),
         FilterAction::Continue
     ));
-    assert!(ctx.get_metadata(META_RESERVATION_ID).is_none());
-    assert_eq!(ctx.get_metadata(META_FAIL_OPEN), Some("bypassed"));
+    assert!(!holds_reservation(&ctx));
+    assert_eq!(fail_open(&ctx), Some("bypassed"));
 }
 
 #[tokio::test]
@@ -2192,12 +2274,12 @@ async fn valkey_token_bucket_worker_reconciles_usage_off_the_response_path() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     let mut body = Some(bytes::Bytes::from_static(br#"{"max_tokens":50}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
-    ctx.set_metadata(META_TOKEN_TOTAL, "10"); // actual usage far below the 50-token estimate
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "10"); // actual usage far below the 50-token estimate
 
     let mut body = None;
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
@@ -2385,13 +2467,13 @@ async fn fixed_estimation_strategy_reserves_like_legacy_reserved_tokens() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
         "fixed estimation should admit within budget"
     );
-    assert!(ctx.get_metadata("token_rate_limit.reservation_id").is_some());
+    assert!(holds_reservation(&ctx));
 }
 
 #[tokio::test]
@@ -2402,7 +2484,7 @@ async fn max_tokens_strategy_defers_to_on_request_body() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
@@ -2410,7 +2492,7 @@ async fn max_tokens_strategy_defers_to_on_request_body() {
         "on_request should pass through when needs_body=true"
     );
     assert!(
-        ctx.get_metadata("token_rate_limit.reservation_id").is_none(),
+        !holds_reservation(&ctx),
         "no reservation should be made in on_request when needs_body=true"
     );
 }
@@ -2423,7 +2505,7 @@ async fn max_tokens_strategy_extracts_from_body_and_reserves() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -2433,12 +2515,9 @@ async fn max_tokens_strategy_extracts_from_body_and_reserves() {
         matches!(action, FilterAction::Continue),
         "should admit with max_tokens=500 within capacity=1000"
     );
-    assert!(
-        ctx.get_metadata("token_rate_limit.reservation_id").is_some(),
-        "reservation should be made in on_request_body"
-    );
+    assert!(holds_reservation(&ctx), "reservation should be made in on_request_body");
 
-    let estimate_meta = ctx.get_metadata("token_rate_limit.estimate").unwrap();
+    let estimate_meta = ctx.filter_metadata.get("token_rate_limit.estimate").unwrap();
     assert_eq!(
         estimate_meta, "500",
         "estimate metadata should reflect extracted max_tokens"
@@ -2452,7 +2531,7 @@ async fn max_tokens_zero_without_fallback_is_rejected() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 0, "messages": []}"#));
@@ -2462,7 +2541,7 @@ async fn max_tokens_zero_without_fallback_is_rejected() {
         "a zero max_tokens with no fallback must not be forwarded unmetered"
     );
     assert!(
-        ctx.get_metadata("token_rate_limit.reservation_id").is_none(),
+        !holds_reservation(&ctx),
         "a rejected zero estimate stores no reservation"
     );
 }
@@ -2474,7 +2553,7 @@ async fn max_tokens_strategy_prefers_max_tokens_over_max_completion_tokens() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(
@@ -2483,7 +2562,7 @@ async fn max_tokens_strategy_prefers_max_tokens_over_max_completion_tokens() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        ctx.filter_metadata.get("token_rate_limit.estimate").unwrap(),
         "300",
         "max_tokens should take priority over max_completion_tokens"
     );
@@ -2496,14 +2575,14 @@ async fn max_tokens_strategy_falls_back_to_max_completion_tokens() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(r#"{"max_completion_tokens": 250, "messages": []}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        ctx.filter_metadata.get("token_rate_limit.estimate").unwrap(),
         "250",
         "should fall back to max_completion_tokens when max_tokens is absent"
     );
@@ -2517,14 +2596,14 @@ async fn max_tokens_strategy_uses_fallback_when_body_has_no_tokens_field() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(r#"{"messages": []}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        ctx.filter_metadata.get("token_rate_limit.estimate").unwrap(),
         "42",
         "should fall back to fallback_estimate when body has no max_tokens"
     );
@@ -2537,7 +2616,7 @@ async fn max_tokens_strategy_admits_without_reservation_when_no_fallback_and_no_
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(r#"{"messages": []}"#));
@@ -2547,7 +2626,7 @@ async fn max_tokens_strategy_admits_without_reservation_when_no_fallback_and_no_
         "should admit without reservation when strategy can't extract a value and no fallback"
     );
     assert!(
-        ctx.get_metadata("token_rate_limit.reservation_id").is_none(),
+        !holds_reservation(&ctx),
         "no reservation should be made when estimate is unavailable"
     );
 }
@@ -2560,14 +2639,14 @@ async fn max_tokens_strategy_applies_multiplier() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 100}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        ctx.filter_metadata.get("token_rate_limit.estimate").unwrap(),
         "150",
         "100 * 1.5 = 150"
     );
@@ -2581,14 +2660,14 @@ async fn max_tokens_strategy_denies_when_body_estimate_exceeds_budget() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    let mut first_ctx = filter_context(&req);
     drop(filter.on_request(&mut first_ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 60}"#));
     let action = filter.on_request_body(&mut first_ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
-    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let mut second_ctx = filter_context(&req);
     drop(filter.on_request(&mut second_ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 60}"#));
@@ -2607,7 +2686,7 @@ async fn on_request_body_is_noop_before_end_of_stream() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 500}"#));
@@ -2616,10 +2695,7 @@ async fn on_request_body_is_noop_before_end_of_stream() {
         matches!(action, FilterAction::Continue),
         "should continue without reservation before end_of_stream"
     );
-    assert!(
-        ctx.get_metadata("token_rate_limit.reservation_id").is_none(),
-        "no reservation before end_of_stream"
-    );
+    assert!(!holds_reservation(&ctx), "no reservation before end_of_stream");
 }
 
 #[tokio::test]
@@ -2630,14 +2706,14 @@ async fn model_scaled_strategy_applies_per_model_multiplier() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 100, "model": "gpt-4"}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        ctx.filter_metadata.get("token_rate_limit.estimate").unwrap(),
         "200",
         "100 * 2.0 (gpt-4 multiplier) = 200"
     );
@@ -2651,14 +2727,14 @@ async fn model_scaled_strategy_uses_default_multiplier_for_unknown_model() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 100, "model": "claude-3"}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        ctx.filter_metadata.get("token_rate_limit.estimate").unwrap(),
         "150",
         "100 * 1.5 (default multiplier for unknown model) = 150"
     );
@@ -2676,14 +2752,14 @@ async fn model_scaled_strategy_reads_model_from_x_model_header_fallback() {
         http::header::HeaderName::from_static("x-model"),
         http::HeaderValue::from_static("gpt-4"),
     );
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 100}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        ctx.filter_metadata.get("token_rate_limit.estimate").unwrap(),
         "300",
         "100 * 3.0 (gpt-4 via x-model header) = 300"
     );
@@ -2697,20 +2773,20 @@ async fn body_dependent_reconciliation_uses_meta_estimate() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 500}"#));
     drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
 
-    ctx.set_metadata(META_TOKEN_TOTAL, "200");
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "200");
 
     let mut resp_body = None;
     drop(filter.on_response_body(&mut ctx, &mut resp_body, true).unwrap());
 
     // Reserved 500 via body, actual 200 -> refund 300 -> 800 remaining.
     // A second 500-token request body should be admitted (800 >= 500).
-    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let mut second_ctx = filter_context(&req);
     drop(filter.on_request(&mut second_ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 500}"#));
@@ -2755,7 +2831,10 @@ fn request_body_access_is_read_only_for_body_dependent_strategy() {
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nestimation:\n  strategy: max_tokens\n  fallback_estimate: 100",
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.request_body_access(), praxis_filter::BodyAccess::ReadOnly);
+    assert_eq!(
+        filter.request_body_access(),
+        praxis_filter::BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    );
 }
 
 #[test]
@@ -2788,7 +2867,7 @@ async fn empty_body_uses_fallback_estimate() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body: Option<bytes::Bytes> = None;
@@ -2798,7 +2877,7 @@ async fn empty_body_uses_fallback_estimate() {
         "empty body should fall back to fallback_estimate=75 and admit"
     );
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        ctx.filter_metadata.get("token_rate_limit.estimate").unwrap(),
         "75",
         "estimate should be the fallback when body is absent"
     );
@@ -2809,13 +2888,13 @@ async fn mixed_rules_fixed_strategy_ignores_body_when_filter_buffers() {
     let filter = TokenRateLimitFilter::from_config(&mixed_fixed_and_body_dependent_yaml()).unwrap();
 
     let fixed_req = make_request_with_header("x-app-id", "fixed-app");
-    let mut ctx = crate::test_utils::make_filter_context(&fixed_req);
+    let mut ctx = filter_context(&fixed_req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 9999}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        ctx.filter_metadata.get("token_rate_limit.estimate").unwrap(),
         "200",
         "fixed-strategy rule must use its constant (200), not the body's max_tokens"
     );
@@ -2826,13 +2905,13 @@ async fn mixed_rules_body_dependent_strategy_extracts_from_body() {
     let filter = TokenRateLimitFilter::from_config(&mixed_fixed_and_body_dependent_yaml()).unwrap();
 
     let body_req = make_request_with_header("x-app-id", "body-app");
-    let mut ctx = crate::test_utils::make_filter_context(&body_req);
+    let mut ctx = filter_context(&body_req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 300}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        ctx.filter_metadata.get("token_rate_limit.estimate").unwrap(),
         "300",
         "body-dependent rule must use extracted max_tokens (300)"
     );
@@ -2872,7 +2951,7 @@ async fn input_plus_max_tokens_defaults_to_zero_input_when_content_length_absent
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     // No Content-Length header set.
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 400}"#));
@@ -2880,7 +2959,7 @@ async fn input_plus_max_tokens_defaults_to_zero_input_when_content_length_absent
     assert!(matches!(action, FilterAction::Continue));
     // input = ceil(0 / 4.0) = 0, output = 400, total = 400
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        ctx.filter_metadata.get("token_rate_limit.estimate").unwrap(),
         "400",
         "missing Content-Length should default input to 0, estimate = 0 + max_tokens"
     );
@@ -2894,7 +2973,7 @@ async fn model_scaled_outer_multiplier_composes_with_per_model_multiplier() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     // gpt-4: effective multiplier = 2.0 * 1.5 = 3.0, max_tokens=100 → estimate=300
@@ -2902,7 +2981,7 @@ async fn model_scaled_outer_multiplier_composes_with_per_model_multiplier() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(
-        ctx.get_metadata("token_rate_limit.estimate").unwrap(),
+        ctx.filter_metadata.get("token_rate_limit.estimate").unwrap(),
         "300",
         "gpt-4 with outer multiplier 1.5 × model multiplier 2.0 = 3.0 × 100 = 300"
     );
@@ -2912,10 +2991,45 @@ async fn model_scaled_outer_multiplier_composes_with_per_model_multiplier() {
 // M4 token-type weights
 // -----------------------------------------------------------------------------
 
+#[test]
+fn shared_quota_source_rejects_legacy_weight_configuration() {
+    for (top_level, rule) in [
+        (
+            "use_token_quota: true\ndefault_weights:\n  cached_input: 0.1",
+            "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 50",
+        ),
+        (
+            "use_token_quota: true",
+            "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 50\nweights:\n  reasoning: 0.9",
+        ),
+    ] {
+        let error = TokenRateLimitFilter::from_config(&single_rule_yaml_with(top_level, rule))
+            .err()
+            .expect("two quota sources must be rejected");
+        assert!(error.to_string().contains("cannot be combined"), "{error}");
+    }
+}
+
+#[cfg(feature = "token-quota-filter")]
+#[test]
+fn shared_quota_decision_is_the_authoritative_reconciliation_value() {
+    let decision = TokenQuotaDecision {
+        status: TokenQuotaResultStatus::Evaluated,
+        value: Some(29),
+    };
+    assert_eq!(shared_quota_cost(decision), Some(29));
+
+    let missing = TokenQuotaDecision {
+        status: TokenQuotaResultStatus::MissingUsage,
+        value: Some(110),
+    };
+    assert_eq!(shared_quota_cost(missing), None);
+}
+
 fn set_typed_usage(ctx: &mut praxis_filter::HttpFilterContext<'_>, input: u64, output: u64, total: u64) {
-    ctx.set_metadata(META_TOKEN_INPUT, input.to_string());
-    ctx.set_metadata(META_TOKEN_OUTPUT, output.to_string());
-    ctx.set_metadata(META_TOKEN_TOTAL, total.to_string());
+    ctx.record_ai_metadata(META_TOKEN_INPUT, input.to_string());
+    ctx.record_ai_metadata(META_TOKEN_OUTPUT, output.to_string());
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, total.to_string());
 }
 
 #[tokio::test]
@@ -2929,15 +3043,15 @@ async fn weighted_cache_hit_refunds_more_than_token_total() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     set_typed_usage(&mut ctx, 100, 10, 110);
-    ctx.set_metadata(META_TOKEN_CACHE_READ, "90");
+    ctx.record_ai_metadata(META_TOKEN_CACHE_READ, "90");
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
-    let mut next_ctx = crate::test_utils::make_filter_context(&req);
+    let mut next_ctx = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut next_ctx).await.unwrap(), FilterAction::Continue),
         "weighted cost 29 of 100 should leave room for another 50-token reservation"
@@ -2953,13 +3067,13 @@ async fn unweighted_total_of_the_same_cached_request_would_starve_the_window() {
     let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 50");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
-    ctx.set_metadata(META_TOKEN_TOTAL, "110");
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "110");
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
-    let mut next_ctx = crate::test_utils::make_filter_context(&req);
+    let mut next_ctx = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut next_ctx).await.unwrap(), FilterAction::Reject(_)),
         "charging token.total=110 against capacity 100 must starve the next 50-token request"
@@ -2996,14 +3110,17 @@ async fn per_rule_weight_overlay_is_isolated_from_filter_defaults() {
 
     // cheap-cache: uncached 10 + cache 90*0 + output 10 = 20. Refund 30.
     let cheap_req = make_request_with_header("x-app-id", "cheap");
-    let mut cheap_ctx = crate::test_utils::make_filter_context(&cheap_req);
+    let mut cheap_ctx = filter_context(&cheap_req);
     drop(filter.on_request(&mut cheap_ctx).await.unwrap());
     set_typed_usage(&mut cheap_ctx, 100, 10, 110);
-    cheap_ctx.set_metadata(META_TOKEN_CACHE_READ, "90");
+    cheap_ctx
+        .filter_metadata
+        .insert(META_TOKEN_CACHE_READ, "90")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let mut body = None;
     drop(filter.on_response_body(&mut cheap_ctx, &mut body, true).unwrap());
 
-    let mut cheap_next = crate::test_utils::make_filter_context(&cheap_req);
+    let mut cheap_next = filter_context(&cheap_req);
     assert!(
         matches!(
             filter.on_request(&mut cheap_next).await.unwrap(),
@@ -3017,12 +3134,15 @@ async fn per_rule_weight_overlay_is_isolated_from_filter_defaults() {
     // is denied. If the 0.0 overlay leaked onto this rule, cost would be
     // 20, remaining 55, and the next reserve would be admitted.
     let full_req = make_request_with_header("x-app-id", "full");
-    let mut full_ctx = crate::test_utils::make_filter_context(&full_req);
+    let mut full_ctx = filter_context(&full_req);
     drop(filter.on_request(&mut full_ctx).await.unwrap());
     set_typed_usage(&mut full_ctx, 100, 10, 110);
-    full_ctx.set_metadata(META_TOKEN_CACHE_READ, "90");
+    full_ctx
+        .filter_metadata
+        .insert(META_TOKEN_CACHE_READ, "90")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     drop(filter.on_response_body(&mut full_ctx, &mut body, true).unwrap());
-    let mut full_next = crate::test_utils::make_filter_context(&full_req);
+    let mut full_next = filter_context(&full_req);
     assert!(
         matches!(
             filter.on_request(&mut full_next).await.unwrap(),
@@ -3042,20 +3162,20 @@ async fn google_additive_reasoning_does_not_drop_visible_output() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     set_typed_usage(&mut ctx, 50, 80, 330);
-    ctx.set_metadata(META_TOKEN_REASONING, "200");
+    ctx.record_ai_metadata(META_TOKEN_REASONING, "200");
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
     // 400 - 310 = 90 remaining. A 50-token reserve fits; a third does not.
-    let mut next_ctx = crate::test_utils::make_filter_context(&req);
+    let mut next_ctx = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut next_ctx).await.unwrap(), FilterAction::Continue),
         "310 of 400 used should admit another 50"
     );
-    let mut third_ctx = crate::test_utils::make_filter_context(&req);
+    let mut third_ctx = filter_context(&req);
     assert!(
         matches!(
             filter.on_request(&mut third_ctx).await.unwrap(),
@@ -3076,14 +3196,14 @@ async fn openai_nested_reasoning_is_not_double_counted() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     set_typed_usage(&mut ctx, 120, 800, 920);
-    ctx.set_metadata(META_TOKEN_REASONING, "640");
+    ctx.record_ai_metadata(META_TOKEN_REASONING, "640");
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
-    let mut next_ctx = crate::test_utils::make_filter_context(&req);
+    let mut next_ctx = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut next_ctx).await.unwrap(), FilterAction::Continue),
         "nested reasoning cost 856 of 1000 must leave room for another 50; additive 1496 would not"
@@ -3095,21 +3215,21 @@ async fn overflow_status_keeps_the_reservation_estimate() {
     let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 50");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     set_typed_usage(&mut ctx, 10, 10, 20);
-    ctx.set_metadata(META_TOKEN_STATUS, TOKEN_STATUS_OVERFLOW);
+    ctx.record_ai_metadata(META_TOKEN_STATUS, TOKEN_STATUS_OVERFLOW);
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
     // Settled at the 50-token estimate, not the 20 typed cost: 50 of 100 used,
     // a second 50 fits exactly, a third does not.
-    let mut second = crate::test_utils::make_filter_context(&req);
+    let mut second = filter_context(&req);
     assert!(matches!(
         filter.on_request(&mut second).await.unwrap(),
         FilterAction::Continue
     ));
-    let mut third = crate::test_utils::make_filter_context(&req);
+    let mut third = filter_context(&req);
     assert!(matches!(
         filter.on_request(&mut third).await.unwrap(),
         FilterAction::Reject(_)
@@ -3127,13 +3247,13 @@ async fn large_finite_weight_does_not_settle_at_zero() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     set_typed_usage(&mut ctx, 2, 0, 2);
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
-    let mut next_ctx = crate::test_utils::make_filter_context(&req);
+    let mut next_ctx = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut next_ctx).await.unwrap(), FilterAction::Reject(_)),
         "overflowed weighted cost must saturate, not settle at zero and refund the reservation"
@@ -3150,27 +3270,27 @@ async fn anthropic_cache_write_weight_is_applied() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     set_typed_usage(&mut ctx, 6050, 100, 6150);
-    ctx.set_metadata(META_TOKEN_CACHE_READ, "5000");
-    ctx.set_metadata(META_TOKEN_CACHE_WRITE, "1000");
+    ctx.record_ai_metadata(META_TOKEN_CACHE_READ, "5000");
+    ctx.record_ai_metadata(META_TOKEN_CACHE_WRITE, "1000");
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
     // 2000 - 1900 = 100 left. 50 fits, second 50 after that would also fit
     // (100 >= 50, then 50 left), third would fail. Two more 50s then deny.
-    let mut a = crate::test_utils::make_filter_context(&req);
+    let mut a = filter_context(&req);
     assert!(matches!(
         filter.on_request(&mut a).await.unwrap(),
         FilterAction::Continue
     ));
-    let mut b = crate::test_utils::make_filter_context(&req);
+    let mut b = filter_context(&req);
     assert!(matches!(
         filter.on_request(&mut b).await.unwrap(),
         FilterAction::Continue
     ));
-    let mut c = crate::test_utils::make_filter_context(&req);
+    let mut c = filter_context(&req);
     assert!(matches!(
         filter.on_request(&mut c).await.unwrap(),
         FilterAction::Reject(_)
@@ -3186,13 +3306,13 @@ async fn bedrock_cache_hidden_in_total_is_not_dropped() {
     let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1300\nreserved_tokens: 50");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     set_typed_usage(&mut ctx, 9, 214, 1289);
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
-    let mut next_ctx = crate::test_utils::make_filter_context(&req);
+    let mut next_ctx = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut next_ctx).await.unwrap(), FilterAction::Reject(_)),
         "uncovered Bedrock cache in token.total must be charged; cost 223 would admit the next 50"
@@ -3211,19 +3331,19 @@ async fn bedrock_normalized_cache_breakdown_applies_cached_input_weight() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     set_typed_usage(&mut ctx, 1075, 214, 1289);
-    ctx.set_metadata(META_TOKEN_CACHE_READ, "1066");
+    ctx.record_ai_metadata(META_TOKEN_CACHE_READ, "1066");
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
-    let mut second = crate::test_utils::make_filter_context(&req);
+    let mut second = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut second).await.unwrap(), FilterAction::Continue),
         "normalized Bedrock cache must take cached_input 0.1 (cost 330 of 380)"
     );
-    let mut third = crate::test_utils::make_filter_context(&req);
+    let mut third = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut third).await.unwrap(), FilterAction::Reject(_)),
         "50 remaining after the second 50-token reserve should deny a third"
@@ -3238,16 +3358,16 @@ async fn token_bucket_applies_the_same_weighted_cost() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     set_typed_usage(&mut ctx, 100, 10, 110);
-    ctx.set_metadata(META_TOKEN_CACHE_READ, "90");
+    ctx.record_ai_metadata(META_TOKEN_CACHE_READ, "90");
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
     // Bucket started at 100, reserved 50, credited back 21 (50-29) → 71.
     // Next 50 fits.
-    let mut next_ctx = crate::test_utils::make_filter_context(&req);
+    let mut next_ctx = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut next_ctx).await.unwrap(), FilterAction::Continue),
         "token_bucket must apply the same partitioned weighted cost as sliding_window"
@@ -3474,7 +3594,7 @@ async fn inject_tier_adds_headers_when_usage_exceeds_threshold() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue), "should be admitted");
     let injected = ctx
@@ -3501,7 +3621,7 @@ async fn no_headers_injected_when_usage_is_below_all_tiers() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert!(
@@ -3524,7 +3644,7 @@ async fn highest_breached_tier_header_wins_for_the_same_header_name() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     let tier_headers: Vec<_> = ctx
@@ -3553,7 +3673,7 @@ async fn multiple_distinct_headers_from_different_tiers_are_all_injected() {
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     let hour_tier = ctx
@@ -3589,14 +3709,14 @@ async fn deny_tier_still_rejects_when_budget_exhausted() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
 
-    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    let mut first_ctx = filter_context(&req);
     let first = filter.on_request(&mut first_ctx).await.unwrap();
     assert!(
         matches!(first, FilterAction::Continue),
         "first request should be admitted"
     );
 
-    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let mut second_ctx = filter_context(&req);
     let second = filter.on_request(&mut second_ctx).await.unwrap();
     assert!(
         matches!(second, FilterAction::Reject(_)),
@@ -3618,7 +3738,7 @@ async fn inject_only_tiers_never_deny() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
 
-    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    let mut first_ctx = filter_context(&req);
     let first = filter.on_request(&mut first_ctx).await.unwrap();
     assert!(
         matches!(first, FilterAction::Continue),
@@ -3658,7 +3778,7 @@ async fn tier_evaluation_with_token_bucket_algorithm() {
     .unwrap();
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue), "should be admitted");
     let injected = ctx
@@ -3693,7 +3813,7 @@ async fn tier_headers_injected_from_on_request_body_path() {
     .unwrap();
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 100}"#));
@@ -3736,7 +3856,7 @@ async fn tiers_with_match_condition_only_apply_to_matching_requests() {
 
     // Request matching the rule: should get inject headers.
     let alpha_req = make_request_with_header("x-app-id", "alpha");
-    let mut alpha_ctx = crate::test_utils::make_filter_context(&alpha_req);
+    let mut alpha_ctx = filter_context(&alpha_req);
     let action = filter.on_request(&mut alpha_ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert!(
@@ -3749,7 +3869,7 @@ async fn tiers_with_match_condition_only_apply_to_matching_requests() {
 
     // Request not matching: should pass through without tiers or rate limiting.
     let other_req = make_request_with_header("x-app-id", "beta");
-    let mut other_ctx = crate::test_utils::make_filter_context(&other_req);
+    let mut other_ctx = filter_context(&other_req);
     let action = filter.on_request(&mut other_ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     assert!(
@@ -3785,7 +3905,7 @@ async fn client_supplied_tier_header_is_stripped_on_admission() {
     // Client sends the inject header pre-emptively.
     let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     req.headers.insert("x-token-tier", "spoofed".parse().unwrap());
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
@@ -3825,7 +3945,7 @@ async fn tier_headers_join_pre_read_mutations_when_ordered_log_is_active() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     // Simulate an earlier filter having activated the ordered log.
     ctx.pre_read_mutations.push(praxis_filter::TrustedHeaderMutation::Set(
@@ -4096,17 +4216,20 @@ fn gauge_value(
 /// next one, then settle the first at 40 actual tokens.
 async fn admit_deny_and_settle(filter: &dyn HttpFilter) {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut admitted = crate::test_utils::make_filter_context(&req);
+    let mut admitted = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut admitted).await.unwrap(), FilterAction::Continue),
         "the first 60-token request fits a 100-token budget"
     );
-    let mut denied = crate::test_utils::make_filter_context(&req);
+    let mut denied = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut denied).await.unwrap(), FilterAction::Reject(_)),
         "the second 60-token request exceeds the 40 tokens left"
     );
-    admitted.set_metadata(META_TOKEN_TOTAL, "40");
+    admitted
+        .filter_metadata
+        .insert(META_TOKEN_TOTAL, "40")
+        .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
     let mut body = None;
     drop(filter.on_response_body(&mut admitted, &mut body, true).unwrap());
 }
@@ -4197,7 +4320,7 @@ fn unauthenticated_rejections_are_counted_apart_from_budget_decisions() {
         );
         let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut ctx = filter_context(&req);
         match filter.on_request(&mut ctx).await.unwrap() {
             FilterAction::Reject(rejection) => assert_eq!(rejection.status, 401, "no subject fails closed"),
             other => panic!("expected a 401 rejection, got {other:?}"),
@@ -4292,7 +4415,7 @@ async fn an_identity_miss_leaves_a_denied_accounting_record_without_the_subject(
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -4342,10 +4465,10 @@ async fn the_decision_span_records_the_admission_and_the_actual_cost() {
     let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     drop(filter.on_request(&mut ctx).await.unwrap());
-    ctx.set_metadata(META_TOKEN_TOTAL, "40");
+    ctx.record_ai_metadata(META_TOKEN_TOTAL, "40");
     let mut body = None;
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
@@ -4373,7 +4496,7 @@ async fn the_decision_span_distinguishes_an_identity_miss_from_a_budget_denial()
     );
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -4462,14 +4585,14 @@ async fn soft_enforcement_still_rejects_key_capacity() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let first_req = make_request_with_header("x-tenant-id", "alpha");
-    let mut first = crate::test_utils::make_filter_context(&first_req);
+    let mut first = filter_context(&first_req);
     assert!(
         matches!(filter.on_request(&mut first).await.unwrap(), FilterAction::Continue),
         "first distinct key must be admitted under a soft rule"
     );
 
     let second_req = make_request_with_header("x-tenant-id", "beta");
-    let mut second = crate::test_utils::make_filter_context(&second_req);
+    let mut second = filter_context(&second_req);
     let action = filter.on_request(&mut second).await.unwrap();
     assert!(
         matches!(&action, FilterAction::Reject(rejection) if rejection.status == 429),
@@ -4493,13 +4616,13 @@ async fn soft_enforcement_forwards_and_annotates_when_over_quota() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
 
-    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    let mut first_ctx = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut first_ctx).await.unwrap(), FilterAction::Continue),
         "first request must be admitted before quota is exceeded"
     );
 
-    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let mut second_ctx = filter_context(&req);
     let second = filter.on_request(&mut second_ctx).await.unwrap();
     assert!(
         matches!(second, FilterAction::Continue),
@@ -4549,9 +4672,7 @@ async fn soft_enforcement_forwards_and_annotates_when_over_quota() {
         "denied soft path reports used = limit - remaining"
     );
     assert!(
-        !second_ctx
-            .filter_metadata
-            .contains_key("token_rate_limit.reservation_id"),
+        !holds_reservation(&second_ctx),
         "soft over-quota must not stash a reservation for reconciliation"
     );
 }
@@ -4562,13 +4683,13 @@ async fn hard_enforcement_still_rejects_when_over_quota() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
 
-    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    let mut first_ctx = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut first_ctx).await.unwrap(), FilterAction::Continue),
         "first request must be admitted before quota is exceeded"
     );
 
-    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let mut second_ctx = filter_context(&req);
     let second = filter.on_request(&mut second_ctx).await.unwrap();
     assert!(
         matches!(second, FilterAction::Reject(_)),
@@ -4582,7 +4703,7 @@ async fn soft_enforcement_strips_spoofed_over_quota_headers() {
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = make_request_with_header("x-over-quota", "spoofed");
 
-    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    let mut first_ctx = filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut first_ctx).await.unwrap(), FilterAction::Continue),
         "first request must be admitted"
@@ -4595,7 +4716,7 @@ async fn soft_enforcement_strips_spoofed_over_quota_headers() {
         "admitted path must strip client-supplied over-quota headers"
     );
 
-    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let mut second_ctx = filter_context(&req);
     assert!(
         matches!(
             filter.on_request(&mut second_ctx).await.unwrap(),
@@ -4632,7 +4753,7 @@ async fn soft_enforcement_strips_spoofed_headers_when_estimate_is_unavailable() 
     .unwrap();
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
     let req = make_request_with_header("x-over-quota", "spoofed");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(bytes::Bytes::from(r#"{"messages": []}"#));
@@ -4641,10 +4762,7 @@ async fn soft_enforcement_strips_spoofed_headers_when_estimate_is_unavailable() 
         matches!(action, FilterAction::Continue),
         "request must continue when the estimate is unavailable"
     );
-    assert!(
-        ctx.get_metadata("token_rate_limit.reservation_id").is_none(),
-        "no reservation when estimate is unavailable"
-    );
+    assert!(!holds_reservation(&ctx), "no reservation when estimate is unavailable");
     assert!(
         ctx.request_headers_to_remove
             .iter()
@@ -5015,7 +5133,7 @@ async fn hierarchy_missing_org_header_returns_401() {
         http::header::HeaderName::from_static("x-team-id"),
         http::HeaderValue::from_static("team-a"),
     );
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
@@ -5037,7 +5155,7 @@ async fn hierarchy_blank_org_header_returns_401() {
         http::header::HeaderName::from_static("x-team-id"),
         http::HeaderValue::from_static("team-a"),
     );
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
@@ -5056,7 +5174,7 @@ fn hierarchy_missing_org_header_records_unauthenticated_metric() {
             http::header::HeaderName::from_static("x-team-id"),
             http::HeaderValue::from_static("team-a"),
         );
-        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut ctx = filter_context(&req);
         let action = filter.on_request(&mut ctx).await.unwrap();
         assert!(
             matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401),
@@ -5083,7 +5201,7 @@ async fn hierarchy_missing_team_header_returns_401() {
         http::header::HeaderName::from_static("x-org-id"),
         http::HeaderValue::from_static("org-a"),
     );
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
@@ -5105,7 +5223,7 @@ async fn hierarchy_missing_subject_returns_401() {
         http::header::HeaderName::from_static("x-team-id"),
         http::HeaderValue::from_static("team-a"),
     );
-    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut ctx = filter_context(&req);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(

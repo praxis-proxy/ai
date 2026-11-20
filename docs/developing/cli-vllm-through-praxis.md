@@ -1316,9 +1316,13 @@ cargo xtask bump-pins             # or: --pin opencode --pin vllm ...
 ```
 
 It rewrites every mechanical site, swaps the checksum fixtures, and validates
-the result before writing. It never changes behavioral pins: tool lists,
-exit-code semantics, version-conditioned test expectations, replay recordings,
-and "verified against" claims in this guide. Its report lists those as a
+the result before writing. It also updates claims that an acceptance lane
+re-proves on every pull request, so the bump cannot merge until that lane
+passes against the new version: the pi "verified against" lines in this guide,
+and the Codex WebSocket recording, whose wire shapes it carries forward
+unchanged with metadata naming the version they came from. It never changes
+other behavioral pins: tool lists, exit-code semantics, version-conditioned
+test expectations, and claims no lane exercises. Its report lists those as a
 re-validation checklist, together with every line that still names the old
 version. The weekly `Bump Pins` workflow runs it and opens a draft pull request
 with that checklist; the GPU acceptance lanes (`vllm-full-suite` label) gate it

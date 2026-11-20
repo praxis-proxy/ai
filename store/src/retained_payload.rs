@@ -216,7 +216,7 @@ mod tests {
             + 1 /* text */
             + 1 /* true */
             + 1 /* null */
-            + 1; /* number */
+            + 1; // number
         let expected = input.len() * RETAINED_JSON_BYTE_MULTIPLIER + expected_nodes * RETAINED_JSON_NODE_BYTES;
         assert_eq!(json_payload_charge(input, expected).unwrap(), expected);
         assert!(matches!(

@@ -21,9 +21,12 @@
 # combines with another status.
 #
 # `dropped` is a defect, not a support level. The renderer MUST fail if a cell
-# has status `dropped` without a `blocker`, and MUST NOT emit `dropped` cells
-# into the customer-facing table — they render into a separate "Known gaps"
-# section so the matrix never claims support Praxis does not provide.
+# has status `dropped` without a `blocker`, or if a `blocker` is anything other
+# than a https://github.com/praxis-proxy/{ai,praxis}/issues/<number> URL. File
+# the issue first; release notes publish the blocker verbatim. The renderer
+# MUST NOT emit `dropped` cells into the customer-facing table — they render
+# into a separate "Known gaps" section so the matrix never claims support
+# Praxis does not provide.
 #
 # `evidence` is one or more `;`-separated `path:lines` citations. Repository
 # paths must exist and the cited lines must fit the file; citations into the
@@ -54,7 +57,7 @@ preconditions:
       when a matching filter installed a formatter. Otherwise that path emits
       RFC 9457 application/problem+json. Explicit filter and body-limit
       rejections carry their own bodies and bypass this formatting path.
-    evidence: praxis-proxy-protocol-0.8.0/src/http/pingora/handler/fail_to_proxy.rs:288-307
+    evidence: praxis-proxy-protocol-0.8.0/src/http/pingora/handler/fail_to_proxy.rs:299-340
     detail:
       - "Installers: ai_operation (apis/src/operation_classifier/mod.rs:235-248, picks the
          OpenAI or Anthropic formatter from the matched protocol),
@@ -300,7 +303,7 @@ surfaces:
           upstream stream ends without the sentinel, no message_delta and no
           message_stop are sent — a truncated response reported as success.
           Anthropic's documented `ping` keep-alive is never emitted either.
-        blocker: TODO-ISSUE emit terminal events at end-of-stream
+        blocker: https://github.com/praxis-proxy/ai/issues/2044
         evidence: apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:539-541; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:965-982; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:344-372
       upstream-error-midstream:
         status: dropped
@@ -309,7 +312,7 @@ surfaces:
           object, matches neither choices nor usage, and is discarded. The
           client sees a short clean completion for a failed generation. Only
           non-JSON and non-object data fails the stream.
-        blocker: TODO-ISSUE surface mid-stream upstream error objects
+        blocker: https://github.com/praxis-proxy/ai/issues/2045
         evidence: apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:559-575; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:583-645
       content-filter-signal:
         status: translated-lossy
@@ -326,7 +329,7 @@ surfaces:
           message_start.usage.input_tokens is hardcoded 0 rather than null, so
           clients reading prompt tokens at message_start get a wrong number,
           not a missing one. Finite-path usage is correct.
-        blocker: TODO-ISSUE populate or null message_start usage
+        blocker: https://github.com/praxis-proxy/ai/issues/2046
         evidence: apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:1045-1047
       cache-accounting:
         status: translated-lossy
@@ -343,7 +346,7 @@ surfaces:
           and refused (the upstream success is rejected with 500); a non-null
           streaming delta.refusal emits a terminal Anthropic error instead of
           being silently dropped.
-        blocker: TODO-ISSUE reject or surface reasoning_content
+        blocker: https://github.com/praxis-proxy/ai/issues/2047
         evidence: apis/src/anthropic/messages_to_chat_completions/response.rs:178-184; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:714-735; apis/src/anthropic/messages_to_chat_completions/response.rs:113-121; apis/src/anthropic/messages_to_chat_completions_stream/mod.rs:624-645
       request-reasoning-cache-controls:
         status: rejected
@@ -387,8 +390,8 @@ surfaces:
       oversized-body:
         status: dropped
         note: See the shared oversized-body gap below.
-        blocker: TODO-ISSUE format the 413 produced by the body-limit filter
-        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215
+        blocker: https://github.com/praxis-proxy/praxis/issues/1564
+        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213
 
   # -------------------------------------------------------------------------
   - id: responses-to-chat-completions
@@ -519,7 +522,7 @@ surfaces:
           — the model silently loses
           hosted-tool history. Separately, an unknown previous_response_id
           returns 400 where OpenAI returns 404.
-        blocker: TODO-ISSUE preserve or reject hosted-tool history on continuation
+        blocker: https://github.com/praxis-proxy/ai/issues/2048
         evidence: apis/src/openai/responses/rehydrate/mod.rs:1415-1433; apis/src/openai/responses/mod.rs:738-770; apis/src/openai/responses/rehydrate/mod.rs:1498-1501
       unsupported-operations:
         status: dropped
@@ -532,7 +535,7 @@ surfaces:
           guard says "this Responses operation has no Chat Completions
           translation". Accounts for 9 of the 10 templates the OpenResponses
           manifest marks inapplicable.
-        blocker: TODO-ISSUE reject untranslatable Responses operations at the edge
+        blocker: https://github.com/praxis-proxy/ai/issues/2049
         evidence: apis/src/classifier/mod.rs:116-118; apis/src/openai/responses/responses_to_chat_completions/mod.rs:853-856; apis/src/openai/responses/routes/mod.rs:200-208; apis/src/openai/responses/routes/mod.rs:256-264; apis/src/openai/responses/compact/mod.rs:415-599
       error-envelope:
         status: translated-lossy
@@ -544,8 +547,8 @@ surfaces:
       oversized-body:
         status: dropped
         note: See the shared oversized-body gap below.
-        blocker: TODO-ISSUE format the 413 produced by the body-limit filter
-        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215
+        blocker: https://github.com/praxis-proxy/praxis/issues/1564
+        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213
 
   # -------------------------------------------------------------------------
   - id: chat-completions-to-vertexai-gemini
@@ -612,7 +615,7 @@ surfaces:
           description and strict are read by nothing. strict:true is accepted
           and silently ignored, so structured-output strictness is lost with
           no error.
-        blocker: TODO-ISSUE reject or honor response_format.json_schema.strict
+        blocker: https://github.com/praxis-proxy/ai/issues/2050
         evidence: apis/src/vertex/gemini/request.rs:146-151; apis/src/vertex/gemini/request.rs:942-969
       streaming:
         status: translated
@@ -646,7 +649,7 @@ surfaces:
       cache-accounting:
         status: dropped
         note: cachedContentTokenCount is discarded; no prompt_tokens_details.cached_tokens is emitted.
-        blocker: TODO-ISSUE map Gemini cachedContentTokenCount
+        blocker: https://github.com/praxis-proxy/ai/issues/2051
         evidence: apis/src/vertex/gemini/response.rs:521-534
       reasoning-content:
         status: dropped
@@ -655,7 +658,7 @@ surfaces:
           completion_tokens_details.reasoning_tokens is emitted. A Part with
           thought:true fails the response, while a Part carrying only
           thoughtSignature produces an empty delta and no error.
-        blocker: TODO-ISSUE map Gemini thoughtsTokenCount
+        blocker: https://github.com/praxis-proxy/ai/issues/1755
         evidence: apis/src/vertex/gemini/response.rs:323-325; apis/src/vertex/gemini/response.rs:345-357; apis/src/vertex/gemini/response.rs:521-534; apis/src/vertex/gemini/response.rs:907-909
       request-reasoning-cache-controls:
         status: rejected
@@ -690,8 +693,8 @@ surfaces:
       oversized-body:
         status: dropped
         note: See the shared oversized-body gap below.
-        blocker: TODO-ISSUE format the 413 produced by the body-limit filter
-        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215
+        blocker: https://github.com/praxis-proxy/praxis/issues/1564
+        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213
 
   # -------------------------------------------------------------------------
   - id: chat-completions-to-azureai
@@ -738,7 +741,7 @@ surfaces:
           only annotations is dropped whole unless it also carries usage or
           other top-level metadata, in which case it is forwarded with empty
           choices. Customers relying on Azure safety metadata lose it entirely.
-        blocker: TODO-ISSUE preserve or document Azure content-filter metadata
+        blocker: https://github.com/praxis-proxy/ai/issues/2052
         evidence: apis/src/azure/to_openai/response.rs:22; apis/src/azure/to_openai/response.rs:25; apis/src/azure/to_openai/response.rs:44-67; apis/src/azure/to_openai/response.rs:114-139; apis/src/azure/to_openai/mod.rs:379-389
       usage-accounting: {status: passthrough, evidence: "apis/src/azure/to_openai/response.rs:52-57"}
       cache-accounting: {status: passthrough, evidence: "apis/src/azure/to_openai/request.rs:19-26"}
@@ -756,8 +759,8 @@ surfaces:
       oversized-body:
         status: dropped
         note: See the shared oversized-body gap below.
-        blocker: TODO-ISSUE format the 413 produced by the body-limit filter
-        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215
+        blocker: https://github.com/praxis-proxy/praxis/issues/1564
+        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213
 
   # -------------------------------------------------------------------------
   - id: chat-completions-to-bedrock-converse
@@ -789,7 +792,7 @@ surfaces:
           and silently discarded, and a non-"function" tool_call type is
           accepted and emitted as a toolUse. An assistant turn with no content
           gets a synthetic empty-string block.
-        blocker: TODO-ISSUE add a per-message field allowlist to the Bedrock translator
+        blocker: https://github.com/praxis-proxy/ai/issues/2053
         evidence: apis/src/bedrock/converse/request.rs:274-325; apis/src/bedrock/converse/request.rs:440-518
       multimodal-image:
         status: rejected
@@ -859,7 +862,7 @@ surfaces:
       cache-accounting:
         status: dropped
         note: cacheReadInputTokens and cacheWriteInputTokens are discarded.
-        blocker: TODO-ISSUE map Bedrock cache token counters
+        blocker: https://github.com/praxis-proxy/ai/issues/2054
         evidence: apis/src/bedrock/converse/response.rs:221-240
       reasoning-content:
         status: dropped
@@ -867,7 +870,7 @@ surfaces:
           Streaming reasoningContent deltas return Ok(None) with no output and
           no error. Citation, toolResult and image deltas take the same path
           and vanish silently.
-        blocker: TODO-ISSUE reject or surface Bedrock reasoningContent and citations
+        blocker: https://github.com/praxis-proxy/ai/issues/2055
         evidence: apis/src/bedrock/converse/response.rs:441-451
       request-reasoning-cache-controls:
         status: rejected
@@ -901,8 +904,8 @@ surfaces:
       oversized-body:
         status: dropped
         note: See the shared oversized-body gap below.
-        blocker: TODO-ISSUE format the 413 produced by the body-limit filter
-        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215
+        blocker: https://github.com/praxis-proxy/praxis/issues/1564
+        evidence: praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213
 
 # ---------------------------------------------------------------------------
 # Defects that span surfaces. Rendered once, above the per-surface tables, so
@@ -917,7 +920,7 @@ cross_surface_gaps:
       entirely on Vertex and Bedrock; Anthropic maps cache reads and loses
       only the cache-write counter. Customers are billed for tokens the matrix
       would otherwise claim they receive.
-    blocker: TODO-ISSUE systematic handling of reasoning and cache tokens across translators
+    blocker: https://github.com/praxis-proxy/ai/issues/2058
 
   - id: oversized-body-generic-413
     affects: [anthropic-messages-to-chat-completions, responses-to-chat-completions, chat-completions-to-vertexai-gemini, chat-completions-to-azureai, chat-completions-to-bedrock-converse]
@@ -929,7 +932,7 @@ cross_surface_gaps:
       declared-length admission, the global ceiling, SizeLimit and StreamBuffer
       limits, including pre-reads before request filters install a formatter.
       The body is no longer empty, but it still does not match the client dialect.
-    blocker: TODO-ISSUE format the 413 produced by the body-limit filter
+    blocker: https://github.com/praxis-proxy/praxis/issues/1564
 
   - id: divergent-error-envelopes
     affects: [chat-completions-to-vertexai-gemini, chat-completions-to-bedrock-converse, chat-completions-to-azureai]
@@ -938,7 +941,7 @@ cross_surface_gaps:
       includes param:null, Bedrock omits param and uses code "invalid_request",
       Azure rewrites whatever Azure returned. One client error handler cannot
       cover all three.
-    blocker: TODO-ISSUE converge on one OpenAI error envelope builder
+    blocker: https://github.com/praxis-proxy/ai/issues/2056
 
   - id: inverted-token-budget-precedence
     affects: [chat-completions-to-vertexai-gemini, chat-completions-to-bedrock-converse]
@@ -948,4 +951,4 @@ cross_surface_gaps:
       client request gets a different token budget depending on the backend.
       Vertex documents and tests its own precedence; nothing explains why the
       two differ.
-    blocker: TODO-ISSUE pick one max-tokens precedence across translators
+    blocker: https://github.com/praxis-proxy/ai/issues/2057

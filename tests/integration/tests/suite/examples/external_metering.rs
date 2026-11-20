@@ -231,7 +231,7 @@ fn external_metering_event_carries_provider_and_reasoning_tokens() {
 
 /// Poll the metering mock until the fire-and-forget usage report POST
 /// arrives, returning its body. Panics if it does not arrive in time.
-fn wait_for_usage_event(metering: &StatefulCapturingGuard) -> String {
+pub(super) fn wait_for_usage_event(metering: &StatefulCapturingGuard) -> String {
     for _ in 0..50 {
         if let Some(req) = metering
             .requests()

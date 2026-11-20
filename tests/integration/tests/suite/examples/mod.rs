@@ -34,6 +34,8 @@ mod compact;
 mod credential_injection;
 mod external_metering;
 mod external_metering_file_key;
+#[cfg(feature = "policy-engine")]
+mod external_metering_policy_identity;
 #[cfg(target_os = "linux")]
 mod file_descriptor_limits;
 #[cfg(feature = "openai-agentic-loop")]
@@ -186,6 +188,8 @@ mod time_to_first_token;
 mod token_ceiling;
 mod token_count;
 mod token_counting;
+#[cfg(feature = "token-quota-filter")]
+mod token_quota;
 #[cfg(feature = "token-rate-limit-filter")]
 mod token_rate_limit;
 #[cfg(feature = "token-rate-limit-filter")]

@@ -76,12 +76,14 @@ reviewed revision and validation evidence.
 - [CLI clients with vLLM](developing/cli-vllm-through-praxis.md),
   [OpenShell](developing/openshell-cli-vllm-through-praxis.md),
   [qualification](developing/vllm-qualification.md), and [GPU testing](developing/gpu-nightly-suite.md).
+- [Hosted passthrough nightly](developing/hosted-passthrough-nightly.md).
 
 ### Conformance
 
 - [OpenAI conformance scope, report, and verification](conformance/README.md).
 - [OpenAI Responses state conformance](conformance/openai-responses-state-conformance.md).
 - [OpenResponses translation coverage](conformance/openresponses-translation.md).
+- [Hosted translation nightly](developing/hosted-translation-nightly.md).
 - [Provider translation compatibility matrix](conformance/translation-matrix.md).
 
 ### Architecture

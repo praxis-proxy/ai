@@ -234,10 +234,12 @@ fn web_search_chat_completions_completes_model_search_model_round_trip() {
 
 #[test]
 fn web_search_chat_completions_streams_dispatch_once_as_one_logical_response() {
-    // Round 1: the Chat backend streams a private `web_search` tool call.
+    // Round 1: commentary text plus a private `web_search` tool call. The
+    // commentary becomes a terminal message item that must not collide with the
+    // resumed-round message under the shared logical response id.
     let first_response = vec![
         chat_chunk(
-            r#"{"id":"chatcmpl_ws","object":"chat.completion.chunk","model":"chat-only-model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_ws_1","type":"function","function":{"name":"web_search","arguments":""}}]}}]}"#,
+            r#"{"id":"chatcmpl_ws","object":"chat.completion.chunk","model":"chat-only-model","choices":[{"index":0,"delta":{"role":"assistant","content":"Searching now.","tool_calls":[{"index":0,"id":"call_ws_1","type":"function","function":{"name":"web_search","arguments":""}}]}}]}"#,
         ),
         chat_chunk(
             r#"{"id":"chatcmpl_ws","object":"chat.completion.chunk","model":"chat-only-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\":\"Praxis Proxy latest release\"}"}}]}}]}"#,
@@ -346,11 +348,31 @@ fn web_search_chat_completions_streams_dispatch_once_as_one_logical_response() {
         "terminal output must contain exactly one web_search_call: {output:#?}"
     );
     assert_eq!(search_calls[0]["status"], "completed");
+    let messages: Vec<&Value> = output.iter().filter(|item| item["type"] == "message").collect();
+    assert_eq!(
+        messages.len(),
+        2,
+        "both the commentary and final assistant messages must survive: {output:#?}"
+    );
+    assert_eq!(messages[0]["content"][0]["text"], "Searching now.");
+    assert_eq!(messages[1]["content"][0]["text"], "Praxis Proxy shipped a new release.");
+    let message_ids: Vec<&str> = messages
+        .iter()
+        .map(|item| item["id"].as_str().expect("message item must carry an id"))
+        .collect();
+    assert_ne!(
+        message_ids[0], message_ids[1],
+        "different assistant messages under one logical response require distinct ids: {message_ids:?}"
+    );
     assert!(
-        output.iter().any(|item| {
-            item["type"] == "message" && item["content"][0]["text"] == "Praxis Proxy shipped a new release."
-        }),
-        "terminal output must contain the final assistant message: {output:#?}"
+        message_ids[0].ends_with("_chatcmpl_ws"),
+        "round-1 message id must include the Chat completion id: {}",
+        message_ids[0]
+    );
+    assert!(
+        message_ids[1].ends_with("_chatcmpl_ans"),
+        "round-2 message id must include the Chat completion id: {}",
+        message_ids[1]
     );
 
     // AC2: the search result is bridged into the resumed inference request.

@@ -26,7 +26,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
-use praxis_ai_apis::promotion::contains_control_chars;
+use praxis_ai_apis::{RecordAiMetadata as _, promotion::contains_control_chars};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     builtins::http::payload_processing::json_rpc::{
@@ -445,7 +445,7 @@ impl HttpFilter for McpBrokerFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -501,8 +501,8 @@ impl HttpFilter for McpBrokerFilter {
         };
 
         if !contains_control_chars(method_str) {
-            ctx.set_metadata("json_rpc.method", method_str.clone());
-            ctx.set_metadata("mcp.method", method_str.clone());
+            ctx.record_ai_metadata("json_rpc.method", method_str.clone());
+            ctx.record_ai_metadata("mcp.method", method_str.clone());
         }
 
         self.dispatch_method(ctx, &value, &envelope, method_str, body)
@@ -822,7 +822,7 @@ fn handle_initialize(
     let session_id = format!("mcp-{}", ctx.id_generator.generate(ctx.time_source));
 
     debug!(session_id_len = session_id.len(), "MCP initialize");
-    ctx.set_metadata("mcp.session_id", session_id.clone());
+    ctx.record_ai_metadata("mcp.session_id", session_id.clone());
 
     Ok(FilterAction::Reject(
         Rejection::status(200)
@@ -862,7 +862,7 @@ fn record_client_protocol_version(ctx: &mut HttpFilterContext<'_>, value: &serde
         .and_then(|v| v.as_str())
         && !contains_control_chars(version)
     {
-        ctx.set_metadata("mcp.protocol_version", version.to_owned());
+        ctx.record_ai_metadata("mcp.protocol_version", version.to_owned());
     }
 }
 

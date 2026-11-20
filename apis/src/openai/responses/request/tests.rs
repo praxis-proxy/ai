@@ -375,7 +375,7 @@ async fn code_interpreter_is_preserved_by_facts_only_passes() {
                 "facts-only passes must forward provider-owned tool declarations unchanged"
             );
             assert_eq!(
-                ctx.get_metadata("openai_responses_request.model"),
+                ctx.filter_metadata.get("openai_responses_request.model"),
                 Some("gpt-5"),
                 "Code Interpreter must not suppress the facts needed to route to OpenAI"
             );
@@ -491,9 +491,7 @@ async fn the_request_head_phase_publishes_the_match_before_the_pre_read() {
         "the consumer processes the matched Responses body"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_request.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_request.format"),
         Some("openai_responses"),
         "the pre-read consumed the head-published operation identity"
     );
@@ -507,17 +505,10 @@ async fn a_create_request_publishes_classification_metadata() {
 
     // Published under the namespace downstream filters already read.
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_request.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_request.format"),
         Some("openai_responses")
     );
-    assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_request.stream")
-            .map(String::as_str),
-        Some("true")
-    );
+    assert_eq!(ctx.filter_metadata.get("openai_responses_request.stream"), Some("true"));
 }
 
 #[tokio::test]
@@ -527,12 +518,9 @@ async fn a_create_request_publishes_validated_facts_and_state_from_one_parse() {
     let ctx = run_streaming_create(filter.as_ref(), &request).await;
 
     // Derived from the same parse rather than round-tripped through metadata.
+    assert_eq!(ctx.filter_metadata.get("responses.stream"), Some("true"));
     assert_eq!(
-        ctx.filter_metadata.get("responses.stream").map(String::as_str),
-        Some("true")
-    );
-    assert_eq!(
-        ctx.filter_metadata.get("responses.store").map(String::as_str),
+        ctx.filter_metadata.get("responses.store"),
         Some("true"),
         "store defaults to true per the OpenAI specification"
     );
@@ -581,9 +569,7 @@ async fn a_model_only_create_is_classified_from_the_endpoint() {
 
     assert!(matches!(action, FilterAction::Release));
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_request.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_request.format"),
         Some("openai_responses"),
         "body heuristics find no discriminator, but the create endpoint decides"
     );
@@ -626,9 +612,7 @@ async fn a_matched_operation_overrides_body_shape() {
     drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
 
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_request.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_request.format"),
         Some("openai_responses"),
         "the endpoint identity is authoritative; JSON shape cannot override it"
     );
@@ -763,16 +747,12 @@ async fn initialize_state_false_classifies_without_building_state() {
 
     assert!(matches!(action, FilterAction::Release));
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_request.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_request.format"),
         Some("openai_responses"),
         "classification is still published so routing is unaffected"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_request.stream")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_request.stream"),
         Some("true"),
         "promoted routing facts are still published"
     );
@@ -804,9 +784,7 @@ async fn a_facts_publisher_caches_its_parse_for_a_managed_owner() {
 
     assert!(matches!(action, FilterAction::Release));
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_request.format")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_request.format"),
         Some("openai_responses"),
         "a facts publisher still promotes routing facts"
     );
@@ -943,9 +921,7 @@ async fn a_model_rewrite_invalidates_the_cached_parse_so_the_owner_reparses() {
             .unwrap(),
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_request.model")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_request.model"),
         Some("new-model"),
         "the owner re-parsed the rewritten body; a reused stale parse would read old-model"
     );
@@ -990,9 +966,7 @@ async fn an_intervening_body_rewrite_makes_the_owner_reparse_without_explicit_in
             .unwrap(),
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_request.model")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_request.model"),
         Some("new-model"),
         "a reused stale parse would publish old-model; the owner must re-parse the rewritten body"
     );
@@ -1092,9 +1066,7 @@ async fn bodyless_responses_operations_publish_identity_without_state() {
             "{method} {path} must not initialize state"
         );
         assert_eq!(
-            ctx.filter_metadata
-                .get("openai_responses_request.format")
-                .map(String::as_str),
+            ctx.filter_metadata.get("openai_responses_request.format"),
             Some("openai_responses"),
             "{method} {path} still publishes its identity so header routing can see it"
         );
@@ -1117,9 +1089,7 @@ async fn an_absent_optional_body_is_not_an_invalid_body() {
 
         assert!(matches!(action, FilterAction::Release), "{path} should forward");
         assert_eq!(
-            ctx.filter_metadata
-                .get("openai_responses_request.format")
-                .map(String::as_str),
+            ctx.filter_metadata.get("openai_responses_request.format"),
             Some("openai_responses"),
             "{path} still publishes its identity so header routing can see it"
         );
@@ -1179,9 +1149,7 @@ async fn other_body_bearing_responses_operations_are_processed() {
 
         assert!(matches!(action, FilterAction::Release), "{path}");
         assert_eq!(
-            ctx.filter_metadata
-                .get("openai_responses_request.format")
-                .map(String::as_str),
+            ctx.filter_metadata.get("openai_responses_request.format"),
             Some("openai_responses"),
             "{path} should publish its classification"
         );
@@ -1305,10 +1273,7 @@ async fn an_unclassifiable_body_follows_on_invalid_continue() {
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
         assert!(matches!(action, FilterAction::Release), "{label} body should forward");
-        let published = ctx
-            .filter_metadata
-            .get("openai_responses_request.format")
-            .map(String::as_str);
+        let published = ctx.filter_metadata.get("openai_responses_request.format");
         assert!(
             published == Some("non_json") || published == Some("invalid_json"),
             "{label} body should publish its format, got {published:?}"
@@ -1349,24 +1314,18 @@ async fn store_and_background_defaults_follow_the_specification() {
 
     drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
 
-    assert_eq!(
-        ctx.filter_metadata.get("responses.store").map(String::as_str),
-        Some("true")
-    );
-    assert_eq!(
-        ctx.filter_metadata.get("responses.background").map(String::as_str),
-        Some("false")
-    );
-    assert_eq!(
-        ctx.filter_metadata.get("responses.stream").map(String::as_str),
-        Some("false")
-    );
+    assert_eq!(ctx.filter_metadata.get("responses.store"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.background"), Some("false"));
+    assert_eq!(ctx.filter_metadata.get("responses.stream"), Some("false"));
 }
 
 #[test]
 fn the_filter_declares_bounded_buffering() {
     let filter = default_filter();
-    assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(
+        filter.request_body_access(),
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    );
     assert!(matches!(
         filter.request_body_mode(),
         BodyMode::StreamBuffer { max_bytes: Some(_) }
@@ -1380,10 +1339,13 @@ fn the_filter_declares_bounded_buffering() {
 #[test]
 fn declares_both_request_body_phases() {
     let filter = default_filter();
-    assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(
+        filter.request_body_access(),
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    );
     assert_eq!(
         filter.bound_upstream_request_body_access(),
-        BodyAccess::ReadOnly,
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional),
         "a chain must be able to defer this filter until a provider is bound"
     );
 }
@@ -1391,7 +1353,10 @@ fn declares_both_request_body_phases() {
 #[test]
 fn declares_a_streamed_response_body() {
     let filter = default_filter();
-    assert_eq!(filter.response_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(
+        filter.response_body_access(),
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    );
     assert!(
         matches!(filter.response_body_mode(), BodyMode::Stream),
         "the response path is teardown only and must not buffer"
@@ -1613,17 +1578,17 @@ async fn a_managed_create_with_a_conversation_publishes_the_append_back_facts() 
     assert!(matches!(action, FilterAction::Release));
 
     assert_eq!(
-        ctx.get_metadata("openai_responses_request.has_conversation"),
+        ctx.filter_metadata.get("openai_responses_request.has_conversation"),
         Some("true"),
         "append-back is armed by the conversation selector"
     );
     assert_eq!(
-        ctx.get_metadata("responses.conversation_id"),
+        ctx.filter_metadata.get("responses.conversation_id"),
         Some("conv_abc123"),
         "the canonical conversation ID must be published before the owner is captured"
     );
     assert_ne!(
-        ctx.get_metadata("openai_responses_request.background"),
+        ctx.filter_metadata.get("openai_responses_request.background"),
         Some("true"),
         "a background create does not arm local append-back"
     );
@@ -1643,7 +1608,7 @@ async fn a_create_without_a_conversation_does_not_arm_append_back() {
     drop(filter.on_request_body(&mut ctx, &mut bytes, true).await.unwrap());
 
     assert_ne!(
-        ctx.get_metadata("openai_responses_request.has_conversation"),
+        ctx.filter_metadata.get("openai_responses_request.has_conversation"),
         Some("true"),
         "no conversation selector means no local append-back"
     );
@@ -1696,9 +1661,7 @@ async fn mode_is_stateless_only_when_store_false_and_no_marker() {
 
     assert_eq!(mode_result(&ctx), Some("stateless"));
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_request.mode")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_request.mode"),
         Some("stateless")
     );
     assert_eq!(collect_headers(&ctx).get("x-praxis-responses-mode"), Some(&"stateless"));
@@ -1776,9 +1739,7 @@ async fn mode_is_present_for_any_body_on_the_responses_endpoint() {
         "endpoint authority makes this a Responses request, which defaults to stateful"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_request.mode")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_request.mode"),
         Some("stateful"),
         "mode metadata is published for the Responses operation"
     );
@@ -1830,9 +1791,7 @@ async fn mode_header_null_suppresses_only_the_header() {
         "a null mode header suppresses emission"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_request.mode")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_request.mode"),
         Some("stateless"),
         "metadata is still written when the header is disabled"
     );
@@ -1935,9 +1894,7 @@ async fn null_header_names_suppress_all_header_promotion() {
         "every promotion header is suppressed when its name is null"
     );
     assert_eq!(
-        ctx.filter_metadata
-            .get("openai_responses_request.model")
-            .map(String::as_str),
+        ctx.filter_metadata.get("openai_responses_request.model"),
         Some("gpt-4.1"),
         "metadata is still published when headers are disabled"
     );

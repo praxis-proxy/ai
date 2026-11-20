@@ -868,7 +868,8 @@ impl AnthropicWebSearchFilter {
         // the metadata is absent and both fall back to the same observed length.
         let observed_len = body.as_ref().map_or(0, Bytes::len);
         let raw_len = ctx
-            .get_metadata(RESPONSE_RAW_BYTES_KEY)
+            .filter_metadata
+            .get(RESPONSE_RAW_BYTES_KEY)
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(observed_len);
         if raw_len > self.max_body_bytes || observed_len > self.max_body_bytes {
@@ -1001,7 +1002,7 @@ impl HttpFilter for AnthropicWebSearchFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -1015,7 +1016,7 @@ impl HttpFilter for AnthropicWebSearchFilter {
         // path inspects the accumulated response. Both need write access to the
         // response body, so the access is declared unconditionally — the transport
         // is chosen per request, not by config.
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {

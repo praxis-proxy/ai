@@ -38,9 +38,6 @@ filter_chains:
       - filter: anthropic_messages_request
         on_invalid: continue
 
-      - filter: anthropic_messages_protocol
-        default_version: "2023-06-01"
-
       - filter: router
         routes:
           - path_prefix: "/"
@@ -49,8 +46,15 @@ filter_chains:
       - filter: load_balancer
         clusters:
           - name: vllm
+            http:
+              application_provider: vllm
             endpoints:
               - "127.0.0.1:8000"
+
+      # After load_balancer so it can refuse the MCP connector for the
+      # selected vLLM cluster (see "MCP connector" below).
+      - filter: anthropic_messages_protocol
+        default_version: "2023-06-01"
 
 insecure_options:
   allow_private_endpoints: true # local development backend
@@ -69,6 +73,21 @@ curl http://localhost:8080/v1/messages \
     "messages": [{"role": "user", "content": "Hi"}]
   }'
 ```
+
+### MCP connector
+
+Anthropic's server-side MCP connector (`mcp_servers` plus `mcp_toolset`
+tools, beta `mcp-client-2025-11-20`) is executed by Anthropic, not by the
+model server, so vLLM cannot honor it. When the selected cluster declares
+`application_provider` with any value other than `anthropic`,
+`anthropic_messages_protocol` refuses such a request with a 400
+`invalid_request_error` instead of forwarding it. The filter must run after
+`load_balancer` to see the selected cluster. A cluster tagged
+`application_provider: anthropic`, or an untagged cluster, forwards the
+connector unchanged. The Chat Completions translation always refuses it.
+
+Claude Code is unaffected: it runs MCP servers itself and sends their tools
+as ordinary client tools, which every route serves.
 
 ### Committed example with credential isolation
 
@@ -561,6 +580,8 @@ The `anthropic_messages_to_chat_completions` filter:
   `output_config.format` (or the deprecated
   `output_format`) to a strict `response_format`; any
   other `output_config` key is rejected with a 400
+- Rejects the MCP connector (`mcp_servers` or any
+  `mcp_toolset` tool) with a 400 that names it
 - Rejects `service_tier`, `container`, `inference_geo`
   and `mcp_servers` with a 400, because the translated
   response cannot report their effect truthfully; the
@@ -666,6 +687,9 @@ Injects `anthropic-version` header if absent.
 A caller-supplied version, including the SDK v2 default `2026-10-21`, is
 forwarded unchanged. No body transformation, version-specific validation,
 or credential handling. See [API version compatibility](#api-version-compatibility).
+Placed after `load_balancer`, it also refuses the
+[MCP connector](#mcp-connector) for a cluster whose `application_provider`
+is not `anthropic`.
 
 ```yaml
 filter: anthropic_messages_protocol

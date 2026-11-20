@@ -168,7 +168,10 @@ use super::{
     error::responses_error_rejection,
     state::{ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, is_client_executed_tool_call},
 };
-use crate::json_body::{SerializedJson, serialize_json_body};
+use crate::{
+    RecordAiMetadata as _,
+    json_body::{BoundedJsonBody, SerializedJson, serialize_json_body_within},
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -475,16 +478,14 @@ impl ClientToolCompatFilter {
 
         restore_snapshot_tools(&mut response, state.client_tool_echo.as_ref());
 
-        let serialized = serialize_json_body(&response).map_err(|error| {
-            FilterAction::Reject(responses_error_rejection(502, "server_error", &error.to_string()))
-        })?;
-        if serialized.len() > self.max_rewritten_body_bytes {
-            return Err(reject_rewritten_body_too_large(
-                serialized.len(),
-                self.max_rewritten_body_bytes,
-            ));
+        match serialize_json_body_within(&response, self.max_rewritten_body_bytes)
+            .map_err(|error| FilterAction::Reject(responses_error_rejection(502, "server_error", &error.to_string())))?
+        {
+            BoundedJsonBody::Fits(serialized) => Ok(Some(serialized)),
+            BoundedJsonBody::TooLarge { actual } => {
+                Err(reject_rewritten_body_too_large(actual, self.max_rewritten_body_bytes))
+            },
         }
-        Ok(Some(serialized))
     }
 
     /// Ratchet the upstream response to a bounded `StreamBuffer` and strip the
@@ -525,7 +526,7 @@ impl HttpFilter for ClientToolCompatFilter {
     fn request_body_access(&self) -> BodyAccess {
         // Lowering mutates `ResponsesState`; the outbound body is serialized by
         // `openai_responses_proxy`. The raw request bytes are not needed here.
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -535,7 +536,7 @@ impl HttpFilter for ClientToolCompatFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -562,7 +563,10 @@ impl HttpFilter for ClientToolCompatFilter {
             return Ok(FilterAction::Continue);
         }
         let streaming = request_is_streaming(ctx);
-        let stream_restoration_armed = ctx.get_metadata("responses.client_tool_stream_restoration").is_some();
+        let stream_restoration_armed = ctx
+            .filter_metadata
+            .get("responses.client_tool_stream_restoration")
+            .is_some();
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
@@ -604,7 +608,7 @@ impl HttpFilter for ClientToolCompatFilter {
         };
         if !reserve_client_tool_restoration(state, bytes) {
             *body = None;
-            ctx.set_metadata("responses.skip_persist", "true");
+            ctx.record_ai_metadata("responses.skip_persist", "true");
             return Ok(FilterAction::Reject(responses_error_rejection(
                 502,
                 "server_error",
@@ -966,7 +970,7 @@ fn restore_request_tools_and_choice(state: &mut ResponsesState, tools: Vec<Value
 /// Return the client's stream preference: the classifier metadata first, falling
 /// back to the request body's `stream` flag.
 fn request_is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_request.stream").map_or_else(
+    ctx.filter_metadata.get("openai_responses_request.stream").map_or_else(
         || {
             ctx.extensions
                 .get::<ResponsesState>()
@@ -1286,8 +1290,9 @@ fn folded_description(value: Option<&Value>) -> String {
 /// - a `custom` tool/member folds a *trimmed, dropped-when-empty* description into its prose
 ///   ([`custom_model_visible_description`]), so `null`/absent/empty/whitespace collapse to omission and a
 ///   trailing-space delta collapses to the trimmed value.
-/// - a `namespace` tool *trims* its (required) description before folding it into every member ([`namespace_header`]),
-///   so a trailing-space delta collapses.
+/// - a `namespace` tool *trims* a present string description before folding it into every member
+///   ([`namespace_header`]), so a trailing-space or blank-only delta collapses. Missing / `null` / non-string values
+///   stay distinct: they reject on lower, so they must not share identity with a schema-valid empty string.
 /// - a `shell` tool *ignores* its `description` entirely (only `environment.skills` is folded, per
 ///   [`shell_model_visible_description`]), so it never distinguishes two listings.
 /// - a `tool_search` tool uses its `description` *verbatim* (or a default when empty, per
@@ -1304,10 +1309,11 @@ fn normalize_identity_description(map: &mut Map<String, Value>) {
             }
         },
         Some("namespace") => {
-            map.insert(
-                "description".to_owned(),
-                json!(folded_description(map.get("description"))),
-            );
+            // Keep reject-worthy shapes (absent / null / non-string) out of the blank-string
+            // identity so a would-reject twin cannot silently dedup behind `""`.
+            if let Some(Value::String(description)) = map.get("description") {
+                map.insert("description".to_owned(), json!(description.trim()));
+            }
         },
         Some("shell") => {
             map.remove("description");
@@ -1997,30 +2003,26 @@ impl Lowering {
 struct NamespaceContext<'a> {
     /// The namespace's non-empty `name`, prefixed to each member's flat wire name.
     name: &'a str,
-    /// The namespace's required model-visible `description`, folded into each member.
+    /// The namespace's required model-visible `description` (may be empty after trim),
+    /// folded into each member.
     description: &'a str,
 }
 
 /// Validate a `namespace` declaration's required fields, returning its
 /// model-visible context and members.
 ///
-/// `NamespaceToolParam` requires a non-empty `name`, a non-empty `description`
-/// (`minLength: 1`, shown to the model), and a non-empty `tools` array
-/// (`minItems: 1`). Each is schema-invalid when missing, so a request that omits
-/// one fails closed rather than lowering members that drop the namespace's
-/// model-visible contract or silently dropping the whole declaration.
+/// `NamespaceToolParam` requires a non-empty `name` (`minLength: 1`), a string
+/// `description` (required, but with no `minLength`, so empty/whitespace are
+/// schema-valid), and a non-empty `tools` array (`minItems: 1`). Omitting
+/// `description` or giving a non-string still fails closed; a present blank
+/// string is accepted and trimmed before folding.
 fn namespace_header(tool: &Value) -> Result<(NamespaceContext<'_>, &[Value]), FilterAction> {
     let Some(name) = tool.get("name").and_then(Value::as_str).filter(|name| !name.is_empty()) else {
         return Err(reject_bad_request("namespace tool requires a non-empty name"));
     };
-    let Some(description) = tool
-        .get("description")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|description| !description.is_empty())
-    else {
+    let Some(description) = tool.get("description").and_then(Value::as_str).map(str::trim) else {
         return Err(reject_bad_request(&format!(
-            "namespace '{name}' requires a non-empty description"
+            "namespace '{name}' requires a string description"
         )));
     };
     let Some(members) = tool
@@ -2040,9 +2042,13 @@ fn namespace_header(tool: &Value) -> Result<(NamespaceContext<'_>, &[Value]), Fi
 /// A flattened member loses its `namespace` grouping on the wire, so the
 /// namespace's required description is folded into each member's description to
 /// keep the model-visible tool contract intact. An empty member body yields just
-/// the namespace context.
+/// the namespace context; a blank namespace description still records the grouping.
 fn prepend_namespace_context(namespace: &str, namespace_description: &str, body: &str) -> String {
-    let prefix = format!("Belongs to the `{namespace}` tool namespace: {namespace_description}");
+    let prefix = if namespace_description.is_empty() {
+        format!("Belongs to the `{namespace}` tool namespace.")
+    } else {
+        format!("Belongs to the `{namespace}` tool namespace: {namespace_description}")
+    };
     let body = body.trim();
     if body.is_empty() {
         prefix

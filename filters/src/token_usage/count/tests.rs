@@ -6,6 +6,7 @@
 use bytes::Bytes;
 use http::header::HeaderValue;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{FilterAction, HttpFilter as _, Request, Response};
 
 use super::*;
@@ -351,9 +352,21 @@ async fn json_chunked_body_reassembled() {
     let mut body2 = Some(Bytes::from_static(chunk2));
     drop(filter.on_response_body(&mut ctx, &mut body2, true).unwrap());
 
-    assert_eq!(ctx.get_metadata("token.input"), Some("15"), "chunked input tokens");
-    assert_eq!(ctx.get_metadata("token.output"), Some("42"), "chunked output tokens");
-    assert_eq!(ctx.get_metadata("token.total"), Some("57"), "chunked total tokens");
+    assert_eq!(
+        ctx.filter_metadata.get("token.input"),
+        Some("15"),
+        "chunked input tokens"
+    );
+    assert_eq!(
+        ctx.filter_metadata.get("token.output"),
+        Some("42"),
+        "chunked output tokens"
+    );
+    assert_eq!(
+        ctx.filter_metadata.get("token.total"),
+        Some("57"),
+        "chunked total tokens"
+    );
 }
 
 #[tokio::test]
@@ -472,7 +485,7 @@ async fn sse_anthropic_counts_from_separate_chunks_are_combined() {
         "token.cache_read",
         "token.cache_write",
     ]
-    .map(|key| ctx.get_metadata(key));
+    .map(|key| ctx.filter_metadata.get(key));
     assert_eq!(
         published,
         [Some("610"), Some("42"), Some("652"), Some("500"), Some("100")],
@@ -520,15 +533,23 @@ async fn sse_chunks_split_across_calls() {
     drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
 
     assert!(
-        ctx.get_metadata("token.input").is_none(),
+        ctx.filter_metadata.get("token.input").is_none(),
         "incomplete SSE frame should not set tokens"
     );
 
     let mut body2 = Some(Bytes::from_static(chunk2));
     drop(filter.on_response_body(&mut ctx, &mut body2, true).unwrap());
 
-    assert_eq!(ctx.get_metadata("token.input"), Some("10"), "split SSE input tokens");
-    assert_eq!(ctx.get_metadata("token.output"), Some("20"), "split SSE output tokens");
+    assert_eq!(
+        ctx.filter_metadata.get("token.input"),
+        Some("10"),
+        "split SSE input tokens"
+    );
+    assert_eq!(
+        ctx.filter_metadata.get("token.output"),
+        Some("20"),
+        "split SSE output tokens"
+    );
 }
 
 #[tokio::test]
@@ -648,14 +669,14 @@ async fn sse_oversized_event_recovers_and_captures_terminal_usage() {
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
     assert_eq!(
-        ctx.get_metadata("token.input"),
+        ctx.filter_metadata.get("token.input"),
         Some("10"),
         "terminal usage should be captured after the oversized event is discarded"
     );
-    assert_eq!(ctx.get_metadata("token.output"), Some("20"));
-    assert_eq!(ctx.get_metadata("token.total"), Some("30"));
+    assert_eq!(ctx.filter_metadata.get("token.output"), Some("20"));
+    assert_eq!(ctx.filter_metadata.get("token.total"), Some("30"));
     assert!(
-        ctx.get_metadata("token.status").is_none(),
+        ctx.filter_metadata.get("token.status").is_none(),
         "recovered terminal usage after a dropped content event is authoritative"
     );
 }
@@ -674,25 +695,25 @@ async fn sse_overflow_does_not_finalize_mid_stream() {
     let usage_event = b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}\n\n";
     let mut body1 = Some(Bytes::from_static(usage_event));
     drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
-    assert!(ctx.get_metadata("token.input").is_none(), "not finalized yet");
+    assert!(ctx.filter_metadata.get("token.input").is_none(), "not finalized yet");
 
     let overflow_chunk = vec![b'x'; DEFAULT_MAX_SCRATCH_BYTES + 1];
     let mut body2 = Some(Bytes::from(overflow_chunk));
     drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
 
     assert!(
-        ctx.get_metadata("token.input").is_none(),
+        ctx.filter_metadata.get("token.input").is_none(),
         "overflow mid-stream should not finalize early; already-accumulated counts wait for end_of_stream"
     );
 
     let mut body3 = Some(Bytes::from_static(b"\n\n"));
     drop(filter.on_response_body(&mut ctx, &mut body3, true).unwrap());
 
-    assert_eq!(ctx.get_metadata("token.input"), Some("10"));
-    assert_eq!(ctx.get_metadata("token.output"), Some("20"));
-    assert_eq!(ctx.get_metadata("token.total"), Some("30"));
+    assert_eq!(ctx.filter_metadata.get("token.input"), Some("10"));
+    assert_eq!(ctx.filter_metadata.get("token.output"), Some("20"));
+    assert_eq!(ctx.filter_metadata.get("token.total"), Some("30"));
     assert_eq!(
-        ctx.get_metadata("token.status"),
+        ctx.filter_metadata.get("token.status"),
         Some("overflow"),
         "a drop after captured usage means later events (possibly a usage correction) were lost"
     );
@@ -715,11 +736,11 @@ async fn sse_overflow_with_no_usage_sets_overflow_status() {
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
     assert!(
-        ctx.get_metadata("token.input").is_none(),
+        ctx.filter_metadata.get("token.input").is_none(),
         "no usage was ever captured, so no counts should be written"
     );
     assert_eq!(
-        ctx.get_metadata("token.status"),
+        ctx.filter_metadata.get("token.status"),
         Some("overflow"),
         "billing consumers must not mistake this for zero usage"
     );
@@ -747,14 +768,14 @@ async fn sse_partial_then_oversized_terminal_event_sets_overflow_status() {
     let mut body = Some(Bytes::from(events));
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
-    assert_eq!(ctx.get_metadata("token.input"), Some("25"), "partial input kept");
+    assert_eq!(ctx.filter_metadata.get("token.input"), Some("25"), "partial input kept");
     assert_eq!(
-        ctx.get_metadata("token.output"),
+        ctx.filter_metadata.get("token.output"),
         Some("0"),
         "terminal output was dropped"
     );
     assert_eq!(
-        ctx.get_metadata("token.status"),
+        ctx.filter_metadata.get("token.status"),
         Some("overflow"),
         "partial maxima are not a complete capture when the terminal event overflowed"
     );
@@ -774,11 +795,11 @@ async fn sse_responses_completed_event_larger_than_64kib_captured_at_default_scr
     let mut body = Some(Bytes::from(responses_stream_with_padded_completed_event(65_536 * 3)));
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
-    assert_eq!(ctx.get_metadata("token.input"), Some("62000"));
-    assert_eq!(ctx.get_metadata("token.output"), Some("13000"));
-    assert_eq!(ctx.get_metadata("token.total"), Some("75000"));
+    assert_eq!(ctx.filter_metadata.get("token.input"), Some("62000"));
+    assert_eq!(ctx.filter_metadata.get("token.output"), Some("13000"));
+    assert_eq!(ctx.filter_metadata.get("token.total"), Some("75000"));
     assert!(
-        ctx.get_metadata("token.status").is_none(),
+        ctx.filter_metadata.get("token.status").is_none(),
         "a complete capture at the default scratch is not an overflow"
     );
 }
@@ -799,11 +820,11 @@ async fn sse_responses_completed_event_beyond_scratch_marks_overflow() {
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
     assert!(
-        ctx.get_metadata("token.input").is_none(),
+        ctx.filter_metadata.get("token.input").is_none(),
         "usage exists only in the oversized terminal event, which must be skipped"
     );
     assert_eq!(
-        ctx.get_metadata("token.status"),
+        ctx.filter_metadata.get("token.status"),
         Some("overflow"),
         "skipping the usage-carrying event must be an explicit overflow, not a silent zero"
     );
@@ -827,7 +848,7 @@ fn on_response_body_noop_without_mode() {
         "should return Continue without mode"
     );
     assert!(
-        ctx.get_metadata("token.input").is_none(),
+        ctx.filter_metadata.get("token.input").is_none(),
         "should not set any token metadata without mode"
     );
 }
@@ -854,11 +875,11 @@ async fn json_overflow_sets_explicit_status_not_zero() {
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
     assert!(
-        ctx.get_metadata("token.input").is_none(),
+        ctx.filter_metadata.get("token.input").is_none(),
         "overflow should not set counts"
     );
     assert_eq!(
-        ctx.get_metadata("token.status"),
+        ctx.filter_metadata.get("token.status"),
         Some("overflow"),
         "billing consumers must not mistake missing counts for zero usage"
     );
@@ -886,8 +907,8 @@ async fn json_valid_usage_beyond_configured_limit_sets_overflow_status() {
     let mut body = Some(Bytes::from(json.into_bytes()));
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
-    assert!(ctx.get_metadata("token.input").is_none());
-    assert_eq!(ctx.get_metadata("token.status"), Some("overflow"));
+    assert!(ctx.filter_metadata.get("token.input").is_none());
+    assert_eq!(ctx.filter_metadata.get("token.status"), Some("overflow"));
 }
 
 #[test]
@@ -1003,17 +1024,17 @@ async fn bedrock_invoke_model_extracts_headers_on_response() {
     ctx.response_header = None;
 
     assert_eq!(
-        ctx.get_metadata("token.input"),
+        ctx.filter_metadata.get("token.input"),
         Some("25"),
         "Bedrock InvokeModel input tokens"
     );
     assert_eq!(
-        ctx.get_metadata("token.output"),
+        ctx.filter_metadata.get("token.output"),
         Some("50"),
         "Bedrock InvokeModel output tokens"
     );
     assert_eq!(
-        ctx.get_metadata("token.total"),
+        ctx.filter_metadata.get("token.total"),
         Some("75"),
         "Bedrock InvokeModel total tokens (computed)"
     );
@@ -1031,11 +1052,11 @@ async fn bedrock_invoke_model_headers_absent_is_noop() {
     ctx.response_header = None;
 
     assert!(
-        ctx.get_metadata("token.input").is_none(),
+        ctx.filter_metadata.get("token.input").is_none(),
         "missing headers should not set input"
     );
     assert!(
-        ctx.get_metadata("token.output").is_none(),
+        ctx.filter_metadata.get("token.output").is_none(),
         "missing headers should not set output"
     );
 }
@@ -1053,7 +1074,7 @@ async fn bedrock_invoke_model_partial_headers_is_noop() {
     ctx.response_header = None;
 
     assert!(
-        ctx.get_metadata("token.input").is_none(),
+        ctx.filter_metadata.get("token.input").is_none(),
         "only-input header should not set tokens"
     );
 }
@@ -1072,11 +1093,11 @@ async fn bedrock_invoke_model_non_numeric_headers_is_noop() {
     ctx.response_header = None;
 
     assert!(
-        ctx.get_metadata("token.input").is_none(),
+        ctx.filter_metadata.get("token.input").is_none(),
         "non-numeric input header should not set tokens"
     );
     assert!(
-        ctx.get_metadata("token.output").is_none(),
+        ctx.filter_metadata.get("token.output").is_none(),
         "non-numeric input header should also suppress the otherwise-valid output header"
     );
 }
@@ -1096,11 +1117,11 @@ async fn bedrock_invoke_model_skips_non_success_status() {
     ctx.response_header = None;
 
     assert!(
-        ctx.get_metadata("token.input").is_none(),
+        ctx.filter_metadata.get("token.input").is_none(),
         "non-success status should skip extraction even with valid token headers present"
     );
     assert!(
-        ctx.get_metadata("token.output").is_none(),
+        ctx.filter_metadata.get("token.output").is_none(),
         "non-success status should skip extraction even with valid token headers present"
     );
 }
@@ -1133,7 +1154,10 @@ fn bedrock_invoke_model_response_body_access_is_none() {
 #[test]
 fn other_providers_response_body_access_is_read_only() {
     let filter = make_filter(ProviderKind::OpenAi);
-    assert_eq!(filter.response_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(
+        filter.response_body_access(),
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    );
 }
 
 #[test]
@@ -1146,7 +1170,7 @@ fn on_response_body_noop_for_bedrock_invoke_model() {
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
 
     assert!(matches!(action, FilterAction::Continue));
-    assert!(ctx.get_metadata("token.input").is_none());
+    assert!(ctx.filter_metadata.get("token.input").is_none());
 }
 
 // -----------------------------------------------------------------------------
@@ -1357,17 +1381,21 @@ async fn bedrock_invoke_model_headers_record_no_cache() {
     drop(filter.on_response(&mut ctx).await.unwrap());
     ctx.response_header = None;
 
-    assert_eq!(ctx.get_metadata("token.input"), Some("15"), "header input tokens");
+    assert_eq!(
+        ctx.filter_metadata.get("token.input"),
+        Some("15"),
+        "header input tokens"
+    );
     assert!(
-        ctx.get_metadata("token.cache_read").is_none(),
+        ctx.filter_metadata.get("token.cache_read").is_none(),
         "response headers carry no cache breakdown"
     );
     assert!(
-        ctx.get_metadata("token.cache_write").is_none(),
+        ctx.filter_metadata.get("token.cache_write").is_none(),
         "response headers carry no cache breakdown"
     );
     assert!(
-        ctx.get_metadata("token.reasoning").is_none(),
+        ctx.filter_metadata.get("token.reasoning").is_none(),
         "response headers carry no reasoning breakdown"
     );
 }
@@ -1640,12 +1668,12 @@ async fn json_stream_buffer_double_delivery_extracts_once() {
     drop(filter.on_response_body(&mut ctx, &mut frozen, true).unwrap());
 
     assert_eq!(
-        ctx.get_metadata("token.input"),
+        ctx.filter_metadata.get("token.input"),
         Some("15"),
         "the EOS frozen buffer must be parsed exactly once"
     );
     assert_eq!(
-        ctx.get_metadata("token.output"),
+        ctx.filter_metadata.get("token.output"),
         Some("42"),
         "output tokens should match"
     );
@@ -1677,12 +1705,12 @@ async fn json_stream_buffer_released_falls_back_to_chunks() {
     drop(filter.on_response_body(&mut ctx, &mut eos, true).unwrap());
 
     assert_eq!(
-        ctx.get_metadata("token.input"),
+        ctx.filter_metadata.get("token.input"),
         Some("7"),
         "released buffers must still extract from the streamed chunks"
     );
     assert_eq!(
-        ctx.get_metadata("token.output"),
+        ctx.filter_metadata.get("token.output"),
         Some("11"),
         "output tokens should match"
     );
@@ -1713,17 +1741,17 @@ async fn json_stream_buffer_released_final_chunk_extracts_usage() {
     drop(filter.on_response_body(&mut ctx, &mut last, true).unwrap());
 
     assert_eq!(
-        ctx.get_metadata("token.input"),
+        ctx.filter_metadata.get("token.input"),
         Some("9"),
         "a released chain's final chunk must be joined to the captured chunks"
     );
     assert_eq!(
-        ctx.get_metadata("token.output"),
+        ctx.filter_metadata.get("token.output"),
         Some("13"),
         "output tokens should match"
     );
     assert!(
-        ctx.get_metadata("token.status").is_none(),
+        ctx.filter_metadata.get("token.status").is_none(),
         "a released chain within the capture limit must not report overflow"
     );
     assert_capture_cleared(&ctx);
@@ -1758,11 +1786,11 @@ async fn json_stream_buffer_frozen_body_beyond_limit_sets_overflow_status() {
     drop(filter.on_response_body(&mut ctx, &mut frozen, true).unwrap());
 
     assert!(
-        ctx.get_metadata("token.input").is_none(),
+        ctx.filter_metadata.get("token.input").is_none(),
         "a frozen body beyond the capture limit must not be parsed"
     );
     assert_eq!(
-        ctx.get_metadata("token.status"),
+        ctx.filter_metadata.get("token.status"),
         Some("overflow"),
         "an oversized frozen body must report overflow, not zero usage"
     );
@@ -1797,11 +1825,11 @@ async fn json_stream_buffer_frozen_body_without_usage_is_not_overflow() {
     drop(filter.on_response_body(&mut ctx, &mut frozen, true).unwrap());
 
     assert!(
-        ctx.get_metadata("token.input").is_none(),
+        ctx.filter_metadata.get("token.input").is_none(),
         "a response without usage records no counts"
     );
     assert!(
-        ctx.get_metadata("token.status").is_none(),
+        ctx.filter_metadata.get("token.status").is_none(),
         "a frozen body within the capture limit must not report overflow"
     );
     assert_capture_cleared(&ctx);
@@ -1832,11 +1860,11 @@ async fn json_stream_buffer_released_fallback_beyond_limit_sets_overflow_status(
     drop(filter.on_response_body(&mut ctx, &mut last, true).unwrap());
 
     assert!(
-        ctx.get_metadata("token.input").is_none(),
+        ctx.filter_metadata.get("token.input").is_none(),
         "a joined document beyond the capture limit must not be parsed"
     );
     assert_eq!(
-        ctx.get_metadata("token.status"),
+        ctx.filter_metadata.get("token.status"),
         Some("overflow"),
         "an oversized released capture must report overflow, not zero usage"
     );
@@ -1930,9 +1958,9 @@ async fn run_json_extraction(
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
     (
-        ctx.get_metadata("token.input").map(str::to_owned),
-        ctx.get_metadata("token.output").map(str::to_owned),
-        ctx.get_metadata("token.total").map(str::to_owned),
+        ctx.filter_metadata.get("token.input").map(str::to_owned),
+        ctx.filter_metadata.get("token.output").map(str::to_owned),
+        ctx.filter_metadata.get("token.total").map(str::to_owned),
     )
 }
 
@@ -1956,8 +1984,8 @@ async fn run_cache_extraction(
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
     (
-        ctx.get_metadata("token.cache_read").map(str::to_owned),
-        ctx.get_metadata("token.cache_write").map(str::to_owned),
+        ctx.filter_metadata.get("token.cache_read").map(str::to_owned),
+        ctx.filter_metadata.get("token.cache_write").map(str::to_owned),
     )
 }
 
@@ -1976,7 +2004,7 @@ async fn run_reasoning_extraction(provider: ProviderKind, content_type: &str, bo
     let mut body = Some(Bytes::copy_from_slice(body_bytes));
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
-    ctx.get_metadata("token.reasoning").map(str::to_owned)
+    ctx.filter_metadata.get("token.reasoning").map(str::to_owned)
 }
 
 /// Run a full `on_response` -> `on_response_body` cycle for SSE extraction.
@@ -1997,9 +2025,9 @@ async fn run_sse_extraction(
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
     (
-        ctx.get_metadata("token.input").map(str::to_owned),
-        ctx.get_metadata("token.output").map(str::to_owned),
-        ctx.get_metadata("token.total").map(str::to_owned),
+        ctx.filter_metadata.get("token.input").map(str::to_owned),
+        ctx.filter_metadata.get("token.output").map(str::to_owned),
+        ctx.filter_metadata.get("token.total").map(str::to_owned),
     )
 }
 
@@ -2013,7 +2041,7 @@ fn publish_token_usage_records_llm_metrics() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some("cb-glm".to_owned().into());
-    ctx.set_metadata("openai_chat_completions_request.model", "gpt-x");
+    ctx.record_ai_metadata("openai_chat_completions_request.model", "gpt-x");
 
     let usage = TokenUsage::new(12, 34, Some(46))
         .with_cache(Some(5), None)
@@ -2056,7 +2084,7 @@ fn publish_token_usage_records_llm_metrics() {
 fn publish_token_usage_bumps_empty_completions_on_zero_output() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_ctx(&req);
-    ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "gpt-x");
+    ctx.record_ai_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "gpt-x");
 
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
@@ -2084,7 +2112,7 @@ fn bedrock_headers_record_llm_metrics() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
     let mut ctx = make_ctx(&req);
     ctx.cluster = Some("bedrock".to_owned().into());
-    ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "claude-x");
+    ctx.record_ai_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, "claude-x");
     let mut headers = http::HeaderMap::new();
     headers.insert(HEADER_BEDROCK_INPUT, HeaderValue::from_static("40"));
     headers.insert(HEADER_BEDROCK_OUTPUT, HeaderValue::from_static("7"));

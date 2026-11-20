@@ -237,7 +237,7 @@ impl HttpFilter for TokenObserver {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -260,18 +260,20 @@ impl HttpFilter for TokenObserver {
     ) -> Result<FilterAction, FilterError> {
         if end_of_stream {
             let counts = ["token.input", "token.output", "token.total", "token.status"]
-                .map(|key| ctx.get_metadata(key).map(str::to_owned));
+                .map(|key| ctx.filter_metadata.get(key).map(str::to_owned));
             self.observations
                 .send((
                     counts,
                     ctx.response_body_mode,
-                    ctx.get_metadata("test.token.raw_seen").is_some(),
+                    ctx.filter_metadata.get("test.token.raw_seen").is_some(),
                     body.clone(),
                 ))
                 .unwrap();
         } else {
-            let first_chunk = ctx.get_metadata("test.token.raw_seen").is_none();
-            ctx.set_metadata("test.token.raw_seen", "true");
+            let first_chunk = ctx.filter_metadata.get("test.token.raw_seen").is_none();
+            ctx.filter_metadata
+                .insert("test.token.raw_seen", "true")
+                .unwrap_or_else(praxis_filter::FilterMetadata::log_loss);
             if first_chunk
                 && body.is_some()
                 && let Some(release) = &self.release

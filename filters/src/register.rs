@@ -41,6 +41,8 @@ use crate::{
 /// [`install_pipeline_extensions`] so the OpenAI store, rehydrate, compaction,
 /// and MCP approval filters find their shared response store registry.
 pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    #[cfg(feature = "token-quota-filter")]
+    crate::token_quota::register_factory();
     register_agentic_filters(registry);
     #[cfg(feature = "aws-sigv4-filter")]
     register_aws_filters(registry);

@@ -505,6 +505,17 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
 /// reported back as the default.
 #[expect(clippy::too_many_lines, reason = "sequential validation of request parameters")]
 fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), TranslationError> {
+    if let Some(value) = obj
+        .get("stream_options")
+        .and_then(|options| options.get("include_obfuscation"))
+        && !value.is_boolean()
+    {
+        return Err(TranslationError::UnrepresentableRequestParameter {
+            parameter: "stream_options.include_obfuscation",
+            value: json_type_name(value),
+            supported: "a boolean",
+        });
+    }
     // Access program selection cannot be honored by the Chat backend. Keep
     // this check at translation so native Responses passthrough is unaffected.
     if let Some(access_programs) = obj.get("access_programs") {
@@ -2143,38 +2154,32 @@ fn build_output_items(
         output.push(reasoning_item);
     }
     let logprobs = chat_logprobs_content(choice);
-    append_message_output(&mut output, message, context, status, logprobs);
+    let content_items = message_content_items(message, logprobs);
+    if !content_items.is_empty() {
+        output.push(message_output_item(context, status, content_items, chat_completion_id));
+    }
     append_tool_call_outputs(&mut output, message, context, status)?;
 
     Ok(output)
 }
 
-/// Append a message output item when the Chat response includes assistant text.
-fn append_message_output(
-    output: &mut Vec<Value>,
-    message: Option<&Value>,
-    context: &ResponseContext<'_>,
-    status: &str,
-    logprobs: &[Value],
-) {
-    let content_items = message_content_items(message, logprobs);
-
-    if content_items.is_empty() {
-        return;
+/// Build an assistant message output item id that stays unique across agentic rounds.
+pub(crate) fn message_item_id(response_id: &str, chat_completion_id: Option<&str>) -> String {
+    match chat_completion_id.filter(|id| !id.is_empty()) {
+        Some(chat_id) => format!("msg_{response_id}_{chat_id}"),
+        None => format!("msg_{response_id}"),
     }
-
-    output.push(message_output_item(context, status, content_items));
-}
-
-/// Build a stable assistant message output item id.
-pub(crate) fn message_item_id(context: &ResponseContext<'_>) -> String {
-    format!("msg_{}", context.response_id)
 }
 
 /// Build a schema-complete `Responses` assistant message item.
-pub(crate) fn message_output_item(context: &ResponseContext<'_>, status: &str, content: Vec<Value>) -> Value {
+pub(crate) fn message_output_item(
+    context: &ResponseContext<'_>,
+    status: &str,
+    content: Vec<Value>,
+    chat_completion_id: Option<&str>,
+) -> Value {
     json!({
-        "id": message_item_id(context),
+        "id": message_item_id(&context.response_id, chat_completion_id),
         "type": "message",
         "status": status,
         "role": "assistant",

@@ -4,7 +4,10 @@
 //! Tests for the `openai_web_search_dispatch` filter.
 
 use super::*;
-use crate::{openai::responses::agentic_loop::budget::SimpleBudget, web_search::config::MAX_SEARCH_QUERY_BYTES};
+use crate::{
+    RecordAiMetadata as _, openai::responses::agentic_loop::budget::SimpleBudget,
+    web_search::config::MAX_SEARCH_QUERY_BYTES,
+};
 
 // -----------------------------------------------------------------------------
 // Helper: build filter from YAML
@@ -452,7 +455,10 @@ fn filter_response_body_access_is_read_only() {
     let yaml = make_filter_yaml("brave", "test-key");
     let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
 
-    assert_eq!(filter.response_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(
+        filter.response_body_access(),
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -1116,7 +1122,7 @@ async fn budgeted_web_search_rejects_oversized_body_without_publishing_results()
             .all(|item| item.get("type").and_then(Value::as_str) != Some("function_call_output")),
         "no result may enter persisted history"
     );
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
 }
 
 #[test]
@@ -3350,7 +3356,7 @@ fn build_tool_result_messages_incomplete_with_results_keeps_them() {
 fn bound_streamed_search_action_replaces_invalid_queries() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata(MAX_QUERY_METADATA, "16".to_owned());
+    ctx.record_ai_metadata(MAX_QUERY_METADATA, "16".to_owned());
     let oversized = "x".repeat(17);
     for action in [
         serde_json::json!({"type": "search", "query": oversized}),
@@ -3372,7 +3378,7 @@ fn bound_streamed_search_action_replaces_invalid_queries() {
 fn bound_streamed_search_action_keeps_valid_and_queryless_items() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata(MAX_QUERY_METADATA, "16".to_owned());
+    ctx.record_ai_metadata(MAX_QUERY_METADATA, "16".to_owned());
     for item in [
         serde_json::json!({"type": "web_search_call", "id": "ws_1", "action": {"type": "search", "query": " rust "}}),
         serde_json::json!({"type": "web_search_call", "id": "ws_1", "status": "in_progress"}),
@@ -3409,13 +3415,10 @@ fn bound_streamed_search_action_is_noop_without_dispatcher_bound() {
 fn search_bridge_shares_payloads_and_detaches_on_mutation() {
     let mut state = ResponsesState::from_request_body(serde_json::json!({"input": "hello"}));
     let start = state.messages.len();
-    append_search_bridge(
-        &mut state,
-        [
-            serde_json::json!({"type": "function_call", "call_id": "bridge"}),
-            serde_json::json!({"type": "function_call_output", "call_id": "bridge", "output": "results"}),
-        ],
-    );
+    state.append_local_tool_results([
+        serde_json::json!({"type": "function_call", "call_id": "bridge"}),
+        serde_json::json!({"type": "function_call_output", "call_id": "bridge", "output": "results"}),
+    ]);
     for index in start..start + 2 {
         assert!(
             state.messages.shares_item_with(index, &state.persisted_messages, index),
@@ -3428,4 +3431,333 @@ fn search_bridge_shares_payloads_and_detaches_on_mutation() {
         "results",
         "working edits must not change persisted results"
     );
+}
+
+// -----------------------------------------------------------------------------
+// filters.allowed_domains enforcement (issue #1768)
+// -----------------------------------------------------------------------------
+
+/// Request body declaring a hosted web-search tool with the given `filters`.
+fn web_search_request_with_filters(filters: &Value) -> Value {
+    serde_json::json!({
+        "model": "gpt-4o",
+        "input": "search praxis",
+        "include": ["web_search_call.action.sources"],
+        "tools": [{"type": "web_search", "filters": filters}],
+    })
+}
+
+/// Assert that `action` is a 400 rejection carrying `code`.
+fn assert_filters_rejected(action: &FilterAction, code: &str) {
+    let FilterAction::Reject(rejection) = action else {
+        panic!("unenforceable filters must be rejected, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400, "unenforceable filters must be a 400");
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["code"], code, "unexpected rejection: {body}");
+}
+
+#[tokio::test]
+async fn on_request_body_drops_results_outside_allowed_domains() {
+    // Regression for issue #1768: the provider returns one result outside the
+    // client's allow-list. It must reach neither the model continuation nor the
+    // public `action.sources`, while the allowed subdomain result survives.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let provider_body = serde_json::json!({
+        "web": {"results": [
+            {"title": "Outside", "url": "https://outside.example/result", "description": "disallowed"},
+            {"title": "Inside", "url": "https://docs.example.org/praxis", "description": "allowed"},
+        ]}
+    })
+    .to_string();
+    spawn_search_responses(listener, vec![(200, provider_body)]);
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(web_search_request_with_filters(
+        &serde_json::json!({"allowed_domains": ["example.org"]}),
+    ));
+    state.select_test_output("web_search_call", vec![web_search_call("ws_domains", "praxis proxy")]);
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "got {action:?}");
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let output = state
+        .accumulated_output
+        .iter()
+        .find(|item| item["id"] == "ws_domains")
+        .unwrap();
+    assert_eq!(output["status"], "completed");
+    let sources: Vec<&str> = output["action"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|source| source["url"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        sources,
+        ["https://docs.example.org/praxis"],
+        "only allowed-domain results may be public sources"
+    );
+    for (label, messages) in [("messages", &state.messages), ("persisted", &state.persisted_messages)] {
+        let continuation = serde_json::to_string(messages).unwrap();
+        assert!(
+            !continuation.contains("outside.example"),
+            "disallowed result must not enter the {label} continuation: {continuation}"
+        );
+        assert!(
+            continuation.contains("docs.example.org"),
+            "allowed result must reach the {label} continuation: {continuation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn on_request_body_drops_results_on_blocked_domains() {
+    // A block-list subtracts from the allow-list, so a blocked subdomain of an
+    // allowed domain never reaches the model or the public sources.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let provider_body = serde_json::json!({
+        "web": {"results": [
+            {"title": "Blocked", "url": "https://docs.example.org/private", "description": "blocked"},
+            {"title": "Blocked domain", "url": "https://outside.example/result", "description": "outside allow-list"},
+            {"title": "Inside", "url": "https://www.example.org/praxis", "description": "allowed"},
+        ]}
+    })
+    .to_string();
+    spawn_search_responses(listener, vec![(200, provider_body)]);
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(web_search_request_with_filters(&serde_json::json!({
+        "allowed_domains": ["example.org"],
+        "blocked_domains": ["docs.example.org"],
+    })));
+    state.select_test_output("web_search_call", vec![web_search_call("ws_blocked", "praxis proxy")]);
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "got {action:?}");
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let output = state
+        .accumulated_output
+        .iter()
+        .find(|item| item["id"] == "ws_blocked")
+        .unwrap();
+    let sources: Vec<&str> = output["action"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|source| source["url"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        sources,
+        ["https://www.example.org/praxis"],
+        "blocked domains must not be public sources"
+    );
+    for (label, messages) in [("messages", &state.messages), ("persisted", &state.persisted_messages)] {
+        let continuation = serde_json::to_string(messages).unwrap();
+        assert!(
+            !continuation.contains("docs.example.org") && !continuation.contains("outside.example"),
+            "blocked result must not enter the {label} continuation: {continuation}"
+        );
+        assert!(
+            continuation.contains("www.example.org"),
+            "permitted result must reach the {label} continuation: {continuation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn on_request_body_drops_unverifiable_results_on_blocked_domains() {
+    // A block-list-only request must not retain a result whose host cannot be
+    // verified: otherwise a malformed or scheme-relative provider URL passes the
+    // "not blocked" check and reaches the model.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let provider_body = serde_json::json!({
+        "web": {"results": [
+            {"title": "Scheme relative", "url": "//outside.example/result", "description": "no scheme"},
+            {"title": "Malformed", "url": "not a url", "description": "unparseable"},
+            {"title": "Opaque scheme", "url": "custom://EXAMPLE.ORG/result", "description": "case-preserving host"},
+            {"title": "Inside", "url": "https://www.example.org/praxis", "description": "verifiable"},
+        ]}
+    })
+    .to_string();
+    spawn_search_responses(listener, vec![(200, provider_body)]);
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(web_search_request_with_filters(
+        &serde_json::json!({"blocked_domains": ["docs.example.org"]}),
+    ));
+    state.select_test_output(
+        "web_search_call",
+        vec![web_search_call("ws_unverifiable", "praxis proxy")],
+    );
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "got {action:?}");
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let output = state
+        .accumulated_output
+        .iter()
+        .find(|item| item["id"] == "ws_unverifiable")
+        .unwrap();
+    let sources: Vec<&str> = output["action"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|source| source["url"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        sources,
+        ["https://www.example.org/praxis"],
+        "results with an unverifiable host must not be public sources"
+    );
+    for (label, messages) in [("messages", &state.messages), ("persisted", &state.persisted_messages)] {
+        let continuation = serde_json::to_string(messages).unwrap();
+        assert!(
+            !continuation.contains("outside.example")
+                && !continuation.contains("not a url")
+                && !continuation.contains("custom://"),
+            "unverifiable results must not enter the {label} continuation: {continuation}"
+        );
+        assert!(
+            continuation.contains("www.example.org"),
+            "the verifiable result must reach the {label} continuation: {continuation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn preflight_rejects_unenforceable_filters() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
+    let too_many: Vec<String> = (0..=MAX_DOMAINS_PER_LIST).map(|i| format!("d{i}.example")).collect();
+    let invalid = [
+        serde_json::json!("example.org"),
+        serde_json::json!({"allowed_domains": "example.org"}),
+        serde_json::json!({"allowed_domains": [1]}),
+        serde_json::json!({"allowed_domains": ["example.org/path"]}),
+        serde_json::json!({"allowed_domains": ["*.example.org"]}),
+        serde_json::json!({"allowed_domains": ["%2a.example.org"]}),
+        serde_json::json!({"allowed_domains": ["example.org.."]}),
+        serde_json::json!({"allowed_domains": too_many}),
+        serde_json::json!({"blocked_domains": "example.org"}),
+        serde_json::json!({"blocked_domains": [null]}),
+        serde_json::json!({"blocked_domains": ["example.org/path"]}),
+        serde_json::json!({"blocked_domains": ["example.*"]}),
+        serde_json::json!({"blocked_domains": ["%2a.example.org"]}),
+        serde_json::json!({"blocked_domains": too_many}),
+    ];
+    for filters in invalid {
+        let action = run_initial_request(filter.as_ref(), web_search_request_with_filters(&filters)).await;
+        assert_filters_rejected(&action, "invalid_value");
+    }
+
+    // The adapter, not the shared matcher, owns the client-facing message.
+    for (field, value) in [
+        (DomainField::Allowed, serde_json::json!(["a b"])),
+        (DomainField::Blocked, serde_json::json!(["*.example.org"])),
+        (DomainField::Blocked, serde_json::json!(too_many.clone())),
+    ] {
+        let rejection = domain_list(Some(&value), field).unwrap_err();
+        let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(&format!("filters.{}", field.as_str())),
+            "the rejection names {}: {message}",
+            field.as_str()
+        );
+    }
+
+    // A filter member dispatch does not implement must not be silently ignored.
+    let action = run_initial_request(
+        filter.as_ref(),
+        web_search_request_with_filters(&serde_json::json!({"search_domain_filter": ["example.org"]})),
+    )
+    .await;
+    assert_filters_rejected(&action, "unsupported_parameter");
+}
+
+#[tokio::test]
+async fn preflight_rejects_web_search_tools_with_conflicting_allowed_domains() {
+    // A call cannot be attributed to one tool, so a restricted tool next to an
+    // unrestricted one must not widen dispatch to the unrestricted filter.
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
+    for second in [
+        serde_json::json!({"type": "web_search_preview"}),
+        serde_json::json!({"type": "web_search_preview", "filters": {"allowed_domains": ["other.example"]}}),
+        serde_json::json!({"type": "web_search_preview", "filters": {"blocked_domains": ["other.example"]}}),
+        serde_json::json!({"type": "web_search_preview", "filters": {
+            "allowed_domains": ["example.org", "a.example"],
+            "blocked_domains": ["other.example"],
+        }}),
+    ] {
+        let request = serde_json::json!({
+            "model": "gpt-4o",
+            "input": "search praxis",
+            "tools": [{"type": "web_search", "filters": {
+                "allowed_domains": ["example.org", "a.example"],
+            }}, second],
+        });
+        let action = run_initial_request(filter.as_ref(), request).await;
+        assert_filters_rejected(&action, "invalid_value");
+    }
+}
+
+#[tokio::test]
+async fn preflight_allows_enforceable_filters() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
+    let requests = [
+        web_search_request_with_filters(&Value::Null),
+        web_search_request_with_filters(&serde_json::json!({})),
+        web_search_request_with_filters(&serde_json::json!({"allowed_domains": null})),
+        web_search_request_with_filters(&serde_json::json!({"allowed_domains": []})),
+        web_search_request_with_filters(&serde_json::json!({"allowed_domains": ["https://Example.org/"]})),
+        web_search_request_with_filters(&serde_json::json!({"blocked_domains": ["example.org"]})),
+        web_search_request_with_filters(&serde_json::json!({"blocked_domains": []})),
+        web_search_request_with_filters(&serde_json::json!({
+            "allowed_domains": ["example.org"],
+            "blocked_domains": ["docs.example.org"],
+        })),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "search praxis",
+            "tools": [
+                {"type": "web_search", "filters": {
+                    "allowed_domains": ["example.org", "a.example"],
+                    "blocked_domains": ["docs.example.org"],
+                }},
+                {"type": "web_search_preview", "filters": {
+                    "allowed_domains": ["A.example", "example.org"],
+                    "blocked_domains": ["https://Docs.Example.org/"],
+                }},
+            ],
+        }),
+    ];
+    for request in requests {
+        let action = run_initial_request(filter.as_ref(), request.clone()).await;
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "enforceable filters must pass preflight: {request} -> {action:?}"
+        );
+    }
 }

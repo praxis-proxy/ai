@@ -48,7 +48,18 @@ go through the [proposal process].
 CI enforces reviewability on every PR:
 
 - A maximum added lines count of production code (tests, docs, examples excluded)
-- A real description of what and why - `Signed-off-by`
+- No more than three open PRs ready for review per contributor in this
+  repository. Drafts are excluded. When a PR takes its author over the limit,
+  the Praxis bot fails its limit check and skips reviewer assignment. Once
+  the count is back to three or fewer, edit or update the waiting PR to
+  refresh the check and reviewer assignment.
+- Non-empty **Why**, **What**, and **How** sections, plus a related issue.
+  Follow the shared [PR conventions], including the guidance for new filter
+  parameters.
+- Maintainer review starts only after all required CI checks pass. A maintainer
+  assignment signals that review has started; contributors should wait for CI
+  to be green before requesting or expecting that assignment.
+- A `Signed-off-by`
   trailer on every commit (`git commit -s`)
 - Cryptographically signed commits (GPG or SSH)
 - Human authorship: commits authored or signed-off by tools are rejected

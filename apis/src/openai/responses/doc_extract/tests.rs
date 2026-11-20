@@ -14,6 +14,7 @@ use super::{
     *,
 };
 use crate::{
+    RecordAiMetadata as _,
     json_body::MAX_JSON_BODY_BYTES,
     test_utils::{make_filter_context, make_request},
 };
@@ -267,7 +268,7 @@ fn raw_base64(text: &str) -> String {
 }
 
 fn set_responses_metadata(ctx: &mut HttpFilterContext<'_>) {
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
 }
 
 #[test]
@@ -362,8 +363,14 @@ fn from_config_zero_max_content_bytes_rejected() {
 #[test]
 fn declares_dual_phase_body_access() {
     let filter = make_filter();
-    assert_eq!(filter.request_body_access(), BodyAccess::ReadWrite);
-    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadWrite);
+    assert_eq!(
+        filter.request_body_access(),
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
+    );
+    assert_eq!(
+        filter.bound_upstream_request_body_access(),
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
+    );
 }
 
 #[test]

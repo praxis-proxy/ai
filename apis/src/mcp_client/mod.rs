@@ -1075,6 +1075,24 @@ fn connection_nominated_from_json(
     nominated
 }
 
+/// Raw body, SSE framing, rmcp parsing, and result conversion of one MCP
+/// reply. Measured peak is about 8x wire bytes plus 250 bytes per node.
+const MCP_RESULT_WIRE_MULTIPLIER: usize = 16;
+/// Per-node reserve for an MCP reply, about 2x the measured parse cost.
+const MCP_RESULT_NODE_RESERVE: usize = 512;
+
+/// Charge an MCP server reply before rmcp parses it.
+///
+/// Callers with a request-wide memory budget admit this charge before the
+/// transport buffers a reply, so the estimate stays independent of the
+/// inference protocol that owns the budget.
+pub(crate) fn mcp_result_charge(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .len()
+        .checked_mul(MCP_RESULT_WIRE_MULTIPLIER)?
+        .checked_add(crate::json_body::json_node_count(bytes)?.checked_mul(MCP_RESULT_NODE_RESERVE)?)
+}
+
 /// Headers that must not pass through from client-supplied MCP
 /// tool config into the proxy's outbound MCP transport.
 pub(crate) fn is_blocked_mcp_header(name: &http::HeaderName) -> bool {
@@ -1104,6 +1122,11 @@ fn tools_to_json(tools: Vec<rmcp::model::Tool>) -> Result<Vec<serde_json::Value>
         .collect()
 }
 
+/// Retain this error-path sink: core sizing discards progress on failure,
+/// but MCP listing charges the accepted prefix even when serialization fails.
+/// The normal successful path uses core sizing; an error is remeasured locally
+/// to preserve that caller-specific policy rather than charging zero.
+///
 /// `io::Write` sink that counts bytes written instead of retaining
 /// them, so a page's serialized size can be measured without a second
 /// heap buffer.
@@ -1128,11 +1151,13 @@ impl std::io::Write for ByteCounter {
 /// page without allocating a second buffer. A serialization error
 /// (which the caller would surface elsewhere) yields the bytes counted
 /// so far, keeping the cumulative budget conservative.
-fn measure_tools_json_bytes(tools: &[rmcp::model::Tool]) -> usize {
-    let mut counter = ByteCounter::default();
-    match serde_json::to_writer(&mut counter, tools) {
-        Ok(()) | Err(_) => counter.count,
-    }
+fn measure_tools_json_bytes<T: serde::Serialize + ?Sized>(tools: &T) -> usize {
+    praxis_filter::json_size::serialized_len(tools).unwrap_or_else(|_| {
+        let mut counter = ByteCounter::default();
+        match serde_json::to_writer(&mut counter, tools) {
+            Ok(()) | Err(_) => counter.count,
+        }
+    })
 }
 
 /// Add one page's decoded size to the running listing total and reject the

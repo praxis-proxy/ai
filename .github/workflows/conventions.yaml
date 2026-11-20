@@ -7,7 +7,7 @@ name: Coding Conventions
 on:
   pull_request_target:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, edited, synchronize, reopened, ready_for_review, converted_to_draft]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
@@ -16,45 +16,19 @@ concurrency:
 permissions: {}
 
 jobs:
-  # ----------------------------------------------------------------------------
-  # PR Description Check
-  # ----------------------------------------------------------------------------
-
-  pr-description-check:
-    if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Generate token
-        id: app-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          app-id: ${{ secrets.PRAXIS_BOT_APP_ID }}
-          private-key: ${{ secrets.PRAXIS_BOT_APP_PRIVATE_KEY }}
-
-      - name: Check for description
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-        run: |
-          labels=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels -q '.labels[].name')
-          if echo "$labels" | grep -q '^skip/pr-conventions$'; then
-            echo "skip/pr-conventions label present — skipping description check"
-            exit 0
-          fi
-
-          word_count=$(echo "$PR_BODY" | wc -w)
-          if [ "$word_count" -lt 2 ]; then
-            marker="<!-- praxis:pr-description-check -->"
-            already=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-              --jq "[.[] | select(.body | contains(\"${marker}\"))] | length")
-            if [ "$already" -eq 0 ]; then
-              gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" \
-                --body "${marker}
-          Please add a description to this PR explaining what it does and why. See our [coding conventions](https://github.com/praxis-proxy/conventions/blob/main/docs/conventions.md)."
-            fi
-          fi
+  pr-context:
+    permissions:
+      pull-requests: write
+    uses: praxis-proxy/conventions/.github/workflows/pr-conventions.yaml@a94d5edb2929b4e623dcfc9f1820d67eab43f748 # conventions PR 49
+    with:
+      context-only: true
+      description-team-bypass: false
+      max-open-prs: 3
+      count-draft-prs: false
+      conventions-doc: https://github.com/praxis-proxy/conventions/blob/main/docs/conventions.md#pull-request-conventions
+    secrets:
+      PRAXIS_BOT_APP_ID: ${{ secrets.PRAXIS_BOT_APP_ID }}
+      PRAXIS_BOT_APP_PRIVATE_KEY: ${{ secrets.PRAXIS_BOT_APP_PRIVATE_KEY }}
 
   # ----------------------------------------------------------------------------
   # Dependency Version Check

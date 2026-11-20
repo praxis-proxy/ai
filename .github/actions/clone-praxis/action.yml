@@ -1,7 +1,7 @@
 name: Clone Praxis core
 description: >-
   Clone praxis core repo as a sibling directory so
-  path-based [patch.crates-io] overrides resolve.
+  path-based [patch."https://github.com/praxis-proxy/praxis"] overrides resolve.
 
 inputs:
   ref:

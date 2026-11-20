@@ -9,7 +9,7 @@
 
 mod config;
 
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -127,7 +127,7 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsStreamFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -364,7 +364,7 @@ struct StreamState {
     /// Incremental SSE framing state.
     buffer: EventBuffer,
     /// Client stop sequences used to validate an upstream match.
-    stop_sequences: Option<Vec<String>>,
+    stop_sequences: Option<Arc<[String]>>,
     /// Incomplete UTF-8 suffix, at most three bytes.
     utf8: Vec<u8>,
     /// Message and terminal-error progress.
@@ -1080,8 +1080,10 @@ fn emit_final_block_stop(state: &mut StreamState, output: &mut Vec<u8>) {
 /// Emit the `message_delta` event with stop reason and usage.
 fn emit_message_delta(state: &StreamState, output: &mut Vec<u8>) {
     let stop_sequence = state.stop_sequence.as_ref();
+    let has_tool_use = get_tool_block_count(state) > 0;
     let stop_reason = match state.finish_reason.as_deref() {
         Some("stop") if stop_sequence.is_some() => "stop_sequence",
+        Some("stop") if has_tool_use => "tool_use",
         Some(reason) => map_stop_reason(reason),
         None => "end_turn",
     };
@@ -1244,6 +1246,7 @@ mod tests {
     use std::borrow::Cow;
 
     use super::*;
+    use crate::RecordAiMetadata as _;
 
     #[test]
     fn empty_chunk_preserves_emitted_cr_marker() {
@@ -1620,7 +1623,7 @@ mod tests {
     #[test]
     fn message_delta_reports_matched_stop_sequence() {
         let (filter, mut ctx) = make_filter_and_context();
-        ctx.set_metadata(
+        ctx.record_ai_metadata(
             crate::anthropic::messages_to_chat_completions::STOP_SEQUENCES_KEY,
             r#"[","]"#,
         );
@@ -1647,9 +1650,42 @@ mod tests {
     }
 
     #[test]
+    fn message_delta_preserves_long_matched_stop_sequence() {
+        let (filter, mut ctx) = make_filter_and_context();
+        let stop_sequence = "s".repeat(300);
+        let client_stop_sequences = Arc::<[String]>::from(vec![stop_sequence.clone()]);
+        ctx.extensions
+            .insert(crate::anthropic::messages_to_chat_completions::ClientStopSequences(
+                Arc::clone(&client_stop_sequences),
+            ));
+        let chunk = serde_json::json!({
+            "id": "c1",
+            "model": "gpt-4",
+            "choices": [{
+                "delta": {"content": "partial"},
+                "index": 0,
+                "finish_reason": "stop",
+                "stop_reason": stop_sequence,
+            }],
+        });
+        let mut body = Some(Bytes::from(format!("data: {chunk}\n\ndata: [DONE]\n\n")));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let stream_state = ctx.get_filter_state::<StreamState>().unwrap();
+        assert!(
+            Arc::ptr_eq(stream_state.stop_sequences.as_ref().unwrap(), &client_stop_sequences),
+            "stream state should share the request extension allocation"
+        );
+
+        let out = std::str::from_utf8(body.as_deref().unwrap()).unwrap();
+        let event = event_data(out, "message_delta");
+        let delta = event.get("delta").unwrap();
+        assert_stop_sequence_delta(delta, stop_sequence.as_str(), "long matched client stop");
+    }
+
+    #[test]
     fn message_delta_ignores_stop_reason_outside_client_sequences() {
         let (filter, mut ctx) = make_filter_and_context();
-        ctx.set_metadata(
+        ctx.record_ai_metadata(
             crate::anthropic::messages_to_chat_completions::STOP_SEQUENCES_KEY,
             r#"[","]"#,
         );
@@ -1795,7 +1831,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_messages_request.stream", "true".to_owned());
+        ctx.record_ai_metadata("anthropic_messages_request.stream", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1821,7 +1857,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream; charset=utf-8"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1843,7 +1879,7 @@ mod tests {
             http::HeaderValue::from_static("Text/Event-Stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1887,7 +1923,7 @@ mod tests {
             http::HeaderValue::from_static("application/json"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1919,7 +1955,7 @@ mod tests {
         resp.headers
             .insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static("gzip"));
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1948,7 +1984,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_messages_request.stream", "true".to_owned());
+        ctx.record_ai_metadata("anthropic_messages_request.stream", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1995,6 +2031,40 @@ mod tests {
     }
 
     #[test]
+    fn matched_stop_sequence_preserves_open_tool_block_state() {
+        let (filter, mut ctx) = make_filter_and_context();
+        ctx.extensions
+            .insert(crate::anthropic::messages_to_chat_completions::ClientStopSequences(
+                vec![",".to_owned()].into(),
+            ));
+
+        let tool_start = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},\"index\":0}]}\n\n";
+        let mut body1 = Some(Bytes::from(tool_start));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+        let start_indices = event_indices(
+            std::str::from_utf8(body1.as_deref().unwrap()).unwrap(),
+            "content_block_start",
+        );
+
+        let matched_stop = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\",\"stop_reason\":\",\"}]}\n\n";
+        let mut body2 = Some(Bytes::from(matched_stop));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let mut body3 = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut body3, false).unwrap());
+
+        let out = std::str::from_utf8(body3.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            event_indices(out, "content_block_stop"),
+            start_indices,
+            "DONE should close the tool block retained across the matched stop"
+        );
+        let event = event_data(out, "message_delta");
+        let delta = event.get("delta").unwrap();
+        assert_stop_sequence_delta(delta, ",", "matched client stop");
+    }
+
+    #[test]
     fn tool_call_delta_emits_tool_use_block_and_input_delta() {
         let (filter, mut ctx) = make_filter_and_context();
 
@@ -2026,6 +2096,130 @@ mod tests {
             "tool arguments should stream as input_json_delta"
         );
     }
+
+    /// A streamed named tool call maps an upstream `stop` to `tool_use`.
+    #[test]
+    fn message_delta_reports_tool_use_when_named_tool_stream_finishes_with_stop() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let tool_start = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},\"index\":0}]}\n\n";
+        let mut body1 = Some(Bytes::from(tool_start));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let finish = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n";
+        let mut body2 = Some(Bytes::from(finish));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let mut done = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut done, false).unwrap());
+
+        let out = String::from_utf8(done.unwrap().to_vec()).unwrap();
+        let event = event_data(&out, "message_delta");
+        let stop_reason = event
+            .get("delta")
+            .and_then(|delta| delta.get("stop_reason"))
+            .and_then(Value::as_str);
+        assert_eq!(
+            stop_reason,
+            Some("tool_use"),
+            "a named tool block must not be reported as end_turn when upstream uses stop"
+        );
+    }
+
+    /// A matched client stop sequence takes precedence over an open tool block.
+    #[test]
+    fn message_delta_prefers_matched_stop_sequence_over_tool_use() {
+        let (filter, mut ctx) = make_filter_and_context();
+        ctx.record_ai_metadata(
+            crate::anthropic::messages_to_chat_completions::STOP_SEQUENCES_KEY,
+            r#"[","]"#,
+        );
+
+        let tool_start = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},\"index\":0}]}\n\n";
+        let mut body1 = Some(Bytes::from(tool_start));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let finish = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\",\"stop_reason\":\",\"}]}\n\n";
+        let mut body2 = Some(Bytes::from(finish));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let mut done = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut done, false).unwrap());
+
+        let out = String::from_utf8(done.unwrap().to_vec()).unwrap();
+        let event = event_data(&out, "message_delta");
+        let delta = event.get("delta").unwrap();
+        assert_eq!(
+            delta.get("stop_reason").and_then(Value::as_str),
+            Some("stop_sequence"),
+            "a matched client stop must take precedence over tool_use"
+        );
+        assert_eq!(
+            delta.get("stop_sequence").and_then(Value::as_str),
+            Some(","),
+            "the matched client stop sequence must be reported"
+        );
+    }
+
+    #[test]
+    fn many_tool_blocks_keep_all_terminal_stops() {
+        let (filter, mut ctx) = make_filter_and_context();
+        let tool_calls = (0..64)
+            .map(|index| {
+                serde_json::json!({
+                    "index": index,
+                    "id": format!("call_{index}"),
+                    "function": {"name": "tool", "arguments": "{}"}
+                })
+            })
+            .collect::<Vec<_>>();
+        let chunk = serde_json::json!({
+            "id": "c1",
+            "model": "gpt-4",
+            "choices": [{"delta": {"tool_calls": tool_calls}, "index": 0}]
+        });
+        let mut body = Some(Bytes::from(format!("data: {chunk}\n\n")));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let first_output = body.take().unwrap();
+        let first_output = std::str::from_utf8(&first_output).unwrap();
+        assert_many_tool_block_indices(first_output, "content_block_start", "start");
+        let state = ctx.get_filter_state::<StreamState>().unwrap();
+        assert_tool_state_counts(state, 64, "before DONE");
+
+        let mut done = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut done, false).unwrap());
+        let output = done.unwrap();
+        let output = std::str::from_utf8(&output).unwrap();
+        assert_many_tool_block_indices(output, "content_block_stop", "stop");
+        assert_message_stop_follows_blocks(output);
+    }
+
+    #[test]
+    fn tool_block_state_isolated_between_filter_instances() {
+        let (_, mut ctx) = make_filter_and_context();
+
+        ctx.current_filter_id = Some(0);
+        let state = ctx.get_filter_state_mut::<StreamState>().unwrap();
+        set_tool_block_index(state, "first", 0);
+        set_tool_block_open(state, "first", true);
+        state.tool_count = 1;
+
+        ctx.current_filter_id = Some(1);
+        ctx.insert_filter_state(StreamState::default());
+        let state = ctx.get_filter_state_mut::<StreamState>().unwrap();
+        assert_tool_state_counts(state, 0, "new filter ID");
+        set_tool_block_index(state, "second", 0);
+        set_tool_block_open(state, "second", true);
+        state.tool_count = 1;
+
+        ctx.current_filter_id = Some(0);
+        let state = ctx.get_filter_state::<StreamState>().unwrap();
+        assert_single_open_tool(state, "first", "filter ID 0");
+        ctx.current_filter_id = Some(1);
+        let state = ctx.get_filter_state::<StreamState>().unwrap();
+        assert_single_open_tool(state, "second", "filter ID 1");
+    }
+
     const INVALID_TOOL_CALL_CASES: [(&str, &str, &str); 5] = [
         (
             "missing id",
@@ -2081,7 +2275,6 @@ mod tests {
             assert_eq!(trailing_body, Some(Bytes::new()));
         }
     }
-
 
     #[test]
     fn interleaved_tool_call_argument_delta_uses_matching_tool_block_index() {
@@ -2141,7 +2334,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
+        ctx.record_ai_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -2830,6 +3023,71 @@ mod tests {
     }
 
     // Test Utilities
+
+    fn assert_many_tool_block_indices(output: &str, event_type: &str, action: &str) {
+        assert_eq!(
+            event_indices(output, event_type),
+            (0..64).collect::<Vec<_>>(),
+            "all 64 tool blocks should {action} once in block-index order"
+        );
+    }
+
+    fn assert_message_stop_follows_blocks(output: &str) {
+        assert_eq!(
+            output.matches("event: message_stop").count(),
+            1,
+            "DONE should emit exactly one terminal message_stop"
+        );
+        let last_block_stop = output.rfind("event: content_block_stop");
+        let message_stop = output.find("event: message_stop");
+        assert!(
+            matches!(
+                (last_block_stop, message_stop),
+                (Some(block_stop_position), Some(message_stop_position))
+                    if block_stop_position < message_stop_position
+            ),
+            "message_stop should follow every content_block_stop"
+        );
+    }
+
+    fn assert_single_open_tool(state: &StreamState, expected_name: &str, label: &str) {
+        assert_eq!(
+            get_tool_block_count(state),
+            1,
+            "{label} should retain its tracked tool block"
+        );
+        assert_eq!(
+            open_tool_blocks(state),
+            vec![(0, expected_name.to_owned())],
+            "{label} should retain only its own open block"
+        );
+    }
+
+    fn assert_stop_sequence_delta(delta: &Value, expected: &str, label: &str) {
+        assert_eq!(
+            delta.get("stop_reason").and_then(Value::as_str),
+            Some("stop_sequence"),
+            "{label} should report the stop_sequence reason"
+        );
+        assert_eq!(
+            delta.get("stop_sequence").and_then(Value::as_str),
+            Some(expected),
+            "{label} should remain intact in the terminal delta"
+        );
+    }
+
+    fn assert_tool_state_counts(state: &StreamState, expected: usize, label: &str) {
+        assert_eq!(
+            state.tools.len(),
+            expected,
+            "{label} should have {expected} tracked tool blocks"
+        );
+        assert_eq!(
+            open_tool_blocks(state).len(),
+            expected,
+            "{label} should have {expected} open tool blocks"
+        );
+    }
 
     fn event_data(output: &str, event_type: &str) -> Value {
         let marker = format!("event: {event_type}\n");

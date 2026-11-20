@@ -15,7 +15,7 @@ use serde_json::json;
 
 use super::*;
 use crate::{
-    CalloutCredentials,
+    CalloutCredentials, RecordAiMetadata as _,
     openai::{
         api_client::{ApiClient, ApiClientConfig},
         responses::state::ResponsesState,
@@ -63,8 +63,14 @@ fn from_config_unknown_field_rejected() {
 #[test]
 fn declares_dual_phase_body_access() {
     let filter = make_filter();
-    assert_eq!(filter.request_body_access(), BodyAccess::ReadWrite);
-    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadWrite);
+    assert_eq!(
+        filter.request_body_access(),
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
+    );
+    assert_eq!(
+        filter.bound_upstream_request_body_access(),
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
+    );
 }
 
 #[test]
@@ -239,7 +245,7 @@ async fn budgeted_file_resolve_rejects_before_file_callout() {
     let filter = FileResolveFilter::from_config(&config).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     ctx.extensions
         .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
     let raw = br#"{"model":"test","input":[{"type":"input_file","file_id":"file-1"}]}"#;
@@ -256,7 +262,7 @@ async fn budgeted_file_resolution_preserves_in_budget_request_and_history() {
     let filter = make_filter_with_outbound_for_url(&files_api_url);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     ctx.extensions
         .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
     let request = json!({
@@ -293,7 +299,7 @@ async fn budgeted_plain_text_skips_file_resolution_without_changing_body() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     ctx.extensions
         .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
     let request = json!({"model":"test","input":"hello"});
@@ -317,7 +323,7 @@ async fn budgeted_text_message_array_skips_file_resolution() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     ctx.extensions
         .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
     let request = json!({"model":"test","input":[{"role":"user","content":[{"type":"input_text","text":"Hello"}]}]});
@@ -338,7 +344,7 @@ async fn budgeted_plain_text_needs_no_second_json_reserve() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     ctx.extensions
         .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
     let request = json!({"model":"test","input":"a".repeat(8192),"store":false});
@@ -372,7 +378,7 @@ async fn budgeted_restored_plain_history_skips_file_resolution() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     ctx.extensions
         .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
     let request = json!({"model":"test","input":"next","previous_response_id":"resp_prev"});
@@ -398,7 +404,7 @@ async fn budgeted_restored_file_with_exhausted_budget_rejects_before_callout() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     ctx.extensions
         .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
     let request = json!({"model":"test","input":"next","previous_response_id":"resp_prev"});
@@ -427,7 +433,7 @@ async fn skips_non_responses_request() {
         "/v1/chat/completions",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_request.format", "openai_chat_completions");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_chat_completions");
     let mut body = Some(Bytes::from(r#"{"messages":[]}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -445,7 +451,7 @@ async fn skips_non_create_responses_endpoint() {
         "/v1/responses/compact",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"input":[{"type":"message","role":"user","content":[{"type":"input_file","file_id":"file-abc"}]}]}"#,
     ));
@@ -482,7 +488,7 @@ async fn releases_missing_body() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body: Option<Bytes> = None;
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -500,7 +506,7 @@ async fn releases_invalid_json() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from("not json"));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -518,7 +524,7 @@ async fn continues_on_no_file_id() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let original = r#"{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#;
     let mut body = Some(Bytes::from(original));
 
@@ -552,7 +558,7 @@ async fn string_input_passes_through() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let original = r#"{"input":"Hello, world!"}"#;
     let mut body = Some(Bytes::from(original));
 
@@ -661,7 +667,7 @@ timeout_ms: 2000"#
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let request_body = json!({
         "model": "gpt-4o",
         "input": [{
@@ -761,7 +767,7 @@ async fn resolves_history_when_current_input_has_no_file_id() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
 
     let request_body = json!({
         "input": [{
@@ -826,7 +832,7 @@ async fn missing_scoped_credential_rejects_before_file_id_dispatch() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let request_body = json!({
         "input": [{
             "type": "message",
@@ -865,7 +871,7 @@ async fn scoped_credential_arrives_on_file_id_metadata_and_content_requests() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let request_body = json!({
         "input": [{
             "type": "message",
@@ -923,7 +929,7 @@ async fn two_user_file_id_contexts_are_isolated() {
             "/v1/responses",
         )));
         let mut ctx = crate::test_utils::make_filter_context(req);
-        ctx.set_metadata("openai_responses_request.format", "openai_responses");
+        ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
         let request_body = json!({
             "input": [{
                 "type": "message",
@@ -1010,7 +1016,7 @@ async fn scoped_file_id_credential_is_not_replayed_to_redirect_authority() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     let request_body = json!({
         "input": [{
             "type": "message",
@@ -1101,7 +1107,7 @@ async fn rejects_resolved_history_when_rebuilt_body_exceeds_limit() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
     ctx.extensions.insert(state);
     let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
 
@@ -1127,7 +1133,7 @@ async fn max_resolved_bytes_bounds_individual_content_independent_of_rewritten_l
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
 
     let request_body = json!({
         "input": [{
@@ -1160,7 +1166,7 @@ async fn max_resolved_bytes_default_allows_resolution() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
 
     let request_body = json!({
         "input": [{
@@ -1201,7 +1207,7 @@ async fn rejects_unresolvable_history_when_configured_to_reject() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.record_ai_metadata("openai_responses_request.format", "openai_responses");
 
     let request_body = json!({"input": "continue"});
     let history = json!({
@@ -2152,4 +2158,18 @@ async fn object_input_file_url_resolved_to_data_uri() {
     let base64_part = file_data.strip_prefix("data:text/plain;base64,").unwrap();
     let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_part).unwrap();
     assert_eq!(decoded, b"Hello World", "data URI should contain the file content");
+}
+
+#[test]
+fn oversized_file_rewrite_does_not_allocate_serialized_output() {
+    let parsed = serde_json::json!({"input": "\u{0000}".repeat(1_048_576)});
+    let original = Bytes::from_static(b"original");
+    let mut body = Some(original.clone());
+    let allocations = allocation_counter::measure(|| {
+        assert!(
+            matches!(rewrite_body(&mut body, &parsed, 1024, "openai_file_resolve").unwrap(), Some(FilterAction::Reject(r)) if r.status == 413)
+        );
+    });
+    assert!(allocations.bytes_total < 16_384, "{allocations:?}");
+    assert_eq!(body.as_ref(), Some(&original));
 }

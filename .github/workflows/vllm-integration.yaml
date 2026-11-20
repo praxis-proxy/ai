@@ -17,6 +17,8 @@ on:
       - "store-backends/**"
       - "store-lifecycle/**"
       - "apis/src/openai/responses/**"
+      - "apis/src/mcp_core/**"
+      - "apis/src/mcp_client/**"
       - "apis/src/openai/translation/**"
       - "apis/src/openai/conversations/**"
       - "apis/src/openai/sse/**"
@@ -193,6 +195,8 @@ jobs:
             'store-backends/' \
             'store-lifecycle/' \
             'apis/src/openai/responses/' \
+            'apis/src/mcp_core/' \
+            'apis/src/mcp_client/' \
             'apis/src/openai/translation/' \
             'apis/src/openai/conversations/' \
             'apis/src/openai/sse/' \
