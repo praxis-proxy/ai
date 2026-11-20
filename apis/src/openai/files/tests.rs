@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Conformance checks for the Files contract.
+//! Conformance checks and service error tests for the Files contract.
 //!
 //! Each `conformance_files_*` test ends with the sentinel line that
 //! `cargo xtask openai-conformance` requires in its output.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, error::Error, io};
 
 use serde_json::{Value, json};
 
 use super::{
+    FileRegistryError, FileServiceError, FileStoreError,
     contracts::{DeleteFileResponse, FilePurpose, ListFilesResponse, OpenAiFile},
     implementation_openapi_json,
     routes::{FilesOperationSpec, operation_specs},
@@ -26,6 +27,53 @@ use crate::{
     operation::Transport,
     operation_classifier::classify,
 };
+
+#[test]
+fn file_service_error_mapping_keeps_client_outcomes() {
+    assert!(matches!(
+        FileServiceError::from(FileRegistryError::QuotaExceeded),
+        FileServiceError::QuotaExceeded
+    ));
+    assert!(matches!(
+        FileServiceError::from(FileRegistryError::InvalidCursor),
+        FileServiceError::InvalidInput(message) if message.contains("after")
+    ));
+    // A store limit error has no reservation context. The upload session
+    // classifies its bound before passing the chunk to the writer.
+    assert!(matches!(
+        FileServiceError::from(FileStoreError::UploadTooLarge),
+        FileServiceError::Store(FileStoreError::UploadTooLarge)
+    ));
+
+    // A registry state conflict is internal until the service decides otherwise.
+    assert!(matches!(
+        FileServiceError::from(FileRegistryError::Conflict),
+        FileServiceError::Registry(FileRegistryError::Conflict)
+    ));
+}
+
+#[test]
+fn file_service_error_mapping_keeps_backend_causes() {
+    let registry = FileServiceError::from(FileRegistryError::Backend(Box::new(io::Error::other("db down"))));
+    assert_eq!(
+        registry
+            .source()
+            .and_then(Error::source)
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("db down")
+    );
+
+    let store = FileServiceError::from(FileStoreError::Backend(Box::new(io::Error::other("read failed"))));
+    assert_eq!(
+        store
+            .source()
+            .and_then(Error::source)
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("read failed")
+    );
+}
 
 /// Generated Files document as JSON.
 fn generated_openapi_spec() -> Value {

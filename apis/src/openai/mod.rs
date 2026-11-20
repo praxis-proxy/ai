@@ -14,7 +14,7 @@ pub(crate) mod conversations;
 #[cfg(any(feature = "openai-conversations", feature = "openai-files"))]
 pub(crate) mod error;
 pub(crate) mod error_response_formatter;
-pub(crate) mod files;
+pub mod files;
 #[cfg(feature = "store")]
 pub(crate) mod include;
 mod operation;
