@@ -1,5 +1,5 @@
 # Manual probe that makes one billable inference request.
-name: Bedrock Mantle smoke
+name: Bedrock Runtime smoke
 
 on:
   workflow_dispatch:
@@ -30,20 +30,20 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
           aws-region: us-east-1
-          role-session-name: bedrock-mantle-smoke-${{ github.run_id }}
+          role-session-name: bedrock-runtime-smoke-${{ github.run_id }}
           role-duration-seconds: 900
 
       - name: Verify AWS session
         run: aws sts get-caller-identity >/dev/null
 
-      - name: Verify Mantle Chat Completions
+      - name: Verify Runtime Chat Completions
         env:
-          BEDROCK_MODEL: openai.gpt-oss-120b
+          BEDROCK_MODEL: openai.gpt-oss-120b-1:0
         run: |
           : "${AWS_ACCESS_KEY_ID:?Missing temporary access key}"
           : "${AWS_SECRET_ACCESS_KEY:?Missing temporary secret key}"
           : "${AWS_SESSION_TOKEN:?Missing session token}"
-          endpoint="https://bedrock-mantle.${AWS_REGION}.api.aws/v1/chat/completions"
+          endpoint="https://bedrock-runtime.${AWS_REGION}.amazonaws.com/openai/v1/chat/completions"
           request=$(jq -nc --arg model "$BEDROCK_MODEL" '{
             model: $model,
             messages: [{role: "user", content: "Reply with OK."}],
@@ -56,11 +56,11 @@ jobs:
             printf 'user = "%s:%s"\nheader = "x-amz-security-token: %s"\n' \
               "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$AWS_SESSION_TOKEN" |
               curl --config - --silent --show-error --max-time 45 \
-                --aws-sigv4 "aws:amz:${AWS_REGION}:bedrock-mantle" \
+                --aws-sigv4 "aws:amz:${AWS_REGION}:bedrock" \
                 --header 'Content-Type: application/json' --data-binary "$request" \
                 --dump-header "$headers" --output "$response" --write-out '%{http_code}' "$endpoint"
           )
-          echo "Bedrock Mantle returned HTTP $status for $BEDROCK_MODEL in $AWS_REGION."
+          echo "Bedrock Runtime returned HTTP $status for $BEDROCK_MODEL in $AWS_REGION."
           if [[ "$status" != 200 ]] ||
             ! jq -e '.object == "chat.completion" and (.choices[0].message.role == "assistant")' "$response" >/dev/null; then
             error_type=$(awk 'tolower($1) == "x-amzn-errortype:" {print $2}' "$headers" | tr -d '\r' | tail -1)
@@ -81,6 +81,6 @@ jobs:
             if [[ ! "$request_id" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
               request_id=unavailable
             fi
-            echo "::error::Bedrock Mantle returned no valid completion (HTTP $status, error type $error_type, request ID $request_id)."
+            echo "::error::Bedrock Runtime returned no valid completion (HTTP $status, error type $error_type, request ID $request_id)."
             exit 1
           fi
