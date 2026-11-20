@@ -79,13 +79,16 @@ tenant isolation, credential injection, and retries are outside the OpenAI suite
 ## Bedrock Runtime
 
 On upstream main, a separate job assumes the CI role using
-`AWS_BEDROCK_ROLE_ARN` and sends one billable completion through the
+`AWS_BEDROCK_ROLE_ARN` and sends billable requests through the
 [loopback gateway](../../{bedrock_config}) for `{bedrock_model}` in
 `us-east-1`. Praxis rewrites the client path and signs the upstream request
 using temporary AWS credentials. The check requires HTTP 200 and an assistant
 completion envelope. The release qualification report lists the job outcome
-under Hosted passthrough. Streaming, tool calls, tenant isolation, and retries
-are outside this check. The separate [direct connectivity probe](../../.github/workflows/bedrock-runtime-smoke.yaml)
+under Hosted passthrough. The [OpenAI SDK suite](../../tests/integration/sdk/openai/test_bedrock_runtime_live.py)
+checks streaming text, finish reason, usage, a tool result followed by a final
+assistant response, and an upstream validation error. The
+`hosted-bedrock-passthrough-results` artifact contains JUnit results.
+Tenant isolation and retries remain unqualified by this job. The separate [direct connectivity probe](../../.github/workflows/bedrock-runtime-smoke.yaml)
 exercises AWS credentials and inference independently of the gateway.
 """
 
