@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   openai-chat:
-    name: OpenAI Chat Completions passthrough
+    name: OpenAI Chat Completions and Embeddings passthrough
     if: github.repository == 'praxis-proxy/ai' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
@@ -73,7 +73,7 @@ jobs:
           fi
 
           {
-            echo "### OpenAI Chat Completions passthrough"
+            echo "### OpenAI Chat Completions and Embeddings passthrough"
             echo "- Gateway commit: $(git rev-parse HEAD)"
             echo "- Configuration: tests/integration/fixtures/openai/chat-completions-live.yaml"
           } >> "$GITHUB_STEP_SUMMARY"
