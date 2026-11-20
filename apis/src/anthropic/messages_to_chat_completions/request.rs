@@ -1013,8 +1013,16 @@ fn validate_content_blocks(blocks: &[Value], role: &str) -> Result<(), String> {
                     None | Some(Value::String(_)) => {},
                     Some(Value::Array(parts)) => {
                         if let Some(part) = parts.iter().find(|part| !tool_result_part_is_supported(part)) {
-                            let kind = part.get("type").and_then(Value::as_str).unwrap_or("missing");
-                            return Err(format!("tool_result `content` has an unsupported part `{kind}`"));
+                            // A `text` part keeps the field-naming strict
+                            // rejection, like a top-level message text block.
+                            let reason = if part.get("type").and_then(Value::as_str) == Some("text") {
+                                let reason = text_block_rejection(part).unwrap_or("`text` must be a string".to_owned());
+                                format!("tool_result `content` text block cannot be translated: {reason}")
+                            } else {
+                                let kind = part.get("type").and_then(Value::as_str).unwrap_or("missing");
+                                format!("tool_result `content` has an unsupported part `{kind}`")
+                            };
+                            return Err(reason);
                         }
                     },
                     _ => {
