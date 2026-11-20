@@ -50,18 +50,37 @@ jobs:
             max_completion_tokens: 128
           }')
           response=$(mktemp)
-          trap 'rm "$response"' EXIT
+          headers=$(mktemp)
+          trap 'rm "$response" "$headers"' EXIT
           status=$(
             printf 'user = "%s:%s"\nheader = "x-amz-security-token: %s"\n' \
               "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$AWS_SESSION_TOKEN" |
               curl --config - --silent --show-error --max-time 45 \
                 --aws-sigv4 "aws:amz:${AWS_REGION}:bedrock-mantle" \
                 --header 'Content-Type: application/json' --data-binary "$request" \
-                --output "$response" --write-out '%{http_code}' "$endpoint"
+                --dump-header "$headers" --output "$response" --write-out '%{http_code}' "$endpoint"
           )
           echo "Bedrock Mantle returned HTTP $status for $BEDROCK_MODEL in $AWS_REGION."
           if [[ "$status" != 200 ]] ||
             ! jq -e '.object == "chat.completion" and (.choices[0].message.role == "assistant")' "$response" >/dev/null; then
-            echo "::error::Bedrock Mantle did not return a Chat Completions response."
+            error_type=$(awk 'tolower($1) == "x-amzn-errortype:" {print $2}' "$headers" | tr -d '\r' | tail -1)
+            if [[ -z "$error_type" ]]; then
+              error_type=$(jq -r 'first((.error.code, .error.type, .code, .__type) | strings | select(length > 0)) // empty' "$response" 2>/dev/null || true)
+            fi
+            request_id=$(awk 'tolower($1) ~ /^x-amz(n)?-request-?id:$/ {print $2}' "$headers" | tr -d '\r' | tail -1)
+            error_type=${error_type##*#}
+            error_type=${error_type%%:*}
+            case "$error_type" in
+              AccessDenied|AccessDeniedException|ExpiredToken|ExpiredTokenException|\
+              IncompleteSignature|InvalidClientTokenId|InvalidSignatureException|\
+              MissingAuthenticationToken|ResourceNotFoundException|SignatureDoesNotMatch|\
+              ThrottlingException|UnrecognizedClientException|ValidationException)
+                ;;
+              *) error_type=unavailable ;;
+            esac
+            if [[ ! "$request_id" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+              request_id=unavailable
+            fi
+            echo "::error::Bedrock Mantle returned no valid completion (HTTP $status, error type $error_type, request ID $request_id)."
             exit 1
           fi

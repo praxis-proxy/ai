@@ -1,0 +1,71 @@
+# Workspace settings for the shared cargo-fips-check compliance report.
+# See docs/developing/fips.md.
+
+package = "praxis-ai-proxy"
+features = "aws-sigv4-filter"
+
+[guards]
+source = ["apis", "filters", "server", "integrations", "store", "store-lifecycle", "store-backends"]
+# llmd-ext-proc is outside the published FIPS profile. Its vendored-protox
+# feature bundles Protobuf tooling and trips the shared guard's vendored
+# pattern. The dependency graph also checks openssl-src on build edges.
+manifests = ["Cargo.toml", "apis", "filters", "server", "store", "store-lifecycle", "store-backends"]
+build_files = ["Containerfile", "Containerfile.fips", "Makefile", ".github"]
+
+# The packages resolved together by make test-fips.
+[test_graph]
+packages = ["praxis-ai-proxy", "praxis-ai-filters", "praxis-ai-apis"]
+
+[test_graph.test_only]
+ring = "rcgen generates test certificates for praxis-ai-filters and does not install a rustls provider"
+sha2 = "aws-sigv4 is the comparison implementation for the OpenSSL signer tests; rmcp is a dev dependency of praxis-ai-apis used for MCP fixtures"
+hmac = "aws-sigv4 is the comparison implementation for the OpenSSL signer tests"
+
+# Where a denied crate enters the Praxis AI build and how to remove it.
+
+[graph.hints.aws-lc-fips-sys]
+fix = "remove the dependency or route it through the system OpenSSL"
+
+[graph.hints.aws-lc-rs]
+location = "reqwest's 'rustls' feature (openai-file-resolve-filter, azure-ad-filter, gcp-adc-filter, and openai-mcp-tools through rmcp's 'reqwest' feature); jsonwebtoken via the policy engine 'jwt' builtin (policy-engine)"
+fix = "find the edge with 'cargo tree -e features -i aws-lc-rs'; keep rustls default-features off; keep the reqwest-based filters and policy-engine out of FIPS_FEATURES (or move reqwest and rmcp to their no-provider features)"
+
+[graph.hints.aws-lc-sys]
+location = "reqwest's 'rustls' feature (openai-file-resolve-filter, azure-ad-filter, gcp-adc-filter, and openai-mcp-tools through rmcp's 'reqwest' feature); jsonwebtoken via the policy engine 'jwt' builtin (policy-engine)"
+fix = "find the edge with 'cargo tree -e features -i aws-lc-rs'; keep rustls default-features off; keep the reqwest-based filters and policy-engine out of FIPS_FEATURES (or move reqwest and rmcp to their no-provider features)"
+
+[graph.hints.boring]
+location = "pingora 'boringssl' feature"
+fix = "build pingora with the 'rustls' feature only"
+
+[graph.hints.boring-sys]
+location = "pingora 'boringssl' feature"
+fix = "build pingora with the 'rustls' feature only"
+
+[graph.hints.hmac]
+location = "sqlx-postgres SCRAM (store-postgres); policy 'oauth' builtin; aws-sigv4 outside dev-dependencies (aws_sigv4_sign signs through OpenSSL and only tests against aws-sigv4)"
+fix = "use store-postgres-cert-auth instead of store-postgres, or keep the feature that pulls it out of FIPS_FEATURES; the crate that needs it (sqlx, praxis-policy) has no OpenSSL backend to switch to; aws-sigv4 must stay a dev-dependency of praxis-ai-filters"
+
+[graph.hints.md-5]
+location = "sqlx-postgres authentication (store-postgres)"
+fix = "use store-postgres-cert-auth instead of store-postgres, or keep the feature that pulls it out of FIPS_FEATURES; the crate that needs it (sqlx, praxis-policy) has no OpenSSL backend to switch to; aws-sigv4 must stay a dev-dependency of praxis-ai-filters"
+
+[graph.hints.openssl-src]
+location = "the 'vendored' feature of the openssl crate, or OPENSSL_STATIC"
+fix = "remove 'vendored', build with OPENSSL_NO_VENDOR=1, never set OPENSSL_STATIC"
+
+[graph.hints.ring]
+location = "a dependency enabling rustls' 'ring' feature (the Pingora fork before 0.10.0 did); rcgen outside dev-dependencies; a manifest built from 'cargo metadata' (which activates rustls-webpki's weak 'ring?/alloc' feature) when the graph itself is clean"
+fix = "find the edge with 'cargo tree -e features -i ring'; keep rustls/tokio-rustls/reqwest on no-provider features; the only provider is praxis-tls' OpenSSL one"
+
+[graph.hints.rsa]
+location = "sqlx-postgres authentication (store-postgres)"
+fix = "use store-postgres-cert-auth instead of store-postgres, or keep the feature that pulls it out of FIPS_FEATURES; the crate that needs it (sqlx, praxis-policy) has no OpenSSL backend to switch to; aws-sigv4 must stay a dev-dependency of praxis-ai-filters"
+
+[graph.hints.sha1]
+location = "tokio-tungstenite WebSocket accept key (test utilities)"
+fix = "keep it a dev-dependency; it must not appear in the release graph"
+
+[graph.hints.sha2]
+location = "sqlx-core's 'migrate' feature, which sqlx always enables (store, store-sqlite, store-postgres, openai-compact, openai-mcp-tools); praxis-policy (policy-engine); aws-sigv4 outside dev-dependencies (aws_sigv4_sign signs through OpenSSL and only tests against aws-sigv4); openai-conversations is clean with store-postgres-cert-auth"
+fix = "use store-postgres-cert-auth instead of store-postgres, or keep the feature that pulls it out of FIPS_FEATURES; the crate that needs it (sqlx, praxis-policy) has no OpenSSL backend to switch to; aws-sigv4 must stay a dev-dependency of praxis-ai-filters"

@@ -36,8 +36,6 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.7", features = ["derive"] }
 crc32fast = "1.5.2"
 dashmap = "6.2.1"
-# zlib-ng backend: the same one already in the graph, so it adds no crate.
-flate2 = { version = "1.1.10", default-features = false, features = ["zlib-ng"] }
 futures = "0.3.34"
 h2 = "0.4.19"
 http = "1.5.0"
@@ -49,7 +47,6 @@ jsonschema = { version = "0.61.2", default-features = false }
 nix = { version = "0.32.0", default-features = false, features = ["process", "resource", "signal", "user"] }
 percent-encoding = "2.3.2"
 notify = "8.2.0"
-object = { version = "0.41.0", default-features = false, features = ["read_core", "elf", "std"] }
 # System OpenSSL bindings, the same crate praxis's rustls provider uses; never
 # with the `vendored` feature, the platform library is the validated module.
 openssl = "0.10.81"
@@ -108,7 +105,7 @@ criterion = { version = "0.8.2", default-features = false, features = ["cargo_be
 prost = "0.14.4"
 prost-build = "0.14.4"
 prost-types = "0.14.4"
-prost-wkt-types = { version = "0.7.2", features = ["vendored-protox"] }
+prost-wkt-types = "0.7.2"
 protox = "0.10.0"
 sync_wrapper = "1.0.2"
 tonic = "0.14.6"

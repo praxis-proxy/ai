@@ -12,7 +12,7 @@
 #   builder   builds the FIPS feature set of praxis-ai with that toolchain
 #             (make container-fips, make fips-check)
 #   report    runs the crypto unit tests on the FIPS provider and
-#             `cargo xtask fips report` on that binary, and keeps the
+#             `cargo fips-check report` on that binary, and keeps the
 #             results (make fips-check)
 #   runtime   the shippable image on ubi9/ubi-minimal (make container-fips)
 #
@@ -26,7 +26,7 @@
 #
 # Both base images are pinned by digest and their Red Hat signatures are
 # verified by `make fips-verify-image` before any build. Update the digests
-# here and in the Makefile together, after `cargo xtask fips verify-image`
+# here and in the Makefile together, after `cargo fips-check verify-image`
 # has accepted the new ones.
 
 ARG UBI9_DIGEST=sha256:a4b9ec09b1e790a53ef25b7777c539976abe519248264298e5194dcbceac8c31
@@ -69,6 +69,13 @@ ARG CARGO_AUDITABLE_VERSION=0.7.6
 RUN --mount=type=cache,id=praxis-ai-fips-registry,target=/cargo/registry \
     cargo install cargo-auditable --version "${CARGO_AUDITABLE_VERSION}" --locked
 
+# Keep this pin in sync with FIPS_CHECK_REV in the Makefile.
+ARG CARGO_FIPS_CHECK_REV=a8dae23f90eb77e6890cc86df5ec6cf6da4e2e79
+RUN --mount=type=cache,id=praxis-ai-fips-registry,target=/cargo/registry \
+    --mount=type=cache,id=praxis-ai-fips-git,target=/cargo/git \
+    cargo install --locked --git https://github.com/praxis-proxy/cargo-fips-check \
+        --rev "${CARGO_FIPS_CHECK_REV}" --root /usr/local cargo-fips-check
+
 WORKDIR /src
 
 # ------------------------------------------------------------------------------
@@ -78,9 +85,9 @@ WORKDIR /src
 FROM toolchain AS builder
 
 # The whole workspace, so the build resolves the committed lockfile as is
-# (--locked) and the report stage can run `cargo xtask fips`. The legal files
+# (--locked) and the report stage can run `cargo fips-check`. The legal files
 # are for the runtime stage (Apache-2.0 section 4).
-COPY Cargo.toml Cargo.lock LICENSE NOTICE ./
+COPY Cargo.toml Cargo.lock fips-check.toml LICENSE NOTICE ./
 COPY store store
 COPY store-lifecycle store-lifecycle
 COPY store-backends store-backends
@@ -126,10 +133,8 @@ RUN --mount=type=cache,id=praxis-ai-fips-registry,target=/cargo/registry \
 # ------------------------------------------------------------------------------
 
 # Only built when this stage is the target (make fips-check), so publishing
-# the runtime image never compiles xtask. The report runs at build time,
-# while the cargo cache is mounted, so `cargo tree` can resolve the graph
-# offline. xtask is built without its default features, which keeps the
-# standard proxy build (and its non-FIPS dependencies) out of this image.
+# the runtime image never runs it. The report runs at build time, while the
+# cargo cache is mounted, so `cargo tree` can resolve the graph offline.
 # The exit status is kept so the image can be run to print the report and
 # fail accordingly.
 FROM builder AS report
@@ -156,11 +161,10 @@ RUN --mount=type=cache,id=praxis-ai-fips-registry,target=/cargo/registry \
     ; true
 
 RUN --mount=type=cache,id=praxis-ai-fips-registry,target=/cargo/registry \
-    --mount=type=cache,id=praxis-ai-fips-target,target=/src/target \
-    { cargo run --quiet --locked -p xtask --no-default-features ${CARGO_ARGS} -- \
-        fips report /fips/praxis-ai --features "${CARGO_FEATURES}" --offline --out /fips/report.txt; \
-      echo $? > /fips/status; } \
-    ; true
+    cargo fips-check report /fips/praxis-ai --features "${CARGO_FEATURES}" --offline --out /fips/report.txt; \
+    status=$?; \
+    [ -s /fips/report.txt ] || exit 1; \
+    echo "$status" > /fips/status
 
 CMD ["sh", "-c", "cat /fips/tests.txt /fips/report.txt; test \"$(cat /fips/tests-status)\" -eq 0 && exit $(cat /fips/status); echo 'crypto unit tests on the FIPS provider failed (see above)'; exit 1"]
 
