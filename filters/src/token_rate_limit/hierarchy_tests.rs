@@ -81,6 +81,7 @@ fn filter(rule_body: &str) -> TokenRateLimitFilter {
         epoch: Instant::now(),
         valkey_clock: false,
         hierarchy: Some(hierarchy),
+        reconciliation_source: super::ReconciliationSource::LegacyWeights,
         on_failure: cfg.backend.on_failure,
     }
 }
