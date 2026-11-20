@@ -1016,7 +1016,8 @@ fn validate_content_blocks(blocks: &[Value], role: &str) -> Result<(), String> {
                             // A `text` part keeps the field-naming strict
                             // rejection, like a top-level message text block.
                             let reason = if part.get("type").and_then(Value::as_str) == Some("text") {
-                                let reason = text_block_rejection(part).unwrap_or("`text` must be a string".to_owned());
+                                let reason =
+                                    text_block_rejection(part).unwrap_or_else(|| "`text` must be a string".to_owned());
                                 format!("tool_result `content` text block cannot be translated: {reason}")
                             } else {
                                 let kind = part.get("type").and_then(Value::as_str).unwrap_or("missing");
