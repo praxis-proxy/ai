@@ -625,16 +625,9 @@ mod tests {
             .expect("signing must succeed");
         assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
 
-        let host = ctx
-            .request_headers_to_set
-            .iter()
-            .find(|(name, _)| *name == http::header::HOST)
-            .map(|(_, value)| value.to_str().expect("ascii"));
-        assert_eq!(
-            host,
-            Some("bedrock-runtime.us-east-1.amazonaws.com"),
-            "filter must set its own Host header"
-        );
+        assert!(ctx.request_headers_to_set.iter().any(|(name, value)| {
+            *name == http::header::HOST && value == "bedrock-runtime.us-east-1.amazonaws.com"
+        }));
 
         let hash = ctx
             .request_headers_to_set
@@ -646,10 +639,12 @@ mod tests {
             Some("14479f4e87d340fe0ca0d522d87a5b3a028ebb1af24fbb8d3ef4553044fc6db6")
         );
 
-        let has_authorization = ctx.request_headers_to_set.iter().any(|(name, value)| {
-            *name == http::header::AUTHORIZATION && value.as_bytes().starts_with(b"AWS4-HMAC-SHA256 ")
-        });
-        assert!(has_authorization, "must set a well-formed Authorization header");
+        assert!(
+            ctx.request_headers_to_set.iter().any(|(name, value)| {
+                *name == http::header::AUTHORIZATION && value.as_bytes().starts_with(b"AWS4-HMAC-SHA256 ")
+            }),
+            "must set a well-formed Authorization header"
+        );
     }
 
     #[tokio::test]
