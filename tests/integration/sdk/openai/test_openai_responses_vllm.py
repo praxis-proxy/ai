@@ -1292,6 +1292,7 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
             return
         if request_body and (
             request_body.get("prompt") is not None
+            or request_body.get("previous_input_messages")
             or "access_programs" in request_body
             or any(tool.get("type") == "code_interpreter" for tool in (request_body.get("tools") or []))
         ):
@@ -4810,6 +4811,95 @@ class TestOpenAIResponsesVLLM:
         }
         assert all(body["model"] == "gpt-5" for body in prompt_creates)
         assert all(body["prompt"] == prompt for body in prompt_creates)
+
+    def test_previous_input_messages_policy_follows_provider_binding(
+        self, witness_backend_client
+    ):
+        """Managed routes own inference history (#2078).
+
+        A non-empty vLLM ``previous_input_messages`` would put caller-supplied
+        history in front of the history Praxis rehydrates, so managed routes
+        reject it before inference on first turns and continuations in both
+        store modes. Absent, null, and empty values pass. OpenAI-owned routes
+        forward the extension unchanged.
+        """
+        client, forwarded = witness_backend_client
+        injected = [{"role": "user", "content": "INJECTED-NEVER-PERSISTED"}]
+
+        stored = client.responses.create(
+            model="sdk-conversation-stream",
+            input="PRAXIS-PERSISTED-TURN",
+            store=True,
+        )
+        assert stored.status == "completed"
+
+        forwarded.clear()
+        for stream in (False, True):
+            for store in (True, False):
+                for previous_response_id in (None, stored.id):
+                    kwargs = {"previous_response_id": previous_response_id} if previous_response_id else {}
+                    with pytest.raises(BadRequestError) as exc_info:
+                        client.responses.create(
+                            model="sdk-conversation-stream",
+                            input="follow up",
+                            store=store,
+                            stream=stream,
+                            extra_body={"previous_input_messages": injected},
+                            **kwargs,
+                        )
+                    error = exc_info.value
+                    assert error.status_code == 400
+                    assert error.body["type"] == "invalid_request_error"
+                    assert error.body["code"] == "unsupported_parameter"
+                    assert error.body["param"] == "previous_input_messages"
+        assert forwarded == [], "rejected requests must not reach inference"
+
+        for value in (None, []):
+            response = client.responses.create(
+                model="sdk-conversation-stream",
+                input="follow up",
+                previous_response_id=stored.id,
+                extra_body={"previous_input_messages": value},
+            )
+            assert response.status == "completed"
+        continuation = client.responses.create(
+            model="sdk-conversation-stream",
+            input="follow up",
+            previous_response_id=stored.id,
+        )
+        assert continuation.status == "completed"
+        assert len(forwarded) == 3
+        assert all(not body.get("previous_input_messages") for body in forwarded)
+        assert all(
+            "INJECTED-NEVER-PERSISTED" not in json.dumps(body) for body in forwarded
+        )
+        for body in forwarded:
+            items = body["input"]
+            assert isinstance(items, list), "continuations must carry rehydrated history"
+            serialized = [json.dumps(item) for item in items]
+            seeded = [i for i, item in enumerate(serialized) if "PRAXIS-PERSISTED-TURN" in item]
+            follow_up = [i for i, item in enumerate(serialized) if "follow up" in item]
+            assert seeded, "the stored turn must reach inference"
+            assert follow_up, "the new turn must reach inference"
+            assert seeded[0] < follow_up[-1], "stored history must precede the new turn"
+
+        forwarded.clear()
+        for stream in (False, True):
+            response = client.responses.create(
+                model="gpt-5",
+                input="OpenAI-owned history extension.",
+                store=False,
+                stream=stream,
+                extra_body={"previous_input_messages": injected},
+            )
+            if stream:
+                events = list(response)
+                assert events[-1].type == "response.completed"
+            else:
+                assert response.status == "completed"
+        assert len(forwarded) == 2
+        assert all(body["model"] == "gpt-5" for body in forwarded)
+        assert all(body["previous_input_messages"] == injected for body in forwarded)
 
     @pytest.mark.critical_vllm
     @requires_real_inference
