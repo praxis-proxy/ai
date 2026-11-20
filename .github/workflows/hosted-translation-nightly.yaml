@@ -160,7 +160,7 @@ jobs:
 
           OPENAI_API_KEY=gateway-test uv run --script \
             tests/integration/sdk/openai/test_openai_chat_completions_live.py \
-            -k "test_responses_passthrough_reports_text_and_usage or test_responses_stream_reports_text_and_completion" \
+            -k test_responses_ \
             --junitxml="$RUNNER_TEMP/hosted-responses-to-chat-junit.xml" --tb=line
 
       - name: Upload test results
