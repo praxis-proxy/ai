@@ -22,8 +22,9 @@ use super::{Attempt, Domain, NOW, PostgresFileCatalog, invalid, retry::PgBackend
 /// A transaction on the catalog pool.
 type Tx<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
 
-/// `(tenant_id, owner_issuer, owner_subject, storage_key, filename, bytes, created_at)`.
-type ExistingRow = (String, String, String, String, String, i64, i64);
+/// `(tenant_id, owner_issuer, owner_subject, storage_key, filename, bytes)`.
+/// For a pending row `bytes` is its reservation.
+type ExistingRow = (String, String, String, String, String, i64);
 
 /// Columns selected for a client-visible record.
 const RECORD_COLUMNS: &str = "id, bytes, created_at, expires_at, filename, purpose";
@@ -57,10 +58,10 @@ fn record_from_row(row: &PgRow) -> Result<FileRecord, PgBackendError> {
 /// One attempt of `create_pending`.
 ///
 /// Takes the per-tenant quota lock first (the only advisory lock in the
-/// transaction), treats an identical existing row as success, then checks
-/// the quota and inserts.
-pub(super) async fn create_pending_once(c: &PostgresFileCatalog, file: &NewFile) -> Attempt<i64> {
-    let reserve = to_i64(file.reserve_bytes, "reserve_bytes")?;
+/// transaction), treats an identical existing row as success with its stored
+/// reservation, then grants `min(max_bytes, remaining quota)` and inserts.
+pub(super) async fn create_pending_once(c: &PostgresFileCatalog, file: &NewFile) -> Attempt<u64> {
+    let max_bytes = to_i64(file.max_bytes, "max_bytes")?;
     let tenant = file.owner.tenant_id();
     let mut tx = c.begin().await?;
 
@@ -70,54 +71,53 @@ pub(super) async fn create_pending_once(c: &PostgresFileCatalog, file: &NewFile)
         .await
         .map_err(|e| c.pg_err(&e))?;
 
-    if let Some(outcome) = identical_pending(c, &mut tx, file, reserve).await? {
+    if let Some(outcome) = identical_pending(c, &mut tx, file).await? {
         return Ok(outcome);
     }
     let used = tenant_usage(c, &mut tx, tenant).await?;
-    if i128::from(used) + i128::from(reserve) > i128::from(c.tenant_limit_bytes) {
+    let remaining = i128::from(c.tenant_limit_bytes).saturating_sub(i128::from(used)).max(0);
+    let reserve = i64::try_from(remaining.min(i128::from(max_bytes))).map_err(|e| invalid(e.to_string()))?;
+    if reserve == 0 {
         return Ok(Err(Domain::Quota));
     }
-    let created_at = match insert_pending(c, &mut tx, file, reserve).await {
-        Ok(created_at) => created_at,
+    match insert_pending(c, &mut tx, file, reserve).await {
+        Ok(()) => {},
         Err(e) if is_unique_violation(&e) => return Ok(Err(Domain::Conflict)),
         Err(e) => return Err(c.pg_err(&e)),
-    };
+    }
     tx.commit().await.map_err(|e| c.pg_err(&e))?;
-    Ok(Ok(created_at))
+    Ok(Ok(to_u64(reserve, "reserve")?))
 }
 
-/// If a row with the same `id` exists, its `created_at` when it is
-/// identical to `file` (a retry) or a conflict when it is not.
+/// If a row with the same `id` exists, its reservation when it is identical
+/// to `file` (a retry) or a conflict when it is not. The reservation depends
+/// on the quota at the first attempt, so it is not compared.
 async fn identical_pending(
     c: &PostgresFileCatalog,
     tx: &mut Tx<'_>,
     file: &NewFile,
-    reserve: i64,
-) -> Result<Option<Result<i64, Domain>>, PgBackendError> {
+) -> Result<Option<Result<u64, Domain>>, PgBackendError> {
     let files = &c.files;
     let existing: Option<ExistingRow> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT tenant_id, owner_issuer, owner_subject, storage_key, filename, bytes, created_at \
+        "SELECT tenant_id, owner_issuer, owner_subject, storage_key, filename, bytes \
          FROM {files} WHERE id = $1"
     )))
     .bind(&file.id)
     .fetch_optional(&mut **tx)
     .await
     .map_err(|e| c.pg_err(&e))?;
-    Ok(
-        existing.map(|(tenant, issuer, subject, key, filename, bytes, created_at)| {
-            let identical = tenant == file.owner.tenant_id()
-                && issuer == file.owner.issuer()
-                && subject == file.owner.subject()
-                && key == file.storage_key
-                && filename == file.filename
-                && bytes == reserve;
-            if identical {
-                Ok(created_at)
-            } else {
-                Err(Domain::Conflict)
-            }
-        }),
-    )
+    let Some((tenant, issuer, subject, key, filename, bytes)) = existing else {
+        return Ok(None);
+    };
+    let identical = tenant == file.owner.tenant_id()
+        && issuer == file.owner.issuer()
+        && subject == file.owner.subject()
+        && key == file.storage_key
+        && filename == file.filename;
+    if !identical {
+        return Ok(Some(Err(Domain::Conflict)));
+    }
+    Ok(Some(Ok(to_u64(bytes, "bytes")?)))
 }
 
 /// The tenant's current usage: `sum(bytes)` over all its rows.
@@ -132,16 +132,16 @@ async fn tenant_usage(c: &PostgresFileCatalog, tx: &mut Tx<'_>, tenant: &str) ->
     .map_err(|e| c.pg_err(&e))
 }
 
-/// Insert the pending row, returning its database-assigned `created_at`.
+/// Insert the pending row.
 async fn insert_pending(
     c: &PostgresFileCatalog,
     tx: &mut Tx<'_>,
     file: &NewFile,
     reserve: i64,
-) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(AssertSqlSafe(format!(
+) -> Result<(), sqlx::Error> {
+    sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO {} (id, tenant_id, owner_issuer, owner_subject, storage_key, filename, state, bytes) \
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7) RETURNING created_at",
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)",
         c.files
     )))
     .bind(&file.id)
@@ -151,8 +151,9 @@ async fn insert_pending(
     .bind(&file.storage_key)
     .bind(&file.filename)
     .bind(reserve)
-    .fetch_one(&mut **tx)
+    .execute(&mut **tx)
     .await
+    .map(|_| ())
 }
 
 /// The state of a tenant's row, if it exists.

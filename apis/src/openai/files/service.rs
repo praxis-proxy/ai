@@ -22,11 +22,11 @@ pub enum FileServiceError {
     /// A request field is invalid.
     #[error("invalid file request: {0}")]
     InvalidInput(String),
-    /// The upload crossed its reserved bound (the size hint or the per-file
-    /// limit).
+    /// The upload crossed the per-file size limit.
     #[error("file exceeds the upload size limit")]
     UploadTooLarge,
-    /// The reservation does not fit in the tenant's remaining quota.
+    /// No capacity could be reserved in the tenant's remaining quota, or the
+    /// upload crossed a reservation smaller than the per-file limit.
     #[error("project file storage limit exceeded")]
     QuotaExceeded,
     /// Reading the incoming HTTP upload body failed.
@@ -72,18 +72,24 @@ pub struct FileDownload {
 #[async_trait]
 pub trait FileUploadSession: Send {
     /// Before passing a chunk to the byte-store writer, reject it if the
-    /// cumulative byte count would exceed the reservation `R`. Never forward a
+    /// cumulative byte count would exceed the reservation `R`. Return
+    /// [`FileServiceError::QuotaExceeded`] when `R < ask`, where
+    /// `ask = min(size_hint, max_file_size)` is the capacity requested from the
+    /// catalog, otherwise [`FileServiceError::UploadTooLarge`]; the
+    /// classification depends on the reserved bound even if one chunk crosses
+    /// both limits. A body cannot exceed its declared `Content-Length`, so a
+    /// crossing at `R == ask` can only be the per-file limit. Never forward a
     /// chunk that exceeds `R`; the writer also enforces `R` as a safety bound
-    /// and applies backpressure. `R` is the declared size hint when the client
-    /// sent one, otherwise the per-file maximum.
+    /// and applies backpressure. When `R < max_file_size`, earlier chunks may
+    /// already have been written before a later chunk reaches the quota bound.
     ///
     /// # Errors
     ///
-    /// Returns [`FileServiceError::UploadTooLarge`] when the upload crosses
-    /// `R`, or [`FileServiceError::Store`] for a byte-store failure. Body-read
-    /// failures remain [`FileServiceError::Stream`] at the handler boundary.
-    /// On failure, stop the writer and arrange byte deletion while retaining
-    /// the catalog reservation until cleanup is confirmed.
+    /// Returns the bound-specific error described above or
+    /// [`FileServiceError::Store`] for a byte-store failure. Body-read failures
+    /// remain [`FileServiceError::Stream`] at the handler boundary. On failure,
+    /// stop the writer and arrange byte deletion while retaining the catalog
+    /// reservation until cleanup is confirmed.
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), FileServiceError>;
 
     /// Validate the complete form, finish the byte write, then commit the
@@ -120,32 +126,34 @@ pub trait FileUploadSession: Send {
 /// and delete that tenant's files, and all subjects share one quota.
 ///
 /// An upload first inserts a pending catalog entry and atomically reserves
-/// `R` bytes of the tenant quota: the client's size hint, or the per-file
-/// maximum when there is none. The catalog rejects the upload with
-/// [`FileServiceError::QuotaExceeded`] when `R` does not fit, before any bytes
-/// are written. The service opens a byte-store writer limited to `R`, checks
-/// each chunk against that bound before writing, then atomically replaces `R`
-/// with the actual byte count after the writer publishes the file. Pending and
-/// failed entries are never returned by read methods. Failed uploads and hidden
-/// or expired files keep their quota charge until their bytes are deleted. A
-/// delete only makes the catalog marker durable and may signal a reaper; it
-/// does not wait for physical byte deletion.
+/// `R = min(ask, remaining_quota)` without purpose or expiration, where
+/// `ask = min(size_hint, max_file_size)` and `size_hint` is the request's
+/// `Content-Length` when present. The hint is only an upper bound on the file:
+/// for multipart it measures the whole body. Without a hint
+/// `ask = max_file_size`. The service opens a byte-store writer limited to
+/// `R`, checks each chunk against that bound before writing, then atomically
+/// replaces `R` with the actual byte count after the writer publishes the file.
+/// Pending and failed entries are never returned by read methods. Failed
+/// uploads and hidden or expired files keep their quota charge until their
+/// bytes are deleted. A delete only makes the catalog marker durable and may
+/// signal a reaper; it does not wait for physical byte deletion.
 /// Implementations must bound the time an upload can remain active so a
 /// scheduled reaper can safely recover abandoned pending entries.
 #[async_trait]
 pub trait FileService: Send + Sync {
     /// Start an upload before all multipart fields are known. The filename
     /// comes from the file part's headers and is never used as a storage key.
-    /// `size_hint` is the declared `Content-Length`, if any. Reserve it, or the
-    /// per-file maximum when absent, in the catalog and retain the reservation
-    /// `R` in the returned session. Reject a hint above the per-file maximum
-    /// with [`FileServiceError::UploadTooLarge`] before reserving; otherwise
-    /// open the writer with `R` as its limit.
+    /// `size_hint` is the declared `Content-Length`, if any. It bounds the file
+    /// from above, so never reject a hint above the per-file maximum; clamp it.
+    /// Pass `ask = min(size_hint, max_file_size)` (`max_file_size` when absent)
+    /// to the catalog and retain its durable reservation `R` in the returned
+    /// session. The catalog never reserves more than the tenant's remaining
+    /// quota; the service opens the writer with `R` as its limit.
     ///
     /// # Errors
     ///
-    /// Returns [`FileServiceError::QuotaExceeded`] if the reservation does not
-    /// fit, or another [`FileServiceError`] for invalid input or a
+    /// Returns [`FileServiceError::QuotaExceeded`] if no capacity can be
+    /// reserved, or another [`FileServiceError`] for invalid input or a
     /// catalog or store failure. If opening the store writer fails after the
     /// pending entry is inserted, mark that entry failed and arrange byte
     /// deletion; retain its reservation until cleanup is confirmed. The
