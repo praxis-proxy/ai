@@ -116,14 +116,7 @@ pub(super) async fn handle_create_conversation(
         messages: Value::Array(Vec::new()),
     };
 
-    if let Err(e) = store.upsert_conversation(&record).await {
-        return Ok(FilterAction::Reject(store_error_response(&e)?));
-    }
-    if !item_records.is_empty()
-        && let Err(e) = store
-            .create_items_and_sync_messages(&conversation_id, &item_records)
-            .await
-    {
+    if let Err(e) = store.create_conversation_with_items(&record, &item_records).await {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
     debug!(conversation_id, "conversation created");
@@ -457,7 +450,6 @@ pub(super) async fn handle_get_item(
 
 /// Handle `DELETE /v1/conversations/{id}/items/{item_id}` — delete one item.
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
-#[expect(clippy::cognitive_complexity, reason = "tracing macros inflate complexity")]
 pub(super) async fn handle_delete_item(
     store: &OwnerScopedResponseStore,
     conversation_id: &str,
@@ -473,32 +465,17 @@ pub(super) async fn handle_delete_item(
         Err(action) => return action,
     };
     let item_id = item_id.as_ref();
-    match store.get_conversation(conversation_id).await {
-        Ok(Some(_)) => {},
-        Ok(None) => {
-            debug!(conversation_id, item_id, "conversation not found for item delete");
-            return Ok(FilterAction::Reject(not_found_response(
-                &conversation_not_found_message(conversation_id),
-            )?));
-        },
-        Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
-    };
-
-    match store.delete_item_and_sync_messages(conversation_id, item_id).await {
-        Ok(true) => {
+    match store.delete_item_and_get_conversation(conversation_id, item_id).await {
+        Ok(Some(record)) => {
             debug!(conversation_id, item_id, "conversation item deleted");
-            match store.get_conversation(conversation_id).await {
-                Ok(Some(record)) => {
-                    let body = conversation_response(record);
-                    Ok(FilterAction::Reject(json_response(200, &body)?))
-                },
-                Ok(None) => Ok(FilterAction::Reject(not_found_response(
-                    &conversation_not_found_message(conversation_id),
-                )?)),
-                Err(e) => Ok(FilterAction::Reject(store_error_response(&e)?)),
-            }
+            let body = ConversationResource::new(
+                record.conversation_id,
+                record.created_at,
+                Metadata::from_value(record.metadata),
+            );
+            Ok(FilterAction::Reject(json_response(200, &body)?))
         },
-        Ok(false) => {
+        Ok(None) => {
             debug!(conversation_id, item_id, "conversation item not found for delete");
             Ok(FilterAction::Reject(not_found_response(&item_not_found_message(
                 item_id,
@@ -710,15 +687,7 @@ fn json_response<T: Serialize + ?Sized>(status: u16, body: &T) -> Result<Rejecti
 
 /// Build a 400 JSON response for invalid input.
 fn invalid_input_response(message: &str) -> Result<Rejection, FilterError> {
-    json_response(
-        400,
-        &serde_json::json!({
-            "error": {
-                "message": message,
-                "type": "invalid_request_error",
-            }
-        }),
-    )
+    invalid_input_response_with(message, None, None)
 }
 
 /// Build a 400 JSON response with optional OpenAI error code and parameter.
@@ -729,14 +698,7 @@ fn invalid_input_response_with(
 ) -> Result<Rejection, FilterError> {
     json_response(
         400,
-        &serde_json::json!({
-            "error": {
-                "message": message,
-                "type": "invalid_request_error",
-                "code": code,
-                "param": param,
-            }
-        }),
+        &crate::openai::error::ErrorResponse::new(message, "invalid_request_error", code, param),
     )
 }
 
@@ -763,12 +725,7 @@ fn classify_update_error(msg: &str) -> Result<Rejection, FilterError> {
 fn not_found_response(message: &str) -> Result<Rejection, FilterError> {
     json_response(
         404,
-        &serde_json::json!({
-            "error": {
-                "message": message,
-                "type": "invalid_request_error",
-            }
-        }),
+        &crate::openai::error::ErrorResponse::new(message, "invalid_request_error", None, None),
     )
 }
 
@@ -794,28 +751,12 @@ fn existing_item_id_message(item_id: &str) -> String {
 
 /// Build a 500 JSON response from a store error.
 fn store_error_response(error: &StoreError) -> Result<Rejection, FilterError> {
-    let message = match error {
-        StoreError::InvalidInput(msg) => {
-            return json_response(
-                400,
-                &serde_json::json!({
-                    "error": {
-                        "message": msg,
-                        "type": "invalid_request_error",
-                    }
-                }),
-            );
-        },
-        _ => "Internal server error.",
-    };
+    if let StoreError::InvalidInput(message) = error {
+        return invalid_input_response(message);
+    }
     json_response(
         500,
-        &serde_json::json!({
-            "error": {
-                "message": message,
-                "type": "server_error",
-            }
-        }),
+        &crate::openai::error::ErrorResponse::new("Internal server error.", "server_error", None, None),
     )
 }
 

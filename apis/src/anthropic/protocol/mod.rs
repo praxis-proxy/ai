@@ -8,11 +8,18 @@
 //! `anthropic-version` and `anthropic-beta` headers across iterative
 //! requests. Does not touch credentials or the request or response
 //! body.
+//!
+//! Also refuses the Anthropic MCP connector (`mcp_servers` /
+//! `mcp_toolset`) when the selected cluster declares an
+//! `application_provider` other than `anthropic`: only Anthropic executes
+//! the connector, so forwarding it elsewhere cannot succeed. The fact comes
+//! from `anthropic_messages_request`, so this filter still reads no body.
 
 mod config;
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "tests")]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing, reason = "tests")]
 mod tests;
 
 use std::borrow::Cow;
@@ -24,6 +31,7 @@ use praxis_filter::{
 use tracing::debug;
 
 use self::config::{AnthropicMessagesProtocolConfig, build_config};
+use super::{messages_request::MCP_CONNECTOR_METADATA_KEY, wire};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -35,12 +43,35 @@ const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
 /// Anthropic beta feature header name.
 const ANTHROPIC_BETA_HEADER: &str = "anthropic-beta";
 
+/// The `application_provider` that executes the MCP connector natively.
+const ANTHROPIC_PROVIDER: &str = "anthropic";
+
+/// Client-facing reason for refusing the MCP connector.
+const MCP_CONNECTOR_UNSUPPORTED: &str =
+    "the MCP connector (`mcp_servers` and `mcp_toolset` tools) is not supported by the selected backend";
+
 // -----------------------------------------------------------------------------
 // AnthropicMessagesProtocolFilter
 // -----------------------------------------------------------------------------
 
 /// Normalizes Anthropic Messages protocol headers for native
 /// backends.
+///
+/// `default_version` applies only when the caller sends no
+/// `anthropic-version`; a caller-supplied version, such as the `2026-10-21`
+/// default of Anthropic SDK v2, is forwarded unchanged. The filter does not
+/// validate version-specific body rules, so under `2026-10-21` the backend
+/// owns rejecting `temperature`, `top_p`, `top_k`, assistant `document`
+/// blocks, and non-empty citations on user text blocks. It does not touch
+/// credentials: remove `x-api-key` and `authorization` separately when the
+/// gateway owns the upstream credential.
+///
+/// A request that uses the MCP connector, as published by
+/// `anthropic_messages_request`, is rejected with an Anthropic
+/// `invalid_request_error` when the selected cluster declares an
+/// `application_provider` other than `anthropic`. Place this filter after
+/// `load_balancer` for the check to see the selected cluster; an untagged
+/// cluster, or a placement before selection, forwards the request unchanged.
 ///
 /// # YAML
 ///
@@ -87,7 +118,23 @@ impl HttpFilter for AnthropicMessagesProtocolFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let has_version = ctx.request.headers.get(ANTHROPIC_VERSION_HEADER).is_some();
+        if let Some(provider) = ctx.selected_application_provider()
+            && provider != ANTHROPIC_PROVIDER
+            && ctx.filter_metadata.get(MCP_CONNECTOR_METADATA_KEY) == Some("true")
+        {
+            debug!(provider, "rejecting MCP connector for a non-Anthropic provider");
+            return Ok(FilterAction::Reject(wire::invalid_request_rejection(
+                MCP_CONNECTOR_UNSUPPORTED,
+            )));
+        }
+
+        // A translated route may already own the version through a queued set.
+        // Do not append a native default that would override that contract.
+        let has_version = ctx.request.headers.get(ANTHROPIC_VERSION_HEADER).is_some()
+            || ctx
+                .request_headers_to_set
+                .iter()
+                .any(|(name, _)| name == ANTHROPIC_VERSION_HEADER);
 
         if !has_version && !restore_original_header(ctx, ANTHROPIC_VERSION_HEADER) {
             debug!(

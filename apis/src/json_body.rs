@@ -23,9 +23,10 @@
 //! Request-side only: core repairs upstream `Content-Length` framing for mutated request bodies via
 //! `mutated_request_body_len`, so filters must not set `Content-Length` themselves.
 
-use std::io::{self, Write};
+use std::io;
 
 use bytes::Bytes;
+use praxis_filter::json_size::{self, JsonSizeError};
 use serde::Serialize;
 use serde_json::Value;
 use tracing::debug;
@@ -66,23 +67,83 @@ pub fn serialize_json_body(value: &Value) -> Result<SerializedJson, serde_json::
 ///
 /// Returns [`serde_json::Error`] if `value` fails to serialize.
 pub fn serialized_len<T: Serialize + ?Sized>(value: &T) -> Result<usize, serde_json::Error> {
-    let mut counter = ByteCounter(0);
-    serde_json::to_writer(&mut counter, value)?;
-    Ok(counter.0)
+    json_size::serialized_len(value).map_err(json_size_error)
 }
 
-/// Sink that records how many bytes were written to it and discards them.
-struct ByteCounter(usize);
-
-impl Write for ByteCounter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0 = self.0.saturating_add(buf.len());
-        Ok(buf.len())
+/// Preserve serde error contracts at the AI body-mutation boundary.
+pub(crate) fn json_size_error(error: JsonSizeError) -> serde_json::Error {
+    match error {
+        JsonSizeError::Serialization(error) => error,
+        error => serde_json::Error::io(io::Error::other(error)),
     }
+}
 
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+/// Serialize a body in one pass without retaining output beyond the inclusive byte limit.
+///
+/// Use this when a rejection does not report the exact serialized size. No partial body is returned on
+/// error, so nothing can be committed.
+///
+/// ```
+/// use praxis_ai_apis::json_body::serialize_json_body_capped;
+/// use praxis_filter::json_size::JsonSizeError;
+///
+/// let value = serde_json::json!({"a": "é"});
+/// assert_eq!(serialize_json_body_capped(&value, 10)?.len(), 10);
+/// assert!(matches!(serialize_json_body_capped(&value, 9), Err(JsonSizeError::LimitExceeded)));
+/// # Ok::<(), JsonSizeError>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns [`JsonSizeError`] on limit exhaustion, length overflow, or serialization failure.
+pub fn serialize_json_body_capped<T: Serialize + ?Sized>(
+    value: &T,
+    limit: usize,
+) -> Result<SerializedJson, JsonSizeError> {
+    json_size::to_vec_capped(value, limit).map(SerializedJson::from_bytes)
+}
+
+/// A body serialized under a limit whose rejection reports the exact serialized size.
+#[derive(Debug)]
+pub enum BoundedJsonBody {
+    /// The serialized body fits within the limit.
+    Fits(SerializedJson),
+    /// The exact serialized size exceeds the limit; no output was allocated.
+    TooLarge {
+        /// Exact serialized byte length.
+        actual: usize,
+    },
+}
+
+/// Serialize a body under an inclusive limit, measuring first so rejections carry the exact size.
+///
+/// Counts the serialized bytes into a discard-only sink, rejects oversized values without allocating
+/// output, and then serializes accepted values with the same cap. Use this when the rejection reports the
+/// exact size; otherwise prefer [`serialize_json_body_capped`].
+///
+/// ```
+/// use praxis_ai_apis::json_body::{BoundedJsonBody, serialize_json_body_within};
+///
+/// let value = serde_json::json!({"a": "é"});
+/// assert!(matches!(serialize_json_body_within(&value, 10)?, BoundedJsonBody::Fits(b) if b.len() == 10));
+/// assert!(matches!(serialize_json_body_within(&value, 9)?, BoundedJsonBody::TooLarge { actual: 10 }));
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns [`serde_json::Error`] if `value` fails to serialize or its length overflows `usize`.
+pub fn serialize_json_body_within<T: Serialize + ?Sized>(
+    value: &T,
+    limit: usize,
+) -> Result<BoundedJsonBody, serde_json::Error> {
+    let actual = serialized_len(value)?;
+    if actual > limit {
+        return Ok(BoundedJsonBody::TooLarge { actual });
     }
+    serialize_json_body_capped(value, limit)
+        .map(BoundedJsonBody::Fits)
+        .map_err(json_size_error)
 }
 
 /// Serialize `value`, replace the buffered request `body`, and emit the mutation event.
@@ -215,6 +276,49 @@ impl BodyMutation {
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
+
+/// Count syntactic JSON nodes without allocating or trusting the payload.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the lexical scan keeps string and number state without allocating"
+)]
+#[cfg(feature = "openai-responses")]
+pub(crate) fn json_node_count(bytes: &[u8]) -> Option<usize> {
+    let mut nodes = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_number = false;
+    for &byte in bytes {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => {
+                nodes = nodes.checked_add(1)?;
+                in_string = true;
+                in_number = false;
+            },
+            b'{' | b'[' | b't' | b'f' | b'n' => {
+                nodes = nodes.checked_add(1)?;
+                in_number = false;
+            },
+            b'-' | b'0'..=b'9' if !in_number => {
+                nodes = nodes.checked_add(1)?;
+                in_number = true;
+            },
+            b'-' | b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' if in_number => {},
+            _ => in_number = false,
+        }
+    }
+    Some(nodes)
+}
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -405,5 +509,79 @@ mod tests {
 
         assert_eq!(mutation.new_len(), bytes.len());
         assert_eq!(body.as_ref().unwrap(), &bytes);
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::panic, reason = "tests")]
+mod capped_tests {
+    use super::*;
+
+    #[test]
+    fn capped_body_preserves_bytes_and_commits_only_on_success() -> Result<(), Box<dyn std::error::Error>> {
+        let value = serde_json::json!({"z": "é 東京 🦀\n\t\"\\\u{0000}", "a": [1, 2]});
+        let expected = serde_json::to_vec(&value)?;
+        let original = Bytes::from_static(b"original");
+        let mut body = Some(original.clone());
+        assert!(matches!(
+            serialize_json_body_capped(&value, expected.len() - 1),
+            Err(JsonSizeError::LimitExceeded)
+        ));
+        assert_eq!(body.as_ref(), Some(&original));
+        serialize_json_body_capped(&value, expected.len())?.commit(&mut body, "test", "body");
+        assert_eq!(body.as_deref(), Some(expected.as_slice()));
+        Ok(())
+    }
+
+    #[test]
+    fn capped_body_does_not_allocate_oversized_output() {
+        let value = serde_json::json!({"input": "\u{0000}".repeat(1_048_576)});
+        let allocations = allocation_counter::measure(|| {
+            assert!(matches!(
+                serialize_json_body_capped(&value, 1024),
+                Err(JsonSizeError::LimitExceeded)
+            ));
+        });
+        assert!(allocations.bytes_total < 16_384, "{allocations:?}");
+    }
+
+    #[test]
+    fn bounded_body_reports_exact_size_and_accepts_exact_cap() -> Result<(), Box<dyn std::error::Error>> {
+        let value = serde_json::json!({"z": "é 東京 🦀\n\t\"\\\u{0000}", "a": [1, 2]});
+        let expected = serde_json::to_vec(&value)?;
+        match serialize_json_body_within(&value, expected.len())? {
+            BoundedJsonBody::Fits(serialized) => assert_eq!(serialized.as_bytes().as_ref(), expected.as_slice()),
+            BoundedJsonBody::TooLarge { actual } => panic!("exact cap rejected {actual} bytes"),
+        }
+        assert!(matches!(
+            serialize_json_body_within(&value, expected.len() - 1)?,
+            BoundedJsonBody::TooLarge { actual } if actual == expected.len()
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_body_rejects_without_allocating_output() {
+        let value = serde_json::json!({"input": "\u{0000}".repeat(1_048_576)});
+        let allocations = allocation_counter::measure(|| {
+            assert!(matches!(
+                serialize_json_body_within(&value, 1024),
+                Ok(BoundedJsonBody::TooLarge { actual }) if actual == 6 * 1_048_576 + 12
+            ));
+        });
+        assert_eq!(allocations.bytes_total, 0, "{allocations:?}");
+    }
+
+    #[test]
+    fn bounded_body_preserves_serialization_errors() {
+        struct Fails;
+        impl Serialize for Fails {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("boom"))
+            }
+        }
+        let error = serialize_json_body_within(&Fails, 1024).unwrap_err();
+        assert_eq!(error.to_string(), "boom");
     }
 }

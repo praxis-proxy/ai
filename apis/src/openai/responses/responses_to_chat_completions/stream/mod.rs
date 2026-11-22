@@ -46,8 +46,8 @@ use crate::openai::{
     translation::{
         chat_completions::{
             ResponseContext, chat_response_to_response_resource, context_has_web_search,
-            function_call_output_item_from_parts, in_progress_response_resource_with_service_tier, message_output_item,
-            output_text_item, refusal_item, web_search_call_output_item_from_parts,
+            function_call_output_item_from_parts, in_progress_response_resource_with_service_tier, message_item_id,
+            message_output_item, output_text_item, refusal_item, web_search_call_output_item_from_parts,
         },
         reasoning::{ReasoningOptions, reasoning_item_id},
     },
@@ -118,6 +118,8 @@ struct EmitState {
     sequence_number: u64,
     /// Count of events emitted so far.
     events_emitted: usize,
+    /// Add padding to generated delta events.
+    include_obfuscation: bool,
 }
 
 /// Errors produced while translating a stream.
@@ -125,6 +127,8 @@ struct EmitState {
 enum ConvertError {
     /// Serializing a Responses event failed; surfaces as a [`FilterError`].
     Serialize(serde_json::Error),
+    /// The random source failed while generating stream padding.
+    ObfuscationRandomness,
     /// A Chat chunk was not valid JSON.
     MalformedJson,
     /// Accumulated stream state could not form a valid terminal response.
@@ -219,7 +223,11 @@ impl From<FramingError> for ConvertError {
 struct MessageState {
     /// Responses output index for this message item.
     output_index: usize,
-    /// Stable message item id (`msg_{response_id}`).
+    /// Stable message item id.
+    ///
+    /// Prefer `msg_{response_id}_{chat_completion_id}` so IRR rounds stay
+    /// distinct; fall back to `msg_{response_id}` when the Chat completion
+    /// omits an id.
     item_id: String,
     /// Whether `response.output_item.added` was emitted.
     item_added: bool,
@@ -397,6 +405,11 @@ pub(super) struct StreamConverter {
 }
 
 impl StreamConverter {
+    /// Set the effective client preference before emitting any events.
+    pub(super) fn set_include_obfuscation(&mut self, enabled: bool) {
+        self.emit.include_obfuscation = enabled;
+    }
+
     /// Create a converter for a streaming response.
     #[expect(clippy::too_many_lines, reason = "initializes every converter field")]
     pub(super) fn new(
@@ -414,6 +427,7 @@ impl StreamConverter {
             emit: EmitState {
                 sequence_number: 0,
                 events_emitted: 0,
+                include_obfuscation: true,
             },
             lifecycle_started: false,
             initial_metadata_checked: false,
@@ -995,11 +1009,12 @@ impl StreamConverter {
             return Ok(());
         }
         let output_index = self.alloc_output_index();
-        // Matches the finite translation `msg_{response_id}` item-id convention.
-        let item_id = format!("msg_{}", self.response_id);
+        // Matches the finite translation: include the Chat completion id so each
+        // agentic/IRR round under one logical response_id gets a distinct message item.
+        let item_id = message_item_id(&self.response_id, self.chat_id.as_deref());
         self.message = Some(MessageState::new(output_index, item_id));
         let context = self.response_context(inputs, None);
-        let item = message_output_item(&context, "in_progress", Vec::new());
+        let item = message_output_item(&context, "in_progress", Vec::new(), self.chat_id.as_deref());
         emit_event(
             &mut self.emit,
             &self.limits,
@@ -1412,7 +1427,7 @@ impl StreamConverter {
         // mutating `self.emit`, so the context's `&self` borrow is released first.
         let item = {
             let context = self.response_context(inputs, None);
-            message_output_item(&context, status, content_items)
+            message_output_item(&context, status, content_items, self.chat_id.as_deref())
         };
         emit_event(
             &mut self.emit,
@@ -1960,11 +1975,11 @@ fn emit_event(
         return Err(ConvertError::EventLimit);
     }
     let start = out.len();
-    if let Err(error) = events::encode(event, emit.sequence_number, out) {
+    if let Err(error) = events::encode(event, emit.sequence_number, emit.include_obfuscation, out) {
         // Drop any partially written frame so a failed encode leaves `out`
         // byte-for-byte as it was before this call.
         out.truncate(start);
-        return Err(ConvertError::Serialize(error));
+        return Err(error);
     }
     if out.len().saturating_sub(start) > limits.max_emitted_sse_frame_bytes {
         // The complete encoded frame exceeds the emitted-frame ceiling. Roll it
@@ -1990,7 +2005,7 @@ fn is_done_sentinel(frame: &framing::Frame) -> bool {
 /// cost nothing.
 fn logprobs_byte_cost(logprobs: &Value) -> usize {
     match logprobs {
-        Value::Array(items) if !items.is_empty() => serde_json::to_vec(logprobs).map_or(0, |bytes| bytes.len()),
+        Value::Array(items) if !items.is_empty() => crate::json_body::serialized_len(logprobs).unwrap_or(0),
         _ => 0,
     }
 }
@@ -2078,20 +2093,7 @@ fn mark_failed(resource: &mut Value, message: &str) {
 /// ceiling; counting into a sink avoids buffering a second full copy alongside
 /// the one `emit_event` serializes.
 fn serialized_json_len(value: &Value) -> Result<usize, ConvertError> {
-    struct Counter(usize);
-    impl std::io::Write for Counter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(buf.len());
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter(0);
-    serde_json::to_writer(&mut counter, value).map_err(ConvertError::Serialize)?;
-    Ok(counter.0)
+    crate::json_body::serialized_len(value).map_err(ConvertError::Serialize)
 }
 
 /// Return whether `reason` is a finish reason the converter can translate.
@@ -2143,6 +2145,7 @@ fn failure_message(error: &ConvertError) -> &'static str {
         ConvertError::MissingFinishReason => "upstream stream ended without a finish reason",
         ConvertError::UnknownFinishReason => "upstream stream used an unrecognized finish reason",
         ConvertError::IncompleteFrame => "upstream stream ended with an incomplete frame",
+        ConvertError::ObfuscationRandomness => "could not generate stream padding",
         ConvertError::Serialize(_) => "internal serialization error",
     }
 }

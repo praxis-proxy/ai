@@ -49,7 +49,7 @@ fn model_inspection_forwards_more_than_ten_mib_without_changing_body_or_trusting
 
 #[test]
 fn model_inspection_enforces_both_bounds_for_fixed_and_chunked_requests() {
-    for (request_cap, buffer_cap) in [(Some(2048), 1024), (Some(1024), 2048), (None, 1024)] {
+    for (request_cap, buffer_cap) in [(Some(1024), 1024), (Some(1024), 2048), (None, 1024)] {
         for chunked in [false, true] {
             let granite = start_stateful_backend(vec![]);
             let llama = start_stateful_backend(vec![(200, "llama".to_owned())]);

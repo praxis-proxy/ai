@@ -43,6 +43,7 @@ use self::{
     config::StreamEventsConfig,
 };
 use crate::{
+    RecordAiMetadata as _,
     classifier::is_responses_create,
     is_event_stream_content_type,
     openai::{
@@ -293,18 +294,18 @@ impl StreamEventsFilter {
             (state.iteration, output_index_offset)
         });
         ctx.insert_filter_state(self.new_round_state(iteration, output_index_offset));
-        ctx.set_metadata("responses.stream_completion", "open");
+        ctx.record_ai_metadata("responses.stream_completion", "open");
         // Publish a per-round marker that `openai_agentic_loop` reads (and then
         // consumes) to confirm this typed-streaming round can surface
         // loop-terminal errors through `finalize_logical_stream`. Refreshed
         // every armed round because the agentic loop overwrites it after each
         // check.
-        ctx.set_metadata("responses.logical_stream", "true");
+        ctx.record_ai_metadata("responses.logical_stream", "true");
         // #1159: advertise to openai_client_tool_compat (which runs later, in
         // on_request_body) that this logical SSE owner is present and will drive
         // streaming client-tool restoration, so the compat filter arms lowering
         // instead of failing streaming closed.
-        ctx.set_metadata(CLIENT_TOOL_STREAM_RESTORATION_MARKER, "true");
+        ctx.record_ai_metadata(CLIENT_TOOL_STREAM_RESTORATION_MARKER, "true");
     }
 
     /// Apply the guard [`ArmDecision`], returning an early [`FilterAction`] when
@@ -414,10 +415,10 @@ fn arm_decision_for(ctx: &HttpFilterContext<'_>) -> ArmDecision {
         .unwrap_or(false);
     let is_responses = is_responses_create(&ctx.request.method, ctx.request.uri.path())
         && (typed_streaming
-            || ctx.get_metadata("openai_responses_request.format") == Some("openai_responses")
+            || ctx.filter_metadata.get("openai_responses_request.format") == Some("openai_responses")
             || has_responses_state);
     let is_streaming =
-        typed_streaming || ctx.get_metadata("openai_responses_request.stream") == Some("true") || body_stream;
+        typed_streaming || ctx.filter_metadata.get("openai_responses_request.stream") == Some("true") || body_stream;
     let inside_irr = ctx.extensions.get::<IterationState>().is_some();
     arm_decision(is_responses && is_streaming, inside_irr)
 }
@@ -434,7 +435,7 @@ impl HttpFilter for StreamEventsFilter {
         // `StreamBuffer`-first phase ordering (#1159). The body is never mutated;
         // the mode stays `Stream` so this never escalates the aggregate step to
         // buffering.
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -444,7 +445,7 @@ impl HttpFilter for StreamEventsFilter {
     fn response_body_access(&self) -> BodyAccess {
         // Always ReadWrite: the filter normalizes every armed stream into one
         // logical Responses lifecycle, rewriting per-round SSE bytes.
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -480,7 +481,7 @@ impl HttpFilter for StreamEventsFilter {
         // response-phase restoration path is unaffected. The body is only read,
         // never mutated.
         if arm_decision_for(ctx) == ArmDecision::Arm {
-            ctx.set_metadata(CLIENT_TOOL_STREAM_RESTORATION_MARKER, "true");
+            ctx.record_ai_metadata(CLIENT_TOOL_STREAM_RESTORATION_MARKER, "true");
         }
         Ok(FilterAction::Continue)
     }
@@ -603,13 +604,13 @@ fn publish_idle_timeout_if_incomplete(ctx: &mut HttpFilterContext<'_>) {
     let parser_complete = ctx
         .get_filter_state::<StreamEventsState>()
         .is_some_and(|state| state.completion_state != CompletionState::Open);
-    if !parser_complete && ctx.get_metadata("responses.stream_error_code").is_none() {
-        ctx.set_metadata("responses.stream_error_code", "server_error");
-        ctx.set_metadata(
+    if !parser_complete && ctx.filter_metadata.get("responses.stream_error_code").is_none() {
+        ctx.record_ai_metadata("responses.stream_error_code", "server_error");
+        ctx.record_ai_metadata(
             "responses.stream_error_message",
             "upstream Responses stream exceeded timeout",
         );
-        ctx.set_metadata("responses.skip_persist", "true");
+        ctx.record_ai_metadata("responses.skip_persist", "true");
     }
 }
 
@@ -666,7 +667,7 @@ fn handle_parse_result(
         CompletionState::TerminalLifecycle => "terminal",
         CompletionState::Error => "error",
     };
-    ctx.set_metadata("responses.stream_completion", completion);
+    ctx.record_ai_metadata("responses.stream_completion", completion);
     *body = parsed;
 }
 
@@ -677,13 +678,15 @@ fn handle_parse_result(
 )]
 fn handle_parse_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, error: &SseParseError) {
     warn!(%error, "SSE parse error in stream_events");
-    if matches!(error, SseParseError::StreamPoisoned) && ctx.get_metadata("responses.stream_error_code").is_some() {
+    if matches!(error, SseParseError::StreamPoisoned)
+        && ctx.filter_metadata.get("responses.stream_error_code").is_some()
+    {
         // Keep the first failure's client-visible cause on repeated input.
         *body = None;
         return;
     }
-    ctx.set_metadata("responses.stream_parse_error", "true".to_owned());
-    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.record_ai_metadata("responses.stream_parse_error", "true".to_owned());
+    ctx.record_ai_metadata("responses.stream_error_code", "server_error");
     // M3: surface a client-tool-restore-specific message when the failure is a
     // restore error. `reason` is client-safe by construction (never a private
     // name; see `client_tools::client_tool_restore_error`). Timeouts keep their
@@ -694,25 +697,25 @@ fn handle_parse_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>,
             record_retained_payload_failure(ctx);
         },
         SseParseError::ClientToolRestore { reason, .. } => {
-            ctx.set_metadata(
+            ctx.record_ai_metadata(
                 "responses.stream_error_message",
                 format!("client tool restoration failed: {reason}"),
             );
         },
         SseParseError::Timeout { .. } => {
-            ctx.set_metadata(
+            ctx.record_ai_metadata(
                 "responses.stream_error_message",
                 "upstream Responses stream exceeded timeout",
             );
         },
         _ => {
-            ctx.set_metadata(
+            ctx.record_ai_metadata(
                 "responses.stream_error_message",
                 "upstream Responses stream could not be parsed",
             );
         },
     }
-    ctx.set_metadata("responses.skip_persist", "true");
+    ctx.record_ai_metadata("responses.skip_persist", "true");
     *body = None;
 }
 
@@ -2541,9 +2544,9 @@ fn encode_local_restore_error(ctx: &mut HttpFilterContext<'_>, mut output: Vec<u
         object.insert("sequence_number".to_owned(), Value::from(sequence_number));
     }
     encode_sse_event("error", &payload, &mut output);
-    ctx.set_metadata("responses.stream_error_code", "server_error");
-    ctx.set_metadata("responses.stream_error_message", message);
-    ctx.set_metadata("responses.skip_persist", "true");
+    ctx.record_ai_metadata("responses.stream_error_code", "server_error");
+    ctx.record_ai_metadata("responses.stream_error_message", message);
+    ctx.record_ai_metadata("responses.skip_persist", "true");
     Bytes::from(output)
 }
 
@@ -2647,8 +2650,8 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
         .get("openai_agentic_loop")
         .and_then(|results| results.get("action"))
         == Some("loop");
-    let terminal_error = ctx.get_metadata("responses.stream_error_code").is_some()
-        || ctx.get_metadata("responses.stream_completion") == Some("error");
+    let terminal_error = ctx.filter_metadata.get("responses.stream_error_code").is_some()
+        || ctx.filter_metadata.get("responses.stream_completion") == Some("error");
     if owner_looping && terminal_error {
         crate::openai::responses::fs_arm_stream_stop(ctx);
     }
@@ -2709,9 +2712,9 @@ const RETAINED_PAYLOAD_OVERFLOW_MESSAGE: &str =
 
 /// Make an overflow sticky across the remaining logical-stream hooks.
 fn record_retained_payload_failure(ctx: &mut HttpFilterContext<'_>) {
-    ctx.set_metadata("responses.stream_error_code", "server_error");
-    ctx.set_metadata("responses.stream_error_message", RETAINED_PAYLOAD_OVERFLOW_MESSAGE);
-    ctx.set_metadata("responses.skip_persist", "true");
+    ctx.record_ai_metadata("responses.stream_error_code", "server_error");
+    ctx.record_ai_metadata("responses.stream_error_message", RETAINED_PAYLOAD_OVERFLOW_MESSAGE);
+    ctx.record_ai_metadata("responses.skip_persist", "true");
     crate::openai::responses::fs_arm_stream_stop(ctx);
 }
 
@@ -2768,12 +2771,12 @@ fn emit_deferred_terminal(
 /// shape and mark the record un-persistable so a later GET cannot serve the leak.
 fn emit_deferred_terminal_restore_error(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>, error: &SseParseError) {
     let message = error.to_string();
-    ctx.set_metadata("responses.stream_error_code", "server_error");
-    ctx.set_metadata("responses.skip_persist", "true");
+    ctx.record_ai_metadata("responses.stream_error_code", "server_error");
+    ctx.record_ai_metadata("responses.skip_persist", "true");
     if let Some(err_bytes) = encode_local_error(ctx, "server_error", &message) {
         output.extend_from_slice(&err_bytes);
     }
-    ctx.set_metadata("responses.stream_error_message", message);
+    ctx.record_ai_metadata("responses.stream_error_message", message);
 }
 
 /// Whether the agentic-loop owner requested another inference step.
@@ -2792,8 +2795,8 @@ fn logical_stream_continues(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return a locally generated terminal error for an already-committed stream.
 fn logical_stream_error(ctx: &HttpFilterContext<'_>) -> Option<Value> {
-    let code = ctx.get_metadata("responses.stream_error_code")?;
-    let message = ctx.get_metadata("responses.stream_error_message")?;
+    let code = ctx.filter_metadata.get("responses.stream_error_code")?;
+    let message = ctx.filter_metadata.get("responses.stream_error_message")?;
     Some(responses_error_sse_payload(code, message))
 }
 
@@ -3040,12 +3043,12 @@ fn stream_end_kind(ctx: &HttpFilterContext<'_>) -> StreamEndKind {
 
 /// Publish incomplete-stream metadata for persistence and logical-stream errors.
 fn record_incomplete_stream(ctx: &mut HttpFilterContext<'_>, timed_out: bool) {
-    ctx.set_metadata("responses.stream_incomplete", "true".to_owned());
-    if ctx.get_metadata("responses.stream_error_code").is_some() {
+    ctx.record_ai_metadata("responses.stream_incomplete", "true".to_owned());
+    if ctx.filter_metadata.get("responses.stream_error_code").is_some() {
         return;
     }
-    ctx.set_metadata("responses.stream_error_code", "server_error");
-    ctx.set_metadata(
+    ctx.record_ai_metadata("responses.stream_error_code", "server_error");
+    ctx.record_ai_metadata(
         "responses.stream_error_message",
         if timed_out {
             "upstream Responses stream exceeded timeout"
@@ -3053,7 +3056,7 @@ fn record_incomplete_stream(ctx: &mut HttpFilterContext<'_>, timed_out: bool) {
             "upstream Responses stream did not terminate cleanly"
         },
     );
-    ctx.set_metadata("responses.skip_persist", "true");
+    ctx.record_ai_metadata("responses.skip_persist", "true");
 }
 
 /// How an SSE stream ended from the parser's point of view.

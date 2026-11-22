@@ -64,12 +64,16 @@ use tracing::{debug, trace, warn};
 
 use super::{
     super::{
-        DEFAULT_STORE_NAME, bound_body_outcome, error::responses_error_rejection, request_input::input_echo_value,
+        DEFAULT_STORE_NAME, bound_body_outcome,
+        error::responses_error_rejection,
+        file_search_dispatch::citations::{persist_citation_files, strip_stored_citation_files},
+        request_input::input_echo_value,
         state::ResponsesState,
     },
     config::{ResponseStoreConfig, validate_config},
 };
 use crate::{
+    RecordAiMetadata as _,
     classifier::is_responses_create,
     is_event_stream_content_type,
     json_body::MAX_JSON_BODY_BYTES,
@@ -476,7 +480,12 @@ fn build_streaming_record(
     request_input: Option<Value>,
 ) -> Option<ResponseRecord> {
     let state = ctx.extensions.get::<ResponsesState>()?;
-    let response_object = state.response_object.clone();
+    let mut response_object = state.response_object.clone();
+    persist_citation_files(
+        &mut response_object,
+        &state.citation_files,
+        &state.restored_citation_file_ids,
+    );
     // The durable record owns independent JSON. Materialize shared values only
     // at this persistence boundary, not while reading or projecting history.
     let state_messages = (state.captures_persistence_history() && !state.persisted_messages.is_empty())
@@ -502,8 +511,13 @@ fn build_buffered_record(
     owner: StateOwner,
     request_input: Option<Value>,
 ) -> Option<ResponseRecord> {
-    let json = decode_response_body(bytes)?;
+    let mut json = decode_response_body(bytes)?;
     let state = ctx.extensions.get::<ResponsesState>();
+    // Only the gateway writes the citation key; never store one from upstream.
+    strip_stored_citation_files(&mut json);
+    if let Some(state) = state {
+        persist_citation_files(&mut json, &state.citation_files, &state.restored_citation_file_ids);
+    }
     // The durable record owns independent JSON. Materialize shared values only
     // at this persistence boundary, not while reading or projecting history.
     let state_messages = state
@@ -776,7 +790,7 @@ fn request_needs_rehydrate_store(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request references a conversation.
 fn has_conversation(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_request.has_conversation") == Some("true")
+    ctx.filter_metadata.get("openai_responses_request.has_conversation") == Some("true")
 }
 
 /// Return whether the request method is not persistable.
@@ -790,7 +804,7 @@ fn is_non_post_request(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request is not a Responses API request.
 fn is_non_responses_format(ctx: &HttpFilterContext<'_>) -> bool {
-    let format = ctx.get_metadata("openai_responses_request.format");
+    let format = ctx.filter_metadata.get("openai_responses_request.format");
     let skip = !is_responses_format(ctx);
     if skip {
         trace!(format = ?format, "skipping non-responses format");
@@ -800,12 +814,12 @@ fn is_non_responses_format(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request is classified as a Responses API request.
 fn is_responses_format(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_request.format") == Some("openai_responses")
+    ctx.filter_metadata.get("openai_responses_request.format") == Some("openai_responses")
 }
 
 /// Return whether the request explicitly disabled persistence.
 fn is_store_disabled(ctx: &HttpFilterContext<'_>) -> bool {
-    let skip = ctx.get_metadata("openai_responses_request.store") == Some("false");
+    let skip = ctx.filter_metadata.get("openai_responses_request.store") == Some("false");
     if skip {
         trace!("skipping persistence (store=false)");
     }
@@ -814,7 +828,7 @@ fn is_store_disabled(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request uses streaming responses.
 fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_request.stream") == Some("true")
+    ctx.filter_metadata.get("openai_responses_request.stream") == Some("true")
 }
 
 /// Return whether this is a streaming replay retrieval
@@ -849,18 +863,20 @@ fn streaming_terminal_emitted(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request references a previous response.
 fn has_previous_response_id(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_request.has_previous_response_id") == Some("true")
+    ctx.filter_metadata
+        .get("openai_responses_request.has_previous_response_id")
+        == Some("true")
 }
 
 /// Check whether persistence was skipped during the response phase.
 fn should_skip_persist(ctx: &HttpFilterContext<'_>) -> bool {
-    should_skip(ctx) || ctx.get_metadata("responses.skip_persist") == Some("true")
+    should_skip(ctx) || ctx.filter_metadata.get("responses.skip_persist") == Some("true")
 }
 
 /// Return whether stream parsing or lifecycle completion failed.
 fn stream_has_errors(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("responses.stream_parse_error") == Some("true")
-        || ctx.get_metadata("responses.stream_incomplete") == Some("true")
+    ctx.filter_metadata.get("responses.stream_parse_error") == Some("true")
+        || ctx.filter_metadata.get("responses.stream_incomplete") == Some("true")
         || ctx
             .extensions
             .get::<ResponseStoreRequestState>()
@@ -885,7 +901,7 @@ fn response_is_persistable(ctx: &mut HttpFilterContext<'_>) -> bool {
 
     if !resp.status.is_success() {
         trace!(status = %resp.status, "skipping persistence for non-2xx response");
-        ctx.set_metadata("responses.skip_persist", "true");
+        ctx.record_ai_metadata("responses.skip_persist", "true");
         return false;
     }
 
@@ -897,7 +913,7 @@ fn response_is_persistable(ctx: &mut HttpFilterContext<'_>) -> bool {
     let is_persistable_content = is_json_content_type(content_type) || is_event_stream_content_type(content_type);
     if !is_persistable_content {
         trace!("skipping persistence for non-persistable content type");
-        ctx.set_metadata("responses.skip_persist", "true");
+        ctx.record_ai_metadata("responses.skip_persist", "true");
         return false;
     }
 
@@ -1027,11 +1043,11 @@ impl HttpFilter for ResponseStoreFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -1041,7 +1057,7 @@ impl HttpFilter for ResponseStoreFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     /// Streaming by default. Non-streaming Responses requests select a
@@ -1272,7 +1288,7 @@ impl ResponseStoreFilter {
     ///
     /// With `stream=true` this serves an incremental SSE replay of the stored
     /// event log ([`serve_replay`]); otherwise it returns the stored response
-    /// object as JSON, unchanged.
+    /// object as JSON, minus gateway-private continuation metadata.
     async fn handle_get_response(&self, ctx: &HttpFilterContext<'_>, id: &str) -> FilterAction {
         let parsed = match parse_get_response_query(ctx.request.uri.query()) {
             Ok(parsed) => parsed,
@@ -1298,11 +1314,13 @@ impl ResponseStoreFilter {
         }
     }
 
-    /// Serve the stored response object as JSON, unchanged.
+    /// Serve the stored response object as JSON, minus gateway-private
+    /// continuation metadata.
     async fn serve_stored_json(store: &OwnerScopedResponseStore, id: &str) -> FilterAction {
         debug!(response_id = id, "retrieving stored response");
         match store.get_response(id).await {
-            Ok(Some(record)) => {
+            Ok(Some(mut record)) => {
+                strip_stored_citation_files(&mut record.response_object);
                 let body = serde_json::to_vec(&record.response_object).unwrap_or_default();
                 FilterAction::Reject(
                     Rejection::status(200)

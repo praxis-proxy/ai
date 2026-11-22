@@ -40,6 +40,7 @@
 mod a2a;
 mod agentic_mocks;
 mod anthropic_messages;
+mod body_contracts;
 mod claude_code;
 mod claude_code_vllm;
 #[cfg(all(feature = "openai-agentic-loop", feature = "store"))]

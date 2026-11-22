@@ -7,7 +7,7 @@ use praxis_core::config::ChainRef;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
-use crate::openai::responses::mcp_classify::ApprovalFloor;
+use crate::mcp_core::{classify::ApprovalFloor, execute::MIN_RETAINED_RESULT_BYTES};
 
 /// Default timeout for MCP `tools/call` calls (30 seconds).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -35,9 +35,6 @@ const MAX_RESULT_BYTES: usize = 16_777_216;
 
 /// Absolute maximum retained bytes for one MCP result batch.
 const MAX_TOTAL_RESULT_BYTES: usize = 67_108_864;
-
-/// Minimum retained reservation needed for one bounded tool-error result.
-pub(super) const MIN_RETAINED_RESULT_BYTES: usize = 1_024;
 
 /// Maximum UTF-8 bytes accepted for one MCP correlation `call_id`.
 ///

@@ -35,9 +35,9 @@ surface section. These facts change what a cell means in a given deployment.
 - **selected-translation-surfaces** — This matrix covers only the translation surfaces listed below; it is not an exhaustive inventory of registered adapters. In particular, OpenAI Chat Completions to Anthropic Messages (including its streaming companion) and Anthropic Messages to Vertex Anthropic are registered but do not yet have feature-by-feature rows here. Their omission is not a claim that the adapters are unsupported.
   - Evidence: `filters/src/register.rs:349-364`
 - **clean-rejection-is-opt-in** — Errors handled by fail_to_proxy's formatter are provider-shaped only when a matching filter installed a formatter. Otherwise that path emits RFC 9457 application/problem+json. Explicit filter and body-limit rejections carry their own bodies and bypass this formatting path.
-  - Installers: ai_operation (apis/src/operation_classifier/mod.rs:233-246, picks the OpenAI or Anthropic formatter from the matched protocol), openai_responses_request (apis/src/openai/responses/request/mod.rs:575 via apis/src/openai/responses/mod.rs:452-460), anthropic_messages_request (apis/src/anthropic/messages_request/mod.rs:275-279).
+  - Installers: ai_operation (apis/src/operation_classifier/mod.rs:235-248, picks the OpenAI or Anthropic formatter from the matched protocol), openai_responses_request (apis/src/openai/responses/request/mod.rs:575 via apis/src/openai/responses/mod.rs:452-460), anthropic_messages_request (apis/src/anthropic/messages_request/mod.rs:275-279).
   - Example configurations do not necessarily install one of these formatters; inspect the selected pipeline before assuming provider-shaped errors.
-  - Evidence: `praxis-proxy-protocol-0.8.0/src/http/pingora/handler/fail_to_proxy.rs:288-307`
+  - Evidence: `praxis-proxy-protocol-0.8.0/src/http/pingora/handler/fail_to_proxy.rs:299-340`
 - **on-invalid-defaults-to-continue** — With on_invalid set to continue, unclassifiable bodies are forwarded. Body classification alone does not install the OpenAI formatter for unknown, invalid, or non-JSON formats. A formatter installed by route classification or an earlier filter is retained. Continue is the default; inspect the selected configuration for overrides.
   - Evidence: `apis/src/openai/responses/config.rs:119-120; apis/src/openai/responses/request/mod.rs:591-610; apis/src/openai/responses/mod.rs:442-463`
 - **no-deny-unknown-fields-on-the-wire** — No request body is deserialized into a typed struct on any surface. Unknown fields are governed only by hand-written allowlists, where those exist. Absence of an allowlist means silent acceptance.
@@ -49,7 +49,7 @@ surface section. These facts change what a cell means in a given deployment.
 | --- | --- | --- | --- | --- | --- |
 | Plain text completion | `translated` | `translated` | `translated` | `passthrough` | `translated` |
 | System / developer instructions | `lossy` | `translated` | `translated` | `passthrough` | `translated` |
-| Multi-turn history | `translated` | `translated` | `translated` | `passthrough` | [`gap`](#known-gaps) |
+| Multi-turn history | `lossy` | `translated` | `translated` | `passthrough` | [`gap`](#known-gaps) |
 | Image input | `translated` | `translated` | `lossy` | `passthrough` | `rejected` |
 | Audio input | `n/a` | `rejected` | `rejected` | `passthrough` | `rejected` |
 | Document / file input | `rejected` | `translated` | `rejected` | `passthrough` | `rejected` |
@@ -83,39 +83,39 @@ defects, not support levels.
 
 - **reasoning-and-cache-tokens-vanish** — Reasoning content is silently discarded on the Anthropic and Bedrock paths, and its token count on Vertex. Cache-token counters are discarded entirely on Vertex and Bedrock; Anthropic maps cache reads and loses only the cache-write counter. Customers are billed for tokens the matrix would otherwise claim they receive.
   - Affects: anthropic-messages-to-chat-completions, chat-completions-to-vertexai-gemini, chat-completions-to-bedrock-converse
-  - Blocker: TODO-ISSUE systematic handling of reasoning and cache tokens across translators
+  - Blocker: https://github.com/praxis-proxy/ai/issues/2058
 - **oversized-body-generic-413** — A core body-limit rejection returns HTTP 413 with Content-Type application/json and the generic body {"error":"request body too large"}. It bypasses the installed provider formatter, so the error member is a string rather than an OpenAI or Anthropic error object. This applies to declared-length admission, the global ceiling, SizeLimit and StreamBuffer limits, including pre-reads before request filters install a formatter. The body is no longer empty, but it still does not match the client dialect.
   - Affects: anthropic-messages-to-chat-completions, responses-to-chat-completions, chat-completions-to-vertexai-gemini, chat-completions-to-azureai, chat-completions-to-bedrock-converse
-  - Blocker: TODO-ISSUE format the 413 produced by the body-limit filter
+  - Blocker: https://github.com/praxis-proxy/praxis/issues/1564
 - **divergent-error-envelopes** — Three filters emit three different OpenAI-shaped envelopes — Vertex includes param:null, Bedrock omits param and uses code "invalid_request", Azure rewrites whatever Azure returned. One client error handler cannot cover all three.
   - Affects: chat-completions-to-vertexai-gemini, chat-completions-to-bedrock-converse, chat-completions-to-azureai
-  - Blocker: TODO-ISSUE converge on one OpenAI error envelope builder
+  - Blocker: https://github.com/praxis-proxy/ai/issues/2056
 - **inverted-token-budget-precedence** — When both max_tokens and max_completion_tokens are present, Vertex prefers max_completion_tokens and Bedrock prefers max_tokens. The same client request gets a different token budget depending on the backend. Vertex documents and tests its own precedence; nothing explains why the two differ.
   - Affects: chat-completions-to-vertexai-gemini, chat-completions-to-bedrock-converse
-  - Blocker: TODO-ISSUE pick one max-tokens precedence across translators
+  - Blocker: https://github.com/praxis-proxy/ai/issues/2057
 
 ### Per surface
 
 | Surface | Feature | Gap | Blocker |
 | --- | --- | --- | --- |
-| Anthropic -> CC | Streaming terminates correctly | Terminal events are emitted only from the [DONE] branch. If the upstream stream ends without the sentinel, no message_delta and no message_stop are sent — a truncated response reported as success. Anthropic's documented `ping` keep-alive is never emitted either. | TODO-ISSUE emit terminal events at end-of-stream |
-| Anthropic -> CC | Mid-stream upstream failure is surfaced | A `data: {"error":{...}}` chunk after a 200 parses as a valid JSON object, matches neither choices nor usage, and is discarded. The client sees a short clean completion for a failed generation. Only non-JSON and non-object data fails the stream. | TODO-ISSUE surface mid-stream upstream error objects |
-| Anthropic -> CC | Token usage accounting | message_start.usage.input_tokens is hardcoded 0 rather than null, so clients reading prompt tokens at message_start get a wrong number, not a missing one. Finite-path usage is correct. | TODO-ISSUE populate or null message_start usage |
-| Anthropic -> CC | Reasoning / thinking content | Upstream message.reasoning_content is never read on either path, so billed reasoning output vanishes. A non-null finite `refusal` is read and refused (the upstream success is rejected with 500); a non-null streaming delta.refusal emits a terminal Anthropic error instead of being silently dropped. | TODO-ISSUE reject or surface reasoning_content |
-| Anthropic -> CC | Oversized request body | See the shared oversized-body gap below. | TODO-ISSUE format the 413 produced by the body-limit filter |
-| Responses -> CC | Server-side state continuation | previous_response_id and conversation rehydrate correctly, but on continuation any stored output item that is not message, function_call, function_call_output, custom_tool_call, custom_tool_call_output, reasoning, compaction or item_reference (including supported legacy normalization) is skipped with no error — the model silently loses hosted-tool history. Separately, an unknown previous_response_id returns 400 where OpenAI returns 404. | TODO-ISSUE preserve or reject hosted-tool history on continuation |
-| Responses -> CC | Unsupported operations on a supported path | The GET /v1/responses WebSocket upgrade is positively classified as Responses traffic, and POST /v1/responses/compact is too unless openai_responses_compact is in the chain to answer it locally. The translator passes anything that is not POST /v1/responses through untouched, so both reach a Chat-Completions-only backend verbatim. No guard says "this Responses operation has no Chat Completions translation". Accounts for 9 of the 10 templates the OpenResponses manifest marks inapplicable. | TODO-ISSUE reject untranslatable Responses operations at the edge |
-| Responses -> CC | Oversized request body | See the shared oversized-body gap below. | TODO-ISSUE format the 413 produced by the body-limit filter |
-| CC -> Gemini | Structured output / JSON schema | json_schema translates, but only json_schema.schema is read: name, description and strict are read by nothing. strict:true is accepted and silently ignored, so structured-output strictness is lost with no error. | TODO-ISSUE reject or honor response_format.json_schema.strict |
-| CC -> Gemini | Prompt-cache token accounting | cachedContentTokenCount is discarded; no prompt_tokens_details.cached_tokens is emitted. | TODO-ISSUE map Gemini cachedContentTokenCount |
-| CC -> Gemini | Reasoning / thinking content | thoughtsTokenCount is discarded, so no completion_tokens_details.reasoning_tokens is emitted. A Part with thought:true fails the response, while a Part carrying only thoughtSignature produces an empty delta and no error. | TODO-ISSUE map Gemini thoughtsTokenCount |
-| CC -> Gemini | Oversized request body | See the shared oversized-body gap below. | TODO-ISSUE format the 413 produced by the body-limit filter |
-| CC -> Azure | Content-filter / safety signal reaches the client | Azure's per-choice content_filter_results, content_filter_offsets, content_filter_raw and top-level prompt_filter_results are stripped from every response with no replacement. A streaming frame carrying only annotations is dropped whole unless it also carries usage or other top-level metadata, in which case it is forwarded with empty choices. Customers relying on Azure safety metadata lose it entirely. | TODO-ISSUE preserve or document Azure content-filter metadata |
-| CC -> Azure | Oversized request body | See the shared oversized-body gap below. | TODO-ISSUE format the 413 produced by the body-limit filter |
-| CC -> Bedrock | Multi-turn history | Roles and tool results translate correctly and client tool_call ids round-trip. But with no per-message allowlist, messages[].name, refusal, annotations and the deprecated function_call are never read and silently discarded, and a non-"function" tool_call type is accepted and emitted as a toolUse. An assistant turn with no content gets a synthetic empty-string block. | TODO-ISSUE add a per-message field allowlist to the Bedrock translator |
-| CC -> Bedrock | Prompt-cache token accounting | cacheReadInputTokens and cacheWriteInputTokens are discarded. | TODO-ISSUE map Bedrock cache token counters |
-| CC -> Bedrock | Reasoning / thinking content | Streaming reasoningContent deltas return Ok(None) with no output and no error. Citation, toolResult and image deltas take the same path and vanish silently. | TODO-ISSUE reject or surface Bedrock reasoningContent and citations |
-| CC -> Bedrock | Oversized request body | See the shared oversized-body gap below. | TODO-ISSUE format the 413 produced by the body-limit filter |
+| Anthropic -> CC | Streaming terminates correctly | Terminal events are emitted only from the [DONE] branch. If the upstream stream ends without the sentinel, no message_delta and no message_stop are sent — a truncated response reported as success. Anthropic's documented `ping` keep-alive is never emitted either. | https://github.com/praxis-proxy/ai/issues/2044 |
+| Anthropic -> CC | Mid-stream upstream failure is surfaced | A `data: {"error":{...}}` chunk after a 200 parses as a valid JSON object, matches neither choices nor usage, and is discarded. The client sees a short clean completion for a failed generation. Only non-JSON and non-object data fails the stream. | https://github.com/praxis-proxy/ai/issues/2045 |
+| Anthropic -> CC | Token usage accounting | message_start.usage.input_tokens is hardcoded 0 rather than null, so clients reading prompt tokens at message_start get a wrong number, not a missing one. Finite-path usage is correct. | https://github.com/praxis-proxy/ai/issues/2046 |
+| Anthropic -> CC | Reasoning / thinking content | Upstream message.reasoning_content is never read on either path, so billed reasoning output vanishes. A non-null finite `refusal` is read and refused (the upstream success is rejected with 500); a non-null streaming delta.refusal emits a terminal Anthropic error instead of being silently dropped. | https://github.com/praxis-proxy/ai/issues/2047 |
+| Anthropic -> CC | Oversized request body | See the shared oversized-body gap below. | https://github.com/praxis-proxy/praxis/issues/1564 |
+| Responses -> CC | Server-side state continuation | previous_response_id and conversation rehydrate correctly, but on continuation any stored output item that is not message, function_call, function_call_output, custom_tool_call, custom_tool_call_output, reasoning, compaction or item_reference (including supported legacy normalization) is skipped with no error — the model silently loses hosted-tool history. Separately, an unknown previous_response_id returns 400 where OpenAI returns 404. | https://github.com/praxis-proxy/ai/issues/2048 |
+| Responses -> CC | Unsupported operations on a supported path | The GET /v1/responses WebSocket upgrade is positively classified as Responses traffic, and POST /v1/responses/compact is too unless openai_responses_compact is in the chain to answer it locally. The translator passes anything that is not POST /v1/responses through untouched, so both reach a Chat-Completions-only backend verbatim. No guard says "this Responses operation has no Chat Completions translation". Accounts for 9 of the 10 templates the OpenResponses manifest marks inapplicable. | https://github.com/praxis-proxy/ai/issues/2049 |
+| Responses -> CC | Oversized request body | See the shared oversized-body gap below. | https://github.com/praxis-proxy/praxis/issues/1564 |
+| CC -> Gemini | Structured output / JSON schema | json_schema translates, but only json_schema.schema is read: name, description and strict are read by nothing. strict:true is accepted and silently ignored, so structured-output strictness is lost with no error. | https://github.com/praxis-proxy/ai/issues/2050 |
+| CC -> Gemini | Prompt-cache token accounting | cachedContentTokenCount is discarded; no prompt_tokens_details.cached_tokens is emitted. | https://github.com/praxis-proxy/ai/issues/2051 |
+| CC -> Gemini | Reasoning / thinking content | thoughtsTokenCount is discarded, so no completion_tokens_details.reasoning_tokens is emitted. A Part with thought:true fails the response, while a Part carrying only thoughtSignature produces an empty delta and no error. | https://github.com/praxis-proxy/ai/issues/1755 |
+| CC -> Gemini | Oversized request body | See the shared oversized-body gap below. | https://github.com/praxis-proxy/praxis/issues/1564 |
+| CC -> Azure | Content-filter / safety signal reaches the client | Azure's per-choice content_filter_results, content_filter_offsets, content_filter_raw and top-level prompt_filter_results are stripped from every response with no replacement. A streaming frame carrying only annotations is dropped whole unless it also carries usage or other top-level metadata, in which case it is forwarded with empty choices. Customers relying on Azure safety metadata lose it entirely. | https://github.com/praxis-proxy/ai/issues/2052 |
+| CC -> Azure | Oversized request body | See the shared oversized-body gap below. | https://github.com/praxis-proxy/praxis/issues/1564 |
+| CC -> Bedrock | Multi-turn history | Roles and tool results translate correctly and client tool_call ids round-trip. But with no per-message allowlist, messages[].name, refusal, annotations and the deprecated function_call are never read and silently discarded, and a non-"function" tool_call type is accepted and emitted as a toolUse. An assistant turn with no content gets a synthetic empty-string block. | https://github.com/praxis-proxy/ai/issues/2053 |
+| CC -> Bedrock | Prompt-cache token accounting | cacheReadInputTokens and cacheWriteInputTokens are discarded. | https://github.com/praxis-proxy/ai/issues/2054 |
+| CC -> Bedrock | Reasoning / thinking content | Streaming reasoningContent deltas return Ok(None) with no output and no error. Citation, toolResult and image deltas take the same path and vanish silently. | https://github.com/praxis-proxy/ai/issues/2055 |
+| CC -> Bedrock | Oversized request body | See the shared oversized-body gap below. | https://github.com/praxis-proxy/praxis/issues/1564 |
 
 ## Surfaces
 
@@ -129,7 +129,7 @@ defects, not support levels.
 | --- | --- | --- | --- |
 | Plain text completion | `translated` |  | `apis/src/anthropic/messages_to_chat_completions/request.rs:820-881` |
 | System / developer instructions | `lossy` | An array of text blocks is joined with newlines into one string, so per-block boundaries are lost. A block carrying cache_control is rejected 400 by default; with allow_lossy_features: [prompt_caching] the marker is stripped and signalled (see the request-side controls row). | `apis/src/anthropic/messages_to_chat_completions/request.rs:859-881; apis/src/anthropic/messages_to_chat_completions/request.rs:497-502; apis/src/anthropic/messages_to_chat_completions/request.rs:703-711` |
-| Multi-turn history | `translated` | In-array system messages are accepted deliberately (Claude Code emits them). | `apis/src/anthropic/messages_to_chat_completions/request.rs:537-542` |
+| Multi-turn history | `lossy` | In-array system messages are accepted deliberately (Claude Code emits them) and preserved in position by default. With allow_lossy_features: [mid_conversation_system] each eligible system message after the first non-system turn is folded into the single leading system message in encounter order and signalled, for backends whose chat templates reject a mid-conversation system message (vLLM "System message must be at the beginning"); leading system messages join the merged prompt first when a later message moves. The fold loses the original system message positions, which is why the cell is lossy. | `apis/src/anthropic/messages_to_chat_completions/request.rs:801-804; apis/src/anthropic/messages_to_chat_completions/request.rs:532-701` |
 | Image input | `translated` | User messages only. An image in an assistant message, or in any message that also carries tool_use, is rejected 400. | `apis/src/anthropic/messages_to_chat_completions/request.rs:627-641; apis/src/anthropic/messages_to_chat_completions/request.rs:688` |
 | Audio input | `n/a` |  |  |
 | Document / file input | `rejected` | All document source types rejected 400; no PDF support. | `apis/src/anthropic/messages_to_chat_completions/request.rs:688` |
@@ -152,7 +152,7 @@ defects, not support levels.
 | Server-side state continuation | `n/a` |  |  |
 | Unsupported operations on a supported path | `n/a` |  |  |
 | Error envelope matches the client dialect | `lossy` | Upstream errors carrying Anthropic vocabulary are preserved; a foreign error.type is replaced by the HTTP-status mapping and only `message` survives. OpenAI error.code and error.param are not read. | `apis/src/anthropic/messages_to_chat_completions/response.rs:22-31; apis/src/anthropic/messages_to_chat_completions/response.rs:131-154; apis/src/anthropic/wire.rs:58-86` |
-| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215` |
+| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213` |
 
 ### OpenAI Responses to OpenAI Chat Completions
 
@@ -179,15 +179,15 @@ defects, not support levels.
 | Content-filter / safety signal reaches the client | `translated` | content_filter maps to incomplete_details.reason. | `apis/src/openai/translation/chat_completions.rs:1966-1980` |
 | Token usage accounting | `lossy` | Missing values become 0 rather than null. audio_tokens and accepted/rejected_prediction_tokens are discarded. | `apis/src/openai/translation/chat_completions.rs:2410-2456` |
 | Prompt-cache token accounting | `translated` | cached_tokens and cache_write_tokens are both carried. | `apis/src/openai/translation/chat_completions.rs:2420-2440` |
-| Reasoning / thinking content | `rejected` | Under the default dialect `none`, reasoning input items are rejected 400 and upstream reasoning fields are not read. Under the `vllm` dialect reasoning round-trips on both the finite and the streaming path (delta.reasoning and delta.reasoning_content become response.reasoning_text events). reasoning.summary is rejected unconditionally — no dialect reports supports_safe_summary. | `apis/src/openai/translation/reasoning.rs:57-62; apis/src/openai/translation/reasoning.rs:106-123; apis/src/openai/translation/reasoning.rs:186-205; apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:755-796` |
-| Request-side thinking / prompt-cache controls | `translated` | reasoning.effort maps to reasoning_effort regardless of dialect. prompt_cache_key, prompt_cache_retention and prompt_cache_options are copied verbatim. reasoning.summary is rejected 400 (see reasoning-content). | `apis/src/openai/translation/chat_completions.rs:577-581; apis/src/openai/translation/chat_completions.rs:473-476` |
+| Reasoning / thinking content | `rejected` | Under the default dialect `none`, reasoning input items are rejected 400 and upstream reasoning fields are not read. Under the `vllm` dialect reasoning round-trips on both the finite and the streaming path (delta.reasoning and delta.reasoning_content become response.reasoning_text events). reasoning.summary `auto` is a best-effort request and is accepted (the backend simply produces no summary items); explicit summary values are rejected 400 because no dialect reports supports_safe_summary. | `apis/src/openai/translation/reasoning.rs:57-62; apis/src/openai/translation/reasoning.rs:106-123; apis/src/openai/translation/reasoning.rs:186-212; apis/src/openai/responses/responses_to_chat_completions/stream/mod.rs:755-796` |
+| Request-side thinking / prompt-cache controls | `translated` | reasoning.effort maps to reasoning_effort regardless of dialect. prompt_cache_key, prompt_cache_retention and prompt_cache_options are copied verbatim. reasoning.summary `auto` translates as a best-effort request; explicit summary values are rejected 400 (see reasoning-content). | `apis/src/openai/translation/chat_completions.rs:577-581; apis/src/openai/translation/chat_completions.rs:473-476` |
 | Stop sequences | `n/a` |  |  |
 | Sampling parameters | `translated` |  | `apis/src/openai/translation/chat_completions.rs:466-490` |
 | Logprobs | `lossy` | top_logprobs force-injects logprobs:true into the Chat request, a field the client never set, and the result is surfaced regardless of `include`. | `apis/src/openai/translation/chat_completions.rs:568-574; apis/src/openai/translation/chat_completions.rs:1956-1963` |
 | Server-side state continuation | `gap` | previous_response_id and conversation rehydrate correctly, but on continuation any stored output item that is not message, function_call, function_call_output, custom_tool_call, custom_tool_call_output, reasoning, compaction or item_reference (including supported legacy normalization) is skipped with no error — the model silently loses hosted-tool history. Separately, an unknown previous_response_id returns 400 where OpenAI returns 404. | `apis/src/openai/responses/rehydrate/mod.rs:1415-1433; apis/src/openai/responses/mod.rs:738-770; apis/src/openai/responses/rehydrate/mod.rs:1498-1501` |
 | Unsupported operations on a supported path | `gap` | The GET /v1/responses WebSocket upgrade is positively classified as Responses traffic, and POST /v1/responses/compact is too unless openai_responses_compact is in the chain to answer it locally. The translator passes anything that is not POST /v1/responses through untouched, so both reach a Chat-Completions-only backend verbatim. No guard says "this Responses operation has no Chat Completions translation". Accounts for 9 of the 10 templates the OpenResponses manifest marks inapplicable. | `apis/src/classifier/mod.rs:116-118; apis/src/openai/responses/responses_to_chat_completions/mod.rs:853-856; apis/src/openai/responses/routes/mod.rs:200-208; apis/src/openai/responses/routes/mod.rs:256-264; apis/src/openai/responses/compact/mod.rs:415-599` |
 | Error envelope matches the client dialect | `lossy` | `type` and `code` are always set to the same string, where OpenAI usually leaves code null or distinct. Provider param, type and extra fields are discarded on upstream errors. | `apis/src/openai/responses/error.rs:20-37; apis/src/openai/responses/responses_to_chat_completions/error.rs:42-79` |
-| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215` |
+| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213` |
 
 ### OpenAI Chat Completions to Vertex AI Gemini
 
@@ -222,7 +222,7 @@ defects, not support levels.
 | Server-side state continuation | `n/a` |  |  |
 | Unsupported operations on a supported path | `n/a` |  |  |
 | Error envelope matches the client dialect | `lossy` | OpenAI-shaped with param:null. Differs from the Bedrock filter's envelope — see the cross-surface gap below. | `apis/src/vertex/wire.rs:151-164` |
-| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215` |
+| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213` |
 
 ### OpenAI Chat Completions to Azure AI Chat Completions
 
@@ -257,7 +257,7 @@ defects, not support levels.
 | Server-side state continuation | `n/a` |  |  |
 | Unsupported operations on a supported path | `n/a` |  |  |
 | Error envelope matches the client dialect | `lossy` | error.type is filled from the HTTP status; Azure's innererror is stripped. | `apis/src/azure/wire.rs:20-58` |
-| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215` |
+| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213` |
 
 ### OpenAI Chat Completions to AWS Bedrock Converse
 
@@ -293,7 +293,7 @@ defects, not support levels.
 | Server-side state continuation | `n/a` |  |  |
 | Unsupported operations on a supported path | `n/a` |  |  |
 | Error envelope matches the client dialect | `lossy` | OpenAI-shaped but omits `param` and uses code "invalid_request". Differs from the Vertex filter's envelope — see the cross-surface gap below. | `apis/src/bedrock/wire.rs:61-72; apis/src/bedrock/wire.rs:113-126` |
-| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:177-215` |
+| Oversized request body | `gap` | See the shared oversized-body gap below. | `praxis-proxy-protocol-0.8.0/src/http/body_limit.rs:28-49; praxis-proxy-protocol-0.8.0/src/http/pingora/handler/request_body_filter.rs:169-213` |
 
 ## Native surfaces
 

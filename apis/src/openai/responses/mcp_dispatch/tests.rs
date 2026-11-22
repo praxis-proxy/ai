@@ -14,32 +14,40 @@ use secrecy::SecretString;
 use serde_json::json;
 
 use super::{
-    McpDispatchFilter, McpExecutionOptions, admitted_result_limits, build_error_result, build_success_result,
-    content_blocks_to_output, execute_mcp_calls, execute_single_call, extract_arguments, extract_call_id,
-    extract_mcp_tool_calls, find_by_encoded_name, is_connector_tool_entry, is_mcp_tool_call,
-    mcp_call_ids_are_unique_and_new, normalize_arguments, parse_call_arguments, partition_calls_by_approval,
-    prepare_response_round, process_call_result, reserve_mcp_execution, reserve_pending_approval_rows,
-    resolve_tool_entry, result_payload_limit,
+    McpCallResult, McpDispatchFilter, admitted_result_limits, build_error_result, build_success_result,
+    execute_mcp_calls, extract_arguments, extract_call_id, extract_mcp_tool_calls, find_by_encoded_name,
+    is_mcp_tool_call, mcp_call_ids_are_unique_and_new, partition_calls_by_approval, prepare_response_round,
+    reserve_mcp_execution, reserve_pending_approval_rows, responses_tool_call,
 };
 use crate::{
+    RecordAiMetadata as _,
     callout_identity::McpCalloutIdentity,
-    openai::responses::{
-        DEFAULT_TENANT_ID,
-        agentic_loop::{AgenticLoopFilter, budget::SimpleBudget},
-        mcp_admission::{
+    mcp_core::{
+        admission::{
             ConnectorToolPolicy, McpAdmissionDecisions, McpAdmissionMode, McpAdmissionPolicy, McpDenyReason,
             McpToolVerdict,
         },
-        mcp_classify::{ApprovalFloor, ApprovalPolicy, ApprovalSelector, parse_approval_policy, requires_approval},
+        classify::{ApprovalFloor, ApprovalPolicy, ApprovalSelector, parse_approval_policy, requires_approval},
+        execute::{
+            self, MIN_RETAINED_RESULT_BYTES, McpCallIdentity, McpCallOutcome as _, McpExecutionOptions,
+            McpResultLimitExceeded, content_blocks_to_output, normalize_arguments,
+        },
+        fingerprint::{
+            bind_credential_context, bind_forwarded_header_context, bind_owner_context, is_connector_tool_entry,
+            owner_fingerprint, target_fingerprint,
+        },
+        naming::{McpToolIndex, encode_function_name},
+    },
+    openai::responses::{
+        DEFAULT_TENANT_ID,
+        agentic_loop::{AgenticLoopFilter, budget::SimpleBudget},
         mcp_dispatch::{
             approval::{
-                ApprovalError, ResolvedApproval, bind_credential_context, bind_forwarded_header_context,
-                bind_owner_context, build_approved_tool_call, build_denial_message, extract_approval_responses,
-                is_approval_response, owner_fingerprint, parse_approval_response, resolve_approval, target_fingerprint,
+                ApprovalError, ResolvedApproval, build_approved_tool_call, build_denial_message,
+                extract_approval_responses, is_approval_response, parse_approval_response, resolve_approval,
             },
             config::{McpDispatchConfig, MinimumApproval, build_config},
         },
-        mcp_tool_resolve::{McpToolIndex, encode_function_name},
         state::{DeferredMcpConnector, McpApprovalState, McpConnectorContextPolicy, ResponsesState},
     },
     store::{
@@ -48,6 +56,86 @@ use crate::{
     },
     test_utils::{make_filter_context, make_owned_filter_context, make_request},
 };
+
+// -----------------------------------------------------------------------------
+// Responses adapters over the shared executor
+// -----------------------------------------------------------------------------
+
+/// Execute one Responses `function_call` item through the shared executor.
+async fn execute_single_call(
+    tool_call: &serde_json::Value,
+    tool_index: &McpToolIndex<'_>,
+    options: &McpExecutionOptions<'_>,
+    callout: &crate::mcp_client::McpCallout,
+) -> Option<McpCallResult> {
+    execute::execute_single_call(&responses_tool_call(tool_call), tool_index, options, callout).await
+}
+
+/// Parse a Responses `function_call` item's arguments.
+fn parse_call_arguments(
+    tool_call: &serde_json::Value,
+    call_id: &str,
+    server_label: &str,
+    tool_name: &str,
+    approval_request_id: Option<&str>,
+) -> Result<(serde_json::Value, String), Box<McpCallResult>> {
+    execute::parse_call_arguments(
+        tool_call.get("arguments"),
+        call_id,
+        server_label,
+        tool_name,
+        approval_request_id,
+    )
+}
+
+/// Resolve an encoded name with Responses results.
+#[expect(clippy::type_complexity, reason = "mirrors the shared resolver")]
+fn resolve_tool_entry<'a>(
+    tool_index: &McpToolIndex<'a>,
+    encoded_name: &str,
+    call_id: &str,
+    approval_request_id: Option<&str>,
+) -> Result<(&'a (String, String), &'a serde_json::Value), Option<Box<McpCallResult>>> {
+    execute::resolve_tool_entry(tool_index, encoded_name, call_id, approval_request_id)
+}
+
+/// Build a Responses result from a completed MCP call.
+#[expect(clippy::too_many_arguments, reason = "mirrors the result identity fields")]
+fn process_call_result(
+    result: Result<rmcp::model::CallToolResult, crate::mcp_client::McpClientError>,
+    call_id: &str,
+    server_label: &str,
+    tool_name: &str,
+    arguments: &str,
+    approval_request_id: Option<&str>,
+    max_result_bytes: usize,
+) -> McpCallResult {
+    execute::process_call_result(
+        result,
+        &McpCallIdentity {
+            call_id,
+            server_label,
+            tool_name,
+            arguments,
+            approval_request_id,
+        },
+        max_result_bytes,
+    )
+}
+
+/// Fit a Responses result to its retained reservation.
+fn fit_result_or_limit_error(
+    tool_call: &serde_json::Value,
+    result: McpCallResult,
+    retained_limit: usize,
+) -> Result<McpCallResult, McpResultLimitExceeded> {
+    execute::fit_result_or_limit_error(&responses_tool_call(tool_call), result, retained_limit)
+}
+
+/// Payload ceiling for one Responses retained-result reservation.
+fn result_payload_limit(retained_result_limit: usize) -> usize {
+    execute::result_payload_limit::<McpCallResult>(retained_result_limit)
+}
 
 /// Borrow owned test tool calls the way the filter passes them:
 /// the dispatch and approval paths take calls by reference.
@@ -113,7 +201,7 @@ fn budgeted_mcp_call_with_small_result_cap_still_admits_initialize() {
     let execution = reserve_mcp_execution(&mut state, 1, 8_192, 8_192)
         .expect("control response capacity must not depend on the tool result cap");
     let initialize = br#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"x","version":"1"}}}"#;
-    let parse_charge = crate::openai::responses::agentic_loop::budget::mcp_result_charge(initialize).unwrap();
+    let parse_charge = crate::mcp_client::mcp_result_charge(initialize).unwrap();
     assert!(parse_charge <= execution.parse_charge_limit);
     assert_eq!(execution.result_limit, 8_192);
 
@@ -396,14 +484,20 @@ fn parse_approval_filter_invalid_member_type_fails_closed() {
 fn filter_response_body_access() {
     let config = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
     let filter = McpDispatchFilter::from_config(&config).unwrap();
-    assert_eq!(filter.response_body_access(), praxis_filter::BodyAccess::ReadOnly);
+    assert_eq!(
+        filter.response_body_access(),
+        praxis_filter::BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    );
 }
 
 #[test]
 fn filter_request_body_access() {
     let config = serde_yaml::from_str::<serde_yaml::Value>("{}").unwrap();
     let filter = McpDispatchFilter::from_config(&config).unwrap();
-    assert_eq!(filter.request_body_access(), praxis_filter::BodyAccess::ReadOnly);
+    assert_eq!(
+        filter.request_body_access(),
+        praxis_filter::BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    );
 }
 
 #[test]
@@ -2541,11 +2635,11 @@ fn oversized_completed_result_becomes_a_bounded_per_call_error() {
     });
     let result = build_success_result("c1", "srv", "tool", "{}", &"x".repeat(4096), false, None);
 
-    let bounded = super::fit_result_or_limit_error(&call, result, super::MIN_RETAINED_RESULT_BYTES)
+    let bounded = fit_result_or_limit_error(&call, result, MIN_RETAINED_RESULT_BYTES)
         .expect("the fallback must fit its pre-dispatch reservation");
 
     assert!(
-        bounded.retained_bytes().unwrap() <= super::MIN_RETAINED_RESULT_BYTES,
+        bounded.retained_bytes().unwrap() <= MIN_RETAINED_RESULT_BYTES,
         "the retained result must stay within its hard memory bound"
     );
     assert!(
@@ -2560,7 +2654,7 @@ fn oversized_completed_result_becomes_a_bounded_per_call_error() {
 
 #[test]
 fn oversized_approval_id_limit_error_fails_terminally() {
-    let oversized_id = "x".repeat(super::MIN_RETAINED_RESULT_BYTES + 1);
+    let oversized_id = "x".repeat(MIN_RETAINED_RESULT_BYTES + 1);
     let call = json!({
         "name": "weather__get_weather",
         "call_id": "c1",
@@ -2568,7 +2662,7 @@ fn oversized_approval_id_limit_error_fails_terminally() {
     });
     let result = build_success_result("c1", "srv", "tool", "{}", &"x".repeat(4096), false, Some(&oversized_id));
 
-    let outcome = super::fit_result_or_limit_error(&call, result, super::MIN_RETAINED_RESULT_BYTES);
+    let outcome = fit_result_or_limit_error(&call, result, MIN_RETAINED_RESULT_BYTES);
 
     assert!(
         outcome.is_err(),
@@ -2594,11 +2688,11 @@ fn bounded_approval_id_is_preserved_in_limit_error_fallback() {
         Some(&approval_id),
     );
 
-    let bounded = super::fit_result_or_limit_error(&call, result, super::MIN_RETAINED_RESULT_BYTES)
+    let bounded = fit_result_or_limit_error(&call, result, MIN_RETAINED_RESULT_BYTES)
         .expect("a gate-bounded approval id must fit the reservation");
 
     assert!(
-        bounded.retained_bytes().unwrap() <= super::MIN_RETAINED_RESULT_BYTES,
+        bounded.retained_bytes().unwrap() <= MIN_RETAINED_RESULT_BYTES,
         "the retained result must stay within its hard memory bound"
     );
     assert_eq!(
@@ -2636,11 +2730,11 @@ fn oversized_result_fallback_uses_the_call_reservation() {
         Some(&approval_id),
     );
 
-    let bounded = super::fit_result_or_limit_error(&call, result, 2048)
-        .expect("the fallback must fit the call's actual reservation");
+    let bounded =
+        fit_result_or_limit_error(&call, result, 2048).expect("the fallback must fit the call's actual reservation");
 
     assert!(
-        bounded.retained_bytes().unwrap() > super::MIN_RETAINED_RESULT_BYTES,
+        bounded.retained_bytes().unwrap() > MIN_RETAINED_RESULT_BYTES,
         "the test must exercise a fallback above the minimum reservation"
     );
     assert!(
@@ -2942,7 +3036,7 @@ async fn on_request_body_skips_deferred_discovery_when_max_tool_calls_exhausted(
 async fn deferred_discovery_budget_failure_ends_committed_stream_with_sse_error() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.record_ai_metadata("openai_responses_format.stream", "true");
     ctx.extensions.insert(ClientResponseHeadersCommitted);
     let request = json!({"model": "gpt-4.1", "input": "hello", "stream": true, "store": false});
     let mut state = ResponsesState::from_request_body(request.clone());
@@ -3015,7 +3109,7 @@ async fn deferred_discovery_budget_failure_ends_committed_stream_with_sse_error(
     );
     assert!(!body.contains("[DONE]") && !body.starts_with('{'));
     assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
-    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.filter_metadata.get("responses.skip_persist"), Some("true"));
 }
 
 #[tokio::test]
@@ -3032,8 +3126,8 @@ async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.current_filter_id = Some(0);
-    ctx.set_metadata("openai_responses_request.stream", "true");
-    ctx.set_metadata("responses.response_id", "resp_deferred_listing_failure");
+    ctx.record_ai_metadata("openai_responses_request.stream", "true");
+    ctx.record_ai_metadata("responses.response_id", "resp_deferred_listing_failure");
 
     let body_json = json!({
         "model": "gpt-4o-mini",

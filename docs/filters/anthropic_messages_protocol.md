@@ -5,6 +5,12 @@
 
 Normalizes Anthropic Messages protocol headers for native backends.
 
+## Configuration Notes
+
+`default_version` applies only when the caller sends no `anthropic-version`; a caller-supplied version, such as the `2026-10-21` default of Anthropic SDK v2, is forwarded unchanged. The filter does not validate version-specific body rules, so under `2026-10-21` the backend owns rejecting `temperature`, `top_p`, `top_k`, assistant `document` blocks, and non-empty citations on user text blocks. It does not touch credentials: remove `x-api-key` and `authorization` separately when the gateway owns the upstream credential.
+
+A request that uses the MCP connector, as published by `anthropic_messages_request`, is rejected with an Anthropic `invalid_request_error` when the selected cluster declares an `application_provider` other than `anthropic`. Place this filter after `load_balancer` for the check to see the selected cluster; an untagged cluster, or a placement before selection, forwards the request unchanged.
+
 ## Configuration
 
 | Field | Type | Required | Description |

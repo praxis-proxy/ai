@@ -11,6 +11,11 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
+    async fn memory_conversation_creation_is_atomic() -> Result<(), Box<dyn std::error::Error>> {
+        assert_atomic_creation(&praxis_ai_store::memory::InMemoryStore::new()).await
+    }
+
+    #[tokio::test]
     #[cfg(feature = "sqlite")]
     async fn sqlite_item_id_conflicts_are_invalid_input() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
@@ -24,6 +29,7 @@ mod tests {
             None,
         )
         .await?;
+        assert_atomic_creation(&store).await?;
         assert_item_id_conflicts(&store).await
     }
 
@@ -44,12 +50,101 @@ mod tests {
             None,
         )
         .await?;
+        assert_atomic_creation(&store).await?;
         assert_item_id_conflicts(&store).await
     }
 
     // -------------------------------------------------------------------------
     // Test Utilities
     // -------------------------------------------------------------------------
+
+    /// A failure after inserting the parent and first item must roll back both.
+    async fn assert_atomic_creation(store: &dyn ConversationItemStore) -> Result<(), Box<dyn std::error::Error>> {
+        let run = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let owner = StateOwner::from_trusted_parts(format!("atomic-{run}"), "issuer", "alice")?;
+        let other = StateOwner::from_trusted_parts(format!("atomic-{run}"), "issuer", "bob")?;
+        let source = atomic_record(&owner, format!("source-{run}"));
+        store
+            .create_conversation_with_items(&source, &[item(&owner, &source.conversation_id, "existing", 1)])
+            .await?;
+        let target = atomic_record(&owner, format!("target-{run}"));
+        assert_creation_rollback(store, &target).await?;
+        assert_creation_owner(store, &source, &other).await?;
+        store
+            .create_conversation_with_items(&target, &[item(&owner, &target.conversation_id, "before-conflict", 1)])
+            .await?;
+        assert_eq!(
+            store
+                .conversation_history(&owner, &target.conversation_id)
+                .await?
+                .map(|rows| rows.len()),
+            Some(1),
+            "failed item IDs remain reusable"
+        );
+        Ok(())
+    }
+
+    fn atomic_record(owner: &StateOwner, conversation_id: String) -> ConversationRecord {
+        ConversationRecord {
+            conversation_id,
+            owner: owner.clone(),
+            created_at: 1,
+            metadata: json!({"keep":"original"}),
+            messages: json!([]),
+        }
+    }
+
+    async fn assert_creation_rollback(
+        store: &dyn ConversationItemStore,
+        target: &ConversationRecord,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let owner = &target.owner;
+        let id = &target.conversation_id;
+        let failed = store
+            .create_conversation_with_items(
+                target,
+                &[item(owner, id, "before-conflict", 1), item(owner, id, "existing", 2)],
+            )
+            .await;
+        assert!(failed.is_err(), "a duplicate item must reject the whole create");
+        assert!(
+            store.get_conversation(owner, id).await?.is_none(),
+            "parent must roll back"
+        );
+        assert!(
+            store
+                .get_conversation_item(owner, id, "before-conflict")
+                .await?
+                .is_none(),
+            "first item must roll back"
+        );
+        Ok(())
+    }
+
+    async fn assert_creation_owner(
+        store: &dyn ConversationItemStore,
+        source: &ConversationRecord,
+        other: &StateOwner,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            store.get_conversation(other, &source.conversation_id).await?.is_none(),
+            "other owner cannot read parent"
+        );
+        assert!(
+            store.create_conversation_with_items(source, &[]).await.is_err(),
+            "creation cannot replace an existing parent"
+        );
+        assert_eq!(
+            store
+                .get_conversation(&source.owner, &source.conversation_id)
+                .await?
+                .map(|row| row.metadata),
+            Some(json!({"keep":"original"}))
+        );
+        Ok(())
+    }
 
     /// Exercise bounded and unbounded appends, including partial-batch rollback.
     #[expect(

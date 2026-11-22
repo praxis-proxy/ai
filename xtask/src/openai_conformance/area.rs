@@ -21,8 +21,25 @@ pub(super) const CONVERSATIONS_SCOPE: OperationScope =
 pub(super) const RESPONSES_SCOPE: OperationScope =
     OperationScope::new("responses", "Responses", &["/responses"]).without_inherited_security();
 
+/// Files operations selected from the full OpenAI reference.
+///
+/// Inherited security is excluded: the generated Files document declares none
+/// because authentication is deployment-owned, as for Conversations.
+pub(super) const FILES_SCOPE: OperationScope =
+    OperationScope::new("files", "Files", &["/files"]).without_inherited_security();
+
 /// Runtime checks executed while generating the Conversations conformance report.
 const CONVERSATIONS_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
+    RuntimeVerificationCheck {
+        kind: "storage_error_rollback",
+        evidence: "openai::conversations::tests::conformance_conversations_storage_errors_roll_back_mutations",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK conversations storage_error_rollback",
+    },
+    RuntimeVerificationCheck {
+        kind: "error_response_contract",
+        evidence: "openai::conversations::tests::conformance_conversations_declared_errors_match_pinned_contract_and_preserve_owners",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK conversations error_response_contract",
+    },
     RuntimeVerificationCheck {
         kind: "rate_limit_response_contract",
         evidence: "openai::conversations::tests::conformance_conversations_rate_limit_rejects_every_operation_before_store_access",
@@ -72,7 +89,202 @@ const RESPONSES_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
         evidence: "openai::responses::tests::conformance_responses_generated_schema_check_rejects_incomplete_payloads",
         success_sentinel: "PRAXIS_CONFORMANCE_OK responses schema_check_sensitivity",
     },
+    RuntimeVerificationCheck {
+        kind: "persistence_default",
+        evidence: "openai::responses::store::tests::conformance_responses_on_request_body_arms_persistence_for_persisted_response",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses persistence_default",
+    },
+    RuntimeVerificationCheck {
+        kind: "persistence_opt_out",
+        evidence: "openai::responses::store::tests::conformance_responses_on_request_body_does_not_arm_persistence_when_store_false",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses persistence_opt_out",
+    },
+    RuntimeVerificationCheck {
+        kind: "persistence_buffered",
+        evidence: "openai::responses::store::tests::conformance_responses_on_response_body_persists_valid_response",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses persistence_buffered",
+    },
+    RuntimeVerificationCheck {
+        kind: "persistence_streamed",
+        evidence: "openai::responses::store::tests::conformance_responses_on_response_body_persists_streaming_response_at_eos",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses persistence_streamed",
+    },
+    RuntimeVerificationCheck {
+        kind: "lifecycle_retrieve",
+        evidence: "openai::responses::store::tests::conformance_responses_get_response_returns_200_when_found",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses lifecycle_retrieve",
+    },
+    RuntimeVerificationCheck {
+        kind: "lifecycle_missing",
+        evidence: "openai::responses::store::tests::conformance_responses_get_response_returns_404_when_not_found",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses lifecycle_missing",
+    },
+    RuntimeVerificationCheck {
+        kind: "lifecycle_owner_isolation",
+        evidence: "openai::responses::store::tests::conformance_responses_response_endpoints_hide_same_tenant_cross_owner_resources",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses lifecycle_owner_isolation",
+    },
+    RuntimeVerificationCheck {
+        kind: "lifecycle_input_items",
+        evidence: "openai::responses::store::tests::conformance_responses_get_input_items_with_cursor",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses lifecycle_input_items",
+    },
+    RuntimeVerificationCheck {
+        kind: "lifecycle_delete",
+        evidence: "openai::responses::store::tests::conformance_responses_delete_existing_response_returns_200",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses lifecycle_delete",
+    },
+    RuntimeVerificationCheck {
+        kind: "lifecycle_replay",
+        evidence: "openai::responses::store::tests::conformance_responses_replay_returns_events_in_order_ending_with_terminal",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses lifecycle_replay",
+    },
+    RuntimeVerificationCheck {
+        kind: "lifecycle_replay_cursor",
+        evidence: "openai::responses::store::tests::conformance_responses_replay_starting_after_skips_earlier_events",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses lifecycle_replay_cursor",
+    },
+    RuntimeVerificationCheck {
+        kind: "lifecycle_replay_owner",
+        evidence: "openai::responses::store::tests::conformance_responses_replay_cross_owner_returns_404",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses lifecycle_replay_owner",
+    },
+    RuntimeVerificationCheck {
+        kind: "rehydration_previous_response",
+        evidence: "openai::responses::rehydrate::tests::conformance_responses_validates_previous_response_and_sets_metadata",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses rehydration_previous_response",
+    },
+    RuntimeVerificationCheck {
+        kind: "rehydration_conversation",
+        evidence: "openai::responses::rehydrate::tests::conformance_responses_rehydrates_from_conversation_string_id",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses rehydration_conversation",
+    },
+    RuntimeVerificationCheck {
+        kind: "rehydration_conversation_object",
+        evidence: "openai::responses::rehydrate::tests::conformance_responses_rehydrates_from_conversation_object_form",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses rehydration_conversation_object",
+    },
+    RuntimeVerificationCheck {
+        kind: "rehydration_missing",
+        evidence: "openai::responses::rehydrate::tests::conformance_responses_rejects_when_previous_response_not_found",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses rehydration_missing",
+    },
+    RuntimeVerificationCheck {
+        kind: "rehydration_incomplete",
+        evidence: "openai::responses::rehydrate::tests::conformance_responses_rejects_when_status_not_completed",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses rehydration_incomplete",
+    },
+    RuntimeVerificationCheck {
+        kind: "rehydration_owner_isolation",
+        evidence: "openai::responses::rehydrate::tests::conformance_responses_body_first_previous_response_lookup_is_exact_owner_scoped",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses rehydration_owner_isolation",
+    },
+    RuntimeVerificationCheck {
+        kind: "rehydration_restore_json",
+        evidence: "openai::responses::rehydrate::tests::conformance_responses_restores_previous_response_id_into_response_body",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses rehydration_restore_json",
+    },
+    RuntimeVerificationCheck {
+        kind: "rehydration_restore_sse",
+        evidence: "openai::responses::rehydrate::tests::conformance_responses_restores_streaming_across_chunk_boundary",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses rehydration_restore_sse",
+    },
+    RuntimeVerificationCheck {
+        kind: "persistence_pipeline",
+        evidence: "openai::responses::store::tests::conformance_responses_pipeline_persists_after_format_request_body_classification",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK responses persistence_pipeline",
+    },
 ];
+
+/// Runtime checks executed while generating the Files conformance report.
+const FILES_RUNTIME_CHECKS: &[RuntimeVerificationCheck] = &[
+    RuntimeVerificationCheck {
+        kind: "route_dispatch",
+        evidence: "openai::files::tests::conformance_files_routes_match_runtime_registry",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK files route_dispatch",
+    },
+    RuntimeVerificationCheck {
+        kind: "success_response_contract",
+        evidence: "openai::files::tests::conformance_files_success_payloads_match_generated_response_schemas",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK files success_response_contract",
+    },
+    RuntimeVerificationCheck {
+        kind: "schema_check_sensitivity",
+        evidence: "openai::files::tests::conformance_files_generated_schema_check_rejects_invalid_payload",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK files schema_check_sensitivity",
+    },
+    RuntimeVerificationCheck {
+        kind: "error_response_contract",
+        evidence: "openai::files::tests::conformance_files_error_responses_match_pinned_contract",
+        success_sentinel: "PRAXIS_CONFORMANCE_OK files error_response_contract",
+    },
+];
+
+/// Evidence-backed discrepancies for Files operations.
+///
+/// Two kinds, each on every operation returning `OpenAIFile` that oasdiff
+/// reports: `evals` added to `OpenAIFile.purpose`, and an explicit
+/// `type: object` the pinned schema leaves implicit.
+const FILES_CONTRACT_EXCEPTIONS: &[ContractException] = &[
+    files_purpose_exception(
+        "GET",
+        "/files",
+        "responses.200.content.application/json.schema.properties.data.items.properties.purpose.enum.added",
+    ),
+    files_purpose_exception(
+        "GET",
+        "/files/{file_id}",
+        "responses.200.content.application/json.schema.properties.purpose.enum.added",
+    ),
+    files_purpose_exception(
+        "POST",
+        "/files",
+        "responses.200.content.application/json.schema.properties.purpose.enum.added",
+    ),
+    files_object_type_exception(
+        "GET",
+        "/files",
+        "responses.200.content.application/json.schema.properties.data.items.type.added",
+    ),
+    files_object_type_exception(
+        "GET",
+        "/files/{file_id}",
+        "responses.200.content.application/json.schema.type.added",
+    ),
+    files_object_type_exception(
+        "POST",
+        "/files",
+        "responses.200.content.application/json.schema.type.added",
+    ),
+];
+
+/// Declare one `OpenAIFile.purpose` exception.
+const fn files_purpose_exception(method: &'static str, path: &'static str, detail: &'static str) -> ContractException {
+    ContractException {
+        kind: super::model::ContractDriftKind::Response,
+        method: Some(method),
+        path: Some(path),
+        detail,
+        rationale: "the pinned CreateFileRequest.purpose enum accepts evals as an upload purpose, so a round-tripped file can report it, while the pinned OpenAIFile.purpose enum omits it",
+        evidence: "docs/conformance/specs/openai-openapi.yaml: CreateFileRequest.purpose enum includes evals; OpenAIFile.purpose enum omits it",
+    }
+}
+
+/// Declare one `OpenAIFile` explicit object-type exception.
+const fn files_object_type_exception(
+    method: &'static str,
+    path: &'static str,
+    detail: &'static str,
+) -> ContractException {
+    ContractException {
+        kind: super::model::ContractDriftKind::Response,
+        method: Some(method),
+        path: Some(path),
+        detail,
+        rationale: "the generated OpenAIFile schema states `type: object`, which the pinned schema leaves implicit; its properties already make it an object",
+        evidence: "praxis-ai-apis/openai/files/contracts.rs: OpenAiFile derived schema",
+    }
+}
 
 /// Evidence-backed discrepancies for Responses operations.
 const RESPONSES_CONTRACT_EXCEPTIONS: &[ContractException] = &[
@@ -284,6 +496,27 @@ pub(super) const CONFORMANCE_AREAS: &[ApiArea] = &[
         runtime_checks: RESPONSES_RUNTIME_CHECKS,
         contract_exceptions: RESPONSES_CONTRACT_EXCEPTIONS,
     },
+    ApiArea {
+        scope: FILES_SCOPE,
+        implementation_source: "generated:praxis-ai-apis/openai/files",
+        implementation_spec: files_implementation_spec,
+        supported_operations: files_supported_operations,
+        runtime_test_command: "cargo test -p praxis-ai-apis --no-default-features --features openai-files --lib conformance_files_ -- --show-output",
+        runtime_test_args: &[
+            "test",
+            "-p",
+            "praxis-ai-apis",
+            "--no-default-features",
+            "--features",
+            "openai-files",
+            "--lib",
+            "conformance_files_",
+            "--",
+            "--show-output",
+        ],
+        runtime_checks: FILES_RUNTIME_CHECKS,
+        contract_exceptions: FILES_CONTRACT_EXCEPTIONS,
+    },
 ];
 
 /// Generate the Conversations implementation spec from crate code.
@@ -315,6 +548,38 @@ fn conversations_supported_operations() -> Vec<SupportedOperation> {
                 "praxis_ai_apis::openai::conversations_operation_specs::{:?}",
                 spec.operation
             ),
+            contract_declared: spec.declares_contract(),
+        })
+        .collect()
+}
+
+/// Generate the Files implementation spec from crate code.
+fn files_implementation_spec() -> Result<String, String> {
+    #[cfg(feature = "openai-all")]
+    {
+        praxis_ai_apis::openai::files_openapi_json()
+            .map_err(|e| format!("failed to generate Files implementation OpenAPI spec: {e}"))
+    }
+    #[cfg(not(feature = "openai-all"))]
+    {
+        Err(
+            "Files conformance requires the experimental APIs: use cargo xtask or cargo run -p xtask --features openai-all --"
+                .to_owned(),
+        )
+    }
+}
+
+/// Return Files operations from the runtime route table.
+fn files_supported_operations() -> Vec<SupportedOperation> {
+    praxis_ai_apis::openai::files_operation_specs()
+        .iter()
+        .map(|spec| SupportedOperation {
+            method: spec.method().as_str().to_owned(),
+            path: spec.spec_path.to_owned(),
+            area: "Files".to_owned(),
+            mode: coverage_mode(spec.mode()),
+            evidence: format!("praxis_ai_apis::openai::files_operation_specs::{:?}", spec.operation),
+            contract_declared: spec.declares_contract(),
         })
         .collect()
 }
@@ -351,6 +616,7 @@ fn responses_supported_operations() -> Vec<SupportedOperation> {
                 "praxis_ai_apis::openai::responses_operation_specs::{:?}",
                 spec.operation
             ),
+            contract_declared: spec.declares_contract(),
         })
         .collect()
 }

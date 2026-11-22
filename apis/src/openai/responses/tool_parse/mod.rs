@@ -39,7 +39,10 @@ use tracing::{debug, trace};
 
 use self::parser::{ParsedTools, parse_tools};
 use super::bound_body_outcome;
-use crate::{classifier::is_responses_create, json_body::MAX_JSON_BODY_BYTES, promotion::is_promotable_value};
+use crate::{
+    RecordAiMetadata as _, classifier::is_responses_create, json_body::MAX_JSON_BODY_BYTES,
+    promotion::is_promotable_value,
+};
 
 // -----------------------------------------------------------------------------
 // ToolParseFilter
@@ -88,11 +91,11 @@ impl HttpFilter for ToolParseFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -169,11 +172,11 @@ impl HttpFilter for ToolParseFilter {
 /// Write durable metadata that persists across all Pingora lifecycle phases.
 fn write_metadata(ctx: &mut HttpFilterContext<'_>, parsed: &ParsedTools) {
     if parsed.has_tools() {
-        ctx.set_metadata("openai_tool_parse.has_tools", "true");
+        ctx.record_ai_metadata("openai_tool_parse.has_tools", "true");
     }
 
     if parsed.function_count > 0 {
-        ctx.set_metadata("openai_tool_parse.function_count", parsed.function_count.to_string());
+        ctx.record_ai_metadata("openai_tool_parse.function_count", parsed.function_count.to_string());
     }
 
     write_tool_presence_metadata(ctx, parsed);
@@ -181,12 +184,12 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, parsed: &ParsedTools) {
     if let Some(tc) = &parsed.tool_choice {
         let choice = tc.as_str();
         if is_promotable_value(choice) {
-            ctx.set_metadata("openai_tool_parse.tool_choice", choice);
+            ctx.record_ai_metadata("openai_tool_parse.tool_choice", choice);
         }
         if let Some(type_str) = tc.type_str()
             && is_promotable_value(type_str)
         {
-            ctx.set_metadata("openai_tool_parse.tool_choice_type", type_str);
+            ctx.record_ai_metadata("openai_tool_parse.tool_choice_type", type_str);
         }
     }
 }
@@ -204,7 +207,7 @@ fn write_tool_presence_metadata(ctx: &mut HttpFilterContext<'_>, parsed: &Parsed
     ];
     for &(key, present) in flags {
         if present {
-            ctx.set_metadata(key, "true");
+            ctx.record_ai_metadata(key, "true");
         }
     }
 
@@ -213,7 +216,7 @@ fn write_tool_presence_metadata(ctx: &mut HttpFilterContext<'_>, parsed: &Parsed
         .as_ref()
         .and_then(|ws| ws.search_context_size.as_deref())
     {
-        ctx.set_metadata("tool_parse.search_context_size", size);
+        ctx.record_ai_metadata("tool_parse.search_context_size", size);
     }
 }
 
@@ -249,7 +252,7 @@ fn restore_presence_flags(ctx: &mut HttpFilterContext<'_>) -> Result<bool, Filte
 
     let mut any = false;
     for &(meta_key, result_key) in FLAGS {
-        if ctx.get_metadata(meta_key).is_some_and(|v| v == "true") {
+        if ctx.filter_metadata.get(meta_key).is_some_and(|v| v == "true") {
             let results = ctx.filter_results.entry("openai_tool_parse").or_default();
             results.set(result_key, "true")?;
             any = true;
@@ -260,7 +263,7 @@ fn restore_presence_flags(ctx: &mut HttpFilterContext<'_>) -> Result<bool, Filte
 
 /// Restore `function_count` from metadata.
 fn restore_function_count(ctx: &mut HttpFilterContext<'_>) -> Result<bool, FilterError> {
-    if let Some(fc) = ctx.get_metadata("openai_tool_parse.function_count") {
+    if let Some(fc) = ctx.filter_metadata.get("openai_tool_parse.function_count") {
         let fc = fc.to_owned();
         let results = ctx.filter_results.entry("openai_tool_parse").or_default();
         results.set("function_count", fc)?;
@@ -273,14 +276,14 @@ fn restore_function_count(ctx: &mut HttpFilterContext<'_>) -> Result<bool, Filte
 fn restore_tool_choice(ctx: &mut HttpFilterContext<'_>) -> Result<bool, FilterError> {
     let mut any = false;
 
-    if let Some(tc) = ctx.get_metadata("openai_tool_parse.tool_choice") {
+    if let Some(tc) = ctx.filter_metadata.get("openai_tool_parse.tool_choice") {
         let tc = tc.to_owned();
         let results = ctx.filter_results.entry("openai_tool_parse").or_default();
         results.set("tool_choice", tc)?;
         any = true;
     }
 
-    if let Some(tct) = ctx.get_metadata("openai_tool_parse.tool_choice_type") {
+    if let Some(tct) = ctx.filter_metadata.get("openai_tool_parse.tool_choice_type") {
         let tct = tct.to_owned();
         let results = ctx.filter_results.entry("openai_tool_parse").or_default();
         results.set("tool_choice_type", tct)?;

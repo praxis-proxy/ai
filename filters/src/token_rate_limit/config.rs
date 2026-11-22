@@ -57,6 +57,9 @@ use serde::Deserialize;
 ///
 /// - `praxis_trl_unauthenticated_total{rule}`
 ///
+/// - `praxis_trl_quota_source_missing_total{rule}`: shared-quota responses for
+///   which PPE produced no decision; `rule` is the configured rule name.
+///
 /// - `praxis_trl_tokens_reserved_total{rule}`
 ///
 /// - `praxis_trl_tokens_reconciled_total{rule}`
@@ -217,8 +220,9 @@ pub(super) struct TokenRateLimitConfig {
     #[serde(default = "default_max_keys")]
     pub max_keys: usize,
 
-    /// Where every rule's admission state lives: in-process (default,
-    /// one budget per gateway instance) or a shared Redis/Valkey backend (one
+    /// Where every rule's admission state lives. Select `kind: memory` for
+    /// in-process state (one budget per gateway instance), or `kind: redis` /
+    /// `kind: valkey` for shared state (one
     /// budget shared across every gateway instance/replica). One
     /// backend for the whole filter, not per rule -- rules already
     /// share Redis/Valkey key-space isolation via `namespace`/rule-name
@@ -226,7 +230,6 @@ pub(super) struct TokenRateLimitConfig {
     /// benefit, only a separate shared-backend connection per rule pointed at
     /// the same URL. Revisit if a real deployment ever needs to mix
     /// in-process and Redis/Valkey rules in one filter instance.
-    #[serde(default)]
     pub backend: BackendConfig,
 
     /// Filter-wide default per-type weights applied at reconciliation
@@ -235,6 +238,18 @@ pub(super) struct TokenRateLimitConfig {
     /// reserves the estimation/`reserved_tokens` cost unweighted.
     #[serde(default)]
     pub default_weights: super::weights::TokenTypeWeightsConfig,
+
+    /// Reconcile reservations from a PPE token-quota plugin result instead of
+    /// recomputing static token weights inside this filter. Defaults to `false`
+    /// for full compatibility with existing configurations.
+    /// Requires the `token-quota-filter` feature when set to `true`.
+    ///
+    /// Mutually exclusive with both `default_weights` and per-rule `weights`:
+    /// the PPE result must be the single source of quota units.
+    /// Server startup also requires one unconditional response chain ordered
+    /// `token_rate_limit`, `policy`, then `token_count`.
+    #[serde(default)]
+    pub use_token_quota: bool,
 
     /// Optional three-level hierarchy enforcing independent org, team,
     /// and user budgets on each request. Exactly three levels in
@@ -1038,31 +1053,32 @@ pub(super) const DEFAULT_RESERVATION_TIMEOUT: &str = "30s";
 #[serde(try_from = "RawBackendConfig")]
 pub(super) struct BackendConfig {
     /// Which backend implementation to use.
-    #[serde(default)]
     pub kind: BackendKind,
 
     /// Standalone URL or Sentinel topology. The two input forms are mutually
-    /// exclusive and network backends require one; ignored for `kind: memory`.
+    /// exclusive and network backends require one. Memory backends reject both.
     /// TLS is derived from the endpoint scheme, so `rediss://`/`valkeys://`
     /// enable Sentinel TLS without a second boolean that can disagree.
     #[serde(default)]
     pub topology: Option<BackendTopology>,
 
-    /// Validated namespace; operator guidance lives on [`RawBackendConfig`].
+    /// Validated network-backend namespace; operator guidance lives on
+    /// [`RawBackendConfig`].
     #[serde(default)]
     pub namespace: Option<String>,
 
-    /// Validated failure policy; operator guidance lives on [`RawBackendConfig`].
+    /// Validated network-backend failure policy; operator guidance lives on
+    /// [`RawBackendConfig`].
     #[serde(default)]
     pub on_failure: BackendOnFailure,
 
     /// Maximum time to establish a standalone or discovered-primary data
-    /// connection. Defaults to 500ms.
+    /// connection. Network backends default to 500ms; memory backends reject it.
     #[serde(default)]
     pub connect_timeout: Duration,
 
     /// Maximum time to wait for one datastore response or transaction-pool
-    /// permit. Defaults to 500ms.
+    /// permit. Network backends default to 500ms; memory backends reject it.
     #[serde(default)]
     pub operation_timeout: Duration,
 }
@@ -1103,18 +1119,17 @@ impl std::fmt::Debug for BackendTopology {
 /// Raw flat backend fields converted into [`BackendConfig`].
 struct RawBackendConfig {
     /// Backend implementation selector.
-    #[serde(default)]
     kind: BackendKind,
     /// Standalone Redis/Valkey URL. Exactly one of `url` or `sentinel` is
-    /// required for `kind: redis` or `kind: valkey`; they are mutually exclusive.
-    /// Ignored for `kind: memory`. Use `rediss://` or `valkeys://` for verified
+    /// required for `kind: redis` or `kind: valkey`; they are mutually exclusive
+    /// and rejected for `kind: memory`. Use `rediss://` or `valkeys://` for verified
     /// TLS and `${ENV_VAR}` substitution for credentials supplied at deployment.
     #[serde(default)]
     url: Option<String>,
     /// Sentinel topology with ordered endpoints and separate Sentinel/data
     /// credentials. Exactly one of `url` or `sentinel` is required for
-    /// `kind: redis` or `kind: valkey`; they are mutually exclusive. Ignored for
-    /// `kind: memory`. TLS is derived from the endpoint scheme: `rediss://` or
+    /// `kind: redis` or `kind: valkey`; they are mutually exclusive and rejected
+    /// for `kind: memory`. TLS is derived from the endpoint scheme: `rediss://` or
     /// `valkeys://` enables verified TLS without a separate boolean.
     #[serde(default)]
     sentinel: Option<RawSentinelConfig>,
@@ -1122,7 +1137,7 @@ struct RawBackendConfig {
     /// share one Redis/Valkey instance without colliding. The namespace is
     /// configured once for the whole filter, not per rule, so changing it
     /// starts a fresh accounting generation and fresh budgets for every rule
-    /// in that filter. Ignored for `kind: memory`. Defaults to
+    /// in that filter. Rejected for `kind: memory`. Defaults to
     /// `"praxis:token_rate_limit"` when unset.
     ///
     /// The shared backend permanently records a schema-versioned fingerprint for each
@@ -1154,17 +1169,20 @@ struct RawBackendConfig {
     /// in place is deliberately rejected.
     #[serde(default)]
     namespace: Option<String>,
-    /// Expected shared-backend failure behavior. `closed` is the safe default:
+    /// Expected shared-backend failure behavior; rejected for `kind: memory`.
+    /// `closed` is the safe default:
     /// return 503 without calling upstream. `open` explicitly waives enforcement
     /// during dependency outages: call upstream once without a reservation
     /// handle. Configuration mismatches always fail closed. This policy is
     /// separate from the pipeline-level `failure_mode` setting.
     #[serde(default)]
-    on_failure: BackendOnFailure,
-    /// Maximum data-node connection time as a duration string; defaults to 500ms.
+    on_failure: Option<BackendOnFailure>,
+    /// Maximum data-node connection time as a duration string; defaults to 500ms
+    /// for network backends and is rejected for `kind: memory`.
     #[serde(default)]
     connect_timeout: Option<String>,
-    /// Maximum datastore operation time as a duration string; defaults to 500ms.
+    /// Maximum datastore operation time as a duration string; defaults to 500ms
+    /// for network backends and is rejected for `kind: memory`.
     #[serde(default)]
     operation_timeout: Option<String>,
 }
@@ -1237,6 +1255,25 @@ impl TryFrom<RawBackendConfig> for BackendConfig {
     type Error = String;
 
     fn try_from(raw: RawBackendConfig) -> Result<Self, Self::Error> {
+        let memory_setting = [
+            raw.url.as_ref().map(|_| "url"),
+            raw.sentinel.as_ref().map(|_| "sentinel"),
+            raw.namespace.as_ref().map(|_| "namespace"),
+            raw.on_failure.as_ref().map(|_| "on_failure"),
+            raw.connect_timeout.as_ref().map(|_| "connect_timeout"),
+            raw.operation_timeout.as_ref().map(|_| "operation_timeout"),
+        ]
+        .into_iter()
+        .flatten()
+        .next();
+        if matches!(raw.kind, BackendKind::Memory)
+            && let Some(setting) = memory_setting
+        {
+            return Err(format!(
+                "token_rate_limit: backend.{setting} is not valid for backend.kind: memory"
+            ));
+        }
+
         let topology = match (raw.url, raw.sentinel) {
             (Some(url), None) => Some(BackendTopology::Standalone(url)),
             (None, Some(sentinel)) => Some(BackendTopology::Sentinel(Box::new(SentinelConfig {
@@ -1267,7 +1304,7 @@ impl TryFrom<RawBackendConfig> for BackendConfig {
             kind: raw.kind,
             topology,
             namespace: raw.namespace,
-            on_failure: raw.on_failure,
+            on_failure: raw.on_failure.unwrap_or_default(),
             connect_timeout: super::parse_backend_timeout(
                 raw.connect_timeout.as_deref(),
                 "connect_timeout",
@@ -1428,8 +1465,13 @@ pub(super) struct EstimationConfig {
 mod tests {
     use super::*;
 
+    /// Parse fixtures that exercise unrelated fields with an explicit memory backend.
     fn parse(yaml: &str) -> Result<TokenRateLimitConfig, serde_yaml::Error> {
-        serde_yaml::from_str(yaml)
+        if yaml.lines().any(|line| line.starts_with("backend:")) {
+            serde_yaml::from_str(yaml)
+        } else {
+            serde_yaml::from_str(&format!("backend:\n  kind: memory\n{yaml}"))
+        }
     }
 
     /// One catch-all sliding-window rule, so tests can focus on `key:`.

@@ -22,7 +22,7 @@
 //!
 //! This filter reads [`praxis_filter::HttpFilterContext::rewritten_path`] and sets
 //! its own `Host` header. It must be placed **after** any
-//! `path_rewrite`/`url_rewrite` filter in the same chain, and it owns
+//! `path_rewrite`/`url_rewrite` and any selected-upstream body writers in the same chain, and it owns
 //! the `Host` header for the request — do not pair it with another
 //! filter (such as `headers`) that also sets `Host`.
 //!
@@ -263,8 +263,8 @@ impl praxis_filter::HttpFilter for Sigv4SignFilter {
         "aws_sigv4_sign"
     }
 
-    fn request_body_access(&self) -> praxis_filter::BodyAccess {
-        praxis_filter::BodyAccess::ReadOnly
+    fn selected_upstream_request_body_access(&self) -> praxis_filter::BodyAccess {
+        praxis_filter::BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> praxis_filter::BodyMode {
@@ -273,21 +273,29 @@ impl praxis_filter::HttpFilter for Sigv4SignFilter {
         }
     }
 
+    async fn on_request(
+        &self,
+        _ctx: &mut praxis_filter::HttpFilterContext<'_>,
+    ) -> Result<praxis_filter::FilterAction, FilterError> {
+        Ok(praxis_filter::FilterAction::Continue)
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "the linear path/uri/sign/fail-closed/header-set sequence exceeds the 30-line limit"
     )]
-    async fn on_request(
+    async fn on_selected_upstream_request_body(
         &self,
         ctx: &mut praxis_filter::HttpFilterContext<'_>,
-    ) -> Result<praxis_filter::FilterAction, FilterError> {
+        body: &mut Option<bytes::Bytes>,
+    ) -> Result<praxis_filter::SelectedUpstreamBodyOutcome, FilterError> {
         let path_and_query = ctx
             .rewritten_path
             .as_deref()
             .or_else(|| ctx.request.uri.path_and_query().map(http::uri::PathAndQuery::as_str))
             .unwrap_or("/");
 
-        let body = ctx.buffered_request_body.clone().unwrap_or_default();
+        let body = body.as_deref().unwrap_or_default();
         let uri = format!("https://{}{path_and_query}", self.host);
 
         let signed_headers = sign_headers(
@@ -298,7 +306,7 @@ impl praxis_filter::HttpFilter for Sigv4SignFilter {
             ctx.request.method.as_str(),
             &uri,
             std::iter::once(("host", self.host.as_str())),
-            &body,
+            body,
         );
 
         let signed_headers = match signed_headers {
@@ -310,9 +318,9 @@ impl praxis_filter::HttpFilter for Sigv4SignFilter {
                 // to surface — without it an operator sees a bare 503
                 // and cannot tell misconfiguration from an outage.
                 tracing::warn!(error = %e, "aws_sigv4_sign: request signing failed; rejecting with 503");
-                return Ok(praxis_filter::FilterAction::Reject(praxis_filter::Rejection::status(
-                    503,
-                )));
+                return Ok(praxis_filter::SelectedUpstreamBodyOutcome::Reject(
+                    praxis_filter::Rejection::status(503),
+                ));
             },
         };
 
@@ -324,7 +332,7 @@ impl praxis_filter::HttpFilter for Sigv4SignFilter {
             ctx.request_headers_to_set.push((name, value));
         }
 
-        Ok(praxis_filter::FilterAction::Continue)
+        Ok(praxis_filter::SelectedUpstreamBodyOutcome::Continue)
     }
 }
 
@@ -401,7 +409,7 @@ mod tests {
 
     use aws_credential_types::Credentials;
     use http::Method;
-    use praxis_filter::{FilterAction, HttpFilter as _};
+    use praxis_filter::{HttpFilter as _, SelectedUpstreamBodyOutcome};
 
     use super::{DEFAULT_MAX_BODY_BYTES, Sigv4SignConfig, Sigv4SignFilter, parse_sigv4_config};
     use crate::test_utils::{make_filter_context, make_request};
@@ -608,26 +616,35 @@ mod tests {
         let filter = test_filter();
         let request = make_request(Method::POST, "/model/anthropic.claude-3/invoke");
         let mut ctx = make_filter_context(&request);
-        ctx.buffered_request_body = Some(bytes::Bytes::from_static(br#"{"prompt":"hi"}"#));
+        ctx.buffered_request_body = Some(bytes::Bytes::from_static(br#"{"input":"hi"}"#));
+        let mut body = Some(bytes::Bytes::from_static(br#"{"prompt":"hi"}"#));
 
-        let action = filter.on_request(&mut ctx).await.expect("signing must succeed");
-        assert!(matches!(action, FilterAction::Continue));
+        let action = filter
+            .on_selected_upstream_request_body(&mut ctx, &mut body)
+            .await
+            .expect("signing must succeed");
+        assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
 
-        let host = ctx
+        assert!(ctx.request_headers_to_set.iter().any(|(name, value)| {
+            *name == http::header::HOST && value == "bedrock-runtime.us-east-1.amazonaws.com"
+        }));
+
+        let hash = ctx
             .request_headers_to_set
             .iter()
-            .find(|(name, _)| *name == http::header::HOST)
+            .find(|(name, _)| name == "x-amz-content-sha256")
             .map(|(_, value)| value.to_str().expect("ascii"));
         assert_eq!(
-            host,
-            Some("bedrock-runtime.us-east-1.amazonaws.com"),
-            "filter must set its own Host header"
+            hash,
+            Some("14479f4e87d340fe0ca0d522d87a5b3a028ebb1af24fbb8d3ef4553044fc6db6")
         );
 
-        let has_authorization = ctx.request_headers_to_set.iter().any(|(name, value)| {
-            *name == http::header::AUTHORIZATION && value.as_bytes().starts_with(b"AWS4-HMAC-SHA256 ")
-        });
-        assert!(has_authorization, "must set a well-formed Authorization header");
+        assert!(
+            ctx.request_headers_to_set.iter().any(|(name, value)| {
+                *name == http::header::AUTHORIZATION && value.as_bytes().starts_with(b"AWS4-HMAC-SHA256 ")
+            }),
+            "must set a well-formed Authorization header"
+        );
     }
 
     #[tokio::test]
@@ -635,10 +652,13 @@ mod tests {
         let filter = test_filter();
         let request = make_request(Method::POST, "/original/client/path");
         let mut ctx = make_filter_context(&request);
-        ctx.buffered_request_body = Some(bytes::Bytes::new());
+        let mut body = None;
         ctx.rewritten_path = Some("/model/anthropic.claude-3/invoke".to_owned());
 
-        let _action = filter.on_request(&mut ctx).await.expect("signing must succeed");
+        let _action = filter
+            .on_selected_upstream_request_body(&mut ctx, &mut body)
+            .await
+            .expect("signing must succeed");
 
         // Re-derive the signature independently using the rewritten
         // path and compare against what the filter produced, proving
@@ -680,7 +700,7 @@ mod tests {
         let filter = test_filter();
         let request = make_request(Method::POST, "/model/anthropic.claude-3/invoke");
         let mut ctx = make_filter_context(&request);
-        ctx.buffered_request_body = Some(bytes::Bytes::new());
+        let mut body = None;
         // A control character in the rewritten path makes the composed
         // URI unparseable, so `sign_headers` -> `SignableRequest::new`
         // fails at request time. This exercises the runtime fail-closed
@@ -688,11 +708,11 @@ mod tests {
         ctx.rewritten_path = Some("/model/\u{7f}/invoke".to_owned());
 
         let action = filter
-            .on_request(&mut ctx)
+            .on_selected_upstream_request_body(&mut ctx, &mut body)
             .await
             .expect("filter must reject, not error out");
         assert!(
-            matches!(action, FilterAction::Reject(r) if r.status == 503),
+            matches!(action, SelectedUpstreamBodyOutcome::Reject(r) if r.status == 503),
             "a runtime signing failure must fail closed with 503"
         );
         assert!(

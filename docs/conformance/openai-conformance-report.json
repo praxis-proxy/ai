@@ -3,6 +3,7 @@
   "scope": {
     "areas": [
       "Conversations",
+      "Files",
       "Responses"
     ],
     "include_deprecated": false,
@@ -32,11 +33,18 @@
       "projection_sha256": "2da4413ec49e555fb5dc015e13906d92b1016255ca6105bcce2a005fcd10caa8",
       "operations": 14,
       "inherited_security": "deployment"
+    },
+    {
+      "area_id": "files",
+      "area": "Files",
+      "projection_sha256": "ed9723726e09ec9b0638644c759afe6def671d9fd7e41132dbfd18076e0c4fc7",
+      "operations": 5,
+      "inherited_security": "deployment"
     }
   ],
   "capability_coverage": {
-    "total_operations": 15,
-    "covered_operations_count": 15,
+    "total_operations": 20,
+    "covered_operations_count": 20,
     "missing_operations_count": 0,
     "coverage_percent": 100.0,
     "ignored": {
@@ -52,6 +60,13 @@
         "coverage_percent": 100.0
       },
       {
+        "area": "Files",
+        "total": 5,
+        "covered": 5,
+        "missing": 0,
+        "coverage_percent": 100.0
+      },
+      {
         "area": "Responses",
         "total": 7,
         "covered": 7,
@@ -62,7 +77,7 @@
     "by_mode": [
       {
         "mode": "passthrough",
-        "operations": 6
+        "operations": 11
       },
       {
         "mode": "inspect",
@@ -377,6 +392,106 @@
           "mode": "passthrough",
           "evidence": "praxis_ai_apis::openai::responses_operation_specs::CancelResponse"
         }
+      },
+      {
+        "operation": {
+          "method": "DELETE",
+          "path": "/files/{file_id}",
+          "operation": "DELETE /files/{file_id}",
+          "area": "Files",
+          "tag": "Files",
+          "operation_id": "deleteFile",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "DELETE",
+          "path": "/files/{file_id}",
+          "operation": "DELETE /files/{file_id}",
+          "area": "Files",
+          "mode": "passthrough",
+          "evidence": "praxis_ai_apis::openai::files_operation_specs::DeleteFile"
+        }
+      },
+      {
+        "operation": {
+          "method": "GET",
+          "path": "/files",
+          "operation": "GET /files",
+          "area": "Files",
+          "tag": "Files",
+          "operation_id": "listFiles",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "GET",
+          "path": "/files",
+          "operation": "GET /files",
+          "area": "Files",
+          "mode": "passthrough",
+          "evidence": "praxis_ai_apis::openai::files_operation_specs::ListFiles"
+        }
+      },
+      {
+        "operation": {
+          "method": "GET",
+          "path": "/files/{file_id}",
+          "operation": "GET /files/{file_id}",
+          "area": "Files",
+          "tag": "Files",
+          "operation_id": "retrieveFile",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "GET",
+          "path": "/files/{file_id}",
+          "operation": "GET /files/{file_id}",
+          "area": "Files",
+          "mode": "passthrough",
+          "evidence": "praxis_ai_apis::openai::files_operation_specs::RetrieveFile"
+        }
+      },
+      {
+        "operation": {
+          "method": "GET",
+          "path": "/files/{file_id}/content",
+          "operation": "GET /files/{file_id}/content",
+          "area": "Files",
+          "tag": "Files",
+          "operation_id": "downloadFile",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "GET",
+          "path": "/files/{file_id}/content",
+          "operation": "GET /files/{file_id}/content",
+          "area": "Files",
+          "mode": "passthrough",
+          "evidence": "praxis_ai_apis::openai::files_operation_specs::DownloadFile"
+        }
+      },
+      {
+        "operation": {
+          "method": "POST",
+          "path": "/files",
+          "operation": "POST /files",
+          "area": "Files",
+          "tag": "Files",
+          "operation_id": "createFile",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "POST",
+          "path": "/files",
+          "operation": "POST /files",
+          "area": "Files",
+          "mode": "passthrough",
+          "evidence": "praxis_ai_apis::openai::files_operation_specs::CreateFile"
+        }
       }
     ],
     "missing_operations": [],
@@ -408,136 +523,15 @@
         "implementation_source": "generated:praxis-ai-apis/openai/conversations",
         "operation_contracts": {
           "total": 8,
-          "exact": 0,
+          "exact": 8,
           "missing": 0,
-          "drifted": 8,
+          "drifted": 0,
           "request_drifted": 0,
-          "response_drifted": 8,
+          "response_drifted": 0,
           "other_drifted": 0,
-          "exact_percent": 0.0,
+          "exact_percent": 100.0,
           "missing_operations": [],
-          "drifted_operations": [
-            {
-              "operation": {
-                "method": "DELETE",
-                "path": "/conversations/{conversation_id}",
-                "operation": "DELETE /conversations/{conversation_id}"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "DELETE",
-                "path": "/conversations/{conversation_id}/items/{item_id}",
-                "operation": "DELETE /conversations/{conversation_id}/items/{item_id}"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "GET",
-                "path": "/conversations/{conversation_id}",
-                "operation": "GET /conversations/{conversation_id}"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "GET",
-                "path": "/conversations/{conversation_id}/items",
-                "operation": "GET /conversations/{conversation_id}/items"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "GET",
-                "path": "/conversations/{conversation_id}/items/{item_id}",
-                "operation": "GET /conversations/{conversation_id}/items/{item_id}"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "POST",
-                "path": "/conversations",
-                "operation": "POST /conversations"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "POST",
-                "path": "/conversations/{conversation_id}",
-                "operation": "POST /conversations/{conversation_id}"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            },
-            {
-              "operation": {
-                "method": "POST",
-                "path": "/conversations/{conversation_id}/items",
-                "operation": "POST /conversations/{conversation_id}/items"
-              },
-              "has_request_drift": false,
-              "has_response_drift": true,
-              "has_other_drift": false,
-              "request_details": [],
-              "response_details": [
-                "responses.deleted"
-              ],
-              "other_details": []
-            }
-          ]
+          "drifted_operations": []
         },
         "inherited_contract": {
           "exact": true,
@@ -666,7 +660,7 @@
             "evidence": "api.openai.com probe on 2026-07-27: update with null metadata returned 400 invalid_type, update with object metadata returned 200"
           }
         ],
-        "all_exact": false
+        "all_exact": true
       },
       {
         "area_id": "responses",
@@ -795,28 +789,129 @@
           }
         ],
         "all_exact": false
+      },
+      {
+        "area_id": "files",
+        "area": "Files",
+        "implementation_source": "generated:praxis-ai-apis/openai/files",
+        "operation_contracts": {
+          "total": 5,
+          "exact": 5,
+          "missing": 0,
+          "drifted": 0,
+          "request_drifted": 0,
+          "response_drifted": 0,
+          "other_drifted": 0,
+          "exact_percent": 100.0,
+          "missing_operations": [],
+          "drifted_operations": []
+        },
+        "inherited_contract": {
+          "exact": true,
+          "details": []
+        },
+        "upstream_spec_exceptions": [
+          {
+            "kind": "response",
+            "operation": {
+              "method": "GET",
+              "path": "/files",
+              "operation": "GET /files"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.data.items.properties.purpose.enum.added",
+            "rationale": "the pinned CreateFileRequest.purpose enum accepts evals as an upload purpose, so a round-tripped file can report it, while the pinned OpenAIFile.purpose enum omits it",
+            "evidence": "docs/conformance/specs/openai-openapi.yaml: CreateFileRequest.purpose enum includes evals; OpenAIFile.purpose enum omits it"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "GET",
+              "path": "/files/{file_id}",
+              "operation": "GET /files/{file_id}"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.purpose.enum.added",
+            "rationale": "the pinned CreateFileRequest.purpose enum accepts evals as an upload purpose, so a round-tripped file can report it, while the pinned OpenAIFile.purpose enum omits it",
+            "evidence": "docs/conformance/specs/openai-openapi.yaml: CreateFileRequest.purpose enum includes evals; OpenAIFile.purpose enum omits it"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "POST",
+              "path": "/files",
+              "operation": "POST /files"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.purpose.enum.added",
+            "rationale": "the pinned CreateFileRequest.purpose enum accepts evals as an upload purpose, so a round-tripped file can report it, while the pinned OpenAIFile.purpose enum omits it",
+            "evidence": "docs/conformance/specs/openai-openapi.yaml: CreateFileRequest.purpose enum includes evals; OpenAIFile.purpose enum omits it"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "GET",
+              "path": "/files",
+              "operation": "GET /files"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.data.items.type.added",
+            "rationale": "the generated OpenAIFile schema states `type: object`, which the pinned schema leaves implicit; its properties already make it an object",
+            "evidence": "praxis-ai-apis/openai/files/contracts.rs: OpenAiFile derived schema"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "GET",
+              "path": "/files/{file_id}",
+              "operation": "GET /files/{file_id}"
+            },
+            "detail": "responses.200.content.application/json.schema.type.added",
+            "rationale": "the generated OpenAIFile schema states `type: object`, which the pinned schema leaves implicit; its properties already make it an object",
+            "evidence": "praxis-ai-apis/openai/files/contracts.rs: OpenAiFile derived schema"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "POST",
+              "path": "/files",
+              "operation": "POST /files"
+            },
+            "detail": "responses.200.content.application/json.schema.type.added",
+            "rationale": "the generated OpenAIFile schema states `type: object`, which the pinned schema leaves implicit; its properties already make it an object",
+            "evidence": "praxis-ai-apis/openai/files/contracts.rs: OpenAiFile derived schema"
+          }
+        ],
+        "all_exact": true
       }
     ],
     "operation_contracts": {
-      "total": 9,
-      "exact": 0,
+      "total": 14,
+      "exact": 13,
       "missing": 0,
-      "drifted": 9,
+      "drifted": 1,
       "request_drifted": 0,
-      "response_drifted": 9,
+      "response_drifted": 1,
       "other_drifted": 0,
-      "exact_percent": 0.0,
+      "exact_percent": 92.85714285714286,
       "by_area": [
         {
           "area": "Conversations",
           "total": 8,
-          "conformant": 0,
+          "conformant": 8,
           "missing": 0,
-          "drifted": 8,
+          "drifted": 0,
           "request_drifted": 0,
-          "response_drifted": 8,
+          "response_drifted": 0,
           "other_drifted": 0,
-          "conformance_percent": 0.0
+          "conformance_percent": 100.0
+        },
+        {
+          "area": "Files",
+          "total": 5,
+          "conformant": 5,
+          "missing": 0,
+          "drifted": 0,
+          "request_drifted": 0,
+          "response_drifted": 0,
+          "other_drifted": 0,
+          "conformance_percent": 100.0
         },
         {
           "area": "Responses",
@@ -838,6 +933,11 @@
         "details": []
       },
       {
+        "area": "Files",
+        "exact": true,
+        "details": []
+      },
+      {
         "area": "Responses",
         "exact": true,
         "details": []
@@ -846,150 +946,14 @@
     "all_exact": false,
     "fixes_required": {
       "summary": {
-        "operations_to_fix": 9,
+        "operations_to_fix": 1,
         "area_contracts_to_fix": 0,
         "missing_operations": 0,
         "request_drift_operations": 0,
-        "response_drift_operations": 9,
+        "response_drift_operations": 1,
         "other_drift_operations": 0
       },
       "by_operation": [
-        {
-          "operation": {
-            "method": "DELETE",
-            "path": "/conversations/{conversation_id}",
-            "operation": "DELETE /conversations/{conversation_id}"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "DELETE",
-            "path": "/conversations/{conversation_id}/items/{item_id}",
-            "operation": "DELETE /conversations/{conversation_id}/items/{item_id}"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "GET",
-            "path": "/conversations/{conversation_id}",
-            "operation": "GET /conversations/{conversation_id}"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "GET",
-            "path": "/conversations/{conversation_id}/items",
-            "operation": "GET /conversations/{conversation_id}/items"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "GET",
-            "path": "/conversations/{conversation_id}/items/{item_id}",
-            "operation": "GET /conversations/{conversation_id}/items/{item_id}"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "POST",
-            "path": "/conversations",
-            "operation": "POST /conversations"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "POST",
-            "path": "/conversations/{conversation_id}",
-            "operation": "POST /conversations/{conversation_id}"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
-        {
-          "operation": {
-            "method": "POST",
-            "path": "/conversations/{conversation_id}/items",
-            "operation": "POST /conversations/{conversation_id}/items"
-          },
-          "fixes": [
-            {
-              "area": "response",
-              "kind": "response_schema",
-              "summary": "Align the response body schema with the OpenAI spec.",
-              "detail_paths": [
-                "responses.deleted"
-              ]
-            }
-          ]
-        },
         {
           "operation": {
             "method": "POST",
@@ -1022,6 +986,14 @@
         "status": "passed",
         "command": "cargo test -p praxis-ai-apis --no-default-features --features openai-conversations,store-all --lib conformance_conversations_ -- --show-output",
         "checks": [
+          {
+            "kind": "storage_error_rollback",
+            "evidence": "openai::conversations::tests::conformance_conversations_storage_errors_roll_back_mutations"
+          },
+          {
+            "kind": "error_response_contract",
+            "evidence": "openai::conversations::tests::conformance_conversations_declared_errors_match_pinned_contract_and_preserve_owners"
+          },
           {
             "kind": "rate_limit_response_contract",
             "evidence": "openai::conversations::tests::conformance_conversations_rate_limit_rejects_every_operation_before_store_access"
@@ -1068,9 +1040,230 @@
           {
             "kind": "schema_check_sensitivity",
             "evidence": "openai::responses::tests::conformance_responses_generated_schema_check_rejects_incomplete_payloads"
+          },
+          {
+            "kind": "persistence_default",
+            "evidence": "openai::responses::store::tests::conformance_responses_on_request_body_arms_persistence_for_persisted_response"
+          },
+          {
+            "kind": "persistence_opt_out",
+            "evidence": "openai::responses::store::tests::conformance_responses_on_request_body_does_not_arm_persistence_when_store_false"
+          },
+          {
+            "kind": "persistence_buffered",
+            "evidence": "openai::responses::store::tests::conformance_responses_on_response_body_persists_valid_response"
+          },
+          {
+            "kind": "persistence_streamed",
+            "evidence": "openai::responses::store::tests::conformance_responses_on_response_body_persists_streaming_response_at_eos"
+          },
+          {
+            "kind": "lifecycle_retrieve",
+            "evidence": "openai::responses::store::tests::conformance_responses_get_response_returns_200_when_found"
+          },
+          {
+            "kind": "lifecycle_missing",
+            "evidence": "openai::responses::store::tests::conformance_responses_get_response_returns_404_when_not_found"
+          },
+          {
+            "kind": "lifecycle_owner_isolation",
+            "evidence": "openai::responses::store::tests::conformance_responses_response_endpoints_hide_same_tenant_cross_owner_resources"
+          },
+          {
+            "kind": "lifecycle_input_items",
+            "evidence": "openai::responses::store::tests::conformance_responses_get_input_items_with_cursor"
+          },
+          {
+            "kind": "lifecycle_delete",
+            "evidence": "openai::responses::store::tests::conformance_responses_delete_existing_response_returns_200"
+          },
+          {
+            "kind": "lifecycle_replay",
+            "evidence": "openai::responses::store::tests::conformance_responses_replay_returns_events_in_order_ending_with_terminal"
+          },
+          {
+            "kind": "lifecycle_replay_cursor",
+            "evidence": "openai::responses::store::tests::conformance_responses_replay_starting_after_skips_earlier_events"
+          },
+          {
+            "kind": "lifecycle_replay_owner",
+            "evidence": "openai::responses::store::tests::conformance_responses_replay_cross_owner_returns_404"
+          },
+          {
+            "kind": "rehydration_previous_response",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_validates_previous_response_and_sets_metadata"
+          },
+          {
+            "kind": "rehydration_conversation",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_rehydrates_from_conversation_string_id"
+          },
+          {
+            "kind": "rehydration_conversation_object",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_rehydrates_from_conversation_object_form"
+          },
+          {
+            "kind": "rehydration_missing",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_rejects_when_previous_response_not_found"
+          },
+          {
+            "kind": "rehydration_incomplete",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_rejects_when_status_not_completed"
+          },
+          {
+            "kind": "rehydration_owner_isolation",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_body_first_previous_response_lookup_is_exact_owner_scoped"
+          },
+          {
+            "kind": "rehydration_restore_json",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_restores_previous_response_id_into_response_body"
+          },
+          {
+            "kind": "rehydration_restore_sse",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_restores_streaming_across_chunk_boundary"
+          },
+          {
+            "kind": "persistence_pipeline",
+            "evidence": "openai::responses::store::tests::conformance_responses_pipeline_persists_after_format_request_body_classification"
+          }
+        ]
+      },
+      {
+        "area": "Files",
+        "modes": [
+          "passthrough"
+        ],
+        "status": "passed",
+        "command": "cargo test -p praxis-ai-apis --no-default-features --features openai-files --lib conformance_files_ -- --show-output",
+        "checks": [
+          {
+            "kind": "route_dispatch",
+            "evidence": "openai::files::tests::conformance_files_routes_match_runtime_registry"
+          },
+          {
+            "kind": "success_response_contract",
+            "evidence": "openai::files::tests::conformance_files_success_payloads_match_generated_response_schemas"
+          },
+          {
+            "kind": "schema_check_sensitivity",
+            "evidence": "openai::files::tests::conformance_files_generated_schema_check_rejects_invalid_payload"
+          },
+          {
+            "kind": "error_response_contract",
+            "evidence": "openai::files::tests::conformance_files_error_responses_match_pinned_contract"
           }
         ]
       }
     ]
+  },
+  "responses_state_verification": {
+    "profile": "native-responses-stateful",
+    "boundary": "Focused runtime checks of Praxis-owned state; backend generation and Chat translation are outside this claim. A group passes only when the complete Responses runtime suite and all required sentinels pass.",
+    "groups": {
+      "persistence": {
+        "status": "passed",
+        "scope": "Local response persistence: default persistence, store:false, buffered and streamed responses",
+        "command": "cargo test -p praxis-ai-apis --no-default-features --features openai-responses,store-all --lib conformance_responses_ -- --show-output",
+        "checks": [
+          {
+            "kind": "persistence_default",
+            "evidence": "openai::responses::store::tests::conformance_responses_on_request_body_arms_persistence_for_persisted_response"
+          },
+          {
+            "kind": "persistence_opt_out",
+            "evidence": "openai::responses::store::tests::conformance_responses_on_request_body_does_not_arm_persistence_when_store_false"
+          },
+          {
+            "kind": "persistence_buffered",
+            "evidence": "openai::responses::store::tests::conformance_responses_on_response_body_persists_valid_response"
+          },
+          {
+            "kind": "persistence_streamed",
+            "evidence": "openai::responses::store::tests::conformance_responses_on_response_body_persists_streaming_response_at_eos"
+          },
+          {
+            "kind": "persistence_pipeline",
+            "evidence": "openai::responses::store::tests::conformance_responses_pipeline_persists_after_format_request_body_classification"
+          }
+        ]
+      },
+      "rehydration": {
+        "status": "passed",
+        "scope": "Stored previous_response_id and conversation history, rejection and owner isolation, JSON and SSE id restoration",
+        "command": "cargo test -p praxis-ai-apis --no-default-features --features openai-responses,store-all --lib conformance_responses_ -- --show-output",
+        "checks": [
+          {
+            "kind": "rehydration_previous_response",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_validates_previous_response_and_sets_metadata"
+          },
+          {
+            "kind": "rehydration_conversation",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_rehydrates_from_conversation_string_id"
+          },
+          {
+            "kind": "rehydration_conversation_object",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_rehydrates_from_conversation_object_form"
+          },
+          {
+            "kind": "rehydration_missing",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_rejects_when_previous_response_not_found"
+          },
+          {
+            "kind": "rehydration_incomplete",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_rejects_when_status_not_completed"
+          },
+          {
+            "kind": "rehydration_owner_isolation",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_body_first_previous_response_lookup_is_exact_owner_scoped"
+          },
+          {
+            "kind": "rehydration_restore_json",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_restores_previous_response_id_into_response_body"
+          },
+          {
+            "kind": "rehydration_restore_sse",
+            "evidence": "openai::responses::rehydrate::tests::conformance_responses_restores_streaming_across_chunk_boundary"
+          }
+        ]
+      },
+      "lifecycle": {
+        "status": "passed",
+        "scope": "Local retrieval, missing resources, owner isolation, input-item pagination, deletion and stored SSE replay",
+        "command": "cargo test -p praxis-ai-apis --no-default-features --features openai-responses,store-all --lib conformance_responses_ -- --show-output",
+        "checks": [
+          {
+            "kind": "lifecycle_retrieve",
+            "evidence": "openai::responses::store::tests::conformance_responses_get_response_returns_200_when_found"
+          },
+          {
+            "kind": "lifecycle_missing",
+            "evidence": "openai::responses::store::tests::conformance_responses_get_response_returns_404_when_not_found"
+          },
+          {
+            "kind": "lifecycle_owner_isolation",
+            "evidence": "openai::responses::store::tests::conformance_responses_response_endpoints_hide_same_tenant_cross_owner_resources"
+          },
+          {
+            "kind": "lifecycle_input_items",
+            "evidence": "openai::responses::store::tests::conformance_responses_get_input_items_with_cursor"
+          },
+          {
+            "kind": "lifecycle_delete",
+            "evidence": "openai::responses::store::tests::conformance_responses_delete_existing_response_returns_200"
+          },
+          {
+            "kind": "lifecycle_replay",
+            "evidence": "openai::responses::store::tests::conformance_responses_replay_returns_events_in_order_ending_with_terminal"
+          },
+          {
+            "kind": "lifecycle_replay_cursor",
+            "evidence": "openai::responses::store::tests::conformance_responses_replay_starting_after_skips_earlier_events"
+          },
+          {
+            "kind": "lifecycle_replay_owner",
+            "evidence": "openai::responses::store::tests::conformance_responses_replay_cross_owner_returns_404"
+          }
+        ]
+      }
+    }
   }
 }

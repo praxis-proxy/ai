@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.0"
+version = "0.12.1"
 edition = "2024"
 rust-version = "1.96"
 authors = ["Shane Utt <shaneutt@linux.com>"]
@@ -36,8 +36,6 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.7", features = ["derive"] }
 crc32fast = "1.5.2"
 dashmap = "6.2.1"
-# zlib-ng backend: the same one already in the graph, so it adds no crate.
-flate2 = { version = "1.1.10", default-features = false, features = ["zlib-ng"] }
 futures = "0.3.34"
 h2 = "0.4.19"
 http = "1.5.0"
@@ -45,11 +43,10 @@ http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 humantime-serde = "1.1.1"
-jsonschema = { version = "0.60.1", default-features = false }
-nix = { version = "0.31.3", default-features = false, features = ["process", "resource", "signal", "user"] }
+jsonschema = { version = "0.61.2", default-features = false }
+nix = { version = "0.32.0", default-features = false, features = ["process", "resource", "signal", "user"] }
 percent-encoding = "2.3.2"
 notify = "8.2.0"
-object = { version = "0.40.0", default-features = false, features = ["read_core", "elf", "std"] }
 # System OpenSSL bindings, the same crate praxis's rustls provider uses; never
 # with the `vendored` feature, the platform library is the validated module.
 openssl = "0.10.81"
@@ -108,7 +105,7 @@ criterion = { version = "0.8.2", default-features = false, features = ["cargo_be
 prost = "0.14.4"
 prost-build = "0.14.4"
 prost-types = "0.14.4"
-prost-wkt-types = { version = "0.7.2", features = ["vendored-protox"] }
+prost-wkt-types = "0.7.2"
 protox = "0.10.0"
 sync_wrapper = "1.0.2"
 tonic = "0.14.6"
@@ -123,24 +120,25 @@ zstd = "0.14.0"
 # Policy Engine) and the pure-Rust cryptography its plugins carry; praxis-ai
 # forwards that engine through its own `policy-engine` feature instead, on by
 # default and off in the FIPS build (see FIPS_FEATURES in the Makefile).
-praxis-core = { version = "0.8.0", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.8.0", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
-praxis-protocol = { version = "0.8.0", package = "praxis-proxy-protocol" }
-praxis-tls = { version = "0.8.0", package = "praxis-proxy-tls" }
-praxis = { version = "0.8.0", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api", "pingora"] }
+praxis-core = { git = "https://github.com/praxis-proxy/praxis", branch = "main", package = "praxis-proxy-core" }
+praxis-filter = { git = "https://github.com/praxis-proxy/praxis", branch = "main", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
+praxis-protocol = { git = "https://github.com/praxis-proxy/praxis", branch = "main", package = "praxis-proxy-protocol" }
+praxis-tls = { git = "https://github.com/praxis-proxy/praxis", branch = "main", package = "praxis-proxy-tls" }
+praxis = { git = "https://github.com/praxis-proxy/praxis", branch = "main", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api", "pingora"] }
+ppe = { version = "0.6.0", package = "praxis-policy" }
 praxis-test-utils = { path = "tests/utils", default-features = false }
 
 # AI-owned llm-d ext_proc compatibility layer
-praxis-ai-llmd-ext-proc = { version = "0.10.0", path = "integrations/llmd/ext-proc" }
+praxis-ai-llmd-ext-proc = { version = "0.12.1", path = "integrations/llmd/ext-proc" }
 
 # Praxis AI workspace dependencies
-praxis-ai-proxy = { version = "0.10.0", path = "server", default-features = false }
-praxis-ai-filters = { version = "0.10.0", path = "filters", default-features = false }
-praxis-ai-store = { version = "0.10.0", path = "store" }
-praxis-ai-store-backends = { version = "0.10.0", path = "store-backends" }
-praxis-ai-store-lifecycle = { version = "0.10.0", path = "store-lifecycle" }
-praxis-ai-apis = { version = "0.10.0", path = "apis", default-features = false }
-praxis-ai-build-support = { version = "0.10.0", path = "server/build_support" }
+praxis-ai-proxy = { version = "0.12.1", path = "server", default-features = false }
+praxis-ai-filters = { version = "0.12.1", path = "filters", default-features = false }
+praxis-ai-store = { version = "0.12.1", path = "store" }
+praxis-ai-store-backends = { version = "0.12.1", path = "store-backends" }
+praxis-ai-store-lifecycle = { version = "0.12.1", path = "store-lifecycle" }
+praxis-ai-apis = { version = "0.12.1", path = "apis", default-features = false }
+praxis-ai-build-support = { version = "0.12.1", path = "server/build_support" }
 
 # Pingora (temporary fork), at the version praxis builds against; two versions
 # of the fork in one graph do not share types, and the older one carries its

@@ -100,10 +100,10 @@ const COMPACTION_XFAIL_CHILD_TIMEOUT: Duration = Duration::from_secs(180);
 /// See docs/developing/gpu-nightly-suite.md.
 const COMPACTION_XFAIL_MODEL: &str = "qwen3-8b";
 
-/// Pinned Codex model-catalog entry that enables `apply_patch` without requesting
-/// reasoning summaries, which the Responses-to-Chat path cannot translate.
+/// Codex 0.167.0 catalog entry that enables grammar-based `apply_patch`.
+/// The older gpt-5.4 entry was removed and falls back to metadata without it.
 /// The live test rewrites this client-facing slug to the configured vLLM model.
-const CODEX_APPLY_PATCH_MODEL: &str = "gpt-5.4";
+const CODEX_APPLY_PATCH_MODEL: &str = "gpt-5.5";
 
 /// Codex output item types that would indicate an attempted tool call.
 const TOOL_ITEM_TYPES: &[&str] = &["command_execution", "file_change", "mcp_tool_call", "web_search"];
@@ -112,8 +112,8 @@ const TOOL_ITEM_TYPES: &[&str] = &["command_execution", "file_change", "mcp_tool
 // Compaction acceptance constants
 // -----------------------------------------------------------------------------
 //
-// Codex 0.144.1 against a provider named `praxis` does not qualify for remote
-// compaction (`supports_remote_compaction()` is false unless the provider is
+// Pinned Codex (verified 0.144.1 through 0.167.0) against a provider named
+// `praxis` does not qualify for remote compaction (`supports_remote_compaction()` is false unless the provider is
 // `openai`/Azure), and the `token_budget` window-reset feature ships disabled by
 // default. Auto-compaction therefore takes the local inline path
 // (`run_inline_auto_compact_task`), which POSTs the summarization prompt to
@@ -177,7 +177,7 @@ async fn pinned_codex_uses_responses_http_through_full_flow() {
         &codex_bin,
         CodexRunOptions {
             proxy_base_url: &proxy_base_url,
-            model: "test-model",
+            model: CODEX_APPLY_PATCH_MODEL,
             working_dir: working_dir.path(),
             prompt: PROMPT,
             sandbox: "read-only",
@@ -202,6 +202,19 @@ async fn pinned_codex_uses_responses_http_through_full_flow() {
     assert!(
         !requests.is_empty(),
         "Codex should send at least one HTTP request; got none"
+    );
+    // Exercise the same catalog entry as GPU acceptance. A client pin bump can
+    // remove a model's metadata and silently omit apply_patch before inference.
+    let request: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("Codex request should parse");
+    assert!(
+        request["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| {
+                tool["name"] == "apply_patch"
+                    && tool["type"] == "custom"
+                    && tool.pointer("/format/type").and_then(serde_json::Value::as_str) == Some("grammar")
+            })),
+        "pinned Codex must declare grammar-based apply_patch for {CODEX_APPLY_PATCH_MODEL}"
     );
     assert_no_websocket_upgrades(&mut backend).await;
     assert_no_unexpected_methods(&mut backend).await;
@@ -367,6 +380,9 @@ async fn pinned_codex_compaction_crosses_context_window_over_http() {
     run_live_codex_compaction_workflow(&live, proxy_port, config).await;
 }
 
+/// Run the same verifier with default permissions in both live workflows.
+const LIVE_VERIFY_INSTRUCTION: &str = "Run exactly `./verify.sh` with default permissions, omit the sandbox_permissions argument, and confirm it exits 0.";
+
 /// Drive a pinned-Codex apply_patch task through one live Praxis pipeline.
 async fn run_live_codex_apply_patch_workflow(
     live: &CodexLiveConfig,
@@ -387,7 +403,7 @@ async fn run_live_codex_apply_patch_workflow(
         "You MUST use the apply_patch tool exactly once with this exact patch to add result.txt:\n\
          *** Begin Patch\n*** Add File: result.txt\n+{}\n*** End Patch\n\n\
          Do not use exec_command or another tool to write or edit files.\n\
-         After apply_patch succeeds, use exec_command only to run exactly `./verify.sh`.\n\
+         After apply_patch succeeds, use exec_command only for verification. {LIVE_VERIFY_INSTRUCTION}\n\
          Do not answer before verification succeeds. Then summarize what changed. /no_think",
         workspace.expected_content(),
     );
@@ -417,6 +433,11 @@ async fn run_live_codex_apply_patch_workflow(
         stderr = output.stderr
     );
 
+    // Preserve the client trace even when a later workspace or wire assertion fails.
+    eprintln!(
+        "Codex live apply_patch stdout:\n{}\nstderr:\n{}",
+        output.stdout, output.stderr
+    );
     observer.assert_http_only();
     // Check the client-visible tool lifecycle and workspace result before the wire
     // observer assertion. If the model completes without returning a client-tool
@@ -480,7 +501,7 @@ async fn run_live_codex_compaction_workflow(
 2. Read every ballast chapter one at a time (a separate cat command per file, no more than one file per command), in this exact order: {chapter_list}. After each file, briefly acknowledge it before reading the next.
 3. Only after all chapters are read, re-read the token by running exactly: cat secret.txt
 4. Write the token printed in step 3 (and nothing else) into result.txt with exactly: printf '%s' '<TOKEN>' > result.txt  — substitute the exact token you just saw.
-5. Run ./verify.sh and confirm it exits 0.
+5. {LIVE_VERIFY_INSTRUCTION}
 6. Summarize what you changed. /no_think"#
     );
     let proxy_base_url = format!("http://{}:{}", live.listen_address, observer.port());
@@ -504,6 +525,16 @@ async fn run_live_codex_compaction_workflow(
         },
     )
     .await;
+
+    // Wire assertions can fail before the completion checks that include this
+    // output. Keep the captured client evidence in the uploaded test log too.
+    eprintln!(
+        "Codex live compaction: exit={:?}, timed_out={}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        output.timed_out,
+        output.stdout,
+        output.stderr,
+    );
 
     // HARD, always enforced (independent of model capability): the pinned client
     // performed its own inline auto-compaction, a post-compaction request carrying
@@ -570,7 +601,7 @@ fn live_codex_config_replaces_the_provider_credential() {
     assert!(patched.contains(database_url));
     assert!(patched.contains("backend: postgres"));
     assert!(patched.contains("allow_private_database_url: true"));
-    assert!(patched.contains("\"gpt-5.4\": \"qwen3-8b\""));
+    assert!(patched.contains("\"gpt-5.5\": \"qwen3-8b\""));
     assert!(!patched.contains("sqlite://responses.db?mode=rwc"));
     praxis_core::config::Config::from_yaml(&patched).expect("patched live Codex config should parse");
 }
@@ -592,7 +623,7 @@ fn live_native_codex_config_injects_the_provider_credential() {
     assert!(patched.contains(database_url));
     assert!(patched.contains("backend: postgres"));
     assert!(patched.contains("allow_private_database_url: true"));
-    assert!(patched.contains("\"gpt-5.4\": \"qwen3-8b\""));
+    assert!(patched.contains("\"gpt-5.5\": \"qwen3-8b\""));
     assert!(!patched.contains("sqlite://responses.db?mode=rwc"));
     praxis_core::config::Config::from_yaml(&patched).expect("patched live native Codex config should parse");
 }
@@ -2157,6 +2188,7 @@ async fn run_codex(codex_bin: &OsStr, options: CodexRunOptions<'_>) -> CodexOutp
     let config = format!(
         r#"model = "{model}"
 model_provider = "praxis"
+approval_policy = "never"
 web_search = "disabled"
 {compaction_keys}
 [features]
@@ -2539,8 +2571,9 @@ fn live_apply_patch_codex_jsonl_requires_a_completed_result_file_change() {
 
 /// Validate the compaction run's JSONL.
 ///
-/// Pinned Codex 0.144.1 emits exactly one `turn.completed` for the whole
-/// submitted prompt (covering every tool round), so accepted-turn growth is
+/// Pinned Codex (verified 0.144.1 through 0.167.0) emits exactly one
+/// `turn.completed` for the whole submitted prompt (covering every tool
+/// round), so accepted-turn growth is
 /// proven by counting correlated successful `command_execution` items, not
 /// `turn.completed` events.
 ///
@@ -2577,8 +2610,9 @@ fn chapter_labels(command: &str) -> Vec<&str> {
 }
 
 /// Unwraps a single `<shell> -c/-lc '<inner>'` layer and returns the command
-/// Codex actually executed. Pinned Codex 0.144.1 records shell-wrapped
-/// invocations such as `/bin/bash -lc './verify.sh'`; the unit fixtures use the
+/// Codex actually executed. Pinned Codex (verified 0.144.1 through 0.167.0)
+/// records shell-wrapped invocations such as `/bin/bash -lc './verify.sh'`;
+/// the unit fixtures use the
 /// bare form. Only one quoting layer is stripped, which is all Codex adds.
 fn unwrap_shell_command(command: &str) -> &str {
     let trimmed = command.trim();

@@ -11,13 +11,12 @@ readme = "../README.md"
 publish = false
 
 [features]
-# Everything except the FIPS tasks: the dev commands run the proxy and read the
-# OpenAI registries. Experimental APIs require explicit `openai-all`. Off inside
-# the FIPS check image, which needs only `cargo xtask fips` and must not
-# compile the standard proxy build to get it.
+# Developer commands run the proxy and read the OpenAI registries. The
+# FIPS runtime probe runs without these features.
 default = ["dev"]
 dev = [
     "pins",
+    "dep:chrono",
     "dep:praxis-ai",
     "dep:praxis-ai-apis",
     "dep:praxis-core",
@@ -58,10 +57,8 @@ store-all = ["store-postgres", "store-sqlite"]
 workspace = true
 
 [dependencies]
-base64 = { workspace = true }
+chrono = { workspace = true, optional = true }
 clap = { workspace = true }
-flate2 = { workspace = true }
-object = { workspace = true }
 openssl = { workspace = true }
 praxis-ai = { path = "../server", package = "praxis-ai-proxy", default-features = false, optional = true }
 praxis-ai-apis = { workspace = true, optional = true }
@@ -70,8 +67,6 @@ praxis-test-utils = { workspace = true, optional = true }
 quote = { workspace = true, optional = true }
 regex = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"], optional = true }
-# Unconditional: `fips host-check` deserializes the compiled-in certified
-# modules list, and the FIPS xtask build runs without default features.
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true, optional = true }

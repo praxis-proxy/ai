@@ -47,10 +47,6 @@ pub(crate) mod file_search_dispatch;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod history;
 #[cfg(feature = "openai-mcp-tools")]
-pub(crate) mod mcp_admission;
-#[cfg(feature = "openai-mcp-tools")]
-pub(crate) mod mcp_classify;
-#[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_dispatch;
 #[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_tool_resolve;
@@ -204,8 +200,6 @@ mod tests;
 
 #[cfg(feature = "openai-responses")]
 use std::borrow::Cow;
-#[cfg(feature = "openai-responses")]
-use std::io;
 
 use praxis_filter::{BoundUpstreamBodyOutcome, FilterAction, FilterError};
 #[cfg(feature = "openai-responses")]
@@ -218,6 +212,8 @@ use tracing::trace;
 
 #[cfg(feature = "openai-responses")]
 use self::config::ResponsesClassificationConfig;
+#[cfg(feature = "openai-responses")]
+use crate::RecordAiMetadata as _;
 #[cfg(feature = "openai-responses")]
 use crate::{
     classifier::{AiRequestFormat, ClassifiedRequest, is_responses_create},
@@ -251,7 +247,7 @@ const AGENTIC_STREAM_GUARD_KEY: &str = "responses.agentic_stream_guard";
 /// Arm the agentic streaming safety check for the current IRR round.
 #[cfg(feature = "openai-agentic-loop")]
 pub(crate) fn arm_agentic_stream_guard(ctx: &mut HttpFilterContext<'_>) {
-    ctx.set_metadata(AGENTIC_STREAM_GUARD_KEY, "true");
+    ctx.record_ai_metadata(AGENTIC_STREAM_GUARD_KEY, "true");
 }
 
 /// Enforce the agentic streaming safety check after transport selection.
@@ -263,13 +259,13 @@ pub(crate) fn arm_agentic_stream_guard(ctx: &mut HttpFilterContext<'_>) {
 /// backend dispatch while allowing the adapter to run after upstream selection.
 #[cfg(feature = "openai-responses")]
 pub(crate) fn enforce_agentic_stream_guard(ctx: &mut HttpFilterContext<'_>) -> Option<Rejection> {
-    if ctx.get_metadata(AGENTIC_STREAM_GUARD_KEY) != Some("true") {
+    if ctx.filter_metadata.get(AGENTIC_STREAM_GUARD_KEY) != Some("true") {
         return None;
     }
 
-    ctx.set_metadata(AGENTIC_STREAM_GUARD_KEY, "false");
-    let stream_events_armed = ctx.get_metadata("responses.logical_stream") == Some("true");
-    ctx.set_metadata("responses.logical_stream", "false");
+    ctx.record_ai_metadata(AGENTIC_STREAM_GUARD_KEY, "false");
+    let stream_events_armed = ctx.filter_metadata.get("responses.logical_stream") == Some("true");
+    ctx.record_ai_metadata("responses.logical_stream", "false");
 
     (ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming && !stream_events_armed).then(|| {
         error::responses_error_rejection(
@@ -288,17 +284,12 @@ pub(crate) fn bounded_json_size<T: serde::Serialize + ?Sized>(
     value: &T,
     max_bytes: usize,
 ) -> Result<Option<usize>, serde_json::Error> {
-    let mut counter = BoundedJsonCounter {
-        bytes: 0,
-        exceeded: false,
-        max_bytes,
-    };
-    let result = serde_json::to_writer(&mut counter, value);
-    if counter.exceeded {
-        return Ok(None);
+    use praxis_filter::json_size::{JsonSizeError, serialized_len_capped};
+    match serialized_len_capped(value, max_bytes) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(JsonSizeError::LimitExceeded | JsonSizeError::LengthOverflow) => Ok(None),
+        Err(error) => Err(crate::json_body::json_size_error(error)),
     }
-    result?;
-    Ok(Some(counter.bytes))
 }
 
 /// Read newly produced local tool results as request-rail messages.
@@ -395,37 +386,6 @@ pub fn record_local_tool_guardrail_failure(
     };
     state.dispatch_failure = Some(state::DispatchFailure { status, code, message });
     true
-}
-
-/// JSON writer that counts bytes and stops at a fixed ceiling.
-#[cfg(feature = "openai-responses")]
-struct BoundedJsonCounter {
-    /// Bytes accepted so far.
-    bytes: usize,
-    /// Whether a write crossed the configured ceiling.
-    exceeded: bool,
-    /// Maximum accepted bytes.
-    max_bytes: usize,
-}
-
-#[cfg(feature = "openai-responses")]
-impl io::Write for BoundedJsonCounter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let Some(next_bytes) = self.bytes.checked_add(buf.len()) else {
-            self.exceeded = true;
-            return Err(io::Error::other("JSON byte count overflow"));
-        };
-        if next_bytes > self.max_bytes {
-            self.exceeded = true;
-            return Err(io::Error::other("JSON byte limit exceeded"));
-        }
-        self.bytes = next_bytes;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 // -----------------------------------------------------------------------------
@@ -550,12 +510,12 @@ fn compute_mode(classified: &ClassifiedRequest) -> Option<&'static str> {
 /// Write durable metadata that persists across all Pingora lifecycle phases.
 #[cfg(feature = "openai-responses")]
 fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest, mode: Option<&str>) {
-    ctx.set_metadata("openai_responses_request.format", classified.format.as_str());
+    ctx.record_ai_metadata("openai_responses_request.format", classified.format.as_str());
     write_optional_metadata(ctx, classified);
     write_boolean_metadata(ctx, classified);
 
     if let Some(m) = mode {
-        ctx.set_metadata("openai_responses_request.mode", m);
+        ctx.record_ai_metadata("openai_responses_request.mode", m);
     }
 }
 
@@ -565,26 +525,26 @@ fn write_optional_metadata(ctx: &mut HttpFilterContext<'_>, classified: &Classif
     if let Some(model) = &classified.model
         && is_promotable_value(model)
     {
-        ctx.set_metadata("openai_responses_request.model", model.clone());
+        ctx.record_ai_metadata("openai_responses_request.model", model.clone());
     }
 
     if let Some(stream) = classified.stream {
-        ctx.set_metadata("openai_responses_request.stream", if stream { "true" } else { "false" });
+        ctx.record_ai_metadata("openai_responses_request.stream", if stream { "true" } else { "false" });
     }
 
     if let Some(store) = classified.store {
-        ctx.set_metadata("openai_responses_request.store", if store { "true" } else { "false" });
+        ctx.record_ai_metadata("openai_responses_request.store", if store { "true" } else { "false" });
     }
 
     if let Some(background) = classified.background {
-        ctx.set_metadata(
+        ctx.record_ai_metadata(
             "openai_responses_request.background",
             if background { "true" } else { "false" },
         );
     }
 
     if let Some(max_output_tokens) = classified.max_output_tokens {
-        ctx.set_metadata(
+        ctx.record_ai_metadata(
             "openai_responses_request.max_output_tokens",
             max_output_tokens.to_string(),
         );
@@ -595,16 +555,16 @@ fn write_optional_metadata(ctx: &mut HttpFilterContext<'_>, classified: &Classif
 #[cfg(feature = "openai-responses")]
 fn write_boolean_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest) {
     if classified.has_previous_response_id {
-        ctx.set_metadata("openai_responses_request.has_previous_response_id", "true");
+        ctx.record_ai_metadata("openai_responses_request.has_previous_response_id", "true");
     }
     if classified.has_conversation {
-        ctx.set_metadata("openai_responses_request.has_conversation", "true");
+        ctx.record_ai_metadata("openai_responses_request.has_conversation", "true");
     }
     if classified.has_tools {
-        ctx.set_metadata("openai_responses_request.has_tools", "true");
+        ctx.record_ai_metadata("openai_responses_request.has_tools", "true");
     }
     if classified.has_prompt_id {
-        ctx.set_metadata("openai_responses_request.has_prompt_id", "true");
+        ctx.record_ai_metadata("openai_responses_request.has_prompt_id", "true");
     }
 }
 
@@ -805,9 +765,9 @@ fn defaulted_openresponses_item_type(object: &serde_json::Map<String, serde_json
 #[cfg(all(feature = "openai-responses", any(test, feature = "openai-agentic-loop")))]
 pub(crate) fn streamed_round_is_dispatchable(ctx: &HttpFilterContext<'_>, state: &state::ResponsesState) -> bool {
     state.request_body.get("stream").and_then(serde_json::Value::as_bool) != Some(true)
-        || (ctx.get_metadata("responses.stream_completion") == Some("terminal")
+        || (ctx.filter_metadata.get("responses.stream_completion") == Some("terminal")
             && state.response_object.get("status").and_then(serde_json::Value::as_str) == Some("completed")
-            && ctx.get_metadata("responses.stream_parse_error") != Some("true"))
+            && ctx.filter_metadata.get("responses.stream_parse_error") != Some("true"))
 }
 
 /// Arm the two-layer continuation stop (§7.3): `action="done"` ends
@@ -836,10 +796,10 @@ pub(crate) fn fs_arm_stream_stop(ctx: &mut HttpFilterContext<'_>) {
 /// on a pre-existing error, so a stale `action="loop"` cannot survive (#313 P1).
 #[cfg(feature = "openai-responses")]
 pub(crate) fn fs_end_stream_with_error_ctx(ctx: &mut HttpFilterContext<'_>, code: &str, message: &str) {
-    if ctx.get_metadata("responses.stream_error_code").is_none() {
-        ctx.set_metadata("responses.stream_error_code", code);
-        ctx.set_metadata("responses.stream_error_message", message);
-        ctx.set_metadata("responses.skip_persist", "true");
+    if ctx.filter_metadata.get("responses.stream_error_code").is_none() {
+        ctx.record_ai_metadata("responses.stream_error_code", code);
+        ctx.record_ai_metadata("responses.stream_error_message", message);
+        ctx.record_ai_metadata("responses.skip_persist", "true");
     }
     fs_arm_stream_stop(ctx);
 }

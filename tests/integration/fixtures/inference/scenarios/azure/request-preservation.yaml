@@ -1,0 +1,44 @@
+version: 1
+id: azure/request-preservation
+description: Remove the Azure-ignored model while retaining message, tool-schema and extension data and their member order.
+protocol: openai_chat_completions
+example_config: azure/chat-completions-to-openai-fixture.yaml
+upstream_authority: 127.0.0.1:3000
+features:
+  - azure.chat.request.preservation
+turns:
+  - name: remove-model
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - content: Hello
+              role: user
+          tools:
+            - type: function
+              function:
+                name: inspect
+                parameters:
+                  type: object
+                  properties:
+                    zebra:
+                      type: string
+                    alpha:
+                      type: number
+          extra:
+            zebra: 1
+            alpha: 2
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

@@ -7,9 +7,12 @@
 //! value) and `bump-pins` (every site is rewritten together), so the check and
 //! the rewrite cannot disagree about what a bump touches.
 //!
-//! Only mechanical references belong here. Behavioral claims ("verified
-//! against X", observed-behavior comments, replay recordings) stay out on
-//! purpose: changing them is a judgment a person makes after re-validating.
+//! Only mechanical references belong here, plus "verified against X" claims
+//! that an acceptance lane re-proves on every PR: the bump PR cannot merge
+//! until that lane passes against the new version, so the green run is the
+//! re-validation. Other behavioral claims (observed-behavior comments, claims
+//! no lane exercises) stay out on purpose: changing them is a judgment a
+//! person makes after re-validating.
 
 use super::manifest::{self, Manifests};
 
@@ -31,6 +34,9 @@ const VLLM_DEV_ENDPOINT: &str = ".github/workflows/vllm-dev-endpoint.yaml";
 
 /// Baked-model GPU image.
 const CONTAINERFILE: &str = "vllm/Containerfile";
+
+/// Client setup guide.
+const GUIDE: &str = "docs/developing/cli-vllm-through-praxis.md";
 
 // -----------------------------------------------------------------------------
 // Pins
@@ -177,6 +183,7 @@ const OPENCODE_SITES: &[Site] = &[
     site(manifest::OPENCODE, "version = \"{v}\"", 1),
     site(HARNESS, "OPENCODE_PINNED_VERSION: &str = \"{v}\";", 1),
     site(INTEGRATION, "OPENCODE_VERSION: \"{v}\"", 1),
+    site(GUIDE, "prints a bare version such as `{v}`", 1),
 ];
 
 /// `OpenCode` 2.x version sites.
@@ -185,14 +192,21 @@ const OPENCODE_V2_SITES: &[Site] = &[
     site(manifest::OPENCODE_V2, "version_output = \"opencode v{v}\"", 1),
     site(HARNESS, "OPENCODE_V2_PINNED_VERSION: &str = \"{v}\";", 1),
     site(INTEGRATION, "OPENCODE_V2_VERSION: \"{v}\"", 1),
+    site(GUIDE, "prints `opencode v{v}`", 1),
 ];
 
 /// pi version sites.
+///
+/// The guide's "verified against" claims are re-proved by the `pi-cpu` lane,
+/// which runs the guide's own `models.json` through the gateway.
 const PI_SITES: &[Site] = &[
     site(manifest::PI, "version = \"{v}\"", 1),
     site(manifest::PI, "releases/download/v{v}/", 1),
     site(HARNESS, "PI_PINNED_VERSION: &str = \"{v}\";", 1),
     site(INTEGRATION, "PI_VERSION: \"{v}\"", 1),
+    site(GUIDE, "verified against pi {v}", 2),
+    site(GUIDE, "earendil-works/pi/releases/tag/v{v})", 1),
+    site(GUIDE, "pi-coding-agent@{v}`", 1),
 ];
 
 /// Codex version sites.

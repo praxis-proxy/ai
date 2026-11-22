@@ -8,6 +8,7 @@
 import json
 import os
 import signal
+import errno
 import socket
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import tempfile
 import threading
 import time
 from collections import deque
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -27,10 +29,38 @@ FAILOVER_EXAMPLE = ROOT / "examples/configs/inference/fallback-with-provider-tra
 MODEL = "fixture-openai-model"
 
 
-def _port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+def _ports(count: int) -> tuple[int, ...]:
+    # Keep every socket bound until the whole group is chosen: releasing one
+    # before choosing the next allows the OS to return the same port twice.
+    with ExitStack() as stack:
+        sockets = [stack.enter_context(socket.socket()) for _ in range(count)]
+        for sock in sockets:
+            sock.bind(("127.0.0.1", 0))
+        return tuple(sock.getsockname()[1] for sock in sockets)
+
+
+@pytest.mark.parametrize("count", [2, 3])
+def test_port_group_prevents_immediate_reuse(monkeypatch, count):
+    """An allocator that immediately reuses released ports must stay distinct."""
+    socket_type = socket.socket
+    with socket_type() as probe:
+        probe.bind(("127.0.0.1", 0))
+        preferred_port = probe.getsockname()[1]
+
+    class ReusingSocket(socket_type):
+        def bind(self, address):
+            # Emulate a kernel preferring the last released port. If the
+            # group still owns it, a real bind fails and we choose another.
+            try:
+                super().bind((address[0], preferred_port))
+            except OSError as error:
+                if error.errno != errno.EADDRINUSE:
+                    raise
+                super().bind(address)
+
+    monkeypatch.setattr(socket, "socket", ReusingSocket)
+    ports = _ports(count)
+    assert len(set(ports)) == count, "proxy and mock backends must never share a port"
 
 
 def _binary() -> str:
@@ -97,7 +127,7 @@ def _message(content: list[dict], usage: dict, stop_reason: str = "end_turn") ->
     }
 
 
-def _config(proxy_port: int, backend_port: int, api_translation_enabled: bool = True) -> dict:
+def _config(proxy_port: int, backend_port: int) -> dict:
     return {
         "listeners": [{"name": "proxy", "address": f"127.0.0.1:{proxy_port}", "filter_chains": ["main"]}],
         "filter_chains": [{
@@ -108,7 +138,7 @@ def _config(proxy_port: int, backend_port: int, api_translation_enabled: bool = 
                  "clusters": ["anthropic-backend"], "reload": {"enabled": False}},
                 {"filter": "openai_chat_completions_to_anthropic_stream", "max_partial_event_bytes": 1048576,
                  "max_tool_blocks": 256},
-                {"filter": "openai_chat_completions_to_anthropic", "api_translation_enabled": api_translation_enabled,
+                {"filter": "openai_chat_completions_to_anthropic",
                  "max_request_body_bytes": 2097152, "max_response_body_bytes": 1048576},
                 {"filter": "credential_inject", "credentials": [{
                     "name": "anthropic-fixture-secret", "namespace": "grid-fixture", "key": "api-key",
@@ -134,15 +164,47 @@ def _failover_config(proxy_port: int, primary_port: int, fallback_port: int) -> 
     )
 
 
+@pytest.fixture(scope="module", params=["2023-06-01", "2026-10-21"])
+def api_version(request):
+    """Expose the selected contract independently of the SDK client."""
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def client():
-    proxy_port, backend_port = _port(), _port()
+def client(api_version):
+    yield from _versioned_client(api_version)
+
+
+@pytest.fixture(params=[
+    ("2023-06-01", "2026-10-21", True),
+    ("2023-06-01", "2026-10-21", False),
+    ("2026-10-21", "2023-06-01", True),
+    ("2026-10-21", "2023-06-01", False),
+])
+def protocol_client(request):
+    """Exercise conflicting native defaults in either filter order."""
+    version, default, first = request.param
+    for sdk in _versioned_client(version, default, first):
+        yield sdk, version
+
+
+def _versioned_client(version, protocol_version=None, protocol_first=True):
+    """Run a translated route with an optional native protocol filter."""
+    proxy_port, backend_port = _ports(2)
     backend = ThreadingHTTPServer(("127.0.0.1", backend_port), _Handler)
     thread = threading.Thread(target=backend.serve_forever, daemon=True)
     thread.start()
     with tempfile.TemporaryDirectory() as directory:
         config = Path(directory) / "praxis.yaml"
-        config.write_text(json.dumps(_config(proxy_port, backend_port)))
+        settings = _config(proxy_port, backend_port)
+        filters = settings["filter_chains"][0]["filters"]
+        translator = next(f for f in filters if f["filter"] == "openai_chat_completions_to_anthropic")
+        translator["api_version"] = version
+        if protocol_version is not None:
+            protocol = {"filter": "anthropic_messages_protocol", "default_version": protocol_version}
+            position = filters.index(translator) + (0 if protocol_first else 1)
+            filters.insert(position, protocol)
+        config.write_text(json.dumps(settings))
         proc = subprocess.Popen([_binary(), "-c", str(config)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             deadline = time.monotonic() + 10
@@ -171,7 +233,7 @@ def client():
 @pytest.fixture
 def translation_disabled_client():
     """OpenAI client for verifying the disabled server-side translation policy."""
-    proxy_port, backend_port = _port(), _port()
+    proxy_port, backend_port = _ports(2)
     with tempfile.TemporaryDirectory() as directory:
         config = Path(directory) / "praxis.yaml"
         config.write_text(json.dumps(_config(proxy_port, backend_port, api_translation_enabled=False)))
@@ -201,7 +263,7 @@ def translation_disabled_client():
 @pytest.fixture
 def failover_client():
     """OpenAI SDK client backed by the checked-in cross-provider failover example."""
-    proxy_port, primary_port, fallback_port = _port(), _port(), _port()
+    proxy_port, primary_port, fallback_port = _ports(3)
     primary = ThreadingHTTPServer(("127.0.0.1", primary_port), _Handler)
     fallback = ThreadingHTTPServer(("127.0.0.1", fallback_port), _Handler)
     primary_thread = threading.Thread(target=primary.serve_forever, daemon=True)
@@ -258,15 +320,18 @@ def test_json_and_cached_usage(client: OpenAI) -> None:
     assert upstream["model"] == "claude-fixture-model", "selected target model must reach Anthropic"
 
 
-def test_anthropic_backend_wire_headers(client: OpenAI) -> None:
+def test_anthropic_backend_wire_headers(client: OpenAI, api_version) -> None:
     STATE.script(200, "application/json", _message(
         [{"type": "text", "text": "hello"}],
         {"input_tokens": 10, "output_tokens": 4},
     ))
-    client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16)
+    client.chat.completions.create(
+        model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16,
+        extra_headers={"anthropic-version": "caller-version"},
+    )
     path, headers, _upstream = STATE.requests[-1]
     assert path == "/v1/messages", "selected Anthropic requests must use the Messages path"
-    assert headers.get("anthropic-version") == "2023-06-01", (
+    assert headers.get("anthropic-version") == api_version, (
         "the selected Anthropic route must pin the API version on the backend request"
     )
     assert headers.get("x-api-key") == "fixture-only-dummy-token", (
@@ -362,8 +427,8 @@ def test_null_cache_usage(client: OpenAI) -> None:
     assert response.usage.total_tokens == 14, "null cache counters must add no total tokens"
 
 
-def test_streaming_and_terminal_usage(client: OpenAI) -> None:
-    events = (
+def _anthropic_events() -> str:
+    return (
         'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_sdk",'
         '"usage":{"input_tokens":10,"cache_read_input_tokens":1000,'
         '"cache_creation_input_tokens":50}}}\n\n'
@@ -376,6 +441,10 @@ def test_streaming_and_terminal_usage(client: OpenAI) -> None:
         '"usage":{"output_tokens":4}}\n\n'
         'event: message_stop\ndata: {"type":"message_stop"}\n\n'
     )
+
+
+def test_streaming_and_terminal_usage(client: OpenAI) -> None:
+    events = _anthropic_events()
     STATE.script(200, "text/event-stream", events)
     chunks = list(client.chat.completions.create(
         model=MODEL, messages=[{"role": "user", "content": "hi"}], stream=True,
@@ -458,17 +527,69 @@ def test_provider_error_preserves_status(client: OpenAI, status: int) -> None:
     assert body["error"]["type"] == ("rate_limit_error" if status == 429 else "server_error"), "OpenAI error type must match provider status"
 
 
-def test_disabled_translation_names_platform_administrator(translation_disabled_client: OpenAI) -> None:
-    with pytest.raises(APIStatusError) as caught:
-        translation_disabled_client.chat.completions.create(
-            model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16,
-        )
+@pytest.mark.parametrize("field,value", [
+    ("temperature", 0), ("temperature", 1), ("temperature", 0.5),
+    ("top_p", 1), ("top_p", 0.9),
+])
+@pytest.mark.parametrize("stream", [False, True])
+def test_sampling_reaches_upstream_unchanged(client: OpenAI, api_version, field, value, stream) -> None:
+    """Both configured versions forward defaults and non-defaults unchanged."""
+    if stream:
+        STATE.script(200, "text/event-stream", _anthropic_events())
+    else:
+        STATE.script(200, "application/json", _message(
+            [{"type": "text", "text": "hello"}], {"input_tokens": 1, "output_tokens": 1},
+        ))
+    response = client.chat.completions.create(
+        model=MODEL, messages=[{"role": "user", "content": "hi"}],
+        max_tokens=16, stream=stream, extra_body={field: value},
+    )
+    if stream:
+        assert list(response), "streaming sampling requests must reach the backend"
+    else:
+        assert response.choices[0].message.content == "hello"
+    assert STATE.requests[-1][2][field] == value, "sampling must not change"
+    assert STATE.requests[-1][1]["anthropic-version"] == api_version
 
-    assert caught.value.status_code == 503
-    error = caught.value.response.json()["error"]
-    assert error["code"] == "api_translation_disabled"
-    assert "platform administrator has forbidden translation" in error["message"]
-    assert not STATE.requests, "disabled translation must reject before contacting the provider"
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_sampling_rejection_comes_from_upstream(client: OpenAI, api_version, stream) -> None:
+    """The backend owns sampling validation; its error reaches the OpenAI client."""
+    STATE.script(400, "application/json", {
+        "type": "error", "error": {"type": "invalid_request_error", "message": "fixture backend rejected sampling"},
+    })
+    with pytest.raises(APIStatusError) as exc:
+        client.chat.completions.create(
+            model=MODEL, messages=[{"role": "user", "content": "hi"}],
+            max_tokens=16, stream=stream, extra_body={"temperature": 0.5, "top_p": 0.9},
+        )
+    assert exc.value.status_code == 400
+    assert exc.value.response.json()["error"] == {
+        "code": 400, "type": "invalid_request_error", "message": "fixture backend rejected sampling",
+    }
+    assert len(STATE.requests) == 1, "sampling must reach the backend before rejection"
+    _, headers, body = STATE.requests[0]
+    assert headers["anthropic-version"] == api_version
+    assert body["temperature"] == 0.5 and body["top_p"] == 0.9
+
+
+@pytest.mark.parametrize("caller_version", [None, "caller-version"])
+def test_protocol_default_cannot_override_translation(protocol_client, caller_version):
+    """The translator selects the wire version without changing sampling."""
+    sdk, version = protocol_client
+    headers = {} if caller_version is None else {"anthropic-version": caller_version}
+    sampling = {"temperature": 0.5}
+    STATE.script(200, "application/json", _message(
+        [{"type": "text", "text": "hello"}], {"input_tokens": 1, "output_tokens": 1},
+    ))
+    sdk.chat.completions.create(
+        model=MODEL, messages=[{"role": "user", "content": "hi"}], max_tokens=16,
+        extra_headers=headers, extra_body=sampling,
+    )
+    _path, wire_headers, body = STATE.requests[-1]
+    assert wire_headers["anthropic-version"] == version, "translator must own the wire contract"
+    if sampling:
+        assert body["temperature"] == 0.5, "sampling must survive a conflicting native default"
 
 
 if __name__ == "__main__":

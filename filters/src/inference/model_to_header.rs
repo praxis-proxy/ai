@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderName;
+use praxis_ai_apis::RecordAiMetadata as _;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, builtins::JsonBodyFieldFilter,
     parse_filter_config,
@@ -191,7 +192,7 @@ impl HttpFilter for ModelToHeaderFilter {
             .find(|(name, _)| name.as_ref().eq_ignore_ascii_case(self.header.as_str()))
             .map(|(_, value)| value.clone());
         if let Some(model) = model {
-            ctx.set_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, model);
+            ctx.record_ai_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL, model);
         }
         Ok(action)
     }
@@ -268,8 +269,8 @@ mod tests {
         let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
         assert_eq!(
             filter.request_body_access(),
-            BodyAccess::ReadOnly,
-            "body access should delegate to inner"
+            BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Required),
+            "body access should delegate to the required body inspector"
         );
         assert_eq!(
             filter.request_body_mode(),
@@ -512,7 +513,7 @@ mod tests {
 
         drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
         assert_eq!(
-            ctx.get_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL),
+            ctx.filter_metadata.get(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL),
             Some("gpt-x"),
             "model_to_header should publish the promoted body model, not a spoofed client header"
         );
@@ -527,7 +528,7 @@ mod tests {
 
         drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
         assert_eq!(
-            ctx.get_metadata(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL),
+            ctx.filter_metadata.get(crate::llm_metrics::META_MODEL_TO_HEADER_MODEL),
             None,
             "no model in the body should publish no model metadata"
         );

@@ -47,6 +47,7 @@ use super::{
     state::ResponsesState,
 };
 use crate::{
+    RecordAiMetadata as _,
     classifier::is_responses_create,
     json_body::MAX_JSON_BODY_BYTES,
     openai::translation::{
@@ -54,27 +55,6 @@ use crate::{
         reasoning::{ReasoningOptions, validate_requested_reasoning},
     },
 };
-
-/// Metadata recording that request translation completed successfully.
-const ARMED_KEY: &str = "openai_responses_to_chat_completions.armed";
-
-/// Metadata recording the Responses resource creation timestamp.
-const CREATED_AT_KEY: &str = "openai_responses_to_chat_completions.created_at";
-
-/// Metadata recording the upstream response status while headers are mutable.
-const RESPONSE_STATUS_KEY: &str = "openai_responses_to_chat_completions.response_status";
-
-/// Metadata selecting the finite response transformation.
-const RESPONSE_TRANSFORM_KEY: &str = "openai_responses_to_chat_completions.response_transform";
-
-/// Marker for a successful Chat Completions response.
-const RESPONSE_TRANSFORM_SUCCESS: &str = "success";
-
-/// Marker for a finite provider error response.
-const RESPONSE_TRANSFORM_ERROR: &str = "error";
-
-/// Marker for a streaming Chat Completions SSE response.
-const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 
 /// Conservative allowance for the owned Chat request tree and its serialized body.
 const CHAT_REQUEST_SOURCE_MULTIPLIER: usize = 8;
@@ -96,8 +76,42 @@ const CHAT_STREAM_OUTPUT_BASE_ALLOWANCE: usize = 8_192;
 const CHAT_STREAM_ERROR_RESERVE: usize = 16_384;
 /// Vec growth on a one-byte partial frame can exceed the wire multiplier.
 const CHAT_STREAM_MIN_TRANSIENT_CHARGE: usize = 256;
-/// Marker that stops processing provider callbacks after an aggregate overflow.
-const CHAT_STREAM_BUDGET_FAILED: &str = "responses_to_chat_completions.budget_failed";
+/// This filter's state for one translated exchange, kept in `filter_state`
+/// from request translation until the response body ends. Absent means the
+/// request was not translated, so its response is left alone.
+struct Exchange {
+    /// Responses resource creation timestamp, once the translated request
+    /// is forwarded.
+    created_at: Option<u64>,
+    /// How the response body is translated, once its headers arrive.
+    response: Option<ResponseTranslation>,
+}
+
+/// How a translated request's response body is translated back.
+enum ResponseTranslation {
+    /// A finite body, translated at end of stream.
+    Finite(FiniteResponse),
+    /// A Chat Completions SSE stream, converted incrementally. `None` once
+    /// the converter is released after a failed callback.
+    Stream(Option<Box<StreamConverter>>),
+    /// A stream whose aggregate budget overflowed: later provider callbacks
+    /// are dropped.
+    StreamBudgetFailed,
+}
+
+/// A finite provider response, selected while response headers are mutable.
+#[derive(Clone, Copy)]
+enum FiniteResponse {
+    /// A successful Chat Completions response.
+    Success,
+    /// A provider error with its upstream status.
+    Error(http::StatusCode),
+}
+
+/// The creation timestamp recorded for this exchange's Responses resource.
+fn recorded_created_at(ctx: &HttpFilterContext<'_>) -> Option<u64> {
+    ctx.get_filter_state::<Exchange>()?.created_at
+}
 
 /// Final emitted bytes stay charged through downstream response filters and
 /// can be released if another Chat inference round starts on this request.
@@ -137,8 +151,10 @@ struct ChatStreamOutputHandoff(usize);
 /// `message.reasoning_content` alias) and emits it as a reasoning item whose
 /// `content` is `reasoning_text`. Raw reasoning is never placed in the item
 /// summary, which is reserved for safe summaries. No current dialect can
-/// generate a safe summary, so a client that requests `reasoning.summary` (or
-/// the deprecated `reasoning.generate_summary`) is rejected. Streaming responses
+/// generate a safe summary, so `reasoning.summary: "auto"` (and the deprecated
+/// `reasoning.generate_summary`) is treated as best effort and satisfied by
+/// emitting no summary items, while an explicit value such as `"concise"` or
+/// `"detailed"` is rejected, so the capability gap stays loud. Streaming responses
 /// translate `delta.reasoning` (or `delta.reasoning_content`) incrementally into
 /// `response.reasoning_text.delta` events under the same byte limit. On continuation,
 /// raw reasoning is replayed into the following assistant turn's `reasoning` field,
@@ -264,15 +280,36 @@ impl ResponsesToChatCompletionsFilter {
         &self,
         ctx: &HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
+        finite: FiniteResponse,
     ) -> Result<(), FilterError> {
-        match ctx.get_metadata(RESPONSE_TRANSFORM_KEY) {
-            Some(RESPONSE_TRANSFORM_ERROR) => {
-                transform_provider_error(ctx, body, self.config.max_rewritten_body_bytes)?;
+        match finite {
+            FiniteResponse::Error(status) => {
+                transform_provider_error(status, body, self.config.max_rewritten_body_bytes)?;
                 Ok(())
             },
-            Some(RESPONSE_TRANSFORM_SUCCESS) => self.transform_success_response(ctx, body),
-            _ => Err("openai_responses_to_chat_completions: missing finite response transform state".into()),
+            FiniteResponse::Success => self.transform_success_response(ctx, body),
         }
+    }
+
+    /// Translate a complete finite provider body, after reserving its parse
+    /// and echo against the request budget.
+    fn finish_finite_response(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        finite: FiniteResponse,
+    ) -> Result<FilterAction, FilterError> {
+        if !reserve_finite_chat_response(ctx, body.as_deref().unwrap_or_default()) {
+            *body = None;
+            ctx.record_ai_metadata("responses.skip_persist", "true");
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                502,
+                "server_error",
+                CHAT_RESPONSE_OVERFLOW,
+            )));
+        }
+        self.transform_finite_response(ctx, body, finite)?;
+        Ok(FilterAction::Continue)
     }
 
     /// Convert and size-check a successful finite Chat response.
@@ -333,14 +370,13 @@ impl ResponsesToChatCompletionsFilter {
             return Ok(FilterAction::Reject(missing_pipeline_state()));
         };
         let Some(output_allowance) = reserve_chat_stream_snapshots(ctx) else {
-            ctx.set_metadata("responses.skip_persist", "true");
+            ctx.record_ai_metadata("responses.skip_persist", "true");
             return Ok(FilterAction::Reject(responses_error_rejection(
                 502,
                 "server_error",
                 CHAT_RESPONSE_OVERFLOW,
             )));
         };
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_STREAM);
         // Downgrade the reconciled pipeline body mode to `Stream`. A downstream
         // `openai_responses_store` declares `StreamBuffer`, so without this the
         // protocol layer buffers the raw first chunk and, when the store
@@ -367,8 +403,15 @@ impl ResponsesToChatCompletionsFilter {
             self.config.stream_limits(),
             self.config.reasoning,
         );
+        converter.set_include_obfuscation(
+            ctx.extensions
+                .get::<ResponsesState>()
+                .and_then(|state| state.request_body.pointer("/stream_options/include_obfuscation"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
+        );
         converter.budget_output_allowance = output_allowance;
-        ctx.insert_filter_state(converter);
+        resume_stream(ctx, Box::new(converter));
         Ok(FilterAction::Continue)
     }
 
@@ -387,11 +430,15 @@ impl ResponsesToChatCompletionsFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if ctx.get_metadata(CHAT_STREAM_BUDGET_FAILED) == Some("true") {
-            *body = None;
-            return Ok(FilterAction::Continue);
-        }
-        let Some(mut converter) = ctx.remove_filter_state::<StreamConverter>() else {
+        let converter = match ctx.get_filter_state_mut::<Exchange>().and_then(|e| e.response.as_mut()) {
+            Some(ResponseTranslation::StreamBudgetFailed) => {
+                *body = None;
+                return Ok(FilterAction::Continue);
+            },
+            Some(ResponseTranslation::Stream(converter)) => converter.take(),
+            Some(ResponseTranslation::Finite(_)) | None => None,
+        };
+        let Some(mut converter) = converter else {
             return Ok(FilterAction::Continue);
         };
         // The converter owns incomplete Chat SSE framing before it produces a
@@ -510,7 +557,7 @@ impl ResponsesToChatCompletionsFilter {
 
         *body = (!out.is_empty()).then(|| Bytes::from(out));
         if !end_of_stream {
-            ctx.insert_filter_state(converter);
+            resume_stream(ctx, converter);
         }
         Ok(FilterAction::Continue)
     }
@@ -589,14 +636,23 @@ fn release_chat_stream_output_handoff(ctx: &mut HttpFilterContext<'_>, converter
     true
 }
 
+/// Hand the stream converter back to this exchange for the next callback.
+fn resume_stream(ctx: &mut HttpFilterContext<'_>, converter: Box<StreamConverter>) {
+    if let Some(exchange) = ctx.get_filter_state_mut::<Exchange>() {
+        exchange.response = Some(ResponseTranslation::Stream(Some(converter)));
+    }
+}
+
 /// The streaming body runs inside IRR, which discards response-body rejections.
 /// Publish a sticky error and let the downstream stream owner emit it at EOS.
 fn chat_stream_budget_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) -> FilterAction {
     *body = None;
-    ctx.set_metadata(CHAT_STREAM_BUDGET_FAILED, "true");
-    ctx.set_metadata("responses.stream_error_code", "server_error");
-    ctx.set_metadata("responses.stream_error_message", CHAT_RESPONSE_OVERFLOW);
-    ctx.set_metadata("responses.skip_persist", "true");
+    if let Some(exchange) = ctx.get_filter_state_mut::<Exchange>() {
+        exchange.response = Some(ResponseTranslation::StreamBudgetFailed);
+    }
+    ctx.record_ai_metadata("responses.stream_error_code", "server_error");
+    ctx.record_ai_metadata("responses.stream_error_message", CHAT_RESPONSE_OVERFLOW);
+    ctx.record_ai_metadata("responses.skip_persist", "true");
     super::fs_arm_stream_stop(ctx);
     FilterAction::Continue
 }
@@ -697,7 +753,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
     }
 
     fn selected_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -714,7 +770,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
 
     fn may_select_streaming_subrequest_response(&self) -> bool {
@@ -734,7 +790,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        if ctx.get_metadata(ARMED_KEY) != Some("true") {
+        if ctx.get_filter_state::<Exchange>().is_none() {
             return Ok(FilterAction::Continue);
         }
 
@@ -749,17 +805,15 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
             return Ok(non_sse_success_for_streaming_rejection());
         }
 
-        let transform = match finite_response_transform(ctx) {
-            Ok(Some(transform)) => transform,
+        let finite = match finite_response_transform(ctx) {
+            Ok(Some(finite)) => finite,
             Ok(None) => return Ok(FilterAction::Continue),
             Err(action) => return Ok(action),
         };
-        let Some(status) = ctx.response_header.as_ref().map(|response| response.status) else {
-            return Ok(FilterAction::Continue);
-        };
 
-        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, transform);
-        ctx.set_metadata(RESPONSE_STATUS_KEY, status.as_u16().to_string());
+        if let Some(exchange) = ctx.get_filter_state_mut::<Exchange>() {
+            exchange.response = Some(ResponseTranslation::Finite(finite));
+        }
         // Cap core's raw response buffer before the body callback can preflight
         // the Chat parse tree and translated Responses resource.
         if let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() {
@@ -782,29 +836,19 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if ctx.get_metadata(ARMED_KEY) != Some("true") {
-            return Ok(FilterAction::Continue);
-        }
-
-        match ctx.get_metadata(RESPONSE_TRANSFORM_KEY) {
-            Some(RESPONSE_TRANSFORM_STREAM) => Self::transform_stream_response(ctx, body, end_of_stream),
-            Some(_) => {
-                if end_of_stream {
-                    if !reserve_finite_chat_response(ctx, body.as_deref().unwrap_or_default()) {
-                        *body = None;
-                        ctx.set_metadata("responses.skip_persist", "true");
-                        return Ok(FilterAction::Reject(responses_error_rejection(
-                            502,
-                            "server_error",
-                            CHAT_RESPONSE_OVERFLOW,
-                        )));
-                    }
-                    self.transform_finite_response(ctx, body)?;
-                }
-                Ok(FilterAction::Continue)
+        let action = match ctx.get_filter_state::<Exchange>().and_then(|e| e.response.as_ref()) {
+            Some(ResponseTranslation::Stream(_) | ResponseTranslation::StreamBudgetFailed) => {
+                Self::transform_stream_response(ctx, body, end_of_stream)
             },
-            None => Ok(FilterAction::Continue),
+            Some(&ResponseTranslation::Finite(finite)) if end_of_stream => {
+                self.finish_finite_response(ctx, body, finite)
+            },
+            Some(ResponseTranslation::Finite(_)) | None => Ok(FilterAction::Continue),
+        };
+        if end_of_stream {
+            ctx.remove_filter_state::<Exchange>();
         }
+        action
     }
 
     async fn on_selected_upstream_request_body(
@@ -821,7 +865,10 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         };
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         *body = Some(Bytes::from(serialized));
-        ctx.set_metadata(ARMED_KEY, "true");
+        ctx.insert_filter_state(Exchange {
+            created_at: None,
+            response: None,
+        });
         select_terminal_response_mode(ctx, stream);
         if let Some(rejection) = enforce_agentic_stream_guard(ctx) {
             return Ok(SelectedUpstreamBodyOutcome::Reject(rejection));
@@ -831,7 +878,9 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
             .extensions
             .get_mut::<ResponsesState>()
             .map_or(now, |state| *state.response_created_at.get_or_insert(now));
-        ctx.set_metadata(CREATED_AT_KEY, created_at.to_string());
+        if let Some(exchange) = ctx.get_filter_state_mut::<Exchange>() {
+            exchange.created_at = Some(created_at);
+        }
 
         Ok(SelectedUpstreamBodyOutcome::Continue)
     }
@@ -864,7 +913,7 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<SelectedUpstreamBo
     if !is_responses_create(&ctx.request.method, ctx.request.uri.path()) {
         return Some(SelectedUpstreamBodyOutcome::Continue);
     }
-    match ctx.get_metadata("openai_responses_request.format") {
+    match ctx.filter_metadata.get("openai_responses_request.format") {
         Some("openai_responses") => None,
         Some(format) => {
             trace!(
@@ -960,7 +1009,7 @@ fn ensure_previous_response_rehydrated(state: &ResponsesState) -> Result<(), Sel
 
 /// Return the client stream preference captured by the classifier.
 fn request_is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_request.stream").map_or_else(
+    ctx.filter_metadata.get("openai_responses_request.stream").map_or_else(
         || {
             ctx.extensions
                 .get::<ResponsesState>()
@@ -988,29 +1037,12 @@ fn is_non_sse_streaming_success(ctx: &HttpFilterContext<'_>) -> bool {
         && ctx.response_header.as_ref().map(|response| response.status) == Some(http::StatusCode::OK)
 }
 
-/// Read and validate the status captured before response headers were committed.
-fn captured_response_status(ctx: &HttpFilterContext<'_>) -> Result<http::StatusCode, FilterError> {
-    let status = ctx
-        .get_metadata(RESPONSE_STATUS_KEY)
-        .ok_or_else(|| -> FilterError {
-            "openai_responses_to_chat_completions: missing captured response status".into()
-        })?
-        .parse::<u16>()
-        .map_err(|error| -> FilterError {
-            format!("openai_responses_to_chat_completions: invalid captured response status: {error}").into()
-        })?;
-    http::StatusCode::from_u16(status).map_err(|error| -> FilterError {
-        format!("openai_responses_to_chat_completions: invalid captured response status: {error}").into()
-    })
-}
-
 /// Normalize a finite provider error using the response-phase status snapshot.
 fn transform_provider_error(
-    ctx: &HttpFilterContext<'_>,
+    status: http::StatusCode,
     body: &mut Option<Bytes>,
     max_rewritten_body_bytes: usize,
 ) -> Result<(), FilterError> {
-    let status = captured_response_status(ctx)?;
     let normalized = normalize_provider_error(status, body.as_deref().unwrap_or_default());
     let mut transformed = responses_error_body(&normalized.code, &normalized.message);
     if transformed.len() > max_rewritten_body_bytes {
@@ -1025,7 +1057,7 @@ fn transform_provider_error(
 }
 
 /// Select finite success or error handling while response headers are mutable.
-fn finite_response_transform(ctx: &HttpFilterContext<'_>) -> Result<Option<&'static str>, FilterAction> {
+fn finite_response_transform(ctx: &HttpFilterContext<'_>) -> Result<Option<FiniteResponse>, FilterAction> {
     let Some(status) = ctx.response_header.as_ref().map(|response| response.status) else {
         return Ok(None);
     };
@@ -1040,9 +1072,9 @@ fn finite_response_transform(ctx: &HttpFilterContext<'_>) -> Result<Option<&'sta
                 "upstream provider returned an unsupported response representation",
             )));
         }
-        return Ok(Some(RESPONSE_TRANSFORM_SUCCESS));
+        return Ok(Some(FiniteResponse::Success));
     }
-    Ok((status.is_client_error() || status.is_server_error()).then_some(RESPONSE_TRANSFORM_ERROR))
+    Ok((status.is_client_error() || status.is_server_error()).then_some(FiniteResponse::Error(status)))
 }
 
 /// Return whether a successful finite body cannot be safely translated.
@@ -1087,13 +1119,11 @@ fn record_stream_reasoning_replay(ctx: &mut HttpFilterContext<'_>, converter: &m
 fn stream_identity(ctx: &HttpFilterContext<'_>) -> Option<(String, u64)> {
     let state = ctx.extensions.get::<ResponsesState>();
     let response_id = ctx
-        .get_metadata("responses.response_id")
+        .filter_metadata
+        .get("responses.response_id")
         .map(str::to_owned)
         .or_else(|| state.and_then(|state| state.response_id.clone()))?;
-    let created_at = ctx
-        .get_metadata(CREATED_AT_KEY)
-        .and_then(|value| value.parse::<u64>().ok())
-        .or_else(|| state.and_then(|state| state.response_created_at))?;
+    let created_at = recorded_created_at(ctx).or_else(|| state.and_then(|state| state.response_created_at))?;
     Some((response_id, created_at))
 }
 
@@ -1127,12 +1157,11 @@ fn translate_success_response(
         .get::<ResponsesState>()
         .ok_or_else(|| -> FilterError { "openai_responses_to_chat_completions: missing Responses state".into() })?;
     let response_id = ctx
-        .get_metadata("responses.response_id")
+        .filter_metadata
+        .get("responses.response_id")
         .or(state.response_id.as_deref())
         .ok_or_else(|| -> FilterError { "openai_responses_to_chat_completions: missing response id".into() })?;
-    let created_at = ctx
-        .get_metadata(CREATED_AT_KEY)
-        .and_then(|value| value.parse::<u64>().ok())
+    let created_at = recorded_created_at(ctx)
         .or(state.response_created_at)
         .ok_or_else(|| -> FilterError { "openai_responses_to_chat_completions: missing creation timestamp".into() })?;
     let mut response_context =

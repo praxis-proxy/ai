@@ -23,7 +23,7 @@ http = { workspace = true }
 praxis-filter = { workspace = true }
 prost-types = { workspace = true }
 prost = { workspace = true }
-prost-wkt-types = { workspace = true }
+prost-wkt-types = { workspace = true, features = ["vendored-protox"] }
 tonic-prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
