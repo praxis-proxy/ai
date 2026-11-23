@@ -623,3 +623,108 @@ async fn anthropic_web_search_appends_only_messages_and_retains_tool_schemas() {
         assert_eq!(search.requests().len(), 1);
     }
 }
+
+#[cfg(feature = "anthropic-mcp-connector-filter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_mcp_connector_rewrites_only_tools_servers_and_messages() {
+    use praxis_test_utils::{McpMockConfig, McpToolFixture, start_mcp_mock_server_with_config};
+
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather").with_description("Get the weather")],
+        ..McpMockConfig::default()
+    });
+    let server_url = format!("http://{}/mcp", mcp.endpoint());
+    let body = format!(
+        r#"{{
+ "model" : "public-model", "max_tokens":32,
+ "tools": [{{"name":"zebra","input_schema":{{"type":"object","properties":{{"z":{{"type":"string"}},"a":{{"type":"number"}}}}}}}},{{"type":"mcp_toolset","mcp_server_name":"weather"}}],
+ "mcp_servers":[{{"type":"url","url":"{server_url}","name":"weather"}}],
+ "messages":[{{"content":[{{"text":"café ☕","type":"text"}}],"role":"user"}}],
+ "stream":false, "extra":{{"z":1,"a":[2,1]}}
+}}"#
+    );
+    for chunked in [false, true] {
+        let filters = format!(
+            r#"- filter: anthropic_messages_request
+- filter: iterative_request_router
+  initial_step: inference
+  max_iterations: 3
+  steps:
+    - name: inference
+      filters:
+        - filter: anthropic_mcp_connector
+          connectors:
+            - id: weather
+              server_url: {server_url}
+              tool_policy: allow_all
+        - filter: router
+          routes:
+            - path_prefix: /
+              cluster: backend
+        - filter: load_balancer
+          clusters:
+            - name: backend
+              endpoints: ['127.0.0.1:BACKEND_PORT']
+      on_result:
+        - filter: anthropic_mcp_connector
+          key: action
+          value: loop
+          next: inference
+        - default: true
+          done: true"#
+        );
+        let reply = |content, stop_reason| {
+            HttpServerAction::Json {
+            status: 200,
+            body: json!({
+                "id":"msg_contract", "type":"message", "role":"assistant", "model":"public-model",
+                "content":content, "stop_reason":stop_reason,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}
+            })
+            .to_string(),
+        }
+        };
+        let rounds = capture_sequence(
+            &filters,
+            "/v1/messages",
+            body.as_bytes(),
+            chunked,
+            &[("anthropic-beta", "mcp-client-2025-11-20")],
+            "/v1/messages",
+            vec![
+                reply(
+                    json!([{"type":"tool_use","id":"tu_contract","name":"weather__get_weather","input":{"city":"Paris"}}]),
+                    "tool_use",
+                ),
+                reply(json!([{"type":"text","text":"done"}]), "end_turn"),
+            ],
+        )
+        .await;
+        assert_json_changes_only(body.as_bytes(), &rounds[0], &["/tools", "/mcp_servers"]);
+        assert_json_changes_only(body.as_bytes(), &rounds[1], &["/tools", "/mcp_servers", "/messages"]);
+        let original: Value = serde_json::from_str(&body).unwrap();
+        let first: Value = serde_json::from_slice(&rounds[0]).unwrap();
+        // The client tool keeps its schema and position; the toolset becomes
+        // the server's encoded tool in place.
+        assert_json_changes_only(
+            &serde_json::to_vec(&original["tools"][0]).unwrap(),
+            &serde_json::to_vec(&first["tools"][0]).unwrap(),
+            &[],
+        );
+        assert_eq!(
+            first["tools"][1]["name"], "weather__get_weather",
+            "toolset expands in place"
+        );
+        let second: Value = serde_json::from_slice(&rounds[1]).unwrap();
+        assert_json_changes_only(
+            &serde_json::to_vec(&original["messages"][0]).unwrap(),
+            &serde_json::to_vec(&second["messages"][0]).unwrap(),
+            &[],
+        );
+        assert_eq!(
+            second["messages"].as_array().unwrap().len(),
+            3,
+            "re-entry appends the assistant call and the tool result"
+        );
+        assert_eq!(second["messages"][2]["content"][0]["type"], "tool_result");
+    }
+}

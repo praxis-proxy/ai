@@ -400,9 +400,11 @@ pub(super) fn rewrite_tools(
     toolsets: &[ToolsetDecl],
     generated: Vec<Vec<Value>>,
 ) -> Result<Vec<String>, String> {
-    body.remove("mcp_servers");
-    let original = match body.remove("tools") {
-        Some(Value::Array(tools)) => tools,
+    // `shift_remove` and in-place replacement keep every other member's
+    // position; `Map::remove` would swap the last member into the gap.
+    body.shift_remove("mcp_servers");
+    let original = match body.get_mut("tools") {
+        Some(Value::Array(tools)) => std::mem::take(tools),
         _ => Vec::new(),
     };
     let mut by_index: HashMap<usize, (Vec<Value>, Option<&Value>)> = toolsets
@@ -438,8 +440,10 @@ pub(super) fn rewrite_tools(
             rewritten.push(generated);
         }
     }
-    if !rewritten.is_empty() {
-        body.insert("tools".to_owned(), Value::Array(rewritten));
+    if rewritten.is_empty() {
+        body.shift_remove("tools");
+    } else if let Some(tools) = body.get_mut("tools") {
+        *tools = Value::Array(rewritten);
     }
     Ok(generated_names)
 }
@@ -529,13 +533,14 @@ fn prepend_carried_results(message: Value, carried: &mut Vec<Value>, converted: 
     match message {
         Value::Object(mut object) if object.get("role").and_then(Value::as_str) == Some("user") => {
             let mut content = results;
-            match object.remove("content") {
-                Some(Value::Array(blocks)) => content.extend(blocks),
-                Some(Value::String(text)) => content.push(serde_json::json!({"type": "text", "text": text})),
-                Some(other) => content.push(other),
-                None => {},
+            let slot = object.entry("content").or_insert(Value::Null);
+            match std::mem::take(slot) {
+                Value::Array(blocks) => content.extend(blocks),
+                Value::String(text) => content.push(serde_json::json!({"type": "text", "text": text})),
+                Value::Null => {},
+                other => content.push(other),
             }
-            object.insert("content".to_owned(), Value::Array(content));
+            *slot = Value::Array(content);
             Value::Object(object)
         },
         other => {
@@ -565,7 +570,9 @@ fn split_assistant_message(index: usize, message: Value, converted: &mut Vec<Val
     let Value::Object(mut object) = message else {
         return Ok(Vec::new());
     };
-    let Some(Value::Array(blocks)) = object.remove("content") else {
+    // Take the blocks but keep the `content` slot, so every rebuilt turn
+    // keeps the message's original member order.
+    let Some(Value::Array(blocks)) = object.get_mut("content").map(Value::take) else {
         return Ok(Vec::new());
     };
     let mut assistant: Vec<Value> = Vec::new();

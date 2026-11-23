@@ -425,6 +425,50 @@ fn rewrite_drops_empty_tools() {
     assert!(!body.contains_key("tools"));
 }
 
+#[test]
+fn rewrite_and_history_keep_member_order() {
+    let mut body = object(json!({
+        "model": "m",
+        "tools": [{"type": "mcp_toolset", "mcp_server_name": "weather"}],
+        "mcp_servers": [{"type": "url", "url": "https://mcp.example.com/mcp", "name": "weather"}],
+        "messages": [
+            {"role": "assistant", "content": [
+                {"type": "mcp_tool_use", "id": "a", "name": "get_weather", "server_name": "weather", "input": {}},
+                {"type": "mcp_tool_result", "tool_use_id": "a", "content": "sunny"},
+            ], "id": "kept"},
+            {"content": "thanks", "role": "user", "z": 1},
+        ],
+        "stream": false,
+        "extra": 1,
+    }));
+    let parsed = parse_connector(&body, 10).unwrap().unwrap();
+    let generated = vec![vec![mcp_tool_to_custom_tool(
+        "weather",
+        &json!({"name": "get_weather"}),
+    )]];
+    rewrite_tools(&mut body, &parsed.toolsets, generated).unwrap();
+    convert_mcp_history(&mut body).unwrap();
+
+    let keys = |object: &Map<String, Value>| object.keys().cloned().collect::<Vec<_>>();
+    assert_eq!(
+        keys(&body),
+        ["model", "tools", "messages", "stream", "extra"],
+        "removing mcp_servers must not move later members"
+    );
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(
+        keys(messages[0].as_object().unwrap()),
+        ["role", "content", "id"],
+        "a split assistant turn keeps its member order"
+    );
+    assert_eq!(
+        keys(messages[1].as_object().unwrap()),
+        ["content", "role", "z"],
+        "carried results are prepended without moving `content`"
+    );
+    assert_eq!(messages[1]["content"][0]["type"], "tool_result");
+}
+
 // -----------------------------------------------------------------------------
 // History Replay
 // -----------------------------------------------------------------------------
