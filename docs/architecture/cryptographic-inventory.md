@@ -32,7 +32,7 @@ The proxy ships two profiles and the inventory tracks both:
 
 
 `fips ⊆ full`: the FIPS runtime is a subset of the published image. FIPS itself
-is **host-activated** (see [`docs/fips.md`](../fips.md)); no build feature
+is **host-activated** (see [`docs/operations/fips.md`](../operations/fips.md)); no build feature
 asserts validation.
 
 ## Provider selection
@@ -88,7 +88,7 @@ Disposition legend:
 
 - **non-validated** = a FIPS-approvable algorithm executed by the **system
   OpenSSL** `libcrypto`; it becomes validated when the operation runs on a
-  FIPS-activated host, so the remediation is host activation (`docs/fips.md`,
+  FIPS-activated host, so the remediation is host activation (`docs/operations/fips.md`,
   unless noted).
 - **excluded-from-fips** = the operation executes **outside** the validated
   OpenSSL module (in `aws-lc-rs` or RustCrypto) **or** uses a **non-approved**

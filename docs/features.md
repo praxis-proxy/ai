@@ -10,7 +10,7 @@ balancing, rate limiting, compression, CORS, health checks, and credential
 injection, see the [Praxis core documentation][praxis].
 
 For client setup, provider authentication, and build choices, use
-[Client and provider paths](client-provider-paths.md). For operator problems,
+[Choose a client and provider](getting-started/choose-client-and-provider.md). For operator problems,
 required ordering, and examples, use the [capability overview](filters/README.md).
 
 ## Inference routing and transformation
@@ -29,7 +29,7 @@ required ordering, and examples, use the [capability overview](filters/README.md
 
 Native forwarding is available with ordinary standard routing. The state and
 tool capabilities below require experimental managed filters and the selected
-store/tool feature groups; see the [managed recipe](recipes/managed-responses.md).
+store/tool feature groups; see the [managed recipe](guides/managed-responses.md).
 
 - Proxy native Responses API traffic and rebuild enriched request state.
 - Store and rehydrate response history through SQLite or PostgreSQL.
@@ -39,14 +39,15 @@ store/tool feature groups; see the [managed recipe](recipes/managed-responses.md
 - Parse tool configuration and dispatch MCP or web-search tool calls in an
   agentic loop.
 
-See the generated [OpenAI filter inventory](filters/reference.md#openai)
-for the complete list. The [Responses retained-payload budget]
+See the generated filter reference for the complete list: OpenAI request and
+translation filters are under [Client APIs and translation](filters/reference.md#client-apis-and-translation),
+and Responses state and tool filters under [Agents, tools, and state](filters/reference.md#agents-tools-and-state). The [Responses retained-payload budget]
 explains how the agentic loop bounds payload held across inference rounds,
 tools, streaming, and Store operations.
 
 ## Anthropic Messages
 
-Choose [native forwarding or a supported translation path](client-provider-paths.md).
+Choose [native forwarding or a supported translation path](getting-started/choose-client-and-provider.md).
 The detailed [Messages guide](anthropic-messages.md) records SDK version and
 backend qualification limits.
 
@@ -55,7 +56,8 @@ backend qualification limits.
 - Translate request, response, and streaming event formats for compatible
   OpenAI-style backends.
 
-See the generated [Anthropic filter inventory](filters/reference.md#anthropic).
+See the generated [Anthropic filters](filters/reference.md#client-apis-and-translation)
+in the filter reference.
 
 ## Agentic protocols
 
@@ -88,7 +90,7 @@ cargo build -p praxis-ai-proxy --features openai-all,store-sqlite
 ```
 
 The FIPS build defaults to `aws-sigv4-filter`; Responses and certificate-only
-PostgreSQL are explicit opt-ins there too. See [FIPS 140-3](fips.md).
+PostgreSQL are explicit opt-ins there too. See [FIPS 140-3](operations/fips.md).
 Experimental graduation requires the workload and autoscaling coverage tracked
 in [#1717](https://github.com/praxis-proxy/ai/issues/1717).
 

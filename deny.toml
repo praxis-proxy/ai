@@ -78,7 +78,7 @@ reason = "aws-lc-rs runs only JWT signature verification in the full profile; it
 [[bans.features]]
 crate = "quixotic-plecostomus-rustls-openssl"
 deny = ["fips"]
-reason = "FIPS is host-activated (docs/fips.md), not a build feature; this crate's `fips` feature is a no-op and must stay unset so the compliance posture is not asserted by the build."
+reason = "FIPS is host-activated (docs/operations/fips.md), not a build feature; this crate's `fips` feature is a no-op and must stay unset so the compliance posture is not asserted by the build."
 
 [sources]
 unknown-registry = "deny"
