@@ -371,6 +371,8 @@ struct StreamState {
     progress: StreamProgress,
     /// Whether the current text block needs closing.
     text_open: bool,
+    /// Whether the current thinking block needs closing.
+    thinking_open: bool,
     /// Next Anthropic content block index.
     block_index: u32,
     /// Number of distinct tool blocks opened against the configured limit.
@@ -805,11 +807,18 @@ fn transform_delta(
     output: &mut Vec<u8>,
     max_tool_blocks: usize,
 ) -> Result<(), FilterError> {
+    if let Some(reasoning) = delta_reasoning(delta) {
+        close_text_block_if_open(state, output);
+        emit_thinking_delta(state, reasoning, output);
+    }
+
     if let Some(content) = delta.get("content").and_then(Value::as_str) {
+        close_thinking_block_if_open(state, output);
         emit_text_delta(state, content, output);
     }
 
     if let Some(Value::Array(tool_calls)) = delta.get("tool_calls") {
+        close_thinking_block_if_open(state, output);
         close_text_block_if_open(state, output);
         for tc in tool_calls {
             transform_tool_delta(state, tc, output, max_tool_blocks)?;
@@ -1069,6 +1078,9 @@ fn emit_done(state: &mut StreamState, output: &mut Vec<u8>) {
 
 /// Close any open content block at end of stream.
 fn emit_final_block_stop(state: &mut StreamState, output: &mut Vec<u8>) {
+    if is_thinking_block_open(state) {
+        close_thinking_block_if_open(state, output);
+    }
     if is_text_block_open(state) {
         close_text_block_if_open(state, output);
     }
@@ -1141,6 +1153,87 @@ fn map_stop_reason(reason: &str) -> &str {
 /// Check whether a text content block is currently open.
 fn is_text_block_open(state: &StreamState) -> bool {
     state.text_open
+}
+
+/// Upstream delta fields carrying assistant reasoning, in preference order.
+///
+/// vLLM prefers `reasoning` and keeps `reasoning_content` as a deprecated
+/// alias; other backends emit only `reasoning_content`. Both spellings carry
+/// output the backend produced and billed, so both are read. A field that is
+/// present but not a non-empty string produces no block, the same treatment
+/// `content` gets.
+fn delta_reasoning(delta: &Value) -> Option<&str> {
+    ["reasoning", "reasoning_content"].into_iter().find_map(|field| {
+        delta
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|reasoning| !reasoning.is_empty())
+    })
+}
+
+/// Whether the current thinking block needs closing.
+fn is_thinking_block_open(state: &StreamState) -> bool {
+    state.thinking_open
+}
+
+/// Emit a thinking content delta, opening a new block if needed.
+///
+/// Mirrors Anthropic's extended-thinking event sequence: the block opens as
+/// an empty thinking block, deltas append reasoning, and closing emits an
+/// empty `signature_delta` — the upstream Chat Completions protocol has no
+/// signature to carry, so the block cannot be replayed to a native Anthropic
+/// API, but the reasoning itself is preserved.
+fn emit_thinking_delta(state: &mut StreamState, reasoning: &str, output: &mut Vec<u8>) {
+    if !is_thinking_block_open(state) {
+        let idx = get_block_index(state);
+        let content_block = ContentBlock::thinking("");
+        emit_event(
+            output,
+            "content_block_start",
+            &serde_json::json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": content_block
+            }),
+        );
+        state.thinking_open = true;
+    }
+
+    let idx = get_block_index(state);
+    emit_event(
+        output,
+        "content_block_delta",
+        &serde_json::json!({
+            "type": "content_block_delta",
+            "index": idx,
+            "delta": {"type": "thinking_delta", "thinking": reasoning}
+        }),
+    );
+}
+
+/// Close the open thinking block, emitting the empty signature delta.
+fn close_thinking_block_if_open(state: &mut StreamState, output: &mut Vec<u8>) {
+    if !is_thinking_block_open(state) {
+        return;
+    }
+
+    let idx = get_block_index(state);
+    emit_event(
+        output,
+        "content_block_delta",
+        &serde_json::json!({
+            "type": "content_block_delta",
+            "index": idx,
+            "delta": {"type": "signature_delta", "signature": ""}
+        }),
+    );
+    emit_event(
+        output,
+        "content_block_stop",
+        &serde_json::json!({"type": "content_block_stop", "index": idx}),
+    );
+    increment_block_index(state);
+    state.thinking_open = false;
 }
 
 /// Get the current block index.
@@ -1498,6 +1591,84 @@ mod tests {
             Some(&Value::Null),
             "streaming text citations should be null"
         );
+    }
+
+    #[test]
+    fn reasoning_deltas_open_a_thinking_block() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let role = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(role));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let reasoning = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"reasoning_content\":\"let me think\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(reasoning));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+
+        let start = event_data(&out, "content_block_start");
+        assert_pointer(&start, "/index", &Value::from(0_u64));
+        assert_pointer(&start, "/content_block/type", &Value::String("thinking".into()));
+        assert_pointer(&start, "/content_block/signature", &Value::String(String::new()));
+
+        let delta = event_data(&out, "content_block_delta");
+        assert_pointer(&delta, "/delta/type", &Value::String("thinking_delta".into()));
+        assert_pointer(&delta, "/delta/thinking", &Value::String("let me think".into()));
+    }
+
+    #[test]
+    fn text_after_reasoning_closes_the_thinking_block_first() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let reasoning = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"reasoning_content\":\"let me think\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(reasoning));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let text = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(text));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+
+        let signature = event_data(&out, "content_block_delta");
+        assert_pointer(&signature, "/delta/type", &Value::String("signature_delta".into()));
+        assert_pointer(&signature, "/delta/signature", &Value::String(String::new()));
+        assert!(
+            out.contains("content_block_stop"),
+            "the thinking block must close before text opens"
+        );
+
+        let text_start = event_data(&out, "content_block_start");
+        assert_pointer(&text_start, "/index", &Value::from(1_u64));
+        assert_pointer(&text_start, "/content_block/type", &Value::String("text".into()));
+        assert!(out.contains("Hello"));
+    }
+
+    #[test]
+    fn a_reasoning_only_stream_closes_the_thinking_block_at_done() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let role = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(role));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let reasoning = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"reasoning\":\"only thinking\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(reasoning));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let reasoning_out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+        assert!(
+            reasoning_out.contains("thinking_delta"),
+            "the reasoning field is read too: {reasoning_out}"
+        );
+
+        let mut done = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut done, true).unwrap());
+        let out = String::from_utf8(done.unwrap().to_vec()).unwrap();
+
+        assert!(
+            out.contains("signature_delta") && out.contains("content_block_stop"),
+            "DONE must close the open thinking block: {out}"
+        );
+        assert!(out.contains("message_stop"), "the stream still terminates");
     }
 
     #[test]
@@ -3087,6 +3258,11 @@ mod tests {
             expected,
             "{label} should have {expected} open tool blocks"
         );
+    }
+
+    /// Assert one JSON pointer path in an event's data.
+    fn assert_pointer(value: &Value, path: &str, expected: &Value) {
+        assert_eq!(value.pointer(path), Some(expected), "at {path}: {value}");
     }
 
     fn event_data(output: &str, event_type: &str) -> Value {
