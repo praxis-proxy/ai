@@ -1233,6 +1233,7 @@ mod tests {
             vec![
                 vec!["chat_completions_to_bedrock_converse"],
                 vec!["chat_completions_to_bedrock_converse"],
+                vec!["chat_completions_to_bedrock_converse"],
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
@@ -1341,6 +1342,7 @@ mod tests {
                 .map(|feature| feature.status.clone())
                 .collect::<Vec<_>>(),
             vec![
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
@@ -1545,6 +1547,10 @@ mod tests {
                 ),
                 (
                     &"bedrock.converse.response.text".to_owned(),
+                    &vec!["bedrock/basic-nonstream".to_owned()]
+                ),
+                (
+                    &"bedrock.converse.response.reasoning".to_owned(),
                     &vec!["bedrock/basic-nonstream".to_owned()]
                 ),
                 (

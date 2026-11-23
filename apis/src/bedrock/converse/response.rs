@@ -178,6 +178,10 @@ fn extract_message_content(message: &Value) -> Result<(Value, Vec<Value>), Strin
             text_parts.push(text);
         } else if let Some(tool_use) = block.get("toolUse") {
             tool_calls.push(translate_tool_use_block(tool_use)?);
+        } else if block.get("reasoningContent").is_some_and(Value::is_object) {
+            // Chat Completions has no response field for Bedrock reasoning.
+            // Streaming omits this recognized union member while preserving
+            // surrounding text, so finite responses follow the same policy.
         } else {
             return Err("unsupported Bedrock response content block".to_owned());
         }
@@ -667,6 +671,49 @@ mod tests {
         assert_eq!(result["usage"]["prompt_tokens"], 20);
         assert_eq!(result["usage"]["completion_tokens"], 8);
         assert_eq!(result["usage"]["total_tokens"], 28);
+    }
+
+    #[test]
+    fn transform_response_preserves_text_beside_reasoning_content() {
+        let bedrock = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"reasoningContent": {"reasoningText": {"text": "Thinking"}}},
+                        {"text": "2"}
+                    ]
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 5, "outputTokens": 10, "totalTokens": 15}
+        });
+
+        let body = serde_json::to_vec(&bedrock).unwrap();
+        let result: Value = serde_json::from_slice(&transform_response(&body, MODEL, ID).unwrap()).unwrap();
+
+        assert_eq!(result["choices"][0]["message"]["content"], "2");
+        assert_eq!(result["choices"][0]["finish_reason"], "stop");
+        assert_eq!(result["usage"]["total_tokens"], 15);
+    }
+
+    #[test]
+    fn transform_response_rejects_malformed_reasoning_content() {
+        let bedrock = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"reasoningContent": "not an object"},
+                        {"text": "must not survive a malformed response"}
+                    ]
+                }
+            },
+            "stopReason": "end_turn"
+        });
+
+        let error = transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap_err();
+        assert_eq!(error, "unsupported Bedrock response content block");
     }
 
     #[test]

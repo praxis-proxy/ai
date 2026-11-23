@@ -1227,8 +1227,8 @@
           "feature": "reasoning-content",
           "label": "Reasoning / thinking content",
           "status": "dropped",
-          "note": "Streaming reasoningContent deltas return Ok(None) with no output and no error. Citation, toolResult and image deltas take the same path and vanish silently.",
-          "evidence": "apis/src/bedrock/converse/response.rs:441-451",
+          "note": "Finite and streaming reasoningContent is omitted while adjacent answer text is preserved. Streaming citation, toolResult and image deltas take the same path and vanish silently.",
+          "evidence": "apis/src/bedrock/converse/response.rs:167-190; apis/src/bedrock/converse/response.rs:445-455",
           "blocker": "https://github.com/praxis-proxy/ai/issues/2055"
         },
         {

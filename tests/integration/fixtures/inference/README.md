@@ -25,6 +25,7 @@ The manifest declares **101 features** across **11 scopes**, linked to **78 scen
 | --- | --- | --- | --- | --- |
 | `chat_completions_to_bedrock_converse` | `bedrock.converse.request.text` | `synthetic_only` | `bedrock/basic-nonstream` | `synthetic`: `synthetic_only` |
 | `chat_completions_to_bedrock_converse` | `bedrock.converse.response.text` | `synthetic_only` | `bedrock/basic-nonstream` | `synthetic`: `synthetic_only` |
+| `chat_completions_to_bedrock_converse` | `bedrock.converse.response.reasoning` | `synthetic_only` | `bedrock/basic-nonstream` | `synthetic`: `synthetic_only` |
 | `messages_to_chat_completions` | `messages.request.minimal` | `live_covered` | `messages/basic-nonstream`<br>`messages/basic-stream` | `openai`: `covered`<br>`vllm`: `live_covered` |
 | `messages_to_chat_completions` | `messages.request.client_tool_ownership` | `synthetic_only` | `messages/typed-server-tools` | `synthetic`: `synthetic_only` |
 | `messages_to_chat_completions` | `messages.request.tool_input_presence` | `synthetic_only` | `messages/tool-input-presence` | `synthetic`: `synthetic_only` |

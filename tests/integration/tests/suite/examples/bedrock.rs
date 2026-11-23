@@ -14,12 +14,15 @@ use praxis_test_utils::{
 // -----------------------------------------------------------------------------
 
 #[test]
-fn bedrock_converse_translates_capital_of_france_end_to_end() {
+fn bedrock_converse_preserves_answer_beside_reasoning_end_to_end() {
     let bedrock_response = serde_json::json!({
         "output": {
             "message": {
                 "role": "assistant",
-                "content": [{"text": "Paris is the capital of France."}]
+                "content": [
+                    {"reasoningContent": {"reasoningText": {"text": "Thinking"}}},
+                    {"text": "Paris is the capital of France."}
+                ]
             }
         },
         "stopReason": "end_turn",
