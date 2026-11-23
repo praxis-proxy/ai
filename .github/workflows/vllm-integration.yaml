@@ -37,6 +37,7 @@ on:
       - ".github/scripts/vllm_qualification.py"
       - "tests/integration/sdk/openai/qualification_plugin.py"
       - ".github/actions/build-vllm-gpu/**"
+      - ".github/actions/prepare-vllm-gpu-image/**"
       - ".github/actions/resolve-vllm-gpu-image/**"
       - ".github/actions/vllm-image-spec/**"
       - ".github/actions/start-vllm/**"
@@ -135,14 +136,12 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   VLLM_IMAGE: "quay.io/opendatahub/vllm-cpu:Qwen3-0.6B-granite-embedding-125m-english@sha256:0212dc82981178033cb71c7477ba8ad1998fb6c0b1ee40646119fb9724ac951b"
   VLLM_MODEL: "Qwen/Qwen3-0.6B"
-  # Use the CUDA 13 default image. The v0.32.0-cu129 image resolves a CUDA 13
-  # torchcodec wheel, which fails to import because libnvrtc.so.13 is absent.
-  VLLM_GPU_IMAGE: "docker.io/vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34"
-  # The full suite's model-baked image is NOT pinned here: it is described by
-  # vllm/images.json and published by vllm-gpu-container.yaml. The job reads the
-  # manifest, reuses the published build when it matches this checkout, and
-  # exports the resolved reference as VLLM_BUILT_GPU_IMAGE for the qualification
-  # record.
+  # Every GPU job serves a model-baked image described by vllm/images.json and
+  # published by vllm-gpu-container.yaml; none is pinned here. Each job prepares
+  # it through the prepare-vllm-gpu-image action, which reuses an image an
+  # earlier job on the runner prepared, else the published build when it matches
+  # this checkout, else builds it. The upstream vLLM image it builds FROM is
+  # pinned in vllm/Containerfile and in each client manifest's `base_image`.
   #
   # Model served on the GPU runner. A capable model is required for reliable
   # tool-calling (file_search, MCP) — the 0.6B CPU model above is not. Qwen3-8B
@@ -151,9 +150,6 @@ env:
   # Instance type for the ephemeral GPU runner. g5.xlarge = A10G (24GB, compute
   # capability 8.6, so FlashAttention-2 is available).
   GPU_INSTANCE_TYPE: "g5.xlarge"
-  # The custom GPU runner service does not guarantee HOME is exported. Keep the
-  # model cache at an explicit instance-local path shared by the acceptance jobs.
-  GPU_HF_CACHE_DIR: /tmp/praxis-huggingface
   # llm-d-inference-sim v0.11.2 multi-architecture image index.
   INFERENCE_SIM_IMAGE: "ghcr.io/llm-d/llm-d-inference-sim@sha256:32144df791330a0006b747edfdf2b114a0fe728e023a9d1b3463eeb48d32abb9"
   INFERENCE_SIM_MODEL: "praxis-test-model"
@@ -215,6 +211,7 @@ jobs:
             '.github/scripts/vllm_qualification.py' \
             'tests/integration/sdk/openai/qualification_plugin.py' \
             '.github/actions/build-vllm-gpu/' \
+            '.github/actions/prepare-vllm-gpu-image/' \
             '.github/actions/resolve-vllm-gpu-image/' \
             '.github/actions/vllm-image-spec/' \
             '.github/actions/start-vllm/' \
@@ -549,7 +546,7 @@ jobs:
   # ----------------------------------------------------------------------------
 
   pins:
-    name: Load Claude Code + OpenCode + pi + vLLM acceptance pins
+    name: Load Claude Code + Codex + OpenCode + pi + vLLM acceptance pins
     if: >-
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
@@ -565,7 +562,7 @@ jobs:
       claude_sha256: ${{ steps.load.outputs.claude_sha256 }}
       claude_version: ${{ steps.load.outputs.claude_version }}
       claude_platform: ${{ steps.load.outputs.claude_platform }}
-      vllm_image: ${{ steps.load.outputs.vllm_image }}
+      vllm_baked_image: ${{ steps.load.outputs.vllm_baked_image }}
       vllm_served_model: ${{ steps.load.outputs.vllm_served_model }}
       vllm_flags: ${{ steps.load.outputs.vllm_flags }}
       opencode_version: ${{ steps.load.outputs.opencode_version }}
@@ -574,13 +571,16 @@ jobs:
       opencode_url: ${{ steps.load.outputs.opencode_url }}
       opencode_sha256: ${{ steps.load.outputs.opencode_sha256 }}
       opencode_model: ${{ steps.load.outputs.opencode_model }}
-      opencode_vllm_image: ${{ steps.load.outputs.opencode_vllm_image }}
+      opencode_vllm_baked_image: ${{ steps.load.outputs.opencode_vllm_baked_image }}
       opencode_vllm_flags: ${{ steps.load.outputs.opencode_vllm_flags }}
       opencode_v2_version: ${{ steps.load.outputs.opencode_v2_version }}
       opencode_v2_platform: ${{ steps.load.outputs.opencode_v2_platform }}
       pi_version: ${{ steps.load.outputs.pi_version }}
       pi_platform: ${{ steps.load.outputs.pi_platform }}
       pi_model: ${{ steps.load.outputs.pi_model }}
+      codex_vllm_baked_image: ${{ steps.load.outputs.codex_vllm_baked_image }}
+      codex_vllm_served_model: ${{ steps.load.outputs.codex_vllm_served_model }}
+      codex_vllm_flags: ${{ steps.load.outputs.codex_vllm_flags }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -621,14 +621,15 @@ jobs:
   #
   # Runs on the SAME ephemeral EC2 GPU runner as the full suite (machulav
   # v2.3.9 registers a non-ephemeral runner, so a second job runs on the same
-  # instance), sequentially AFTER it (`needs: vllm-gpu-full-suite`), reusing the
-  # Qwen3-8B weights from a shared on-disk HF cache when another acceptance job
-  # already downloaded them. The full suite uses baked weights in a separate
-  # image. This job starts its OWN vLLM container WITH --api-key (the full
-  # suite's is keyless and torn down first): the credential-isolation proof
-  # requires the backend to REJECT an un-injected bearer. Two Qwen3-8B
-  # containers cannot coexist on the 24GB A10G, so a separate sequential
-  # keyed container is mandatory.
+  # instance), sequentially AFTER it (`needs: vllm-gpu-full-suite`), serving the
+  # same model-baked image (the manifest's `baked_image`), so no weights are
+  # downloaded and no Hugging Face token reaches the container. This job starts
+  # its OWN vLLM container WITH --api-key (the full suite's is keyless and torn
+  # down first): the credential-isolation proof requires the backend to REJECT
+  # an un-injected bearer. Two Qwen3-8B containers cannot coexist on the 24GB
+  # A10G, so a separate sequential keyed container is mandatory. When the full
+  # suite did not run (an acceptance-only dispatch), the prepare step pulls the
+  # published image or, when none matches this checkout, builds it here.
   #
   # Reproducibility-critical: depends on the pins recorded in
   # tests/integration/fixtures/claude-code-cli/pin.toml (consumed via the `pins`
@@ -666,12 +667,12 @@ jobs:
         github.event_name == 'schedule'
       )
     runs-on: ${{ needs.gpu-start-runner.outputs.label }}
-    # The pinned upstream image downloads ~16GB of Qwen3-8B on a cold cache;
-    # the full suite's baked image does not populate this cache. A previous
-    # acceptance job on the same instance may have warmed it.
+    # Leaves room to build the baked image on an acceptance-only dispatch whose
+    # checkout has no matching published image.
     timeout-minutes: 60
     permissions:
       contents: read
+      packages: read
     env:
       # True only for a dispatch that requests the focused degradation cases and
       # nothing broader. The two translated steps below always run on any
@@ -685,7 +686,7 @@ jobs:
       CLAUDE_SHA256: ${{ needs.pins.outputs.claude_sha256 }}
       CLAUDE_VERSION: ${{ needs.pins.outputs.claude_version }}
       CLAUDE_PLATFORM: ${{ needs.pins.outputs.claude_platform }}
-      VLLM_IMAGE_PIN: ${{ needs.pins.outputs.vllm_image }}
+      VLLM_BAKED_IMAGE: ${{ needs.pins.outputs.vllm_baked_image }}
       VLLM_SERVED_MODEL: ${{ needs.pins.outputs.vllm_served_model }}
       VLLM_FLAGS: ${{ needs.pins.outputs.vllm_flags }}
     steps:
@@ -725,7 +726,7 @@ jobs:
           # backend (e.g. a partially filled manifest) with a clear, actionable
           # error rather than an opaque vLLM startup failure.
           for pin in "$CLAUDE_URL" "$CLAUDE_SHA256" "$CLAUDE_VERSION" "$CLAUDE_PLATFORM" \
-                     "$VLLM_IMAGE_PIN" "$VLLM_SERVED_MODEL" "$VLLM_FLAGS"; do
+                     "$VLLM_BAKED_IMAGE" "$VLLM_SERVED_MODEL" "$VLLM_FLAGS"; do
             case "$pin" in
               "" )
                 echo "::error::a required pin is empty; the pins job did not export it"
@@ -763,9 +764,20 @@ jobs:
           echo "::add-mask::$token"
           echo "VLLM_API_KEY=$token" >> "$GITHUB_ENV"
 
+      - name: Prepare model-baked vLLM image
+        id: vllm_image
+        uses: ./.github/actions/prepare-vllm-gpu-image
+        with:
+          key: ${{ env.VLLM_BAKED_IMAGE }}
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          registry-username: ${{ github.actor }}
+          registry-token: ${{ secrets.GITHUB_TOKEN }}
+          hugging-face-token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+          record: ${{ runner.temp }}/claude-vllm-image.json
+
       - name: Start native-Anthropic vLLM with backend auth
         env:
-          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+          VLLM_SERVED_IMAGE: ${{ steps.vllm_image.outputs.image }}
         run: |
           set -euo pipefail
           gpu_args=()
@@ -774,27 +786,18 @@ jobs:
           else
             gpu_args=(--gpus all)
           fi
-          cache_mount="$GPU_HF_CACHE_DIR:/root/.cache/huggingface"
-          if [ "$CONTAINER_RUNTIME" = "podman" ]; then
-            cache_mount="${cache_mount}:Z"
-          fi
-          # The full suite uses baked weights, so this pinned upstream image
-          # downloads Qwen3-8B into the host cache unless an earlier acceptance
-          # job on the same instance already populated it.
-          mkdir -p "$GPU_HF_CACHE_DIR"
-          "$CONTAINER_RUNTIME" pull "$VLLM_IMAGE_PIN"
+          # The weights are baked into the image; the manifest's --model points
+          # at them, so nothing is downloaded and no Hugging Face token is set.
           # Native Anthropic Messages serving (/v1/messages,
           # /v1/messages/count_tokens) is on by default in this image (verified
           # by the preflight below). --api-key makes vLLM require the same bearer
           # token Praxis injects, so unauthenticated upstream calls fail — the
           # credential-isolation proof this job uniquely provides.
           # shellcheck disable=SC2086
-          "$CONTAINER_RUNTIME" run -d --name vllm \
+          "$CONTAINER_RUNTIME" run -d --name vllm --pull=never \
             "${gpu_args[@]}" \
             -p 8000:8000 \
-            -e HUGGING_FACE_HUB_TOKEN \
-            -v "$cache_mount" \
-            "$VLLM_IMAGE_PIN" \
+            "$VLLM_SERVED_IMAGE" \
             $VLLM_FLAGS \
             --served-model-name "$VLLM_SERVED_MODEL" \
             --api-key "$VLLM_API_KEY"
@@ -804,8 +807,8 @@ jobs:
         run: |
           set -euo pipefail
           echo "Waiting for vLLM..."
-          # Allow a generous deadline when the pinned image must download the
-          # weights into a cold host cache before serving.
+          # The image is already local, so this covers only loading the baked
+          # weights and warming up.
           deadline=$((SECONDS + 1200))
           until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; do
             if ! "$CONTAINER_RUNTIME" inspect --format='{{.State.Running}}' vllm 2>/dev/null | grep -q true; then
@@ -1259,6 +1262,11 @@ jobs:
               "checkout_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
               "cases": cases,
           }
+          # The baked vLLM image this lane served, as prepare-vllm-gpu-image
+          # recorded it; absent when the job failed before preparing it.
+          image_record = pathlib.Path(os.environ["RUNNER_TEMP"]) / "claude-vllm-image.json"
+          if image_record.exists():
+              data["backend"] = json.loads(image_record.read_text())
           pathlib.Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n")
           PY
 
@@ -1311,13 +1319,15 @@ jobs:
   # tool through Praxis against Qwen3-8B on both paths. The child runs in a
   # namespace whose only route reaches Praxis, and
   # vLLM requires a provider credential Codex never receives, proving Praxis
-  # replaced the gateway credential. It reuses the full suite's on-disk model
-  # cache when available and starts its own keyed container sequentially.
+  # replaced the gateway credential. It serves the full suite's model-baked
+  # image from its own keyed container, started sequentially, with the launch
+  # flags pinned in the `[vllm]` block of
+  # tests/integration/fixtures/codex-cli/pin.toml.
   # -----------------------------------------------------------------------------
 
   vllm-gpu-codex-acceptance:
     name: Codex acceptance on real vLLM (GPU)
-    needs: [gpu-start-runner, vllm-gpu-full-suite]
+    needs: [pins, gpu-start-runner, vllm-gpu-full-suite]
     if: |
       !cancelled() &&
       needs.gpu-start-runner.result == 'success' &&
@@ -1337,11 +1347,14 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+      packages: read
     env:
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
       CODEX_VERSION: "0.170.0"
-      CODEX_VLLM_MODEL: qwen3-8b
+      CODEX_VLLM_BAKED_IMAGE: ${{ needs.pins.outputs.codex_vllm_baked_image }}
+      CODEX_VLLM_MODEL: ${{ needs.pins.outputs.codex_vllm_served_model }}
+      CODEX_VLLM_FLAGS: ${{ needs.pins.outputs.codex_vllm_flags }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1360,6 +1373,19 @@ jobs:
             echo "Neither docker nor podman is available on this runner" >&2
             exit 1
           fi
+
+      - name: Fail on unset pins
+        run: |
+          set -euo pipefail
+          # This job runs even when the pins job failed (`!cancelled()`), so
+          # guard against an output arriving empty and starting vLLM with no
+          # model.
+          for name in CODEX_VLLM_BAKED_IMAGE CODEX_VLLM_MODEL CODEX_VLLM_FLAGS; do
+            if [ -z "${!name}" ]; then
+              echo "::error::pin $name is empty; the pins job did not export it"
+              exit 1
+            fi
+          done
 
       - name: Setup Rust
         uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
@@ -1422,9 +1448,20 @@ jobs:
           echo "::add-mask::$token"
           echo "CODEX_BACKEND_TOKEN=$token" >> "$GITHUB_ENV"
 
+      - name: Prepare model-baked vLLM image
+        id: vllm_image
+        uses: ./.github/actions/prepare-vllm-gpu-image
+        with:
+          key: ${{ env.CODEX_VLLM_BAKED_IMAGE }}
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          registry-username: ${{ github.actor }}
+          registry-token: ${{ secrets.GITHUB_TOKEN }}
+          hugging-face-token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+          record: ${{ runner.temp }}/codex-vllm-image.json
+
       - name: Start keyed vLLM for Codex
         env:
-          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+          VLLM_SERVED_IMAGE: ${{ steps.vllm_image.outputs.image }}
         run: |
           set -euo pipefail
           gpu_args=()
@@ -1433,26 +1470,14 @@ jobs:
           else
             gpu_args=(--gpus all)
           fi
-          cache_mount="$GPU_HF_CACHE_DIR:/root/.cache/huggingface"
-          if [ "$CONTAINER_RUNTIME" = "podman" ]; then
-            cache_mount="${cache_mount}:Z"
-          fi
-          mkdir -p "$GPU_HF_CACHE_DIR"
-          "$CONTAINER_RUNTIME" pull "$VLLM_GPU_IMAGE"
-          "$CONTAINER_RUNTIME" run -d --name vllm \
+          # The manifest's --model points at the weights baked into the image.
+          # shellcheck disable=SC2086
+          "$CONTAINER_RUNTIME" run -d --name vllm --pull=never \
             "${gpu_args[@]}" \
             -p 8000:8000 \
-            -e HUGGING_FACE_HUB_TOKEN \
-            -v "$cache_mount" \
-            "$VLLM_GPU_IMAGE" \
-            --model "$VLLM_GPU_MODEL" \
+            "$VLLM_SERVED_IMAGE" \
+            $CODEX_VLLM_FLAGS \
             --served-model-name "$CODEX_VLLM_MODEL" \
-            --max-model-len 16384 \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            --reasoning-parser deepseek_r1 \
-            --gpu-memory-utilization 0.9 \
-            --seed 0 \
             --api-key "$CODEX_BACKEND_TOKEN"
 
       - name: Preflight vLLM Responses and Chat Completions
@@ -1686,6 +1711,11 @@ jobs:
               "checkout_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
               "cases": [{"id": name.lower(), "status": os.environ[name] or "unexecuted"} for name in names],
           }
+          # The baked vLLM image this lane served, as prepare-vllm-gpu-image
+          # recorded it; absent when the job failed before preparing it.
+          image_record = pathlib.Path(os.environ["RUNNER_TEMP"]) / "codex-vllm-image.json"
+          if image_record.exists():
+              data["backend"] = json.loads(image_record.read_text())
           pathlib.Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n")
           PY
 
@@ -1793,11 +1823,12 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+      packages: read
     env:
       OPENCODE_VERSION: ${{ needs.pins.outputs.opencode_version }}
       OPENCODE_NPM_PACKAGE: ${{ needs.pins.outputs.opencode_npm_package }}
       OPENCODE_VLLM_MODEL: ${{ needs.pins.outputs.opencode_model }}
-      OPENCODE_VLLM_IMAGE: ${{ needs.pins.outputs.opencode_vllm_image }}
+      OPENCODE_VLLM_BAKED_IMAGE: ${{ needs.pins.outputs.opencode_vllm_baked_image }}
       OPENCODE_VLLM_FLAGS: ${{ needs.pins.outputs.opencode_vllm_flags }}
       OPENCODE_V2_VERSION: ${{ needs.pins.outputs.opencode_v2_version }}
       OPENCODE_V2_PLATFORM: ${{ needs.pins.outputs.opencode_v2_platform }}
@@ -1826,7 +1857,7 @@ jobs:
           # The pins job validates the manifest; this guards against an output
           # silently arriving empty, which would otherwise install `opencode-ai@`
           # and fail much later with a confusing error.
-          for name in OPENCODE_VERSION OPENCODE_NPM_PACKAGE OPENCODE_VLLM_MODEL OPENCODE_VLLM_IMAGE OPENCODE_VLLM_FLAGS \
+          for name in OPENCODE_VERSION OPENCODE_NPM_PACKAGE OPENCODE_VLLM_MODEL OPENCODE_VLLM_BAKED_IMAGE OPENCODE_VLLM_FLAGS \
               OPENCODE_V2_VERSION OPENCODE_V2_PLATFORM; do
             value="${!name}"
             if [ -z "$value" ] || case "$value" in *TBD*) true ;; *) false ;; esac; then
@@ -1924,30 +1955,36 @@ jobs:
           echo "::add-mask::$token"
           echo "VLLM_API_KEY=$token" >> "$GITHUB_ENV"
 
+      - name: Prepare model-baked vLLM image
+        id: vllm_image
+        uses: ./.github/actions/prepare-vllm-gpu-image
+        with:
+          key: ${{ env.OPENCODE_VLLM_BAKED_IMAGE }}
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          registry-username: ${{ github.actor }}
+          registry-token: ${{ secrets.GITHUB_TOKEN }}
+          hugging-face-token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+          record: ${{ runner.temp }}/opencode-vllm-image.json
+
       - name: Start keyed vLLM for OpenCode
         env:
-          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+          VLLM_SERVED_IMAGE: ${{ steps.vllm_image.outputs.image }}
         run: |
           set -euo pipefail
           # Keyed deliberately: the credential-isolation proof requires the
-          # backend to REJECT a request that Praxis did not inject into.
+          # backend to REJECT a request that Praxis did not inject into. The
+          # manifest's --model points at the weights baked into the image.
           gpu_args=()
-          cache_mount="${GPU_HF_CACHE_DIR}:/root/.cache/huggingface"
           if [ "$CONTAINER_RUNTIME" = "podman" ]; then
             gpu_args=(--device nvidia.com/gpu=all)
-            cache_mount="${cache_mount}:Z"
           else
             gpu_args=(--gpus all)
           fi
-          mkdir -p "${GPU_HF_CACHE_DIR}"
-          "$CONTAINER_RUNTIME" pull "${OPENCODE_VLLM_IMAGE}"
           # shellcheck disable=SC2086
-          "$CONTAINER_RUNTIME" run -d --name vllm-opencode \
+          "$CONTAINER_RUNTIME" run -d --name vllm-opencode --pull=never \
             "${gpu_args[@]}" --ipc=host -p 8000:8000 \
-            -v "$cache_mount" \
-            -e HUGGING_FACE_HUB_TOKEN \
             -e VLLM_API_KEY="${VLLM_API_KEY}" \
-            "${OPENCODE_VLLM_IMAGE}" \
+            "${VLLM_SERVED_IMAGE}" \
             ${OPENCODE_VLLM_FLAGS} \
             --served-model-name "${OPENCODE_VLLM_MODEL}"
 
@@ -2172,6 +2209,11 @@ jobs:
                   for case_id, name in zip(ids, names)
               ],
           }
+          # The baked vLLM image this lane served, as prepare-vllm-gpu-image
+          # recorded it; absent when the job failed before preparing it.
+          image_record = pathlib.Path(os.environ["RUNNER_TEMP"]) / "opencode-vllm-image.json"
+          if image_record.exists():
+              data["backend"] = json.loads(image_record.read_text())
           pathlib.Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n")
           PY
 
@@ -2261,11 +2303,12 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+      packages: read
     env:
       PI_VERSION: ${{ needs.pins.outputs.pi_version }}
       PI_PLATFORM: ${{ needs.pins.outputs.pi_platform }}
       PI_VLLM_MODEL: ${{ needs.pins.outputs.pi_model }}
-      PI_VLLM_IMAGE: ${{ needs.pins.outputs.opencode_vllm_image }}
+      PI_VLLM_BAKED_IMAGE: ${{ needs.pins.outputs.opencode_vllm_baked_image }}
       PI_VLLM_FLAGS: ${{ needs.pins.outputs.opencode_vllm_flags }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2292,7 +2335,7 @@ jobs:
           # The pins job validates the manifests; this guards against an output
           # silently arriving empty, which would otherwise fetch a release
           # archive for `v` and fail much later with a confusing error.
-          for name in PI_VERSION PI_PLATFORM PI_VLLM_MODEL PI_VLLM_IMAGE PI_VLLM_FLAGS; do
+          for name in PI_VERSION PI_PLATFORM PI_VLLM_MODEL PI_VLLM_BAKED_IMAGE PI_VLLM_FLAGS; do
             value="${!name}"
             if [ -z "$value" ] || case "$value" in *TBD*) true ;; *) false ;; esac; then
               echo "::error::pin $name is empty or TBD: '$value'"
@@ -2349,30 +2392,36 @@ jobs:
           echo "::add-mask::$token"
           echo "VLLM_API_KEY=$token" >> "$GITHUB_ENV"
 
+      - name: Prepare model-baked vLLM image
+        id: vllm_image
+        uses: ./.github/actions/prepare-vllm-gpu-image
+        with:
+          key: ${{ env.PI_VLLM_BAKED_IMAGE }}
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          registry-username: ${{ github.actor }}
+          registry-token: ${{ secrets.GITHUB_TOKEN }}
+          hugging-face-token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+          record: ${{ runner.temp }}/pi-vllm-image.json
+
       - name: Start keyed vLLM for pi
         env:
-          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+          VLLM_SERVED_IMAGE: ${{ steps.vllm_image.outputs.image }}
         run: |
           set -euo pipefail
           # Keyed deliberately: the credential-isolation proof requires the
-          # backend to REJECT a request that Praxis did not inject into.
+          # backend to REJECT a request that Praxis did not inject into. The
+          # manifest's --model points at the weights baked into the image.
           gpu_args=()
-          cache_mount="${GPU_HF_CACHE_DIR}:/root/.cache/huggingface"
           if [ "$CONTAINER_RUNTIME" = "podman" ]; then
             gpu_args=(--device nvidia.com/gpu=all)
-            cache_mount="${cache_mount}:Z"
           else
             gpu_args=(--gpus all)
           fi
-          mkdir -p "${GPU_HF_CACHE_DIR}"
-          "$CONTAINER_RUNTIME" pull "${PI_VLLM_IMAGE}"
           # shellcheck disable=SC2086
-          "$CONTAINER_RUNTIME" run -d --name vllm-pi \
+          "$CONTAINER_RUNTIME" run -d --name vllm-pi --pull=never \
             "${gpu_args[@]}" --ipc=host -p 8000:8000 \
-            -v "$cache_mount" \
-            -e HUGGING_FACE_HUB_TOKEN \
             -e VLLM_API_KEY="${VLLM_API_KEY}" \
-            "${PI_VLLM_IMAGE}" \
+            "${VLLM_SERVED_IMAGE}" \
             ${PI_VLLM_FLAGS} \
             --served-model-name "${PI_VLLM_MODEL}"
 
@@ -2559,6 +2608,11 @@ jobs:
                   for case_id, name in zip(ids, names)
               ],
           }
+          # The baked vLLM image this lane served, as prepare-vllm-gpu-image
+          # recorded it; absent when the job failed before preparing it.
+          image_record = pathlib.Path(os.environ["RUNNER_TEMP"]) / "pi-vllm-image.json"
+          if image_record.exists():
+              data["backend"] = json.loads(image_record.read_text())
           pathlib.Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n")
           PY
 
@@ -2687,68 +2741,30 @@ jobs:
           "$CONTAINER_RUNTIME" system prune -af || true
           df -h /
 
-      - name: Read text image spec
-        id: spec
-        uses: ./.github/actions/vllm-image-spec
+      - name: Prepare model-baked GPU image
+        id: image
+        uses: ./.github/actions/prepare-vllm-gpu-image
         with:
           key: text
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          registry-username: ${{ github.actor }}
+          registry-token: ${{ secrets.GITHUB_TOKEN }}
+          hugging-face-token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
 
       - name: Export resolved image reference
         env:
-          SPEC_IMAGE: ${{ steps.spec.outputs.image }}
-          SPEC_MODEL: ${{ steps.spec.outputs.model }}
+          SPEC_IMAGE: ${{ steps.image.outputs.image }}
+          SPEC_MODEL: ${{ steps.image.outputs.model }}
         run: |
           set -euo pipefail
-          # VLLM_GPU_MODEL is shared with the acceptance jobs, which serve the
-          # same model from the pinned upstream image rather than this baked
-          # one. Fail loudly on drift instead of silently rebuilding every run
-          # because the manifest and the workflow env disagree.
+          # VLLM_GPU_MODEL names the model to the suite's tests. Fail loudly on
+          # drift from the manifest instead of running the tests against a
+          # model name the server does not serve.
           if [ "$SPEC_MODEL" != "$VLLM_GPU_MODEL" ]; then
             echo "::error::vllm/images.json serves $SPEC_MODEL but VLLM_GPU_MODEL is $VLLM_GPU_MODEL"
             exit 1
           fi
           echo "VLLM_BUILT_GPU_IMAGE=$SPEC_IMAGE" >> "$GITHUB_ENV"
-
-      - name: Log in to GHCR (docker)
-        if: env.CONTAINER_RUNTIME == 'docker'
-        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Log in to GHCR (podman)
-        if: env.CONTAINER_RUNTIME == 'podman'
-        env:
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          echo "$GHCR_TOKEN" | podman login ghcr.io \
-            --username "$GHCR_USERNAME" --password-stdin
-
-      - name: Resolve model-baked GPU image
-        id: image
-        uses: ./.github/actions/resolve-vllm-gpu-image
-        with:
-          image: ${{ steps.spec.outputs.image }}
-          model: ${{ steps.spec.outputs.model }}
-          revision: ${{ steps.spec.outputs.revision }}
-          runtime: ${{ env.CONTAINER_RUNTIME }}
-
-      # Only reached when GHCR has no image matching this checkout -- the
-      # vllm-full-suite label on a PR that edits vllm/Containerfile, or a
-      # publish that has not landed yet. Building here is what keeps such a PR
-      # validated against the image it actually describes.
-      - name: Build model-baked GPU image
-        if: steps.image.outputs.build-required == 'true'
-        uses: ./.github/actions/build-vllm-gpu
-        with:
-          model: ${{ steps.spec.outputs.model }}
-          revision: ${{ steps.spec.outputs.revision }}
-          image: ${{ steps.spec.outputs.image }}
-          runtime: ${{ env.CONTAINER_RUNTIME }}
-          hugging-face-token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
 
       - name: Setup Rust
         uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
@@ -2792,15 +2808,15 @@ jobs:
       - name: Start vLLM on GPU (background)
         uses: ./.github/actions/start-vllm
         with:
-          image: ${{ steps.spec.outputs.image }}
-          model: ${{ steps.spec.outputs.served-model-name }}
-          model-path: ${{ steps.spec.outputs.model-path }}
+          image: ${{ steps.image.outputs.image }}
+          model: ${{ steps.image.outputs.served-model-name }}
+          model-path: ${{ steps.image.outputs.model-path }}
           runtime: ${{ env.CONTAINER_RUNTIME }}
           # Resolved above, either pulled or built; nothing left to fetch.
           pull: "false"
           device-args: ${{ env.GPU_DEVICE_ARGS }}
-          tool-call-parser: ${{ steps.spec.outputs.tool-call-parser }}
-          reasoning-parser: ${{ steps.spec.outputs.reasoning-parser }}
+          tool-call-parser: ${{ steps.image.outputs.tool-call-parser }}
+          reasoning-parser: ${{ steps.image.outputs.reasoning-parser }}
           gpu-memory-utilization: "0.9"
           # Suite-specific: the qualification cases need more context than the
           # publisher's smoke test, so this overrides the manifest default.

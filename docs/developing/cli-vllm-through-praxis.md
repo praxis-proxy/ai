@@ -1300,12 +1300,27 @@ kill "$PRAXIS_PID"
 
 ## Pinned client versions
 
-The integration tests pin one version of each client and one vLLM image. Each
+The integration tests pin one version of each client and one vLLM build. Each
 client's manifest under `tests/integration/fixtures/*/pin.toml` is the source
-of truth for that client; the vLLM image is pinned in the OpenCode 1.x and
-Claude Code manifests. `cargo xtask check-pins` (part of `make lint`) fails if
-any harness constant, workflow, checksum fixture, or image reference disagrees
-with them.
+of truth for that client. The vLLM backend is pinned in two layers in the
+`[vllm]` block of the Claude Code, OpenCode 1.x, and Codex manifests:
+
+- `base_image` is the upstream `vllm/vllm-openai` image, by digest. It is the
+  image `vllm/Containerfile` builds from, so it fixes the vLLM build every GPU
+  lane runs. To reproduce a lane's server yourself, run that image with the
+  manifest's `[vllm.launch]` flags as shown in
+  [Existing or local vLLM](#existing-or-local-vllm), passing
+  `--model Qwen/Qwen3-8B` in place of the in-image path.
+- `baked_image` names the [`vllm/images.json`](../../vllm/images.json) entry the
+  GPU lanes actually serve: the same build with the model weights baked in, so
+  no lane downloads weights or holds a Hugging Face token. That entry owns the
+  model and its Hugging Face revision. Its published tag is mutable, so each
+  lane records the image it served (local image ID, and registry digest when
+  pulled) in the qualification report rather than in the manifest.
+
+`cargo xtask check-pins` (part of `make lint`) fails if any harness constant,
+workflow, checksum fixture, or image reference disagrees with them, or if a
+launch would load anything other than the baked weights.
 
 To move every pin to its latest upstream release within each manifest's
 `major_series`:

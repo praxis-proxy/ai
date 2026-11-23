@@ -244,11 +244,14 @@ the multi-gigabyte build starts, and detects Docker or Podman to select
 ## Base image updates
 
 The `FROM` directive in `Containerfile` is one of the five sites that record the
-vLLM GPU image pin. `cargo xtask bump-pins` rewrites all five — this file, the
-two pin manifests under `tests/integration/fixtures/`, and the two workflow
-`VLLM_GPU_IMAGE` values — and `cargo xtask check-pins` (part of `make lint`)
-fails if any of them disagree, so a bump has to land as one change. The weekly
-`Bump Pins` workflow opens that change as a draft PR.
+vLLM base image pin. `cargo xtask bump-pins` rewrites all five — this file, the
+`base_image` of the Claude Code, OpenCode 1.x, and Codex pin manifests under
+`tests/integration/fixtures/`, and `VLLM_GPU_IMAGE` in `vllm-dev-endpoint.yaml`
+— and `cargo xtask check-pins` (part of `make lint`) fails if any of them
+disagree, so a bump has to land as one change. The weekly `Bump Pins` workflow
+opens that change as a draft PR. The GPU acceptance lanes serve the baked image
+built from this file, so the manifests' `base_image` is the immutable record of
+the vLLM build those lanes ran.
 
 Dependabot deliberately does not manage this file. It understands only the
 `FROM` line, so the PR it opens leaves the pin manifests and workflows stale and

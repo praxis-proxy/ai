@@ -257,8 +257,14 @@ def acceptance(path, job_result, run_id, attempt, sha, scope):
                 "job_status": job_result, "scope": scope,
                 "reason": "per-scenario result artifact unavailable or provenance mismatch",
                 "cases": []}
-    return {"status": job_result, "job_status": job_result, "scope": scope,
-            "cases": raw["cases"], "reason": "scenario statuses from individual GitHub steps"}
+    result = {"status": job_result, "job_status": job_result, "scope": scope,
+              "cases": raw["cases"], "reason": "scenario statuses from individual GitHub steps"}
+    # The model-baked vLLM image the lane served, recorded by
+    # prepare-vllm-gpu-image. Each lane runs its own container, so this is the
+    # lane's backend provenance, not the full suite's.
+    if isinstance(raw.get("backend"), dict):
+        result["backend"] = raw["backend"]
+    return result
 
 
 def passing_suite_problem(report):
@@ -403,6 +409,11 @@ def render(report, detailed=False):
             suite_data = report.get("suites", {}).get(name, {})
             cases = suite_data.get("cases", [])
             suffix = f" ({sum(case.get('status') == 'success' for case in cases)}/{len(cases)} scenarios succeeded)" if cases else ""
+            served = suite_data.get("backend", {})
+            if served.get("local_image_id"):
+                digest = served.get("registry_digest")
+                suffix += (f"; vLLM image `{served['local_image_id']}` ({served.get('image_source') or 'unknown'}"
+                           + (f", digest `{digest}`" if digest else "") + ")")
             lines.append(f"{name.replace('_', ' ').title()}: {suite_data.get('status', 'unavailable')}{suffix}.")
     if report.get("workflow", {}).get("url"):
         lines += ["", f"[Workflow run]({report['workflow']['url']}) and [report/diagnostic artifacts]({report['workflow']['url']}#artifacts)"]

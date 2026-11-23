@@ -128,8 +128,66 @@ fn drifted_vllm_image_is_reported_per_site() {
 
 #[test]
 fn diverging_manifest_images_are_reported() {
-    let errors = errors_with(manifest::CLAUDE, "image = \"docker.io/", "image = \"quay.io/");
-    assert_reported(&errors, &["must pin the same vLLM image"]);
+    for path in [manifest::CLAUDE, manifest::CODEX] {
+        let errors = errors_with(path, "base_image = \"docker.io/", "base_image = \"quay.io/");
+        assert_reported(&errors, &["must pin the same vLLM image", path]);
+    }
+}
+
+#[test]
+fn unknown_baked_image_is_reported() {
+    let errors = errors_with(manifest::OPENCODE, "baked_image = \"text\"", "baked_image = \"other\"");
+    assert_reported(
+        &errors,
+        &["vllm.baked_image `other` is not an image in vllm/images.json"],
+    );
+}
+
+#[test]
+fn launch_must_load_the_baked_weights() {
+    // A Hugging Face ID would make vLLM download the weights at run time.
+    for path in [manifest::CLAUDE, manifest::OPENCODE, manifest::CODEX] {
+        let errors = errors_with(
+            path,
+            "\"--model\", \"/opt/vllm/models/Qwen/Qwen3-8B\"",
+            "\"--model\", \"Qwen/Qwen3-8B\"",
+        );
+        assert_reported(
+            &errors,
+            &[path, "must be the baked weights' path `/opt/vllm/models/Qwen/Qwen3-8B`"],
+        );
+    }
+}
+
+#[test]
+fn launch_must_follow_the_baked_model() {
+    let errors = errors_with(
+        manifest::IMAGES,
+        "\"model\": \"Qwen/Qwen3-8B\"",
+        "\"model\": \"Qwen/Qwen3-4B\"",
+    );
+    assert_reported(&errors, &[manifest::CODEX, "`/opt/vllm/models/Qwen/Qwen3-4B`"]);
+}
+
+#[test]
+fn launch_flags_the_workflow_appends_are_rejected() {
+    for flag in ["--api-key", "--served-model-name", "--revision", "--download-dir"] {
+        let errors = errors_with(
+            manifest::CODEX,
+            "  \"--seed\", \"0\",\n",
+            &format!("  \"{flag}\", \"x\",\n"),
+        );
+        assert_reported(&errors, &[manifest::CODEX, &format!("must not pass {flag}")]);
+    }
+}
+
+#[test]
+fn codex_context_must_match_the_server_flag() {
+    let errors = errors_with(manifest::CODEX, "context_length = 16384", "context_length = 32768");
+    assert_reported(
+        &errors,
+        &[manifest::CODEX, "vllm.context_length must match --max-model-len"],
+    );
 }
 
 #[test]

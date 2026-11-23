@@ -23,6 +23,14 @@ const CLAUDE_COMPACTION_RESERVE: u64 = 15_048;
 /// Approximate bytes per token, for sizing the compaction ballast.
 const BYTES_PER_TOKEN: f64 = 4.0;
 
+/// Launch flags a `[vllm]` block must not carry, with the reason.
+const FORBIDDEN_VLLM_FLAGS: [(&str, &str); 4] = [
+    ("--served-model-name", "the lane appends it from served_model_name"),
+    ("--api-key", "the lane appends its per-job ephemeral key"),
+    ("--revision", "the revision is baked into the image by vllm/images.json"),
+    ("--download-dir", "the weights are baked into the image"),
+];
+
 // -----------------------------------------------------------------------------
 // Entry Point
 // -----------------------------------------------------------------------------
@@ -136,20 +144,21 @@ pub(crate) fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Both `[vllm]` blocks pin the same `tag@sha256:<digest>` image; the site
-/// table then holds every workflow and the Containerfile to it.
+/// Every `[vllm]` block pins the same `tag@sha256:<digest>` base image; the
+/// site table then holds the Containerfile and the dev endpoint to it.
 fn check_vllm_image(manifests: &Manifests, errors: &mut Vec<String>) {
     let Some(opencode) = manifests.opencode.vllm.as_ref() else {
         return;
     };
-    let image = &opencode.image;
-    if image != &manifests.claude.vllm.image {
-        errors.push(format!(
-            "{} and {} must pin the same vLLM image: `{image}` vs `{}`",
-            manifest::OPENCODE,
-            manifest::CLAUDE,
-            manifests.claude.vllm.image
-        ));
+    let image = &opencode.base_image;
+    for (path, vllm) in manifests.vllm_blocks() {
+        if &vllm.base_image != image {
+            errors.push(format!(
+                "{} and {path} must pin the same vLLM image: `{image}` vs `{}`",
+                manifest::OPENCODE,
+                vllm.base_image
+            ));
+        }
     }
     let digest_form = image
         .split_once("@sha256:")
@@ -158,6 +167,36 @@ fn check_vllm_image(manifests: &Manifests, errors: &mut Vec<String>) {
         errors.push(format!(
             "vLLM image `{image}` must have the form `<repo>:<tag>@sha256:<digest>`"
         ));
+    }
+    check_baked_images(manifests, errors);
+}
+
+/// Every GPU lane serves an image from vllm/images.json and loads the weights
+/// baked into it, so no lane downloads weights at run time or passes flags the
+/// workflow appends itself.
+fn check_baked_images(manifests: &Manifests, errors: &mut Vec<String>) {
+    for (path, vllm) in manifests.vllm_blocks() {
+        let Some(baked) = manifests.images.images.get(&vllm.baked_image) else {
+            errors.push(format!(
+                "{path}: vllm.baked_image `{}` is not an image in {}",
+                vllm.baked_image,
+                manifest::IMAGES
+            ));
+            continue;
+        };
+        let expected = format!("{}/{}", manifest::BAKED_MODEL_DIR, baked.model);
+        match vllm.flag_value("--model") {
+            Ok(model) if model != expected => errors.push(format!(
+                "{path}: --model in vllm.launch.flags must be the baked weights' path `{expected}`, not `{model}`"
+            )),
+            Ok(_) => {},
+            Err(e) => errors.push(format!("{path}: {e}")),
+        }
+        for (flag, reason) in FORBIDDEN_VLLM_FLAGS {
+            if vllm.launch.flags.iter().any(|f| f == flag) {
+                errors.push(format!("{path}: vllm.launch.flags must not pass {flag}: {reason}"));
+            }
+        }
     }
 }
 
@@ -521,6 +560,20 @@ fn check_pi_models(repo: &Repo, manifests: &Manifests, errors: &mut Vec<String>)
 fn check_codex(manifests: &Manifests, errors: &mut Vec<String>) {
     let path = manifest::CODEX;
     let codex = &manifests.codex.codex;
+    let vllm = &manifests.codex.vllm;
+    match vllm.flag_context() {
+        Ok(flag) if flag != vllm.context_length => errors.push(format!(
+            "{path}: vllm.context_length must match --max-model-len in vllm.launch.flags"
+        )),
+        Ok(_) => {},
+        Err(e) => errors.push(format!("{path}: {e}")),
+    }
+    if vllm.tool_call_parser.is_empty() || !vllm.launch.flags.iter().any(|f| f == "--enable-auto-tool-choice") {
+        errors.push(format!(
+            "{path}: the Codex backend must serve tool calls: set vllm.tool_call_parser and pass \
+             --enable-auto-tool-choice"
+        ));
+    }
     if codex.install != "github-release" || codex.release_tag_prefix.is_empty() {
         errors.push(format!(
             "{path}: Codex must install from a GitHub release with a non-empty release_tag_prefix"

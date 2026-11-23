@@ -432,6 +432,24 @@ class QualificationTest(unittest.TestCase):
             wrong_attempt = qualification.acceptance(path, "success", 17, 3, "a" * 40, "Codex")
             self.assertEqual(wrong_attempt["status"], "unreported")
 
+    def test_acceptance_reports_the_vllm_image_the_lane_served(self):
+        backend = {"image_tag": "ghcr.io/praxis-proxy/vllm-gpu:Qwen3-8B", "local_image_id": "sha256:abc",
+                   "registry_digest": None, "image_source": "runner", "model": "Qwen/Qwen3-8B"}
+        with tempfile.TemporaryDirectory() as directory:
+            raw = Path(directory) / "raw.json"
+            raw.write_text(json.dumps(report()))
+            codex_raw = Path(directory) / "codex-acceptance.json"
+            codex_raw.write_text(json.dumps({"run_id": 17, "attempt": 2, "checkout_sha": "a" * 40,
+                                             "cases": [{"id": "codex_native", "status": "success"}],
+                                             "backend": backend}))
+            finished = qualification.finish(raw, True, "success", "success", "skipped", "success",
+                                            17, 2, "https://example.test/run", "a" * 40, codex_raw=codex_raw)
+        self.assertEqual(finished["suites"]["codex_acceptance"]["backend"], backend)
+        self.assertIn("Codex Acceptance: success (1/1 scenarios succeeded); vLLM image `sha256:abc` (runner).",
+                      qualification.render(finished))
+        # A lane that recorded no image renders as before.
+        self.assertNotIn("backend", finished["suites"]["claude_acceptance"])
+
     def test_pi_acceptance_is_reported_beside_the_other_clients(self):
         with tempfile.TemporaryDirectory() as directory:
             raw = Path(directory) / "raw.json"

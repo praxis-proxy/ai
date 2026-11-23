@@ -1,0 +1,156 @@
+name: Prepare vLLM GPU image
+description: >-
+  Make one model-baked image from vllm/images.json available on this runner:
+  reuse a matching image an earlier job on the runner already prepared, else
+  pull the matching published build, else build it from vllm/Containerfile.
+  Every GPU job that serves a baked model goes through this one path, so a job
+  that runs without the full suite (an acceptance-only dispatch, or a vLLM bump
+  whose image is not published yet) gets the same image the suite would have
+  used. The tag is local afterwards; start the container with `--pull=never`.
+  The Hugging Face token reaches only the build, never a serving container.
+inputs:
+  key:
+    description: Key under `images` in vllm/images.json (for example "text").
+    required: true
+  runtime:
+    description: Container runtime binary (docker or podman).
+    required: true
+  registry-username:
+    description: GHCR user for the pull.
+    required: true
+  registry-token:
+    description: GHCR token for the pull (the job's GITHUB_TOKEN with packages:read).
+    required: true
+  hugging-face-token:
+    description: Optional token for gated models, used only when the image must be built.
+    required: false
+    default: ""
+  record:
+    description: >-
+      Optional path to write a JSON record of the image this job will serve
+      (tag, local image ID, registry digest, source, model, revision, base
+      image), for a lane's acceptance results.
+    required: false
+    default: ""
+outputs:
+  image:
+    description: Fully qualified image reference, now present locally.
+    value: ${{ steps.spec.outputs.image }}
+  model:
+    description: Hugging Face model ID baked into the image.
+    value: ${{ steps.spec.outputs.model }}
+  revision:
+    description: Pinned Hugging Face model revision, empty when unpinned.
+    value: ${{ steps.spec.outputs.revision }}
+  model-path:
+    description: Path to the baked weights inside the image.
+    value: ${{ steps.spec.outputs.model-path }}
+  served-model-name:
+    description: Default name the model is served under.
+    value: ${{ steps.spec.outputs.served-model-name }}
+  tool-call-parser:
+    description: Default vLLM tool-call parser.
+    value: ${{ steps.spec.outputs.tool-call-parser }}
+  reasoning-parser:
+    description: Default vLLM reasoning parser.
+    value: ${{ steps.spec.outputs.reasoning-parser }}
+  digest:
+    description: Registry digest when this step pulled the image, otherwise empty.
+    value: ${{ steps.resolve.outputs.digest }}
+  source:
+    description: '"registry", "runner" (prepared by an earlier job on this runner), or "build".'
+    value: ${{ steps.resolve.outputs.source }}
+runs:
+  using: composite
+  steps:
+    - name: Read image spec
+      id: spec
+      uses: ./.github/actions/vllm-image-spec
+      with:
+        key: ${{ inputs.key }}
+
+    - name: Log in to GHCR (docker)
+      if: inputs.runtime == 'docker'
+      uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      with:
+        registry: ghcr.io
+        username: ${{ inputs.registry-username }}
+        password: ${{ inputs.registry-token }}
+
+    - name: Log in to GHCR (podman)
+      if: inputs.runtime == 'podman'
+      shell: bash
+      env:
+        GHCR_USERNAME: ${{ inputs.registry-username }}
+        GHCR_TOKEN: ${{ inputs.registry-token }}
+      run: |
+        set -euo pipefail
+        echo "$GHCR_TOKEN" | podman login ghcr.io \
+          --username "$GHCR_USERNAME" --password-stdin
+
+    - name: Resolve image
+      id: resolve
+      uses: ./.github/actions/resolve-vllm-gpu-image
+      with:
+        image: ${{ steps.spec.outputs.image }}
+        model: ${{ steps.spec.outputs.model }}
+        revision: ${{ steps.spec.outputs.revision }}
+        runtime: ${{ inputs.runtime }}
+        reuse-local: "true"
+
+    # Only reached when neither the runner nor GHCR holds an image matching this
+    # checkout: the vllm-full-suite label on a PR that edits vllm/Containerfile,
+    # or a publish that has not landed yet. Building here keeps such a run
+    # validated against the image the checkout describes.
+    - name: Build image
+      if: steps.resolve.outputs.build-required == 'true'
+      uses: ./.github/actions/build-vllm-gpu
+      with:
+        model: ${{ steps.spec.outputs.model }}
+        revision: ${{ steps.spec.outputs.revision }}
+        image: ${{ steps.spec.outputs.image }}
+        runtime: ${{ inputs.runtime }}
+        hugging-face-token: ${{ inputs.hugging-face-token }}
+
+    - name: Record prepared image
+      if: inputs.record != ''
+      shell: bash
+      env:
+        RECORD: ${{ inputs.record }}
+        IMAGE: ${{ steps.spec.outputs.image }}
+        CONTAINER_RUNTIME: ${{ inputs.runtime }}
+        DIGEST: ${{ steps.resolve.outputs.digest }}
+        SOURCE: ${{ steps.resolve.outputs.source }}
+      run: |
+        set -euo pipefail
+        # Read provenance off the image now on the runner, which after a build
+        # is not the one the registry holds.
+        label() {
+          local value
+          value="$("$CONTAINER_RUNTIME" image inspect "$IMAGE" \
+            --format "{{index .Config.Labels \"$1\"}}" 2>/dev/null || true)"
+          [ "$value" = "<no value>" ] && value=""
+          printf '%s' "$value"
+        }
+        IMAGE_ID="$("$CONTAINER_RUNTIME" image inspect "$IMAGE" --format '{{.Id}}')" \
+        MODEL="$(label praxis.vllm.inference-model)" \
+        REVISION="$(label praxis.vllm.inference-revision)" \
+        BASE_IMAGE="$(label praxis.vllm.base-image)" \
+        BUILT_FROM="$(label org.opencontainers.image.revision)" \
+        python3 - <<'PY'
+        import json, os
+        env = os.environ
+        record = {
+            "image_tag": env["IMAGE"],
+            "local_image_id": env["IMAGE_ID"],
+            "registry_digest": env["DIGEST"] or None,
+            "image_source": env["SOURCE"],
+            "model": env["MODEL"],
+            "model_revision": env["REVISION"] or None,
+            "base_image": env["BASE_IMAGE"],
+            "built_from_commit": env["BUILT_FROM"],
+        }
+        with open(env["RECORD"], "w", encoding="utf-8") as out:
+            json.dump(record, out, indent=2)
+            out.write("\n")
+        PY
