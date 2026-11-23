@@ -527,6 +527,11 @@ fn validate_finish_reason(reason: Option<&str>) -> Result<(), String> {
 // -----------------------------------------------------------------------------
 
 /// Convert Gemini `usageMetadata` to OpenAI `usage`.
+///
+/// `cachedContentTokenCount` is a subset of `promptTokenCount`, matching
+/// OpenAI's `prompt_tokens_details.cached_tokens` inclusion in
+/// `prompt_tokens`, so it maps without adjusting the prompt total. The
+/// details object is emitted only when Vertex reports a cached count.
 fn convert_usage(usage: &Value) -> Value {
     let prompt = usage.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0);
     let completion = usage.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0);
@@ -535,11 +540,14 @@ fn convert_usage(usage: &Value) -> Value {
         .and_then(Value::as_u64)
         .unwrap_or(prompt + completion);
 
-    json!({
-        "prompt_tokens": prompt,
-        "completion_tokens": completion,
-        "total_tokens": total,
-    })
+    let mut converted = Map::with_capacity(4);
+    converted.insert("prompt_tokens".to_owned(), Value::from(prompt));
+    converted.insert("completion_tokens".to_owned(), Value::from(completion));
+    converted.insert("total_tokens".to_owned(), Value::from(total));
+    if let Some(cached) = usage.get("cachedContentTokenCount").and_then(Value::as_u64) {
+        converted.insert("prompt_tokens_details".to_owned(), json!({"cached_tokens": cached}));
+    }
+    Value::Object(converted)
 }
 
 // -----------------------------------------------------------------------------
@@ -1148,6 +1156,40 @@ mod tests {
         assert_eq!(parsed["usage"]["prompt_tokens"], 5);
         assert_eq!(parsed["usage"]["completion_tokens"], 2);
         assert_eq!(parsed["usage"]["total_tokens"], 7);
+        assert!(
+            parsed["usage"].get("prompt_tokens_details").is_none(),
+            "no cached count means no prompt_tokens_details"
+        );
+    }
+
+    #[test]
+    fn cached_content_token_count_maps_to_cached_tokens() {
+        let body = br#"{
+            "candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 100, "cachedContentTokenCount": 80, "candidatesTokenCount": 5, "totalTokenCount": 105}
+        }"#;
+        let output = transform_response(body, "gemini-1.5-pro").unwrap();
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(
+            parsed["usage"]["prompt_tokens"], 100,
+            "cached tokens stay inside prompt_tokens"
+        );
+        assert_eq!(parsed["usage"]["completion_tokens"], 5);
+        assert_eq!(parsed["usage"]["total_tokens"], 105);
+        assert_eq!(parsed["usage"]["prompt_tokens_details"], json!({"cached_tokens": 80}));
+    }
+
+    #[test]
+    fn zero_cached_content_token_count_is_preserved() {
+        let body = br#"{
+            "candidates": [{"content": {"parts": [{"text": "Hi"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 4, "cachedContentTokenCount": 0, "candidatesTokenCount": 1, "totalTokenCount": 5}
+        }"#;
+        let output = transform_response(body, "gemini-1.5-pro").unwrap();
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(parsed["usage"]["prompt_tokens_details"], json!({"cached_tokens": 0}));
     }
 
     #[test]
@@ -2114,7 +2156,30 @@ mod tests {
         assert_eq!(usage["usage"]["prompt_tokens"], 3);
         assert_eq!(usage["usage"]["completion_tokens"], 1);
         assert_eq!(usage["usage"]["total_tokens"], 4);
+        assert!(usage["usage"].get("prompt_tokens_details").is_none());
         assert_eq!(usage["id"], parsed["id"]);
+    }
+
+    #[test]
+    fn stream_trailing_usage_carries_cached_tokens_from_latest_frame() {
+        let mut state = new_stream_state(1);
+        state.set_include_usage(true);
+        translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"text":"Hel"}]}}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":80}}"#,
+        );
+        translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"text":"lo"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":80,"candidatesTokenCount":2,"totalTokenCount":102}}"#,
+        );
+
+        let usage: Value =
+            serde_json::from_slice(&take_stream_usage_chunk(&mut state, "gemini-1.5-pro").unwrap()).unwrap();
+        assert_eq!(usage["choices"], json!([]));
+        assert_eq!(usage["usage"]["prompt_tokens"], 100);
+        assert_eq!(usage["usage"]["completion_tokens"], 2);
+        assert_eq!(usage["usage"]["total_tokens"], 102);
+        assert_eq!(usage["usage"]["prompt_tokens_details"], json!({"cached_tokens": 80}));
     }
 
     #[test]

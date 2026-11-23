@@ -1,0 +1,75 @@
+version: 1
+id: vertex/cached-usage
+description: Map Vertex cachedContentTokenCount to OpenAI prompt_tokens_details.cached_tokens on finite responses and trailing stream usage.
+protocol: openai_chat_completions
+example_config: vertex/chat-completions-to-gemini.yaml
+upstream_authority: 127.0.0.1:3000
+features:
+  - vertex.gemini.response.cached_usage
+turns:
+  - name: finite-cached-usage
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: user
+              content: Hi
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/projects/my-gcp-project/locations/us-central1/publishers/google/models/synthetic-vertex-model:generateContent
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: finite-uncached-usage
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: user
+              content: Hi again
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/projects/my-gcp-project/locations/us-central1/publishers/google/models/synthetic-vertex-model:generateContent
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: streaming-cached-usage
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: user
+              content: Hi
+          stream: true
+          stream_options:
+            include_usage: true
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /v1/projects/my-gcp-project/locations/us-central1/publishers/google/models/synthetic-vertex-model:streamGenerateContent?alt=sse
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []
