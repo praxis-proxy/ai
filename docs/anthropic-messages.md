@@ -87,7 +87,7 @@ model server, so vLLM cannot honor it. When the selected cluster declares
 connector unchanged. The Chat Completions translation always refuses it.
 
 To serve the connector on these backends, add the experimental
-[`anthropic_mcp_connector`](filters/anthropic_mcp_connector.md) filter
+[`anthropic_mcp_connector`](filters/agents/anthropic_mcp_connector.md) filter
 (cargo feature `anthropic-mcp-connector-filter`) first in the inference step
 of an `iterative_request_router`. Praxis then runs the connector itself:
 

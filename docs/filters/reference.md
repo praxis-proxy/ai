@@ -77,6 +77,7 @@ Route MCP and A2A traffic, manage Responses and Conversations state, and execute
 | Filter | Description |
 |--------|-------------|
 | [`a2a`](agents/a2a.md) | Extracts A2A protocol metadata from JSON-RPC request bodies and promotes method, family, task ID, streaming detection, and version to request headers, filter results, and durable metadata for routing. |
+| [`anthropic_mcp_connector`](agents/anthropic_mcp_connector.md) | Executes the Anthropic Messages MCP connector for non-Anthropic backends. |
 | [`anthropic_web_search`](agents/anthropic_web_search.md) | Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop. |
 | [`mcp`](agents/mcp.md) | Extracts MCP protocol metadata from JSON-RPC request bodies and promotes method, tool/resource/prompt name, JSON-RPC kind, protocol version, and session presence to request headers/filter results; stores session ID in durable metadata. |
 | [`openai_agentic_loop`](agents/openai_agentic_loop.md) | Agentic loop controller for the Responses API pipeline. |
