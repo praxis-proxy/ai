@@ -4,7 +4,7 @@
 //! [`FileCatalog`] implementation.
 //!
 //! The SQL lives in [`request`] and
-//! [`reaper`]; this module wires each operation to the trait
+//! [`cleanup`]; this module wires each operation to the trait
 //! and applies the bounded retry only where a repeat is a no-op by state check:
 //! `create_pending`, `complete_upload`, `fail_upload`, `mark_for_deletion`,
 //! and `complete_cleanup`. `claim_cleanup` and the batch
@@ -19,7 +19,7 @@ use praxis_ai_store::{
     FileRecordPage, NewFile, StateOwner, StoredFile,
 };
 
-use super::{PostgresFileCatalog, finish, reaper, request, retry::with_retry};
+use super::{PostgresFileCatalog, cleanup, finish, request, retry::with_retry};
 
 /// Map a backend-only result onto the trait error.
 fn backend<T>(result: Result<T, super::retry::PgBackendError>) -> Result<T, CatalogError> {
@@ -58,18 +58,18 @@ impl FileCatalog for PostgresFileCatalog {
     }
 
     async fn mark_expired_for_deletion(&self, limit: u32) -> Result<u32, CatalogError> {
-        backend(reaper::mark_expired_once(self, limit).await)
+        backend(cleanup::mark_expired_once(self, limit).await)
     }
 
     async fn fail_abandoned_uploads(&self, abandon_after: Duration, limit: u32) -> Result<u32, CatalogError> {
-        backend(reaper::fail_abandoned_once(self, abandon_after, limit).await)
+        backend(cleanup::fail_abandoned_once(self, abandon_after, limit).await)
     }
 
     async fn claim_cleanup(&self, lease: Duration, limit: u32) -> Result<Vec<CleanupClaim>, CatalogError> {
-        backend(reaper::claim_cleanup_once(self, lease, limit).await)
+        backend(cleanup::claim_cleanup_once(self, lease, limit).await)
     }
 
     async fn complete_cleanup(&self, claim: &CleanupClaim) -> Result<bool, CatalogError> {
-        backend(with_retry(|| reaper::complete_cleanup_once(self, claim)).await)
+        backend(with_retry(|| cleanup::complete_cleanup_once(self, claim)).await)
     }
 }

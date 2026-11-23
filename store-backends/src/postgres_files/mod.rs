@@ -6,7 +6,7 @@
 //! [`FileCatalog`]: praxis_ai_store::FileCatalog
 
 mod catalog;
-mod reaper;
+mod cleanup;
 mod request;
 pub(crate) mod retry;
 pub(crate) mod schema;

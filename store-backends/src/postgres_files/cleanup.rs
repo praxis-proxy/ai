@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Reaper-facing operations of the [`FileCatalog`](praxis_ai_store::FileCatalog).
+//! Cross-tenant lifecycle and cleanup operations of the [`FileCatalog`](praxis_ai_store::FileCatalog).
 //!
 //! These work across tenants and never change usage except the purge in
 //! [`complete_cleanup_once`]. Each
