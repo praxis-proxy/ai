@@ -807,12 +807,13 @@ fn transform_delta(
     output: &mut Vec<u8>,
     max_tool_blocks: usize,
 ) -> Result<(), FilterError> {
-    if let Some(reasoning) = delta_reasoning(delta) {
-        close_text_block_if_open(state, output);
-        emit_thinking_delta(state, reasoning, output);
-    }
+    transform_reasoning_delta(state, delta, output);
 
-    if let Some(content) = delta.get("content").and_then(Value::as_str) {
+    if let Some(content) = delta
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|content| !content.is_empty())
+    {
         close_thinking_block_if_open(state, output);
         emit_text_delta(state, content, output);
     }
@@ -863,6 +864,26 @@ fn emit_text_delta(state: &mut StreamState, content: &str, output: &mut Vec<u8>)
 // -----------------------------------------------------------------------------
 // Tool Delta Transformation
 // -----------------------------------------------------------------------------
+
+/// Transform one delta's reasoning field, if any.
+///
+/// A malformed reasoning field is an upstream outcome Anthropic's schema
+/// cannot represent, the same treatment a refusal gets: the stream fails
+/// closed instead of completing without the reasoning.
+fn transform_reasoning_delta(state: &mut StreamState, delta: &Value, output: &mut Vec<u8>) {
+    match delta_reasoning(delta) {
+        ReasoningDelta::Absent => {},
+        ReasoningDelta::Text(reasoning) => {
+            close_open_tool_blocks(state, output);
+            close_text_block_if_open(state, output);
+            emit_thinking_delta(state, reasoning, output);
+        },
+        ReasoningDelta::Malformed => {
+            emit_upstream_transform_error(output);
+            mark_stream_failed(state);
+        },
+    }
+}
 
 /// Transform a tool call delta into Anthropic content block events.
 fn transform_tool_delta(
@@ -1155,20 +1176,54 @@ fn is_text_block_open(state: &StreamState) -> bool {
     state.text_open
 }
 
-/// Upstream delta fields carrying assistant reasoning, in preference order.
+/// What one upstream delta's reasoning field carries.
+enum ReasoningDelta<'a> {
+    /// No reasoning field, or an empty string: nothing to emit.
+    Absent,
+    /// Reasoning text to surface.
+    Text(&'a str),
+    /// A reasoning field that is neither null nor a string. The finite path
+    /// rejects the same shape, so the stream must not silently drop it.
+    Malformed,
+}
+
+/// Read one upstream delta's reasoning field.
 ///
-/// vLLM prefers `reasoning` and keeps `reasoning_content` as a deprecated
-/// alias; other backends emit only `reasoning_content`. Both spellings carry
-/// output the backend produced and billed, so both are read. A field that is
-/// present but not a non-empty string produces no block, the same treatment
-/// `content` gets.
-fn delta_reasoning(delta: &Value) -> Option<&str> {
-    ["reasoning", "reasoning_content"].into_iter().find_map(|field| {
-        delta
-            .get(field)
-            .and_then(Value::as_str)
-            .filter(|reasoning| !reasoning.is_empty())
-    })
+/// The field list is shared with the finite translator
+/// ([`REASONING_FIELDS`](crate::anthropic::messages_to_chat_completions::response::REASONING_FIELDS))
+/// so the two paths cannot drift when an alias is added: vLLM prefers
+/// `reasoning` and keeps `reasoning_content` as a deprecated alias, and other
+/// backends emit only `reasoning_content`.
+fn delta_reasoning(delta: &Value) -> ReasoningDelta<'_> {
+    for field in crate::anthropic::messages_to_chat_completions::response::REASONING_FIELDS {
+        let Some(value) = delta.get(field) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        // An empty string falls through to the next alias, like the finite
+        // path's field preference does.
+        if let Some(reasoning) = value.as_str() {
+            if !reasoning.is_empty() {
+                return ReasoningDelta::Text(reasoning);
+            }
+        } else {
+            return ReasoningDelta::Malformed;
+        }
+    }
+    ReasoningDelta::Absent
+}
+
+/// Close every open tool block, in block order, before other content opens.
+///
+/// Interleaved thinking arrives after a tool call's arguments; Anthropic
+/// permits one open block at a time, so the tool closes first and the
+/// thinking follows it.
+fn close_open_tool_blocks(state: &mut StreamState, output: &mut Vec<u8>) {
+    for (_, tool_call_key) in open_tool_blocks(state) {
+        close_tool_block(state, &tool_call_key, output);
+    }
 }
 
 /// Whether the current thinking block needs closing.
@@ -1641,6 +1696,84 @@ mod tests {
         assert_pointer(&text_start, "/index", &Value::from(1_u64));
         assert_pointer(&text_start, "/content_block/type", &Value::String("text".into()));
         assert!(out.contains("Hello"));
+    }
+
+    #[test]
+    fn an_empty_leading_content_chunk_does_not_preempt_the_thinking_block() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        // vLLM's usual first chunk carries an empty content string; it must
+        // not open an empty text block ahead of the reasoning that follows.
+        let first = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(first));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+        assert!(
+            !out.contains("content_block_start"),
+            "an empty content string must not open a block: {out}"
+        );
+
+        let reasoning = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"reasoning_content\":\"let me think\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(reasoning));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+
+        let start = event_data(&out, "content_block_start");
+        assert_pointer(&start, "/index", &Value::from(0_u64));
+        assert_pointer(&start, "/content_block/type", &Value::String("thinking".into()));
+    }
+
+    #[test]
+    fn reasoning_after_tool_calls_closes_the_tool_block_first() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let tool_delta = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(tool_delta));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let reasoning = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"reasoning_content\":\"between calls\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(reasoning));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+
+        assert!(
+            out.contains("content_block_stop"),
+            "the open tool block must close before thinking opens: {out}"
+        );
+        let start = event_data(&out, "content_block_start");
+        assert_pointer(&start, "/content_block/type", &Value::String("thinking".into()));
+        assert_pointer(&start, "/index", &Value::from(1_u64));
+    }
+
+    #[test]
+    fn a_malformed_reasoning_delta_fails_the_stream_closed() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let role = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(role));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let malformed = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"reasoning_content\":7},\"index\":0}]}\n\n";
+        let mut body = Some(Bytes::from(malformed));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+
+        assert!(
+            out.contains("error"),
+            "a non-string reasoning delta must fail the stream: {out}"
+        );
+        assert!(
+            is_stream_failed(state_mut(&mut ctx)),
+            "the stream must be marked failed"
+        );
+
+        let mut done = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut done, true).unwrap());
+        let out = String::from_utf8(done.unwrap().to_vec()).unwrap();
+        assert!(
+            !out.contains("message_stop"),
+            "a failed stream must not terminate as a success"
+        );
     }
 
     #[test]

@@ -188,7 +188,7 @@ fn build_content_blocks<'a>(obj: &'a Map<String, Value>) -> Result<Vec<ContentBl
 /// vLLM prefers `reasoning` and keeps `reasoning_content` as a deprecated
 /// alias; other backends emit only `reasoning_content`. Both spellings carry
 /// output the backend produced and billed, so both are read.
-const REASONING_FIELDS: [&str; 2] = ["reasoning", "reasoning_content"];
+pub(crate) const REASONING_FIELDS: [&str; 2] = ["reasoning", "reasoning_content"];
 
 /// Extract a thinking content block from the message's reasoning, if any.
 ///
