@@ -23,7 +23,7 @@ pub(crate) use frame::{SseFrame, SseFrameParser, SseParseError};
 /// Decode a complete, already-buffered SSE body into each event's joined
 /// `data` payload, in order.
 ///
-/// Runs the conforming [`SseFrameParser`]: CR, LF, and CRLF line endings, an
+/// Runs the crate's conforming SSE frame parser: CR, LF, and CRLF line endings, an
 /// optional leading UTF-8 BOM, comments, and colonless fields. Because the
 /// caller has read the body to its end, a final event without a terminating
 /// blank line is still returned.
