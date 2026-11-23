@@ -58,7 +58,7 @@ pub(super) async fn mark_expired_once(c: &PostgresFileCatalog, limit: u32) -> Re
     let files = &c.files;
     let mut tx = c.begin().await?;
     let affected = sqlx::query(AssertSqlSafe(format!(
-        "WITH batch AS MATERIALIZED ( \
+        "WITH batch AS ( \
            SELECT id FROM {files} WHERE state = 'ready' AND expires_at <= {NOW} \
            LIMIT $1 FOR UPDATE SKIP LOCKED) \
          UPDATE {files} f SET state = 'deletion_pending', lease_until = {NOW} \
@@ -83,7 +83,7 @@ pub(super) async fn fail_abandoned_once(
     let secs = secs_ceil(abandon_after)?;
     let mut tx = c.begin().await?;
     let affected = sqlx::query(AssertSqlSafe(format!(
-        "WITH batch AS MATERIALIZED ( \
+        "WITH batch AS ( \
            SELECT id FROM {files} WHERE state = 'pending' AND created_at <= {NOW} - $1 \
            LIMIT $2 FOR UPDATE SKIP LOCKED) \
          UPDATE {files} f SET state = 'failed', lease_until = {NOW} \
@@ -109,7 +109,7 @@ pub(super) async fn claim_cleanup_once(
     let lease_secs = secs_ceil(lease)?;
     let mut tx = c.begin().await?;
     let rows = sqlx::query(AssertSqlSafe(format!(
-        "WITH batch AS MATERIALIZED ( \
+        "WITH batch AS ( \
            SELECT id FROM {files} \
            WHERE state IN ('failed', 'deletion_pending') AND lease_until <= {NOW} \
            ORDER BY lease_until LIMIT $2 FOR UPDATE SKIP LOCKED) \
