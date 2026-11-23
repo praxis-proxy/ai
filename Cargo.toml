@@ -95,7 +95,7 @@ toml = { version = "1.1.8", default-features = false, features = ["std", "serde"
 tokio-rustls = { version = "0.26.5", default-features = false, features = ["logging", "tls12"] }
 tokio-tungstenite = "0.30.0"
 tokio-util = "0.7.19"
-url = "2.5.8"
+url = "2.5.9"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 utoipa = "6.0.0"
