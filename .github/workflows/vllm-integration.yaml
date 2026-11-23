@@ -932,8 +932,7 @@ jobs:
         # additionally skip on a focused degradation-only or compaction-only
         # dispatch; the two translated steps below carry the degradation run, and
         # the compaction steps carry the compaction-only run.
-        # TEMP(#2027): connector-only GPU validation; revert before merge.
-        if: ${{ false && success() && env.DEGRADE_ONLY != 'true' && !inputs.run_compaction_only }}
+        if: ${{ success() && env.DEGRADE_ONLY != 'true' && !inputs.run_compaction_only }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -958,8 +957,7 @@ jobs:
 
       - name: Run Claude Code transformed-vLLM acceptance test (once, no retry)
         id: claude_translated_edits
-        # TEMP(#2027): connector-only GPU validation; revert before merge.
-        if: ${{ false && always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -981,8 +979,7 @@ jobs:
 
       - name: Run Claude Code auto-mode native-vLLM acceptance test (once, no retry)
         id: claude_native_auto
-        # TEMP(#2027): connector-only GPU validation; revert before merge.
-        if: ${{ false && always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -1003,8 +1000,7 @@ jobs:
 
       - name: Run Claude Code auto-mode transformed-vLLM acceptance test (once, no retry)
         id: claude_translated_auto
-        # TEMP(#2027): connector-only GPU validation; revert before merge.
-        if: ${{ false && always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -1024,8 +1020,7 @@ jobs:
 
       - name: Run Claude Code planning-turn regression (once, no retry)
         id: claude_planning
-        # TEMP(#2027): connector-only GPU validation; revert before merge.
-        if: ${{ false && always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -1051,8 +1046,7 @@ jobs:
 
       - name: Run Claude Code server-side web-search acceptance test (once, no retry)
         id: claude_web_search
-        # TEMP(#2027): connector-only GPU validation; revert before merge.
-        if: ${{ false && always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -1086,8 +1080,7 @@ jobs:
 
       - name: Run Claude Code compaction acceptance test (once, no retry)
         id: claude_compaction
-        # TEMP(#2027): connector-only GPU validation; revert before merge.
-        if: ${{ false && always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -1113,8 +1106,7 @@ jobs:
 
       - name: Run Anthropic SDK Messages against real vLLM
         id: anthropic_messages
-        # TEMP(#2027): connector-only GPU validation; revert before merge.
-        if: ${{ false && always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         timeout-minutes: 15
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
@@ -1128,8 +1120,7 @@ jobs:
 
       - name: Run Anthropic SDK web search against real vLLM (stubbed provider)
         id: anthropic_stubbed_web_search
-        # TEMP(#2027): connector-only GPU validation; revert before merge.
-        if: ${{ false && always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         timeout-minutes: 15
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
@@ -1161,8 +1152,7 @@ jobs:
 
       - name: Run credentialed live Tavily web search against real vLLM
         id: anthropic_credentialed_web_search
-        # TEMP(#2027): connector-only GPU validation; revert before merge.
-        if: ${{ false && always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         timeout-minutes: 15
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
@@ -1184,8 +1174,7 @@ jobs:
 
       - name: Run selected-Anthropic OpenAI-chat translation against real vLLM
         id: selected_anthropic_openai_chat
-        # TEMP(#2027): connector-only GPU validation; revert before merge.
-        if: ${{ false && always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' && env.DEGRADE_ONLY != 'true' }}
         timeout-minutes: 15
         env:
           # Reuse the praxis-ai binary built by "Build Praxis and acceptance test".
@@ -1349,9 +1338,8 @@ jobs:
   vllm-gpu-codex-acceptance:
     name: Codex acceptance on real vLLM (GPU)
     needs: [gpu-start-runner, vllm-gpu-full-suite]
-    # TEMP(#2027): connector-only GPU validation; revert before merge.
     if: |
-      false &&
+      !cancelled() &&
       needs.gpu-start-runner.result == 'success' &&
       (
         github.event_name == 'schedule' ||
@@ -1806,9 +1794,8 @@ jobs:
   vllm-gpu-opencode-acceptance:
     name: OpenCode acceptance on real vLLM (GPU)
     needs: [pins, gpu-start-runner, vllm-gpu-full-suite]
-    # TEMP(#2027): connector-only GPU validation; revert before merge.
     if: |
-      false &&
+      !cancelled() &&
       needs.gpu-start-runner.result == 'success' &&
       (
         github.event_name == 'schedule' ||
@@ -2275,9 +2262,8 @@ jobs:
   vllm-gpu-pi-acceptance:
     name: pi acceptance on real vLLM (GPU)
     needs: [pins, gpu-start-runner, vllm-gpu-full-suite]
-    # TEMP(#2027): connector-only GPU validation; revert before merge.
     if: |
-      false &&
+      !cancelled() &&
       needs.gpu-start-runner.result == 'success' &&
       (
         github.event_name == 'schedule' ||
@@ -2682,9 +2668,8 @@ jobs:
     # Runs on schedule, a run_live_vllm dispatch, or a vllm-full-suite label —
     # but NOT on an acceptance-only dispatch, which starts the runner purely for
     # pinned Claude/Codex validation and must skip the ~90-minute suite.
-    # TEMP(#2027): connector-only GPU validation; revert before merge.
     if: |
-      false &&
+      !cancelled() &&
       needs.gpu-start-runner.result == 'success' &&
       (
         github.event_name == 'schedule' ||
@@ -3050,8 +3035,7 @@ jobs:
     name: Summarize vLLM Responses gateway GPU qualification
     needs: [gpu-start-runner, vllm-gpu-full-suite, vllm-gpu-claude-acceptance, vllm-gpu-codex-acceptance,
             vllm-gpu-opencode-acceptance, vllm-gpu-pi-acceptance]
-    # TEMP(#2027): connector-only GPU validation; revert before merge.
-    if: always() && github.event_name == 'schedule'
+    if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
