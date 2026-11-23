@@ -151,7 +151,7 @@ Every run that pushes a standard image also pushes the FIPS image, built
 from `Containerfile.fips` on UBI 9 with Red Hat's toolchain and OpenSSL,
 under the same tag with a `-fips` suffix. The pinned Red Hat base images are
 verified to be signed by Red Hat before every such build
-(`make fips-verify-image`). See [FIPS 140-3](fips.md) for what that image
+(`make fips-verify-image`). See [FIPS 140-3](../operations/fips.md) for what that image
 contains and how to run it.
 
 ## Changelog
@@ -190,7 +190,7 @@ The separate **vLLM Responses gateway qualification** section records live GPU
 evidence. Missing or unverifiable GPU evidence is stated as unavailable, with
 its reason and instructions to collect it; it does not block the release.
 The additional CI inventory is informational and does not change existing
-release gates. See [native vLLM qualification](developing/vllm-qualification.md)
+release gates. See [native vLLM qualification](vllm-qualification.md)
 for the GPU schema and recent ancestor nightly selection policy.
 
 ## Release support report
@@ -259,10 +259,10 @@ The production image is a minimal Alpine container:
 - Writable state directory: `/var/lib/praxis`, owned by the `praxis` user, for
   backends that keep local files such as the SQLite response store
 - Cargo features: `full` — experimental Responses, agentic loops and stores
-  require a custom build with explicit [feature selection](features.md#cargo-features)
+  require a custom build with explicit [feature selection](../features.md#cargo-features)
 
 The `-fips` image is the same binary's FIPS feature set on
 `ubi9/ubi-minimal`, built with Red Hat's `rust-toolset` and linked against
-UBI's OpenSSL; see [FIPS 140-3](fips.md).
+UBI's OpenSSL; see [FIPS 140-3](../operations/fips.md).
 
 > **Note**: This is subject to change.

@@ -470,7 +470,7 @@ example to PostgreSQL is a single filter edit:
 - `allow_private_database_url` is required for a loopback or other
   local-sensitive target; the URL validator rejects those by default. It is
   intended for local development; see
-  [`openai_responses_store`](../filters/openai_responses_store.md) for the full
+  [`openai_responses_store`](../filters/agents/openai_responses_store.md) for the full
   field reference.
 - `ssl_mode` defaults to `verify-full`, which a local server without TLS can
   never satisfy. `disable` is honest only when the connection never leaves the
@@ -489,7 +489,7 @@ example to PostgreSQL is a single filter edit:
 - Schema upgrades are recreate-only: a Praxis release that requires a newer
   schema refuses to start against the old tables, so treat stored responses as
   disposable and recreate the database. See
-  [Responses store schema upgrade](../store/schema-migration.md).
+  [Responses store schema upgrade](../operations/store/schema-migration.md).
 
 ## 3. Connect Codex
 

@@ -3,43 +3,43 @@
 Reviewed **2026-11-13**, against main
 `56dc39a25d7f44da0467c28f0e85bfa4ca220130` (the checkout matched fetched
 `origin/main` before edits). This document records evidence and remaining work;
-the [client/provider selector](client-provider-paths.md) is the reader entry
+the [client/provider selector](../getting-started/choose-client-and-provider.md) is the reader entry
 point. The onboarding/client-provider guides from #1976 were already present
 and are extended rather than replaced with competing guides.
 
 ## Evidence and support boundaries
 
-The audit checked [server feature wiring](../server/Cargo.toml),
-[filter registration](../filters/src/register.rs), API implementation modules,
+The audit checked [server feature wiring](../../server/Cargo.toml),
+[filter registration](../../filters/src/register.rs), API implementation modules,
 complete example YAML, functional example tests, SDK tests, and the
-[generated translation matrix](conformance/translation-matrix.md).
+[generated translation matrix](../conformance/translation-matrix.md).
 Registration establishes availability, not protocol conformance. Fixture replay
 establishes behavior against the recorded or synthetic backend, not a live
 provider/model. A test gated on infrastructure can skip and prove nothing live.
 
 | Capability | Source and existing test evidence | Operator boundary |
 | --- | --- | --- |
-| Native Chat/Responses forwarding | [Quickstart](quickstart.md), [HTTP passthrough config](../examples/configs/openai/responses/http-passthrough.yaml), [server feature graph](../server/Cargo.toml) | Standard routing can forward the upstream's APIs without local managed filters; no gateway tool execution follows from that |
-| Native Anthropic Messages | [Native config](../examples/configs/anthropic/messages-native-vllm.yaml), [functional tests](../tests/integration/tests/suite/examples/anthropic_messages_native_vllm.rs), [SDK lanes](../tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py) | Provider/model owns semantics; SDK v1/v2 credential/version differences matter |
-| Messages to Chat | [Request/finite adapter](../apis/src/anthropic/messages_to_chat_completions), [SSE adapter](../apis/src/anthropic/messages_to_chat_completions_stream), [functional tests](../tests/integration/tests/suite/examples/anthropic_messages_to_openai_vllm.rs) | Standard adapters; thinking/cache opt-ins lose semantics; document/server-tool/error-result rejection; count_tokens is not translated |
-| Chat to selected Anthropic | [Adapter](../apis/src/anthropic), [selected-provider example test](../tests/integration/tests/suite/examples/intelligent_route_selected_anthropic_legacy.rs), [OpenAI SDK test](../tests/integration/sdk/openai/test_selected_anthropic_chat_completions.py) | Requires trusted selected profile and explicit permission; ignored fields and per-version contract documented separately |
-| Azure Chat adaptation | [Example test](../tests/integration/tests/suite/examples/azure_translation.rs), [adapter reference](filters/openai_chat_completions_to_azureai_chat_completions.md) | Standard adapter; Entra acquisition is optional experimental; safety annotation loss remains in matrix |
-| Vertex Gemini translation | [Example test](../tests/integration/tests/suite/examples/vertex_gemini.rs), [adapter reference](filters/openai_chat_completions_to_vertexai_gemini.md) | Standard adapter; GCP acquisition optional experimental; strict schema and accounting limitations |
-| Vertex Anthropic | [Example test](../tests/integration/tests/suite/examples/vertex_anthropic.rs), [reference](filters/anthropic_messages_to_vertexai_anthropic.md) | Experimental adapter; selected cluster metadata, endpoint/model adaptation, authorized GCP identity required |
-| Bedrock Converse | [Implementation](../apis/src/bedrock/converse), [example test](../tests/integration/tests/suite/examples/bedrock.rs), [complete config](../examples/configs/bedrock/chat-completions-to-converse.yaml) | Standard translator and default signer; signing is not itself API support; history/reasoning/cache gaps remain |
-| Managed Responses, continuation and Conversations | [Responses modules](../apis/src/openai/responses), [Conversations](../apis/src/openai/conversations), [SDK tests](../tests/integration/sdk/openai/test_openai_conversations.py), [recipe](recipes/managed-responses.md) | Experimental opt-ins plus selected store backend for persistence; managed restrictions differ from passthrough |
-| MCP execution and server-owned tools | [Loop config](../examples/configs/openai/responses/agentic-loop.yaml), [MCP outbound tests](../tests/integration/tests/suite/examples/openai_mcp_outbound_chain.rs), [retained-payload contract](architecture/responses-retained-payload.md) | Discovery, dispatch, loop continuation, approval, and credential boundaries must all be composed; client function calls remain client-owned |
-| MCP broker and A2A routing | [Protocol architecture](architecture/agentic-protocols.md), [broker config](../examples/configs/mcp-stateless-broker.yaml), [A2A affinity config](../examples/configs/a2a-task-routing.yaml) | Protocol routing/brokering does not imply Responses tool execution or a hosted agent implementation |
-| Aliases and provider routing | [Model mapping tests](../tests/integration/tests/suite/examples/model_to_provider.rs), [dynamic routing contract](filters/intelligent_route.md) | Alias, dynamic selection, endpoint retries, and affinity are separate mechanisms; affinity is process-local |
-| Guardrails | [Implementation](../filters/src/guardrails), [functional tests](../tests/integration/tests/suite/examples/guardrails.rs), [response tests](../tests/integration/tests/suite/examples/guardrails_response.rs) | Operation identity required; fail-closed screening; Chat-only redaction; response streaming restrictions |
-| Tokens, limits and metering | [Usage implementation](../filters/src/token_usage), [count tests](../tests/integration/tests/suite/examples/token_counting.rs), [tenant metrics tests](../tests/integration/tests/suite/examples/token_usage_metrics.rs), [metering reference](filters/external_metering.md) | Observed usage is not enforcement; token ceilings, budgets and inflight tracking are optional experimental; body counts arrive after headers |
-| Credentials, identity and enrichment | [Registration](../filters/src/register.rs), [credential boundaries](recipes/README.md#credentials), [prompt enrichment](filters/prompt_enrich.md) | Header capture is not authentication; distinguish cluster credentials, selected-provider credentials, and destination-bound callout secrets |
+| Native Chat/Responses forwarding | [Build from source](../getting-started/build-from-source.md), [HTTP passthrough config](../../examples/configs/openai/responses/http-passthrough.yaml), [server feature graph](../../server/Cargo.toml) | Standard routing can forward the upstream's APIs without local managed filters; no gateway tool execution follows from that |
+| Native Anthropic Messages | [Native config](../../examples/configs/anthropic/messages-native-vllm.yaml), [functional tests](../../tests/integration/tests/suite/examples/anthropic_messages_native_vllm.rs), [SDK lanes](../../tests/integration/sdk/anthropic/test_anthropic_sdk_compat.py) | Provider/model owns semantics; SDK v1/v2 credential/version differences matter |
+| Messages to Chat | [Request/finite adapter](../../apis/src/anthropic/messages_to_chat_completions), [SSE adapter](../../apis/src/anthropic/messages_to_chat_completions_stream), [functional tests](../../tests/integration/tests/suite/examples/anthropic_messages_to_openai_vllm.rs) | Standard adapters; thinking/cache opt-ins lose semantics; document/server-tool/error-result rejection; count_tokens is not translated |
+| Chat to selected Anthropic | [Adapter](../../apis/src/anthropic), [selected-provider example test](../../tests/integration/tests/suite/examples/intelligent_route_selected_anthropic_legacy.rs), [OpenAI SDK test](../../tests/integration/sdk/openai/test_selected_anthropic_chat_completions.py) | Requires trusted selected profile and explicit permission; ignored fields and per-version contract documented separately |
+| Azure Chat adaptation | [Example test](../../tests/integration/tests/suite/examples/azure_translation.rs), [adapter reference](../filters/providers/openai_chat_completions_to_azureai_chat_completions.md) | Standard adapter; Entra acquisition is optional experimental; safety annotation loss remains in matrix |
+| Vertex Gemini translation | [Example test](../../tests/integration/tests/suite/examples/vertex_gemini.rs), [adapter reference](../filters/providers/openai_chat_completions_to_vertexai_gemini.md) | Standard adapter; GCP acquisition optional experimental; strict schema and accounting limitations |
+| Vertex Anthropic | [Example test](../../tests/integration/tests/suite/examples/vertex_anthropic.rs), [reference](../filters/providers/anthropic_messages_to_vertexai_anthropic.md) | Experimental adapter; selected cluster metadata, endpoint/model adaptation, authorized GCP identity required |
+| Bedrock Converse | [Implementation](../../apis/src/bedrock/converse), [example test](../../tests/integration/tests/suite/examples/bedrock.rs), [complete config](../../examples/configs/bedrock/chat-completions-to-converse.yaml) | Standard translator and default signer; signing is not itself API support; history/reasoning/cache gaps remain |
+| Managed Responses, continuation and Conversations | [Responses modules](../../apis/src/openai/responses), [Conversations](../../apis/src/openai/conversations), [SDK tests](../../tests/integration/sdk/openai/test_openai_conversations.py), [recipe](../guides/managed-responses.md) | Experimental opt-ins plus selected store backend for persistence; managed restrictions differ from passthrough |
+| MCP execution and server-owned tools | [Loop config](../../examples/configs/openai/responses/agentic-loop.yaml), [MCP outbound tests](../../tests/integration/tests/suite/examples/openai_mcp_outbound_chain.rs), [retained-payload contract](../architecture/responses-retained-payload.md) | Discovery, dispatch, loop continuation, approval, and credential boundaries must all be composed; client function calls remain client-owned |
+| MCP broker and A2A routing | [Protocol architecture](../architecture/agentic-protocols.md), [broker config](../../examples/configs/mcp-stateless-broker.yaml), [A2A affinity config](../../examples/configs/a2a-task-routing.yaml) | Protocol routing/brokering does not imply Responses tool execution or a hosted agent implementation |
+| Aliases and provider routing | [Model mapping tests](../../tests/integration/tests/suite/examples/model_to_provider.rs), [dynamic routing contract](../filters/routing/intelligent_route.md) | Alias, dynamic selection, endpoint retries, and affinity are separate mechanisms; affinity is process-local |
+| Guardrails | [Implementation](../../filters/src/guardrails), [functional tests](../../tests/integration/tests/suite/examples/guardrails.rs), [response tests](../../tests/integration/tests/suite/examples/guardrails_response.rs) | Operation identity required; fail-closed screening; Chat-only redaction; response streaming restrictions |
+| Tokens, limits and metering | [Usage implementation](../../filters/src/token_usage), [count tests](../../tests/integration/tests/suite/examples/token_counting.rs), [tenant metrics tests](../../tests/integration/tests/suite/examples/token_usage_metrics.rs), [metering reference](../filters/control/external_metering.md) | Observed usage is not enforcement; token ceilings, budgets and inflight tracking are optional experimental; body counts arrive after headers |
+| Credentials, identity and enrichment | [Registration](../../filters/src/register.rs), [credential boundaries](../guides/README.md#credentials), [prompt enrichment](../filters/core/prompt_enrich.md) | Header capture is not authentication; distinguish cluster credentials, selected-provider credentials, and destination-bound callout secrets |
 
 The matrix explicitly distinguishes `translated`, `passthrough`, `lossy`,
 `rejected`, `n/a`, and `gap`. Its known gaps include accepted-but-incomplete
 behavior and must remain visible when promoting a provider recipe. Examples
 with local stubs, placeholder providers, or a broad path route are not complete
-provider qualifications. See [Anthropic evidence](anthropic-messages.md) for
+provider qualifications. See [Anthropic evidence](../anthropic-messages.md) for
 existing pinned GPU/model lanes; they were not rerun as part of this audit.
 
 ## Documentation changes
@@ -53,8 +53,8 @@ existing pinned GPU/model lanes; they were not rerun as part of this audit.
 - Reused the native/translated Anthropic and model-mapping examples in recipes.
 - Added full local composition recipes for guardrails with usage and for an
   experimental managed Responses/MCP/SQLite lab.
-- Moved Rust hosting/registration material to [development](developing/filter-hosts.md).
-- Added an [operations path](operations.md).
+- Moved Rust hosting/registration material to [development](filter-hosts.md).
+- Added an [operations path](../operations/README.md).
 
 ## Verification for this change
 
@@ -125,7 +125,7 @@ stopped after verification.
   Fix generator discovery/source metadata in a separate change; do not hand-edit
   the generated reference. This documentation links the implementation,
   configuration, and compatibility evidence without inventing an exact-settings page.
-- **Cloud account provisioning and qualification:** the [provider runbook](recipes/providers.md)
+- **Cloud account provisioning and qualification:** the [provider runbook](../guides/providers/README.md)
   completes gateway configuration and requests around existing examples. It
   assumes cloud accounts, regional permissions, model/deployment access, and
   a supported credential source. Those external prerequisites and live cloud

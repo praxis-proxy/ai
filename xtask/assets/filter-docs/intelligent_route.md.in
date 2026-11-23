@@ -747,14 +747,14 @@ See the [inference example], [MCP example], and [overlay contract fixtures] for
 additional configuration and compatibility cases.
 
 [model extraction]: model_to_header.md
-[overlay configuration example]: ../../examples/configs/intelligent-route-overlay.yaml
-[management-path example]: ../../examples/configs/intelligent-route-management-skip.yaml
-[minimal envelope fixture]: ../../tests/fixtures/overlay-contract/v1/valid-minimal.json
-[multi-candidate fixture]: ../../tests/fixtures/overlay-contract/v1/valid-multi-candidate.json
-[contract fixture manifest]: ../../tests/fixtures/overlay-contract/v1/manifest.json
-[credential injection]: credential_inject.md
-[Anthropic request converter]: openai_chat_completions_to_anthropic.md
+[overlay configuration example]: ../../../examples/configs/intelligent-route-overlay.yaml
+[management-path example]: ../../../examples/configs/intelligent-route-management-skip.yaml
+[minimal envelope fixture]: ../../../tests/fixtures/overlay-contract/v1/valid-minimal.json
+[multi-candidate fixture]: ../../../tests/fixtures/overlay-contract/v1/valid-multi-candidate.json
+[contract fixture manifest]: ../../../tests/fixtures/overlay-contract/v1/manifest.json
+[credential injection]: ../providers/credential_inject.md
+[Anthropic request converter]: ../apis/openai_chat_completions_to_anthropic.md
 [provider routing]: provider_route.md
-[inference example]: ../../examples/configs/intelligent-route-inference.yaml
-[MCP example]: ../../examples/configs/intelligent-route-mcp.yaml
-[overlay contract fixtures]: ../../tests/fixtures/overlay-contract/v1/manifest.json
+[inference example]: ../../../examples/configs/intelligent-route-inference.yaml
+[MCP example]: ../../../examples/configs/intelligent-route-mcp.yaml
+[overlay contract fixtures]: ../../../tests/fixtures/overlay-contract/v1/manifest.json

@@ -1,15 +1,16 @@
-# Quickstart
+# Build from source
 
 This source-build guide is for operators and client integrators who want to
-forward a first request to a hosted OpenAI API. Praxis AI is alpha software. The
-default responder check needs no provider account; the API request does. For
-other protocols and providers, start with [Client and provider
-paths](client-provider-paths.md).
+build Praxis AI and forward a first request to a hosted OpenAI API. To run the
+published container image instead, follow the [Quickstart](quickstart.md).
+Praxis AI is alpha software. The default responder check needs no provider
+account; the API request does. For other protocols and providers, start with
+[Choose a client and provider](choose-client-and-provider.md).
 
 ## Prerequisites and build
 
 You need Git, Make, curl, and the native build requirements listed in
-[Development setup](developing/getting-started.md#requirements). Run the
+[Development setup](../developing/getting-started.md#requirements). Run the
 commands from a repository checkout, as a non-root user:
 
 ```console
@@ -65,7 +66,7 @@ Replace both placeholders. The commands below do not print the key, but the
 request sends it to the configured upstream. This example forwards the caller's
 Authorization header; it does not configure gateway-owned credentials. For
 routing-selected upstream secrets, see [credential
-injection](filters/credential_inject.md) and its routing prerequisites.
+injection](../filters/providers/credential_inject.md) and its routing prerequisites.
 
 Create `praxis-ai.yaml`:
 
@@ -123,7 +124,7 @@ does not install the managed Responses filters, local Conversations storage, or
 an agentic loop. `make release` selects the standard proxy feature set; managed
 Responses requires `openai-responses`, and the ephemeral agent loop additionally
 requires `openai-agentic-loop`. These are experimental opt-ins; see [Cargo
-features](features.md#cargo-features) before choosing a build.
+features](../features.md#cargo-features) before choosing a build.
 
 ## Connect an existing client
 
@@ -151,7 +152,7 @@ print(response.output_text)
 This calls native `/v1/responses`. The route also forwards
 `/v1/chat/completions` without translating it; use the API supported by your
 upstream. Other provider protocols need their own configuration, as listed in
-[Client and provider paths](client-provider-paths.md).
+[Choose a client and provider](choose-client-and-provider.md).
 
 ## Chat Completions
 
@@ -194,7 +195,7 @@ Use the failure checks and cleanup below for either API.
   startup log has no configuration error. Stop the default responder before
   starting the configured proxy.
 - **Unknown filter type at startup:** check the binary's [build
-  features](features.md#cargo-features) against the configured filters.
+  features](../features.md#cargo-features) against the configured filters.
 - **HTTP error from the API:** inspect the response body. Authentication,
   permissions, model access, quota, and request validation can fail
   independently of proxy routing. Check the key and model in the client shell
@@ -206,7 +207,7 @@ Use the failure checks and cleanup below for either API.
 The SDK and hosted request above require provider access. For credential-free,
 local fixture coverage, see the deterministic OpenAI Agents SDK test command in
 [Development
-setup](developing/getting-started.md#openai-agents-sdk-responses-compatibility).
+setup](../developing/getting-started.md#openai-agents-sdk-responses-compatibility).
 That fixture exercises a managed Responses configuration with a different build;
 it does not verify this hosted route or live provider compatibility.
 
@@ -223,8 +224,8 @@ Remove `praxis-ai.yaml` if you no longer need the example.
 
 ## Next steps
 
-- [Example configs](../examples/README.md): working YAML for supported features
+- [Example configs](../../examples/README.md): working YAML for supported features
   and integration patterns.
-- [Filters](filters/README.md): operator capabilities and composition.
+- [Filters](../filters/README.md): operator capabilities and composition.
 - [Praxis core](https://github.com/praxis-proxy/praxis): listener, filter-chain,
   routing, and load-balancer configuration.
