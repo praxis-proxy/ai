@@ -444,6 +444,21 @@ impl HttpFilter for McpBrokerFilter {
         "mcp"
     }
 
+    fn selects_cluster(&self) -> bool {
+        self.protocol_profile == ProtocolProfile::Stateless
+    }
+
+    fn selected_clusters(&self) -> Vec<String> {
+        if !self.selects_cluster() {
+            return Vec::new();
+        }
+
+        let mut clusters: Vec<String> = self.catalog.iter().map(|tool| tool.cluster.clone()).collect();
+        clusters.sort_unstable();
+        clusters.dedup();
+        clusters
+    }
+
     fn request_body_access(&self) -> BodyAccess {
         BodyAccess::ReadWrite(praxis_filter::BodyRequirement::Optional)
     }
