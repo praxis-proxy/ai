@@ -61,7 +61,6 @@ fn record_from_row(row: &PgRow) -> Result<FileRecord, PgBackendError> {
 /// transaction), treats an identical existing row as success with its stored
 /// reservation, then grants `min(max_bytes, remaining quota)` and inserts.
 pub(super) async fn create_pending_once(c: &PostgresFileCatalog, file: &NewFile) -> Attempt<u64> {
-    let max_bytes = to_i64(file.max_bytes, "max_bytes")?;
     let tenant = file.owner.tenant_id();
     let mut tx = c.begin().await?;
 
@@ -76,7 +75,8 @@ pub(super) async fn create_pending_once(c: &PostgresFileCatalog, file: &NewFile)
     }
     let used = tenant_usage(c, &mut tx, tenant).await?;
     let remaining = i128::from(c.tenant_limit_bytes).saturating_sub(i128::from(used)).max(0);
-    let reserve = i64::try_from(remaining.min(i128::from(max_bytes))).map_err(|e| invalid(e.to_string()))?;
+    // Compared as i128 so a ceiling above i64::MAX is bounded by the quota.
+    let reserve = i64::try_from(remaining.min(i128::from(file.max_bytes))).map_err(|e| invalid(e.to_string()))?;
     if reserve == 0 {
         return Ok(Err(Domain::Quota));
     }
@@ -119,7 +119,7 @@ async fn identical_pending(
         && key == file.storage_key
         && filename == file.filename
         && state == "pending"
-        && bytes <= to_i64(file.max_bytes, "max_bytes")?;
+        && i128::from(bytes) <= i128::from(file.max_bytes);
     if !identical {
         return Ok(Some(Err(Domain::Conflict)));
     }
@@ -314,7 +314,7 @@ pub(super) async fn list_ready_impl(
     let cursor = match &query.after {
         None => None,
         Some(after) => match resolve_cursor(c, &mut tx, tenant, after).await? {
-            Some(created_at) => Some((created_at, after.clone())),
+            Some(created_at) => Some((created_at, after.as_str())),
             None => return Ok(Err(Domain::Cursor)),
         },
     };
@@ -333,7 +333,7 @@ async fn page_rows(
     tx: &mut Tx<'_>,
     tenant: &str,
     query: &FileListQuery,
-    cursor: Option<(i64, String)>,
+    cursor: Option<(i64, &str)>,
 ) -> Result<Vec<PgRow>, PgBackendError> {
     let files = &c.files;
     // Fixed fragments only: nothing request-controlled is interpolated.

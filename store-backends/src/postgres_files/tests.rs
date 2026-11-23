@@ -555,9 +555,10 @@ mod operations {
         // A retry asking for less than the stored reservation is a different request.
         let smaller = new_file("f1", &a, 10);
         assert!(matches!(c.create_pending(&smaller).await, Err(CatalogError::Conflict)));
-        // Reservation above i64::MAX is rejected, not wrapped.
+        // A ceiling above i64::MAX is bounded by the remaining quota, not rejected.
         let huge = new_file("f3", &a, u64::MAX);
-        assert!(matches!(c.create_pending(&huge).await, Err(CatalogError::Backend(_))));
+        let granted = c.create_pending(&huge).await.unwrap();
+        assert_eq!(granted, LIMIT - 100, "the grant is the remaining quota");
         c.close().await;
     }
 
@@ -858,10 +859,13 @@ mod operations {
             let (c, a) = (Arc::clone(&c), a.clone());
             completions.spawn(async move {
                 let id = format!("f{i}");
-                (
-                    id.clone(),
-                    c.complete_upload(&a, &id, completion(10, "p")).await.is_ok(),
-                )
+                let result = c.complete_upload(&a, &id, completion(10, "p")).await;
+                let completed = match result {
+                    Ok(_) => true,
+                    Err(CatalogError::Conflict) => false,
+                    Err(e) => panic!("losing completion must be a conflict, got {e:?}"),
+                };
+                (id, completed)
             });
         }
         let mut won = 0;
@@ -1019,11 +1023,13 @@ mod operations {
                     .connect(&database_url())
                     .await
                     .unwrap();
-                sqlx::query("SELECT pg_terminate_backend($1)")
+                // The timeout makes the call wait until the backend has exited.
+                let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1, 5000)")
                     .bind(pid)
-                    .execute(&admin)
+                    .fetch_one(&admin)
                     .await
                     .unwrap();
+                assert!(terminated, "the backend must be gone before the retry is exercised");
                 admin.close().await;
             }
             sqlx::query("SELECT 1")

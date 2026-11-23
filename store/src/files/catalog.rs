@@ -57,7 +57,8 @@ pub trait FileCatalog: Send + Sync {
     ///
     /// Returns [`CatalogError::QuotaExceeded`] without inserting when `R` is
     /// zero, [`CatalogError::Conflict`] for a duplicate ID or storage key with
-    /// different fields, a non-pending file, or a reservation above `max_bytes`, or [`CatalogError::Backend`] on persistence failure.
+    /// different fields, a non-pending file, or a reservation above `max_bytes`, or [`CatalogError::Backend`] on
+    /// persistence failure.
     async fn create_pending(&self, file: &NewFile) -> Result<u64, CatalogError>;
 
     /// Transition a pending file to ready and settle its charge from the

@@ -39,7 +39,6 @@ use crate::{
 /// the `schema` module for the DDL. Usage is derived (`sum(bytes)` per tenant) rather
 /// than stored, and the per-tenant quota advisory lock serializes only a
 /// tenant's `create_pending` calls.
-#[derive(Debug)]
 pub struct PostgresFileCatalog {
     /// Connection pool.
     pool: sqlx::PgPool,
@@ -49,6 +48,16 @@ pub struct PostgresFileCatalog {
     tenant_limit_bytes: u64,
     /// Connection URL, held only to redact it from runtime query errors.
     redact_url: String,
+}
+
+/// Omits `redact_url`, which can carry the connection password.
+impl std::fmt::Debug for PostgresFileCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresFileCatalog")
+            .field("files", &self.files)
+            .field("tenant_limit_bytes", &self.tenant_limit_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PostgresFileCatalog {
@@ -81,9 +90,7 @@ impl PostgresFileCatalog {
         pool_config: Option<&PoolConfig>,
         tenant_limit_bytes: u64,
     ) -> Result<Self, CatalogError> {
-        let options = pg_connect_options(database_url, tls).map_err(|e| {
-            CatalogError::Backend(Box::new(PgBackendError::new(PgFailure::NonRetryable, e.to_string())))
-        })?;
+        let options = pg_connect_options(database_url, tls).map_err(|e| non_retryable(database_url, &e))?;
         let pool = Box::pin(apply_pool_config(sqlx::postgres::PgPoolOptions::new(), pool_config).connect_with(options))
             .await
             .map_err(|e| {
@@ -96,9 +103,7 @@ impl PostgresFileCatalog {
 
         Box::pin(schema::initialize_files_schema(&pool, files_table))
             .await
-            .map_err(|e| {
-                CatalogError::Backend(Box::new(PgBackendError::new(PgFailure::NonRetryable, e.to_string())))
-            })?;
+            .map_err(|e| non_retryable(database_url, &e))?;
 
         tracing::info!(files = files_table, "postgres file catalog initialized");
         Ok(Self {
@@ -149,6 +154,13 @@ impl PostgresFileCatalog {
         statement_timeout: &str,
     ) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, PgBackendError> {
         let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.pg_err(&e))?;
+        // Explicit, so a non-default session isolation cannot give the quota
+        // sum a snapshot taken before the advisory lock wait. Must precede any
+        // other statement in the transaction.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| self.pg_err(&e))?;
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "SET LOCAL lock_timeout = '{lock_timeout}'"
         )))
@@ -168,6 +180,14 @@ impl PostgresFileCatalog {
     async fn begin(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, PgBackendError> {
         self.begin_tx(LOCK_TIMEOUT, STATEMENT_TIMEOUT).await
     }
+}
+
+/// A non-retryable backend error with the connection URL redacted.
+fn non_retryable(database_url: &str, e: &dyn std::fmt::Display) -> CatalogError {
+    CatalogError::Backend(Box::new(PgBackendError::new(
+        PgFailure::NonRetryable,
+        super::redact_connection_error(database_url, &e.to_string()),
+    )))
 }
 
 /// How long any statement may wait for a lock. Short, so a contended tenant
