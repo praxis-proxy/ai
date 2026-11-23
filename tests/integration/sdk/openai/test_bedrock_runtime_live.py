@@ -44,20 +44,25 @@ def test_stream_reports_text_finish_and_usage(client):
 
 def test_tool_result_continues_conversation(client):
     model = os.environ["BEDROCK_MODEL"]
-    messages = [{"role": "user", "content": "Call the status tool, then repeat its result verbatim."}]
+    messages = [{"role": "user", "content": "Call the status tool for service gateway, then repeat its result verbatim."}]
     response = client.chat.completions.create(
         model=model,
         messages=messages,
         tools=[{"type": "function", "function": {
-            "name": "status", "description": "Get the current status.",
-            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            "name": "status", "description": "Get the current status of a service.",
+            "parameters": {
+                "type": "object",
+                "properties": {"service": {"type": "string", "enum": ["gateway"]}},
+                "required": ["service"],
+                "additionalProperties": False,
+            },
         }}],
         max_completion_tokens=512,
     )
     message = response.choices[0].message
     call, = message.tool_calls
     assert call.function.name == "status"
-    assert json.loads(call.function.arguments) == {}
+    assert json.loads(call.function.arguments) == {"service": "gateway"}
     result = "STATUS-2907"
     messages.extend([
         message.model_dump(exclude_none=True, include={"role", "content", "tool_calls"}),
