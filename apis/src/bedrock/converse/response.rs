@@ -178,10 +178,12 @@ fn extract_message_content(message: &Value) -> Result<(Value, Vec<Value>), Strin
             text_parts.push(text);
         } else if let Some(tool_use) = block.get("toolUse") {
             tool_calls.push(translate_tool_use_block(tool_use)?);
-        } else if block.get("reasoningContent").is_some_and(Value::is_object) {
+        } else if let Some(reasoning_content) = block.get("reasoningContent") {
+            validate_reasoning_content(reasoning_content)?;
             // Chat Completions has no response field for Bedrock reasoning.
-            // Streaming omits this recognized union member while preserving
-            // surrounding text, so finite responses follow the same policy.
+            // Issue #1886 permits explicit omission on the finite path so the
+            // surrounding answer survives; #2055 owns the shared finite and
+            // streaming representation policy.
         } else {
             return Err("unsupported Bedrock response content block".to_owned());
         }
@@ -194,6 +196,33 @@ fn extract_message_content(message: &Value) -> Result<(Value, Vec<Value>), Strin
     };
 
     Ok((content, tool_calls))
+}
+
+/// Validate a Bedrock `ReasoningContentBlock` before omitting it.
+fn validate_reasoning_content(reasoning_content: &Value) -> Result<(), String> {
+    let reasoning_content = reasoning_content
+        .as_object()
+        .ok_or("Bedrock reasoningContent block must be an object")?;
+
+    match (
+        reasoning_content.get("reasoningText"),
+        reasoning_content.get("redactedContent"),
+    ) {
+        (Some(reasoning_text), None) => {
+            let reasoning_text = reasoning_text
+                .as_object()
+                .ok_or("Bedrock reasoningText block must be an object")?;
+            reasoning_text
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or("Bedrock reasoningText block is missing string `text`")?;
+            Ok(())
+        },
+        (None, Some(redacted_content)) if redacted_content.is_string() => Ok(()),
+        (None, Some(_)) => Err("Bedrock redactedContent must be a string".to_owned()),
+        (None, None) => Err("Bedrock reasoningContent block has no recognized variant".to_owned()),
+        (Some(_), Some(_)) => Err("Bedrock reasoningContent block has multiple union variants".to_owned()),
+    }
 }
 
 /// Convert a Bedrock `toolUse` content block to an OpenAI `tool_calls` entry.
@@ -698,22 +727,86 @@ mod tests {
     }
 
     #[test]
-    fn transform_response_rejects_malformed_reasoning_content() {
+    fn transform_response_preserves_text_and_tools_around_signed_reasoning() {
         let bedrock = serde_json::json!({
             "output": {
                 "message": {
-                    "role": "assistant",
                     "content": [
-                        {"reasoningContent": "not an object"},
-                        {"text": "must not survive a malformed response"}
+                        {"text": "Before "},
+                        {"reasoningContent": {
+                            "reasoningText": {"text": "Thinking", "signature": "opaque"}
+                        }},
+                        {"text": "after."},
+                        {"toolUse": {"toolUseId": "tc1", "name": "lookup", "input": {}}}
                     ]
                 }
             },
+            "stopReason": "tool_use"
+        });
+
+        let result: Value =
+            serde_json::from_slice(&transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap()).unwrap();
+
+        assert_eq!(result["choices"][0]["message"]["content"], "Before after.");
+        assert_eq!(result["choices"][0]["message"]["tool_calls"][0]["id"], "tc1");
+    }
+
+    #[test]
+    fn transform_response_preserves_text_beside_redacted_reasoning() {
+        let bedrock = serde_json::json!({
+            "output": {"message": {"content": [
+                {"reasoningContent": {"redactedContent": "b3BhcXVl"}},
+                {"text": "visible answer"}
+            ]}},
             "stopReason": "end_turn"
         });
 
-        let error = transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap_err();
-        assert_eq!(error, "unsupported Bedrock response content block");
+        let result: Value =
+            serde_json::from_slice(&transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap()).unwrap();
+        assert_eq!(result["choices"][0]["message"]["content"], "visible answer");
+    }
+
+    #[test]
+    fn transform_response_allows_reasoning_only_completion() {
+        let bedrock = serde_json::json!({
+            "output": {"message": {"content": [
+                {"reasoningContent": {"reasoningText": {"text": "Thinking"}}}
+            ]}},
+            "stopReason": "end_turn"
+        });
+
+        let result: Value =
+            serde_json::from_slice(&transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap()).unwrap();
+
+        assert!(result["choices"][0]["message"]["content"].is_null());
+        assert!(result["choices"][0]["message"].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn transform_response_rejects_malformed_reasoning_content() {
+        for malformed in [
+            serde_json::json!("not an object"),
+            serde_json::json!({}),
+            serde_json::json!({"reasoningText": "not an object"}),
+            serde_json::json!({"reasoningText": {}}),
+            serde_json::json!({"reasoningText": {"text": 1}}),
+            serde_json::json!({"redactedContent": 1}),
+            serde_json::json!({
+                "reasoningText": {"text": "ambiguous"},
+                "redactedContent": "b3BhcXVl"
+            }),
+        ] {
+            let bedrock = serde_json::json!({
+                "output": {"message": {"content": [
+                    {"reasoningContent": malformed},
+                    {"text": "must not survive a malformed response"}
+                ]}},
+                "stopReason": "end_turn"
+            });
+
+            let error = transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap_err();
+            assert!(error.contains("Bedrock"), "unexpected error: {error}");
+        }
     }
 
     #[test]
