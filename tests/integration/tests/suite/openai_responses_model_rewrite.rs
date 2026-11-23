@@ -3,8 +3,8 @@
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    free_port, http_send, json_post, parse_body, parse_status, start_backend_with_shutdown, start_echo_backend,
-    start_header_echo_backend, start_proxy,
+    StatefulCapturingBackend, free_port, http_send, json_post, parse_body, parse_status, start_backend_with_shutdown,
+    start_echo_backend, start_header_echo_backend, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -460,6 +460,50 @@ fn repeated_model_rejected_in_continue_mode_on_both_endpoints() {
             "{path}: rejection should have structured error type"
         );
     }
+}
+
+#[test]
+fn repeated_model_beside_out_of_range_number_rejected_in_continue_mode() {
+    let backend = StatefulCapturingBackend::new(vec![(200, "backend".to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+
+    let config = Config::from_yaml(&rewrite_without_request_classifier_yaml(proxy_port, backend.port())).unwrap();
+    let proxy = start_proxy(&config);
+
+    for body in [
+        r#"{"temperature":1e999,"model":"codex-mini-latest","input":"hi","model":"gpt-4.1-mini"}"#,
+        r#"{"model":"codex-mini-latest","input":"hi","model":"gpt-4.1-mini","temperature":1e999}"#,
+    ] {
+        let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+        assert_eq!(
+            parse_status(&raw),
+            400,
+            "an unrepresentable number must not let a repeated model through: {body}"
+        );
+        let error_body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+        assert_eq!(
+            error_body["error"]["type"].as_str(),
+            Some("invalid_request_error"),
+            "rejection should have structured error type"
+        );
+    }
+    assert!(
+        backend.requests().is_empty(),
+        "an ambiguous model must not reach the backend"
+    );
+
+    // Control: one model with the same number stays invalid JSON, which
+    // `on_invalid: continue` forwards unchanged as before.
+    let body = r#"{"temperature":1e999,"model":"codex-mini-latest","input":"hi"}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "a single-model invalid body must still pass through in continue mode"
+    );
+    let requests = backend.requests();
+    assert_eq!(requests.len(), 1, "only the control request reaches the backend");
+    assert_eq!(requests[0].body, body, "the invalid body is forwarded unchanged");
 }
 
 #[test]

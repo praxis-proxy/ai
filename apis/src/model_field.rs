@@ -66,6 +66,12 @@ pub enum ParseError {
 /// Builds the same map `serde_json::from_slice::<Value>` would, including
 /// trailing-content rejection, so callers swap it in without a second pass.
 ///
+/// A value `Value` cannot hold, such as the out-of-range number `1e999`, fails
+/// the map build wherever it sits relative to the repeated keys. Only that
+/// failure path rescans the body with [`scan`], which skips values without
+/// interpreting them, so a repeated `model` is still reported as
+/// [`ParseError::DuplicateModel`] and cannot pass as merely invalid JSON.
+///
 /// # Errors
 ///
 /// Returns [`ParseError`] for invalid JSON, a non-object document, or a
@@ -74,8 +80,11 @@ pub fn parse_object(raw: &[u8]) -> Result<Map<String, Value>, ParseError> {
     let mut deserializer = serde_json::Deserializer::from_slice(raw);
     let root = (&mut deserializer)
         .deserialize_any(RootVisitor)
-        .map_err(ParseError::Json)?;
-    deserializer.end().map_err(ParseError::Json)?;
+        .and_then(|root| deserializer.end().map(|()| root))
+        .map_err(|error| match scan(raw) {
+            ModelScan::Duplicate => ParseError::DuplicateModel,
+            ModelScan::Invalid | ModelScan::Absent | ModelScan::One(_) => ParseError::Json(error),
+        })?;
     match root {
         Root::Object {
             object,
@@ -362,6 +371,36 @@ mod tests {
             ),
             "a document that is not valid JSON is reported as such"
         );
+    }
+
+    #[test]
+    fn parse_object_refuses_a_repeat_beside_an_out_of_range_number() {
+        for raw in [
+            &br#"{"n":1e999,"model":"a","model":"b"}"#[..],
+            br#"{"model":"a","model":"b","n":1e999}"#,
+            br#"{"model":"a","n":[-1e999],"model":"a"}"#,
+        ] {
+            assert!(
+                matches!(parse_object(raw), Err(ParseError::DuplicateModel)),
+                "an unrelated unrepresentable value must not hide the repeat: {}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_object_keeps_json_error_for_single_model_out_of_range_number() {
+        for raw in [
+            &br#"{"n":1e999,"model":"a"}"#[..],
+            br#"{"model":"a","n":1e999}"#,
+            br#"{"n":1e999}"#,
+        ] {
+            assert!(
+                matches!(parse_object(raw), Err(ParseError::Json(_))),
+                "without a repeat the body stays invalid JSON: {}",
+                String::from_utf8_lossy(raw)
+            );
+        }
     }
 
     #[test]
