@@ -310,11 +310,13 @@ impl HttpFilter for TokenCountFilter {
 
         if !is_success {
             trace!("non-success response, skipping token extraction");
+            publish_quota_policy_context(ctx);
             return Ok(FilterAction::Continue);
         }
 
         if self.provider == ProviderKind::BedrockInvokeModel {
             extract_bedrock_headers(ctx);
+            publish_quota_policy_context(ctx);
             return Ok(FilterAction::Continue);
         }
 
@@ -362,9 +364,23 @@ impl HttpFilter for TokenCountFilter {
             None => {},
         }
 
+        if end_of_stream {
+            publish_quota_policy_context(ctx);
+        }
+
         Ok(FilterAction::Continue)
     }
 }
+
+/// Publish final usage into the trusted metadata-only PPE response context.
+#[cfg(feature = "token-quota-filter")]
+fn publish_quota_policy_context(ctx: &mut HttpFilterContext<'_>) {
+    crate::token_quota::publish_policy_context(ctx);
+}
+
+/// Keep call sites uniform when the quota integration is not compiled.
+#[cfg(not(feature = "token-quota-filter"))]
+fn publish_quota_policy_context(_ctx: &mut HttpFilterContext<'_>) {}
 
 // -----------------------------------------------------------------------------
 // Bedrock InvokeModel (Header-Only) Path

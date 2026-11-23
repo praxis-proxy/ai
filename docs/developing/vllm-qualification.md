@@ -146,3 +146,13 @@ A synthetic, reviewable notes fixture lives in
 section and idempotent composition; it is not real GPU qualification evidence.
 The broader CI summary has a separate synthetic fixture at
 `tests/qualification/release-ci-notes.fixture.md`.
+
+## CPU embeddings
+
+The [vLLM Embeddings Qualification workflow](../../.github/workflows/vllm-embeddings.yaml)
+serves a pinned Granite embedding model in pooling mode on a standard runner.
+The OpenAI SDK calls `/v1/embeddings` through Praxis and checks batch order
+against individual requests, 768-dimensional finite vectors, token usage, and
+unknown-model handling. The workflow records the image and model revision in
+its summary and publishes JUnit results. Release qualification lists the latest
+eligible run for the release commit.

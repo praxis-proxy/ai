@@ -76,6 +76,7 @@ reviewed revision and validation evidence.
 - [CLI clients with vLLM](developing/cli-vllm-through-praxis.md),
   [OpenShell](developing/openshell-cli-vllm-through-praxis.md),
   [qualification](developing/vllm-qualification.md), and [GPU testing](developing/gpu-nightly-suite.md).
+- [Hosted passthrough nightly](developing/hosted-passthrough-nightly.md).
 
 ### Conformance
 

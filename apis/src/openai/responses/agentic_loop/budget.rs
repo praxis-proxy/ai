@@ -7,6 +7,8 @@
 //! expansions across inference rounds. Owners reserve capacity before making
 //! independent payload copies and settle transient reservations after use.
 
+use crate::json_body::json_node_count;
+
 /// Copies and parsing capacity held while classifying and validating input.
 pub(super) const INPUT_WIRE_MULTIPLIER: usize = 32;
 /// The router buffer is reserved at one eighth of the configured ceiling.
@@ -18,13 +20,6 @@ const JSON_NODE_RESERVE: usize = 256;
 /// Parsed provider values may own a four-slot Vec or map for only a few wire
 /// bytes. Leave room for those allocations and their response-state copies.
 const OUTPUT_NODE_RESERVE: usize = 8_192;
-/// Raw body, SSE framing, rmcp parsing, and result conversion of one MCP
-/// reply. Measured peak is about 8x wire bytes plus 250 bytes per node.
-#[cfg(any(test, feature = "openai-mcp-tools"))]
-const MCP_RESULT_WIRE_MULTIPLIER: usize = 16;
-/// Per-node reserve for an MCP reply, about 2x the measured parse cost.
-#[cfg(any(test, feature = "openai-mcp-tools"))]
-const MCP_RESULT_NODE_RESERVE: usize = 512;
 /// Retained projections of each wire chunk across the logical stream.
 const STREAM_WIRE_MULTIPLIER: usize = 32;
 /// Additional retained replay and response projections when Store is active.
@@ -424,68 +419,17 @@ pub(crate) fn output_charge(bytes: &[u8]) -> Option<usize> {
         .checked_add(json_node_count(bytes)?.checked_mul(OUTPUT_NODE_RESERVE)?)
 }
 
-/// Charge an MCP server reply before rmcp parses it.
-#[cfg(any(test, feature = "openai-mcp-tools"))]
-pub(crate) fn mcp_result_charge(bytes: &[u8]) -> Option<usize> {
-    bytes
-        .len()
-        .checked_mul(MCP_RESULT_WIRE_MULTIPLIER)?
-        .checked_add(json_node_count(bytes)?.checked_mul(MCP_RESULT_NODE_RESERVE)?)
-}
-
-/// Count syntactic JSON nodes without allocating or trusting the payload.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the lexical scan keeps string and number state without allocating"
-)]
-fn json_node_count(bytes: &[u8]) -> Option<usize> {
-    let mut nodes = 0_usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut in_number = false;
-    for &byte in bytes {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match byte {
-            b'"' => {
-                nodes = nodes.checked_add(1)?;
-                in_string = true;
-                in_number = false;
-            },
-            b'{' | b'[' | b't' | b'f' | b'n' => {
-                nodes = nodes.checked_add(1)?;
-                in_number = false;
-            },
-            b'-' | b'0'..=b'9' if !in_number => {
-                nodes = nodes.checked_add(1)?;
-                in_number = true;
-            },
-            b'-' | b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' if in_number => {},
-            _ => in_number = false,
-        }
-    }
-    Some(nodes)
-}
-
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "unit tests construct validated budgets")]
 mod tests {
     use super::*;
 
     #[test]
-    fn mcp_result_charge_tracks_measured_parse_cost() {
+    #[cfg(feature = "openai-mcp-tools")]
+    fn mcp_result_charge_stays_below_output_charge() {
         let payload = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}],"structuredContent":{"replicas":[1,2,3],"ready":true}}}"#;
-        let nodes = json_node_count(payload).unwrap();
-        assert_eq!(mcp_result_charge(payload), Some(payload.len() * 16 + nodes * 512));
-        assert!(mcp_result_charge(payload).unwrap() * 4 < output_charge(payload).unwrap());
+        let mcp_charge = crate::mcp_client::mcp_result_charge(payload).unwrap();
+        assert!(mcp_charge * 4 < output_charge(payload).unwrap());
     }
 
     #[test]

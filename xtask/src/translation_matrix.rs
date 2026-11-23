@@ -12,7 +12,8 @@
 //! - Every surface answers every feature in the shared catalog, so the table is a matrix rather than a pile of
 //!   per-filter notes. A feature added to the catalog fails the check until each surface classifies it.
 //! - A `dropped` cell is a defect, not a support level, and must carry a blocker. Those cells never reach the support
-//!   table; they render into "Known gaps" so the document cannot claim behavior Praxis lacks.
+//!   table; they render into "Known gaps" so the document cannot claim behavior Praxis lacks. A blocker is an issue URL
+//!   in this repository or in Praxis core, never placeholder text, because release notes publish it verbatim.
 //!
 //! Two further checks tie the manifest to the checkout it describes: every
 //! filter it names must be registered in `filters/src/register.rs`, and every
@@ -62,6 +63,12 @@ const REGISTER_REL: &str = "filters/src/register.rs";
 
 /// Crate the manifest cites for behavior owned by the core protocol layer.
 const PROTOCOL_CRATE: &str = "praxis-proxy-protocol";
+
+/// Issue URL prefixes a gap's blocker may use.
+const BLOCKER_ISSUE_PREFIXES: [&str; 2] = [
+    "https://github.com/praxis-proxy/ai/issues/",
+    "https://github.com/praxis-proxy/praxis/issues/",
+];
 
 // -----------------------------------------------------------------------------
 // Manifest
@@ -477,6 +484,11 @@ fn validate_cross_surface_gaps(m: &Manifest, surface_ids: &BTreeSet<&str>, probl
         }
         if gap.blocker.trim().is_empty() {
             problems.push(format!("cross-surface gap `{}` has no blocker", gap.id));
+        } else if let Err(problem) = check_blocker(&gap.blocker) {
+            problems.push(format!(
+                "cross-surface gap `{}` blocker `{}` {problem}",
+                gap.id, gap.blocker
+            ));
         }
     }
 }
@@ -522,6 +534,11 @@ fn validate_cell(where_: &str, cell: &Cell, checkout: &Checkout, problems: &mut 
         (Some(blocker), true) if blocker.trim().is_empty() => {
             problems.push(format!("{where_} is a gap with an empty blocker"));
         },
+        (Some(blocker), true) => {
+            if let Err(problem) = check_blocker(blocker) {
+                problems.push(format!("{where_} blocker `{blocker}` {problem}"));
+            }
+        },
         (Some(_), false) => problems.push(format!(
             "{where_} has a blocker but status `{}`; only a gap takes a blocker",
             cell.status.label()
@@ -541,6 +558,23 @@ fn validate_cell(where_: &str, cell: &Cell, checkout: &Checkout, problems: &mut 
 
     if cell.status.needs_note() && cell.note.as_ref().is_none_or(|n| n.trim().is_empty()) {
         problems.push(format!("{where_} has status `{}` but no note", cell.status.label()));
+    }
+}
+
+/// Check that a blocker is a tracking issue rather than free text.
+///
+/// The release support report publishes blockers verbatim, so a placeholder
+/// such as `TODO-ISSUE ...` would ship as a known gap with nothing to follow.
+/// Only issues in this repository or in Praxis core are accepted.
+fn check_blocker(blocker: &str) -> Result<(), String> {
+    let number = BLOCKER_ISSUE_PREFIXES
+        .iter()
+        .find_map(|prefix| blocker.strip_prefix(prefix))
+        .ok_or_else(|| format!("is not an issue URL under {}", BLOCKER_ISSUE_PREFIXES.join(" or ")))?;
+    if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) && !number.starts_with('0') {
+        Ok(())
+    } else {
+        Err("does not end in an issue number".to_owned())
     }
 }
 
@@ -998,4 +1032,56 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("xtask crate always has a parent directory")
         .to_path_buf()
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocker_accepts_ai_and_core_issue_urls() {
+        assert!(check_blocker("https://github.com/praxis-proxy/ai/issues/2044").is_ok());
+        assert!(check_blocker("https://github.com/praxis-proxy/praxis/issues/1564").is_ok());
+    }
+
+    #[test]
+    fn blocker_rejects_placeholder_text() {
+        let problem = check_blocker("TODO-ISSUE emit terminal events at end-of-stream").unwrap_err();
+        assert!(problem.contains("is not an issue URL"), "{problem}");
+    }
+
+    #[test]
+    fn blocker_rejects_other_repositories_and_link_kinds() {
+        for blocker in [
+            "https://github.com/praxis-proxy/conventions/issues/1",
+            "https://github.com/praxis-proxy/ai/pull/1591",
+            "http://github.com/praxis-proxy/ai/issues/2044",
+            "#2044",
+        ] {
+            assert!(check_blocker(blocker).is_err(), "{blocker} should be rejected");
+        }
+    }
+
+    #[test]
+    fn blocker_rejects_missing_or_malformed_issue_numbers() {
+        for blocker in [
+            "https://github.com/praxis-proxy/ai/issues/",
+            "https://github.com/praxis-proxy/ai/issues/abc",
+            "https://github.com/praxis-proxy/ai/issues/12#issuecomment-3",
+            "https://github.com/praxis-proxy/ai/issues/012",
+            "https://github.com/praxis-proxy/ai/issues/12 ",
+        ] {
+            assert_eq!(
+                check_blocker(blocker).unwrap_err(),
+                "does not end in an issue number",
+                "{blocker}"
+            );
+        }
+    }
 }

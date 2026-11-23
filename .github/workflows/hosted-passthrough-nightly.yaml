@@ -1,0 +1,194 @@
+# Live provider calls are billable. Results apply to the tested checkout.
+name: Hosted Passthrough Nightly
+
+on:
+  schedule:
+    - cron: "43 5 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+
+jobs:
+  openai-chat:
+    name: Official OpenAI API passthrough
+    if: github.repository == 'praxis-proxy/ai' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check provider credential
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [[ -z "$OPENAI_API_KEY" ]]; then
+            echo "::error::Qualification unavailable: set the OPENAI_API_KEY Actions secret."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Build Praxis
+        run: cargo build --locked -p praxis-ai-proxy
+
+      - name: Qualify OpenAI passthrough
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PRAXIS_LIVE_OPENAI_BASE_URL: http://127.0.0.1:8080/v1
+        run: |
+          log="$RUNNER_TEMP/hosted-openai-praxis.log"
+          env -u OPENAI_API_KEY target/debug/praxis-ai \
+            -c tests/integration/fixtures/openai/chat-completions-live.yaml >"$log" 2>&1 &
+          gateway_pid=$!
+          trap 'kill "$gateway_pid" 2>/dev/null || true; wait "$gateway_pid" 2>/dev/null || true' EXIT
+          ready=false
+          for _ in {1..30}; do
+            if ! kill -0 "$gateway_pid" 2>/dev/null; then
+              break
+            fi
+            if curl --silent --output /dev/null --max-time 1 "$PRAXIS_LIVE_OPENAI_BASE_URL"; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            cat "$log"
+            echo "::error::Praxis did not start."
+            exit 1
+          fi
+
+          {
+            echo "### Official OpenAI API passthrough"
+            echo "- Gateway commit: $(git rev-parse HEAD)"
+            echo "- Configuration: tests/integration/fixtures/openai/chat-completions-live.yaml"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          uv run --script \
+            tests/integration/sdk/openai/test_openai_chat_completions_live.py \
+            --junitxml="$RUNNER_TEMP/hosted-openai-junit.xml" --tb=line
+
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hosted-openai-passthrough-results
+          path: |
+            ${{ runner.temp }}/hosted-openai-junit.xml
+            ${{ runner.temp }}/hosted-openai-praxis.log
+          if-no-files-found: ignore
+
+  bedrock-runtime:
+    name: Bedrock Runtime Chat Completions passthrough
+    if: github.repository == 'praxis-proxy/ai' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
+
+      - name: Build Praxis
+        run: cargo build --locked -p praxis-ai-proxy --features openai-responses
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Assume Bedrock role
+        id: bedrock-role
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: bedrock-gateway-${{ github.run_id }}
+          role-duration-seconds: 900
+
+      - name: Verify Bedrock Runtime passthrough
+        env:
+          PRAXIS_LIVE_BEDROCK: "1"
+          BEDROCK_MODEL: openai.gpt-oss-120b-1:0
+          GATEWAY_CONFIG: tests/integration/fixtures/bedrock/runtime-chat-live.yaml
+        run: |
+          target/debug/praxis-ai -c "$GATEWAY_CONFIG" >"$RUNNER_TEMP/bedrock-gateway.log" 2>&1 &
+          gateway_pid=$!
+          trap 'kill "$gateway_pid" 2>/dev/null || true; wait "$gateway_pid" 2>/dev/null || true' EXIT
+          for _ in {1..30}; do
+            kill -0 "$gateway_pid" || exit 1
+            if curl --silent --output /dev/null --max-time 1 http://127.0.0.1:8080/; then
+              break
+            fi
+            sleep 1
+          done
+          request=$(jq -nc --arg model "$BEDROCK_MODEL" '{
+            model: $model, messages: [{role: "user", content: "Reply with OK."}], max_completion_tokens: 128
+          }')
+          response=$(mktemp)
+          status=$(curl --silent --show-error --max-time 60 --output "$response" --write-out '%{http_code}' \
+            --json "$request" http://127.0.0.1:8080/v1/chat/completions)
+          echo "Gateway returned HTTP $status for $BEDROCK_MODEL."
+          test "$status" = 200
+          jq -e '.object == "chat.completion" and .choices[0].message.role == "assistant"' "$response" >/dev/null
+          echo "Passed signed gateway completion for $BEDROCK_MODEL in us-east-1 at $GITHUB_SHA ($GATEWAY_CONFIG)." >> "$GITHUB_STEP_SUMMARY"
+
+          env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
+            uv run --script tests/integration/sdk/openai/test_bedrock_runtime_live.py \
+              --junitxml="$RUNNER_TEMP/hosted-bedrock-junit.xml" --tb=line
+
+      - name: Smoke Responses translation to Bedrock Runtime
+        if: ${{ !cancelled() && steps.bedrock-role.outcome == 'success' }}
+        env:
+          BEDROCK_MODEL: openai.gpt-oss-120b-1:0
+        run: |
+          target/debug/praxis-ai -c tests/integration/fixtures/bedrock/responses-to-runtime-live.yaml \
+            >"$RUNNER_TEMP/bedrock-responses-gateway.log" 2>&1 &
+          gateway_pid=$!
+          response=$(mktemp)
+          trap 'kill "$gateway_pid" 2>/dev/null || true; wait "$gateway_pid" 2>/dev/null || true; rm "$response"' EXIT
+          for _ in {1..30}; do
+            kill -0 "$gateway_pid" || exit 1
+            if curl --silent --output /dev/null --max-time 1 http://127.0.0.1:8080/; then
+              break
+            fi
+            sleep 1
+          done
+          request=$(jq -nc --arg model "$BEDROCK_MODEL" '{
+            model: $model, input: "Reply with OK.", store: false, max_output_tokens: 512
+          }')
+          status=$(curl --silent --show-error --max-time 90 --output "$response" --write-out '%{http_code}' \
+            --json "$request" http://127.0.0.1:8080/v1/responses)
+          echo "Bedrock Responses translation returned HTTP $status."
+          test "$status" = 200
+          jq -e '.object == "response" and .status == "completed" and
+            any(.output[] | select(.type == "message") | .content[];
+                .type == "output_text" and (.text | length > 0))' "$response" >/dev/null
+
+      - name: Upload Bedrock test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hosted-bedrock-passthrough-results
+          path: ${{ runner.temp }}/hosted-bedrock-junit.xml
+          if-no-files-found: ignore

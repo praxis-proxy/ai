@@ -17,6 +17,8 @@ on:
       - "store-backends/**"
       - "store-lifecycle/**"
       - "apis/src/openai/responses/**"
+      - "apis/src/mcp_core/**"
+      - "apis/src/mcp_client/**"
       - "apis/src/openai/translation/**"
       - "apis/src/openai/conversations/**"
       - "apis/src/openai/sse/**"
@@ -193,6 +195,8 @@ jobs:
             'store-backends/' \
             'store-lifecycle/' \
             'apis/src/openai/responses/' \
+            'apis/src/mcp_core/' \
+            'apis/src/mcp_client/' \
             'apis/src/openai/translation/' \
             'apis/src/openai/conversations/' \
             'apis/src/openai/sse/' \
@@ -3090,9 +3094,13 @@ jobs:
       - vllm-gpu-codex-acceptance
       - vllm-gpu-opencode-acceptance
       - vllm-gpu-pi-acceptance
-    # Always tear down the instance, even on failure/cancel, but skip when the
-    # runner was never started (non-GPU triggers).
-    if: always() && needs.gpu-start-runner.result != 'skipped'
+    # A failed launch with no runner identifiers has nothing to stop.
+    # Keep partial outputs visible as cleanup errors.
+    if: >-
+      always() &&
+      (needs.gpu-start-runner.result == 'success' ||
+       needs.gpu-start-runner.outputs.ec2-instance-id != '' ||
+       needs.gpu-start-runner.outputs.label != '')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

@@ -1075,6 +1075,24 @@ fn connection_nominated_from_json(
     nominated
 }
 
+/// Raw body, SSE framing, rmcp parsing, and result conversion of one MCP
+/// reply. Measured peak is about 8x wire bytes plus 250 bytes per node.
+const MCP_RESULT_WIRE_MULTIPLIER: usize = 16;
+/// Per-node reserve for an MCP reply, about 2x the measured parse cost.
+const MCP_RESULT_NODE_RESERVE: usize = 512;
+
+/// Charge an MCP server reply before rmcp parses it.
+///
+/// Callers with a request-wide memory budget admit this charge before the
+/// transport buffers a reply, so the estimate stays independent of the
+/// inference protocol that owns the budget.
+pub(crate) fn mcp_result_charge(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .len()
+        .checked_mul(MCP_RESULT_WIRE_MULTIPLIER)?
+        .checked_add(crate::json_body::json_node_count(bytes)?.checked_mul(MCP_RESULT_NODE_RESERVE)?)
+}
+
 /// Headers that must not pass through from client-supplied MCP
 /// tool config into the proxy's outbound MCP transport.
 pub(crate) fn is_blocked_mcp_header(name: &http::HeaderName) -> bool {

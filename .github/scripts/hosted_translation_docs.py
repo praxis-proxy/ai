@@ -27,7 +27,6 @@ def render():
     secret = field(r"secrets\.([A-Z_]+)", workflow)
     artifact = field(r"^\s+name: (hosted-\S+-results)$", workflow)
     sdk = field(r'"anthropic==([^"]+)"', suite)
-    pytest = field(r'"pytest==([^"]+)"', suite)
     model = field(r'^MODEL = "([^"]+)"$', suite)
 
     return f"""# Hosted translation nightly
@@ -38,7 +37,8 @@ def render():
 `{runner}` at cron `{cron}` (UTC) and supports manual dispatch.
 It builds Praxis from the workflow checkout and uses the
 `{secret}` Actions secret to call official OpenAI. A missing
-secret fails the credential check before the build.
+secret fails the credential check before the build. Fork schedules skip
+the job. Manual runs require the secret in the repository running the job.
 
 The [SDK suite](../../{SUITE}) sends Anthropic Messages requests
 through the local [Praxis configuration](../../{CONFIG})
@@ -52,15 +52,29 @@ repository root, with `{secret}` set in the gateway environment.
 
 ```bash
 PRAXIS_LIVE_MESSAGES_BASE_URL=http://127.0.0.1:8080 \\
-  uv run --with pytest=={pytest} --with anthropic=={sdk} pytest \\
+  uv run --script \\
   {SUITE}
 ```
 
 The run summary records the tested commit and configuration. The
-`{artifact}` artifact contains JUnit results. Release CI
+`{artifact}` artifact contains JUnit results and gateway logs. Release CI
 qualification records this lane when it finds a run for the exact release
-commit. Praxis injects the OpenAI key upstream and the SDK uses a dummy local key.
+commit. A release with no matching run shows `not_run`. Update the pinned
+model snapshot in the SDK suite when OpenAI retires it.
+
+Praxis injects the OpenAI key upstream and the SDK uses a dummy local key.
 Gateway authorization, tenant isolation, and retries are outside this suite.
+
+## OpenAI Responses to Chat Completions
+
+A separate job builds with `--features openai-responses` and uses the
+[Responses translation fixture](../../tests/integration/fixtures/openai/responses-to-chat-live.yaml).
+It runs the Responses completion and streaming cases from the
+[OpenAI SDK suite](../../tests/integration/sdk/openai/test_openai_chat_completions_live.py).
+Praxis injects the provider key and translates requests to official OpenAI
+Chat Completions. The checks cover completed text and usage, streaming text
+the terminal completion event, and stateless tool-result continuation, with `store: false`. The
+`hosted-responses-to-chat-results` artifact contains JUnit results and gateway logs.
 """
 
 

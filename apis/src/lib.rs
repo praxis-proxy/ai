@@ -23,6 +23,7 @@ pub mod callout_policy;
 pub mod callout_target;
 pub mod classifier;
 pub mod credential_source;
+pub mod gemini;
 pub mod guardrail_messages;
 pub mod hash;
 #[cfg(all(test, feature = "openai-responses"))]
@@ -31,6 +32,8 @@ pub mod http_hop;
 pub mod json_body;
 #[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_client;
+#[cfg(feature = "openai-mcp-tools")]
+pub(crate) mod mcp_core;
 pub mod openai;
 pub mod operation;
 pub mod operation_classifier;
@@ -217,8 +220,7 @@ pub(crate) mod test_utils {
             attempted_endpoints: Vec::new(),
             retry_policy: None,
             route_retry_policy: None,
-            cluster_retry_state: None,
-            cluster_retry_state_released: false,
+            cluster_admission: None,
             endpoint_reselector: None,
             pinned_endpoint_address: None,
             rewritten_path: None,

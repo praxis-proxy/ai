@@ -50,10 +50,9 @@ highlight = "all"
 # fails if any is enabled; cargo-deny prints the full feature-activation path.
 #
 # This is the feature-level half of the guard. The complementary "no non-OpenSSL
-# crypto backend crate in the FIPS image" check lives in `cargo xtask fips`
-# (xtask/src/fips/graph.rs::DENIED — ring, aws-lc-rs, aws-lc-sys, boring, …),
+# crypto backend crate in the FIPS image" check lives in `cargo fips-check report`,
 # run per-PR via `make lint` (fips-deps) and the FIPS workflow. Together they
-# cover both profiles: cargo-deny the full/superset graph, cargo xtask fips the
+# cover both profiles: cargo-deny the full/superset graph, cargo-fips-check the
 # reduced FIPS graph. The human-readable operation/provider inventory is
 # docs/architecture/cryptographic-inventory.md.
 [[bans.features]]

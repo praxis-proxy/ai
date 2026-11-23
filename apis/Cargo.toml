@@ -46,8 +46,8 @@ store-all = ["store-postgres", "store-sqlite"]
 # Locally served Conversations API with JSON Schema item validation and the
 # generated implementation OpenAPI document.
 openai-conversations = ["store", "dep:jsonschema", "dep:utoipa"]
-# Files API contract: wire DTOs and owned operation metadata for the generated
-# implementation OpenAPI document.
+# Files API contract and service-layer traits; concrete backends and handlers
+# are not part of this feature yet.
 openai-files = ["experimental", "dep:utoipa"]
 # Context compaction with tiktoken token estimation.
 openai-compact = ["store", "dep:tiktoken-rs"]

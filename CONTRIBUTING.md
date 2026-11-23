@@ -48,20 +48,14 @@ go through the [proposal process].
 CI enforces reviewability on every PR:
 
 - A maximum added lines count of production code (tests, docs, examples excluded)
-- No more than three open PRs per contributor in this repository. Drafts count.
-  The Praxis bot comments on and fails a PR that takes its author over the
-  limit and skips automatic reviewer assignment; it will receive review
-  attention once enough other PRs are merged to bring the author's open count
-  back to three or fewer. Edit or update the PR to refresh the check.
-- A link to the issue the PR addresses, using `Closes #123` when the PR
-  completes the issue or `Refs #123` when the issue remains open.
-- A description with non-empty **Why**, **What**, and **How** sections. Explain
-  why the change is needed, what problem it fixes, and how the implementation
-  addresses it. The Praxis bot check fails when a section is missing or empty,
-  or when the PR has no issue reference.
-  PRs that add a filter parameter must also justify why the parameter is
-  needed, what behavior it controls, and why existing configuration is
-  insufficient.
+- No more than three open PRs ready for review per contributor in this
+  repository. Drafts are excluded. When a PR takes its author over the limit,
+  the Praxis bot fails its limit check and skips reviewer assignment. Once
+  the count is back to three or fewer, edit or update the waiting PR to
+  refresh the check and reviewer assignment.
+- Non-empty **Why**, **What**, and **How** sections, plus a related issue.
+  Follow the shared [PR conventions], including the guidance for new filter
+  parameters.
 - Maintainer review starts only after all required CI checks pass. A maintainer
   assignment signals that review has started; contributors should wait for CI
   to be green before requesting or expecting that assignment.

@@ -217,8 +217,7 @@ enum Command {
     #[cfg(feature = "dev")]
     SyncResponsesReadme(sync_responses_readme::Args),
 
-    /// FIPS build tooling: the compliance report, Red Hat image verification
-    /// and podman's signature store.
+    /// Drive the Praxis AI listener probes on a FIPS host.
     Fips(fips::Args),
 }
 

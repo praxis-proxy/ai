@@ -1,0 +1,81 @@
+name: vLLM Embeddings Qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/vllm-embeddings.yaml"
+      - ".github/actions/start-vllm/**"
+      - ".github/actions/wait-vllm/**"
+      - "tests/integration/fixtures/vllm/embeddings-live.yaml"
+      - "tests/integration/sdk/openai/test_vllm_embeddings_live.py"
+  schedule:
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: read
+
+env:
+  EMBEDDING_MODEL: ibm-granite/granite-embedding-125m-english
+  EMBEDDING_REVISION: 4ab61ffd423be45cd932b21a7c696063d82bf45f
+  VLLM_IMAGE: quay.io/opendatahub/vllm-cpu:Qwen3-0.6B-granite-embedding-125m-english@sha256:0212dc82981178033cb71c7477ba8ad1998fb6c0b1ee40646119fb9724ac951b
+
+jobs:
+  embeddings:
+    name: vLLM CPU Embeddings passthrough
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Start embedding model
+        uses: ./.github/actions/start-vllm
+        with:
+          image: ${{ env.VLLM_IMAGE }}
+          model: ${{ env.EMBEDDING_MODEL }}
+          model-path: ${{ env.EMBEDDING_MODEL }}
+          tool-call-parser: ""
+          reasoning-parser: ""
+          max-model-len: "512"
+          extra-args: --runner pooling --revision ${{ env.EMBEDDING_REVISION }}
+      - name: Build Praxis
+        run: cargo build --locked -p praxis-ai-proxy
+      - uses: ./.github/actions/wait-vllm
+      - name: Qualify embeddings through Praxis
+        env:
+          PRAXIS_LIVE_VLLM_EMBEDDINGS: "1"
+        run: |
+          target/debug/praxis-ai -c tests/integration/fixtures/vllm/embeddings-live.yaml >"$RUNNER_TEMP/embeddings-praxis.log" 2>&1 &
+          gateway_pid=$!
+          trap 'kill "$gateway_pid" 2>/dev/null || true; wait "$gateway_pid" 2>/dev/null || true' EXIT
+          ready=false
+          for _ in {1..30}; do
+            kill -0 "$gateway_pid" || break
+            if curl -s -o /dev/null --max-time 1 http://127.0.0.1:8080/; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            cat "$RUNNER_TEMP/embeddings-praxis.log"
+            exit 1
+          fi
+          printf "vLLM image: %s\nModel revision: %s@%s\n" "$VLLM_IMAGE" "$EMBEDDING_MODEL" "$EMBEDDING_REVISION" >> "$GITHUB_STEP_SUMMARY"
+          uv run --script tests/integration/sdk/openai/test_vllm_embeddings_live.py \
+            --junitxml="$RUNNER_TEMP/embeddings-junit.xml" --tb=line
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vllm-embeddings-results
+          path: |
+            ${{ runner.temp }}/embeddings-junit.xml
+            ${{ runner.temp }}/embeddings-praxis.log
+          if-no-files-found: ignore

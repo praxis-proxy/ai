@@ -11,6 +11,8 @@ Tenant identity is resolved from the highest-trust source available: an `Authent
 
 When no `{prefix}model` identity header names the model and `model_to_provider` mapped the request, balance checks and usage events use the client-facing model ID it recorded rather than the provider target. That filter buffers the request body, so its body pass completes before this filter's request hook runs the balance check.
 
+Usage events include the optional `quota_value`, `quota_formula`, `quota_unit`, and `quota_status` fields when PPE quota policy runs earlier in the response phase. `quota_usage` and `quota_context` preserve the exact normalized policy inputs, including missing-field presence flags, so the result can be audited and recomputed. Declare `external_metering` before `policy`, and `policy` before `token_count`, because response hooks run in reverse filter order. Quota fields are enforcement/audit data, never currency.
+
 For a complete setup where the Praxis Policy Engine (`policy` filter) verifies a JWT and this filter meters on the resulting tier-0 `AuthenticatedIdentity` — no `{prefix}*` header involved — see the end-to-end example below (a gateway config plus the PPE policy document it loads). A metered request then carries only `Authorization: Bearer <jwt>`, and usage is billed to the token's verified `identity_username_claim` within its `identity_group_claim`.
 
 ## Configuration

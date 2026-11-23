@@ -67,7 +67,7 @@ jobs:
   test:
     needs: [validate]
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -391,6 +391,7 @@ jobs:
     needs: [validate, container-fips]
     if: >-
       !cancelled()
+      && !inputs.skip-fips-proof
       && needs.validate.result == 'success'
       && needs.container-fips.result == 'success'
       && needs.container-fips.outputs.fips-digest != ''

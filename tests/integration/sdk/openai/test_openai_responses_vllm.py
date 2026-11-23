@@ -863,11 +863,7 @@ class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
             for item in items
         )
 
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length) if length else b""
-        request_body = json.loads(body) if body else {}
-
+    def _output(self, request_body):
         if self._already_rejected(request_body):
             output = [
                 {
@@ -890,6 +886,14 @@ class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
                 }
             ]
 
+        return output
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        request_body = json.loads(body) if body else {}
+
+        output = self._output(request_body)
         payload = json.dumps(
             {
                 "id": f"resp_mcp_invalid_{time.time_ns()}",
@@ -909,6 +913,45 @@ class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         pass
+
+
+class McpSequentialBackendHandler(McpInvalidArgsBackendHandler):
+    """Emit one advertised MCP tool per round after receiving the prior result."""
+
+    final_text = "Both tools completed."
+
+    def _output(self, request_body):
+        assert request_body["parallel_tool_calls"] is False
+        inputs = request_body["input"]
+        if isinstance(inputs, str):
+            inputs = []
+        results = {
+            item["call_id"]: item["output"]
+            for item in inputs
+            if item["type"] == "function_call_output"
+        }
+        if "call_get_time" in results:
+            assert "12:00 PM" in results["call_get_time"]
+            return super()._output(request_body)
+        tool_name = "get_weather"
+        if "call_get_weather" in results:
+            assert "72F and sunny" in results["call_get_weather"]
+            tool_name = "get_time"
+        advertised_name = next(
+            tool["name"]
+            for tool in request_body["tools"]
+            if tool["type"] == "function" and tool["name"].endswith(tool_name)
+        )
+        return [
+            {
+                "id": f"fc_{tool_name}",
+                "type": "function_call",
+                "call_id": f"call_{tool_name}",
+                "name": advertised_name,
+                "arguments": json.dumps({"city": "Paris"}),
+                "status": "completed",
+            }
+        ]
 
 
 class StructuredMCPHandler(MCPHandler):
@@ -7716,10 +7759,11 @@ class TestClientToolCompatChatVLLM:
 
 
 @pytest.fixture(scope="session")
-def mcp_invalid_args_backend():
-    """Start the deterministic schema-invalid MCP backend for the session."""
+def scripted_mcp_backend(request):
+    """Start a scripted native Responses backend for MCP tests."""
     port = _free_port()
-    server = HTTPServer(("127.0.0.1", port), McpInvalidArgsBackendHandler)
+    handler = getattr(request, "param", McpInvalidArgsBackendHandler)
+    server = HTTPServer(("127.0.0.1", port), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     yield port
@@ -7727,22 +7771,17 @@ def mcp_invalid_args_backend():
 
 
 @pytest.fixture(scope="session")
-def mcp_invalid_args_proxy(
-    tmp_path_factory, request, mcp_server, nemo_guardrails_server, mcp_invalid_args_backend
+def scripted_mcp_proxy(
+    tmp_path_factory, request, mcp_server, nemo_guardrails_server, scripted_mcp_backend
 ):
-    """Start the full-flow agentic proxy against the deterministic backend.
-
-    This drives MCP argument validation through the real OpenAI client without a
-    live model: the backend scripts one schema-invalid tool call and a recovery
-    message, so the outcome is deterministic in every lane (issue #1125).
-    """
+    """Start the full-flow agentic proxy against a scripted Responses backend."""
     port = _free_port()
-    db_dir = tmp_path_factory.mktemp("mcp-invalid-args-responses")
+    db_dir = tmp_path_factory.mktemp("scripted-mcp-responses")
     db_path = str(db_dir / "responses.db")
     config_path = _write_full_flow_config(
         port,
         db_path,
-        backend_endpoint=f"127.0.0.1:{mcp_invalid_args_backend}",
+        backend_endpoint=f"127.0.0.1:{scripted_mcp_backend}",
         mcp_endpoint=f"http://127.0.0.1:{mcp_server}/mcp",
         nemo_port=nemo_guardrails_server,
     )
@@ -7771,25 +7810,72 @@ def mcp_invalid_args_proxy(
         if not started or request.session.testsfailed > 0:
             with open(log_path) as f:
                 print(
-                    f"\n=== MCP invalid-args Praxis logs ===\n{f.read()}",
+                    f"\n=== Scripted MCP Praxis logs ===\n{f.read()}",
                     file=sys.stderr,
                 )
         os.unlink(config_path)
 
 
 @pytest.fixture(scope="session")
-def mcp_invalid_args_client(mcp_invalid_args_proxy):
+def scripted_mcp_client(scripted_mcp_proxy):
     """Return an OpenAI client pointed at the deterministic MCP proxy."""
-    proxy_port = mcp_invalid_args_proxy
+    proxy_port = scripted_mcp_proxy
     return _make_openai_client(
         proxy_port,
         default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
     )
 
 
+def _request_paired_mcp_tools(client, *, parallel):
+    return client.responses.create(
+        model=VLLM_MODEL,
+        input=(
+            "You MUST call both get_weather and get_time for Paris "
+            "in the same turn before answering. Do not omit either "
+            "function. /no_think"
+        ),
+        tools=[
+            {
+                "type": "mcp",
+                "server_label": "utilities",
+                "connector_id": "trusted-mcp",
+                "allowed_tools": ["get_weather", "get_time"],
+                "require_approval": "never",
+            }
+        ],
+        parallel_tool_calls=parallel,
+        store=False,
+        max_output_tokens=512,
+    )
+
+
+def _assert_mcp_results_paired(response):
+    mcp_calls = [item for item in response.output if item.type == "mcp_call"]
+    assert len(mcp_calls) == 2, (
+        "both calls must execute exactly once; "
+        f"got: {[item.type for item in response.output]}"
+    )
+    outputs = {item.name: item.output or "" for item in mcp_calls}
+    assert set(outputs) == {"get_weather", "get_time"}
+    assert "72F and sunny" in outputs["get_weather"], (
+        "get_weather must carry its own result"
+    )
+    assert "12:00 PM" in outputs["get_time"], "get_time must carry its own result"
+
+
+@qualification_profile("supporting")
+@pytest.mark.parametrize(
+    "scripted_mcp_backend", [McpSequentialBackendHandler], indirect=True, ids=["sequential"]
+)
+def test_sequential_mcp_tool_results_stay_paired(scripted_mcp_client):
+    response = _request_paired_mcp_tools(scripted_mcp_client, parallel=False)
+    _assert_mcp_results_paired(response)
+    assert any(item.type == "message" for item in response.output)
+
+
 @qualification_profile("supporting")
 def test_mcp_schema_invalid_arguments_rejected_without_outbound_call(
-    mcp_invalid_args_client,
+    scripted_mcp_client,
 ):
     """Schema-invalid MCP arguments are rejected at the gateway (issue #1125).
 
@@ -7809,7 +7895,7 @@ def test_mcp_schema_invalid_arguments_rejected_without_outbound_call(
     ]
     calls_before = MCPHandler.tool_call_count()
 
-    response = mcp_invalid_args_client.responses.create(
+    response = scripted_mcp_client.responses.create(
         model=VLLM_MODEL,
         input="What is the weather in Paris?",
         tools=tools,
@@ -9099,40 +9185,9 @@ class TestAgenticLoopVLLM:
         assert len(BraveSearchHandler.request_paths) == request_count + 1
 
     @requires_vllm_compat
-    def test_batched_mcp_tools_honor_parallel_tool_calls(
-        self,
-        agentic_client,
-        agentic_proxy,
-    ):
-        """Two MCP calls emitted in one model round both complete."""
-
-        response = agentic_client.responses.create(
-            model=VLLM_MODEL,
-            input=(
-                "You MUST call both get_weather and get_time for Paris "
-                "in the same turn before answering. Do not omit either "
-                "function. /no_think"
-            ),
-            tools=[
-                {
-                    "type": "mcp",
-                    "server_label": "utilities",
-                    "connector_id": "trusted-mcp",
-                    "allowed_tools": ["get_weather", "get_time"],
-                    "require_approval": "never",
-                }
-            ],
-            parallel_tool_calls=True,
-            store=False,
-            max_output_tokens=512,
-        )
-
-        mcp_calls = [item for item in response.output if item.type == "mcp_call"]
-        assert len(mcp_calls) == 2, (
-            "both calls from the batched model round must execute exactly "
-            f"once; got: {[item.type for item in response.output]}"
-        )
-        assert {item.name for item in mcp_calls} == {"get_weather", "get_time"}
+    def test_batched_mcp_tools_honor_parallel_tool_calls(self, agentic_client):
+        """Live vLLM can emit a batch whose MCP results stay paired."""
+        _assert_mcp_results_paired(_request_paired_mcp_tools(agentic_client, parallel=True))
 
     @requires_vllm_compat
     def test_mcp_approval_batch_resume_executes_multiple_approved_tools(
@@ -11764,6 +11819,54 @@ def test_null_tool_choice_succeeds_sdk(chat_streaming_client):
                 },
             }
         ]
+
+
+@pytest.mark.skipif(
+    VLLM_TEST_BACKEND != "simulator",
+    reason="uses the simulator's scripted Chat stream",
+)
+@pytest.mark.parametrize("include_obfuscation", [None, True, False])
+def test_translated_stream_obfuscation(chat_streaming_client, include_obfuscation):
+    options = (
+        {} if include_obfuscation is None
+        else {"stream_options": {"include_obfuscation": include_obfuscation}}
+    )
+    with chat_streaming_client.responses.with_streaming_response.create(
+        model=CHAT_TRANSLATION_MODEL,
+        input="STREAM-SERVICE-TIER-1549",
+        store=False,
+        stream=True,
+        **options,
+    ) as stream:
+        wire = b"".join(stream.iter_bytes())
+
+    events = []
+    for frame in wire.split(b"\n\n"):
+        for line in frame.splitlines():
+            if line.startswith(b"data: "):
+                events.append((json.loads(line.removeprefix(b"data: ")), len(frame) + 2))
+
+    assert events[-1][0]["type"] == "response.completed"
+    deltas = [(event, size) for event, size in events if event["type"] == "response.output_text.delta"]
+    assert deltas
+    for event, size in deltas:
+        if include_obfuscation is False:
+            assert "obfuscation" not in event
+        else:
+            assert 1 <= len(event["obfuscation"]) <= 64
+            assert size % 64 == 0
+    assert all("obfuscation" not in event for event, _ in events if not event["type"].endswith(".delta"))
+
+
+def test_translated_stream_rejects_non_boolean_obfuscation(chat_streaming_client):
+    with pytest.raises(openai.BadRequestError, match=r"stream_options\.include_obfuscation"):
+        chat_streaming_client.responses.create(
+            model=CHAT_TRANSLATION_MODEL,
+            input="STREAM-SERVICE-TIER-1549",
+            store=False,
+            stream=True,
+            extra_body={"stream_options": {"include_obfuscation": "false"}},
+        )
 
 
 @pytest.mark.skipif(

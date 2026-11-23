@@ -1,0 +1,17 @@
+listeners:
+  - name: gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [embeddings]
+filter_chains:
+  - name: embeddings
+    filters:
+      - filter: router
+        routes:
+          - path: /v1/embeddings
+            cluster: vllm
+      - filter: load_balancer
+        clusters:
+          - name: vllm
+            endpoints: ["127.0.0.1:8000"]
+insecure_options:
+  allow_private_endpoints: true

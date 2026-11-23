@@ -18,7 +18,7 @@ deny.toml
 
 # Ignore devtools and examples. The test crates, benchmarks and xtask stay in
 # the context: they are workspace members, and Containerfile.fips builds with
-# --locked against the whole workspace and runs `cargo xtask fips` in its
+# --locked against the whole workspace and runs `cargo fips-check report` in its
 # report stage.
 Makefile
 examples/
