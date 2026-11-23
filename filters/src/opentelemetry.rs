@@ -15,9 +15,11 @@ use tracing::field::Empty;
 
 use crate::routing::descriptor::RouteCandidate;
 
+#[cfg(feature = "token-rate-limit-filter")]
 /// Request-scoped token-rate-limit span retained until reconciliation.
 pub(crate) struct TokenRateLimitSpan(tracing::Span);
 
+#[cfg(feature = "token-rate-limit-filter")]
 impl TokenRateLimitSpan {
     /// Record actual weighted token cost once response usage is available.
     pub(crate) fn record_actual(&self, actual: u64) {
@@ -25,6 +27,7 @@ impl TokenRateLimitSpan {
     }
 }
 
+#[cfg(feature = "token-rate-limit-filter")]
 /// Create a bounded per-request span for one token-rate-limit decision.
 ///
 /// Rule and algorithm come from bounded configuration. No budget key,
@@ -202,7 +205,9 @@ pub(crate) fn record_provider_route_selection(
 mod tests {
     use std::sync::Arc;
 
-    use super::{ProviderRouteSelection, RoutingSelection, record_provider_route_selection, token_rate_limit_span};
+    #[cfg(feature = "token-rate-limit-filter")]
+    use super::token_rate_limit_span;
+    use super::{ProviderRouteSelection, RoutingSelection, record_provider_route_selection};
     use crate::routing::descriptor::{AdmissionState, CapabilityKind, RouteCandidate};
 
     #[test]
@@ -274,6 +279,7 @@ mod tests {
         assert_eq!(fields.revision, None);
     }
 
+    #[cfg(feature = "token-rate-limit-filter")]
     #[test]
     fn token_rate_limit_span_accepts_its_bounded_decision_and_actual_cost_fields() {
         let span = token_rate_limit_span("engineering", "sliding_window", 500, "admitted");

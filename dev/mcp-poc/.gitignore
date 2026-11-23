@@ -1,0 +1,4 @@
+/certs/keycloak.crt
+/catalog.json
+/.venv/
+/__pycache__/

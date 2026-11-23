@@ -76,9 +76,11 @@ token-ceiling-filter = ["praxis-ai-filters/token-ceiling-filter", "experimental"
 inflight-tracker-filter = ["praxis-ai-filters/inflight-tracker-filter", "experimental"]
 # Marker feature activated transitively by any experimental feature.
 experimental = ["praxis-ai-filters/experimental"]
-opentelemetry = ["praxis-ai-filters/opentelemetry"]
+opentelemetry = ["praxis-ai-filters/opentelemetry", "praxis-protocol/otel"]
 llmd-ext-proc = ["dep:praxis-ai-llmd-ext-proc"]
 praxis-main = ["praxis-ai-filters/praxis-main"]
+# Development-only local MCP POC; not part of default production builds.
+mcp-poc-filter = ["praxis-ai-filters/mcp-poc-filter"]
 
 [lints]
 workspace = true

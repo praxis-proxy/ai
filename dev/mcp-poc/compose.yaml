@@ -1,0 +1,100 @@
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.2
+    entrypoint: ["/bin/bash", "/opt/keycloak/data/start-keycloak.sh"]
+    environment:
+      DEV_KEYSTORE_PASSWORD: mcp-poc-local-only
+      KC_HOSTNAME: https://localhost:18443
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./keycloak/start-keycloak.sh:/opt/keycloak/data/start-keycloak.sh:ro
+      - ./keycloak/realm.json:/opt/keycloak/data/import/mcp-poc-realm.json:ro
+      - ./certs:/public
+    ports:
+      - "127.0.0.1:18443:8443"
+
+  fastmcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "/app/fastmcp_server.py"]
+    ports:
+      - "127.0.0.1:18101:8001"
+
+  everything:
+    build:
+      context: https://github.com/modelcontextprotocol/servers.git#e1dc4b18dbb948921da37f3d4224a628730b43b0
+      dockerfile: src/everything/Dockerfile
+    command: ["streamableHttp"]
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3001"
+    ports:
+      - "127.0.0.1:18102:3001"
+
+  discovery:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["python", "/app/discover.py"]
+    command:
+      - "--server"
+      - "fastmcp=http://fastmcp:8001/mcp"
+      - "--server"
+      - "everything=http://everything:3001/mcp"
+      - "--output"
+      - "/workspace/catalog.json"
+    depends_on:
+      - fastmcp
+      - everything
+    volumes:
+      - ./:/workspace
+  tempo:
+    image: grafana/tempo:3.1.1
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:13200:3200"
+
+
+  metrics-relay:
+    image: nginx:1.29.8-alpine
+    volumes:
+      - ./metrics-relay.conf:/etc/nginx/conf.d/default.conf:ro
+
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=24h"
+    volumes:
+      - ./prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:19090:9090"
+    depends_on:
+      - metrics-relay
+  grafana:
+    image: grafana/grafana:12.4.15
+    environment:
+      GF_SECURITY_ADMIN_USER: mcp-poc
+      GF_SECURITY_ADMIN_PASSWORD: mcp-poc-grafana-local
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning/datasources/tempo.yaml:/etc/grafana/provisioning/datasources/tempo.yaml:ro
+      - ./grafana/provisioning/datasources/prometheus.yaml:/etc/grafana/provisioning/datasources/prometheus.yaml:ro
+    ports:
+      - "127.0.0.1:13000:3000"
+    depends_on:
+      - tempo
+      - prometheus
+
+volumes:
+  tempo-data:
+  grafana-data:
+  prometheus-data:

@@ -1,0 +1,67 @@
+# Local-only MCP POC. Do not reuse this configuration for production.
+admin:
+  metrics_address: "127.0.0.1:9901"
+
+telemetry:
+  otlp_endpoint: "http://127.0.0.1:4317"
+  batch_interval_secs: 1
+  sampling_rate: 1.0
+  service_name: praxis-mcp-poc
+  service_version: "0.11.0"
+  environment: local
+
+listeners:
+  - name: mcp-poc
+    address: "127.0.0.1:18080"
+    filter_chains: [mcp-poc]
+
+filter_chains:
+  - name: mcp-poc
+    filters:
+      # Classify MCP and prepare tool-call routing from the bounded body pre-read.
+      # This stage publishes method/name facts for PPE.
+      - filter: mcp_poc
+        stage: classify
+        catalog_path: dev/mcp-poc/catalog.json
+        path: /mcp
+        cache_scope: private
+        cache_ttl_ms: 300000
+        max_body_bytes: 1048576
+      # The local HTTPS Keycloak endpoint is loopback; this relaxation is
+      # development-only and must not be copied into production config.
+      - filter: policy
+        config_path: dev/mcp-poc/policy.yaml
+        body_access: read_only
+        allow_private_idp: true
+        require_protocol_metadata: true
+
+      # Serve local discovery/list responses after PPE from the same catalog.
+      - filter: mcp_poc
+        stage: respond
+        catalog_path: dev/mcp-poc/catalog.json
+        path: /mcp
+        cache_scope: private
+        cache_ttl_ms: 300000
+        max_body_bytes: 1048576
+
+      - filter: router
+        routes:
+          - path_prefix: /mcp
+            headers:
+              x-praxis-mcp-target: fastmcp
+            cluster: fastmcp
+          - path_prefix: /mcp
+            headers:
+              x-praxis-mcp-target: everything
+            cluster: everything
+
+      - filter: load_balancer
+        clusters:
+          - name: fastmcp
+            endpoints: ["127.0.0.1:18101"]
+          - name: everything
+            endpoints: ["127.0.0.1:18102"]
+
+# Development-only permission for loopback MCP and OIDC endpoints.
+insecure_options:
+  allow_private_endpoints: true

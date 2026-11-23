@@ -1,0 +1,81 @@
+{
+  "realm": "mcp-poc",
+  "enabled": true,
+  "sslRequired": "all",
+  "clients": [
+    {
+      "clientId": "praxis-gateway",
+      "name": "Praxis MCP POC gateway",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "fullScopeAllowed": true,
+      "protocolMappers": [
+        {
+          "name": "praxis-gateway audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "praxis-gateway",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
+  "roles": {
+    "realm": [
+      {
+        "name": "mcp-tools-all",
+        "description": "Can call every tool in the MCP POC catalog"
+      },
+      {
+        "name": "mcp-tool-fastmcp-echo",
+        "description": "Can call only fastmcp/echo in the MCP POC catalog"
+      }
+    ]
+  },
+  "users": [
+    {
+      "username": "demo",
+      "firstName": "Demo",
+      "lastName": "User",
+      "email": "demo@example.test",
+      "realmRoles": ["mcp-tools-all"],
+      "requiredActions": [],
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        {
+          "type": "password",
+          "value": "demo",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "limited",
+      "firstName": "Limited",
+      "lastName": "User",
+      "email": "limited@example.test",
+      "realmRoles": ["mcp-tool-fastmcp-echo"],
+      "requiredActions": [],
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        {
+          "type": "password",
+          "value": "limited",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

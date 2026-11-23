@@ -20,6 +20,8 @@ use crate::Sigv4SignFilter;
 use crate::TokenCeilingFilter;
 #[cfg(feature = "token-rate-limit-filter")]
 use crate::TokenRateLimitFilter;
+#[cfg(feature = "mcp-poc-filter")]
+use crate::agentic::mcp::poc::McpPocFilter;
 use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IdentityHeaderGuardFilter,
     InFlightRegistry, IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter, ModelToHeaderFilter,
@@ -128,6 +130,11 @@ fn register_agentic_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "mcp" => McpFilter::from_config
+    );
+    #[cfg(feature = "mcp-poc-filter")]
+    praxis_filter::register_filters!(
+        @register registry,
+        http "mcp_poc" => McpPocFilter::from_config
     );
 }
 
@@ -982,6 +989,7 @@ provider:
         ("openai_mcp_tool_resolve", cfg!(feature = "openai-mcp-tools")),
         ("openai_mcp_dispatch", cfg!(feature = "openai-mcp-tools")),
         ("openai_mcp_streaming_selector", cfg!(feature = "openai-mcp-tools")),
+        ("mcp_poc", cfg!(feature = "mcp-poc-filter")),
     ];
 
     /// Opt-in filter groups register only when their cargo feature is enabled.

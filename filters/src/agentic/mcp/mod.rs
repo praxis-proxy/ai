@@ -6,6 +6,8 @@
 mod broker;
 pub(crate) mod config;
 pub(crate) mod envelope;
+#[cfg(feature = "mcp-poc-filter")]
+pub mod poc;
 pub(crate) mod protocol;
 
 #[cfg(test)]

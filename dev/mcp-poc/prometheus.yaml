@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 2s
+  scrape_timeout: 1s
+
+scrape_configs:
+  - job_name: praxis
+    static_configs:
+      - targets: ["metrics-relay:9110"]

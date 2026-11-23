@@ -1,0 +1,47 @@
+# Local-only PPE policy for the MCP POC. The JWKS endpoint is the local
+# HTTPS Keycloak realm; its public certificate is trusted by the Praxis process.
+plugins:
+  - name: keycloak-user
+    kind: identity/jwt
+    hooks: [identity.resolve]
+    capabilities: [perform_http]
+    config:
+      role: user
+      credential:
+        kind: header
+        name: Authorization
+      trusted_issuers:
+        - issuer: "https://localhost:18443/realms/mcp-poc"
+          audiences: [praxis-gateway]
+          algorithms: [RS256]
+          decoding_key:
+            kind: jwks_url
+            url: "https://localhost:18443/realms/mcp-poc/protocol/openid-connect/certs"
+
+      claim_mapper: keycloak
+
+mcp_authorization:
+  role_grants:
+    mcp-tools-all:
+      - server: "*"
+        tool: "*"
+    mcp-tool-fastmcp-echo:
+      - server: fastmcp
+        tool: echo
+global:
+  assertions:
+    request:
+      strip: [Authorization]
+  authentication: [keycloak-user]
+  defaults:
+    tool:
+      authorization:
+        pre_invocation:
+          - "require(authenticated)"
+
+routes:
+  - http:
+      path_prefix: /
+    authorization:
+      pre_invocation:
+        - "require(authenticated)"

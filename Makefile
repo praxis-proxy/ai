@@ -920,6 +920,8 @@ fips-scanner: | require-go
 # Praxis path override (test against local ../praxis)
 # -------------------------------------------------------------------
 
+PRAXIS_CRATE_DIR := $(if $(wildcard ../praxis/crates),../praxis/crates,../praxis)
+
 patch-praxis:
 	@if [ ! -d "../praxis" ]; then \
 		echo "ERROR: ../praxis not found — clone praxis core as a sibling directory first"; \
@@ -930,11 +932,11 @@ patch-praxis:
 		exit 1; \
 	fi
 	@printf '\n[patch.crates-io]\n\
-	praxis-proxy-core = { path = "../praxis/core" }\n\
-	praxis-proxy-filter = { path = "../praxis/filter" }\n\
-	praxis-proxy-protocol = { path = "../praxis/protocol" }\n\
-	praxis-proxy-tls = { path = "../praxis/tls" }\n\
-	praxis-proxy = { path = "../praxis/server" }\n' >> Cargo.toml
+	praxis-proxy-core = { path = "$(PRAXIS_CRATE_DIR)/core" }\n\
+	praxis-proxy-filter = { path = "$(PRAXIS_CRATE_DIR)/filter" }\n\
+	praxis-proxy-protocol = { path = "$(PRAXIS_CRATE_DIR)/protocol" }\n\
+	praxis-proxy-tls = { path = "$(PRAXIS_CRATE_DIR)/tls" }\n\
+	praxis-proxy = { path = "$(PRAXIS_CRATE_DIR)/server" }\n' >> Cargo.toml
 	@echo "Patched Cargo.toml to use ../praxis path dependencies"
 
 unpatch-praxis:
