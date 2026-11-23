@@ -157,9 +157,14 @@ A backend that answers `initialize` with a protocol
 version outside the broker's `supported_versions` is
 never confirmed: the broker terminates that session and
 returns a `unsupported_protocol_version` error instead
-of forwarding the call. SSE replies are decoded with the
-shared conforming parser (CR, LF, or CRLF line endings
-and an optional leading BOM).
+of forwarding the call. A client `MCP-Protocol-Version`
+the broker does not support is rejected with HTTP 400
+before any handshake; without the header the broker
+offers its default version. SSE replies are decoded with
+the shared conforming parser (CR, LF, or CRLF line
+endings and an optional leading BOM); as the SSE
+specification requires, an event the backend never
+terminated with a blank line is discarded.
 
 Concurrent first calls for one pair share a single
 handshake. A mapping is bound to a SHA-256 fingerprint
@@ -170,10 +175,16 @@ backend sessions created with the caller's own
 credentials. The map is in memory, per filter instance,
 capped by `max_sessions` (least recently used entries
 are evicted) and expired after `idle_timeout_ms`. A
-mapping in use by an in-flight handshake or lookup is
-never evicted or expired, so one pair cannot end up on
-two backend sessions; when every mapping is in use, a
-call for a new pair fails with `session_capacity`.
+mapping in use by an in-flight handshake or forwarded
+call is never evicted or expired until that request
+completes, so one pair cannot end up on two backend
+sessions; when every mapping is in use, a call for a new
+pair fails with `session_capacity`. Eviction and expiry
+drop only the broker's mapping: the broker keeps a
+fingerprint of the caller's credentials, not the
+credentials, so it cannot terminate that backend
+session. Backends must therefore expire idle sessions on
+their own, as the MCP transport allows.
 Distributed session storage is tracked separately.
 
 ### Filter Results

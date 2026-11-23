@@ -144,7 +144,11 @@ servers:
 "#;
 
 fn broker_with(mock: Arc<MockBackend>) -> McpBrokerFilter {
-    let cfg: McpBrokerConfig = serde_yaml::from_str(SESSION_BROKER_YAML).unwrap();
+    broker_from_yaml(mock, SESSION_BROKER_YAML)
+}
+
+fn broker_from_yaml(mock: Arc<MockBackend>, yaml: &str) -> McpBrokerFilter {
+    let cfg: McpBrokerConfig = serde_yaml::from_str(yaml).unwrap();
     let servers = cfg.servers.clone();
     let (validated, catalog) = build_config(cfg).unwrap();
     let settings = validated.backend_sessions.clone().unwrap();
@@ -495,6 +499,39 @@ async fn successful_response_keeps_mapping() {
 }
 
 #[tokio::test]
+async fn in_flight_call_keeps_its_slot_until_completion() {
+    let mock = Arc::new(MockBackend::default());
+    let filter = broker_from_yaml(
+        Arc::clone(&mock),
+        &SESSION_BROKER_YAML.replace("max_sessions: 16", "max_sessions: 1"),
+    );
+    let first = call_request(Some("gw-1"), None);
+    let mut in_flight = crate::test_utils::make_filter_context(&first);
+    in_flight.current_filter_id = Some(0);
+    let mut body = Some(call_body("weather_get_weather"));
+    let action = filter.on_request_body(&mut in_flight, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release), "first call must be forwarded");
+    let mut response = crate::test_utils::make_response();
+    in_flight.response_header = Some(&mut response);
+    let _headers = filter.on_response(&mut in_flight).await.unwrap();
+
+    let blocked = route(&filter, &call_request(Some("gw-2"), None), "weather_get_weather").await;
+    let (_, error) = rejection_json(&blocked.action);
+    assert_eq!(
+        error["error"]["data"]["reason"], "session_capacity",
+        "a call still streaming must keep its slot after response headers"
+    );
+
+    filter.on_request_complete(&mut in_flight, 200);
+    drop(in_flight);
+    let admitted = route(&filter, &call_request(Some("gw-2"), None), "weather_get_weather").await;
+    assert!(
+        matches!(admitted.action, FilterAction::Release),
+        "a completed call must release its slot"
+    );
+}
+
+#[tokio::test]
 async fn credential_change_rebinds_backend_session() {
     let mock = Arc::new(MockBackend::default());
     let filter = broker_with(Arc::clone(&mock));
@@ -598,8 +635,7 @@ async fn client_protocol_version_is_offered_to_backend() {
 
     route(&filter, &call_request(Some("gw-1"), None), "weather_get_weather").await;
     let mut req = call_request(Some("gw-2"), None);
-    req.headers
-        .insert("mcp-protocol-version", "1999-01-01".parse().unwrap());
+    req.headers.remove("mcp-protocol-version");
     route(&filter, &req, "weather_get_weather").await;
 
     let calls = mock.calls.lock().unwrap().clone();
@@ -609,8 +645,27 @@ async fn client_protocol_version_is_offered_to_backend() {
     );
     assert!(
         calls[2].2.starts_with(&format!("{}|", filter.default_version)),
-        "unsupported client version must fall back to the default: {}",
+        "a missing client version must fall back to the default: {}",
         calls[2].2
+    );
+}
+
+#[tokio::test]
+async fn unsupported_client_version_is_rejected_before_handshake() {
+    let mock = Arc::new(MockBackend::default());
+    let filter = broker_with(Arc::clone(&mock));
+    let mut req = call_request(Some("gw-1"), None);
+    req.headers
+        .insert("mcp-protocol-version", "1999-01-01".parse().unwrap());
+
+    let routed = route(&filter, &req, "weather_get_weather").await;
+
+    let (status, body) = rejection_json(&routed.action);
+    assert_eq!(status, 400, "an unsupported version header must be HTTP 400");
+    assert_eq!(body["error"]["code"], -32022, "error must be unsupported version");
+    assert!(
+        mock.calls.lock().unwrap().is_empty(),
+        "no backend session may be created"
     );
 }
 

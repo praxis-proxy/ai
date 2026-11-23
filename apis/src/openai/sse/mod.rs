@@ -24,17 +24,14 @@ pub(crate) use frame::{SseFrame, SseFrameParser, SseParseError};
 /// `data` payload, in order.
 ///
 /// Runs the crate's conforming SSE frame parser: CR, LF, and CRLF line endings, an
-/// optional leading UTF-8 BOM, comments, and colonless fields. Because the
-/// caller has read the body to its end, a final event without a terminating
-/// blank line is still returned.
+/// optional leading UTF-8 BOM, comments, and colonless fields. As the SSE
+/// specification requires at end of stream, a final event without a
+/// terminating blank line is discarded.
 pub fn buffered_sse_event_data(body: &[u8]) -> Vec<Vec<u8>> {
-    // The limit covers the whole body plus the flushing terminator, so the
-    // parser cannot overflow on input the caller already bounded.
-    let mut parser = SseFrameParser::new(body.len().saturating_add(2));
-    let mut frames = parser.parse_chunk(body).unwrap_or_default();
-    if parser.has_incomplete_frame() {
-        frames.extend(parser.parse_chunk(b"\n\n").unwrap_or_default());
-    }
+    // The limit covers the whole body, so the parser cannot overflow on input
+    // the caller already bounded.
+    let mut parser = SseFrameParser::new(body.len());
+    let frames = parser.parse_chunk(body).unwrap_or_default();
     frames.into_iter().map(|frame| frame.data).collect()
 }
 
@@ -61,9 +58,12 @@ mod buffered_tests {
     }
 
     #[test]
-    fn returns_unterminated_final_event() {
+    fn discards_unterminated_final_event() {
         let events = buffered_sse_event_data(b"data: first\n\ndata: last");
-        assert_eq!(events.len(), 2, "a complete body's final event must be returned");
-        assert_eq!(events[1], b"last".to_vec(), "final event data must be kept");
+        assert_eq!(
+            events,
+            vec![b"first".to_vec()],
+            "an event without a terminating blank line must be discarded"
+        );
     }
 }

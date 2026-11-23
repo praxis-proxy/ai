@@ -7,8 +7,8 @@
 //! so concurrent first calls for the same pair initialize the backend once.
 //! The map holds at most `max_sessions` entries; idle entries expire after
 //! `idle_timeout`, and inserting into a full map evicts the least recently
-//! used entry. A slot is in use while a caller holds it (a handshake or a
-//! lookup in flight); in-use slots are never expired or evicted, so two calls
+//! used entry. A slot is in use while a caller holds it (a handshake, a
+//! lookup, or a forwarded call in flight); in-use slots are never expired or evicted, so two calls
 //! for one key cannot end up on two backend sessions. When every slot is in
 //! use, a new key is refused. Mappings are in memory and per filter instance, so a config
 //! reload or restart starts with an empty map and backends see a fresh

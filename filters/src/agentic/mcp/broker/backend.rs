@@ -548,11 +548,11 @@ mod tests {
     }
 
     #[test]
-    fn sse_initialize_without_terminal_blank_line_is_accepted() {
+    fn sse_initialize_without_terminal_blank_line_is_rejected() {
         let body = format!("data: {}", init_reply("2025-06-18"));
         assert!(
-            parse_initialize_response(&response(200, "text/event-stream", Some("s"), &body)).is_ok(),
-            "final unterminated event must be parsed"
+            parse_initialize_response(&response(200, "text/event-stream", Some("s"), &body)).is_err(),
+            "an unterminated event is incomplete and must not be accepted"
         );
     }
 

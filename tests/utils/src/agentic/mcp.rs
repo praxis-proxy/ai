@@ -436,7 +436,9 @@ fn handle_connection(
 
     if req.method == "DELETE" {
         record_request(state, build_record(&req));
+        // Only a DELETE the handler accepts ends the session.
         if config.enforce_sessions
+            && path_matches(&req.path, &config.path)
             && let Some(session) = request_header(&req.headers, "mcp-session-id")
         {
             sessions.live.lock().unwrap().remove(session);

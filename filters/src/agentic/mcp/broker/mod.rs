@@ -70,7 +70,7 @@ use self::{
         McpBackendClient, McpBackendError,
     },
     config::{CacheScope, CatalogTool, McpBrokerConfig, McpServerConfig, ValidatedBackendSessions, build_config},
-    sessions::{BackendSessionKey, BackendSessionStore, BoundSession, credential_fingerprint},
+    sessions::{BackendSessionKey, BackendSessionStore, BoundSession, SessionSlot, credential_fingerprint},
 };
 use super::protocol::ProtocolProfile;
 
@@ -144,8 +144,15 @@ struct BackendSessions {
 /// `on_response` (backend answered) or `on_request_complete` (it never did)
 /// to invalidate a session that expired or whose endpoint is unreachable.
 struct ForwardedCall {
+    /// Whether a backend response arrived.
+    answered: bool,
     /// Session map key.
     key: BackendSessionKey,
+    /// The slot this call uses, held until the request completes so capacity
+    /// pressure or idle expiry cannot evict the mapping mid-call and let an
+    /// overlapping call open a second backend session. Dropping the request
+    /// context releases it on every path.
+    slot: Arc<SessionSlot>,
     /// Backend session id sent upstream.
     session_id: http::HeaderValue,
     /// Endpoint the backend session lives on.
@@ -324,7 +331,7 @@ impl McpBrokerFilter {
     async fn dispatch_method(
         &self,
         ctx: &mut HttpFilterContext<'_>,
-        value: &serde_json::Value,
+        value: &mut serde_json::Value,
         envelope: &JsonRpcEnvelope,
         method_str: &str,
         body: &mut Option<Bytes>,
@@ -340,7 +347,7 @@ impl McpBrokerFilter {
     async fn dispatch_current(
         &self,
         ctx: &mut HttpFilterContext<'_>,
-        value: &serde_json::Value,
+        value: &mut serde_json::Value,
         envelope: &JsonRpcEnvelope,
         method_str: &str,
         body: &mut Option<Bytes>,
@@ -441,7 +448,7 @@ impl McpBrokerFilter {
     async fn handle_current_tools_call(
         &self,
         ctx: &mut HttpFilterContext<'_>,
-        value: &serde_json::Value,
+        value: &mut serde_json::Value,
         envelope: &JsonRpcEnvelope,
         body: &mut Option<Bytes>,
     ) -> FilterAction {
@@ -459,10 +466,13 @@ impl McpBrokerFilter {
             cluster: &server.cluster,
             path: &server.path,
         };
-        let version = self.requested_backend_version(ctx);
+        let version = match self.requested_backend_version(ctx, envelope) {
+            Ok(version) => version,
+            Err(action) => return action,
+        };
 
-        let init = match backend.ensure_session(&key, target, version, &callout).await {
-            Ok(init) => init,
+        let (slot, init) = match backend.ensure_session(&key, target, version, &callout).await {
+            Ok(session) => session,
             Err(error) => {
                 warn!(server = %tool.server_name, reason = error.reason(), "mcp backend session handshake failed");
                 return backend_error_action(envelope, &tool.server_name, &error);
@@ -470,7 +480,7 @@ impl McpBrokerFilter {
         };
 
         forward_current_tools_call(ctx, value, body, tool, &init);
-        record_forwarded_call(ctx, key, init);
+        record_forwarded_call(ctx, key, slot, init);
         FilterAction::Release
     }
 
@@ -503,12 +513,22 @@ impl McpBrokerFilter {
         Ok((tool, server, key))
     }
 
-    /// Protocol version offered to the backend: the client's negotiated
-    /// version when the broker supports it, otherwise the broker default.
-    fn requested_backend_version<'a>(&'a self, ctx: &'a HttpFilterContext<'_>) -> &'a str {
-        header_str(&ctx.request.headers, "mcp-protocol-version")
-            .and_then(|requested| self.supported_versions.iter().find(|v| v.as_str() == requested))
-            .map_or(self.default_version.as_str(), String::as_str)
+    /// Protocol version offered to the backend: the client's
+    /// `MCP-Protocol-Version`, or the broker default when the header is absent.
+    /// A present but unsupported version is rejected with HTTP 400.
+    fn requested_backend_version(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        envelope: &JsonRpcEnvelope,
+    ) -> Result<&str, FilterAction> {
+        let Some(requested) = header_str(&ctx.request.headers, "mcp-protocol-version") else {
+            return Ok(self.default_version.as_str());
+        };
+        self.supported_versions
+            .iter()
+            .find(|v| v.as_str() == requested)
+            .map(String::as_str)
+            .ok_or_else(|| unsupported_version_action(envelope, requested, &self.supported_versions))
     }
 
     /// Best-effort termination of every backend session a gateway session owns.
@@ -768,7 +788,7 @@ impl HttpFilter for McpBrokerFilter {
             return Ok(FilterAction::Continue);
         };
 
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(chunk) else {
+        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(chunk) else {
             return Ok(FilterAction::Reject(Rejection::status(400)));
         };
 
@@ -785,7 +805,7 @@ impl HttpFilter for McpBrokerFilter {
             ctx.record_ai_metadata("mcp.method", method_str.clone());
         }
 
-        self.dispatch_method(ctx, &value, &envelope, method_str, body).await
+        self.dispatch_method(ctx, &mut value, &envelope, method_str, body).await
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -795,15 +815,21 @@ impl HttpFilter for McpBrokerFilter {
         let Some(status) = ctx.response_header.as_ref().map(|response| response.status) else {
             return Ok(FilterAction::Continue);
         };
-        let Some(call) = ctx.remove_filter_state::<ForwardedCall>() else {
+        // The record stays until completion: it holds the session slot.
+        let Some(call) = ctx.get_filter_state_mut::<ForwardedCall>() else {
             return Ok(FilterAction::Continue);
         };
+        call.answered = true;
         // 404: the backend forgot the session. 502: an intermediary reports
         // the pinned endpoint unreachable; the session cannot move elsewhere.
         if matches!(status, http::StatusCode::NOT_FOUND | http::StatusCode::BAD_GATEWAY)
             && let Some(backend) = self.backend.as_ref()
         {
-            backend.invalidate_forwarded(&call, "mcp backend session expired or unreachable; mapping invalidated");
+            backend.invalidate_forwarded(
+                &call.key,
+                &call.session_id,
+                "mcp backend session expired or unreachable; mapping invalidated",
+            );
         }
         Ok(FilterAction::Continue)
     }
@@ -813,17 +839,30 @@ impl HttpFilter for McpBrokerFilter {
     }
 
     fn on_request_complete(&self, ctx: &mut HttpFilterContext<'_>, status: u16) {
-        // A call still recorded here never got a backend response. A proxy
-        // 502 or 504 then means the pinned endpoint could not be reached
+        // Completion releases the call's slot. A call no backend answered
+        // that ends in a proxy 502 or 504 could not reach its pinned endpoint
         // (refused, reset, TLS failure, or timed out), so the session it holds
         // is unusable; local rejections keep it.
-        let Some(call) = ctx.remove_filter_state::<ForwardedCall>() else {
+        let Some(ForwardedCall {
+            answered,
+            key,
+            slot,
+            session_id,
+            ..
+        }) = ctx.remove_filter_state::<ForwardedCall>()
+        else {
             return;
         };
-        if matches!(status, 502 | 504)
+        drop(slot);
+        if !answered
+            && matches!(status, 502 | 504)
             && let Some(backend) = self.backend.as_ref()
         {
-            backend.invalidate_forwarded(&call, "mcp backend endpoint unreachable; mapping invalidated");
+            backend.invalidate_forwarded(
+                &key,
+                &session_id,
+                "mcp backend endpoint unreachable; mapping invalidated",
+            );
         }
     }
 }
@@ -847,9 +886,9 @@ impl BackendSessions {
     }
 
     /// Drop the mapping a forwarded call used, if it still holds that session.
-    fn invalidate_forwarded(&self, call: &ForwardedCall, message: &'static str) {
-        if self.store.invalidate(&call.key, &call.session_id) {
-            debug!(server = call.key.server, "{message}");
+    fn invalidate_forwarded(&self, key: &BackendSessionKey, session_id: &http::HeaderValue, message: &'static str) {
+        if self.store.invalidate(key, session_id) {
+            debug!(server = key.server, "{message}");
         }
     }
 
@@ -900,7 +939,7 @@ impl BackendSessions {
         target: BackendTarget<'_>,
         protocol_version: &str,
         callout: &BackendCallout,
-    ) -> Result<BackendInit, McpBackendError> {
+    ) -> Result<(Arc<SessionSlot>, BackendInit), McpBackendError> {
         let credential = credential_fingerprint(&callout.forwarded_headers);
         let slot = self.store.slot(key).ok_or(McpBackendError::Capacity)?;
         let mut state = tokio::time::timeout_at(callout.deadline.into(), slot.state.lock())
@@ -909,7 +948,9 @@ impl BackendSessions {
         if let Some(bound) = state.as_ref()
             && bound.credential == credential
         {
-            return Ok(bound.init.clone());
+            let init = bound.init.clone();
+            drop(state);
+            return Ok((slot, init));
         }
 
         let init = self.handshake(target, protocol_version, callout).await?;
@@ -918,7 +959,7 @@ impl BackendSessions {
             init: init.clone(),
         });
         drop(state);
-        Ok(init)
+        Ok((slot, init))
     }
 
     /// Run `initialize` and `notifications/initialized` for a new session.
@@ -1034,7 +1075,7 @@ fn filter_entry(value: serde_yaml::Value) -> Result<FilterEntry, FilterError> {
 /// gateway session for the backend session.
 fn forward_current_tools_call(
     ctx: &mut HttpFilterContext<'_>,
-    value: &serde_json::Value,
+    value: &mut serde_json::Value,
     body: &mut Option<Bytes>,
     tool: &CatalogTool,
     init: &BackendInit,
@@ -1050,11 +1091,10 @@ fn forward_current_tools_call(
     ctx.rewritten_path = Some(tool.backend_path.clone());
 
     if tool.original_name != tool.exposed_name {
-        let mut mutated = value.clone();
-        if let Some(p) = mutated.get_mut("params").and_then(|p| p.as_object_mut()) {
+        if let Some(p) = value.get_mut("params").and_then(|p| p.as_object_mut()) {
             p.insert("name".to_owned(), serde_json::Value::String(tool.original_name.clone()));
         }
-        *body = Some(Bytes::from(mutated.to_string()));
+        *body = Some(Bytes::from(value.to_string()));
     }
 
     match init.session_id.as_ref() {
@@ -1068,10 +1108,17 @@ fn forward_current_tools_call(
 
 /// Record a forwarded session-bearing call so the header phase can pin its
 /// endpoint and the response can invalidate an expired or unreachable session.
-fn record_forwarded_call(ctx: &mut HttpFilterContext<'_>, key: BackendSessionKey, init: BackendInit) {
+fn record_forwarded_call(
+    ctx: &mut HttpFilterContext<'_>,
+    key: BackendSessionKey,
+    slot: Arc<SessionSlot>,
+    init: BackendInit,
+) {
     if let Some(session_id) = init.session_id {
         ctx.insert_filter_state(ForwardedCall {
+            answered: false,
             key,
+            slot,
             session_id,
             endpoint: init.endpoint,
         });
