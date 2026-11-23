@@ -2532,8 +2532,6 @@ fn make_ctx(req: &praxis_filter::Request) -> HttpFilterContext<'_> {
         attempted_endpoints: Vec::new(),
         retry_policy: None,
         route_retry_policy: None,
-        cluster_retry_state: None,
-        cluster_retry_state_released: false,
         endpoint_reselector: None,
         pinned_endpoint_address: None,
         rewritten_path: None,
