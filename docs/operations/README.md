@@ -1,7 +1,17 @@
 # Operate Praxis AI
 
-Start with a working [recipe](recipes/README.md), then carry its exact binary,
+Start with a working [guide](../guides/README.md), then carry its exact binary,
 configuration, credentials, and backend assumptions into deployment.
+
+This section covers:
+
+- This page: deployment checklist, capacity and observability, troubleshooting,
+  reload, and upgrades.
+- [Capacity planning](capacity-planning.md): file descriptors and admission.
+- [FIPS 140-3 deployment](fips.md).
+- Response store maintenance: [schema migration](store/schema-migration.md) and
+  [legacy item position repair](store/legacy-item-position-repair.md).
+- Upgrades: [migrating to 0.2](upgrades/migrating-to-0.2.md).
 
 ## Build and deploy
 
@@ -9,7 +19,7 @@ Record the source revision or image digest and enabled features with each
 configuration. The default build selects standard features; managed Responses
 and several identity/token/cloud helpers require explicit opt-ins. An unknown
 filter at startup usually means the selected binary lacks the configured
-feature. Use the [feature table](features.md#cargo-features) and
+feature. Use the [feature table](../features.md#cargo-features) and
 [FIPS deployment guide](fips.md) for the appropriate build.
 
 Run `praxis-ai --validate -c CONFIG` using the deployment binary and environment
@@ -26,17 +36,17 @@ mechanics; this repository's AI-specific recipes do not replace them.
 ## Capacity and observability
 
 Start with [file-descriptor planning](capacity-planning.md) and the
-[descriptor-budget example](../examples/configs/file-descriptor-limits.yaml).
+[descriptor-budget example](../../examples/configs/file-descriptor-limits.yaml).
 Bound connections, concurrency, request bodies, upstream timeouts, buffered
 responses, SSE events, and tool callout fan-out. Managed loops also need the
-[retained-payload budget](architecture/responses-retained-payload.md).
+[retained-payload budget](../architecture/responses-retained-payload.md).
 Do not infer gateway memory sizing or replica scaling rules from model token
 throughput alone. Measure your selected filters, payloads, concurrent streams,
 backend stalls, and tool rounds under sustained load and recovery.
 
 Use private admin health/readiness/metrics endpoints, access logs, request IDs,
-[token usage](recipes/guardrails-token-usage.md), and
-[OpenTelemetry](architecture/opentelemetry.md) where enabled. Token labels are
+[token usage](../guides/guardrails.md), and
+[OpenTelemetry](../architecture/opentelemetry.md) where enabled. Token labels are
 not tenant authorization; missing provider usage is not zero billing.
 Avoid collecting prompts, secrets, or tool results in unrestricted debug logs.
 
@@ -71,6 +81,6 @@ Read release notes and compare your enabled features and configuration against
 the destination version's docs. Review [store migration requirements](store/schema-migration.md)
 and [legacy item repair](store/legacy-item-position-repair.md) before changing
 persisted deployments; retain a tested backup and rollback procedure.
-The [release process](release.md) is a maintainer workflow, not an operator
+The [release process](../developing/release.md) is a maintainer workflow, not an operator
 upgrade compatibility promise. Development documentation added here is not
 part of the published v0.10.0 snapshot until separately released and imported.

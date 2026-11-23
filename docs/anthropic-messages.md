@@ -2,9 +2,9 @@
 
 Praxis AI can forward Anthropic Messages (`/v1/messages`) to a native
 backend, or translate supported requests to a Chat Completions backend.
-Start with the [complete operator recipes](recipes/anthropic.md) for build,
+Start with the [complete operator recipes](guides/anthropic.md) for build,
 credentials, startup, requests, and cleanup. This page owns the detailed
-protocol and qualification notes; the [client/provider table](client-provider-paths.md)
+protocol and qualification notes; the [client/provider table](getting-started/choose-client-and-provider.md)
 also covers the optional Vertex Anthropic path.
 
 Translation is a bounded compatibility layer. Review rejected fields, explicit

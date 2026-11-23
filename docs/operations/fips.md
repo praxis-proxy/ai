@@ -11,7 +11,7 @@ mode on its own: FIPS mode comes from the host, and praxis-ai reports and, on
 request, enforces it.
 
 This page is for operators deploying the FIPS build. How the build is checked
-and how the tooling works is in [FIPS Tooling](developing/fips.md).
+and how the tooling works is in [FIPS Tooling](../developing/fips.md).
 
 ## The FIPS build
 
@@ -33,7 +33,7 @@ Responses, stores or the agentic loop by default:
 | `azure_ad`, `gcp_adc`, MCP tool dispatch | experimental opt-in | no: their dependency boundaries have not been cleared for this profile |
 | Base image | Alpine, praxis-ai built with upstream Rust | `ubi9/ubi-minimal`, praxis-ai built with Red Hat's `rust-toolset` on `ubi9/ubi`, both pinned by digest and signature-verified |
 | OpenSSL | Alpine's, dynamically linked | UBI's, dynamically linked (`openssl-libs` and `openssl-fips-provider-so`), the validated module on a FIPS host |
-| Published tags | `<version>`, `<major>.<minor>`, `sha-<hash>` (see [image tags](release.md#image-tags)) | the same with a `-fips` suffix (`0.3.0-fips`) |
+| Published tags | `<version>`, `<major>.<minor>`, `sha-<hash>` (see [image tags](../developing/release.md#image-tags)) | the same with a `-fips` suffix (`0.3.0-fips`) |
 
 A configuration that names one of the excluded filters is rejected at
 startup by the FIPS build, as any unknown filter is. Everything else,
@@ -269,7 +269,7 @@ defines no symbol of a bundled crypto backend.
 
 ## Release readiness
 
-The [release checklist](release.md#pre-release-checklist) includes
+The [release checklist](../developing/release.md#pre-release-checklist) includes
 FIPS-specific items. The release workflow's `fips-proof` job blocks
 publication unless a successful `fips-host` run exists for the release
 commit. The release CI evidence table records the FIPS workflow outcome

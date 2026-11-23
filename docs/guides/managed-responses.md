@@ -1,6 +1,6 @@
 # Experimental managed Responses and tools
 
-Choose the owner of Responses state first. [Native forwarding](../quickstart.md)
+Choose the owner of Responses state first. [Native forwarding](../getting-started/build-from-source.md)
 needs no managed Responses features and leaves state and hosted tools to the
 upstream. Adding `openai_responses_proxy` alone does not provide a complete
 managed service. Gateway-managed validation, history, persistence, and tool
@@ -8,7 +8,7 @@ execution require an explicitly composed experimental pipeline.
 
 ## Prerequisites and build
 
-Follow the [recipe prerequisites](README.md). For this local lab you need:
+Follow the [guide prerequisites](README.md). For this local lab you need:
 
 - A native `/v1/responses` inference backend on `127.0.0.1:3001` that supports
   function tools, returns complete Responses objects, and implements Responses
@@ -200,8 +200,8 @@ Client function tools are returned to the client for execution. Recognizing a
 tool declaration does not imply a server executor exists. Managed
 `code_interpreter`, `background:true`, and non-null reusable `prompt`
 references are rejected; direct provider-owned passthrough is a different path.
-See [managed validation](../filters/openai_responses_request.md),
-[MCP dispatch](../filters/openai_mcp_dispatch.md), and
+See [managed validation](../filters/apis/openai_responses_request.md),
+[MCP dispatch](../filters/agents/openai_mcp_dispatch.md), and
 [retained-payload bounds](../architecture/responses-retained-payload.md).
 
 ## Conversations and state
@@ -218,7 +218,7 @@ Expect a Conversation ID. Use it in a subsequent Responses request's
 Conversation. The store and Conversations filters share the database and run
 before rehydration/inference; reverse response order appends the conversation
 turn before storing its successful response. See the
-[exact Conversations contract](../filters/openai_conversations.md) and
+[exact Conversations contract](../filters/agents/openai_conversations.md) and
 [store lifecycle](../architecture/response-store.md). In the unified example,
 an OpenAI-selected route forwards directly and the provider owns history.
 
@@ -249,4 +249,22 @@ if started for this recipe. Unset `BACKEND_API_KEY` in the proxy shell and
 `MODEL` in the client shell. Delete your local `managed-responses.yaml` and,
 only if this was a disposable lab, `managed-lab.db` and its `-wal`/`-shm`
 sidecars. Do not remove a shared or production store. Follow
-[store migrations](../store/schema-migration.md) for deployed state.
+[store migrations](../operations/store/schema-migration.md) for deployed state.
+
+## Filter reference
+
+- [`ai_operation`](../filters/core/ai_operation.md)
+- [`state_owner`](../filters/core/state_owner.md)
+- [`openai_responses_request`](../filters/apis/openai_responses_request.md)
+- [`openai_tool_parse`](../filters/apis/openai_tool_parse.md)
+- [`openai_responses_rehydrate`](../filters/agents/openai_responses_rehydrate.md)
+- [`openai_responses_proxy`](../filters/agents/openai_responses_proxy.md)
+- [`openai_mcp_tool_resolve`](../filters/agents/openai_mcp_tool_resolve.md)
+- [`openai_agentic_loop`](../filters/agents/openai_agentic_loop.md)
+- [`openai_mcp_dispatch`](../filters/agents/openai_mcp_dispatch.md)
+- [`openai_stream_events`](../filters/apis/openai_stream_events.md)
+- [`openai_responses_store`](../filters/agents/openai_responses_store.md)
+- [`openai_conversations`](../filters/agents/openai_conversations.md)
+
+Core filters such as `router`, `headers`, `credential_injection`, and
+`load_balancer` are documented in the [Praxis core filter reference](https://github.com/praxis-proxy/praxis/blob/main/docs/filters/reference.md).

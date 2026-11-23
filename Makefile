@@ -762,7 +762,7 @@ test-postgres-fips-host: | require-podman
 # that the provider reports FIPS and refuses MD5, and fail otherwise. Needs
 # the host's fips module (Fedora and RHEL ship /usr/lib64/ossl-modules/fips.so);
 # the same tests run inside the UBI 9 report stage (make fips-check), and
-# only a FIPS-mode host proves a deployment (docs/fips.md).
+# only a FIPS-mode host proves a deployment (docs/operations/fips.md).
 FIPS_PROVIDER_CNF       := $(CURDIR)/xtask/assets/fips/fips-provider.cnf
 test-fips-provider:
 	@OPENSSL_CONF=$(FIPS_PROVIDER_CNF) openssl list -providers 2>/dev/null | grep -q '^  fips$$' \
@@ -819,7 +819,7 @@ fips-toolchain: fips-verify-image
 # praxis-ai refuses to start as root, and the tests that boot the real
 # server would fail for that reason alone as container root.
 #
-# Needs rootless podman on a RHEL 9 host in FIPS mode (docs/fips.md). On any
+# Needs rootless podman on a RHEL 9 host in FIPS mode (docs/operations/fips.md). On any
 # other host it fails at the first test, by design.
 test-fips-host: fips-toolchain
 	podman run --rm --userns=keep-id --security-opt label=disable \
@@ -1078,7 +1078,7 @@ help:
 	@echo "  fips-verify-image    verify the pinned UBI 9 base images are Red Hat's (digest + signature)"
 	@echo "  fips-signature-store point podman at Red Hat's signature store (once, on Debian/Ubuntu hosts)"
 	@echo ""
-	@echo "FIPS host (RHEL 9 in FIPS mode; see docs/fips.md):"
+	@echo "FIPS host (RHEL 9 in FIPS mode; see docs/operations/fips.md):"
 	@echo "  test-integration-fips  the integration suite as the FIPS build (in-process proxy, FIPS binary for subprocess tests)"
 	@echo "  test-schema-fips       the schema suite as the FIPS build"
 	@echo "  fips-toolchain         build the UBI 9 toolchain image the host run uses"

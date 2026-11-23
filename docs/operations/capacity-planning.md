@@ -42,7 +42,7 @@ cost descriptors per request.
 
 ## Other Callouts
 
-Every other [outbound callout](architecture/outbound-callouts.md)
+Every other [outbound callout](../architecture/outbound-callouts.md)
 (guardrails, web search, file resolution, token fetches,
 MCP) also holds a descriptor while it runs.
 
@@ -92,4 +92,4 @@ admin endpoint does not serve it.
 [examples/configs/file-descriptor-limits.yaml] sizes a
 metered gateway with every setting on this page.
 
-[examples/configs/file-descriptor-limits.yaml]: ../examples/configs/file-descriptor-limits.yaml
+[examples/configs/file-descriptor-limits.yaml]: ../../examples/configs/file-descriptor-limits.yaml

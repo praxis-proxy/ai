@@ -51,7 +51,7 @@
 //! HMAC-SHA256 key derivation and signing) is computed by the system
 //! OpenSSL through [`praxis_ai_apis::hash`], like every other digest
 //! praxis-ai computes. In the FIPS build on a FIPS-mode RHEL host that
-//! library is the validated module (see `docs/fips.md`), so request
+//! library is the validated module (see `docs/operations/fips.md`), so request
 //! signing runs inside the same boundary as TLS; on any other host it
 //! is OpenSSL's default provider. This filter never selects or enables
 //! a provider itself.
