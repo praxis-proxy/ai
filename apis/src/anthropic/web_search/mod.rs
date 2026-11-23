@@ -1541,10 +1541,14 @@ fn append_search_turns(
     assistant_turn.insert("content".to_owned(), Value::Array(assistant_content));
     messages.push(Value::Object(assistant_turn));
     messages.push(build_tool_result_turn(&id, outcome));
-    if request.get("tool_choice").is_some()
-        && let Some(object) = request.as_object_mut()
-    {
-        object.insert("tool_choice".to_owned(), json!({"type":"auto"}));
+    if let Some(tool_choice) = request.get_mut("tool_choice") {
+        match tool_choice {
+            Value::Object(tool_choice) => {
+                tool_choice.insert("type".to_owned(), Value::String("auto".to_owned()));
+                tool_choice.remove("name");
+            },
+            other => *other = json!({"type":"auto"}),
+        }
     }
     Ok(())
 }
