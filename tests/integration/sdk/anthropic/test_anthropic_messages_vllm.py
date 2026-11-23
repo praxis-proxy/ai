@@ -10,7 +10,9 @@
 
 The native and translated production examples are both exercised against the
 same keyed vLLM server. Qwen3-8B runs the text matrix; the image case requires
-a separately served vision model and is selected with ``-k image``.
+a separately served vision model and is selected with ``-k image``. The
+translated example is text-only, so the image case drives a ``translated_vision``
+route that adds ``image_input_providers: [vllm]`` to a generated copy of it.
 
 The SDK is pinned to ``anthropic==1.9.0`` deliberately: this GPU acceptance
 baseline was qualified against that client release and its ``2023-06-01``
@@ -38,7 +40,7 @@ from urllib.parse import urlparse
 import zlib
 
 import pytest
-from anthropic import Anthropic
+from anthropic import Anthropic, BadRequestError
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -47,6 +49,10 @@ EXAMPLES = {
     "translated": ROOT / "examples/configs/anthropic/messages-to-openai-vllm.yaml",
 }
 ROUTES = tuple(EXAMPLES)
+# The translated example rejects images; vision coverage opts its vLLM cluster in.
+VISION_ROUTES = ("native", "translated_vision")
+TRANSLATOR_MAX_BODY = "        max_body_bytes: 1048576\n"
+VISION_OPT_IN = "        image_input_providers: [vllm]\n"
 
 
 def _required_live() -> bool:
@@ -111,9 +117,13 @@ def live_clients():
     with tempfile.TemporaryDirectory(prefix="praxis-anthropic-sdk-") as temporary:
         directory = Path(temporary)
         try:
-            for route, example in EXAMPLES.items():
+            routes = [*EXAMPLES.items(), ("translated_vision", EXAMPLES["translated"])]
+            for route, example in routes:
                 port = _free_port()
                 config = example.read_text()
+                if route == "translated_vision":
+                    assert config.count(TRANSLATOR_MAX_BODY) == 1, example
+                    config = config.replace(TRANSLATOR_MAX_BODY, TRANSLATOR_MAX_BODY + VISION_OPT_IN)
                 assert config.count('address: "127.0.0.1:8080"') == 1, example
                 assert config.count('"127.0.0.1:8000"') == 1, example
                 config = config.replace('address: "127.0.0.1:8080"', f'address: "127.0.0.1:{port}"')
@@ -308,7 +318,36 @@ def _solid_png(rgb: tuple[int, int, int]) -> bytes:
     )
 
 
-@pytest.mark.parametrize("route", ROUTES)
+def test_text_only_translated_route_rejects_vision_input(live_clients):
+    # Runs in the default Qwen3-8B text matrix: the translated example declares
+    # its vLLM cluster text-only, so Praxis rejects images before any backend
+    # call and no `image_url` reaches vLLM.
+    clients, model = live_clients
+    image = base64.b64encode(_solid_png((255, 0, 0))).decode("ascii")
+    for source in (
+        {"type": "base64", "media_type": "image/png", "data": image},
+        {"type": "url", "url": "https://images.example.test/red.png"},
+    ):
+        with pytest.raises(BadRequestError) as caught:
+            clients["translated"].messages.create(
+                model=model,
+                max_tokens=16,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "source": source},
+                            {"type": "text", "text": "What is the dominant color?"},
+                        ],
+                    }
+                ],
+            )
+        assert caught.value.status_code == 400
+        assert caught.value.body["error"]["type"] == "invalid_request_error"
+        assert "selected backend" in caught.value.body["error"]["message"]
+
+
+@pytest.mark.parametrize("route", VISION_ROUTES)
 @pytest.mark.parametrize("color,rgb", [("red", (255, 0, 0)), ("blue", (0, 0, 255))])
 def test_image_message(live_clients, route, color, rgb):
     # Run with -k image only against a vLLM-served vision model. The default

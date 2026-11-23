@@ -274,6 +274,9 @@ Positive image coverage uses Qwen3-VL-4B-Instruct in the separate
 [`anthropic-vllm-vision.yaml`](../.github/workflows/anthropic-vllm-vision.yaml)
 GPU workflow. It sends generated red and blue PNGs through the SDK and both
 Praxis routes, then checks that the vision model identifies each color. The
+translated route opts its vLLM cluster into `image_input_providers` in the
+generated config, because the committed example is text-only; the text matrix
+asserts that the committed translated example rejects images. The
 Qwen3-8B text model cannot establish image support. Both workflows set
 `PRAXIS_TEST_REQUIRE_LIVE=1`, so missing infrastructure fails rather than
 silently skipping the tests. Label an upstream PR `vllm-full-suite` to run both
@@ -563,6 +566,8 @@ The `anthropic_messages_to_chat_completions` filter:
   and text-only user `tool_result` blocks; rejects
   `document`, `search_result`, and other blocks that
   Chat Completions cannot represent
+- Applies the selected cluster's image policy (see
+  [Image input and cluster profiles](#image-input-and-cluster-profiles))
 - Rejects `tool_result.is_error: true` because Chat
   Completions has no equivalent tool-result error flag
 - Maps `stop_sequences` to `stop`,
@@ -625,6 +630,54 @@ If an upstream success response cannot be translated, the filter rejects it.
 This can return an HTTP 500 before response headers are sent. Once the
 upstream success headers have been sent, the proxy aborts the response body;
 the client may observe a connection error or an incomplete HTTP 200 response.
+
+### Image input and cluster profiles
+
+Whether a translated request may carry images depends on the backend the
+router selects, not on the request. Each cluster declares its profile with
+`http.application_provider`, and the translator lists the trusted
+image-capable providers in `image_input_providers`:
+
+```yaml
+- filter: anthropic_messages_to_chat_completions
+  image_input_providers: [openai]   # default: [] (no backend receives images)
+...
+- filter: load_balancer
+  clusters:
+    - name: hosted-openai           # image-capable, for example api.openai.com
+      http:
+        application_provider: openai
+      endpoints: ["api.openai.com:443"]
+    - name: vllm-text               # text-only
+      http:
+        application_provider: vllm
+      endpoints: ["127.0.0.1:8000"]
+```
+
+- A listed provider receives Anthropic image blocks as Chat Completions
+  `image_url` parts: `base64` sources become data URLs and `url` sources are
+  forwarded unchanged for the backend to fetch. Praxis never fetches or
+  inlines a remote image.
+- A cluster without `application_provider`, or with a provider that is not
+  listed, fails closed: a request carrying an image block, in message content
+  or nested in `tool_result` content, is rejected with a 400
+  `invalid_request_error` before any backend call.
+- Images nested in `tool_result` content are rejected for every provider,
+  because a Chat Completions tool message cannot carry them.
+- Trust comes only from the cluster declaration. Praxis never infers it from
+  an endpoint hostname.
+
+The vLLM translation path in
+[`messages-to-openai-vllm.yaml`](../examples/configs/anthropic/messages-to-openai-vllm.yaml)
+is text-only: its cluster declares `application_provider: vllm` and the
+translator lists no image-capable providers, matching the Qwen3-8B model it
+serves. To serve a vision-capable vLLM model, add
+`image_input_providers: [vllm]`. The vision acceptance workflow does exactly
+that in its generated config.
+
+Configurations that relied on translated images before this policy must opt
+in: declare `application_provider` on the image-capable cluster and list it in
+`image_input_providers`.
 
 Add `anthropic_messages_to_chat_completions_stream` with a `text/event-stream`
 response condition when the backend may return streaming
@@ -705,6 +758,7 @@ for SSE responses.
 ```yaml
 filter: anthropic_messages_to_chat_completions
 max_body_bytes: 1048576    # 1 MiB
+image_input_providers: []  # selected-cluster providers that may receive images
 ```
 
 ### `anthropic_messages_to_chat_completions_stream`

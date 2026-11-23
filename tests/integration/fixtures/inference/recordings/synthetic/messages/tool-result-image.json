@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "scenario_id": "messages/tool-result-image",
+  "protocol": "anthropic_messages",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-tool-result-image-model",
+    "source_id": "controlled-anthropic-tool-result-image"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {}
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "model": "synthetic-tool-result-image-model",
+              "max_tokens": 64,
+              "stream": false,
+              "messages": [
+                {
+                  "role": "user",
+                  "content": [
+                    {
+                      "type": "tool_result",
+                      "tool_use_id": "call_1",
+                      "content": [
+                        {
+                          "type": "text",
+                          "text": "chart rendered"
+                        },
+                        {
+                          "type": "image",
+                          "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "iVBORw0KGgo="
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "type": "error",
+              "error": {
+                "type": "invalid_request_error",
+                "message": "tool_result content cannot be translated: `type` must be \"text\""
+              },
+              "request_id": null
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    }
+  ]
+}
