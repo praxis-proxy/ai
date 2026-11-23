@@ -23,11 +23,11 @@
 # Version asserted from `opencode --version`. Keep in sync with
 # OPENCODE_V2_PINNED_VERSION in `tests/integration/tests/suite/harness.rs`;
 # `pin_toml_version_matches_harness_const` enforces the pair.
-version = "2.3.2"
+version = "2.1.2"
 # OBSERVED: unlike 1.x, which prints the bare version, 2.x prints a product
 # prefix and a `v`: `opencode v2.1.2`. The version check compares against this
 # exact line.
-version_output = "opencode v2.3.2"
+version_output = "opencode v2.1.2"
 # Platform slug the pinned build targets.
 platform = "linux-x64"
 # How CI obtains the executable.

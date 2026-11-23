@@ -811,7 +811,7 @@ jobs:
     permissions:
       contents: read
     env:
-      OPENCODE_V2_VERSION: "2.3.2"
+      OPENCODE_V2_VERSION: "2.1.2"
       OPENCODE_V2_PLATFORM: "linux-x64"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

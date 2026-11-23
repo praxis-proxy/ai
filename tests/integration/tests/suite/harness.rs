@@ -45,7 +45,7 @@ pub(crate) const OPENCODE_PINNED_VERSION: &str = "1.19.6";
 /// version check compares against that full line, not this bare value. Kept in
 /// sync with `tests/integration/fixtures/opencode-cli-v2/pin.toml` by
 /// `opencode_v2::pin_toml_version_matches_harness_const`.
-pub(crate) const OPENCODE_V2_PINNED_VERSION: &str = "2.3.2";
+pub(crate) const OPENCODE_V2_PINNED_VERSION: &str = "2.1.2";
 
 /// Pinned version of the pi coding agent executable used for E2E acceptance tests.
 ///

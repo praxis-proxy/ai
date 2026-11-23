@@ -719,7 +719,7 @@ the way the environment variable does.
 
 OpenCode 1.x and 2.x need different setups. Check your version with
 `opencode --version`: 1.x prints a bare version such as `1.19.6`, and 2.x
-prints `opencode v2.3.2`. The two majors ship as different npm packages
+prints `opencode v2.1.2`. The two majors ship as different npm packages
 (`opencode-ai` for 1.x, `@opencode/cli` for 2.x) and use different
 configuration schemas, so a 1.x configuration does not carry over to 2.x.
 
