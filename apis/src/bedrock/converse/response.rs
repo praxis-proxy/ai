@@ -179,6 +179,9 @@ fn extract_message_content(message: &Value) -> Result<(Value, Vec<Value>), Strin
         } else if let Some(tool_use) = block.get("toolUse") {
             tool_calls.push(translate_tool_use_block(tool_use)?);
         } else if let Some(reasoning_content) = block.get("reasoningContent") {
+            if block.as_object().is_none_or(|block| block.len() != 1) {
+                return Err("Bedrock response content block has multiple union variants".to_owned());
+            }
             validate_reasoning_content(reasoning_content)?;
             // Chat Completions has no response field for Bedrock reasoning.
             // Issue #1886 permits explicit omission on the finite path so the
@@ -807,6 +810,24 @@ mod tests {
             let error = transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap_err();
             assert!(error.contains("Bedrock"), "unexpected error: {error}");
         }
+    }
+
+    #[test]
+    fn transform_response_rejects_reasoning_mixed_with_another_content_variant() {
+        let bedrock = serde_json::json!({
+            "output": {"message": {"content": [
+                {
+                    "reasoningContent": {"reasoningText": {"text": "Thinking"}},
+                    "image": {}
+                },
+                {"text": "must not survive an ambiguous response"}
+            ]}},
+            "stopReason": "end_turn"
+        });
+
+        let error = transform_response(bedrock.to_string().as_bytes(), MODEL, ID).unwrap_err();
+
+        assert_eq!(error, "Bedrock response content block has multiple union variants");
     }
 
     #[test]
