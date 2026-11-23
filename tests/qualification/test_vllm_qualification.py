@@ -60,6 +60,28 @@ def report():
 
 
 class QualificationTest(unittest.TestCase):
+    def test_codex_capture_keeps_assertion_results_and_lane_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory, "native.json")
+            evidence.write_text(json.dumps({"outcomes": [["verified file edit", "passed"]]}))
+            output = Path(directory, "acceptance.json")
+            env = {"GITHUB_RUN_ID": "17", "GITHUB_RUN_ATTEMPT": "2", "VLLM_GPU_MODEL": "checkpoint",
+                   "CODEX_VLLM_MODEL": "served", "VLLM_GPU_IMAGE": "image", "CODEX_TOOL_PARSER": "hermes",
+                   "CODEX_REASONING_PARSER": "deepseek_r1", "CODEX_NATIVE": "success",
+                   "CODEX_NATIVE_EVIDENCE": str(evidence), "CODEX_TRANSLATED": "skipped"}
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+                qualification, "model_revision", return_value=None
+            ), mock.patch.object(subprocess, "check_output", return_value="abcd"):
+                qualification.capture_codex(output)
+            suite = qualification.acceptance(output, "success", 17, 2, "abcd", "Codex")
+            native, translated, compaction = suite["cases"]
+            self.assertEqual(native["capabilities"]["checkout_sha"], "abcd")
+            self.assertEqual(native["capabilities"]["outcomes"], [["verified file edit", "passed"]])
+            self.assertEqual(native["capabilities"]["served_model"], "served")
+            self.assertIsNone(native["capabilities"]["resolved_revision"])
+            self.assertEqual(translated, {"id": "codex_translated", "status": "skipped"})
+            self.assertEqual(compaction, {"id": "codex_compaction", "status": "unexecuted"})
+
     def test_release_uses_recent_ancestor_nightly_and_discloses_newer_failure(self):
         timestamp = qualification.now()
         def run(identifier, conclusion="success", sha="a" * 40, created=timestamp):

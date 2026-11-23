@@ -1341,6 +1341,8 @@ jobs:
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
       CODEX_VERSION: "0.170.0"
+      CODEX_TOOL_PARSER: hermes
+      CODEX_REASONING_PARSER: deepseek_r1
       CODEX_VLLM_MODEL: qwen3-8b
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1449,8 +1451,8 @@ jobs:
             --served-model-name "$CODEX_VLLM_MODEL" \
             --max-model-len 16384 \
             --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            --reasoning-parser deepseek_r1 \
+            --tool-call-parser "$CODEX_TOOL_PARSER" \
+            --reasoning-parser "$CODEX_REASONING_PARSER" \
             --gpu-memory-utilization 0.9 \
             --seed 0 \
             --api-key "$CODEX_BACKEND_TOKEN"
@@ -1576,7 +1578,10 @@ jobs:
           PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
         run: |
           set -uo pipefail
-          sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+          PRAXIS_TEST_CODEX_EVIDENCE="$(mktemp "$RUNNER_TEMP/codex-native-evidence.XXXXXX")"
+          export PRAXIS_TEST_CODEX_EVIDENCE
+          echo "CODEX_NATIVE_EVIDENCE=$PRAXIS_TEST_CODEX_EVIDENCE" >> "$GITHUB_ENV"
+          sudo --preserve-env=PRAXIS_TEST_CODEX_EVIDENCE,PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
             "$TEST_BIN" \
             codex_http::pinned_codex_completes_native_vllm_apply_patch_workflow_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-native.log"
@@ -1600,7 +1605,10 @@ jobs:
           PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
         run: |
           set -uo pipefail
-          sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+          PRAXIS_TEST_CODEX_EVIDENCE="$(mktemp "$RUNNER_TEMP/codex-translated-evidence.XXXXXX")"
+          export PRAXIS_TEST_CODEX_EVIDENCE
+          echo "CODEX_TRANSLATED_EVIDENCE=$PRAXIS_TEST_CODEX_EVIDENCE" >> "$GITHUB_ENV"
+          sudo --preserve-env=PRAXIS_TEST_CODEX_EVIDENCE,PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
             "$TEST_BIN" \
             codex_http::pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-translated.log"
@@ -1630,7 +1638,10 @@ jobs:
           # test-local HTTP observer between Codex and Praxis captures the
           # compaction request on the wire; the egress namespace guarantees the
           # client's only route is Praxis.
-          sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+          PRAXIS_TEST_CODEX_EVIDENCE="$(mktemp "$RUNNER_TEMP/codex-compaction-evidence.XXXXXX")"
+          export PRAXIS_TEST_CODEX_EVIDENCE
+          echo "CODEX_COMPACTION_EVIDENCE=$PRAXIS_TEST_CODEX_EVIDENCE" >> "$GITHUB_ENV"
+          sudo --preserve-env=PRAXIS_TEST_CODEX_EVIDENCE,PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
             "$TEST_BIN" \
             codex_http::pinned_codex_compaction_crosses_context_window_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-compaction.log"
@@ -1677,17 +1688,7 @@ jobs:
           CODEX_TRANSLATED: ${{ steps.codex_translated.outcome }}
           CODEX_COMPACTION: ${{ steps.codex_compaction.outcome }}
         run: |
-          python3 - "$RUNNER_TEMP/codex-acceptance.json" <<'PY'
-          import json, os, pathlib, subprocess, sys
-          names = ("CODEX_NATIVE", "CODEX_TRANSLATED", "CODEX_COMPACTION")
-          data = {
-              "run_id": int(os.environ["GITHUB_RUN_ID"]),
-              "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
-              "checkout_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-              "cases": [{"id": name.lower(), "status": os.environ[name] or "unexecuted"} for name in names],
-          }
-          pathlib.Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n")
-          PY
+          python3 .github/scripts/vllm_qualification.py capture-codex --output "$RUNNER_TEMP/codex-acceptance.json"
 
       - name: Upload Codex acceptance results
         if: always()

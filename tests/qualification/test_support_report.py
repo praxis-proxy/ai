@@ -180,6 +180,29 @@ class SupportReportTest(unittest.TestCase):
             self.assertIn("Qwen3-8B", markdown)
             self.assertIn("| Tests | success |", markdown)
 
+    def test_client_chooser_lists_the_release_capabilities(self):
+        guide = SCRIPT.parents[2] / "docs/getting-started/choose-client-and-provider.md"
+        self.assertIn("\n".join(support.codex_inventory()), guide.read_text())
+
+    def test_compaction_evidence_is_scoped_to_assertion_and_checkout(self):
+        evidence = {
+            "checkout_sha": SHA, "client_version": "0.170.0", "client_model": "qwen3-8b",
+            "served_model": "qwen3-8b", "checkpoint": "Qwen/Qwen3-8B", "transport": "HTTP/SSE",
+            "sandbox": "danger-full-access", "web_search": "disabled", "example": "client-tool-compat.yaml",
+            "outcomes": [["client compaction observed", "passed"], ["post-compaction task completion", "unverified"]],
+        }
+        live = qualification()
+        cases = live["suites"]["codex_acceptance"]["cases"]
+        cases.append({"id": "codex_compaction", "status": "success", "capabilities": evidence})
+        for tested_sha, expected in [(SHA, "**Verified**"), ("b" * 40, "Unverified")]:
+            with self.subTest(tested_sha=tested_sha), tempfile.TemporaryDirectory() as directory:
+                evidence["checkout_sha"] = tested_sha
+                write_fixtures(directory, qualification_value=live)
+                _, markdown = generate(arguments(directory, qualification=str(Path(directory) / "qualification.json")))
+                self.assertIn(f"| Compact a session | {expected} | Outside test scope |", markdown)
+                self.assertIn("| Finish a task after compaction | Unverified | Outside test scope |", markdown)
+                self.assertIn("| Apply a file patch | Unverified | Unverified |", markdown)
+
     def test_provenance_mismatch_refuses_live_claims(self):
         with tempfile.TemporaryDirectory() as directory:
             write_fixtures(directory, qualification_value=qualification(sha="9" * 40))

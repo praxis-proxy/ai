@@ -105,6 +105,9 @@ const COMPACTION_XFAIL_MODEL: &str = "qwen3-8b";
 /// The live test rewrites this client-facing slug to the configured vLLM model.
 const CODEX_APPLY_PATCH_MODEL: &str = "gpt-5.5";
 
+const CODEX_EDIT_SANDBOX: &str = "danger-full-access";
+const CODEX_WEB_SEARCH: &str = "disabled";
+
 /// Codex output item types that would indicate an attempted tool call.
 const TOOL_ITEM_TYPES: &[&str] = &["command_execution", "file_change", "mcp_tool_call", "web_search"];
 
@@ -250,7 +253,7 @@ async fn pinned_codex_completes_chat_backend_coding_workflow_over_http() {
             model: "test-model",
             working_dir: workspace.path(),
             prompt,
-            sandbox: "danger-full-access",
+            sandbox: CODEX_EDIT_SANDBOX,
             execution_timeout: Duration::from_secs(30),
             no_proxy: "127.0.0.1,localhost",
             netns: None,
@@ -289,8 +292,9 @@ async fn pinned_codex_completes_native_vllm_apply_patch_workflow_over_http() {
     live.require_egress_isolation_if_demanded();
 
     let proxy_port = free_port();
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/client-tool-compat.yaml"))
-        .expect("Codex native Responses example should exist");
+    let example = "openai/responses/client-tool-compat.yaml";
+    let yaml =
+        std::fs::read_to_string(example_config_path(example)).expect("Codex native Responses example should exist");
     let patched = patch_live_native_codex_config(
         &yaml,
         proxy_port,
@@ -304,6 +308,7 @@ async fn pinned_codex_completes_native_vllm_apply_patch_workflow_over_http() {
     let config = praxis_core::config::Config::from_yaml(&patched).expect("live native Codex config should parse");
 
     run_live_codex_apply_patch_workflow(&live, proxy_port, config).await;
+    record_codex_capabilities(example, CODEX_APPLY_PATCH_MODEL, &[("verified file edit", "passed")]);
 }
 
 /// Prove pinned Codex applies the same patch through Praxis's rich-client-tool
@@ -324,10 +329,9 @@ async fn pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http()
     live.require_egress_isolation_if_demanded();
 
     let proxy_port = free_port();
-    let yaml = std::fs::read_to_string(example_config_path(
-        "openai/responses/client-tool-compat-chat-completions.yaml",
-    ))
-    .expect("Codex client-tool Chat composition example should exist");
+    let example = "openai/responses/client-tool-compat-chat-completions.yaml";
+    let yaml = std::fs::read_to_string(example_config_path(example))
+        .expect("Codex client-tool Chat composition example should exist");
     let patched = patch_live_codex_config(
         &yaml,
         proxy_port,
@@ -341,6 +345,23 @@ async fn pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http()
     let config = praxis_core::config::Config::from_yaml(&patched).expect("live Codex config should parse");
 
     run_live_codex_apply_patch_workflow(&live, proxy_port, config).await;
+    record_codex_capabilities(example, CODEX_APPLY_PATCH_MODEL, &[("verified file edit", "passed")]);
+}
+
+/// Persist only assertions reached by this invocation for the CI qualification artifact.
+fn record_codex_capabilities(example: &str, client_model: &str, outcomes: &[(&str, &str)]) {
+    if let Some(path) = std::env::var_os("PRAXIS_TEST_CODEX_EVIDENCE") {
+        let evidence = serde_json::json!({
+            "example": example,
+            "client_version": CODEX_PINNED_VERSION,
+            "client_model": client_model,
+            "transport": "HTTP/SSE",
+            "sandbox": CODEX_EDIT_SANDBOX,
+            "web_search": CODEX_WEB_SEARCH,
+            "outcomes": outcomes,
+        });
+        std::fs::write(path, evidence.to_string()).expect("write Codex capability evidence");
+    }
 }
 
 /// Prove a pinned Codex session crosses its own context limit mid-task, performs
@@ -364,8 +385,9 @@ async fn pinned_codex_compaction_crosses_context_window_over_http() {
     live.require_egress_isolation_if_demanded();
 
     let proxy_port = free_port();
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/client-tool-compat.yaml"))
-        .expect("Codex native Responses example should exist");
+    let example = "openai/responses/client-tool-compat.yaml";
+    let yaml =
+        std::fs::read_to_string(example_config_path(example)).expect("Codex native Responses example should exist");
     let patched = patch_live_native_codex_config(
         &yaml,
         proxy_port,
@@ -377,7 +399,7 @@ async fn pinned_codex_compaction_crosses_context_window_over_http() {
     );
     let config = praxis_core::config::Config::from_yaml(&patched).expect("live compaction Codex config should parse");
 
-    run_live_codex_compaction_workflow(&live, proxy_port, config).await;
+    run_live_codex_compaction_workflow(&live, proxy_port, config, example).await;
 }
 
 /// Run the same verifier with default permissions in both live workflows.
@@ -416,7 +438,7 @@ async fn run_live_codex_apply_patch_workflow(
             model: CODEX_APPLY_PATCH_MODEL,
             working_dir: workspace.path(),
             prompt: &prompt,
-            sandbox: "danger-full-access",
+            sandbox: CODEX_EDIT_SANDBOX,
             execution_timeout: LIVE_CHILD_TIMEOUT,
             no_proxy: &no_proxy,
             netns: live.netns.as_deref(),
@@ -473,6 +495,7 @@ async fn run_live_codex_compaction_workflow(
     live: &CodexLiveConfig,
     proxy_port: u16,
     config: praxis_core::config::Config,
+    example: &str,
 ) {
     let compaction_is_xfail = live.model.to_ascii_lowercase().contains(COMPACTION_XFAIL_MODEL);
     let execution_timeout = if compaction_is_xfail {
@@ -513,7 +536,7 @@ async fn run_live_codex_compaction_workflow(
             model: &live.model,
             working_dir: workspace.path(),
             prompt: &prompt,
-            sandbox: "danger-full-access",
+            sandbox: CODEX_EDIT_SANDBOX,
             execution_timeout,
             no_proxy: &no_proxy,
             netns: live.netns.as_deref(),
@@ -546,6 +569,18 @@ async fn run_live_codex_compaction_workflow(
     observer.assert_http_only();
     observer.assert_compaction_traversed_praxis();
     observer.assert_compaction_preceded_result_write();
+
+    let record = |completion| {
+        record_codex_capabilities(
+            example,
+            &live.model,
+            &[
+                ("client compaction observed", "passed"),
+                ("post-compaction task completion", completion),
+            ],
+        );
+    };
+    record("unverified");
 
     // XFAIL on the known-limited model: self-compaction is proven above, but
     // Qwen3-8B cannot reliably complete the post-compaction marker write. Record
@@ -581,6 +616,7 @@ async fn run_live_codex_compaction_workflow(
     );
     assert_live_compaction_codex_jsonl(&output.stdout, CODEX_COMPACTION_BALLAST_CHAPTERS);
     workspace.assert_successful_completion();
+    record("passed");
 }
 
 /// Keep the live backend credential ephemeral rather than coupled to the example fixture.
@@ -2189,7 +2225,7 @@ async fn run_codex(codex_bin: &OsStr, options: CodexRunOptions<'_>) -> CodexOutp
         r#"model = "{model}"
 model_provider = "praxis"
 approval_policy = "never"
-web_search = "disabled"
+web_search = "{CODEX_WEB_SEARCH}"
 {compaction_keys}
 [features]
 apps = false
