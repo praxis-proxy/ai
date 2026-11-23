@@ -108,7 +108,8 @@ def _write_config(proxy_port: int, authority: str, model: str, mcp_url: str) -> 
         ('address: "127.0.0.1:8080"', f'address: "127.0.0.1:{proxy_port}"'),
         (f'x-praxis-ai-model: "{CHAT_MODEL_ROUTE}"', f'x-praxis-ai-model: "{model}"'),
         ('"127.0.0.1:8001"', f'"{authority}"'),
-        (EXAMPLE_MCP_URL, mcp_url),
+        # Anchor on the key: the header comment's curl example repeats the URL.
+        (f"server_url: {EXAMPLE_MCP_URL}", f"server_url: {mcp_url}"),
     ]:
         assert config.count(old) == 1, f"example drift: {old!r}"
         config = config.replace(old, new)
