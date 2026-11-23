@@ -70,7 +70,10 @@ use self::{
         McpBackendClient, McpBackendError,
     },
     config::{CacheScope, CatalogTool, McpBrokerConfig, McpServerConfig, ValidatedBackendSessions, build_config},
-    sessions::{BackendSessionKey, BackendSessionStore, BoundSession, SessionSlot, credential_fingerprint},
+    sessions::{
+        BackendSessionKey, BackendSessionStore, BoundSession, Publish, RetiredSession, SessionSlot,
+        credential_fingerprint,
+    },
 };
 use super::protocol::ProtocolProfile;
 
@@ -124,8 +127,14 @@ struct BrokerServer {
     path: String,
 }
 
+/// Most retired backend sessions terminated concurrently; beyond that the
+/// backend's own idle expiry applies.
+const MAX_CONCURRENT_CLEANUPS: usize = 16;
+
 /// Current-profile backend session runtime.
 struct BackendSessions {
+    /// Bounds concurrent background terminations of retired sessions.
+    cleanup: Arc<tokio::sync::Semaphore>,
     /// Lifecycle callout client.
     client: Arc<dyn McpBackendClient>,
     /// Transport used when the request context exposes no shared client.
@@ -455,7 +464,7 @@ impl McpBrokerFilter {
         let Some(backend) = self.backend.as_ref() else {
             return json_rpc_error_action(envelope, -32601, "method not yet supported");
         };
-        let (tool, server, key) = match self.current_call_route(ctx, value, envelope) {
+        let (tool, server, key, version) = match self.current_call_route(ctx, value, envelope) {
             Ok(route) => route,
             Err(action) => return action,
         };
@@ -466,12 +475,9 @@ impl McpBrokerFilter {
             cluster: &server.cluster,
             path: &server.path,
         };
-        let version = match self.requested_backend_version(ctx, envelope) {
-            Ok(version) => version,
-            Err(action) => return action,
-        };
-
-        let (slot, init) = match backend.ensure_session(&key, target, version, &callout).await {
+        let session = backend.ensure_session(&key, target, version, &callout).await;
+        backend.retire(&self.servers, &callout);
+        let (slot, init) = match session {
             Ok(session) => session,
             Err(error) => {
                 warn!(server = %tool.server_name, reason = error.reason(), "mcp backend session handshake failed");
@@ -484,14 +490,15 @@ impl McpBrokerFilter {
         FilterAction::Release
     }
 
-    /// Resolve the catalog tool, its server, and the session map key for a
-    /// current-profile `tools/call`, or the JSON-RPC error to return.
+    /// Resolve the catalog tool, its server, the session map key, and the
+    /// backend protocol version for a current-profile `tools/call`, or the
+    /// error to return.
     fn current_call_route(
         &self,
         ctx: &HttpFilterContext<'_>,
         value: &serde_json::Value,
         envelope: &JsonRpcEnvelope,
-    ) -> Result<(&CatalogTool, &BrokerServer, BackendSessionKey), FilterAction> {
+    ) -> Result<(&CatalogTool, &BrokerServer, BackendSessionKey, &str), FilterAction> {
         let tool_name =
             extract_tool_name(value).map_err(|detail| json_rpc_error_action(envelope, ERR_INVALID_PARAMS, detail))?;
         let tool = self
@@ -510,7 +517,8 @@ impl McpBrokerFilter {
             gateway_session: Box::from(gateway),
             server: tool.server_index,
         };
-        Ok((tool, server, key))
+        let version = self.requested_backend_version(ctx, envelope)?;
+        Ok((tool, server, key, version))
     }
 
     /// Protocol version offered to the backend: the client's
@@ -538,18 +546,19 @@ impl McpBrokerFilter {
         };
         let credential = credential_fingerprint(&callout.forwarded_headers);
         let removed = backend.store.remove_gateway(gateway, &credential);
-        for (server_index, bound) in removed {
-            let Some(server) = self.servers.get(server_index) else {
+        for retired in removed {
+            let Some(server) = self.servers.get(retired.server) else {
                 continue;
             };
             let target = BackendTarget {
                 cluster: &server.cluster,
                 path: &server.path,
             };
-            if let Err(error) = backend.client.terminate(target, &bound.init, &callout).await {
+            if let Err(error) = backend.client.terminate(target, &retired.session.init, &callout).await {
                 debug!(reason = error.reason(), "mcp backend session termination failed");
             }
         }
+        backend.retire(&self.servers, &callout);
     }
 
     // -------------------------------------------------------------------------
@@ -876,6 +885,7 @@ impl BackendSessions {
         supported_versions: Vec<String>,
     ) -> Self {
         Self {
+            cleanup: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CLEANUPS)),
             client,
             fallback_client,
             forward_headers: settings.forward_headers.clone(),
@@ -942,24 +952,112 @@ impl BackendSessions {
     ) -> Result<(Arc<SessionSlot>, BackendInit), McpBackendError> {
         let credential = credential_fingerprint(&callout.forwarded_headers);
         let slot = self.store.slot(key).ok_or(McpBackendError::Capacity)?;
-        let mut state = tokio::time::timeout_at(callout.deadline.into(), slot.state.lock())
-            .await
-            .map_err(|_elapsed| McpBackendError::Timeout)?;
-        if let Some(bound) = state.as_ref()
-            && bound.credential == credential
-        {
-            let init = bound.init.clone();
-            drop(state);
+        if let Some(init) = slot.current(&credential) {
             return Ok((slot, init));
         }
+        let (outcome, init) = self
+            .serialized_handshake(&slot, target, protocol_version, callout)
+            .await?;
+        match outcome {
+            None => Ok((slot, init)),
+            Some(Publish::Published(replaced)) => {
+                if let Some(session) = replaced {
+                    self.store.push_retired(RetiredSession {
+                        server: key.server,
+                        session,
+                    });
+                }
+                Ok((slot, init))
+            },
+            Some(Publish::Cancelled(session)) => {
+                self.abandon(target, &session.init, callout).await;
+                Err(McpBackendError::SessionClosed)
+            },
+        }
+    }
 
-        let init = self.handshake(target, protocol_version, callout).await?;
-        *state = Some(BoundSession {
-            credential,
-            init: init.clone(),
-        });
-        drop(state);
-        Ok((slot, init))
+    /// Run the handshake under the slot's permit. Returns `None` for the
+    /// outcome when a concurrent caller published a usable session first.
+    async fn serialized_handshake(
+        &self,
+        slot: &SessionSlot,
+        target: BackendTarget<'_>,
+        protocol_version: &str,
+        callout: &BackendCallout,
+    ) -> Result<(Option<Publish>, BackendInit), McpBackendError> {
+        let _permit = tokio::time::timeout_at(callout.deadline.into(), slot.handshake_permit())
+            .await
+            .map_err(|_elapsed| McpBackendError::Timeout)?;
+        let credential = credential_fingerprint(&callout.forwarded_headers);
+        if let Some(init) = slot.current(&credential) {
+            return Ok((None, init));
+        }
+        slot.begin(credential);
+        match self.handshake(target, protocol_version, callout).await {
+            Ok(init) => {
+                let outcome = slot.publish(BoundSession::new(&callout.forwarded_headers, init.clone()));
+                Ok((Some(outcome), init))
+            },
+            Err(error) => {
+                slot.abort();
+                Err(error)
+            },
+        }
+    }
+
+    /// Terminate the sessions the map retired (evicted, expired, or replaced
+    /// after a credential change) in the background, each with the
+    /// credentials that created it.
+    fn retire(&self, servers: &[BrokerServer], callout: &BackendCallout) {
+        for retired in self.store.take_retired() {
+            self.spawn_terminate(servers, callout, retired);
+        }
+    }
+
+    /// A callout outliving the request, carrying the retired session's own
+    /// credentials and a fresh per-exchange deadline.
+    fn detached_callout(&self, callout: &BackendCallout, forwarded_headers: http::HeaderMap) -> BackendCallout {
+        let now = Instant::now();
+        BackendCallout {
+            client: callout.client.clone(),
+            deadline: now.checked_add(self.handshake_timeout).unwrap_or(now),
+            depth: callout.depth,
+            downstream: callout.downstream.clone(),
+            forwarded_headers,
+            trace_context: callout.trace_context.clone(),
+        }
+    }
+
+    /// Spawn one bounded best-effort termination.
+    fn spawn_terminate(&self, servers: &[BrokerServer], callout: &BackendCallout, retired: RetiredSession) {
+        let Some(server) = servers.get(retired.server) else {
+            return;
+        };
+        let Ok(permit) = Arc::clone(&self.cleanup).try_acquire_owned() else {
+            debug!(
+                server = retired.server,
+                "mcp backend session cleanup saturated; backend expiry applies"
+            );
+            return;
+        };
+        let cleanup = self.detached_callout(callout, retired.session.credentials);
+        let client = Arc::clone(&self.client);
+        let cluster = Arc::clone(&server.cluster);
+        let path = server.path.clone();
+        let init = retired.session.init;
+        drop(tokio::spawn(async move {
+            let target = BackendTarget {
+                cluster: &cluster,
+                path: &path,
+            };
+            if let Err(error) = client.terminate(target, &init, &cleanup).await {
+                debug!(
+                    reason = error.reason(),
+                    "mcp backend retired session termination failed"
+                );
+            }
+            drop(permit);
+        }));
     }
 
     /// Run `initialize` and `notifications/initialized` for a new session.

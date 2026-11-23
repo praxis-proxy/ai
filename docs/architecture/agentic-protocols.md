@@ -170,22 +170,37 @@ Concurrent first calls for one pair share a single
 handshake. A mapping is bound to a SHA-256 fingerprint
 of the forwarded credential headers, so a different
 credential on the same gateway session runs its own
-handshake. A gateway `DELETE` terminates only the
-backend sessions created with the caller's own
-credentials. The map is in memory, per filter instance,
-capped by `max_sessions` (least recently used entries
-are evicted) and expired after `idle_timeout_ms`. A
-mapping in use by an in-flight handshake or forwarded
-call is never evicted or expired until that request
-completes, so one pair cannot end up on two backend
-sessions; when every mapping is in use, a call for a new
-pair fails with `session_capacity`. Eviction and expiry
-drop only the broker's mapping: the broker keeps a
-fingerprint of the caller's credentials, not the
-credentials, so it cannot terminate that backend
-session. Backends must therefore expire idle sessions on
-their own, as the MCP transport allows.
-Distributed session storage is tracked separately.
+handshake, and the session it replaces is terminated. A
+gateway `DELETE` terminates only the backend sessions
+created with the caller's own credentials, including one
+whose handshake is still in flight: that handshake
+terminates its session instead of publishing it, and its
+call fails with `session_closed`. A backend `404` drops
+the mapping even while another handshake for the pair is
+running.
+
+The map is in memory, per filter instance, capped by
+`max_sessions` (least recently used entries are evicted)
+and expired after `idle_timeout_ms`. A mapping in use by
+an in-flight handshake or forwarded call is never
+evicted or expired until that request completes, so one
+pair cannot end up on two backend sessions; when every
+mapping is in use, a call for a new pair fails with
+`session_capacity`. Evicted and expired sessions are
+terminated in the background with the credentials that
+created them, which the broker keeps in memory (marked
+sensitive) for the session's lifetime. At most 16 such
+terminations run at once; beyond that, and for sessions
+lost to a restart or reload, the backend's own idle
+expiry applies. Idle entries are swept on traffic, at
+most once per `idle_timeout_ms`.
+
+Running several broker replicas behind one gateway
+address is not supported yet: gateway sessions and their
+backend mappings live in one broker instance, so clients
+must reach the same replica for a session's lifetime.
+The broker also does not yet track which gateway
+`Mcp-Session-Id` values it issued.
 
 ### Filter Results
 

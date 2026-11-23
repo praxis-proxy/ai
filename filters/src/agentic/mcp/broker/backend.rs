@@ -128,6 +128,8 @@ pub(crate) enum McpBackendError {
     UnsupportedVersion,
     /// Every session slot is busy with an in-flight exchange.
     Capacity,
+    /// The gateway session was deleted while its handshake ran.
+    SessionClosed,
 }
 
 impl McpBackendError {
@@ -142,6 +144,7 @@ impl McpBackendError {
             Self::Malformed(_) => "malformed_response",
             Self::UnsupportedVersion => "unsupported_protocol_version",
             Self::Capacity => "session_capacity",
+            Self::SessionClosed => "session_closed",
         }
     }
 }
@@ -157,6 +160,7 @@ impl fmt::Display for McpBackendError {
             Self::Malformed(detail) => write!(f, "malformed backend response: {detail}"),
             Self::UnsupportedVersion => f.write_str("backend negotiated an unsupported protocol version"),
             Self::Capacity => f.write_str("backend session capacity exhausted"),
+            Self::SessionClosed => f.write_str("gateway session closed during the backend handshake"),
         }
     }
 }

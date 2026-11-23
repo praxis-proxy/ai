@@ -105,9 +105,14 @@ impl McpBackendClient for MockBackend {
         &self,
         target: BackendTarget<'_>,
         session: &BackendInit,
-        _callout: &BackendCallout,
+        callout: &BackendCallout,
     ) -> Result<(), McpBackendError> {
-        self.record("terminate", target, session_label(session));
+        let auth = callout
+            .forwarded_headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        self.record("terminate", target, format!("{}|{auth}", session_label(session)));
         Ok(())
     }
 }
@@ -263,6 +268,33 @@ async fn route_without_response(filter: &McpBrokerFilter, req: &praxis_filter::R
         "the broker must observe completion"
     );
     filter.on_request_complete(&mut ctx, status);
+}
+
+/// Let spawned background terminations run.
+async fn settle() {
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+}
+
+fn terminations(mock: &MockBackend) -> Vec<String> {
+    mock.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(e, ..)| e == "terminate")
+        .map(|(.., detail)| detail.clone())
+        .collect()
+}
+
+async fn delete(filter: &McpBrokerFilter, session: &str, auth: Option<&str>) -> FilterAction {
+    let mut req = crate::test_utils::make_request(http::Method::DELETE, "/mcp");
+    req.headers.insert("mcp-session-id", session.parse().unwrap());
+    if let Some(auth) = auth {
+        req.headers.insert("authorization", auth.parse().unwrap());
+    }
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    filter.on_request(&mut ctx).await.unwrap()
 }
 
 fn header<'a>(routed: &'a Routed, name: &str) -> Option<&'a str> {
@@ -529,6 +561,91 @@ async fn in_flight_call_keeps_its_slot_until_completion() {
         matches!(admitted.action, FilterAction::Release),
         "a completed call must release its slot"
     );
+}
+
+#[tokio::test]
+async fn evicted_session_is_terminated_with_its_credentials() {
+    let mock = Arc::new(MockBackend::default());
+    let filter = broker_from_yaml(
+        Arc::clone(&mock),
+        &SESSION_BROKER_YAML.replace("max_sessions: 16", "max_sessions: 1"),
+    );
+    route(
+        &filter,
+        &call_request(Some("gw-1"), Some("Bearer alice")),
+        "weather_get_weather",
+    )
+    .await;
+    route(
+        &filter,
+        &call_request(Some("gw-2"), Some("Bearer bob")),
+        "weather_get_weather",
+    )
+    .await;
+    settle().await;
+
+    assert_eq!(
+        terminations(&mock),
+        ["backend-1|Bearer alice"],
+        "an evicted session must be terminated with the credentials that created it"
+    );
+}
+
+#[tokio::test]
+async fn credential_change_terminates_replaced_session() {
+    let mock = Arc::new(MockBackend::default());
+    let filter = broker_with(Arc::clone(&mock));
+    route(
+        &filter,
+        &call_request(Some("gw-1"), Some("Bearer alice")),
+        "weather_get_weather",
+    )
+    .await;
+    route(
+        &filter,
+        &call_request(Some("gw-1"), Some("Bearer bob")),
+        "weather_get_weather",
+    )
+    .await;
+    settle().await;
+
+    assert_eq!(
+        terminations(&mock),
+        ["backend-1|Bearer alice"],
+        "the replaced session must be terminated with its own credentials"
+    );
+}
+
+#[tokio::test]
+async fn delete_during_handshake_terminates_instead_of_publishing() {
+    let mock = Arc::new(MockBackend {
+        initialize_delay: Some(std::time::Duration::from_millis(50)),
+        ..MockBackend::default()
+    });
+    let filter = broker_with(Arc::clone(&mock));
+    let req = call_request(Some("gw-1"), None);
+
+    let (routed, deleted) = tokio::join!(route(&filter, &req, "weather_get_weather"), async {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        delete(&filter, "gw-1", None).await
+    });
+
+    assert!(
+        matches!(&deleted, FilterAction::Reject(r) if r.status == 204),
+        "DELETE must return 204"
+    );
+    let (_, error) = rejection_json(&routed.action);
+    assert_eq!(
+        error["error"]["data"]["reason"], "session_closed",
+        "the call racing DELETE must not be forwarded"
+    );
+    assert_eq!(
+        terminations(&mock),
+        ["backend-1|"],
+        "the session the racing handshake created must be terminated"
+    );
+    route(&filter, &req, "weather_get_weather").await;
+    assert_eq!(mock.count("initialize"), 2, "nothing stale may remain mapped");
 }
 
 #[tokio::test]

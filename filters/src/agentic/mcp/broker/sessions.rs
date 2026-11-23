@@ -3,20 +3,28 @@
 
 //! Bounded `(gateway session, server)` → backend session mapping.
 //!
-//! Each key owns one slot whose async mutex serializes the backend handshake,
-//! so concurrent first calls for the same pair initialize the backend once.
+//! Each key owns one slot. A slot's handshake permit serializes the backend
+//! handshake, so concurrent first calls for the same pair initialize the
+//! backend once; its session state sits behind a short-held lock that is never
+//! held across I/O, so invalidation and gateway `DELETE` always apply, even
+//! while a handshake is in flight.
+//!
 //! The map holds at most `max_sessions` entries; idle entries expire after
 //! `idle_timeout`, and inserting into a full map evicts the least recently
 //! used entry. A slot is in use while a caller holds it (a handshake, a
-//! lookup, or a forwarded call in flight); in-use slots are never expired or evicted, so two calls
-//! for one key cannot end up on two backend sessions. When every slot is in
-//! use, a new key is refused. Mappings are in memory and per filter instance, so a config
-//! reload or restart starts with an empty map and backends see a fresh
-//! handshake.
+//! lookup, or a forwarded call in flight); in-use slots are never expired or
+//! evicted, so two calls for one key cannot end up on two backend sessions.
+//! When every slot is in use, a new key is refused.
+//!
+//! Sessions dropped by eviction, expiry, or a credential change are queued as
+//! retired, with the credentials that created them, so the caller can
+//! terminate them off the map lock. Mappings are in memory and per filter
+//! instance, so a config reload or restart starts with an empty map and
+//! backends see a fresh handshake.
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -46,15 +54,120 @@ pub(crate) struct BackendSessionKey {
 pub(crate) struct BoundSession {
     /// Credential fingerprint of the handshake's forwarded headers.
     pub credential: CredentialFingerprint,
+    /// The handshake's forwarded headers, marked sensitive, kept so the
+    /// session can be terminated with the credentials that created it.
+    pub credentials: HeaderMap,
     /// Backend handshake result.
     pub init: BackendInit,
+}
+
+impl BoundSession {
+    /// Bind `init` to the forwarded `headers` that created it.
+    pub(crate) fn new(headers: &HeaderMap, init: BackendInit) -> Self {
+        let mut credentials = headers.clone();
+        for value in credentials.values_mut() {
+            value.set_sensitive(true);
+        }
+        Self {
+            credential: credential_fingerprint(headers),
+            credentials,
+            init,
+        }
+    }
+}
+
+/// A backend session the map no longer references, awaiting termination.
+#[derive(Debug)]
+pub(crate) struct RetiredSession {
+    /// Server index in configuration order.
+    pub server: usize,
+    /// The retired session.
+    pub session: BoundSession,
+}
+
+/// Result of publishing a completed handshake.
+#[derive(Debug)]
+pub(crate) enum Publish {
+    /// The session is now current; a session bound to other credentials that
+    /// it replaced is returned for termination.
+    Published(Option<BoundSession>),
+    /// The gateway session was deleted while the handshake ran; the new
+    /// session was not published and must be terminated.
+    Cancelled(BoundSession),
+}
+
+/// A handshake in flight for one slot.
+#[derive(Debug)]
+struct Pending {
+    /// Credential fingerprint the handshake runs with.
+    credential: CredentialFingerprint,
+    /// Set by a gateway `DELETE` from the same credentials.
+    cancelled: bool,
+}
+
+/// Session state of one slot.
+#[derive(Debug, Default)]
+struct SlotState {
+    /// Current backend session, if initialized.
+    bound: Option<BoundSession>,
+    /// Handshake in flight, if any.
+    pending: Option<Pending>,
 }
 
 /// One key's handshake serialization point and current session.
 #[derive(Debug, Default)]
 pub(crate) struct SessionSlot {
-    /// Current backend session, if initialized.
-    pub state: tokio::sync::Mutex<Option<BoundSession>>,
+    /// Serializes handshakes; held across handshake I/O.
+    permit: tokio::sync::Mutex<()>,
+    /// Session state; held only for short updates, never across I/O.
+    state: Mutex<SlotState>,
+}
+
+impl SessionSlot {
+    /// The current session when it was created with `credential`.
+    pub(crate) fn current(&self, credential: &CredentialFingerprint) -> Option<BackendInit> {
+        self.lock_state()
+            .bound
+            .as_ref()
+            .filter(|bound| bound.credential == *credential)
+            .map(|bound| bound.init.clone())
+    }
+
+    /// Wait for the handshake permit.
+    pub(crate) async fn handshake_permit(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.permit.lock().await
+    }
+
+    /// Record that a handshake with `credential` started. Call while holding
+    /// the handshake permit.
+    pub(crate) fn begin(&self, credential: CredentialFingerprint) {
+        self.lock_state().pending = Some(Pending {
+            credential,
+            cancelled: false,
+        });
+    }
+
+    /// Record that the started handshake failed.
+    pub(crate) fn abort(&self) {
+        self.lock_state().pending = None;
+    }
+
+    /// Publish a completed handshake unless a gateway `DELETE` cancelled it.
+    pub(crate) fn publish(&self, session: BoundSession) -> Publish {
+        let mut state = self.lock_state();
+        if state.pending.take().is_some_and(|pending| pending.cancelled) {
+            return Publish::Cancelled(session);
+        }
+        let replaced = state.bound.replace(session);
+        drop(state);
+        Publish::Published(replaced)
+    }
+
+    /// Lock the session state, recovering from a poisoned lock: every
+    /// mutation completes before any fallible step.
+    fn lock_state(&self) -> MutexGuard<'_, SlotState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// Map entry with LRU bookkeeping.
@@ -74,6 +187,27 @@ impl Entry {
     }
 }
 
+/// State behind the map lock.
+#[derive(Debug)]
+struct Inner {
+    /// Live entries.
+    entries: HashMap<BackendSessionKey, Entry>,
+    /// Last full idle sweep.
+    last_sweep: Instant,
+    /// Sessions dropped from the map, awaiting termination.
+    retired: Vec<RetiredSession>,
+}
+
+impl Inner {
+    /// Queue the session of a removed `entry` for termination.
+    fn retire(&mut self, server: usize, entry: &Entry) {
+        let session = entry.slot.lock_state().bound.take();
+        if let Some(session) = session {
+            self.retired.push(RetiredSession { server, session });
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // BackendSessionStore
 // -----------------------------------------------------------------------------
@@ -81,8 +215,8 @@ impl Entry {
 /// Bounded in-memory backend session map.
 #[derive(Debug)]
 pub(crate) struct BackendSessionStore {
-    /// Live entries.
-    entries: Mutex<HashMap<BackendSessionKey, Entry>>,
+    /// Entries, sweep bookkeeping, and the retired queue.
+    inner: Mutex<Inner>,
     /// Idle lifetime of an entry.
     idle_timeout: Duration,
     /// Maximum number of entries.
@@ -93,7 +227,11 @@ impl BackendSessionStore {
     /// Create an empty store.
     pub(crate) fn new(max_sessions: usize, idle_timeout: Duration) -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Inner {
+                entries: HashMap::new(),
+                last_sweep: Instant::now(),
+                retired: Vec::new(),
+            }),
             idle_timeout,
             max_sessions,
         }
@@ -108,28 +246,34 @@ impl BackendSessionStore {
 
     /// [`slot`](Self::slot) with an explicit clock for tests.
     fn slot_at(&self, key: &BackendSessionKey, now: Instant) -> Option<Arc<SessionSlot>> {
-        let mut entries = self.lock();
-        if let Some(entry) = entries.get_mut(key) {
+        let mut inner = self.lock();
+        if now.saturating_duration_since(inner.last_sweep) >= self.idle_timeout {
+            inner.last_sweep = now;
+            self.purge_idle(&mut inner, now);
+        }
+        if let Some(entry) = inner.entries.get_mut(key) {
             if self.reusable(entry, now) {
                 entry.last_used = now;
                 let slot = Arc::clone(&entry.slot);
-                drop(entries);
+                drop(inner);
                 return Some(slot);
             }
-            entries.remove(key);
+            if let Some(stale) = inner.entries.remove(key) {
+                inner.retire(key.server, &stale);
+            }
         }
-        if !self.make_room(&mut entries, now) {
+        if !self.make_room(&mut inner, now) {
             return None;
         }
         let slot = Arc::new(SessionSlot::default());
-        entries.insert(
+        inner.entries.insert(
             key.clone(),
             Entry {
                 last_used: now,
                 slot: Arc::clone(&slot),
             },
         );
-        drop(entries);
+        drop(inner);
         Some(slot)
     }
 
@@ -138,18 +282,34 @@ impl BackendSessionStore {
         entry.in_use() || now.saturating_duration_since(entry.last_used) <= self.idle_timeout
     }
 
+    /// Remove and retire every idle entry not in use.
+    fn purge_idle(&self, inner: &mut Inner, now: Instant) {
+        let idle: Vec<BackendSessionKey> = inner
+            .entries
+            .iter()
+            .filter(|(_, entry)| !self.reusable(entry, now))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in idle {
+            if let Some(entry) = inner.entries.remove(&key) {
+                inner.retire(key.server, &entry);
+            }
+        }
+    }
+
     /// Free one slot when the map is full, purging idle entries first and then
     /// the least recently used entry not in use. Returns `false` when every
     /// slot is in use.
-    fn make_room(&self, entries: &mut HashMap<BackendSessionKey, Entry>, now: Instant) -> bool {
-        if entries.len() < self.max_sessions {
+    fn make_room(&self, inner: &mut Inner, now: Instant) -> bool {
+        if inner.entries.len() < self.max_sessions {
             return true;
         }
-        entries.retain(|_, entry| self.reusable(entry, now));
-        if entries.len() < self.max_sessions {
+        self.purge_idle(inner, now);
+        if inner.entries.len() < self.max_sessions {
             return true;
         }
-        let Some(oldest) = entries
+        let Some(oldest) = inner
+            .entries
             .iter()
             .filter(|(_, entry)| !entry.in_use())
             .min_by_key(|(_, entry)| entry.last_used)
@@ -157,71 +317,91 @@ impl BackendSessionStore {
         else {
             return false;
         };
-        entries.remove(&oldest);
+        if let Some(entry) = inner.entries.remove(&oldest) {
+            inner.retire(oldest.server, &entry);
+        }
         true
+    }
+
+    /// Queue a session dropped outside the map (a credential change replaced
+    /// it) for termination.
+    pub(crate) fn push_retired(&self, retired: RetiredSession) {
+        self.lock().retired.push(retired);
+    }
+
+    /// Take the sessions dropped from the map since the last call.
+    pub(crate) fn take_retired(&self) -> Vec<RetiredSession> {
+        std::mem::take(&mut self.lock().retired)
     }
 
     /// Drop the mapping for `key` when it still holds `session_id`.
     ///
-    /// A slot busy with a concurrent handshake is left alone: that handshake
-    /// replaces the session the backend rejected.
+    /// Applies even while a handshake is in flight: that handshake publishes
+    /// its own session afterwards.
     pub(crate) fn invalidate(&self, key: &BackendSessionKey, session_id: &http::HeaderValue) -> bool {
-        let mut entries = self.lock();
-        let Some(entry) = entries.get(key) else {
+        let mut inner = self.lock();
+        let Some(entry) = inner.entries.get(key) else {
             return false;
         };
-        let Ok(mut state) = entry.slot.state.try_lock() else {
-            return false;
-        };
+        let mut state = entry.slot.lock_state();
         let matches = state
+            .bound
             .as_ref()
             .and_then(|bound| bound.init.session_id.as_ref())
             .is_some_and(|current| current == session_id);
         if !matches {
             return false;
         }
-        *state = None;
+        state.bound = None;
+        let idle = state.pending.is_none();
         drop(state);
         // A caller holding the slot must keep finding it in the map, or its
         // next handshake would land on a slot no other call can see.
-        if !entry.in_use() {
-            entries.remove(key);
+        if idle && !entry.in_use() {
+            inner.entries.remove(key);
         }
+        drop(inner);
         true
     }
 
     /// Remove the mappings of `gateway_session` that were created with
-    /// `credential`, returning them so the caller can terminate them.
+    /// `credential`, returning them so the caller can terminate them, and
+    /// cancel that caller's handshakes still in flight so they terminate
+    /// their session instead of publishing it.
     ///
-    /// Mappings bound to other credentials, uninitialized slots, and slots
-    /// busy with a handshake are kept: presenting a gateway session id alone
-    /// must not tear down sessions another caller created.
+    /// Mappings and handshakes of other credentials are kept: presenting a
+    /// gateway session id alone must not tear down sessions another caller
+    /// created.
     pub(crate) fn remove_gateway(
         &self,
         gateway_session: &str,
         credential: &CredentialFingerprint,
-    ) -> Vec<(usize, BoundSession)> {
+    ) -> Vec<RetiredSession> {
         let mut removed = Vec::new();
-        self.lock().retain(|key, entry| {
+        self.lock().entries.retain(|key, entry| {
             if &*key.gateway_session != gateway_session {
                 return true;
             }
-            let Ok(mut state) = entry.slot.state.try_lock() else {
-                return true;
-            };
-            match state.take() {
-                Some(bound) if bound.credential == *credential => {
-                    removed.push((key.server, bound));
-                    drop(state);
-                    // Keep a slot a caller still holds; it is now empty, so
-                    // that caller runs a fresh handshake on the mapped slot.
-                    entry.in_use()
-                },
-                other => {
-                    *state = other;
-                    true
-                },
+            let mut state = entry.slot.lock_state();
+            if let Some(pending) = state.pending.as_mut()
+                && pending.credential == *credential
+            {
+                pending.cancelled = true;
             }
+            if state.bound.as_ref().is_none_or(|bound| bound.credential != *credential) {
+                return true;
+            }
+            if let Some(session) = state.bound.take() {
+                removed.push(RetiredSession {
+                    server: key.server,
+                    session,
+                });
+            }
+            let pending = state.pending.is_some();
+            drop(state);
+            // Keep a slot a caller still holds; it is now empty, so that
+            // caller runs a fresh handshake on the mapped slot.
+            pending || entry.in_use()
         });
         removed
     }
@@ -229,13 +409,13 @@ impl BackendSessionStore {
     /// Number of retained mappings.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.lock().len()
+        self.lock().entries.len()
     }
 
     /// Lock the map, recovering from a poisoned lock: entries stay valid
     /// because every mutation completes before any fallible step.
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<BackendSessionKey, Entry>> {
-        self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -274,9 +454,10 @@ mod tests {
         }
     }
 
-    fn bound(session: &str) -> BoundSession {
+    fn bound_with(session: &str, credential: u8) -> BoundSession {
         BoundSession {
-            credential: [0; SHA256_LEN],
+            credential: [credential; SHA256_LEN],
+            credentials: HeaderMap::new(),
             init: BackendInit {
                 protocol_version: Box::from("2025-06-18"),
                 session_id: Some(HeaderValue::from_str(session).unwrap()),
@@ -285,11 +466,37 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn same_key_returns_same_slot() {
+    fn bound(session: &str) -> BoundSession {
+        bound_with(session, 0)
+    }
+
+    fn set(slot: &SessionSlot, session: BoundSession) {
+        slot.lock_state().bound = Some(session);
+    }
+
+    fn current_id(slot: &SessionSlot) -> Option<String> {
+        slot.lock_state()
+            .bound
+            .as_ref()
+            .and_then(|bound| bound.init.session_id.as_ref())
+            .map(|id| id.to_str().unwrap().to_owned())
+    }
+
+    fn retired_ids(store: &BackendSessionStore) -> Vec<String> {
+        let mut ids: Vec<String> = store
+            .take_retired()
+            .into_iter()
+            .map(|retired| retired.session.init.session_id.unwrap().to_str().unwrap().to_owned())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn same_key_returns_same_slot() {
         let store = BackendSessionStore::new(4, Duration::from_secs(60));
         let first = store.slot(&key("g", 0)).unwrap();
-        *first.state.lock().await = Some(bound("s"));
+        set(&first, bound("s"));
         let second = store.slot(&key("g", 0)).unwrap();
         assert!(Arc::ptr_eq(&first, &second), "same key must reuse the slot");
         assert!(
@@ -299,14 +506,24 @@ mod tests {
     }
 
     #[test]
-    fn idle_entry_is_replaced() {
+    fn idle_entry_is_replaced_and_retired() {
         let store = BackendSessionStore::new(4, Duration::from_secs(10));
         let start = Instant::now();
-        let first = Arc::downgrade(&store.slot_at(&key("g", 0), start).unwrap());
+        set(&store.slot_at(&key("g", 0), start).unwrap(), bound("old"));
         let later = store.slot_at(&key("g", 0), start + Duration::from_secs(11)).unwrap();
-        assert!(first.upgrade().is_none(), "idle entry must be replaced");
-        assert!(later.state.try_lock().unwrap().is_none(), "replacement must be fresh");
+        assert!(current_id(&later).is_none(), "replacement must be fresh");
         assert_eq!(store.len(), 1, "replacement must not grow the map");
+        assert_eq!(retired_ids(&store), ["old"], "the expired session must be retired");
+    }
+
+    #[test]
+    fn idle_sweep_retires_untouched_entries() {
+        let store = BackendSessionStore::new(4, Duration::from_secs(10));
+        let start = Instant::now();
+        set(&store.slot_at(&key("a", 0), start).unwrap(), bound("a"));
+        store.slot_at(&key("b", 0), start + Duration::from_secs(21));
+        assert_eq!(store.len(), 1, "an idle entry must be swept without a lookup");
+        assert_eq!(retired_ids(&store), ["a"], "the swept session must be retired");
     }
 
     #[test]
@@ -340,39 +557,30 @@ mod tests {
     }
 
     #[test]
-    fn full_store_evicts_least_recently_used() {
+    fn full_store_evicts_least_recently_used_and_retires_it() {
         let store = BackendSessionStore::new(2, Duration::from_secs(60));
         let start = Instant::now();
-        let a = Arc::downgrade(&store.slot_at(&key("a", 0), start).unwrap());
-        store.slot_at(&key("b", 0), start + Duration::from_secs(1));
+        set(&store.slot_at(&key("a", 0), start).unwrap(), bound("a"));
+        set(
+            &store.slot_at(&key("b", 0), start + Duration::from_secs(1)).unwrap(),
+            bound("b"),
+        );
         store.slot_at(&key("a", 0), start + Duration::from_secs(2));
         store.slot_at(&key("c", 0), start + Duration::from_secs(3));
 
         assert_eq!(store.len(), 2, "store must stay at capacity");
-        assert!(
-            Arc::ptr_eq(
-                &a.upgrade().unwrap(),
-                &store.slot_at(&key("a", 0), start + Duration::from_secs(4)).unwrap()
-            ),
+        assert_eq!(
+            current_id(&store.slot_at(&key("a", 0), start + Duration::from_secs(4)).unwrap()).as_deref(),
+            Some("a"),
             "recently used entry must survive"
         );
-        assert_eq!(store.len(), 2, "lookup of a survivor must not grow the map");
+        assert_eq!(retired_ids(&store), ["b"], "the evicted session must be retired");
     }
 
     #[test]
-    fn full_store_purges_idle_entries_first() {
-        let store = BackendSessionStore::new(2, Duration::from_secs(5));
-        let start = Instant::now();
-        store.slot_at(&key("a", 0), start);
-        store.slot_at(&key("b", 0), start);
-        store.slot_at(&key("c", 0), start + Duration::from_secs(10));
-        assert_eq!(store.len(), 1, "idle entries must be purged before insert");
-    }
-
-    #[tokio::test]
-    async fn invalidate_requires_matching_session() {
+    fn invalidate_requires_matching_session() {
         let store = BackendSessionStore::new(4, Duration::from_secs(60));
-        *store.slot(&key("g", 0)).unwrap().state.lock().await = Some(bound("current"));
+        set(&store.slot(&key("g", 0)).unwrap(), bound("current"));
 
         assert!(
             !store.invalidate(&key("g", 0), &HeaderValue::from_static("stale")),
@@ -386,17 +594,17 @@ mod tests {
         assert_eq!(store.len(), 0, "an unheld mapping must be removed");
     }
 
-    #[tokio::test]
-    async fn invalidate_keeps_held_slot_mapped() {
+    #[test]
+    fn invalidate_keeps_held_slot_mapped() {
         let store = BackendSessionStore::new(4, Duration::from_secs(60));
         let held = store.slot(&key("g", 0)).unwrap();
-        *held.state.lock().await = Some(bound("s"));
+        set(&held, bound("s"));
 
         assert!(
             store.invalidate(&key("g", 0), &HeaderValue::from_static("s")),
             "matching session must invalidate"
         );
-        assert!(held.state.lock().await.is_none(), "the session must be cleared");
+        assert!(current_id(&held).is_none(), "the session must be cleared");
         assert!(
             Arc::ptr_eq(&held, &store.slot(&key("g", 0)).unwrap()),
             "a held slot must stay mapped so the next handshake is shared"
@@ -404,43 +612,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidate_skips_busy_slot() {
+    async fn invalidate_applies_during_a_handshake() {
         let store = BackendSessionStore::new(4, Duration::from_secs(60));
         let slot = store.slot(&key("g", 0)).unwrap();
-        let mut guard = slot.state.lock().await;
-        *guard = Some(bound("s"));
+        set(&slot, bound_with("old", 0));
+        let permit = slot.handshake_permit().await;
+        slot.begin([1; SHA256_LEN]);
+
         assert!(
-            !store.invalidate(&key("g", 0), &HeaderValue::from_static("s")),
-            "a slot mid-handshake must not be invalidated"
+            store.invalidate(&key("g", 0), &HeaderValue::from_static("old")),
+            "a rejected session must be dropped while another handshake runs"
         );
-        drop(guard);
+        slot.abort();
+        drop(permit);
+        assert!(
+            slot.current(&[0; SHA256_LEN]).is_none(),
+            "a failed replacement must not resurrect the rejected session"
+        );
     }
 
-    #[tokio::test]
-    async fn remove_gateway_returns_initialized_sessions() {
+    #[test]
+    fn publish_returns_session_of_other_credentials() {
+        let slot = SessionSlot::default();
+        set(&slot, bound_with("alice", 0));
+        slot.begin([1; SHA256_LEN]);
+        let outcome = slot.publish(bound_with("bob", 1));
+        assert!(
+            matches!(
+                &outcome,
+                Publish::Published(Some(replaced))
+                    if replaced.init.session_id.as_ref().is_some_and(|id| id == "alice")
+            ),
+            "the replaced session must be handed back for termination: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn remove_gateway_returns_initialized_sessions() {
         let store = BackendSessionStore::new(8, Duration::from_secs(60));
-        *store.slot(&key("g", 0)).unwrap().state.lock().await = Some(bound("s0"));
-        *store.slot(&key("g", 1)).unwrap().state.lock().await = Some(bound("s1"));
+        set(&store.slot(&key("g", 0)).unwrap(), bound("s0"));
+        set(&store.slot(&key("g", 1)).unwrap(), bound("s1"));
         store.slot(&key("g", 2)).unwrap();
-        *store.slot(&key("other", 0)).unwrap().state.lock().await = Some(bound("o"));
+        set(&store.slot(&key("other", 0)).unwrap(), bound("o"));
 
         let mut removed = store.remove_gateway("g", &[0; SHA256_LEN]);
-        removed.sort_by_key(|(server, _)| *server);
+        removed.sort_by_key(|retired| retired.server);
 
         assert_eq!(removed.len(), 2, "only initialized sessions are returned");
-        assert_eq!(removed[0].0, 0, "server index must be reported");
+        assert_eq!(removed[0].server, 0, "server index must be reported");
         assert_eq!(store.len(), 2, "other gateway sessions and empty slots remain");
     }
 
-    #[tokio::test]
-    async fn remove_gateway_keeps_sessions_of_other_credentials() {
+    #[test]
+    fn remove_gateway_keeps_sessions_of_other_credentials() {
         let store = BackendSessionStore::new(8, Duration::from_secs(60));
-        *store.slot(&key("g", 0)).unwrap().state.lock().await = Some(bound("s0"));
+        set(&store.slot(&key("g", 0)).unwrap(), bound("s0"));
 
         let removed = store.remove_gateway("g", &[1; SHA256_LEN]);
 
         assert!(removed.is_empty(), "another credential must not remove the session");
         assert_eq!(store.len(), 1, "the mapping must remain");
+    }
+
+    #[tokio::test]
+    async fn remove_gateway_cancels_a_handshake_in_flight() {
+        let store = BackendSessionStore::new(8, Duration::from_secs(60));
+        let slot = store.slot(&key("g", 0)).unwrap();
+        let permit = slot.handshake_permit().await;
+        slot.begin([0; SHA256_LEN]);
+
+        assert!(
+            store.remove_gateway("g", &[1; SHA256_LEN]).is_empty(),
+            "nothing is published yet"
+        );
+        assert!(
+            matches!(slot.publish(bound_with("other", 0)), Publish::Published(None)),
+            "another credential's DELETE must not cancel the handshake"
+        );
+
+        slot.begin([0; SHA256_LEN]);
+        store.remove_gateway("g", &[0; SHA256_LEN]);
+        let outcome = slot.publish(bound_with("late", 0));
+        drop(permit);
+        assert!(
+            matches!(outcome, Publish::Cancelled(_)),
+            "a handshake the same caller deleted must not be published"
+        );
     }
 
     #[test]
