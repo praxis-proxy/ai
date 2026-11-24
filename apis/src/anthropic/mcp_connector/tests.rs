@@ -160,12 +160,13 @@ fn resolved_state() -> ConnectorState {
         &mut tool_map,
     );
     ConnectorState {
-        tool_map,
+        owner: None,
+        tool_map: index_resolved_tools(tool_map),
         admission: McpAdmissionDecisions::default(),
         has_connector: false,
         earlier: Vec::new(),
         usage: RoundUsage::default(),
-        pending: false,
+        pending: None,
     }
 }
 
@@ -595,7 +596,7 @@ fn retained_bytes_cover_both_representations() {
 #[test]
 fn only_tool_use_rounds_with_mcp_calls_loop() {
     let state = resolved_state();
-    let index = McpToolIndex::new(&state.tool_map);
+    let index = McpToolIndex::Resolved(&state.tool_map);
     let round = |stop: &str, name: &str| {
         json!({"type": "message", "role": "assistant", "stop_reason": stop,
                "content": [{"type": "tool_use", "id": "t", "name": name, "input": {}}]})
@@ -621,7 +622,7 @@ fn only_tool_use_rounds_with_mcp_calls_loop() {
 #[test]
 fn client_content_inlines_results_after_each_mcp_call() {
     let state = resolved_state();
-    let index = McpToolIndex::new(&state.tool_map);
+    let index = McpToolIndex::Resolved(&state.tool_map);
     let content = vec![
         json!({"type": "text", "text": "checking"}),
         json!({"type": "tool_use", "id": "t1", "name": "weather__get_weather", "input": {"city": "Paris"}}),
@@ -740,22 +741,31 @@ async fn unconfigured_server_is_rejected_before_dialing() {
 }
 
 #[tokio::test]
-async fn streaming_connector_requests_are_rejected() {
-    let filter = filter_for("https://mcp.example.com/mcp", "");
+async fn streaming_connector_resolves_and_delivers_message_start_before_eof() {
+    let (url, ct) = start_weather_server().await;
+    let filter = filter_for(&url, "");
     let request = make_request(http::Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&request);
-    let mut body = connector_body(
-        "https://mcp.example.com/mcp",
-        json!({"type": "mcp_toolset", "mcp_server_name": "weather"}),
-    );
+    ctx.current_filter_id = Some(0);
+    let mut body = connector_body(&url, json!({"type":"mcp_toolset","mcp_server_name":"weather"}));
     body["stream"] = Value::Bool(true);
     let mut body = Some(Bytes::from(serde_json::to_vec(&body).unwrap()));
-
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-
-    let (status, error) = rejection_body(&action);
-    assert_eq!(status, 400);
-    assert!(error["error"]["message"].as_str().unwrap().contains("streaming"));
+    ct.cancel();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.subrequest_response_mode(), SubRequestResponseMode::Streaming);
+    let mut chunk = Some(Bytes::from_static(
+        b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n",
+    ));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        std::str::from_utf8(&chunk.unwrap())
+            .unwrap()
+            .contains("event: message_start")
+    );
 }
 
 #[tokio::test]
@@ -868,7 +878,10 @@ fn mcp_round_publishes_loop_and_marks_pending() {
             .and_then(|results| results.get("action")),
         Some("loop")
     );
-    assert!(ctx.extensions.get::<ConnectorState>().unwrap().pending);
+    assert!(matches!(
+        ctx.extensions.get::<ConnectorState>().unwrap().pending,
+        Some(PendingRound::Buffered)
+    ));
 }
 
 #[test]
@@ -953,4 +966,111 @@ async fn authorization_token_never_reaches_logs() {
     ct.cancel();
 
     assert!(!logs.contains("SECRET-TOKEN-MARKER"), "the token leaked into logs");
+}
+
+#[test]
+fn stream_state_is_instance_local_and_released_after_a_terminal_error() {
+    let filter = filter_for("https://mcp.example.com/mcp", "");
+    let request = make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    ctx.extensions.insert(resolved_state());
+    apply_transport(&mut ctx, true);
+    ctx.current_filter_id = Some(3);
+    ctx.insert_filter_state(streaming::StreamRound::new(128));
+    let prefix = Bytes::from_static(b"data: {\"type\":\"mes");
+    let mut body = Some(prefix.clone());
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(body.is_none());
+    // A different connector instance in the same context never reads the prefix.
+    ctx.current_filter_id = Some(4);
+    body = Some(prefix.clone());
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(body, Some(prefix));
+    ctx.current_filter_id = Some(3);
+    body = Some(Bytes::from_static(b"sage_start\",\"message\":{\"id\":\"msg_1\"}}\n\n"));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        std::str::from_utf8(body.as_ref().unwrap())
+            .unwrap()
+            .starts_with("event: message_start")
+    );
+    body = Some(Bytes::from(vec![b'x'; 129]));
+    assert!(filter.on_response_body(&mut ctx, &mut body, false).is_err());
+    // The router cancels the upstream before running the final callback.
+    body = None;
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        std::str::from_utf8(body.as_ref().unwrap())
+            .unwrap()
+            .starts_with("event: error")
+    );
+    assert!(ctx.get_filter_state::<streaming::StreamRound>().is_none());
+}
+
+#[test]
+fn fragmented_tool_input_allocation_scales_with_event_size() {
+    use crate::anthropic::tool_stream::{BlockPresentation, MessagesStream};
+    let allocated = |size| {
+        let argument = "é".repeat(size);
+        let start = json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"weather__get_weather","input":{}}});
+        let delta = json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json": serde_json::to_string(&json!({"city":argument})).unwrap()}});
+        let wire = format!(
+            "data: {{\"type\":\"message_start\",\"message\":{{}}}}\r\n\r\ndata: {start}\r\n\r\ndata: {delta}\r\n\r\n"
+        );
+        allocation_counter::measure(|| {
+            let mut stream = MessagesStream::new(1 << 20, 1 << 20);
+            let mut output = Vec::new();
+            for chunk in wire.as_bytes().chunks(17) {
+                stream
+                    .write_chunk(chunk, false, &mut output, |_| BlockPresentation::Forward)
+                    .unwrap();
+            }
+            assert!(std::str::from_utf8(&output).unwrap().contains(&argument));
+        })
+        .bytes_total
+    };
+    let small = allocated(2048);
+    let large = allocated(8192);
+    assert!(
+        large < 5 * small,
+        "fourfold input grew allocations from {small} to {large}"
+    );
+}
+
+#[test]
+fn model_replay_preserves_initial_text_and_streamed_citations() {
+    use crate::anthropic::tool_stream::{BlockPresentation, MessagesStream};
+    let mut stream = MessagesStream::new(8192, 8192);
+    let citation = json!({"type":"char_location","cited_text":"Paris","start_char_index":0,"end_char_index":5});
+    for frame in [
+        json!({"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant"}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"First"}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" second"}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"citations_delta","citation":citation}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+        json!({"type":"message_stop"}),
+    ] {
+        stream
+            .write_chunk(format!("data: {frame}\n\n").as_bytes(), false, &mut Vec::new(), |_| {
+                BlockPresentation::Forward
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        stream.reconstruct_message().unwrap()["content"][0],
+        json!({"type":"text","text":"First second","citations":[citation]})
+    );
 }

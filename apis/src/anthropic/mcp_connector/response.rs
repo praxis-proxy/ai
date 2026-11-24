@@ -116,6 +116,20 @@ pub(super) fn is_mcp_owned(name: &str, index: &McpToolIndex<'_>, admission: &Mcp
     index.contains(name) || admission.is_denied_encoded(name)
 }
 
+/// Resolve the client-visible server and tool name for an owned model call.
+pub(super) fn mcp_names<'a>(
+    name: &'a str,
+    index: &McpToolIndex<'a>,
+    admission: &McpAdmissionDecisions,
+) -> Option<(&'a str, &'a str)> {
+    match index.get(name) {
+        Some(McpToolMatch::Unique { key, .. }) => Some((&key.0, &key.1)),
+        Some(McpToolMatch::Ambiguous { .. }) => Some(("unknown", name)),
+        None if admission.is_denied_encoded(name) => Some(("unknown", name)),
+        None => None,
+    }
+}
+
 /// Whether a buffered round must re-enter inference to run MCP calls.
 ///
 /// A round loops when it is an assistant message that stopped for tool use
@@ -173,7 +187,6 @@ pub(super) fn has_client_tool_use(
 /// Every MCP `tool_use` becomes an `mcp_tool_use` with its original tool and
 /// server name, immediately followed by its `mcp_tool_result`. Other blocks,
 /// including client tool calls, are kept in order.
-#[expect(clippy::too_many_lines, reason = "one ordered pass over the round content")]
 pub(super) fn client_content(
     content: &[Value],
     index: &McpToolIndex<'_>,
@@ -189,16 +202,12 @@ pub(super) fn client_content(
         let owned_name = (block.get("type").and_then(Value::as_str) == Some("tool_use"))
             .then(|| block.get("name").and_then(Value::as_str))
             .flatten()
-            .filter(|name| is_mcp_owned(name, index, admission));
-        let Some(encoded_name) = owned_name else {
+            .and_then(|name| mcp_names(name, index, admission));
+        let Some((server_name, tool_name)) = owned_name else {
             blocks.push(block.clone());
             continue;
         };
         let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
-        let (server_name, tool_name) = match index.get(encoded_name) {
-            Some(McpToolMatch::Unique { key, .. }) => (key.0.as_str(), key.1.as_str()),
-            _ => ("unknown", encoded_name),
-        };
         blocks.push(json!({
             "type": MCP_TOOL_USE_TYPE,
             "id": id,

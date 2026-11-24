@@ -39,6 +39,16 @@ fn load_config(
     chat_port: u16,
     mcp: &McpMockServerGuard,
 ) -> praxis_core::config::Config {
+    load_config_with(proxy_port, native_port, chat_port, mcp, |yaml| yaml)
+}
+
+fn load_config_with(
+    proxy_port: u16,
+    native_port: u16,
+    chat_port: u16,
+    mcp: &McpMockServerGuard,
+    configure: impl FnOnce(String) -> String,
+) -> praxis_core::config::Config {
     let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("read mcp-connector example");
     let yaml = patch_yaml(
         &yaml,
@@ -48,7 +58,7 @@ fn load_config(
     let yaml = yaml.replace("http://127.0.0.1:9100/mcp", &format!("http://{}/mcp", mcp.endpoint()));
     // Secret-bearing filters resolve at build time; use a Cargo-provided var.
     let yaml = yaml.replace("env_var: VLLM_API_KEY", "env_var: CARGO_PKG_NAME");
-    praxis_core::config::Config::from_yaml(&yaml).expect("parse mcp-connector example")
+    praxis_core::config::Config::from_yaml(&configure(yaml)).expect("parse mcp-connector example")
 }
 
 /// A client request declaring the mock server through the MCP connector.
@@ -161,6 +171,37 @@ fn assert_mcp_blocks(response: &Value) {
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
+
+#[test]
+fn pending_round_can_resume_at_a_different_filter_index() {
+    let mcp = start_weather_mcp();
+    let backend = StatefulCapturingBackend::new(vec![(200, native_tool_round()), (200, native_answer_round())])
+        .start_with_shutdown();
+    let config = load_config_with(free_port(), backend.port(), free_port(), &mcp, |yaml| {
+        let (steps, tail) = yaml.split_once("\ninsecure_options:").unwrap();
+        let (_, filters) = steps.split_once("          - name: inference\n").unwrap();
+        let resumed = filters.replacen(
+            "            filters:\n",
+            "            filters:\n              - filter: headers\n                request_set:\n                  - {name: x-inference-step, value: resumed}\n",
+            1,
+        );
+        format!(
+            "{}          - name: continuation\n{resumed}\ninsecure_options:{tail}",
+            steps.replace("next: inference", "next: continuation")
+        )
+    });
+    let proxy = start_proxy(&config);
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/messages", &connector_request(NATIVE_MODEL, &mcp)),
+    );
+    assert_eq!(parse_status(&raw), 200, "{raw}");
+    assert_mcp_blocks(&serde_json::from_str(&parse_body(&raw)).unwrap());
+    assert_eq!(mcp.tool_call_count("get_weather"), 1);
+    let requests = backend.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].headers.to_lowercase().contains("x-inference-step: resumed"));
+}
 
 #[test]
 fn native_route_runs_mcp_tools_and_returns_mcp_blocks() {
@@ -319,19 +360,216 @@ fn unconfigured_server_is_rejected_before_inference() {
     assert_eq!(mcp.method_count("tools/list"), 0, "no MCP server is dialed");
 }
 
+/// The recorded model round is replayed on both sides of the Chat translator.
+/// This extends the single-exchange fixture through a real MCP call and re-entry.
+fn fixture_frames(side: &str) -> Vec<Value> {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../fixtures/inference/recordings/synthetic/messages/mcp-model-tool-stream.json"
+    ))
+    .unwrap();
+    fixture["turns"][0][side]["response"]["body"]["frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|frame| serde_json::from_str(frame["data"].as_str().unwrap()).unwrap())
+        .collect()
+}
+
+fn event_stream(frames: &[Value]) -> String {
+    frames.iter().map(|frame| format!("data: {frame}\n\n")).collect()
+}
+
+fn fixture_round(side: &str) -> String {
+    let mut stream = event_stream(&fixture_frames(side));
+    if side == "upstream" {
+        stream.push_str("data: [DONE]\n\n");
+    }
+    stream
+}
+
+fn stream_request(model: &str, mcp: &McpMockServerGuard) -> String {
+    let mut request: Value = serde_json::from_str(&connector_request(model, mcp)).unwrap();
+    request["stream"] = Value::Bool(true);
+    request.to_string()
+}
+
+fn stream_events(raw: &str) -> Vec<Value> {
+    assert_eq!(parse_status(raw), 200, "{raw}");
+    parse_body(raw)
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect()
+}
+
+/// Records calls observed by the step's ordinary response-body pipeline.
+struct CallObserver {
+    observed: std::sync::mpsc::Sender<()>,
+    reject: bool,
+}
+
+#[async_trait::async_trait]
+impl praxis_filter::HttpFilter for CallObserver {
+    fn name(&self) -> &'static str {
+        "test_mcp_call_observer"
+    }
+
+    fn response_body_access(&self) -> praxis_filter::BodyAccess {
+        praxis_filter::BodyAccess::ReadOnly(praxis_filter::BodyRequirement::Optional)
+    }
+
+    async fn on_request(
+        &self,
+        _ctx: &mut praxis_filter::HttpFilterContext<'_>,
+    ) -> Result<praxis_filter::FilterAction, praxis_filter::FilterError> {
+        Ok(praxis_filter::FilterAction::Continue)
+    }
+
+    fn on_response_body(
+        &self,
+        _ctx: &mut praxis_filter::HttpFilterContext<'_>,
+        body: &mut Option<bytes::Bytes>,
+        _eof: bool,
+    ) -> Result<praxis_filter::FilterAction, praxis_filter::FilterError> {
+        if let Some(bytes) = body
+            && std::str::from_utf8(bytes)?.contains("\"mcp_tool_use\"")
+        {
+            self.observed.send(())?;
+            if self.reject {
+                return Err("test observer stopped the managed call".into());
+            }
+        }
+        Ok(praxis_filter::FilterAction::Continue)
+    }
+}
+
 #[test]
-fn streaming_connector_request_is_rejected() {
+fn step_body_observer_sees_tool_frames_coalesced_with_stop() {
+    assert_observed_handoff(false);
+}
+
+#[test]
+fn rejected_call_chunk_stops_before_mcp_dispatch() {
+    assert_observed_handoff(true);
+}
+
+fn assert_observed_handoff(reject: bool) {
     let mcp = start_weather_mcp();
-    let native = StatefulCapturingBackend::new(vec![(200, native_answer_round())]).start_with_shutdown();
-    let proxy = start_proxy(&load_config(free_port(), native.port(), free_port(), &mcp));
-    let mut body: Value = serde_json::from_str(&connector_request(NATIVE_MODEL, &mcp)).expect("request JSON");
-    body["stream"] = Value::Bool(true);
+    let backend = StatefulCapturingBackend::new(vec![(200, fixture_round("client")), (503, "{}".to_owned())])
+        .start_with_shutdown();
+    let config = load_config_with(free_port(), backend.port(), free_port(), &mcp, |yaml| {
+        yaml.replacen(
+            "              - filter: anthropic_mcp_connector",
+            "              - filter: test_mcp_call_observer\n              - filter: anthropic_mcp_connector",
+            1,
+        )
+    });
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut registry = praxis_ai::build_full_registry(&praxis_test_utils::test_subrequest_client());
+    registry
+        .register(
+            "test_mcp_call_observer",
+            praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |_| {
+                Ok(Box::new(CallObserver {
+                    observed: sender.clone(),
+                    reject,
+                }))
+            })),
+        )
+        .unwrap();
+    let proxy = praxis_test_utils::start_proxy_with_registry(&config, &registry);
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/messages", &stream_request(NATIVE_MODEL, &mcp)),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "the model has already opened the streamed response"
+    );
+    assert_eq!(
+        mcp.tool_call_count("get_weather"),
+        usize::from(!reject),
+        "only a call accepted by the step observer may execute"
+    );
+    assert_eq!(
+        receiver.try_iter().count(),
+        1,
+        "the step observer sees the managed call once"
+    );
+}
 
-    let raw = http_send(proxy.addr(), &json_post("/v1/messages", &body.to_string()));
-
-    assert_eq!(parse_status(&raw), 400, "{raw}");
-    assert!(parse_body(&raw).contains("streaming"));
-    assert!(native.requests().is_empty());
+#[test]
+fn translated_and_native_streams_compose_tool_results_and_final_text() {
+    for (model, side) in [(CHAT_MODEL, "upstream"), (NATIVE_MODEL, "client")] {
+        let mcp = start_weather_mcp();
+        let answer = if model == CHAT_MODEL {
+            format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({
+                    "id":"chatcmpl_final","model":model,"choices":[{"index":0,"delta":{"content":"Sunny."},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":20,"completion_tokens":7,"total_tokens":27}
+                })
+            )
+        } else {
+            [
+                json!({"type":"message_start","message":{"id":"msg_final","type":"message","role":"assistant","usage":{"input_tokens":20,"output_tokens":0}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Sunny."}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}),
+                json!({"type":"message_stop"}),
+            ].iter().map(|v|format!("data: {v}\n\n")).collect()
+        };
+        let backend =
+            StatefulCapturingBackend::new(vec![(200, fixture_round(side)), (200, answer)]).start_with_shutdown();
+        let proxy = start_proxy(&load_config(free_port(), backend.port(), backend.port(), &mcp));
+        let raw = http_send(proxy.addr(), &json_post("/v1/messages", &stream_request(model, &mcp)));
+        let events = stream_events(&raw);
+        let types: Vec<_> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ],
+            "{model}: {events:?}"
+        );
+        assert_eq!(events[1]["content_block"]["type"], "mcp_tool_use");
+        assert_eq!(events[1]["content_block"]["server_name"], "weather");
+        assert_eq!(events[1]["content_block"]["name"], "get_weather");
+        assert_eq!(events[5]["index"], 1);
+        assert_eq!(events[5]["content_block"]["type"], "mcp_tool_result");
+        assert_eq!(
+            events[5]["content_block"]["tool_use_id"],
+            events[1]["content_block"]["id"]
+        );
+        assert_eq!(
+            events[5]["content_block"]["content"][0]["text"],
+            "mock result for get_weather"
+        );
+        assert_eq!(events[8]["index"], 2);
+        assert_eq!(events[8]["delta"]["text"], "Sunny.");
+        assert_eq!(events[10]["delta"]["stop_reason"], "end_turn");
+        assert_eq!(events[10]["usage"]["input_tokens"], 30);
+        assert_eq!(events[10]["usage"]["output_tokens"], 12);
+        assert_eq!(mcp.tool_call_count("get_weather"), 1);
+        let requests = backend.requests();
+        assert_eq!(requests.len(), 2);
+        let resumed: Value = serde_json::from_str(&requests[1].body).unwrap();
+        assert_eq!(resumed["stream"], true);
+        assert!(resumed["messages"].to_string().contains("mock result for get_weather"));
+    }
 }
 
 #[test]
@@ -392,4 +630,235 @@ fn mixed_round_runs_mcp_calls_and_returns_client_tool_calls() {
     );
     assert_eq!(mcp.tool_call_count("get_weather"), 1);
     assert_eq!(native.requests().len(), 1, "no second inference round");
+}
+
+#[test]
+fn mixed_stream_returns_mcp_results_and_leaves_the_client_tool_open_for_the_caller() {
+    let mcp = start_weather_mcp();
+    let mut round = fixture_frames("client");
+    let before_delta = round.iter().position(|event| event["type"] == "message_delta").unwrap();
+    round.splice(before_delta..before_delta, [
+        json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","name":"local","id":"toolu_local","input":{}}}),
+        json!({"type":"content_block_stop","index":1}),
+    ]);
+    let backend = StatefulCapturingBackend::new(vec![(200, event_stream(&round))]).start_with_shutdown();
+    let proxy = start_proxy(&load_config(free_port(), backend.port(), free_port(), &mcp));
+    let mut request: Value = serde_json::from_str(&stream_request(NATIVE_MODEL, &mcp)).unwrap();
+    request["tools"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"local","input_schema":{"type":"object"}}));
+
+    let events = stream_events(&http_send(
+        proxy.addr(),
+        &json_post("/v1/messages", &request.to_string()),
+    ));
+    let blocks: Vec<_> = events.iter().filter_map(|e| e.get("content_block")).collect();
+    assert_eq!(
+        blocks.iter().map(|b| b["type"].as_str().unwrap()).collect::<Vec<_>>(),
+        ["mcp_tool_use", "tool_use", "mcp_tool_result"]
+    );
+    assert_eq!(blocks[1]["id"], "toolu_local");
+    assert_eq!(blocks[2]["tool_use_id"], blocks[0]["id"]);
+    assert_eq!(events[events.len() - 2]["delta"]["stop_reason"], "tool_use");
+    assert_eq!(events.last().unwrap()["type"], "message_stop");
+    assert_eq!(mcp.tool_call_count("get_weather"), 1);
+    assert_eq!(backend.requests().len(), 1);
+}
+
+#[test]
+fn incomplete_calls_and_iteration_exhaustion_end_in_one_error_before_dispatch() {
+    let round = fixture_frames("client");
+    let mut missing_stop = round.clone();
+    assert_eq!(missing_stop.pop().unwrap()["type"], "message_stop");
+    let mut bad_input = round.clone();
+    bad_input[3]["delta"]["partial_json"] = json!("invalid");
+    for (source, limit, reason) in [
+        (missing_stop, 6, "ended before completion"),
+        (round, 1, "iteration or deadline"),
+        (bad_input, 6, "malformed"),
+    ] {
+        let mcp = start_weather_mcp();
+        let backend = StatefulCapturingBackend::new(vec![(200, event_stream(&source))]).start_with_shutdown();
+        let proxy = start_proxy(&load_config_with(
+            free_port(),
+            backend.port(),
+            free_port(),
+            &mcp,
+            |yaml| yaml.replace("max_iterations: 6", &format!("max_iterations: {limit}")),
+        ));
+        let events = stream_events(&http_send(
+            proxy.addr(),
+            &json_post("/v1/messages", &stream_request(NATIVE_MODEL, &mcp)),
+        ));
+        let error = events.last().unwrap();
+        assert_eq!(error["type"], "error", "{events:?}");
+        assert!(error["error"]["message"].as_str().unwrap().contains(reason));
+        assert_eq!(events.iter().filter(|e| e["type"] == "error").count(), 1);
+        assert!(events.iter().all(|e| e["type"] != "message_stop"));
+        assert_eq!(mcp.tool_call_count("get_weather"), 0);
+    }
+}
+
+#[test]
+fn resumed_http_failure_keeps_the_completed_result_and_emits_one_sse_error() {
+    let mcp = start_weather_mcp();
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, fixture_round("client")),
+        (503, r#"{"private":"backend marker"}"#.to_owned()),
+    ])
+    .start_with_shutdown();
+    let proxy = start_proxy(&load_config(free_port(), backend.port(), free_port(), &mcp));
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/messages", &stream_request(NATIVE_MODEL, &mcp)),
+    );
+    let events = stream_events(&raw);
+    assert_eq!(events.last().unwrap()["error"]["type"], "api_error");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["content_block"]["type"] == "mcp_tool_result")
+            .count(),
+        1
+    );
+    assert!(events.iter().all(|e| e["type"] != "message_stop"));
+    assert!(!raw.contains("backend marker"));
+    assert_eq!(mcp.tool_call_count("get_weather"), 1);
+}
+
+#[test]
+fn streamed_batch_over_result_budget_errors_before_any_tool_runs() {
+    let mut round = fixture_frames("client");
+    let second = json!({"type":"tool_use","name":"weather__get_weather","id":"toolu_second","input":{"city":"Lyon"}});
+    let before_delta = round.iter().position(|event| event["type"] == "message_delta").unwrap();
+    round.splice(
+        before_delta..before_delta,
+        [
+            json!({"type":"content_block_start","index":1,"content_block":second}),
+            json!({"type":"content_block_stop","index":1}),
+        ],
+    );
+    let mcp = start_weather_mcp();
+    let backend = StatefulCapturingBackend::new(vec![(200, event_stream(&round))]).start_with_shutdown();
+    let proxy = start_proxy(&load_config_with(
+        free_port(),
+        backend.port(),
+        free_port(),
+        &mcp,
+        |yaml| {
+            yaml.replace("timeout_ms: 30000", "timeout_ms: 30000\n                max_result_bytes: 1024\n                max_total_result_bytes: 1024")
+        },
+    ));
+    let events = stream_events(&http_send(
+        proxy.addr(),
+        &json_post("/v1/messages", &stream_request(NATIVE_MODEL, &mcp)),
+    ));
+    let error = events.last().unwrap();
+    assert_eq!(error["type"], "error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("tool results exceed")
+    );
+    assert_eq!(mcp.tool_call_count("get_weather"), 0);
+    assert_eq!(backend.requests().len(), 1);
+}
+
+#[test]
+fn token_limited_tool_input_stops_without_dispatch() {
+    let mut round = fixture_frames("client");
+    round[3]["delta"]["partial_json"] = json!("\"Pa");
+    round.iter_mut().find(|event| event["type"] == "message_delta").unwrap()["delta"]["stop_reason"] =
+        json!("max_tokens");
+    let mcp = start_weather_mcp();
+    let backend = StatefulCapturingBackend::new(vec![(200, event_stream(&round))]).start_with_shutdown();
+    let proxy = start_proxy(&load_config(free_port(), backend.port(), free_port(), &mcp));
+    let events = stream_events(&http_send(
+        proxy.addr(),
+        &json_post("/v1/messages", &stream_request(NATIVE_MODEL, &mcp)),
+    ));
+    assert_eq!(events[events.len() - 2]["delta"]["stop_reason"], "max_tokens");
+    assert_eq!(events.last().unwrap()["type"], "message_stop");
+    assert_eq!(mcp.tool_call_count("get_weather"), 0);
+}
+
+#[test]
+fn oversized_reentry_reports_the_executed_call_and_ends_with_an_error() {
+    let mcp = start_weather_mcp();
+    let backend = StatefulCapturingBackend::new(vec![(200, fixture_round("client"))]).start_with_shutdown();
+    let proxy = start_proxy(&load_config_with(
+        free_port(),
+        backend.port(),
+        free_port(),
+        &mcp,
+        |yaml| {
+            yaml.replace(
+                "timeout_ms: 30000",
+                "timeout_ms: 30000\n                max_body_bytes: 2048",
+            )
+        },
+    ));
+    let mut request: Value = serde_json::from_str(&stream_request(NATIVE_MODEL, &mcp)).unwrap();
+    request["messages"][0]["content"] = Value::from("x".repeat(1700));
+    let events = stream_events(&http_send(
+        proxy.addr(),
+        &json_post("/v1/messages", &request.to_string()),
+    ));
+    assert_eq!(mcp.tool_call_count("get_weather"), 1);
+    assert_eq!(backend.requests().len(), 1);
+    assert!(events.iter().any(|e| e["content_block"]["type"] == "mcp_tool_result"));
+    let last = events.last().unwrap();
+    assert_eq!(last["type"], "error");
+    assert!(
+        last["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("request body exceeds")
+    );
+}
+
+#[test]
+fn retained_round_over_router_budget_fails_before_dispatch() {
+    let mcp = start_weather_mcp();
+    let mut round = fixture_frames("client");
+    round[3]["delta"]["partial_json"] = json!(format!("\"{}\"}}", "a".repeat(8192)));
+    let backend = StatefulCapturingBackend::new(vec![(200, event_stream(&round))]).start_with_shutdown();
+    let proxy = start_proxy(&load_config_with(
+        free_port(),
+        backend.port(),
+        free_port(),
+        &mcp,
+        |yaml| yaml.replace("max_iterations: 6", "max_iterations: 6\n        max_state_bytes: 4096"),
+    ));
+    let events = stream_events(&http_send(
+        proxy.addr(),
+        &json_post("/v1/messages", &stream_request(NATIVE_MODEL, &mcp)),
+    ));
+    assert_eq!(events.last().unwrap()["type"], "error");
+    assert_eq!(events.iter().filter(|event| event["type"] == "error").count(), 1);
+    assert!(
+        events.last().unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("retained-state")
+    );
+    assert_eq!(mcp.tool_call_count("get_weather"), 0);
+    assert_eq!(backend.requests().len(), 1);
+}
+
+#[test]
+fn first_inference_connection_failure_returns_a_messages_http_error() {
+    let mcp = start_weather_mcp();
+    let proxy = start_proxy(&load_config(free_port(), free_port(), free_port(), &mcp));
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/messages", &stream_request(NATIVE_MODEL, &mcp)),
+    );
+    assert_eq!(parse_status(&raw), 502, "{raw}");
+    assert!(raw.to_ascii_lowercase().contains("content-type: application/json"));
+    let body: Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "api_error");
+    assert_eq!(mcp.tool_call_count("get_weather"), 0);
 }

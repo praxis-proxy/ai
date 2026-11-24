@@ -11,7 +11,7 @@ Place it first in the inference step of an `iterative_request_router`, so it rew
 
 On the first round it validates `mcp_servers` and `mcp_toolset` tools, lists each server's tools, keeps the ones the toolset enables, and replaces the connector with plain custom tools named `{server}__{tool}`. Replayed `mcp_tool_use` / `mcp_tool_result` history becomes ordinary tool turns. When the model calls MCP tools, the filter runs them and loops; the final response carries `mcp_tool_use` / `mcp_tool_result` blocks for every call.
 
-A client server is matched to an operator connector by URL. Unmatched URLs are rejected unless `allow_client_servers` is set. Streaming requests that use the connector are rejected for now.
+A client server is matched to an operator connector by URL. Unmatched URLs are rejected unless `allow_client_servers` is set. With `stream: true`, model blocks stream as they arrive. Executed calls produce `mcp_tool_result` blocks and the client receives one message lifecycle with usage summed across inference rounds.
 
 ## Configuration
 
@@ -31,7 +31,7 @@ A client server is matched to an operator connector by URL. Unmatched URLs are r
 | `timeout_ms` | integer | no | Timeout for one MCP `tools/list` or `tools/call`, in milliseconds. |
 | `max_servers` | integer | no | Maximum number of MCP servers one request may declare. |
 | `max_tools` | integer | no | Maximum number of tools accepted from one MCP server. |
-| `max_body_bytes` | integer | no | Maximum request and response body size buffered by the loop. |
+| `max_body_bytes` | integer | no | Maximum bytes per request or inference response, including streamed Messages events. |
 | `max_parallel_calls` | integer | no | Maximum number of MCP calls running at once. |
 | `max_result_bytes` | integer | no | Maximum bytes retained for one MCP result. |
 | `max_total_result_bytes` | integer | no | Maximum bytes retained for all results of one model round. |
