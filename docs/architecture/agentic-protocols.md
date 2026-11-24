@@ -134,9 +134,15 @@ generated outbound chain: the `mcp_broker_backend`
 selector, any `outbound_filters`, and a `load_balancer`
 that references each server cluster by name, so server
 clusters must be declared in top-level `clusters:`.
-Each exchange is bounded by `handshake_timeout_ms` and
-`max_response_bytes`; oversized or chunked replies are
-rejected before the full body is retained.
+Each reply is bounded by `max_response_bytes`; oversized
+or chunked replies are rejected before the full body is
+retained. `handshake_timeout_ms` is one budget for the
+whole handshake, not for each exchange: it starts before
+the broker waits on a concurrent handshake for the same
+pair, time `initialize` spends is no longer available to
+`notifications/initialized`, and a parent agent-loop
+deadline can shorten it. Each background session
+termination gets a fresh budget of the same length.
 
 A backend session exists only on the endpoint that
 issued it, so the broker records the endpoint the
@@ -183,8 +189,10 @@ The map is in memory, per filter instance, capped by
 `max_sessions` (least recently used entries are evicted)
 and expired after `idle_timeout_ms`. A mapping in use by
 an in-flight handshake or forwarded call is never
-evicted or expired until that request completes, so one
-pair cannot end up on two backend sessions; when every
+evicted or expired until that request completes. A
+credential change can still replace it, so a call that
+started earlier may finish on the replaced session while
+new calls use the new one. When every
 mapping is in use, a call for a new pair fails with
 `session_capacity`. Idle time counts from the end of the
 last call that used the mapping. Evicted, expired, and

@@ -37,6 +37,9 @@ struct MockBackend {
     initialized_error: Mutex<Option<McpBackendError>>,
     /// Delay applied to `initialize`.
     initialize_delay: Option<std::time::Duration>,
+    /// When set, `initialize` signals the first notify once it starts and
+    /// then waits for the second before completing.
+    initialize_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     /// Mint no session id (stateless backend).
     sessionless: bool,
     /// Version the backend negotiates instead of echoing the requested one.
@@ -78,6 +81,10 @@ impl McpBackendClient for MockBackend {
         self.record("initialize", target, format!("{protocol_version}|{auth}"));
         if let Some(delay) = self.initialize_delay {
             tokio::time::sleep(delay).await;
+        }
+        if let Some((started, proceed)) = &self.initialize_gate {
+            started.notify_one();
+            proceed.notified().await;
         }
         let scripted = self.initialize_error.lock().unwrap().clone();
         if let Some(error) = scripted {
@@ -554,13 +561,14 @@ async fn in_flight_call_keeps_its_slot_until_completion() {
         "a call still streaming must keep its slot after response headers"
     );
 
+    // The context stays alive: the completion hook alone must free the slot.
     filter.on_request_complete(&mut in_flight, 200);
-    drop(in_flight);
     let admitted = route(&filter, &call_request(Some("gw-2"), None), "weather_get_weather").await;
     assert!(
         matches!(admitted.action, FilterAction::Release),
         "a completed call must release its slot"
     );
+    drop(in_flight);
 }
 
 #[tokio::test]
@@ -618,16 +626,22 @@ async fn credential_change_terminates_replaced_session() {
 
 #[tokio::test]
 async fn delete_during_handshake_terminates_instead_of_publishing() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let proceed = Arc::new(tokio::sync::Notify::new());
     let mock = Arc::new(MockBackend {
-        initialize_delay: Some(std::time::Duration::from_millis(50)),
+        initialize_gate: Some((Arc::clone(&started), Arc::clone(&proceed))),
         ..MockBackend::default()
     });
     let filter = broker_with(Arc::clone(&mock));
     let req = call_request(Some("gw-1"), None);
 
+    // DELETE runs only once `initialize` has started, and `initialize` finishes
+    // only after DELETE has returned.
     let (routed, deleted) = tokio::join!(route(&filter, &req, "weather_get_weather"), async {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        delete(&filter, "gw-1", None).await
+        started.notified().await;
+        let deleted = delete(&filter, "gw-1", None).await;
+        proceed.notify_one();
+        deleted
     });
 
     assert!(
@@ -644,6 +658,8 @@ async fn delete_during_handshake_terminates_instead_of_publishing() {
         ["backend-1|"],
         "the session the racing handshake created must be terminated"
     );
+    // Let the next handshake through the gate.
+    proceed.notify_one();
     route(&filter, &req, "weather_get_weather").await;
     assert_eq!(mock.count("initialize"), 2, "nothing stale may remain mapped");
 }
@@ -713,11 +729,17 @@ async fn concurrent_first_calls_share_one_handshake() {
         1,
         "concurrent first calls must initialize once"
     );
-    assert_eq!(
-        header(&a, "mcp-session-id"),
-        header(&b, "mcp-session-id"),
-        "both calls share the session"
-    );
+    for routed in [&a, &b] {
+        assert!(
+            matches!(routed.action, FilterAction::Release),
+            "each concurrent call must be forwarded"
+        );
+        assert_eq!(
+            header(routed, "mcp-session-id"),
+            Some("backend-1"),
+            "each concurrent call must use the published session"
+        );
+    }
 }
 
 #[tokio::test]

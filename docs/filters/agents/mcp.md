@@ -39,7 +39,7 @@ Supports two protocol profiles: `current` (session-based, default) and `stateles
 | `backend_sessions` | object | no | Current-profile backend session management. Requires `protocol_profile: current`. |
 | `backend_sessions.forward_headers` | string[] | no | Request headers copied from the client request onto the handshake. |
 | `backend_sessions.idle_timeout_ms` | integer | no | Idle lifetime of one backend session mapping, in milliseconds. |
-| `backend_sessions.handshake_timeout_ms` | integer | no | Deadline for one handshake exchange, in milliseconds. |
+| `backend_sessions.handshake_timeout_ms` | integer | no | Budget for one whole handshake, in milliseconds: waiting for a concurrent handshake, `initialize`, and `notifications/initialized` share it, and a parent deadline can shorten it. |
 | `backend_sessions.max_sessions` | integer | no | Maximum retained backend session mappings. |
 | `backend_sessions.max_response_bytes` | integer | no | Response body ceiling for each handshake exchange, in bytes. |
 | `backend_sessions.outbound_filters` | FilterEntry[] | no | Extra filters run on each handshake subrequest before the broker's generated `load_balancer` (for example credential injection). |

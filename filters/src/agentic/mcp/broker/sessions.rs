@@ -262,7 +262,8 @@ impl BackendSessionStore {
         }
         if let Some(entry) = inner.entries.get_mut(key) {
             if self.reusable(entry, now) {
-                entry.last_used = now;
+                // Overlapping callers may sample the clock out of order.
+                entry.last_used = entry.last_used.max(now);
                 let slot = Arc::clone(&entry.slot);
                 drop(inner);
                 return Some(slot);
@@ -344,7 +345,7 @@ impl BackendSessionStore {
         if let Some(entry) = inner.entries.get_mut(key)
             && Arc::ptr_eq(&entry.slot, &slot)
         {
-            entry.last_used = now;
+            entry.last_used = entry.last_used.max(now);
         }
         // Dropped under the map lock, so eviction never sees the entry idle
         // with a stale timestamp.
@@ -581,6 +582,23 @@ mod tests {
             "a session released 5s ago must not count as idle"
         );
         assert!(retired_ids(&store).is_empty(), "nothing may be retired");
+    }
+
+    #[test]
+    fn out_of_order_release_keeps_the_later_time() {
+        let store = BackendSessionStore::new(4, Duration::from_secs(10));
+        let start = Instant::now();
+        let first = store.slot_at(&key("g", 0), start).unwrap();
+        let second = store.slot_at(&key("g", 0), start).unwrap();
+        set(&first, bound("live"));
+        store.release_at(&key("g", 0), second, start + Duration::from_secs(28));
+        store.release_at(&key("g", 0), first, start + Duration::from_secs(20));
+        let later = store.slot_at(&key("g", 0), start + Duration::from_secs(31)).unwrap();
+        assert_eq!(
+            current_id(&later).as_deref(),
+            Some("live"),
+            "an earlier release sample must not move the idle start backward"
+        );
     }
 
     #[test]

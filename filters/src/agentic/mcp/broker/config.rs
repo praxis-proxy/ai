@@ -142,7 +142,9 @@ pub(super) struct BackendSessionsConfig {
     /// Idle lifetime of one backend session mapping, in milliseconds.
     #[serde(default = "default_backend_idle_timeout_ms")]
     pub idle_timeout_ms: u64,
-    /// Deadline for one handshake exchange, in milliseconds.
+    /// Budget for one whole handshake, in milliseconds: waiting for a
+    /// concurrent handshake, `initialize`, and `notifications/initialized`
+    /// share it, and a parent deadline can shorten it.
     #[serde(default = "default_handshake_timeout_ms")]
     pub handshake_timeout_ms: u64,
     /// Maximum retained backend session mappings.

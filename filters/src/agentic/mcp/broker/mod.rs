@@ -856,7 +856,9 @@ impl HttpFilter for McpBrokerFilter {
         // Completion releases the call's slot. A call no backend answered
         // that ends in a proxy 502 or 504 could not reach its pinned endpoint
         // (refused, reset, TLS failure, or timed out), so the session it holds
-        // is unusable; local rejections keep it.
+        // is unusable; local rejections keep it. The mapping is invalidated
+        // before the slot is released, so no other call can pick up the dead
+        // session in between.
         let Some(ForwardedCall {
             answered,
             key,
@@ -867,19 +869,17 @@ impl HttpFilter for McpBrokerFilter {
         else {
             return;
         };
-        if let Some(backend) = self.backend.as_ref() {
-            backend.store.release(&key, slot);
-        }
-        if !answered
-            && matches!(status, 502 | 504)
-            && let Some(backend) = self.backend.as_ref()
-        {
+        let Some(backend) = self.backend.as_ref() else {
+            return;
+        };
+        if !answered && matches!(status, 502 | 504) {
             backend.invalidate_forwarded(
                 &key,
                 &session_id,
                 "mcp backend endpoint unreachable; mapping invalidated",
             );
         }
+        backend.store.release(&key, slot);
     }
 }
 

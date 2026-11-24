@@ -37,8 +37,6 @@ pub fn buffered_sse_event_data(body: &[u8]) -> Vec<Vec<u8>> {
 }
 
 #[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::indexing_slicing, reason = "tests")]
 mod buffered_tests {
     use super::buffered_sse_event_data;
 

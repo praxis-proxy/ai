@@ -36,8 +36,8 @@ use super::selector::BrokerBackendCluster;
 // Constants
 // -----------------------------------------------------------------------------
 
-/// JSON-RPC id the broker uses for its own backend `initialize`.
-const INITIALIZE_REQUEST_ID: &str = "praxis-broker-initialize";
+/// Prefix of the JSON-RPC id the broker uses for its own backend `initialize`.
+const INITIALIZE_REQUEST_ID_PREFIX: &str = "praxis-broker-initialize-";
 
 /// Client name the broker reports to backends.
 const CLIENT_NAME: &str = "praxis";
@@ -279,9 +279,10 @@ impl McpBackendClient for FilteredMcpBackendClient {
         protocol_version: &str,
         callout: &BackendCallout,
     ) -> Result<BackendInit, McpBackendError> {
-        let request = post_request(target, initialize_body(protocol_version), callout, None)?;
+        let request_id = initialize_request_id();
+        let request = post_request(target, initialize_body(&request_id, protocol_version), callout, None)?;
         let (response, endpoint) = self.exchange(target, request, callout, None).await?;
-        let mut init = parse_initialize_response(&response)?;
+        let mut init = parse_initialize_response(&response, &request_id)?;
         init.endpoint = endpoint;
         Ok(init)
     }
@@ -376,11 +377,20 @@ fn insert_protocol_version(headers: &mut HeaderMap, version: &str) -> Result<(),
     Ok(())
 }
 
+/// A fresh JSON-RPC id for one backend `initialize`.
+///
+/// Clients choose the ids of the calls the broker forwards on the same backend
+/// session, and MCP forbids reusing an id within a session. A random id keeps
+/// the broker's own request from colliding with any id a client picks.
+fn initialize_request_id() -> String {
+    format!("{INITIALIZE_REQUEST_ID_PREFIX}{:032x}", rand::random::<u128>())
+}
+
 /// Serialize the broker's backend `initialize` request.
-fn initialize_body(protocol_version: &str) -> Bytes {
+fn initialize_body(request_id: &str, protocol_version: &str) -> Bytes {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
-        "id": INITIALIZE_REQUEST_ID,
+        "id": request_id,
         "method": "initialize",
         "params": {
             "protocolVersion": protocol_version,
@@ -405,7 +415,10 @@ fn expect_success(status: u16) -> Result<(), McpBackendError> {
 }
 
 /// Validate an `initialize` reply delivered as JSON or a buffered SSE stream.
-pub(crate) fn parse_initialize_response(response: &SubResponse) -> Result<BackendInit, McpBackendError> {
+pub(crate) fn parse_initialize_response(
+    response: &SubResponse,
+    request_id: &str,
+) -> Result<BackendInit, McpBackendError> {
     expect_success(response.status)?;
     let session_id = backend_session_id(&response.headers)?;
     let is_sse = response
@@ -414,12 +427,12 @@ pub(crate) fn parse_initialize_response(response: &SubResponse) -> Result<Backen
         .and_then(|v| v.to_str().ok())
         .is_some_and(praxis_ai_apis::is_event_stream_content_type);
     let message = if is_sse {
-        find_sse_response(&response.body)?
+        find_sse_response(&response.body, request_id)?
     } else {
         serde_json::from_slice::<serde_json::Value>(&response.body)
             .map_err(|_e| McpBackendError::Malformed("initialize reply is not JSON"))?
     };
-    let protocol_version = initialize_result_version(&message)?;
+    let protocol_version = initialize_result_version(&message, request_id)?;
     Ok(BackendInit {
         protocol_version,
         session_id,
@@ -444,25 +457,25 @@ fn backend_session_id(headers: &HeaderMap) -> Result<Option<HeaderValue>, McpBac
 }
 
 /// Find the JSON-RPC reply to the broker's `initialize` in an SSE body.
-fn find_sse_response(body: &[u8]) -> Result<serde_json::Value, McpBackendError> {
+fn find_sse_response(body: &[u8], request_id: &str) -> Result<serde_json::Value, McpBackendError> {
     praxis_ai_apis::buffered_sse_event_data(body)
         .iter()
-        .find_map(|data| initialize_reply(data))
+        .find_map(|data| initialize_reply(data, request_id))
         .ok_or(McpBackendError::Malformed("initialize stream has no reply"))
 }
 
 /// Parse one SSE event payload when it answers the broker's `initialize`.
-fn initialize_reply(data: &[u8]) -> Option<serde_json::Value> {
+fn initialize_reply(data: &[u8], request_id: &str) -> Option<serde_json::Value> {
     let value: serde_json::Value = serde_json::from_slice(data).ok()?;
-    (value.get("id").and_then(serde_json::Value::as_str) == Some(INITIALIZE_REQUEST_ID)).then_some(value)
+    (value.get("id").and_then(serde_json::Value::as_str) == Some(request_id)).then_some(value)
 }
 
 /// Extract the negotiated version from an `initialize` JSON-RPC reply.
-fn initialize_result_version(message: &serde_json::Value) -> Result<Box<str>, McpBackendError> {
+fn initialize_result_version(message: &serde_json::Value, request_id: &str) -> Result<Box<str>, McpBackendError> {
     if message.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
         return Err(McpBackendError::Malformed("initialize reply is not JSON-RPC 2.0"));
     }
-    if message.get("id").and_then(serde_json::Value::as_str) != Some(INITIALIZE_REQUEST_ID) {
+    if message.get("id").and_then(serde_json::Value::as_str) != Some(request_id) {
         return Err(McpBackendError::Malformed("initialize reply id does not match"));
     }
     if let Some(error) = message.get("error") {
@@ -502,6 +515,13 @@ fn initialize_result_version(message: &serde_json::Value) -> Result<Box<str>, Mc
 )]
 mod tests {
     use super::*;
+
+    /// Request id the tests' `initialize` replies answer.
+    const INITIALIZE_REQUEST_ID: &str = "praxis-broker-initialize-test";
+
+    fn parse_initialize_response(response: &SubResponse) -> Result<BackendInit, McpBackendError> {
+        super::parse_initialize_response(response, INITIALIZE_REQUEST_ID)
+    }
 
     fn response(status: u16, content_type: &str, session: Option<&str>, body: &str) -> SubResponse {
         let mut headers = HeaderMap::new();
@@ -681,12 +701,33 @@ mod tests {
 
     #[test]
     fn initialize_body_is_valid_request() {
-        let body: serde_json::Value = serde_json::from_slice(&initialize_body("2025-06-18")).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&initialize_body("req-1", "2025-06-18")).unwrap();
         assert_eq!(body["method"], "initialize", "method must be initialize");
+        assert_eq!(body["id"], "req-1", "the request id must be sent");
         assert_eq!(body["params"]["protocolVersion"], "2025-06-18", "version must be sent");
         assert_eq!(
             body["params"]["clientInfo"]["name"], CLIENT_NAME,
             "client name must be sent"
+        );
+    }
+
+    #[test]
+    fn initialize_request_ids_are_unique() {
+        let first = initialize_request_id();
+        assert!(
+            first.starts_with(INITIALIZE_REQUEST_ID_PREFIX),
+            "the id must carry the broker prefix"
+        );
+        assert_ne!(first, initialize_request_id(), "each handshake must get its own id");
+    }
+
+    #[test]
+    fn reply_to_another_request_id_is_rejected() {
+        let body =
+            r#"{"jsonrpc":"2.0","id":"praxis-broker-initialize-other","result":{"protocolVersion":"2025-06-18"}}"#;
+        assert!(
+            parse_initialize_response(&response(200, "application/json", None, body)).is_err(),
+            "a reply must answer this handshake's own id"
         );
     }
 
