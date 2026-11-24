@@ -772,10 +772,10 @@
         {
           "feature": "cache-accounting",
           "label": "Prompt-cache token accounting",
-          "status": "dropped",
-          "note": "cachedContentTokenCount is discarded; no prompt_tokens_details.cached_tokens is emitted.",
-          "evidence": "apis/src/vertex/gemini/response.rs:521-534",
-          "blocker": "https://github.com/praxis-proxy/ai/issues/2051"
+          "status": "translated",
+          "note": "cachedContentTokenCount maps to prompt_tokens_details.cached_tokens on finite responses and on the trailing include_usage chunk. Both counts are subsets of the prompt total, so prompt_tokens is unchanged; the details object is omitted when Vertex reports no cached count.",
+          "evidence": "apis/src/vertex/gemini/response.rs:529-551; apis/src/vertex/gemini/response.rs:138-145; apis/src/vertex/gemini/response.rs:220-226; apis/src/vertex/gemini/response.rs:720-740",
+          "blocker": null
         },
         {
           "feature": "reasoning-content",
@@ -1342,11 +1342,11 @@
     }
   ],
   "status_totals": {
-    "dropped": 18,
+    "dropped": 17,
     "n-a": 10,
     "passthrough": 21,
     "rejected": 19,
-    "translated": 38,
+    "translated": 39,
     "translated-lossy": 24
   }
 }

@@ -248,6 +248,25 @@ def capture(args):
     write_json(args.output, report)
 
 
+def capture_codex(output):
+    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    cases = []
+    checkpoint = os.environ.get("CODEX_MODEL") or os.environ.get("VLLM_GPU_MODEL")
+    revision = os.environ.get("CODEX_MODEL_REVISION") or model_revision(os.environ.get("CONTAINER_RUNTIME", "docker"), checkpoint)
+    for name in ("CODEX_NATIVE", "CODEX_TRANSLATED", "CODEX_COMPACTION"):
+        case = {"id": name.lower(), "status": os.environ.get(name) or "unexecuted"}
+        evidence = read_json(os.environ.get(name + "_EVIDENCE"))
+        if isinstance(evidence, dict):
+            evidence.update(checkpoint=checkpoint, resolved_revision=revision,
+                            served_model=os.environ.get("CODEX_VLLM_MODEL"), image=os.environ.get("VLLM_GPU_IMAGE"),
+                            tool_parser=os.environ.get("CODEX_TOOL_CALL_PARSER"),
+                            reasoning_parser=os.environ.get("CODEX_REASONING_PARSER"))
+            case["capabilities"] = evidence
+        cases.append(case)
+    write_json(output, {"run_id": int(os.environ["GITHUB_RUN_ID"]),
+                        "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "checkout_sha": sha, "cases": cases})
+
+
 def acceptance(path, job_result, run_id, attempt, sha, scope):
     raw = read_json(path)
     if (not isinstance(raw, dict) or raw.get("run_id") != run_id
@@ -681,6 +700,7 @@ def main():
     cap.add_argument("--credentialed", required=True)
     cap.add_argument("--setup", choices=("passed", "failed"), required=True)
     cap.add_argument("--output", required=True)
+    sub.add_parser("capture-codex").add_argument("--output", required=True)
     fin = sub.add_parser("finish")
     fin.add_argument("--raw", required=True)
     fin.add_argument("--requested", choices=("true", "false"), required=True)
@@ -704,6 +724,8 @@ def main():
     args = parser.parse_args()
     if args.command == "capture":
         capture(args)
+    elif args.command == "capture-codex":
+        capture_codex(args.output)
     elif args.command == "finish":
         report = finish(args.raw, args.requested == "true", args.start_result, args.suite_result,
                         args.claude_result, args.codex_result, int(args.run_id), int(args.attempt), args.url, args.sha,
