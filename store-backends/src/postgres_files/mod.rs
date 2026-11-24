@@ -45,7 +45,7 @@ pub struct PostgresFileCatalog {
     /// Configured files table name.
     files: String,
     /// Per-tenant byte limit enforced at reservation time.
-    tenant_limit_bytes: u64,
+    tenant_limit_bytes: i64,
     /// Connection URL, held only to redact it from runtime query errors.
     redact_url: String,
 }
@@ -76,9 +76,13 @@ impl PostgresFileCatalog {
     /// certificate-authentication compliance profile.
     ///
     /// `tenant_limit_bytes` is the single per-tenant quota: one limit for
-    /// every tenant, no overrides and no file-count limit.
+    /// every tenant, no overrides and no file-count limit. It must not exceed
+    /// `i64::MAX`, the range of the `BIGINT` column that charges it.
     ///
     /// # Errors
+    ///
+    /// Returns [`CatalogError::Backend`] (classified non-retryable) if
+    /// `tenant_limit_bytes` exceeds `i64::MAX`, before any connection is made.
     ///
     /// Returns [`CatalogError::Backend`] if the connection fails (classified
     /// unavailable) or schema initialization fails (classified
@@ -90,6 +94,7 @@ impl PostgresFileCatalog {
         pool_config: Option<&PoolConfig>,
         tenant_limit_bytes: u64,
     ) -> Result<Self, CatalogError> {
+        let tenant_limit_bytes = validate_tenant_limit(tenant_limit_bytes)?;
         let options = pg_connect_options(database_url, tls).map_err(|e| non_retryable(database_url, &e))?;
         let pool = Box::pin(apply_pool_config(sqlx::postgres::PgPoolOptions::new(), pool_config).connect_with(options))
             .await
@@ -188,6 +193,16 @@ fn non_retryable(database_url: &str, e: &dyn std::fmt::Display) -> CatalogError 
         PgFailure::NonRetryable,
         super::redact_connection_error(database_url, &e.to_string()),
     )))
+}
+
+/// Reject a quota the `BIGINT` charge and usage columns cannot represent.
+fn validate_tenant_limit(limit: u64) -> Result<i64, CatalogError> {
+    i64::try_from(limit).map_err(|e| {
+        CatalogError::Backend(Box::new(invalid(format!(
+            "tenant_limit_bytes {limit} exceeds the supported maximum {} (PostgreSQL BIGINT): {e}",
+            i64::MAX
+        ))))
+    })
 }
 
 /// How long any statement may wait for a lock. Short, so a contended tenant

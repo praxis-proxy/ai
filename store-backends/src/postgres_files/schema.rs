@@ -112,6 +112,28 @@ fn validate_files_table(files: &str) -> Result<(), StoreError> {
     validate_postgres_identifier_len("files table name", files, MAX_FILES_TABLE_LEN)
 }
 
+/// DDL for the files table itself.
+fn files_table_ddl(files: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {files} (\n\
+         \x20 id            TEXT   PRIMARY KEY,\n\
+         \x20 tenant_id     TEXT   NOT NULL,\n\
+         \x20 owner_issuer  TEXT   NOT NULL,\n\
+         \x20 owner_subject TEXT   NOT NULL,\n\
+         \x20 storage_key   TEXT   NOT NULL UNIQUE,\n\
+         \x20 filename      TEXT   NOT NULL,\n\
+         \x20 purpose       TEXT,\n\
+         \x20 state         TEXT   NOT NULL\n\
+         \x20               CHECK (state IN ('pending','ready','failed','deletion_pending')),\n\
+         \x20 bytes         BIGINT NOT NULL CHECK (bytes >= 0),\n\
+         \x20 created_at    BIGINT NOT NULL DEFAULT extract(epoch FROM now())::bigint,\n\
+         \x20 expires_at    BIGINT,\n\
+         \x20 lease_until  BIGINT NOT NULL DEFAULT extract(epoch FROM now())::bigint,\n\
+         \x20 claim_token   BIGINT\n\
+         )"
+    )
+}
+
 /// Generate the idempotent DDL statements for the files schema.
 pub(super) fn generate_files_ddl(files: &str) -> Result<Vec<String>, StoreError> {
     validate_files_table(files)?;
@@ -120,24 +142,7 @@ pub(super) fn generate_files_ddl(files: &str) -> Result<Vec<String>, StoreError>
     let (pending_idx, lease_idx) = (pending_index(files), lease_index(files));
     let claim_seq = claim_sequence(files);
     Ok(vec![
-        format!(
-            "CREATE TABLE IF NOT EXISTS {files} (\n\
-             \x20 id            TEXT   PRIMARY KEY,\n\
-             \x20 tenant_id     TEXT   NOT NULL,\n\
-             \x20 owner_issuer  TEXT   NOT NULL,\n\
-             \x20 owner_subject TEXT   NOT NULL,\n\
-             \x20 storage_key   TEXT   NOT NULL UNIQUE,\n\
-             \x20 filename      TEXT   NOT NULL,\n\
-             \x20 purpose       TEXT,\n\
-             \x20 state         TEXT   NOT NULL\n\
-             \x20               CHECK (state IN ('pending','ready','failed','deletion_pending')),\n\
-             \x20 bytes         BIGINT NOT NULL CHECK (bytes >= 0),\n\
-             \x20 created_at    BIGINT NOT NULL DEFAULT extract(epoch FROM now())::bigint,\n\
-             \x20 expires_at    BIGINT,\n\
-             \x20 lease_until  BIGINT NOT NULL DEFAULT extract(epoch FROM now())::bigint,\n\
-             \x20 claim_token   BIGINT\n\
-             )"
-        ),
+        files_table_ddl(files),
         // Listing and the quota sum: `tenant_id` is the prefix, so the sum scans only
         // the tenant's rows; ordered paging reads `ready` rows in (created_at, id) order.
         format!("CREATE INDEX IF NOT EXISTS {list_idx} ON {files} (tenant_id, state, created_at, id)"),

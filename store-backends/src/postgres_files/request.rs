@@ -74,9 +74,9 @@ pub(super) async fn create_pending_once(c: &PostgresFileCatalog, file: &NewFile)
         return Ok(outcome);
     }
     let used = tenant_usage(c, &mut tx, tenant).await?;
-    let remaining = i128::from(c.tenant_limit_bytes).saturating_sub(i128::from(used)).max(0);
-    // Compared as i128 so a ceiling above i64::MAX is bounded by the quota.
-    let reserve = i64::try_from(remaining.min(i128::from(file.max_bytes))).map_err(|e| invalid(e.to_string()))?;
+    let remaining = c.tenant_limit_bytes.saturating_sub(used).max(0);
+    // A ceiling above i64::MAX is bounded by the quota, which fits `BIGINT`.
+    let reserve = remaining.min(i64::try_from(file.max_bytes).unwrap_or(i64::MAX));
     if reserve == 0 {
         return Ok(Err(Domain::Quota));
     }

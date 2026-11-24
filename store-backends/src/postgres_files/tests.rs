@@ -35,7 +35,7 @@ mod schema {
     fn ddl_has_table_indexes_sequence_and_version_table() {
         let ddl = generate_files_ddl("f1").unwrap();
         assert_eq!(ddl.len(), 7);
-        let [table, list, expiry, pending, lease, sequence, versions] = &ddl[..] else {
+        let [table, list, expiry, pending, lease, sequence, versions] = &*ddl else {
             panic!("unexpected statement count");
         };
         assert!(table.starts_with("CREATE TABLE IF NOT EXISTS f1 ("));
@@ -304,6 +304,25 @@ mod constructor {
         assert!(!text.contains("supersecret"), "leaked password: {text}");
         let source = err.source().unwrap().to_string();
         assert!(!source.contains("supersecret"), "leaked password: {source}");
+    }
+
+    #[tokio::test]
+    async fn constructor_rejects_limit_above_bigint_without_connecting() {
+        // The check precedes the connect, so the unreachable URL is never used.
+        let too_big = u64::try_from(i64::MAX).unwrap() + 1;
+        let err = PostgresFileCatalog::new("postgres://unused.invalid/db", "files", &tls(), None, too_big)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        let CatalogError::Backend(source) = err else {
+            panic!("expected a backend error");
+        };
+        let text = source.to_string();
+        assert!(text.contains("tenant_limit_bytes") && text.contains("BIGINT"), "{text}");
+        assert_eq!(
+            validate_tenant_limit(u64::try_from(i64::MAX).unwrap()).unwrap(),
+            i64::MAX
+        );
     }
 
     #[tokio::test]
