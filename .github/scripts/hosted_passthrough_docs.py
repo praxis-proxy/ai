@@ -96,6 +96,16 @@ for Bedrock Runtime.
 The check requires a completed Responses resource with output text.
 Tenant isolation and retries remain unqualified by this job. The separate [direct connectivity probe](../../.github/workflows/bedrock-runtime-smoke.yaml)
 exercises AWS credentials and inference independently of the gateway.
+
+## Anthropic Messages passthrough
+
+The nightly uses the `ANTHROPIC_API_KEY` Actions secret and the
+[local gateway fixture](../../tests/integration/fixtures/anthropic/messages-live.yaml).
+The [SDK case](../../tests/integration/sdk/anthropic/test_official_anthropic_live.py)
+uses `claude-haiku-4-5-20251001` and API version `2023-06-01`. It makes at most two
+inference requests with a 64-token output cap per request and SDK retries
+disabled. It checks tool arguments, streamed tool-result continuation,
+completion, and usage. JUnit results are in `hosted-anthropic-passthrough-results`.
 """
 
 

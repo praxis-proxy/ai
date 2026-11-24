@@ -172,3 +172,78 @@ jobs:
             ${{ runner.temp }}/hosted-responses-to-chat-junit.xml
             ${{ runner.temp }}/hosted-responses-to-chat-praxis.log
           if-no-files-found: ignore
+
+  anthropic-translation:
+    name: OpenAI Chat Completions to Anthropic Messages
+    if: github.repository == 'praxis-proxy/ai' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check provider credential
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [[ -z "$ANTHROPIC_API_KEY" ]]; then
+            echo "::error::Qualification unavailable: set the ANTHROPIC_API_KEY Actions secret."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@2a0d28ddd3690ed73347ddbe59d08dac02f604ce # v0.5.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Build Praxis
+        run: cargo build --locked -p praxis-ai-proxy
+
+      - name: Qualify official Anthropic
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PRAXIS_LIVE_ANTHROPIC: chat
+          GATEWAY_CONFIG: tests/integration/fixtures/anthropic/chat-to-anthropic-live.yaml
+        run: |
+          umask 077
+          credential_dir=$(mktemp -d)
+          trap 'rm -r -- "$credential_dir"' EXIT
+          mkdir -p "$credential_dir/grid-fixture/anthropic-fixture-secret"
+          printf '%s' "$ANTHROPIC_API_KEY" > "$credential_dir/grid-fixture/anthropic-fixture-secret/api-key"
+          unset ANTHROPIC_API_KEY
+          sed "s|/tmp/praxis-hosted-anthropic|$credential_dir|" "$GATEWAY_CONFIG" > "$credential_dir/gateway.yaml"
+          GATEWAY_CONFIG="$credential_dir/gateway.yaml"
+          target/debug/praxis-ai -c "$GATEWAY_CONFIG" >"$RUNNER_TEMP/anthropic-praxis.log" 2>&1 &
+          gateway_pid=$!
+          trap 'kill "$gateway_pid" 2>/dev/null || true; wait "$gateway_pid" 2>/dev/null || true; rm -r -- "$credential_dir"' EXIT
+          ready=false
+          for _ in {1..30}; do
+            kill -0 "$gateway_pid" || break
+            if curl --silent --output /dev/null --max-time 1 http://127.0.0.1:8080/; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            echo "::error::Praxis did not start."
+            exit 1
+          fi
+          env -u ANTHROPIC_API_KEY uv run --script \
+            tests/integration/sdk/anthropic/test_official_anthropic_live.py -k test_chat_translation \
+            --junitxml="$RUNNER_TEMP/hosted-anthropic-junit.xml" --tb=line
+
+      - name: Upload Anthropic test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hosted-anthropic-translation-results
+          path: ${{ runner.temp }}/hosted-anthropic-junit.xml
+          if-no-files-found: ignore
