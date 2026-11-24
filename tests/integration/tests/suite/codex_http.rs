@@ -474,8 +474,21 @@ async fn pinned_codex_live_search_through_translated_vllm() {
     let marker = format!("SEARCH_RESULT_{:032x}", rand::random::<u128>());
     let mut search = start_codex_search_provider(&marker).await;
     let proxy_port = free_port();
+    let upstream = tokio::net::lookup_host(&live.vllm_authority)
+        .await
+        .expect("vLLM address should resolve")
+        .next()
+        .expect("vLLM should have a socket address");
+    let marker_probe = Arc::new((marker.clone(), AtomicBool::new(false)));
+    let model_observer = HttpTransportObserver::start_inner(
+        upstream,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        None,
+        Some(Arc::clone(&marker_probe)),
+    )
+    .await;
     let yaml = codex_search_yaml(proxy_port, search.port())
-        .replace("127.0.0.1:3001", &live.vllm_authority)
+        .replace("127.0.0.1:3001", &format!("127.0.0.1:{}", model_observer.port()))
         .replace("env_var: VLLM_API_KEY", "env_var: CODEX_BACKEND_TOKEN");
     let config = praxis_core::config::Config::from_yaml(&yaml).expect("live search config should parse");
     let _proxy = start_proxy(&config);
@@ -503,6 +516,10 @@ async fn pinned_codex_live_search_through_translated_vllm() {
     ).await;
     assert!(output.status.success(), "{}\n{}", output.stdout, output.stderr);
     next_translated_request(&mut search).await;
+    assert!(
+        marker_probe.1.load(Ordering::SeqCst),
+        "Praxis called the search provider but did not send its result marker to vLLM"
+    );
     assert_codex_search_answer(&output.stdout, &marker);
     observer.assert_http_only();
 }
@@ -1518,23 +1535,34 @@ struct HttpTransportObserver {
 impl HttpTransportObserver {
     /// Bind a front-door observer that forwards all connections to Praxis.
     async fn start(upstream_port: u16) -> Self {
-        Self::start_inner(upstream_port, IpAddr::V4(Ipv4Addr::LOCALHOST), None).await
+        Self::start_on(upstream_port, IpAddr::V4(Ipv4Addr::LOCALHOST)).await
     }
 
     /// Bind the observer on an explicit address, including a host-side veth.
     async fn start_on(upstream_port: u16, listen_address: IpAddr) -> Self {
-        Self::start_inner(upstream_port, listen_address, None).await
+        Self::start_inner((Ipv4Addr::LOCALHOST, upstream_port).into(), listen_address, None, None).await
     }
 
     /// Bind the observer and, when it first sees Codex's summarization request on
     /// the wire, snapshot the compaction workspace's filesystem state (secret
     /// deleted, result still empty) BEFORE forwarding that request upstream.
     async fn start_compaction_probe(upstream_port: u16, listen_address: IpAddr, workspace: PathBuf) -> Self {
-        Self::start_inner(upstream_port, listen_address, Some(workspace)).await
+        Self::start_inner(
+            (Ipv4Addr::LOCALHOST, upstream_port).into(),
+            listen_address,
+            Some(workspace),
+            None,
+        )
+        .await
     }
 
     /// Shared constructor; `workspace` is `Some` only for the compaction probe.
-    async fn start_inner(upstream_port: u16, listen_address: IpAddr, workspace: Option<PathBuf>) -> Self {
+    async fn start_inner(
+        upstream: std::net::SocketAddr,
+        listen_address: IpAddr,
+        workspace: Option<PathBuf>,
+        marker_probe: Option<Arc<(String, AtomicBool)>>,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind((listen_address, 0))
             .await
             .expect("transport observer should bind");
@@ -1554,6 +1582,7 @@ impl HttpTransportObserver {
             apply_patch_output_seen: Arc::clone(&apply_patch_output_seen),
             result_empty_at_compaction: Arc::clone(&result_empty_at_compaction),
             compaction_workspace: workspace.map(Arc::<Path>::from),
+            marker_probe,
         };
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
@@ -1564,7 +1593,7 @@ impl HttpTransportObserver {
                         let Ok((client, _peer)) = accepted else {
                             break;
                         };
-                        tokio::spawn(forward_observed_connection(client, upstream_port, signals.clone()));
+                        tokio::spawn(forward_observed_connection(client, upstream, signals.clone()));
                     },
                 }
             }
@@ -1669,6 +1698,7 @@ struct ObservedConnectionSignals {
     result_empty_at_compaction: Arc<AtomicBool>,
     /// Compaction workspace to probe at that instant; `None` for non-compaction observers.
     compaction_workspace: Option<Arc<Path>>,
+    marker_probe: Option<Arc<(String, AtomicBool)>>,
 }
 
 impl Drop for HttpTransportObserver {
@@ -1692,12 +1722,12 @@ const MAX_CODEX_REQUEST_NEEDLE_LEN: usize = CODEX_SUMMARY_PREFIX_NEEDLE.len();
 /// verbatim so SSE responses are never held back.
 async fn forward_observed_connection(
     client: tokio::net::TcpStream,
-    upstream_port: u16,
+    upstream: std::net::SocketAddr,
     signals: ObservedConnectionSignals,
 ) {
-    let upstream = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, upstream_port))
+    let upstream = tokio::net::TcpStream::connect(upstream)
         .await
-        .expect("transport observer should connect to Praxis");
+        .expect("transport observer should connect to its upstream");
     let (mut client_rd, mut client_wr) = client.into_split();
     let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
 
@@ -1765,6 +1795,12 @@ async fn forward_observed_connection(
 /// workspace (result still empty) BEFORE the caller forwards the request upstream.
 /// `compare_exchange` guarantees exactly one snapshot even if two connections race.
 fn scan_codex_request_needles(haystack: &[u8], signals: &ObservedConnectionSignals) {
+    if let Some(probe) = &signals.marker_probe
+        && !probe.1.load(Ordering::SeqCst)
+        && contains_subslice(haystack, probe.0.as_bytes())
+    {
+        probe.1.store(true, Ordering::SeqCst);
+    }
     if !signals.summarization_request_seen.load(Ordering::SeqCst)
         && contains_subslice(haystack, CODEX_SUMMARIZATION_PROMPT_NEEDLE)
         && signals
@@ -1811,6 +1847,7 @@ fn scan_codex_request_needles_sets_each_flag_once_when_its_needle_appears() {
         apply_patch_output_seen: Arc::new(AtomicBool::new(false)),
         result_empty_at_compaction: Arc::new(AtomicBool::new(false)),
         compaction_workspace: None,
+        marker_probe: None,
     };
 
     // Ordinary request bytes leave both compaction flags clear.
@@ -1876,6 +1913,7 @@ fn compaction_probe_signals(workspace: &Path) -> ObservedConnectionSignals {
         apply_patch_output_seen: Arc::new(AtomicBool::new(false)),
         result_empty_at_compaction: Arc::new(AtomicBool::new(false)),
         compaction_workspace: Some(Arc::from(workspace)),
+        marker_probe: None,
     }
 }
 
