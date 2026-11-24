@@ -5,6 +5,7 @@
 
 mod broker;
 pub(crate) mod metrics;
+pub(crate) mod audit;
 pub(crate) mod config;
 pub(crate) mod envelope;
 pub(crate) mod protocol;
@@ -41,9 +42,11 @@ use self::{
 };
 use self::metrics::{
     record_mcp_request, record_filter_rejection, record_tool_call_completed,
-    McpMetricsState,
 };
 use self::envelope::McpMethod;
+use self::audit::{
+    AuditState, emit_completed, emit_non_tool, emit_rejected,
+};
 
 // -----------------------------------------------------------------------------
 // McpFilter
@@ -177,11 +180,31 @@ impl HttpFilter for McpFilter {
             .unwrap_or("unknown");
         record_mcp_request(method_str, pv);
 
+        let tenant_header = ctx.request.headers
+            .get("x-tenant-id")
+            .and_then(|v| v.to_str().ok());
+
         if let Some(action) = reject_missing_required_selector(&mcp_envelope, &parsed.envelope, &self.config) {
+            emit_rejected(
+                mcp_envelope.method.as_str(),
+                mcp_envelope.name.as_deref(),
+                mcp_envelope.session_id.as_deref(),
+                mcp_envelope.protocol_version.as_deref(),
+                tenant_header,
+                "invalid_params",
+            );
             return Ok(action);
         }
 
         if let Err(action) = validate_mcp_headers(ctx, &mcp_envelope, &parsed.envelope, &self.config) {
+            emit_rejected(
+                mcp_envelope.method.as_str(),
+                mcp_envelope.name.as_deref(),
+                mcp_envelope.session_id.as_deref(),
+                mcp_envelope.protocol_version.as_deref(),
+                tenant_header,
+                "header_mismatch",
+            );
             return Ok(action);
         }
 
@@ -201,18 +224,28 @@ impl HttpFilter for McpFilter {
             "extracted MCP envelope metadata"
         );
 
-        // For tools/call, store per-instance metrics state for the response phase.
-        // Uses filter_state (keyed by current_filter_id) so two MCP filter
-        // instances in the same pipeline do not overwrite each other.
+        // ── MCP audit + metrics (request phase) ──────────────────────────
+        // For tools/call: store AuditState in filter_state for response-phase
+        //   metrics recording AND audit event emit.
+        // AuditState replaces McpMetricsState — it carries start time and
+        //   tool_name (for metrics) plus method, session, tenant (for audit).
+        // For all other methods: emit the audit event now (no response follows).
         if matches!(mcp_envelope.method, McpMethod::ToolsCall) {
-            let tool_name = mcp_envelope
-                .name
-                .clone()
-                .unwrap_or_else(|| "unknown".to_owned());
-            ctx.insert_filter_state(McpMetricsState {
+            ctx.insert_filter_state(AuditState {
                 start: Instant::now(),
-                tool_name,
+                method: mcp_envelope.method.as_str().to_owned(),
+                tool_name: mcp_envelope.name.clone().unwrap_or_default(),
+                session_id: mcp_envelope.session_id.clone(),
+                protocol_version: mcp_envelope.protocol_version.clone(),
+                tenant: tenant_header.map(str::to_owned),
             });
+        } else {
+            emit_non_tool(
+                mcp_envelope.method.as_str(),
+                mcp_envelope.session_id.as_deref(),
+                mcp_envelope.protocol_version.as_deref(),
+                tenant_header,
+            );
         }
 
         Ok(FilterAction::Release)
@@ -222,26 +255,29 @@ impl HttpFilter for McpFilter {
         &self,
         ctx: &mut HttpFilterContext<'_>,
     ) -> Result<FilterAction, FilterError> {
-        // Only record duration for tool calls that stored metrics state.
-        // Uses filter_state (per-instance) so two MCP filters in the same
-        // pipeline each track their own tool call independently.
-        if let Some(state) = ctx.get_filter_state::<McpMetricsState>() {
-            let duration_seconds = state.start.elapsed().as_secs_f64();
-
-            let tool = &state.tool_name;
+        // ── MCP metrics + audit (response phase) ──────────────────────────
+        // AuditState replaced McpMetricsState in the request phase.
+        // It carries start time + tool_name (for metrics) plus method,
+        // session, protocol_version, tenant (for audit).
+        // We record Prometheus metrics AND emit the audit event from it.
+        if let Some(audit) = ctx.get_filter_state::<AuditState>() {
             let cluster = ctx
                 .cluster_name()
                 .unwrap_or("unknown");
-
-            // transport_status reflects HTTP status only. JSON-RPC
-            // application errors inside HTTP 200 are recorded as "ok".
-            let is_error = ctx
+            let upstream_status = ctx
                 .response_header
                 .as_ref()
-                .map_or(false, |r| r.status.as_u16() >= 400);
-            let transport_status = if is_error { "error" } else { "ok" };
+                .map_or(200u16, |r| r.status.as_u16());
 
-            record_tool_call_completed(tool, cluster, transport_status, duration_seconds);
+            // Prometheus metrics (from PR #2030)
+            let duration_seconds = audit.start.elapsed().as_secs_f64();
+            let transport_status = if upstream_status >= 400 { "error" } else { "ok" };
+            record_tool_call_completed(
+                &audit.tool_name, cluster, transport_status, duration_seconds,
+            );
+
+            // Structured audit log event
+            emit_completed(&audit, cluster, upstream_status);
         }
         Ok(FilterAction::Continue)
     }
