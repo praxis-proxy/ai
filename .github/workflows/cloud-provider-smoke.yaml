@@ -1,0 +1,126 @@
+name: Azure OpenAI and Vertex AI smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: Provider to validate
+        required: true
+        type: choice
+        options: [azure, vertex]
+
+permissions: {}
+
+jobs:
+  azure:
+    if: github.repository == 'praxis-proxy/ai' && github.ref == 'refs/heads/main' && inputs.provider == 'azure'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - name: Authenticate to Azure
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Verify Azure OpenAI Chat Completions
+        env:
+          AZURE_OPENAI_RESOURCE: ${{ secrets.AZURE_OPENAI_RESOURCE }}
+          AZURE_OPENAI_RESOURCE_GROUP: ${{ secrets.AZURE_OPENAI_RESOURCE_GROUP }}
+          AZURE_CHAT_DEPLOYMENT: ${{ vars.AZURE_CHAT_DEPLOYMENT }}
+        run: |
+          : "${AZURE_OPENAI_RESOURCE:?Missing Azure resource}"
+          : "${AZURE_OPENAI_RESOURCE_GROUP:?Missing Azure resource group}"
+          : "${AZURE_CHAT_DEPLOYMENT:?Missing Azure chat deployment}"
+          key=$(az cognitiveservices account keys list --name "$AZURE_OPENAI_RESOURCE" \
+            --resource-group "$AZURE_OPENAI_RESOURCE_GROUP" --query key1 -o tsv)
+          : "${key:?Azure returned no key}"
+          echo "::add-mask::$key"
+          AZURE_SMOKE_KEY="$key" python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          resource = os.environ["AZURE_OPENAI_RESOURCE"]
+          if not re.fullmatch(r"[a-zA-Z0-9-]+", resource):
+              raise SystemExit("Invalid Azure resource name")
+          deployment = urllib.parse.quote(os.environ["AZURE_CHAT_DEPLOYMENT"], safe="")
+          url = (
+              f"https://{resource}.openai.azure.com/openai/deployments/{deployment}"
+              "/chat/completions?api-version=2024-10-21"
+          )
+          payload = {"messages": [{"role": "user", "content": "Say OK."}], "max_completion_tokens": 64}
+          request = urllib.request.Request(url, json.dumps(payload).encode(), {
+              "Content-Type": "application/json", "api-key": os.environ["AZURE_SMOKE_KEY"],
+          })
+          try:
+              with urllib.request.urlopen(request, timeout=45) as response:
+                  result = json.load(response)
+          except urllib.error.HTTPError as error:
+              raise SystemExit(f"Azure OpenAI returned HTTP {error.code}") from None
+          if not any(choice.get("message", {}).get("role") == "assistant"
+                     for choice in result.get("choices", [])):
+              raise SystemExit("Azure returned no assistant completion")
+          print("Azure OpenAI Chat Completions passed.")
+          PY
+
+  vertex:
+    if: github.repository == 'praxis-proxy/ai' && github.ref == 'refs/heads/main' && inputs.provider == 'vertex'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - name: Authenticate to Google Cloud
+        id: google
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ secrets.VERTEX_AI_PROJECT }}
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          create_credentials_file: false
+      - name: Verify native Vertex AI Gemini
+        env:
+          VERTEX_AI_PROJECT: ${{ secrets.VERTEX_AI_PROJECT }}
+          VERTEX_MODEL: ${{ vars.VERTEX_GEMINI_MODEL }}
+          VERTEX_TOKEN: ${{ steps.google.outputs.auth_token }}
+        run: |
+          : "${VERTEX_AI_PROJECT:?Missing Vertex project}"
+          : "${VERTEX_MODEL:?Missing Vertex Gemini model}"
+          : "${VERTEX_TOKEN:?Google returned no federated token}"
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          project = urllib.parse.quote(os.environ["VERTEX_AI_PROJECT"], safe="")
+          model = urllib.parse.quote(os.environ["VERTEX_MODEL"], safe="")
+          url = (
+              "https://us-central1-aiplatform.googleapis.com/v1/"
+              f"projects/{project}/locations/us-central1/publishers/google/models/{model}:generateContent"
+          )
+          payload = {
+              "contents": [{"role": "user", "parts": [{"text": "Say OK."}]}],
+              "generationConfig": {"maxOutputTokens": 64},
+          }
+          request = urllib.request.Request(url, json.dumps(payload).encode(), {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer " + os.environ["VERTEX_TOKEN"],
+          })
+          try:
+              with urllib.request.urlopen(request, timeout=45) as response:
+                  result = json.load(response)
+          except urllib.error.HTTPError as error:
+              raise SystemExit(f"Vertex AI returned HTTP {error.code}") from None
+          if not result.get("candidates"):
+              raise SystemExit("Vertex AI returned no candidates")
+          print("Native Vertex AI Gemini generateContent passed.")
+          PY
