@@ -1,0 +1,51 @@
+{
+  "schema_version": "1.0.0",
+  "revision": {
+    "kind": "content_addressed",
+    "algorithm": "sha256",
+    "value": "9bb404b90c4209cc19adf2356e49ce11a137573f31b861a2c70c539871ae5ba3"
+  },
+  "content_digest": {
+    "algorithm": "sha256",
+    "value": "9bb404b90c4209cc19adf2356e49ce11a137573f31b861a2c70c539871ae5ba3"
+  },
+  "scope": {
+    "network": "fixture-network",
+    "gateway": "fixture-gateway",
+    "namespace": "grid-fixture",
+    "local_site": "fixture-site"
+  },
+  "provenance": {
+    "producer": "praxis-ai-inference-fixture",
+    "producer_version": "1",
+    "source_name": "fixture-network",
+    "source_uid": "fixture-only",
+    "source_generation": 1,
+    "rendered_at": "2026-10-17T00:00:00Z"
+  },
+  "overlay": {
+    "local_site": "fixture-site",
+    "network": "fixture-network",
+    "candidates": [
+      {
+        "kind": "inference_model",
+        "name": "claude-haiku-4-5-20251001",
+        "site": "fixture-site",
+        "cluster": "anthropic-backend",
+        "fresh": true,
+        "stable_id": "fixture-anthropic-candidate",
+        "api_format": "messages",
+        "path": "/v1/messages",
+        "target_model": "claude-haiku-4-5-20251001",
+        "credential": {
+          "strategy": "apikey",
+          "secretRef": {
+            "name": "anthropic-fixture-secret",
+            "namespace": "grid-fixture",
+            "key": "api-key"
+          }
+        }
+      }
+    ]
+  }
+}
