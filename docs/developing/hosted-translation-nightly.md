@@ -50,9 +50,10 @@ the terminal completion event, and stateless tool-result continuation, with `sto
 The nightly uses the `ANTHROPIC_API_KEY` Actions secret and the
 [local gateway fixture](../../tests/integration/fixtures/anthropic/chat-to-anthropic-live.yaml).
 The [SDK case](../../tests/integration/sdk/anthropic/test_official_anthropic_live.py)
-uses `claude-haiku-4-5-20251001` and API version `2023-06-01`. It makes at most two
-inference requests with a 64-token output cap per request and SDK retries
-disabled. It checks tool arguments, streamed tool-result continuation,
-completion, and usage. JUnit results are in `hosted-anthropic-translation-results`.
+uses `claude-haiku-4-5-20251001` and API version `2023-06-01`. Two round
+trips cover buffered tool calls with streamed results and streamed tool-call
+arguments with buffered results. The suite checks tool IDs, arguments, finish
+reasons, and usage. It makes at most four inference requests with a 64-token
+output cap per request and SDK retries disabled. JUnit results are in `hosted-anthropic-translation-results`.
 During initial testing, Haiku 5.5 emitted a streamed thinking block that
 the Chat Completions translator rejected. This lane qualifies Haiku 4.5.

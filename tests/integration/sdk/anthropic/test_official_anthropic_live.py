@@ -82,5 +82,48 @@ def test_chat_translation():
         assert any(chunk.usage and chunk.usage.completion_tokens > 0 for chunk in chunks)
 
 
+def test_chat_translation_streamed_tool_call():
+    if os.getenv("PRAXIS_LIVE_ANTHROPIC") != "chat":
+        pytest.skip("Enable the translated Chat Completions route")
+    tool = {"type": "function", "function": {
+        "name": "status", "description": "Get service status.", "parameters": SCHEMA,
+    }}
+    messages = [{"role": "user", "content": PROMPT}]
+    with OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local-test",
+                max_retries=0, timeout=45) as client:
+        with client.chat.completions.create(
+            model=MODEL, max_completion_tokens=64, messages=messages, tools=[tool],
+            tool_choice={"type": "function", "function": {"name": "status"}},
+            stream=True, stream_options={"include_usage": True},
+        ) as stream:
+            chunks = list(stream)
+        choices = [choice for chunk in chunks for choice in chunk.choices]
+        deltas = [call for choice in choices for call in (choice.delta.tool_calls or [])]
+        assert deltas and {delta.index for delta in deltas} == {0}
+        call_id, = {delta.id for delta in deltas if delta.id}
+        name = "".join(delta.function.name or "" for delta in deltas if delta.function)
+        arguments = "".join(delta.function.arguments or "" for delta in deltas if delta.function)
+        assert name == "status"
+        assert json.loads(arguments) == {"service": "gateway"}
+        assert [choice.finish_reason for choice in choices if choice.finish_reason] == ["tool_calls"]
+        assert any(chunk.usage and chunk.usage.completion_tokens > 0 for chunk in chunks)
+
+        result = secrets.token_hex(4)
+        messages.extend([
+            {"role": "assistant", "tool_calls": [{
+                "id": call_id, "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }]},
+            {"role": "tool", "tool_call_id": call_id, "content": result},
+        ])
+        final = client.chat.completions.create(
+            model=MODEL, max_completion_tokens=64, messages=messages, tools=[tool],
+        )
+        choice, = final.choices
+        assert choice.finish_reason == "stop"
+        assert result in (choice.message.content or "")
+        assert final.usage.completion_tokens > 0
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
