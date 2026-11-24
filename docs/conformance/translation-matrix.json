@@ -764,9 +764,9 @@
         {
           "feature": "usage-accounting",
           "label": "Token usage accounting",
-          "status": "translated-lossy",
-          "note": "completion_tokens comes from candidatesTokenCount, which excludes thoughtsTokenCount, so on thinking models it under-reports billed output and total_tokens no longer equals prompt + completion.",
-          "evidence": "apis/src/vertex/gemini/response.rs:521-534",
+          "status": "translated",
+          "note": "completion_tokens is candidatesTokenCount plus thoughtsTokenCount, matching OpenAI's inclusion of reasoning tokens in completion_tokens. total_tokens keeps Vertex's totalTokenCount, which already counts thoughts, and falls back to prompt + completion when absent.",
+          "evidence": "apis/src/vertex/gemini/response.rs:529-565",
           "blocker": null
         },
         {
@@ -774,16 +774,16 @@
           "label": "Prompt-cache token accounting",
           "status": "translated",
           "note": "cachedContentTokenCount maps to prompt_tokens_details.cached_tokens on finite responses and on the trailing include_usage chunk. Both counts are subsets of the prompt total, so prompt_tokens is unchanged; the details object is omitted when Vertex reports no cached count.",
-          "evidence": "apis/src/vertex/gemini/response.rs:529-551; apis/src/vertex/gemini/response.rs:138-145; apis/src/vertex/gemini/response.rs:220-226; apis/src/vertex/gemini/response.rs:720-740",
+          "evidence": "apis/src/vertex/gemini/response.rs:529-565; apis/src/vertex/gemini/response.rs:138-145; apis/src/vertex/gemini/response.rs:220-226; apis/src/vertex/gemini/response.rs:733-755",
           "blocker": null
         },
         {
           "feature": "reasoning-content",
           "label": "Reasoning / thinking content",
-          "status": "dropped",
-          "note": "thoughtsTokenCount is discarded, so no completion_tokens_details.reasoning_tokens is emitted. A Part with thought:true fails the response, while a Part carrying only thoughtSignature produces an empty delta and no error.",
-          "evidence": "apis/src/vertex/gemini/response.rs:323-325; apis/src/vertex/gemini/response.rs:345-357; apis/src/vertex/gemini/response.rs:521-534; apis/src/vertex/gemini/response.rs:907-909",
-          "blocker": "https://github.com/praxis-proxy/ai/issues/1755"
+          "status": "rejected",
+          "note": "thoughtsTokenCount maps to completion_tokens_details.reasoning_tokens on finite responses and on the trailing include_usage chunk; the details object is omitted when Vertex reports no thought count. Thought text has no Chat Completions field, so a Part with thought:true fails the response. A text or metadata-only Part's thoughtSignature is not surfaced, since Gemini does not require it on a later non-function-call turn.",
+          "evidence": "apis/src/vertex/gemini/response.rs:354-372; apis/src/vertex/gemini/response.rs:529-565; apis/src/vertex/gemini/response.rs:733-755",
+          "blocker": null
         },
         {
           "feature": "request-reasoning-cache-controls",
@@ -1342,11 +1342,11 @@
     }
   ],
   "status_totals": {
-    "dropped": 17,
+    "dropped": 16,
     "n-a": 10,
     "passthrough": 21,
-    "rejected": 19,
-    "translated": 39,
-    "translated-lossy": 24
+    "rejected": 20,
+    "translated": 40,
+    "translated-lossy": 23
   }
 }
