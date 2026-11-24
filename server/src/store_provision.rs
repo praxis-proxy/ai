@@ -311,7 +311,13 @@ pub(crate) fn store_listener_names(config: &Config) -> Vec<String> {
 }
 
 /// Reject one listener binding a registry name to different effective backend
-/// configurations, then collapse repeated references to the same backend.
+/// configurations or disagreeing retention discovery, then collapse repeated
+/// references to the same backend.
+///
+/// Within-listener reaper discovery consistency runs before
+/// [`plan::deduplicate_refs`]: TTL fields are stripped from [`StoreRef`] configs,
+/// so collapsing same-name refs would otherwise hide conflicting or partially
+/// unset policies that only existed on the pre-dedup declarations.
 fn validate_and_deduplicate_refs(
     plans: &mut [ListenerStorePlan],
     factories: &[Arc<dyn StoreBackendFactory>],
@@ -347,11 +353,120 @@ fn validate_and_deduplicate_refs(
         validate_cross_store_collisions(plans, &factories)?;
     }
 
+    validate_within_listener_reaper_discovery(plans)?;
     for plan in plans.iter_mut() {
         plan::deduplicate_refs(&format!("listener '{}'", plan.listener), &mut plan.refs, &factories)?;
     }
     validate_reaper_policy_conflicts(plans, &factories)?;
     Ok(())
+}
+
+/// Reject one listener whose store filters disagree on retention for the same
+/// registry name before duplicate refs are collapsed.
+///
+/// Discovery records one [`StoreRef`] per filter declaration and one
+/// `reaper_bindings` entry only when that filter sets `ttl`. After
+/// [`plan::deduplicate_refs`], same-name refs collapse to one identity and
+/// [`validate_reaper_policy_conflicts`] can see at most the first binding per
+/// name — so conflicting TTLs or an enabled-vs-unset mix must be caught here.
+/// The same policy repeated on multiple identical filters is allowed.
+fn validate_within_listener_reaper_discovery(plans: &[ListenerStorePlan]) -> Result<(), ProvisionError> {
+    for plan in plans {
+        validate_plan_reaper_discovery(plan)?;
+    }
+    Ok(())
+}
+
+/// Check one listener's pre-dedup refs against its discovered reaper bindings.
+fn validate_plan_reaper_discovery(plan: &ListenerStorePlan) -> Result<(), ProvisionError> {
+    let mut ref_counts: HashMap<&str, usize> = HashMap::new();
+    for store_ref in &plan.refs {
+        *ref_counts.entry(store_ref.name.as_ref()).or_insert(0) += 1;
+    }
+    let mut policies_by_name: HashMap<&str, Vec<ReaperPolicy>> = HashMap::new();
+    for (name, policy) in &plan.reaper_bindings {
+        policies_by_name.entry(name.as_ref()).or_default().push(*policy);
+    }
+    for (store_name, &ref_count) in &ref_counts {
+        let policies = policies_by_name.get(store_name).map_or(&[][..], Vec::as_slice);
+        check_store_reaper_discovery(plan, store_name, ref_count, policies)?;
+    }
+    Ok(())
+}
+
+/// Reject distinct TTLs or an enabled-vs-unset mix for one registry name.
+fn check_store_reaper_discovery(
+    plan: &ListenerStorePlan,
+    store_name: &str,
+    ref_count: usize,
+    policies: &[ReaperPolicy],
+) -> Result<(), ProvisionError> {
+    let distinct = distinct_reaper_policies(policies);
+    if let [first, second, ..] = distinct.as_slice() {
+        return Err(within_listener_reaper_conflict(
+            plan,
+            store_name,
+            Some(*first),
+            Some(*second),
+        ));
+    }
+    if let Some(&enabled) = policies.first()
+        && policies.len() < ref_count
+    {
+        return Err(within_listener_reaper_conflict(plan, store_name, Some(enabled), None));
+    }
+    Ok(())
+}
+
+/// Unique policies in declaration order.
+fn distinct_reaper_policies(policies: &[ReaperPolicy]) -> Vec<ReaperPolicy> {
+    let mut distinct = Vec::new();
+    for policy in policies {
+        if !distinct.contains(policy) {
+            distinct.push(*policy);
+        }
+    }
+    distinct
+}
+
+/// Build a [`ProvisionError`] for disagreeing retention on one registry name.
+///
+/// Unlike [`reaper_policy_conflict_message`], this describes multiple filter
+/// declarations of the **same** store name on one listener — so the message
+/// names the listener once and does not invent a second store identity.
+fn within_listener_reaper_conflict(
+    plan: &ListenerStorePlan,
+    store_name: &str,
+    existing: Option<ReaperPolicy>,
+    conflicting: Option<ReaperPolicy>,
+) -> ProvisionError {
+    let name = plan
+        .refs
+        .iter()
+        .find(|store_ref| store_ref.name.as_ref() == store_name)
+        .map_or_else(|| Arc::<str>::from(store_name), |store_ref| Arc::clone(&store_ref.name));
+    let message = match (existing, conflicting) {
+        (Some(_), Some(_)) => format!(
+            "listener '{}' has conflicting reaper policies on store '{name}' \
+             (filter declarations disagree on ttl); configure one \
+             ttl/sweep_interval/sweep_batch_size for every declaration of that store",
+            plan.listener
+        ),
+        (Some(_), None) | (None, Some(_)) => format!(
+            "listener '{}' store '{name}' enables a ttl reaper on some filter declarations \
+             while other declarations of the same store set no ttl and must retain their rows; \
+             give every declaration the same ttl or stop omitting it",
+            plan.listener
+        ),
+        (None, None) => format!(
+            "listener '{}' store '{name}' has inconsistent reaper discovery",
+            plan.listener
+        ),
+    };
+    ProvisionError::Backend {
+        name,
+        source: BackendError::Config(message),
+    }
 }
 
 /// Suffix the responses schema appends to derive its server-owned
@@ -383,6 +498,12 @@ const EVENTS_SUFFIX: &str = "_events";
 /// effective-key check, so identical in-memory config with a different ttl (one
 /// shared backend) is still rejected. Both checks must hold. The same policy on a
 /// shared table is idempotent and allowed.
+///
+/// Within-listener discovery consistency (conflicting or partially unset TTLs on
+/// the same registry name before refs collapse) is checked earlier by
+/// [`validate_within_listener_reaper_discovery`]. This function runs after
+/// [`plan::deduplicate_refs`] and catches cross-listener / cross-name physical
+/// overlap.
 ///
 /// The loop walks **every** provisioned store (`plan.refs`), not just the
 /// TTL-enabled ones in `plan.reaper_bindings`. A store without a `ttl` is recorded
@@ -3871,6 +3992,132 @@ filter_chains:
         assert!(
             error.to_string().contains("conflicting reaper policies"),
             "actionable conflict error: {error}"
+        );
+    }
+
+    /// One listener, one chain: two response-store filters on the same physical
+    /// tables. `first_ttl` / `second_ttl` are optional YAML duration strings.
+    #[cfg(feature = "store-sqlite")]
+    fn within_listener_dual_store_config(
+        database_url: &str,
+        first_ttl: Option<&str>,
+        second_ttl: Option<&str>,
+    ) -> Config {
+        let first_ttl_line = first_ttl.map_or(String::new(), |ttl| format!("\n        ttl: {ttl}"));
+        let second_ttl_line = second_ttl.map_or(String::new(), |ttl| format!("\n        ttl: {ttl}"));
+        Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: a
+    address: "127.0.0.1:8080"
+    filter_chains: [chain-a]
+filter_chains:
+  - name: chain-a
+    filters:
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses
+        conversations_table: conversations{first_ttl_line}
+      - filter: openai_responses_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses
+        conversations_table: conversations{second_ttl_line}
+"#
+        ))
+        .expect("within-listener dual store config")
+    }
+
+    #[test]
+    #[cfg(feature = "store-sqlite")]
+    fn within_listener_conflicting_ttl_policies_fail_validation() {
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("within.db").display());
+        let config = within_listener_dual_store_config(&database_url, Some("1h"), Some("7d"));
+        let error = build_store_wiring(&config)
+            .err()
+            .expect("1h then 7d on the same listener store must fail");
+        let text = error.to_string();
+        assert!(
+            text.contains("conflicting reaper policies") && text.contains("listener 'a'"),
+            "actionable within-listener conflict error: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "store-sqlite")]
+    fn within_listener_conflicting_ttl_policies_reversed_fail_validation() {
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("within.db").display());
+        let config = within_listener_dual_store_config(&database_url, Some("7d"), Some("1h"));
+        let error = build_store_wiring(&config)
+            .err()
+            .expect("7d then 1h on the same listener store must fail");
+        let text = error.to_string();
+        assert!(
+            text.contains("conflicting reaper policies") && text.contains("listener 'a'"),
+            "actionable within-listener conflict error: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "store-sqlite")]
+    fn within_listener_unset_then_enabled_ttl_fail_validation() {
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("within.db").display());
+        let config = within_listener_dual_store_config(&database_url, None, Some("1h"));
+        let error = build_store_wiring(&config)
+            .err()
+            .expect("unset then 1h on the same listener store must fail");
+        let text = error.to_string();
+        assert!(
+            text.contains("must retain their rows") && text.contains("listener 'a'"),
+            "actionable enabled-vs-unset error: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "store-sqlite")]
+    fn within_listener_enabled_then_unset_ttl_fail_validation() {
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("within.db").display());
+        let config = within_listener_dual_store_config(&database_url, Some("1h"), None);
+        let error = build_store_wiring(&config)
+            .err()
+            .expect("1h then unset on the same listener store must fail");
+        let text = error.to_string();
+        assert!(
+            text.contains("must retain their rows") && text.contains("listener 'a'"),
+            "actionable enabled-vs-unset error: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "store-sqlite")]
+    fn within_listener_matching_ttl_policies_succeed() {
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("within.db").display());
+        let config = within_listener_dual_store_config(&database_url, Some("1h"), Some("1h"));
+        let result = build_store_wiring(&config);
+        assert!(
+            result.is_ok(),
+            "identical ttl on duplicate same-table filters should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "store-sqlite")]
+    fn within_listener_both_unset_ttl_succeed() {
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("within.db").display());
+        let config = within_listener_dual_store_config(&database_url, None, None);
+        let result = build_store_wiring(&config);
+        assert!(
+            result.is_ok(),
+            "duplicate same-table filters with no ttl should succeed: {:?}",
+            result.err()
         );
     }
 
