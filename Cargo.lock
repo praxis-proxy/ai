@@ -1925,8 +1925,6 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -3635,7 +3633,7 @@ dependencies = [
  "openssl",
  "percent-encoding",
  "praxis-ai-apis",
- "praxis-policy",
+ "praxis-policy 0.6.0",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-tls",
@@ -3778,11 +3776,24 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "662b03ab6155d6789464d7e9e0b4d2065900cd9d04b370d532f1b18bb1e7006b"
 dependencies = [
- "praxis-policy-apl-cmf",
- "praxis-policy-apl-core",
- "praxis-policy-apl-runtime",
- "praxis-policy-builtins",
- "praxis-policy-core",
+ "praxis-policy-apl-cmf 0.6.0",
+ "praxis-policy-apl-core 0.6.0",
+ "praxis-policy-apl-runtime 0.6.0",
+ "praxis-policy-builtins 0.6.0",
+ "praxis-policy-core 0.6.0",
+]
+
+[[package]]
+name = "praxis-policy"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba9565c9143abbb0fcb315f968713c3e8d7fda05f3cf8f66c19c0aa1f1d31f31"
+dependencies = [
+ "praxis-policy-apl-cmf 0.7.0",
+ "praxis-policy-apl-core 0.7.0",
+ "praxis-policy-apl-runtime 0.7.0",
+ "praxis-policy-builtins 0.7.0",
+ "praxis-policy-core 0.7.0",
 ]
 
 [[package]]
@@ -3792,8 +3803,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "200333ebf208821f40f17070a27936d32867284605c103657fedaed6c12f504b"
 dependencies = [
  "chrono",
- "praxis-policy-apl-core",
- "praxis-policy-core",
+ "praxis-policy-apl-core 0.6.0",
+ "praxis-policy-core 0.6.0",
+ "serde_json",
+]
+
+[[package]]
+name = "praxis-policy-apl-cmf"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "becb5da1b6d2308ed1fadd7708499059535b0ff1bf4733b346910c02585b33fd"
+dependencies = [
+ "chrono",
+ "praxis-policy-apl-core 0.7.0",
+ "praxis-policy-core 0.7.0",
  "serde_json",
 ]
 
@@ -3805,7 +3828,24 @@ checksum = "abade295a61836accbfb9c860b3196e5491a34a378ca4769566674779511d1fa"
 dependencies = [
  "async-trait",
  "futures",
- "praxis-policy-orchestration",
+ "praxis-policy-orchestration 0.6.0",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "yaml_serde",
+]
+
+[[package]]
+name = "praxis-policy-apl-core"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9493f8caa280055034b071f36cb5162e9ae6ae6d93d7bf6c8b740998189b9977"
+dependencies = [
+ "async-trait",
+ "futures",
+ "praxis-policy-orchestration 0.7.0",
  "regex",
  "serde",
  "serde_json",
@@ -3822,9 +3862,27 @@ checksum = "1ce569d880efacc2c4893bdda5c1751095a90b2e9707ee92ff12366a61c91f5d"
 dependencies = [
  "async-trait",
  "chrono",
- "praxis-policy-apl-cmf",
- "praxis-policy-apl-core",
- "praxis-policy-core",
+ "praxis-policy-apl-cmf 0.6.0",
+ "praxis-policy-apl-core 0.6.0",
+ "praxis-policy-core 0.6.0",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "yaml_serde",
+]
+
+[[package]]
+name = "praxis-policy-apl-runtime"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "430342f3ca72c828db96465a2d6353661e23eed25009218b988a5af7ba0c21b4"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "praxis-policy-apl-cmf 0.7.0",
+ "praxis-policy-apl-core 0.7.0",
+ "praxis-policy-core 0.7.0",
  "serde_json",
  "thiserror",
  "tokio",
@@ -3840,6 +3898,30 @@ checksum = "9629f9ab2cd663fb095a3e75feffe90497250af1dda841f70fac3b4ed80f1ed7"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "praxis-policy-apl-cmf 0.6.0",
+ "praxis-policy-apl-runtime 0.6.0",
+ "praxis-policy-core 0.6.0",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+ "yaml_serde",
+ "zeroize",
+]
+
+[[package]]
+name = "praxis-policy-builtins"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5a97788156632556d251b980925b9630840d4a67fa2f3d9fec3b415c9f95e55"
+dependencies = [
+ "arc-swap",
+ "async-trait",
  "base64 0.23.1",
  "bytes",
  "cedar-policy",
@@ -3850,10 +3932,10 @@ dependencies = [
  "hmac",
  "jsonwebtoken",
  "moka",
- "praxis-policy-apl-cmf",
- "praxis-policy-apl-core",
- "praxis-policy-apl-runtime",
- "praxis-policy-core",
+ "praxis-policy-apl-cmf 0.7.0",
+ "praxis-policy-apl-core 0.7.0",
+ "praxis-policy-apl-runtime 0.7.0",
+ "praxis-policy-core 0.7.0",
  "redis",
  "regorus",
  "serde",
@@ -3884,7 +3966,36 @@ dependencies = [
  "hashbrown 0.17.1",
  "hmac",
  "http",
- "praxis-policy-orchestration",
+ "praxis-policy-orchestration 0.6.0",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "wildmatch",
+ "yaml_serde",
+ "zeroize",
+]
+
+[[package]]
+name = "praxis-policy-core"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc2a7e63a7402b7dd96e16f9d22858e0b3ced8f8e82bfefd3554cfa71d151ebf"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "getrandom 0.4.3",
+ "hashbrown 0.17.1",
+ "hmac",
+ "http",
+ "praxis-policy-orchestration 0.7.0",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -3909,9 +4020,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "praxis-policy-orchestration"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d938a2ce09d90761befd75dbaf02e492a8a923d8a941f7d26f02d136eb82324a"
+dependencies = [
+ "futures",
+ "tokio",
+]
+
+[[package]]
 name = "praxis-proxy"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/praxis?branch=main#32a9eff78b75109f6af0798c16d84f8295821abb"
+source = "git+https://github.com/praxis-proxy/praxis?branch=main#736e95a5b4a45bcdef53724987139d3a140acb87"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -3932,7 +4053,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-core"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/praxis?branch=main#32a9eff78b75109f6af0798c16d84f8295821abb"
+source = "git+https://github.com/praxis-proxy/praxis?branch=main#736e95a5b4a45bcdef53724987139d3a140acb87"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3958,7 +4079,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-filter"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/praxis?branch=main#32a9eff78b75109f6af0798c16d84f8295821abb"
+source = "git+https://github.com/praxis-proxy/praxis?branch=main#736e95a5b4a45bcdef53724987139d3a140acb87"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3971,7 +4092,7 @@ dependencies = [
  "openssl",
  "parking_lot",
  "percent-encoding",
- "praxis-policy",
+ "praxis-policy 0.7.0",
  "praxis-proxy-core",
  "praxis-proxy-tls",
  "rand 0.10.4",
@@ -3992,7 +4113,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-protocol"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/praxis?branch=main#32a9eff78b75109f6af0798c16d84f8295821abb"
+source = "git+https://github.com/praxis-proxy/praxis?branch=main#736e95a5b4a45bcdef53724987139d3a140acb87"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4008,7 +4129,6 @@ dependencies = [
  "quixotic-plecostomus-core",
  "quixotic-plecostomus-http",
  "quixotic-plecostomus-proxy",
- "rand 0.10.4",
  "rustls",
  "serde",
  "serde_json",
@@ -4022,7 +4142,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-tls"
 version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/praxis?branch=main#32a9eff78b75109f6af0798c16d84f8295821abb"
+source = "git+https://github.com/praxis-proxy/praxis?branch=main#736e95a5b4a45bcdef53724987139d3a140acb87"
 dependencies = [
  "arc-swap",
  "notify",
@@ -4536,7 +4656,7 @@ dependencies = [
  "arrayvec 0.7.8",
  "async-channel",
  "flurry",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
  "log",
  "parking_lot",
  "rand 0.10.4",
