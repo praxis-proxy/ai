@@ -1491,7 +1491,8 @@ jobs:
             auth=(-H "Authorization: Bearer $HUGGING_FACE_HUB_TOKEN")
           fi
           revision=$(curl --fail --silent --show-error --retry 3 --max-time 30 \
-            "${auth[@]}" "https://huggingface.co/api/models/$CODEX_MODEL" | jq -er '.sha')
+            "${auth[@]}" "https://huggingface.co/api/models/$CODEX_MODEL" | \
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["sha"])')
           if ! [[ "$revision" =~ ^[0-9a-f]{40}$ ]]; then
             echo '::error::Hugging Face did not return a model commit SHA'
             exit 1
