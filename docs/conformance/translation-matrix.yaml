@@ -647,10 +647,14 @@ surfaces:
           output and total_tokens no longer equals prompt + completion.
         evidence: apis/src/vertex/gemini/response.rs:521-534
       cache-accounting:
-        status: dropped
-        note: cachedContentTokenCount is discarded; no prompt_tokens_details.cached_tokens is emitted.
-        blocker: https://github.com/praxis-proxy/ai/issues/2051
-        evidence: apis/src/vertex/gemini/response.rs:521-534
+        status: translated
+        note: >-
+          cachedContentTokenCount maps to prompt_tokens_details.cached_tokens
+          on finite responses and on the trailing include_usage chunk. Both
+          counts are subsets of the prompt total, so prompt_tokens is
+          unchanged; the details object is omitted when Vertex reports no
+          cached count.
+        evidence: apis/src/vertex/gemini/response.rs:529-551; apis/src/vertex/gemini/response.rs:138-145; apis/src/vertex/gemini/response.rs:220-226; apis/src/vertex/gemini/response.rs:720-740
       reasoning-content:
         status: dropped
         note: >-

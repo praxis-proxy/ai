@@ -1311,6 +1311,7 @@ mod tests {
                 vec!["openai_chat_completions_to_vertexai_gemini"],
                 vec!["openai_chat_completions_to_vertexai_gemini"],
                 vec!["openai_chat_completions_to_vertexai_gemini"],
+                vec!["openai_chat_completions_to_vertexai_gemini"],
                 vec!["messages_to_chat_completions"],
                 vec!["anthropic_messages_to_vertexai_anthropic"],
                 vec!["anthropic_messages_to_vertexai_anthropic"],
@@ -1438,11 +1439,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 99, "manifest feature inventory count");
-        assert_eq!(report.scenarios_total, 76, "manifest scenario inventory count");
-        assert_eq!(report.recordings_total, 81, "manifest recording inventory count");
+        assert_eq!(report.features_total, 100, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 77, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 82, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1520,11 +1522,12 @@ mod tests {
                 "responses/responses-to-chat-completions-reasoning-agentic",
                 "vertex/anthropic-wire-translation",
                 "vertex/bounded-stream-limits",
+                "vertex/cached-usage",
                 "vertex/fallback-response-id",
                 "vertex/invalid-content",
             ]
         );
-        assert_eq!(manifest.features.len(), 99, "manifest must declare every feature");
+        assert_eq!(manifest.features.len(), 100, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1889,6 +1892,10 @@ mod tests {
                 (
                     &"vertex.gemini.response.fallback_id".to_owned(),
                     &vec!["vertex/fallback-response-id".to_owned()]
+                ),
+                (
+                    &"vertex.gemini.response.cached_usage".to_owned(),
+                    &vec!["vertex/cached-usage".to_owned()]
                 ),
                 (
                     &"vertex.gemini.streaming.candidate_limit".to_owned(),
