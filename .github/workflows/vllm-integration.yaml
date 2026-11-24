@@ -2948,6 +2948,8 @@ jobs:
         env:
           QUALIFICATION_SETUP: ${{ steps.qualification_build.outcome == 'success' && steps.qualification_vllm_ready.outcome == 'success' && steps.qualification_ogx_ready.outcome == 'success' && 'passed' || 'failed' }}
           GPU_INSTANCE_TYPE: ${{ inputs.gpu_instance_type || env.GPU_INSTANCE_TYPE }}
+          # Empty when resolve rejected the published image and it was built here.
+          VLLM_GPU_IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
         run: |
           python3 .github/scripts/vllm_qualification.py capture \
             --responses "$RUNNER_TEMP/qualification-responses-cases.json" \

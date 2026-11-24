@@ -241,6 +241,10 @@ class QualificationTest(unittest.TestCase):
                 ))
             captured = json.loads(output.read_text())
             self.assertEqual(captured["backend"]["version"], "0.32.0")
+            # Every image_inspect query answers, as podman's RepoDigests does for
+            # a local build; without a digest from resolve it is still local.
+            self.assertEqual(captured["backend"]["image_source"], "local-build")
+            self.assertIsNone(captured["backend"]["registry_digest"])
             # Missing model metadata remains unknown, not fabricated.
             self.assertIsNone(captured["model"]["resolved_revision"])
             self.assertEqual(len(probes), 2)
@@ -258,6 +262,29 @@ class QualificationTest(unittest.TestCase):
             )
             self.assertEqual(unavailable["status"], "incomplete")
             self.assertEqual(unavailable["reason"], "required provenance unavailable: vLLM version")
+
+    def test_capture_reports_registry_only_with_resolved_digest(self):
+        # resolve-vllm-gpu-image hands over the pulled image's digest only when
+        # it reused the published build.
+        digest = "ghcr.io/praxis-proxy/vllm-gpu@sha256:" + "e" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            cases = directory / "cases.json"
+            cases.write_text(json.dumps({"selected": [], "exit_code": 0}))
+            output = directory / "raw.json"
+            with mock.patch.dict(os.environ, {
+                "CONTAINER_RUNTIME": "podman", "VLLM_GPU_MODEL": "test-model",
+                "VLLM_GPU_IMAGE_DIGEST": digest,
+            }), mock.patch.object(qualification.subprocess, "check_output", return_value="available"), \
+                 mock.patch.object(qualification, "file_hash", return_value="b" * 64), \
+                 mock.patch.object(qualification, "locked_version", return_value="0.8.0"), \
+                 mock.patch.object(qualification, "image_inspect", return_value="image-id"):
+                qualification.capture(SimpleNamespace(
+                    responses=cases, credentialed=cases, setup="passed", output=output,
+                ))
+            backend = json.loads(output.read_text())["backend"]
+        self.assertEqual(backend["image_source"], "registry")
+        self.assertEqual(backend["registry_digest"], digest)
 
     def test_client_fixture_profiles_and_unknown_paths(self):
         def item(*fixtures, override=None):

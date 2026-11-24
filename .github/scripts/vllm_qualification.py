@@ -180,10 +180,12 @@ def capture(args):
     # working tree. The suite reuses the build vllm-gpu-container.yaml published
     # whenever it matches this checkout, so "what the image was built from" is
     # the honest claim; hashing the checked-out Containerfile would describe a
-    # build that may never have happened on this runner. A registry digest is
-    # present only when the image was pulled, absent when it was built here.
-    registry_digest = image_inspect(
-        runtime, image, "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}")
+    # build that may never have happened on this runner. The registry digest
+    # comes from resolve-vllm-gpu-image, which reports one only when it reused
+    # the pulled image. The image's own RepoDigests cannot decide this: podman
+    # records a manifest digest for a local build too, which would label a
+    # build that was never pushed as a registry pull.
+    registry_digest = os.environ.get("VLLM_GPU_IMAGE_DIGEST") or None
     containerfile_sha256 = (image_label(runtime, image, "praxis.vllm.containerfile-sha256")
                             or file_hash("vllm/Containerfile"))
     base_image = image_label(runtime, image, "praxis.vllm.base-image")
