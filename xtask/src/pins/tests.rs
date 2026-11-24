@@ -417,6 +417,17 @@ mod bump {
         );
     }
 
+    #[test]
+    fn codex_checklist_names_every_acceptance_lane() {
+        let items = checklist(Pin::Codex, "0.163.0", "0.164.0");
+        for lane in ["`codex-http`", "`codex-websocket`", "`vllm-gpu-codex-acceptance`"] {
+            assert!(
+                items.iter().any(|item| item.contains(lane)),
+                "{lane} missing: {items:#?}"
+            );
+        }
+    }
+
     /// The pinned Codex version, its recording, and that recording carried
     /// to `9.9.9`.
     fn carried_pinned_recording() -> (String, String, String) {

@@ -483,6 +483,16 @@ pub(crate) fn checklist(pin: Pin, old: &str, new: &str) -> Vec<String> {
     items
 }
 
+/// Codex re-validation items: the observed behaviors, then every lane that
+/// drives a documented Codex route against the new build.
+const CODEX_CHECKLIST: &[&str] = &[
+    "Re-check the observed behaviors cited in `codex_http.rs` against the new build.",
+    "Check that `codex-http` passes: it drives native Responses and Responses → Chat Completions over HTTP/SSE.",
+    "Check that `codex-websocket` passes: it drives native Responses over WebSocket.",
+    "Check that `vllm-gpu-codex-acceptance` passes under `vllm-full-suite`: it proves the routes and \
+     capabilities in the client guide's Codex CLI qualification table on real vLLM.",
+];
+
 /// The fixed checklist items for each pin.
 const fn checklist_items(pin: Pin) -> &'static [&'static str] {
     match pin {
@@ -507,7 +517,7 @@ const fn checklist_items(pin: Pin) -> &'static [&'static str] {
             "Re-check JSON-mode exit codes, stdin behavior, and `unresolved_header_error`.",
             "Check that `pi-cpu` passes: the guide's \"verified against pi\" lines were updated on the strength of it.",
         ],
-        Pin::Codex => &["Re-check the observed behaviors cited in `codex_http.rs` against the new build."],
+        Pin::Codex => CODEX_CHECKLIST,
         Pin::Vllm => &[
             "Review version-conditioned xfails and skips in the live SDK and suite tests.",
             "Re-check the client guide's vLLM claims and the CUDA image notes in `vllm-integration.yaml`.",
