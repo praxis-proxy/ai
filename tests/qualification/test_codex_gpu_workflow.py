@@ -12,12 +12,99 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = (ROOT / ".github/workflows/vllm-integration.yaml").read_text()
 CODEX_JOB = "vllm-gpu-codex-acceptance"
+CANDIDATE_CRON = "42 7 * * 1"
+CANDIDATE_WORKFLOW = ROOT / ".github/workflows/codex-candidate-qualification.yaml"
+RUNNER_ACTION = (ROOT / ".github/actions/start-ec2-runner/action.yml").read_text()
+
+
+def job_body(job):
+    return re.split(r"\n  [a-z][a-z0-9-]*:\n", WORKFLOW.split(f"\n  {job}:\n", 1)[1], maxsplit=1)[0]
 
 
 def step_script(job, step):
-    job_body = re.split(r"\n  [a-z][a-z0-9-]*:\n", WORKFLOW.split(f"\n  {job}:\n", 1)[1], maxsplit=1)[0]
-    body = job_body.split(f"      - name: {step}\n", 1)[1].split("\n      - ", 1)[0]
+    job_body_text = job_body(job)
+    body = job_body_text.split(f"      - name: {step}\n", 1)[1].split("\n      - ", 1)[0]
     return "\n".join(line.removeprefix("          ") for line in body.split("        run: |\n", 1)[1].splitlines())
+
+
+class CodexGpuScheduleTest(unittest.TestCase):
+    def test_opt_in_schedule_only_runs_candidate_lane(self):
+        self.assertNotIn(f'- cron: "{CANDIDATE_CRON}"', WORKFLOW)
+        self.assertIn('- cron: "17 4 * * *"', WORKFLOW)
+        candidate = " ".join(CANDIDATE_WORKFLOW.read_text().split())
+        self.assertIn(f'- cron: "{CANDIDATE_CRON}"', candidate)
+        self.assertIn(
+            "github.repository == 'praxis-proxy/ai' && "
+            "github.ref == 'refs/heads/main' && "
+            "vars.CODEX_GPT_OSS_120B_SCHEDULE == 'true'",
+            candidate,
+        )
+        self.assertIn("uses: ./.github/workflows/vllm-integration.yaml", candidate)
+        self.assertIn("scheduled_codex_candidate: true", candidate)
+        start = " ".join(job_body("gpu-start-runner").split())
+        self.assertIn("if: | github.event_name == 'schedule' ||", start)
+        self.assertIn("inputs.scheduled_codex_candidate && 'p5.4xlarge'", start)
+        self.assertIn("&& vars.AWS_GPU_FALLBACK_SUBNET_IDS || ''", start)
+        for job in ("vllm-responses", "vllm-live-cpu", "vllm-responses-postgres"):
+            with self.subTest(job=job):
+                self.assertIn("github.event_name != 'schedule'", job_body(job).split("    steps:", 1)[0])
+        for job in ("pins", "vllm-gpu-claude-acceptance", "vllm-gpu-opencode-acceptance",
+                    "vllm-gpu-pi-acceptance", "vllm-gpu-full-suite"):
+            with self.subTest(job=job):
+                condition = " ".join(job_body(job).split("    steps:", 1)[0].split())
+                self.assertIn("github.event_name == 'schedule' && !inputs.scheduled_codex_candidate", condition)
+        codex = " ".join(job_body(CODEX_JOB).split())
+        self.assertIn("needs.gpu-start-runner.result == 'success'", codex)
+        for value in ("openai/gpt-oss-120b", "gpt-oss-120b", "openai", "openai_gptoss"):
+            self.assertIn(f"inputs.scheduled_codex_candidate && '{value}'", codex)
+        self.assertIn("CODEX_CANDIDATE: >- ${{ inputs.scheduled_codex_candidate ||", codex)
+        self.assertIn("inputs.scheduled_codex_candidate || inputs.codex_skip_translated", codex)
+        self.assertIn("env.CODEX_SKIP_TRANSLATED != 'true'", codex)
+        for case in ("codex_native", "codex_compaction"):
+            with self.subTest(case=case):
+                step = job_body(CODEX_JOB).split(f"        id: {case}\n", 1)[1].split("\n      - ", 1)[0]
+                self.assertIn("PRAXIS_TEST_CODEX_CANDIDATE: ${{ env.CODEX_CANDIDATE }}", step)
+                self.assertNotIn("CODEX_SKIP_TRANSLATED", step)
+        stop = job_body("gpu-stop-runner")
+        self.assertIn(CODEX_JOB, stop)
+        self.assertIn("always() &&", stop)
+        self.assertIn("needs.gpu-start-runner.outputs.ec2-instance-id != ''", stop)
+        summary = " ".join(job_body("gpu-qualification-summary").split())
+        self.assertIn(CODEX_JOB, summary)
+        self.assertIn("if: always()", summary)
+        self.assertIn("GPU_REQUESTED: >- ${{ (github.event_name == 'schedule' && !inputs.scheduled_codex_candidate)", summary)
+
+    def test_fallback_passes_ordered_same_region_configs_to_pinned_action(self):
+        self.assertIn("availability-zones-config: ${{ steps.subnets.outputs.config }}", RUNNER_ACTION)
+        step = RUNNER_ACTION.split("    - name: Build EC2 subnet fallback\n", 1)[1].split("\n    - ", 1)[0]
+        self.assertIn("if: inputs.fallback-subnet-ids != ''", step)
+        script = "\n".join(line.removeprefix("        ") for line in step.split("      run: |\n", 1)[1].splitlines())
+        primary, first, second = ("subnet-11111111", "subnet-22222222", "subnet-33333333")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            env = {
+                **os.environ,
+                "GITHUB_OUTPUT": str(output),
+                "AWS_GPU_AMI_ID": "ami-test",
+                "AWS_SUBNET_ID": primary,
+                "AWS_SECURITY_GROUP_ID": "sg-test",
+                "FALLBACK_SUBNET_IDS": f"{first}\n{second} {primary}",
+            }
+            result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(output.read_text().removeprefix("config=")), [
+                {"imageId": "ami-test", "subnetId": subnet, "securityGroupId": "sg-test"}
+                for subnet in (primary, first, second)
+            ])
+            output.unlink()
+            for bad in ("not-a-subnet", "subnet-abc", f"{first} {second} subnet-44444444"):
+                with self.subTest(bad=bad):
+                    result = subprocess.run(
+                        ["bash", "-c", script], env={**env, "FALLBACK_SUBNET_IDS": bad},
+                        capture_output=True, text=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(output.exists())
 
 
 class CodexGpuDispatchTest(unittest.TestCase):

@@ -51,6 +51,19 @@ on:
     # Avoid overlapping the repository's 02:47 UTC nightly workflow and
     # 03:02 UTC CodeQL schedule.
     - cron: "17 4 * * *"
+  workflow_call:
+    inputs:
+      scheduled_codex_candidate:
+        description: Run only the scheduled native gpt-oss-120b Codex profile.
+        required: true
+        type: boolean
+    secrets:
+      PRAXIS_RUNNER_PAT:
+        required: true
+      HUGGING_FACE_HUB_TOKEN:
+        required: false
+      TAVILY_API_KEY:
+        required: false
   workflow_dispatch:
     inputs:
       run_live_vllm:
@@ -602,7 +615,7 @@ jobs:
   pins:
     name: Load Claude Code + OpenCode + pi + vLLM acceptance pins
     if: >-
-      github.event_name == 'schedule' ||
+      (github.event_name == 'schedule' && !inputs.scheduled_codex_candidate) ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
        github.event.action == 'labeled' &&
@@ -714,7 +727,7 @@ jobs:
           github.event.action == 'labeled' &&
           github.event.label.name == 'vllm-full-suite'
         ) ||
-        github.event_name == 'schedule'
+        (github.event_name == 'schedule' && !inputs.scheduled_codex_candidate)
       )
     runs-on: ${{ needs.gpu-start-runner.outputs.label }}
     # The pinned upstream image downloads ~16GB of Qwen3-8B on a cold cache;
@@ -1413,10 +1426,23 @@ jobs:
       CODEX_BIN: codex-x86_64-unknown-linux-musl
       CODEX_VERSION: "0.170.0"
       CODEX_CANDIDATE: >-
-        ${{ github.event_name == 'workflow_dispatch' && inputs.codex_model != '' }}
-      CODEX_VLLM_MODEL: ${{ inputs.codex_served_model_name || 'qwen3-8b' }}
-      CODEX_TOOL_CALL_PARSER: ${{ inputs.codex_tool_call_parser || 'hermes' }}
-      CODEX_REASONING_PARSER: ${{ inputs.codex_reasoning_parser || 'deepseek_r1' }}
+        ${{ inputs.scheduled_codex_candidate ||
+          (github.event_name == 'workflow_dispatch' &&
+            inputs.codex_model != '') }}
+      CODEX_CANDIDATE_MODEL: >-
+        ${{ (inputs.scheduled_codex_candidate && 'openai/gpt-oss-120b')
+          || inputs.codex_model }}
+      CODEX_VLLM_MODEL: >-
+        ${{ (inputs.scheduled_codex_candidate && 'gpt-oss-120b')
+          || inputs.codex_served_model_name || 'qwen3-8b' }}
+      CODEX_TOOL_CALL_PARSER: >-
+        ${{ (inputs.scheduled_codex_candidate && 'openai')
+          || inputs.codex_tool_call_parser || 'hermes' }}
+      CODEX_REASONING_PARSER: >-
+        ${{ (inputs.scheduled_codex_candidate && 'openai_gptoss')
+          || inputs.codex_reasoning_parser || 'deepseek_r1' }}
+      CODEX_SKIP_TRANSLATED: >-
+        ${{ inputs.scheduled_codex_candidate || inputs.codex_skip_translated }}
       CODEX_TENSOR_PARALLEL_SIZE: ${{ inputs.codex_tensor_parallel_size || '1' }}
       CODEX_MAX_MODEL_LEN: ${{ inputs.codex_max_model_len || '16384' }}
     steps:
@@ -1502,7 +1528,7 @@ jobs:
       - name: Resolve Codex candidate snapshot
         if: env.CODEX_CANDIDATE == 'true'
         env:
-          CODEX_MODEL: ${{ inputs.codex_model }}
+          CODEX_MODEL: ${{ env.CODEX_CANDIDATE_MODEL }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -1521,7 +1547,8 @@ jobs:
 
       - name: Start keyed vLLM for Codex
         env:
-          CODEX_MODEL: ${{ inputs.codex_model || env.VLLM_GPU_MODEL }}
+          CODEX_MODEL: >-
+            ${{ env.CODEX_CANDIDATE_MODEL || env.VLLM_GPU_MODEL }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -1571,8 +1598,6 @@ jobs:
 
       - name: Preflight vLLM Responses and Chat Completions
         id: codex_vllm_preflight
-        env:
-          CODEX_SKIP_TRANSLATED: ${{ inputs.codex_skip_translated }}
         run: |
           set -euo pipefail
           deadline=$((SECONDS + 1200))
@@ -1715,7 +1740,12 @@ jobs:
 
       - name: Run Codex translated-Chat vLLM acceptance test (once, no retry)
         id: codex_translated
-        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && !inputs.codex_skip_translated && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
+        if: >-
+          always() && !cancelled() && !inputs.run_compaction_only &&
+          env.CODEX_SKIP_TRANSLATED != 'true' &&
+          steps.codex_vllm_preflight.outcome == 'success' &&
+          steps.codex_namespace.outcome == 'success' &&
+          steps.codex_test_binary.outcome == 'success'
         env:
           PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
@@ -1809,9 +1839,10 @@ jobs:
           CODEX_NATIVE: ${{ steps.codex_native.outcome }}
           CODEX_TRANSLATED: ${{ steps.codex_translated.outcome }}
           CODEX_COMPACTION: ${{ steps.codex_compaction.outcome }}
-          CODEX_MODEL: ${{ inputs.codex_model || env.VLLM_GPU_MODEL }}
+          CODEX_MODEL: >-
+            ${{ env.CODEX_CANDIDATE_MODEL || env.VLLM_GPU_MODEL }}
           CODEX_GPU_INSTANCE_TYPE: >-
-            ${{ inputs.gpu_instance_type || env.GPU_INSTANCE_TYPE }}
+            ${{ needs.gpu-start-runner.outputs.instance-type }}
         run: |
           python3 .github/scripts/vllm_qualification.py capture-codex --output "$RUNNER_TEMP/codex-acceptance.json"
           python3 - "$RUNNER_TEMP/codex-acceptance.json" <<'PY'
@@ -1944,7 +1975,8 @@ jobs:
       !cancelled() &&
       needs.gpu-start-runner.result == 'success' &&
       (
-        github.event_name == 'schedule' ||
+        (github.event_name == 'schedule' &&
+          !inputs.scheduled_codex_candidate) ||
         (
           github.event_name == 'workflow_dispatch' &&
           (inputs.run_live_vllm || inputs.run_opencode_acceptance)
@@ -2412,7 +2444,8 @@ jobs:
       !cancelled() &&
       needs.gpu-start-runner.result == 'success' &&
       (
-        github.event_name == 'schedule' ||
+        (github.event_name == 'schedule' &&
+          !inputs.scheduled_codex_candidate) ||
         (
           github.event_name == 'workflow_dispatch' &&
           (inputs.run_live_vllm || inputs.run_pi_acceptance)
@@ -2793,6 +2826,7 @@ jobs:
     outputs:
       label: ${{ steps.start.outputs.label }}
       ec2-instance-id: ${{ steps.start.outputs.ec2-instance-id }}
+      instance-type: ${{ steps.runner-config.outputs.instance-type }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -2835,6 +2869,16 @@ jobs:
             exit 1
           fi
 
+      - name: Select GPU instance type
+        id: runner-config
+        env:
+          RUNNER_INSTANCE_TYPE: >-
+            ${{ (inputs.scheduled_codex_candidate && 'p5.4xlarge')
+              || inputs.gpu_instance_type || env.GPU_INSTANCE_TYPE }}
+        run: |
+          printf 'instance-type=%s\n' "$RUNNER_INSTANCE_TYPE" \
+            >> "$GITHUB_OUTPUT"
+
       - name: Start EC2 GPU runner
         id: start
         uses: ./.github/actions/start-ec2-runner
@@ -2843,8 +2887,13 @@ jobs:
           aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
           ami-id: ${{ vars.AWS_GPU_AMI_ID }}
           subnet-id: ${{ vars.AWS_SUBNET_ID || vars.US_EAST_2A_SUBNET_ID }}
+          fallback-subnet-ids: >-
+            ${{ (inputs.scheduled_codex_candidate ||
+              (github.event_name == 'workflow_dispatch' &&
+                inputs.codex_model != '')) && vars.AWS_GPU_FALLBACK_SUBNET_IDS
+              || '' }}
           security-group-id: ${{ vars.AWS_SECURITY_GROUP_ID || vars.US_EAST_2_SG_ID }}
-          instance-type: ${{ inputs.gpu_instance_type || env.GPU_INSTANCE_TYPE }}
+          instance-type: ${{ steps.runner-config.outputs.instance-type }}
           github-token: ${{ secrets.PRAXIS_RUNNER_PAT }}
 
   vllm-gpu-full-suite:
@@ -2857,7 +2906,8 @@ jobs:
       !cancelled() &&
       needs.gpu-start-runner.result == 'success' &&
       (
-        github.event_name == 'schedule' ||
+        (github.event_name == 'schedule' &&
+          !inputs.scheduled_codex_candidate) ||
         (github.event_name == 'workflow_dispatch' && inputs.run_live_vllm) ||
         (
           github.event_name == 'pull_request' &&
@@ -3251,7 +3301,14 @@ jobs:
 
       - name: Build report and Actions summary
         env:
-          GPU_REQUESTED: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_live_vllm) || (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == 'vllm-full-suite') }}
+          GPU_REQUESTED: >-
+            ${{ (github.event_name == 'schedule' &&
+                  !inputs.scheduled_codex_candidate) ||
+              (github.event_name == 'workflow_dispatch' &&
+                inputs.run_live_vllm) ||
+              (github.event_name == 'pull_request' &&
+                github.event.action == 'labeled' &&
+                github.event.label.name == 'vllm-full-suite') }}
           GPU_START_RESULT: ${{ needs.gpu-start-runner.result }}
           GPU_SUITE_RESULT: ${{ needs.vllm-gpu-full-suite.result }}
           CLAUDE_RESULT: ${{ needs.vllm-gpu-claude-acceptance.result }}

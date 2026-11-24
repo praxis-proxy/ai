@@ -1,0 +1,25 @@
+name: Codex Candidate GPU Qualification
+
+on:
+  schedule:
+    - cron: "42 7 * * 1"
+
+permissions: {}
+
+jobs:
+  qualify:
+    if: >-
+      github.repository == 'praxis-proxy/ai' &&
+      github.ref == 'refs/heads/main' &&
+      vars.CODEX_GPT_OSS_120B_SCHEDULE == 'true'
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      packages: read
+    uses: ./.github/workflows/vllm-integration.yaml
+    with:
+      scheduled_codex_candidate: true
+    secrets:
+      PRAXIS_RUNNER_PAT: ${{ secrets.PRAXIS_RUNNER_PAT }}
+      HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
