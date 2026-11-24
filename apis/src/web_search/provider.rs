@@ -9,6 +9,7 @@
 //! [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
 
 use std::{
+    fmt::Write as _,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -188,6 +189,20 @@ fn default_base_url(provider: SearchProvider) -> &'static str {
         SearchProvider::Tavily => "https://api.tavily.com",
         SearchProvider::You => "https://api.you.com",
     }
+}
+
+/// Join a configured search `base_url` with a provider endpoint path (and
+/// optional query string).
+///
+/// Trailing slashes on the base are ignored so equivalent spellings such as
+/// `/api` and `/api/` produce the same final URL when a provider path that
+/// starts with `/` is appended.
+fn join_base_url(base: &str, path_and_query: &str) -> String {
+    debug_assert!(
+        path_and_query.starts_with('/'),
+        "provider endpoint paths must start with '/'"
+    );
+    format!("{}{path_and_query}", base.trim_end_matches('/'))
 }
 
 /// The request header and value prefix a provider carries its API key under.
@@ -757,8 +772,12 @@ impl SearchClient {
     /// location signal rather than a lat/long fallback.
     fn build_brave_request(&self, query: &str, count: u32, country: Option<&str>) -> (String, SubRequest) {
         let encoded_query = percent_encoding::utf8_percent_encode(query, percent_encoding::NON_ALPHANUMERIC);
-        let base = self.effective_base_url();
-        let url = format!("{base}/res/v1/web/search?q={encoded_query}&count={count}");
+        // Join the static path first so trailing-slash normalization does not
+        // allocate a temporary query String, then append the encoded params.
+        let mut url = join_base_url(self.effective_base_url(), "/res/v1/web/search");
+        // `Write` for `String` is infallible; bind the `Result` so clippy does
+        // not flag `let _ =` on a `#[must_use]` type.
+        let _written = write!(url, "?q={encoded_query}&count={count}");
 
         // The API key is NOT set here: it is staged as an authority-bound
         // `DeferredCredential` (`x-subscription-token`) in `prepare_staged_request`
@@ -822,8 +841,7 @@ impl SearchClient {
         );
         headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
 
-        let base = self.effective_base_url();
-        let url = format!("{base}/search");
+        let url = join_base_url(self.effective_base_url(), "/search");
         (
             url,
             SubRequest {
@@ -863,8 +881,7 @@ impl SearchClient {
         );
         headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
 
-        let base = self.effective_base_url();
-        let url = format!("{base}/v1/search");
+        let url = join_base_url(self.effective_base_url(), "/v1/search");
         (
             url,
             SubRequest {
@@ -1368,6 +1385,73 @@ mod tests {
         assert!(
             url.starts_with("http://localhost:9999/"),
             "base_url should override the default You.com URL; got: {url}"
+        );
+    }
+
+    fn client_with_base(provider: SearchProvider, base: &str) -> SearchClient {
+        let config = ValidatedConfig {
+            provider,
+            api_key: test_api_key("test-key"),
+            default_context_size: SearchContextSize::Medium,
+            timeout_ms: 5000,
+            max_body_bytes: 64 * 1024 * 1024,
+            max_query_bytes: MAX_SEARCH_QUERY_BYTES,
+            base_url: Some(base.into()),
+            user_credential: None,
+        };
+        SearchClient::from_config("test", &config, test_subrequest_client()).unwrap()
+    }
+
+    #[test]
+    fn join_base_url_strips_trailing_slash_before_provider_path() {
+        assert_eq!(
+            join_base_url("http://127.0.0.1:9999/api", "/search"),
+            "http://127.0.0.1:9999/api/search"
+        );
+        assert_eq!(
+            join_base_url("http://127.0.0.1:9999/api/", "/search"),
+            "http://127.0.0.1:9999/api/search"
+        );
+        assert_eq!(
+            join_base_url("http://127.0.0.1:9999/", "/res/v1/web/search?q=a&count=1"),
+            "http://127.0.0.1:9999/res/v1/web/search?q=a&count=1"
+        );
+    }
+
+    #[test]
+    fn trailing_slash_base_url_matches_bare_tavily_path() {
+        let bare = client_with_base(SearchProvider::Tavily, "http://127.0.0.1:9999/api");
+        let trailing = client_with_base(SearchProvider::Tavily, "http://127.0.0.1:9999/api/");
+        let (bare_url, _) = bare.build_tavily_request("q", SearchContextSize::Medium);
+        let (trailing_url, _) = trailing.build_tavily_request("q", SearchContextSize::Medium);
+        assert_eq!(bare_url, trailing_url);
+        assert_eq!(bare_url, "http://127.0.0.1:9999/api/search");
+    }
+
+    #[test]
+    fn trailing_slash_base_url_matches_bare_you_path() {
+        let bare = client_with_base(SearchProvider::You, "http://127.0.0.1:9999/api");
+        let trailing = client_with_base(SearchProvider::You, "http://127.0.0.1:9999/api/");
+        let (bare_url, _) = bare.build_you_request("q", 5, None);
+        let (trailing_url, _) = trailing.build_you_request("q", 5, None);
+        assert_eq!(bare_url, trailing_url);
+        assert_eq!(bare_url, "http://127.0.0.1:9999/api/v1/search");
+    }
+
+    #[test]
+    fn trailing_slash_base_url_matches_bare_brave_path() {
+        let bare = client_with_base(SearchProvider::Brave, "http://127.0.0.1:9999/api");
+        let trailing = client_with_base(SearchProvider::Brave, "http://127.0.0.1:9999/api/");
+        let (bare_url, _) = bare.build_brave_request("q", 5, None);
+        let (trailing_url, _) = trailing.build_brave_request("q", 5, None);
+        assert_eq!(bare_url, trailing_url);
+        assert!(
+            bare_url.starts_with("http://127.0.0.1:9999/api/res/v1/web/search?"),
+            "Brave path must keep a single separator after the base prefix; got {bare_url}"
+        );
+        assert!(
+            !bare_url.contains("/api//"),
+            "Brave must not double the separator after a path-prefix base; got {bare_url}"
         );
     }
 

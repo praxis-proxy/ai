@@ -33,11 +33,17 @@ const EXAMPLE: &str = "openai/responses/web-search-chat-completions.yaml";
 /// Read the example config and point its model backend and search provider at
 /// the given local mock ports.
 fn patched_yaml(listener_port: u16, model_port: u16, search_port: u16) -> String {
+    patched_yaml_with_search_base(listener_port, model_port, &format!("http://127.0.0.1:{search_port}"))
+}
+
+/// Like [`patched_yaml`], but allows an explicit search `base_url` (including a
+/// trailing slash or path prefix) so join behavior can be exercised end-to-end.
+fn patched_yaml_with_search_base(listener_port: u16, model_port: u16, search_base_url: &str) -> String {
     let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("example config should exist");
     let yaml = patch_yaml(&yaml, listener_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = yaml.replace(
         "env_var: WEB_SEARCH_API_KEY",
-        &format!("value: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+        &format!("value: test-key\n                base_url: {search_base_url}"),
     );
     // The provider callout targets a loopback mock, so the executor's SSRF check
     // requires the operator opt-in on the outbound pipeline.
@@ -50,6 +56,19 @@ fn patched_yaml(listener_port: u16, model_port: u16, search_port: u16) -> String
 fn load_test_config(listener_port: u16, model_port: u16, search_port: u16) -> praxis_core::config::Config {
     praxis_core::config::Config::from_yaml(&patched_yaml(listener_port, model_port, search_port))
         .expect("patched config should parse")
+}
+
+fn load_test_config_with_search_base(
+    listener_port: u16,
+    model_port: u16,
+    search_base_url: &str,
+) -> praxis_core::config::Config {
+    praxis_core::config::Config::from_yaml(&patched_yaml_with_search_base(
+        listener_port,
+        model_port,
+        search_base_url,
+    ))
+    .expect("patched config should parse")
 }
 
 /// Load the example with the logical-stream finalizer removed, modelling a
@@ -228,6 +247,89 @@ fn web_search_chat_completions_completes_model_search_model_round_trip() {
     assert!(
         !search_requests[0].uri.contains("country="),
         "country must not be forwarded as a query param: {}",
+        search_requests[0].uri
+    );
+}
+
+/// A trailing slash on `base_url` must not double the Brave provider path
+/// separator when the managed search callout is built.
+#[test]
+fn web_search_chat_completions_trailing_slash_base_url_keeps_single_path_separator() {
+    let first_response = json!({
+        "id": "chatcmpl_search",
+        "object": "chat.completion",
+        "model": "chat-only-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_search_1",
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": "{\"query\":\"Praxis Proxy latest release\"}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
+    });
+    let second_response = json!({
+        "id": "chatcmpl_answer",
+        "object": "chat.completion",
+        "model": "chat-only-model",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "Praxis Proxy has a current release."},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 24, "completion_tokens": 8, "total_tokens": 32}
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first_response.to_string()),
+        (200, second_response.to_string()),
+    ])
+    .start_with_shutdown();
+    let search = StatefulCapturingBackend::new(vec![(
+        200,
+        json!({
+            "web": {"results": [{
+                "title": "Praxis Proxy releases",
+                "url": "https://github.com/praxis-proxy/praxis/releases",
+                "description": "Current Praxis Proxy releases."
+            }]}
+        })
+        .to_string(),
+    )])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let search_base = format!("http://127.0.0.1:{}/", search.port());
+    let config = load_test_config_with_search_base(proxy_port, model.port(), &search_base);
+    let proxy = start_proxy(&config);
+    let request = json!({
+        "model": "chat-only-model",
+        "input": "Find the latest Praxis Proxy release.",
+        "tools": [{"type": "web_search"}],
+        "tool_choice": {"type": "web_search"},
+        "store": false
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 200, "round trip should succeed: {raw}");
+    let search_requests = search.requests();
+    assert_eq!(search_requests.len(), 1, "managed search should call the provider once");
+    assert!(
+        search_requests[0].uri.starts_with("/res/v1/web/search?"),
+        "trailing-slash base_url must keep a single path separator; got {}",
+        search_requests[0].uri
+    );
+    assert!(
+        !search_requests[0].uri.contains("//"),
+        "provider path must not contain a doubled separator; got {}",
         search_requests[0].uri
     );
 }
