@@ -181,10 +181,10 @@ fn merge<'a>(
 /// and always advance by `state.input.len()` so the current-input span stays aligned
 /// with the rest of merge's history arithmetic.
 fn appended_tool_start(live: &[Cow<'_, Value>], state: &ResponsesState) -> usize {
-    let input_len = state.input.len();
-    if input_len == 0 {
+    if state.input.is_empty() {
         return 0;
     }
+    let input_len = state.input.len();
     if let Some(start) = state.messages.rposition_run(&state.input) {
         return start + input_len;
     }
