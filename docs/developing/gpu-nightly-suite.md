@@ -218,7 +218,8 @@ preflight; both native gates still run.
 
 Download `qualification.json` from the `vllm-qualification` artifact. Under
 `suites.codex_acceptance`, `cases` contains the scenario results and
-`provenance` contains the checkpoint and alias, pinned vLLM image, parser and
+`provenance` contains the checkpoint and alias, the Hugging Face commit SHA
+pinned for candidate runs, the pinned vLLM image, parser and
 GPU settings, Codex version, and ordered Praxis filter names by case. The
 report only merges Codex evidence matching its run ID, attempt, and checkout
 SHA. The top-level `not_requested` status on a Codex-only run refers to the

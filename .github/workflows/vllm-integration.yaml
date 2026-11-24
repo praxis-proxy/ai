@@ -1479,6 +1479,25 @@ jobs:
           echo "::add-mask::$token"
           echo "CODEX_BACKEND_TOKEN=$token" >> "$GITHUB_ENV"
 
+      - name: Resolve Codex candidate snapshot
+        if: env.CODEX_CANDIDATE == 'true'
+        env:
+          CODEX_MODEL: ${{ inputs.codex_model }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth=()
+          if [ -n "$HUGGING_FACE_HUB_TOKEN" ]; then
+            auth=(-H "Authorization: Bearer $HUGGING_FACE_HUB_TOKEN")
+          fi
+          revision=$(curl --fail --silent --show-error --retry 3 --max-time 30 \
+            "${auth[@]}" "https://huggingface.co/api/models/$CODEX_MODEL" | jq -er '.sha')
+          if ! [[ "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Hugging Face did not return a model commit SHA'
+            exit 1
+          fi
+          echo "CODEX_MODEL_REVISION=$revision" >> "$GITHUB_ENV"
+
       - name: Start keyed vLLM for Codex
         env:
           CODEX_MODEL: ${{ inputs.codex_model || env.VLLM_GPU_MODEL }}
@@ -1507,6 +1526,9 @@ jobs:
             --seed 0
             --api-key "$CODEX_BACKEND_TOKEN"
           )
+          if [ -n "${CODEX_MODEL_REVISION:-}" ]; then
+            vllm_args+=(--revision "$CODEX_MODEL_REVISION")
+          fi
           if [ "$CODEX_TENSOR_PARALLEL_SIZE" -gt 1 ]; then
             vllm_args+=(--tensor-parallel-size "$CODEX_TENSOR_PARALLEL_SIZE")
           fi
@@ -1790,6 +1812,7 @@ jobs:
                   "codex_version": os.environ["CODEX_VERSION"],
                   "backend": {
                       "model": os.environ["CODEX_MODEL"],
+                      "resolved_revision": os.environ.get("CODEX_MODEL_REVISION"),
                       "served_model_name": os.environ["CODEX_VLLM_MODEL"],
                       "vllm_image": os.environ["VLLM_GPU_IMAGE"],
                       "tensor_parallel_size": int(os.environ["CODEX_TENSOR_PARALLEL_SIZE"]),

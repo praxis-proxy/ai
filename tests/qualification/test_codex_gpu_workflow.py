@@ -82,6 +82,7 @@ class CodexGpuDispatchTest(unittest.TestCase):
                     "GPU_HF_CACHE_DIR": str(directory / "hf"),
                     "VLLM_GPU_IMAGE": "vllm-test-image",
                     "CODEX_MODEL": "openai/gpt-oss-120b",
+                    "CODEX_MODEL_REVISION": "a" * 40,
                     "CODEX_VLLM_MODEL": "gpt-oss-120b",
                     "CODEX_BACKEND_TOKEN": "synthetic-credential",
                     "CODEX_MAX_MODEL_LEN": "24576",
@@ -97,7 +98,8 @@ class CodexGpuDispatchTest(unittest.TestCase):
                 self.assertEqual(argv[argv.index("--model"):], [
                     "--model", "openai/gpt-oss-120b", "--served-model-name", "gpt-oss-120b",
                     "--max-model-len", "24576", "--gpu-memory-utilization", "0.9", "--seed", "0",
-                    "--api-key", "synthetic-credential", "--tensor-parallel-size", "4",
+                    "--api-key", "synthetic-credential", "--revision", "a" * 40,
+                    "--tensor-parallel-size", "4",
                     "--enable-auto-tool-choice", "--tool-call-parser", "openai",
                     "--reasoning-parser", "openai_gptoss",
                 ])
@@ -156,6 +158,7 @@ class CodexGpuDispatchTest(unittest.TestCase):
                 "GITHUB_RUN_ATTEMPT": "2",
                 "CODEX_CANDIDATE": "true",
                 "CODEX_VERSION": "0.170.0",
+                "CODEX_MODEL_REVISION": "a" * 40,
                 "CODEX_MODEL": "openai/gpt-oss-120b",
                 "CODEX_VLLM_MODEL": "gpt-oss-120b",
                 "VLLM_GPU_IMAGE": "vllm-test-image",
@@ -174,6 +177,7 @@ class CodexGpuDispatchTest(unittest.TestCase):
             self.assertEqual((result["run_id"], result["attempt"]), (123, 2))
             self.assertEqual(result["provenance"]["filter_chains"], {"codex_native": native_chain})
             self.assertEqual(result["provenance"]["backend"]["max_model_len"], 24576)
+            self.assertEqual(result["provenance"]["backend"]["resolved_revision"], "a" * 40)
             self.assertEqual(result["provenance"]["runner"]["instance_type"], "g6e.12xlarge")
             self.assertEqual([case["status"] for case in result["cases"]], ["success", "skipped", "failure"])
 

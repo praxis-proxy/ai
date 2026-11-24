@@ -1919,14 +1919,20 @@ async fn read_first_translated_delta(proxy_port: u16) {
     }
 }
 
-/// Build the scripted HTTP response turns.
-///
+/// Distinguishes streamed reasoning from the user-visible reply.
+const HTTP_REASONING_MARKER: &str = "scripted-reasoning-marker";
+
 /// The scripted backend delivers a `PONG` text response in SSE form for
 /// each request Codex sends. The test backend delivers the same response
 /// for every turn so the assertion is deterministic regardless of how
 /// many times Codex polls the endpoint.
 #[expect(clippy::large_stack_frames, reason = "scripted turns are test fixtures")]
 fn http_response_script() -> Vec<HttpServerAction> {
+    let reasoning = serde_json::json!({
+        "id": "rs_http_acceptance",
+        "type": "reasoning",
+        "summary": [{"type": "summary_text", "text": HTTP_REASONING_MARKER}]
+    });
     let turn = HttpServerAction::StreamSse {
         events: vec![
             sse_event(
@@ -1943,6 +1949,24 @@ fn http_response_script() -> Vec<HttpServerAction> {
                     "type": "response.output_item.added",
                     "sequence_number": 1,
                     "output_index": 0,
+                    "item": {"id": "rs_http_acceptance", "type": "reasoning", "summary": []}
+                }),
+            ),
+            sse_event(
+                "response.output_item.done",
+                &serde_json::json!({
+                    "type": "response.output_item.done",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "item": reasoning
+                }),
+            ),
+            sse_event(
+                "response.output_item.added",
+                &serde_json::json!({
+                    "type": "response.output_item.added",
+                    "sequence_number": 3,
+                    "output_index": 1,
                     "item": {
                         "id": "msg_http_acceptance",
                         "type": "message",
@@ -1956,9 +1980,9 @@ fn http_response_script() -> Vec<HttpServerAction> {
                 "response.content_part.added",
                 &serde_json::json!({
                     "type": "response.content_part.added",
-                    "sequence_number": 2,
+                    "sequence_number": 4,
                     "item_id": "msg_http_acceptance",
-                    "output_index": 0,
+                    "output_index": 1,
                     "content_index": 0,
                     "part": {
                         "type": "output_text",
@@ -1971,9 +1995,9 @@ fn http_response_script() -> Vec<HttpServerAction> {
                 "response.output_text.delta",
                 &serde_json::json!({
                     "type": "response.output_text.delta",
-                    "sequence_number": 3,
+                    "sequence_number": 5,
                     "item_id": "msg_http_acceptance",
-                    "output_index": 0,
+                    "output_index": 1,
                     "content_index": 0,
                     "delta": "PONG"
                 }),
@@ -1982,9 +2006,9 @@ fn http_response_script() -> Vec<HttpServerAction> {
                 "response.output_text.done",
                 &serde_json::json!({
                     "type": "response.output_text.done",
-                    "sequence_number": 4,
+                    "sequence_number": 6,
                     "item_id": "msg_http_acceptance",
-                    "output_index": 0,
+                    "output_index": 1,
                     "content_index": 0,
                     "text": "PONG"
                 }),
@@ -1993,9 +2017,9 @@ fn http_response_script() -> Vec<HttpServerAction> {
                 "response.content_part.done",
                 &serde_json::json!({
                     "type": "response.content_part.done",
-                    "sequence_number": 5,
+                    "sequence_number": 7,
                     "item_id": "msg_http_acceptance",
-                    "output_index": 0,
+                    "output_index": 1,
                     "content_index": 0,
                     "part": {
                         "type": "output_text",
@@ -2008,8 +2032,8 @@ fn http_response_script() -> Vec<HttpServerAction> {
                 "response.output_item.done",
                 &serde_json::json!({
                     "type": "response.output_item.done",
-                    "sequence_number": 6,
-                    "output_index": 0,
+                    "sequence_number": 8,
+                    "output_index": 1,
                     "item": {
                         "id": "msg_http_acceptance",
                         "type": "message",
@@ -2029,10 +2053,10 @@ fn http_response_script() -> Vec<HttpServerAction> {
                 "response.completed",
                 &serde_json::json!({
                     "type": "response.completed",
-                    "sequence_number": 7,
+                    "sequence_number": 9,
                     "response": http_response_resource(
                         "completed",
-                        vec![serde_json::json!({
+                        vec![reasoning, serde_json::json!({
                             "id": "msg_http_acceptance",
                             "type": "message",
                             "role": "assistant",
@@ -3159,6 +3183,7 @@ async fn assert_no_unexpected_methods(backend: &mut praxis_test_utils::HttpBacke
 
 /// Validate the completed output and ensure Codex attempted no tool.
 fn assert_codex_jsonl(stdout: &str) {
+    let mut saw_reasoning = false;
     let mut saw_final_message = false;
     let mut saw_completed_turn = false;
     for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
@@ -3168,11 +3193,26 @@ fn assert_codex_jsonl(stdout: &str) {
             item_type.is_none_or(|kind| !TOOL_ITEM_TYPES.contains(&kind)),
             "Codex attempted a tool: {event}"
         );
+        saw_reasoning |= event["type"] == "item.completed"
+            && item_type == Some("reasoning")
+            && event["item"]["text"] == HTTP_REASONING_MARKER;
+        if item_type == Some("agent_message") {
+            assert!(
+                !event["item"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(HTTP_REASONING_MARKER)),
+                "reasoning appeared in a Codex agent message: {event}"
+            );
+        }
         saw_final_message |= event["type"] == "item.completed"
             && item_type == Some("agent_message")
             && event.pointer("/item/text").and_then(serde_json::Value::as_str) == Some("PONG");
         saw_completed_turn |= event["type"] == "turn.completed";
     }
+    assert!(
+        saw_reasoning,
+        "Codex should report the scripted reasoning as a reasoning item"
+    );
     assert!(
         saw_final_message,
         "Codex should complete an agent message whose exact text is PONG"
