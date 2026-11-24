@@ -113,8 +113,7 @@ fn credential_injection_internal_cluster() {
 }
 
 fn tenant_config(
-    tenant_a_port: u16,
-    tenant_b_port: u16,
+    (tenant_a_port, tenant_b_port): (u16, u16),
     backend_port: u16,
     path: &str,
     header: &str,
@@ -185,7 +184,7 @@ fn assert_tenant_credentials(path: &str, header: &str, prefix: &str) {
     let backend = start_header_echo_backend();
     let tenant_a_port = free_port();
     let tenant_b_port = free_port();
-    let config = tenant_config(tenant_a_port, tenant_b_port, backend.port(), path, header, prefix);
+    let config = tenant_config((tenant_a_port, tenant_b_port), backend.port(), path, header, prefix);
     let _proxy = praxis_test_utils::start_proxy(&config);
     let send = |port, authorization| {
         http_send(
@@ -203,17 +202,25 @@ fn assert_tenant_credentials(path: &str, header: &str, prefix: &str) {
         (tenant_b_port, BETA, ALPHA, "upstream-beta"),
     ] {
         for rejected in ["", "Authorization: Basic aW52YWxpZA==\r\n", other] {
-            assert_eq!(parse_status(&send(port, rejected)), 401);
+            assert_eq!(
+                parse_status(&send(port, rejected)),
+                401,
+                "{path} must reject invalid tenant credentials"
+            );
         }
         let response = send(port, allowed);
-        assert_eq!(parse_status(&response), 200);
+        assert_eq!(parse_status(&response), 200, "{path} must accept the matching tenant");
         let headers = parse_body(&response);
         let injected = headers
             .lines()
             .filter_map(|line| line.split_once(':'))
             .filter_map(|(name, value)| name.eq_ignore_ascii_case(header).then_some(value.trim()))
             .collect::<Vec<_>>();
-        assert_eq!(injected, [format!("{prefix}{key}")]);
-        assert!(!headers.contains("Basic "));
+        assert_eq!(
+            injected,
+            [format!("{prefix}{key}")],
+            "{path} must forward exactly one tenant upstream credential"
+        );
+        assert!(!headers.contains("Basic "), "{path} must strip ingress Basic Auth");
     }
 }
