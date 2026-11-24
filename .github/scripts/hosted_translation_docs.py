@@ -86,6 +86,9 @@ trips cover buffered tool calls with streamed results and streamed tool-call
 arguments with buffered results. The suite checks tool IDs, arguments, finish
 reasons, and usage. It makes at most four inference requests with a 64-token
 output cap per request and SDK retries disabled. JUnit results are in `hosted-anthropic-translation-results`.
+A separate invalid-temperature request checks that Anthropic’s validation error
+reaches the OpenAI SDK as HTTP 400. Both streaming cases require a final
+usage-only chunk.
 During initial testing, Haiku 5.5 emitted a streamed thinking block that
 the Chat Completions translator rejected. This lane qualifies Haiku 4.5.
 """

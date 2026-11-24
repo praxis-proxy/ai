@@ -70,3 +70,4 @@ uses `claude-haiku-4-5-20251001` and API version `2023-06-01`. It makes at most 
 inference requests with a 64-token output cap per request and SDK retries
 disabled. It checks tool arguments, streamed tool-result continuation,
 completion, and usage. JUnit results are in `hosted-anthropic-passthrough-results`.
+A separate unknown-model request checks the native Anthropic 404 error.

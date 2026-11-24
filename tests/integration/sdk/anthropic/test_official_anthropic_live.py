@@ -10,8 +10,8 @@ import secrets
 import sys
 
 import pytest
-from anthropic import Anthropic
-from openai import OpenAI
+from anthropic import Anthropic, NotFoundError
+from openai import BadRequestError, OpenAI
 
 MODEL = "claude-haiku-4-5-20251001"
 PROMPT = "Call status for service gateway, then repeat the tool result verbatim."
@@ -49,6 +49,20 @@ def test_messages():
         assert final.usage.output_tokens > 0
 
 
+def test_messages_unknown_model_preserves_error():
+    if os.getenv("PRAXIS_LIVE_ANTHROPIC") != "messages":
+        pytest.skip("Enable the native Messages route")
+    with Anthropic(base_url="http://127.0.0.1:8080", api_key="local-test",
+                   max_retries=0, timeout=45) as client:
+        with pytest.raises(NotFoundError) as error:
+            client.messages.create(
+                model="praxis-missing-anthropic-model", max_tokens=1,
+                messages=[{"role": "user", "content": "Hello."}],
+            )
+    assert error.value.status_code == 404
+    assert error.value.type == "not_found_error"
+
+
 def test_chat_translation():
     if os.getenv("PRAXIS_LIVE_ANTHROPIC") != "chat":
         pytest.skip("Enable the translated Chat Completions route")
@@ -79,7 +93,10 @@ def test_chat_translation():
         assert result in "".join(choice.delta.content or "" for chunk in chunks for choice in chunk.choices)
         assert [choice.finish_reason for chunk in chunks for choice in chunk.choices
                 if choice.finish_reason is not None] == ["stop"]
-        assert any(chunk.usage and chunk.usage.completion_tokens > 0 for chunk in chunks)
+        assert all(chunk.usage is None for chunk in chunks[:-1])
+        assert chunks[-1].choices == []
+        assert chunks[-1].usage.prompt_tokens > 0
+        assert chunks[-1].usage.completion_tokens > 0
 
 
 def test_chat_translation_streamed_tool_call():
@@ -106,7 +123,10 @@ def test_chat_translation_streamed_tool_call():
         assert name == "status"
         assert json.loads(arguments) == {"service": "gateway"}
         assert [choice.finish_reason for choice in choices if choice.finish_reason] == ["tool_calls"]
-        assert any(chunk.usage and chunk.usage.completion_tokens > 0 for chunk in chunks)
+        assert all(chunk.usage is None for chunk in chunks[:-1])
+        assert chunks[-1].choices == []
+        assert chunks[-1].usage.prompt_tokens > 0
+        assert chunks[-1].usage.completion_tokens > 0
 
         result = secrets.token_hex(4)
         messages.extend([
@@ -123,6 +143,22 @@ def test_chat_translation_streamed_tool_call():
         assert choice.finish_reason == "stop"
         assert result in (choice.message.content or "")
         assert final.usage.completion_tokens > 0
+
+
+def test_chat_translation_maps_provider_validation_error():
+    if os.getenv("PRAXIS_LIVE_ANTHROPIC") != "chat":
+        pytest.skip("Enable the translated Chat Completions route")
+    with OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local-test",
+                max_retries=0, timeout=45) as client:
+        # Valid for Chat Completions, outside the upstream Anthropic range.
+        with pytest.raises(BadRequestError) as error:
+            client.chat.completions.create(
+                model=MODEL, max_completion_tokens=1, temperature=1.5,
+                messages=[{"role": "user", "content": "Hello."}],
+            )
+    assert error.value.status_code == 400
+    assert isinstance(error.value.body, dict)
+    assert "temperature" in error.value.body["message"].lower()
 
 
 if __name__ == "__main__":
