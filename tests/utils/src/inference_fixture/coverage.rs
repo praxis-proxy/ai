@@ -728,7 +728,7 @@ fn status_name(status: &CoverageStatus) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{collections::BTreeMap, fs, path::Path};
 
     use serde_json::json;
     use tempfile::TempDir;
@@ -807,7 +807,7 @@ mod tests {
         write_manifest(root.path(), "covered", "feature.one", "case/one", "");
         write_scenario(root.path(), "case/one", &["feature.one"]);
         write_recording(root.path(), "one.json", "case/one", "source_a", "imported");
-        let mut reads = std::collections::BTreeMap::new();
+        let mut reads = BTreeMap::new();
 
         let report = check_coverage_with_fixture_loader(root.path(), |path| {
             *reads.entry(path.to_path_buf()).or_insert(0_usize) += 1;
@@ -826,7 +826,7 @@ mod tests {
         write_manifest(root.path(), "covered", "feature.one", "case/one", "");
         write_scenario(root.path(), "case/one", &["feature.one"]);
         write_recording(root.path(), "one.json", "case/one", "source_a", "imported");
-        let mut reads = std::collections::BTreeMap::new();
+        let mut reads = BTreeMap::new();
 
         let report = check_coverage_with_loaders(
             root.path(),
@@ -1986,182 +1986,100 @@ mod tests {
                 ),
             ]
         );
-        for feature in &manifest.features[0..2] {
-            assert_eq!(
-                feature
-                    .providers
-                    .iter()
-                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                    .collect::<Vec<_>>(),
-                vec![("synthetic", CoverageStatus::SyntheticOnly)],
-            );
-        }
-        assert_eq!(
-            manifest.features[2]
-                .providers
-                .iter()
-                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("openai", CoverageStatus::Covered),
-                ("vllm", CoverageStatus::LiveCovered),
-            ],
-        );
-        for feature in &manifest.features[3..5] {
-            assert_eq!(
-                feature
-                    .providers
-                    .iter()
-                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                    .collect::<Vec<_>>(),
-                vec![("synthetic", CoverageStatus::SyntheticOnly)],
-            );
-        }
-        assert_eq!(
-            manifest.features[5]
-                .providers
-                .iter()
-                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("openai", CoverageStatus::Covered),
-                ("vllm", CoverageStatus::LiveCovered),
-            ],
-        );
-        for feature in &manifest.features[6..10] {
-            assert_eq!(
-                feature
-                    .providers
-                    .iter()
-                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                    .collect::<Vec<_>>(),
-                vec![("synthetic", CoverageStatus::SyntheticOnly)],
-            );
-        }
-        assert_eq!(
-            manifest.features[10]
-                .providers
-                .iter()
-                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("openai", CoverageStatus::LiveCovered),
-                ("vllm", CoverageStatus::LiveCovered),
-            ],
-        );
-        for feature in &manifest.features[11..18] {
-            assert_eq!(
-                feature
-                    .providers
-                    .iter()
-                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                    .collect::<Vec<_>>(),
-                vec![("synthetic", CoverageStatus::SyntheticOnly)],
-            );
-        }
-        for feature in &manifest.features[18..21] {
-            assert_eq!(
-                feature
-                    .providers
-                    .iter()
-                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                    .collect::<Vec<_>>(),
-                vec![("anthropic", CoverageStatus::LiveCovered)],
-            );
-        }
-        for feature in &manifest.features[21..23] {
-            assert_eq!(
-                feature
-                    .providers
-                    .iter()
-                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                    .collect::<Vec<_>>(),
-                vec![("synthetic", CoverageStatus::SyntheticOnly)],
-            );
-        }
-        for feature in &manifest.features[23..26] {
-            assert_eq!(
-                feature
-                    .providers
-                    .iter()
-                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                    .collect::<Vec<_>>(),
+        // Every feature is synthetic-only unless it is listed here by id, so
+        // adding a feature does not shift the expectations for the others.
+        let non_synthetic_providers = BTreeMap::from([
+            (
+                "messages.request.minimal",
+                vec![
+                    ("openai", CoverageStatus::Covered),
+                    ("vllm", CoverageStatus::LiveCovered),
+                ],
+            ),
+            (
+                "messages.response.text",
+                vec![
+                    ("openai", CoverageStatus::Covered),
+                    ("vllm", CoverageStatus::LiveCovered),
+                ],
+            ),
+            (
+                "messages.streaming.usage",
                 vec![
                     ("openai", CoverageStatus::LiveCovered),
                     ("vllm", CoverageStatus::LiveCovered),
                 ],
-            );
-        }
-        for feature in &manifest.features[26..41] {
-            assert_eq!(
-                feature
-                    .providers
-                    .iter()
-                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                    .collect::<Vec<_>>(),
-                vec![("synthetic", CoverageStatus::SyntheticOnly)],
-            );
-        }
-        for feature in &manifest.features[41..43] {
-            assert_eq!(
-                feature
-                    .providers
-                    .iter()
-                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                    .collect::<Vec<_>>(),
+            ),
+            (
+                "messages.native.request",
+                vec![("anthropic", CoverageStatus::LiveCovered)],
+            ),
+            (
+                "messages.native.response.text",
+                vec![("anthropic", CoverageStatus::LiveCovered)],
+            ),
+            (
+                "messages.native.tool_use",
+                vec![("anthropic", CoverageStatus::LiveCovered)],
+            ),
+            (
+                "responses.native.request",
+                vec![
+                    ("openai", CoverageStatus::LiveCovered),
+                    ("vllm", CoverageStatus::LiveCovered),
+                ],
+            ),
+            (
+                "responses.native.response.text",
+                vec![
+                    ("openai", CoverageStatus::LiveCovered),
+                    ("vllm", CoverageStatus::LiveCovered),
+                ],
+            ),
+            (
+                "responses.native.tool_call",
+                vec![
+                    ("openai", CoverageStatus::LiveCovered),
+                    ("vllm", CoverageStatus::LiveCovered),
+                ],
+            ),
+            (
+                "responses.chat.reasoning.request",
                 vec![("vllm", CoverageStatus::LiveCovered)],
+            ),
+            (
+                "responses.chat.reasoning.response",
+                vec![("vllm", CoverageStatus::LiveCovered)],
+            ),
+            (
+                "messages.response.stop_sequence",
+                vec![("vllm", CoverageStatus::LiveCovered)],
+            ),
+            (
+                "responses.chat.reasoning.agentic_replay",
+                vec![("vllm", CoverageStatus::LiveCovered)],
+            ),
+        ]);
+        for id in non_synthetic_providers.keys() {
+            assert!(
+                manifest.features.iter().any(|feature| feature.id == *id),
+                "expected provider coverage names unknown feature `{id}`"
             );
         }
-        for feature in &manifest.features[43..59] {
+        for feature in &manifest.features {
+            let expected = non_synthetic_providers
+                .get(feature.id.as_str())
+                .cloned()
+                .unwrap_or_else(|| vec![("synthetic", CoverageStatus::SyntheticOnly)]);
             assert_eq!(
                 feature
                     .providers
                     .iter()
                     .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                     .collect::<Vec<_>>(),
-                vec![("synthetic", CoverageStatus::SyntheticOnly)],
-            );
-        }
-        assert_eq!(
-            manifest.features[59]
-                .providers
-                .iter()
-                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                .collect::<Vec<_>>(),
-            vec![("synthetic", CoverageStatus::SyntheticOnly)],
-        );
-        assert_eq!(
-            manifest.features[60]
-                .providers
-                .iter()
-                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                .collect::<Vec<_>>(),
-            vec![("vllm", CoverageStatus::LiveCovered)],
-        );
-        assert_eq!(
-            manifest.features[61]
-                .providers
-                .iter()
-                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                .collect::<Vec<_>>(),
-            vec![("synthetic", CoverageStatus::SyntheticOnly)],
-        );
-        assert_eq!(
-            manifest.features[62]
-                .providers
-                .iter()
-                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                .collect::<Vec<_>>(),
-            vec![("vllm", CoverageStatus::LiveCovered)],
-        );
-        for feature in &manifest.features[63..99] {
-            assert_eq!(
-                feature
-                    .providers
-                    .iter()
-                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                    .collect::<Vec<_>>(),
-                vec![("synthetic", CoverageStatus::SyntheticOnly)],
+                expected,
+                "provider coverage for feature `{}`",
+                feature.id
             );
         }
         for feature in &manifest.features {
@@ -2963,7 +2881,7 @@ mod tests {
         );
         assert_eq!(
             report.counts_by_status,
-            std::collections::BTreeMap::from([
+            BTreeMap::from([
                 (CoverageStatus::Covered, 1),
                 (CoverageStatus::LiveCovered, 1),
                 (CoverageStatus::SyntheticOnly, 1),
@@ -2986,10 +2904,7 @@ mod tests {
             (report.features_total, report.scenarios_total, report.recordings_total),
             (2, 1, 1)
         );
-        assert_eq!(
-            report.counts_by_status,
-            std::collections::BTreeMap::from([(CoverageStatus::Covered, 2)])
-        );
+        assert_eq!(report.counts_by_status, BTreeMap::from([(CoverageStatus::Covered, 2)]));
     }
 
     #[test]
