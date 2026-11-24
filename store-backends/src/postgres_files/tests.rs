@@ -25,26 +25,30 @@ mod schema {
         let name = "a".repeat(48);
         generate_files_ddl(&name).unwrap();
         assert!(version_table(&name).len() <= POSTGRES_MAX_IDENTIFIER_LEN);
-        assert!(tenant_index(&name).len() <= POSTGRES_MAX_IDENTIFIER_LEN);
+        for index in [list_index, expiry_index, pending_index, lease_index] {
+            assert!(index(&name).len() <= POSTGRES_MAX_IDENTIFIER_LEN);
+        }
         assert!(claim_sequence(&name).len() <= POSTGRES_MAX_IDENTIFIER_LEN);
     }
 
     #[test]
-    fn ddl_has_table_index_sequence_and_version_table() {
+    fn ddl_has_table_indexes_sequence_and_version_table() {
         let ddl = generate_files_ddl("f1").unwrap();
-        assert_eq!(ddl.len(), 4);
-        let mut statements = ddl.iter();
-        let (table, index, sequence, versions) = (
-            statements.next().unwrap(),
-            statements.next().unwrap(),
-            statements.next().unwrap(),
-            statements.next().unwrap(),
-        );
+        assert_eq!(ddl.len(), 7);
+        let [table, list, expiry, pending, lease, sequence, versions] = &ddl[..] else {
+            panic!("unexpected statement count");
+        };
         assert!(table.starts_with("CREATE TABLE IF NOT EXISTS f1 ("));
         assert!(table.contains("storage_key   TEXT   NOT NULL UNIQUE"));
         assert!(table.contains("extract(epoch FROM now())::bigint"));
         assert!(table.contains("claim_token   BIGINT\n"));
-        assert_eq!(index, "CREATE INDEX IF NOT EXISTS f1_tenant_idx ON f1 (tenant_id)");
+        assert_eq!(
+            list,
+            "CREATE INDEX IF NOT EXISTS f1_list_idx ON f1 (tenant_id, state, created_at, id)"
+        );
+        assert!(expiry.contains("f1_expiry_idx ON f1 (expires_at) WHERE state = 'ready' AND expires_at IS NOT NULL"));
+        assert!(pending.contains("f1_pending_idx ON f1 (created_at) WHERE state = 'pending'"));
+        assert!(lease.contains("f1_lease_idx ON f1 (lease_until) WHERE state IN ('failed', 'deletion_pending')"));
         assert_eq!(sequence, "CREATE SEQUENCE IF NOT EXISTS f1_claim_seq");
         assert_eq!(
             versions,
@@ -1133,27 +1137,138 @@ mod operations {
 
     // ---- indexes ----
 
-    #[tokio::test]
-    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-    async fn quota_sum_uses_tenant_index() {
-        let c = catalog().await;
+    /// Seed a mixed-state table large enough for the planner to prefer the indexes.
+    async fn seed_indexed_table(c: &PostgresFileCatalog) {
         exec(
-            &c,
-            "INSERT INTO {f} (id, tenant_id, owner_issuer, owner_subject, storage_key, filename, state, bytes) \
-             SELECT 'id' || n, 'tenant' || (n % 100), 'i', 's', 'k' || n, 'f', 'ready', 1 \
-             FROM generate_series(1, 5000) n",
+            c,
+            "INSERT INTO {f} (id, tenant_id, owner_issuer, owner_subject, storage_key, filename, state, bytes, \
+                              created_at, expires_at) \
+             SELECT 'id' || n, 'tenant' || (n % 100), 'i', 's', 'k' || n, 'f', \
+                    CASE WHEN n % 50 = 0 THEN 'pending' WHEN n % 40 = 1 THEN 'failed' \
+                         WHEN n % 40 = 2 THEN 'deletion_pending' ELSE 'ready' END, \
+                    1, n, CASE WHEN n % 10 = 0 THEN n END \
+             FROM generate_series(1, 500) n",
         )
         .await;
-        exec(&c, "ANALYZE {f}").await;
-        let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "EXPLAIN SELECT coalesce(sum(bytes), 0) FROM {} WHERE tenant_id = 'tenant7'",
-            c.files
-        )))
-        .fetch_all(&c.pool)
-        .await
-        .unwrap();
-        let plan = plan.join("\n");
-        assert!(plan.contains(&format!("{}_tenant_idx", c.files)), "plan:\n{plan}");
+        exec(c, "ANALYZE {f}").await;
+    }
+
+    /// The plan for `sql` with sequential scans, bitmap scans and sorts discouraged,
+    /// so a missing or unusable index shows up as a plan without that index.
+    async fn explain(c: &PostgresFileCatalog, sql: &str) -> String {
+        let mut tx = c.pool.begin().await.unwrap();
+        // Sorts and bitmap scans are disabled too: on a small table the planner would
+        // otherwise pick bitmap scan + sort, hiding whether the index gives the order.
+        sqlx::raw_sql("SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let plan: Vec<String> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN {}", sql.replace("{f}", &c.files))))
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+        tx.rollback().await.unwrap();
+        plan.join("\n")
+    }
+
+    /// Assert the plan scans `index` and needs no sort.
+    fn assert_uses(plan: &str, c: &PostgresFileCatalog, suffix: &str, sorted: bool) {
+        assert!(plan.contains(&format!("{}{suffix}", c.files)), "plan:\n{plan}");
+        assert!(!plan.contains("Seq Scan"), "plan:\n{plan}");
+        assert!(!sorted || !plan.contains("Sort"), "plan:\n{plan}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    async fn quota_sum_uses_list_index() {
+        let c = catalog().await;
+        seed_indexed_table(&c).await;
+        let plan = explain(
+            &c,
+            "SELECT coalesce(sum(bytes), 0) FROM {f} WHERE tenant_id = 'tenant7'",
+        )
+        .await;
+        assert_uses(&plan, &c, "_list_idx", false);
+        c.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    async fn listing_uses_list_index_in_both_directions_without_sort() {
+        let c = catalog().await;
+        seed_indexed_table(&c).await;
+        for (cmp, dir) in [(">", "ASC"), ("<", "DESC")] {
+            let plan = explain(
+                &c,
+                &format!(
+                    "SELECT id FROM {{f}} WHERE tenant_id = 'tenant7' AND state = 'ready' \
+                     AND (created_at, id) {cmp} (5000, 'id5007') \
+                     ORDER BY created_at {dir}, id {dir} LIMIT 11"
+                ),
+            )
+            .await;
+            assert_uses(&plan, &c, "_list_idx", true);
+        }
+        c.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    async fn purpose_filtered_listing_still_uses_list_index() {
+        let c = catalog().await;
+        seed_indexed_table(&c).await;
+        let plan = explain(
+            &c,
+            "SELECT id FROM {f} WHERE tenant_id = 'tenant7' AND state = 'ready' AND purpose = 'x' \
+             ORDER BY created_at, id LIMIT 11",
+        )
+        .await;
+        assert_uses(&plan, &c, "_list_idx", true);
+        c.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    async fn expiry_sweep_uses_expiry_index() {
+        let c = catalog().await;
+        seed_indexed_table(&c).await;
+        let plan = explain(
+            &c,
+            "SELECT id FROM {f} WHERE state = 'ready' AND expires_at <= 100 LIMIT 100 FOR UPDATE SKIP LOCKED",
+        )
+        .await;
+        assert_uses(&plan, &c, "_expiry_idx", false);
+        c.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    async fn abandoned_upload_sweep_uses_pending_index() {
+        let c = catalog().await;
+        seed_indexed_table(&c).await;
+        let plan = explain(
+            &c,
+            "SELECT id FROM {f} WHERE state = 'pending' AND created_at <= 100 LIMIT 100 FOR UPDATE SKIP LOCKED",
+        )
+        .await;
+        assert_uses(&plan, &c, "_pending_idx", false);
+        c.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    async fn cleanup_claim_uses_lease_index_without_sort() {
+        let c = catalog().await;
+        seed_indexed_table(&c).await;
+        let plan = explain(
+            &c,
+            "SELECT id FROM {f} WHERE state IN ('failed', 'deletion_pending') \
+             AND lease_until <= extract(epoch FROM now())::bigint + 1 \
+             ORDER BY lease_until LIMIT 100 FOR UPDATE SKIP LOCKED",
+        )
+        .await;
+        assert_uses(&plan, &c, "_lease_idx", true);
         c.close().await;
     }
 }

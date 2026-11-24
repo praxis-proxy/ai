@@ -3,9 +3,9 @@
 
 //! DDL, identifier validation and initialization for the file catalog schema.
 //!
-//! One configured table holds every file row. The schema version table and the
-//! tenant index names derive from it, the same way the response store derives
-//! its auxiliary names.
+//! One configured table holds every file row. The schema version table, the
+//! index names and the claim sequence derive from it, the same way the response
+//! store derives its auxiliary names.
 
 use praxis_ai_store::{StoreError, validate_table_identifier};
 
@@ -27,8 +27,17 @@ pub(super) const FILES_SCHEMA_VERSION: i64 = 1;
 /// Suffix appended to the files table name for the schema version table.
 const VERSION_SUFFIX: &str = "_schema_version";
 
-/// Suffix appended to the files table name for the tenant index.
-const TENANT_INDEX_SUFFIX: &str = "_tenant_idx";
+/// Suffix of the listing index, which also serves the tenant quota sum.
+const LIST_INDEX_SUFFIX: &str = "_list_idx";
+
+/// Suffix of the partial index behind the expiry sweep.
+const EXPIRY_INDEX_SUFFIX: &str = "_expiry_idx";
+
+/// Suffix of the partial index behind the abandoned-upload sweep.
+const PENDING_INDEX_SUFFIX: &str = "_pending_idx";
+
+/// Suffix of the partial index behind the cleanup lease claim.
+const LEASE_INDEX_SUFFIX: &str = "_lease_idx";
 
 /// Suffix appended to the files table name for the claim token sequence.
 const CLAIM_SEQUENCE_SUFFIX: &str = "_claim_seq";
@@ -68,9 +77,24 @@ pub(crate) fn version_table(files: &str) -> String {
     format!("{files}{VERSION_SUFFIX}")
 }
 
-/// Derive the tenant index name from the files table name.
-pub(super) fn tenant_index(files: &str) -> String {
-    format!("{files}{TENANT_INDEX_SUFFIX}")
+/// Derive the listing index name from the files table name.
+pub(super) fn list_index(files: &str) -> String {
+    format!("{files}{LIST_INDEX_SUFFIX}")
+}
+
+/// Derive the expiry sweep index name from the files table name.
+pub(super) fn expiry_index(files: &str) -> String {
+    format!("{files}{EXPIRY_INDEX_SUFFIX}")
+}
+
+/// Derive the abandoned-upload sweep index name from the files table name.
+pub(super) fn pending_index(files: &str) -> String {
+    format!("{files}{PENDING_INDEX_SUFFIX}")
+}
+
+/// Derive the cleanup lease index name from the files table name.
+pub(super) fn lease_index(files: &str) -> String {
+    format!("{files}{LEASE_INDEX_SUFFIX}")
 }
 
 /// Derive the claim token sequence name from the files table name.
@@ -92,7 +116,8 @@ fn validate_files_table(files: &str) -> Result<(), StoreError> {
 pub(super) fn generate_files_ddl(files: &str) -> Result<Vec<String>, StoreError> {
     validate_files_table(files)?;
     let versions = version_table(files);
-    let tenant_idx = tenant_index(files);
+    let (list_idx, expiry_idx) = (list_index(files), expiry_index(files));
+    let (pending_idx, lease_idx) = (pending_index(files), lease_index(files));
     let claim_seq = claim_sequence(files);
     Ok(vec![
         format!(
@@ -113,7 +138,19 @@ pub(super) fn generate_files_ddl(files: &str) -> Result<Vec<String>, StoreError>
              \x20 claim_token   BIGINT\n\
              )"
         ),
-        format!("CREATE INDEX IF NOT EXISTS {tenant_idx} ON {files} (tenant_id)"),
+        // Listing and the quota sum: `tenant_id` is the prefix, so the sum scans only
+        // the tenant's rows; ordered paging reads `ready` rows in (created_at, id) order.
+        format!("CREATE INDEX IF NOT EXISTS {list_idx} ON {files} (tenant_id, state, created_at, id)"),
+        // Cleanup sweeps. Partial, so each holds only rows still waiting for cleanup.
+        format!(
+            "CREATE INDEX IF NOT EXISTS {expiry_idx} ON {files} (expires_at) \
+             WHERE state = 'ready' AND expires_at IS NOT NULL"
+        ),
+        format!("CREATE INDEX IF NOT EXISTS {pending_idx} ON {files} (created_at) WHERE state = 'pending'"),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {lease_idx} ON {files} (lease_until) \
+             WHERE state IN ('failed', 'deletion_pending')"
+        ),
         format!("CREATE SEQUENCE IF NOT EXISTS {claim_seq}"),
         format!("CREATE TABLE IF NOT EXISTS {versions} (version BIGINT PRIMARY KEY)"),
     ])
