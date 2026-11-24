@@ -257,8 +257,11 @@ def acceptance(path, job_result, run_id, attempt, sha, scope):
                 "job_status": job_result, "scope": scope,
                 "reason": "per-scenario result artifact unavailable or provenance mismatch",
                 "cases": []}
-    return {"status": job_result, "job_status": job_result, "scope": scope,
-            "cases": raw["cases"], "reason": "scenario statuses from individual GitHub steps"}
+    result = {"status": job_result, "job_status": job_result, "scope": scope,
+              "cases": raw["cases"], "reason": "scenario statuses from individual GitHub steps"}
+    if isinstance(raw.get("provenance"), dict):
+        result["provenance"] = raw["provenance"]
+    return result
 
 
 def passing_suite_problem(report):
