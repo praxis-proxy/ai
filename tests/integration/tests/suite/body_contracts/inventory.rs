@@ -86,6 +86,10 @@ const NON_REQUEST_MUTATORS: &[(&str, &str)] = &[
         "selects response transport from canonical state",
     ),
     (
+        "mcp_broker_backend",
+        "selects the staged cluster for broker handshake subrequests",
+    ),
+    (
         "openai_responses_compact",
         "serves a local compaction API; does not rewrite the forwarded request body",
     ),

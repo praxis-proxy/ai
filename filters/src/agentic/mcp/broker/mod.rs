@@ -3,9 +3,27 @@
 
 //! MCP static catalog filter: static tool catalog, prefix management, broker
 //! behavior for `tools/list`, current-profile `initialize`, `ping`, and
-//! `notifications`, and stateless-profile `tools/call` routing.
+//! `notifications`, stateless-profile `tools/call` routing, and
+//! current-profile `tools/call` routing over lazily initialized backend
+//! sessions.
 
+mod backend;
 pub(crate) mod config;
+mod selector;
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::needless_raw_strings,
+    clippy::needless_raw_string_hashes,
+    clippy::too_many_lines,
+    reason = "tests"
+)]
+mod session_tests;
+mod sessions;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -21,23 +39,42 @@ pub(crate) mod config;
 )]
 mod tests;
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
 use praxis_ai_apis::{RecordAiMetadata as _, promotion::contains_control_chars};
+use praxis_core::{
+    config::{ChainRef, FilterEntry},
+    subrequest::{DEPTH_HEADER, SubRequestClient},
+};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    IterationState, Rejection, SubrequestRuntime, TraceContext,
     builtins::http::payload_processing::json_rpc::{
         config::JsonRpcConfig,
         envelope::{JsonRpcEnvelope, JsonRpcIdKind, JsonRpcKind, parse_json_rpc_value},
     },
     parse_filter_config,
 };
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
-use self::config::{CacheScope, CatalogTool, McpBrokerConfig, build_config};
+pub use self::selector::McpBrokerBackendSelectorFilter;
+use self::{
+    backend::{
+        BackendCallout, BackendInit, BackendTarget, FilteredMcpBackendClient, MCP_PROTOCOL_VERSION, MCP_SESSION_ID,
+        McpBackendClient, McpBackendError,
+    },
+    config::{CacheScope, CatalogTool, McpBrokerConfig, McpServerConfig, ValidatedBackendSessions, build_config},
+    sessions::{
+        BackendSessionKey, BackendSessionStore, BoundSession, Publish, RetiredSession, SessionSlot,
+        credential_fingerprint,
+    },
+};
 use super::protocol::ProtocolProfile;
 
 // -----------------------------------------------------------------------------
@@ -65,6 +102,77 @@ const BASE64_SENTINEL_PREFIX: &str = "=?base64?";
 /// MCP `=?base64?` sentinel suffix.
 const BASE64_SENTINEL_SUFFIX: &str = "?=";
 
+/// JSON-RPC error code for invalid requests.
+const ERR_INVALID_REQUEST: i32 = -32600;
+
+/// JSON-RPC error code for internal errors (backend session failures).
+const ERR_INTERNAL: i32 = -32603;
+
+/// Maximum accepted gateway `Mcp-Session-Id` length.
+const MAX_GATEWAY_SESSION_ID_LEN: usize = 256;
+
+/// Name of the generated backend handshake chain.
+const BACKEND_CHAIN_NAME: &str = "mcp-backend-sessions";
+
+// -----------------------------------------------------------------------------
+// Backend Sessions
+// -----------------------------------------------------------------------------
+
+/// Routing facts for one configured backend server.
+#[derive(Debug)]
+struct BrokerServer {
+    /// Top-level cluster name.
+    cluster: Arc<str>,
+    /// Backend MCP endpoint path.
+    path: String,
+}
+
+/// Most retired backend sessions terminated concurrently; beyond that the
+/// backend's own idle expiry applies.
+const MAX_CONCURRENT_CLEANUPS: usize = 16;
+
+/// Current-profile backend session runtime.
+struct BackendSessions {
+    /// Bounds concurrent background terminations of retired sessions.
+    cleanup: Arc<tokio::sync::Semaphore>,
+    /// Lifecycle callout client.
+    client: Arc<dyn McpBackendClient>,
+    /// Transport used when the request context exposes no shared client.
+    fallback_client: Option<SubRequestClient>,
+    /// Client headers copied onto handshake exchanges.
+    forward_headers: Vec<http::HeaderName>,
+    /// Deadline for one handshake exchange.
+    handshake_timeout: Duration,
+    /// Gateway → backend session map.
+    store: BackendSessionStore,
+    /// Protocol versions a backend may negotiate.
+    supported_versions: Vec<String>,
+}
+
+/// Per-request record of a forwarded current-profile `tools/call`, read by
+/// `on_response` (backend answered) or `on_request_complete` (it never did)
+/// to invalidate a session that expired or whose endpoint is unreachable.
+struct ForwardedCall {
+    /// Whether a backend response arrived.
+    answered: bool,
+    /// Session map key.
+    key: BackendSessionKey,
+    /// The slot this call uses, held until the request completes so capacity
+    /// pressure or idle expiry cannot evict the mapping mid-call and let an
+    /// overlapping call open a second backend session. Dropping the request
+    /// context releases it on every path.
+    slot: Arc<SessionSlot>,
+    /// Backend session id sent upstream.
+    session_id: http::HeaderValue,
+    /// Endpoint the backend session lives on.
+    ///
+    /// The broker resolves the session in the request-body phase, but core
+    /// rebuilds `pinned_endpoint_address` empty for every phase, so the pin is
+    /// carried here and applied in the header phase that runs the
+    /// `load_balancer`.
+    endpoint: Option<Arc<str>>,
+}
+
 // -----------------------------------------------------------------------------
 // McpBrokerFilter
 // -----------------------------------------------------------------------------
@@ -77,8 +185,14 @@ const BASE64_SENTINEL_SUFFIX: &str = "?=";
 /// cluster by exposed tool name, stripping the public prefix from `params.name`
 /// and repairing the forwarded `Mcp-Name` header before forwarding.
 ///
-/// In the current profile, `tools/call` returns `-32601` because current-profile
-/// routing requires session infrastructure not implemented here.
+/// In the current profile, `tools/call` returns `-32601` unless
+/// `backend_sessions` is configured. With it, the broker lazily runs the
+/// backend `initialize` / `notifications/initialized` handshake once per
+/// `(Mcp-Session-Id, server)` pair through a generated outbound chain that
+/// dials the server's top-level cluster, then forwards the call to that
+/// cluster with the backend `Mcp-Session-Id`. A backend `404` drops the
+/// mapping so the next call reinitializes. Server clusters must be declared
+/// in top-level `clusters:` so the handshake chain can reference them.
 ///
 /// # YAML
 ///
@@ -103,6 +217,8 @@ const BASE64_SENTINEL_SUFFIX: &str = "?=";
 ///         description: Create a calendar event
 /// ```
 pub(crate) struct McpBrokerFilter {
+    /// Current-profile backend session runtime, when configured.
+    backend: Option<BackendSessions>,
     /// Cache scope for stateless responses.
     cache_scope: CacheScope,
     /// Cache TTL in milliseconds for stateless responses.
@@ -119,6 +235,8 @@ pub(crate) struct McpBrokerFilter {
     protocol_profile: ProtocolProfile,
     /// Public path this MCP broker handles (e.g. `/mcp`).
     public_path: String,
+    /// Configured servers in configuration order.
+    servers: Vec<BrokerServer>,
     /// Implemented versions used for protocol version negotiation.
     supported_versions: Vec<String>,
 }
@@ -135,13 +253,65 @@ impl McpBrokerFilter {
     ///
     /// Returns [`FilterError`] if the YAML config is invalid or if
     /// the static tool catalog cannot be serialized.
+    #[cfg(test)]
     pub(crate) fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: McpBrokerConfig = parse_filter_config("mcp", config)?;
-        let (validated, catalog) = build_config(cfg)?;
+        Self::from_config_with_binding(config, None, None)
+    }
 
+    /// Create a filter, binding the backend handshake chain when
+    /// `backend_sessions` is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the config is invalid, if
+    /// `backend_sessions` is configured without a chain-binding context, or
+    /// if the generated handshake chain cannot be bound.
+    pub(crate) fn from_config_with_binding(
+        config: &serde_yaml::Value,
+        binding: Option<&ChainBindingContext<'_>>,
+        fallback_client: Option<SubRequestClient>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let cfg: McpBrokerConfig = parse_filter_config("mcp", config)?;
+        let handshake_filters = cfg
+            .backend_sessions
+            .as_ref()
+            .map(|sessions| sessions.outbound_filters.clone());
+        let servers_cfg = cfg.servers.clone();
+        let (validated, catalog) = build_config(cfg)?;
+        let backend = match (validated.backend_sessions.as_ref(), handshake_filters) {
+            (Some(settings), Some(filters)) => {
+                let Some(binding) = binding else {
+                    return Err("mcp: backend_sessions requires chain-binding registration".into());
+                };
+                let pipeline = Arc::new(bind_backend_chain(&servers_cfg, filters, binding)?);
+                let client = Arc::new(FilteredMcpBackendClient::new(
+                    pipeline,
+                    settings.max_response_bytes,
+                    settings.handshake_timeout,
+                ));
+                Some(BackendSessions::new(
+                    client,
+                    fallback_client,
+                    settings,
+                    validated.supported_versions.clone(),
+                ))
+            },
+            _ => None,
+        };
+        Ok(Box::new(Self::build(&validated, catalog, &servers_cfg, backend)))
+    }
+
+    /// Assemble the filter from validated parts.
+    fn build(
+        validated: &config::ValidatedBrokerConfig,
+        catalog: Vec<CatalogTool>,
+        servers: &[McpServerConfig],
+        backend: Option<BackendSessions>,
+    ) -> Self {
         let json_rpc_config = super::build_json_rpc_config(validated.max_body_bytes);
 
-        Ok(Box::new(Self {
+        Self {
+            backend,
             cache_scope: validated.cache_scope,
             cache_ttl_ms: validated.cache_ttl_ms,
             catalog,
@@ -150,8 +320,15 @@ impl McpBrokerFilter {
             max_body_bytes: validated.max_body_bytes,
             protocol_profile: validated.protocol_profile,
             public_path: validated.path.clone(),
+            servers: servers
+                .iter()
+                .map(|server| BrokerServer {
+                    cluster: Arc::from(server.cluster.as_str()),
+                    path: server.path.clone(),
+                })
+                .collect(),
             supported_versions: validated.supported_versions.clone(),
-        }))
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -160,27 +337,29 @@ impl McpBrokerFilter {
 
     /// Maps a JSON-RPC method to the MCP handler that owns it.
     #[expect(clippy::too_many_arguments, reason = "body reference needed for tools/call mutation")]
-    fn dispatch_method(
+    async fn dispatch_method(
         &self,
         ctx: &mut HttpFilterContext<'_>,
-        value: &serde_json::Value,
+        value: &mut serde_json::Value,
         envelope: &JsonRpcEnvelope,
         method_str: &str,
         body: &mut Option<Bytes>,
     ) -> Result<FilterAction, FilterError> {
         match self.protocol_profile {
-            ProtocolProfile::Current => self.dispatch_current(ctx, value, envelope, method_str),
+            ProtocolProfile::Current => self.dispatch_current(ctx, value, envelope, method_str, body).await,
             ProtocolProfile::Stateless => Ok(self.dispatch_stateless(ctx, value, envelope, method_str, body)),
         }
     }
 
-    /// Current-profile dispatch: preserves existing behavior.
-    fn dispatch_current(
+    /// Current-profile dispatch.
+    #[expect(clippy::too_many_arguments, reason = "body reference needed for tools/call mutation")]
+    async fn dispatch_current(
         &self,
         ctx: &mut HttpFilterContext<'_>,
-        value: &serde_json::Value,
+        value: &mut serde_json::Value,
         envelope: &JsonRpcEnvelope,
         method_str: &str,
+        body: &mut Option<Bytes>,
     ) -> Result<FilterAction, FilterError> {
         if method_str.starts_with("notifications/") {
             return Ok(handle_notification(envelope));
@@ -193,7 +372,7 @@ impl McpBrokerFilter {
         let action = match method_str {
             "initialize" => handle_initialize(ctx, value, envelope, &self.supported_versions, &self.default_version)?,
             "tools/list" => handle_tools_list(&self.catalog, envelope)?,
-            "tools/call" => json_rpc_error_action(envelope, -32601, "method not yet supported"),
+            "tools/call" => self.handle_current_tools_call(ctx, value, envelope, body).await,
             "ping" => handle_ping(envelope),
             _ => {
                 debug!(method_len = method_str.len(), "unsupported MCP method");
@@ -256,11 +435,135 @@ impl McpBrokerFilter {
     }
 
     /// Profile-aware DELETE handler.
-    fn handle_delete(&self, ctx: &HttpFilterContext<'_>) -> FilterAction {
+    async fn handle_delete(&self, ctx: &HttpFilterContext<'_>) -> FilterAction {
         match self.protocol_profile {
-            ProtocolProfile::Current => handle_delete_current(ctx),
+            ProtocolProfile::Current => {
+                let action = handle_delete_current(ctx);
+                if let (Some(backend), Some(gateway)) = (self.backend.as_ref(), gateway_session_id(ctx)) {
+                    self.terminate_backend_sessions(ctx, backend, gateway).await;
+                }
+                action
+            },
             ProtocolProfile::Stateless => FilterAction::Reject(Rejection::status(405)),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Current-Profile Backend Sessions
+    // -------------------------------------------------------------------------
+
+    /// Route a current-profile `tools/call` over a lazily initialized backend
+    /// session, or return `-32601` when `backend_sessions` is not configured.
+    async fn handle_current_tools_call(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        value: &mut serde_json::Value,
+        envelope: &JsonRpcEnvelope,
+        body: &mut Option<Bytes>,
+    ) -> FilterAction {
+        let Some(backend) = self.backend.as_ref() else {
+            return json_rpc_error_action(envelope, -32601, "method not yet supported");
+        };
+        let (tool, server, key, version) = match self.current_call_route(ctx, value, envelope) {
+            Ok(route) => route,
+            Err(action) => return action,
+        };
+        let Some(callout) = backend.callout(ctx) else {
+            return backend_error_action(envelope, &tool.server_name, &McpBackendError::Transport);
+        };
+        let target = BackendTarget {
+            cluster: &server.cluster,
+            path: &server.path,
+        };
+        let session = backend.ensure_session(&key, target, version, &callout).await;
+        backend.retire(&self.servers, &callout);
+        let (slot, init) = match session {
+            Ok(session) => session,
+            Err(error) => {
+                warn!(server = %tool.server_name, reason = error.reason(), "mcp backend session handshake failed");
+                return backend_error_action(envelope, &tool.server_name, &error);
+            },
+        };
+
+        forward_current_tools_call(ctx, value, body, tool, &init);
+        record_forwarded_call(ctx, key, slot, init);
+        FilterAction::Release
+    }
+
+    /// Resolve the catalog tool, its server, the session map key, and the
+    /// backend protocol version for a current-profile `tools/call`, or the
+    /// error to return.
+    fn current_call_route(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        value: &serde_json::Value,
+        envelope: &JsonRpcEnvelope,
+    ) -> Result<(&CatalogTool, &BrokerServer, BackendSessionKey, &str), FilterAction> {
+        let tool_name =
+            extract_tool_name(value).map_err(|detail| json_rpc_error_action(envelope, ERR_INVALID_PARAMS, detail))?;
+        let tool = self
+            .catalog
+            .iter()
+            .find(|t| t.exposed_name == tool_name)
+            .ok_or_else(|| json_rpc_error_action(envelope, ERR_INVALID_PARAMS, "unknown tool"))?;
+        let gateway = gateway_session_id(ctx).ok_or_else(|| {
+            json_rpc_error_action_with_status(envelope, 400, ERR_INVALID_REQUEST, "missing or invalid Mcp-Session-Id")
+        })?;
+        let server = self
+            .servers
+            .get(tool.server_index)
+            .ok_or_else(|| json_rpc_error_action(envelope, ERR_INTERNAL, "unknown backend server"))?;
+        let key = BackendSessionKey {
+            gateway_session: Box::from(gateway),
+            server: tool.server_index,
+        };
+        let version = self.requested_backend_version(ctx, envelope)?;
+        Ok((tool, server, key, version))
+    }
+
+    /// Protocol version offered to the backend: the client's
+    /// `MCP-Protocol-Version`, or the broker default when the header is absent.
+    /// A present but unsupported or undecodable version is rejected with
+    /// HTTP 400.
+    fn requested_backend_version(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        envelope: &JsonRpcEnvelope,
+    ) -> Result<&str, FilterAction> {
+        let Some(value) = ctx.request.headers.get("mcp-protocol-version") else {
+            return Ok(self.default_version.as_str());
+        };
+        // The raw bytes are not echoed back.
+        let requested = value
+            .to_str()
+            .map_err(|_invalid| unsupported_version_action(envelope, "", &self.supported_versions))?;
+        self.supported_versions
+            .iter()
+            .find(|v| v.as_str() == requested)
+            .map(String::as_str)
+            .ok_or_else(|| unsupported_version_action(envelope, requested, &self.supported_versions))
+    }
+
+    /// Best-effort termination of every backend session a gateway session owns.
+    async fn terminate_backend_sessions(&self, ctx: &HttpFilterContext<'_>, backend: &BackendSessions, gateway: &str) {
+        let Some(callout) = backend.callout(ctx) else {
+            return;
+        };
+        let credential = credential_fingerprint(&callout.forwarded_headers);
+        let removed = backend.store.remove_gateway(gateway, &credential);
+        for retired in removed {
+            let Some(server) = self.servers.get(retired.server) else {
+                continue;
+            };
+            let target = BackendTarget {
+                cluster: &server.cluster,
+                path: &server.path,
+            };
+            if let Err(error) = backend.client.terminate(target, &retired.session.init, &callout).await {
+                debug!(reason = error.reason(), "mcp backend session termination failed");
+            }
+        }
+        backend.retire(&self.servers, &callout);
     }
 
     // -------------------------------------------------------------------------
@@ -460,8 +763,19 @@ impl HttpFilter for McpBrokerFilter {
         }
 
         match ctx.request.method {
-            http::Method::POST => Ok(FilterAction::Continue),
-            http::Method::DELETE => Ok(self.handle_delete(ctx)),
+            http::Method::POST => {
+                // With a pre-read body the body phase already resolved the
+                // backend session; pin its endpoint for the load_balancer that
+                // runs later in this phase.
+                let pinned = ctx
+                    .get_filter_state::<ForwardedCall>()
+                    .and_then(|call| call.endpoint.clone());
+                if pinned.is_some() {
+                    ctx.pinned_endpoint_address = pinned;
+                }
+                Ok(FilterAction::Continue)
+            },
+            http::Method::DELETE => Ok(self.handle_delete(ctx).await),
             _ => Ok(FilterAction::Reject(Rejection::status(405))),
         }
     }
@@ -488,7 +802,7 @@ impl HttpFilter for McpBrokerFilter {
             return Ok(FilterAction::Continue);
         };
 
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(chunk) else {
+        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(chunk) else {
             return Ok(FilterAction::Reject(Rejection::status(400)));
         };
 
@@ -505,8 +819,457 @@ impl HttpFilter for McpBrokerFilter {
             ctx.record_ai_metadata("mcp.method", method_str.clone());
         }
 
-        self.dispatch_method(ctx, &value, &envelope, method_str, body)
+        self.dispatch_method(ctx, &mut value, &envelope, method_str, body).await
     }
+
+    async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        // Without response headers no backend answered (core runs this hook
+        // during cleanup after an upstream failure); `on_request_complete`
+        // settles the call with the status the client received.
+        let Some(status) = ctx.response_header.as_ref().map(|response| response.status) else {
+            return Ok(FilterAction::Continue);
+        };
+        // The record stays until completion: it holds the session slot.
+        let Some(call) = ctx.get_filter_state_mut::<ForwardedCall>() else {
+            return Ok(FilterAction::Continue);
+        };
+        call.answered = true;
+        // 404: the backend forgot the session. 502: an intermediary reports
+        // the pinned endpoint unreachable; the session cannot move elsewhere.
+        if matches!(status, http::StatusCode::NOT_FOUND | http::StatusCode::BAD_GATEWAY)
+            && let Some(backend) = self.backend.as_ref()
+        {
+            backend.invalidate_forwarded(
+                &call.key,
+                &call.session_id,
+                "mcp backend session expired or unreachable; mapping invalidated",
+            );
+        }
+        Ok(FilterAction::Continue)
+    }
+
+    fn observes_request_completion(&self) -> bool {
+        self.backend.is_some()
+    }
+
+    fn on_request_complete(&self, ctx: &mut HttpFilterContext<'_>, status: u16) {
+        // Completion releases the call's slot. A call no backend answered
+        // that ends in a proxy 502 or 504 could not reach its pinned endpoint
+        // (refused, reset, TLS failure, or timed out), so the session it holds
+        // is unusable; local rejections keep it. The mapping is invalidated
+        // before the slot is released, so no other call can pick up the dead
+        // session in between.
+        let Some(ForwardedCall {
+            answered,
+            key,
+            slot,
+            session_id,
+            ..
+        }) = ctx.remove_filter_state::<ForwardedCall>()
+        else {
+            return;
+        };
+        let Some(backend) = self.backend.as_ref() else {
+            return;
+        };
+        if !answered && matches!(status, 502 | 504) {
+            backend.invalidate_forwarded(
+                &key,
+                &session_id,
+                "mcp backend endpoint unreachable; mapping invalidated",
+            );
+        }
+        backend.store.release(&key, slot);
+    }
+}
+
+impl BackendSessions {
+    /// Build the runtime from validated settings.
+    fn new(
+        client: Arc<dyn McpBackendClient>,
+        fallback_client: Option<SubRequestClient>,
+        settings: &ValidatedBackendSessions,
+        supported_versions: Vec<String>,
+    ) -> Self {
+        Self {
+            cleanup: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CLEANUPS)),
+            client,
+            fallback_client,
+            forward_headers: settings.forward_headers.clone(),
+            handshake_timeout: settings.handshake_timeout,
+            store: BackendSessionStore::new(settings.max_sessions, settings.idle_timeout),
+            supported_versions,
+        }
+    }
+
+    /// Drop the mapping a forwarded call used, if it still holds that session.
+    fn invalidate_forwarded(&self, key: &BackendSessionKey, session_id: &http::HeaderValue, message: &'static str) {
+        if self.store.invalidate(key, session_id) {
+            debug!(server = key.server, "{message}");
+        }
+    }
+
+    /// Capture request-scoped callout resources, or `None` without a transport.
+    fn callout(&self, ctx: &HttpFilterContext<'_>) -> Option<BackendCallout> {
+        let client = ctx
+            .subrequest_client
+            .cloned()
+            .or_else(|| self.fallback_client.clone())?;
+        let iteration_state = ctx.extensions.get::<IterationState>();
+        let now = Instant::now();
+        let step_deadline = now.checked_add(self.handshake_timeout).unwrap_or(now);
+        let deadline = iteration_state
+            .map(IterationState::deadline)
+            .map_or(step_deadline, |parent| parent.min(step_deadline));
+        Some(BackendCallout {
+            client,
+            deadline,
+            depth: callout_depth(iteration_state, &ctx.request.headers),
+            downstream: SubrequestRuntime::new(
+                ctx.client_addr,
+                ctx.downstream_tls,
+                ctx.peer_identity.clone(),
+                ctx.request_start,
+            ),
+            forwarded_headers: self.forwarded_headers(&ctx.request.headers),
+            trace_context: ctx.extensions.get::<TraceContext>().cloned(),
+        })
+    }
+
+    /// Copy the allowlisted client headers onto a handshake exchange.
+    fn forwarded_headers(&self, request_headers: &http::HeaderMap) -> http::HeaderMap {
+        let mut forwarded = http::HeaderMap::new();
+        for name in &self.forward_headers {
+            for value in request_headers.get_all(name) {
+                forwarded.append(name.clone(), value.clone());
+            }
+        }
+        forwarded
+    }
+
+    /// Return the backend session for `key`, running the handshake when the
+    /// key has none or when the caller's credentials differ from the ones
+    /// that created it. Concurrent callers for one key share one handshake.
+    async fn ensure_session(
+        &self,
+        key: &BackendSessionKey,
+        target: BackendTarget<'_>,
+        protocol_version: &str,
+        callout: &BackendCallout,
+    ) -> Result<(Arc<SessionSlot>, BackendInit), McpBackendError> {
+        let credential = credential_fingerprint(&callout.forwarded_headers);
+        let slot = self.store.slot(key).ok_or(McpBackendError::Capacity)?;
+        if let Some(init) = slot.current(&credential) {
+            return Ok((slot, init));
+        }
+        let (outcome, init) = self
+            .serialized_handshake(&slot, target, protocol_version, callout)
+            .await?;
+        match outcome {
+            None => Ok((slot, init)),
+            Some(Publish::Published(replaced)) => {
+                if let Some(session) = replaced {
+                    self.store.push_retired(RetiredSession {
+                        server: key.server,
+                        session,
+                    });
+                }
+                Ok((slot, init))
+            },
+            Some(Publish::Cancelled(session)) => {
+                self.abandon(target, &session.init, callout).await;
+                Err(McpBackendError::SessionClosed)
+            },
+        }
+    }
+
+    /// Run the handshake under the slot's permit. Returns `None` for the
+    /// outcome when a concurrent caller published a usable session first.
+    async fn serialized_handshake(
+        &self,
+        slot: &SessionSlot,
+        target: BackendTarget<'_>,
+        protocol_version: &str,
+        callout: &BackendCallout,
+    ) -> Result<(Option<Publish>, BackendInit), McpBackendError> {
+        let _permit = tokio::time::timeout_at(callout.deadline.into(), slot.handshake_permit())
+            .await
+            .map_err(|_elapsed| McpBackendError::Timeout)?
+            .map_err(|_closed| McpBackendError::SessionClosed)?;
+        let credential = credential_fingerprint(&callout.forwarded_headers);
+        if let Some(init) = slot.current(&credential) {
+            return Ok((None, init));
+        }
+        slot.begin(credential);
+        match self.handshake(target, protocol_version, callout).await {
+            Ok(init) => {
+                let outcome = slot.publish(BoundSession::new(&callout.forwarded_headers, init.clone()));
+                Ok((Some(outcome), init))
+            },
+            Err(error) => {
+                slot.abort();
+                Err(error)
+            },
+        }
+    }
+
+    /// Terminate the sessions the map retired (evicted, expired, or replaced
+    /// after a credential change) in the background, each with the
+    /// credentials that created it.
+    fn retire(&self, servers: &[BrokerServer], callout: &BackendCallout) {
+        for retired in self.store.take_retired() {
+            self.spawn_terminate(servers, callout, retired);
+        }
+    }
+
+    /// A callout outliving the request, carrying the retired session's own
+    /// credentials and a fresh per-exchange deadline.
+    fn detached_callout(&self, callout: &BackendCallout, forwarded_headers: http::HeaderMap) -> BackendCallout {
+        let now = Instant::now();
+        BackendCallout {
+            client: callout.client.clone(),
+            deadline: now.checked_add(self.handshake_timeout).unwrap_or(now),
+            depth: callout.depth,
+            downstream: callout.downstream.clone(),
+            forwarded_headers,
+            trace_context: callout.trace_context.clone(),
+        }
+    }
+
+    /// Spawn one bounded best-effort termination.
+    fn spawn_terminate(&self, servers: &[BrokerServer], callout: &BackendCallout, retired: RetiredSession) {
+        let Some(server) = servers.get(retired.server) else {
+            return;
+        };
+        let Ok(permit) = Arc::clone(&self.cleanup).try_acquire_owned() else {
+            debug!(
+                server = retired.server,
+                "mcp backend session cleanup saturated; backend expiry applies"
+            );
+            return;
+        };
+        let cleanup = self.detached_callout(callout, retired.session.credentials);
+        let client = Arc::clone(&self.client);
+        let cluster = Arc::clone(&server.cluster);
+        let path = server.path.clone();
+        let init = retired.session.init;
+        drop(tokio::spawn(async move {
+            let target = BackendTarget {
+                cluster: &cluster,
+                path: &path,
+            };
+            if let Err(error) = client.terminate(target, &init, &cleanup).await {
+                debug!(
+                    reason = error.reason(),
+                    "mcp backend retired session termination failed"
+                );
+            }
+            drop(permit);
+        }));
+    }
+
+    /// Run `initialize` and `notifications/initialized` for a new session.
+    ///
+    /// A backend that answers `initialize` with a version outside
+    /// `supported_versions` is never confirmed: its session is terminated and
+    /// no call is forwarded.
+    async fn handshake(
+        &self,
+        target: BackendTarget<'_>,
+        protocol_version: &str,
+        callout: &BackendCallout,
+    ) -> Result<BackendInit, McpBackendError> {
+        let init = self.client.initialize(target, protocol_version, callout).await?;
+        if !self
+            .supported_versions
+            .iter()
+            .any(|v| v.as_str() == &*init.protocol_version)
+        {
+            self.abandon(target, &init, callout).await;
+            return Err(McpBackendError::UnsupportedVersion);
+        }
+        if let Err(error) = self.client.send_initialized(target, &init, callout).await {
+            self.abandon(target, &init, callout).await;
+            return Err(error);
+        }
+        Ok(init)
+    }
+
+    /// Best-effort termination of a backend session that will not be used.
+    ///
+    /// Runs with a fresh deadline: the handshake that failed may have used up
+    /// the request's.
+    async fn abandon(&self, target: BackendTarget<'_>, init: &BackendInit, callout: &BackendCallout) {
+        let cleanup = self.detached_callout(callout, callout.forwarded_headers.clone());
+        if let Err(cleanup) = self.client.terminate(target, init, &cleanup).await {
+            debug!(reason = cleanup.reason(), "mcp backend session cleanup failed");
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Backend Session Helpers
+// -----------------------------------------------------------------------------
+
+/// Bind the generated handshake chain: the backend selector, any operator
+/// `outbound_filters`, and a `load_balancer` referencing each server's
+/// top-level cluster.
+fn bind_backend_chain(
+    servers: &[McpServerConfig],
+    outbound_filters: Vec<FilterEntry>,
+    binding: &ChainBindingContext<'_>,
+) -> Result<praxis_filter::FilterPipeline, FilterError> {
+    let mut clusters: Vec<&str> = Vec::with_capacity(servers.len());
+    for server in servers {
+        if !clusters.contains(&server.cluster.as_str()) {
+            clusters.push(server.cluster.as_str());
+        }
+    }
+    if clusters.is_empty() {
+        return Err("mcp: backend_sessions requires at least one server".into());
+    }
+
+    let (selector, load_balancer) = generated_chain_entries(&clusters)?;
+    let mut filters = Vec::with_capacity(outbound_filters.len().saturating_add(2));
+    filters.push(selector);
+    filters.extend(outbound_filters);
+    filters.push(load_balancer);
+
+    binding
+        .bind_chain(&ChainRef::Inline {
+            name: BACKEND_CHAIN_NAME.to_owned(),
+            filters,
+        })
+        .map_err(|e| {
+            FilterError::from(format!(
+                "mcp: backend_sessions handshake chain failed to bind (declare each server cluster in top-level \
+                 `clusters:`): {e}"
+            ))
+        })
+}
+
+/// Build the generated selector and `load_balancer` entries for `clusters`.
+fn generated_chain_entries(clusters: &[&str]) -> Result<(FilterEntry, FilterEntry), FilterError> {
+    let selector = serde_yaml::to_value(serde_json::json!({
+        "filter": McpBrokerBackendSelectorFilter::NAME,
+        "clusters": clusters,
+    }))
+    .map_err(|e| FilterError::from(format!("mcp: backend selector config: {e}")))?;
+    let load_balancer = serde_yaml::to_value(serde_json::json!({
+        "filter": "load_balancer",
+        "clusters": clusters.iter().map(|name| serde_json::json!({ "name": name })).collect::<Vec<_>>(),
+    }))
+    .map_err(|e| FilterError::from(format!("mcp: backend load_balancer config: {e}")))?;
+    Ok((filter_entry(selector)?, filter_entry(load_balancer)?))
+}
+
+/// Sub-request nesting depth, preferring IRR-owned state over the framework
+/// header (which ingress strips from client requests).
+fn callout_depth(iteration_state: Option<&IterationState>, headers: &http::HeaderMap) -> u8 {
+    iteration_state.map_or_else(
+        || {
+            header_str(headers, DEPTH_HEADER)
+                .and_then(|raw| raw.parse::<u8>().ok())
+                .unwrap_or(0)
+        },
+        IterationState::depth,
+    )
+}
+
+/// Deserialize one generated chain entry through [`FilterEntry`]'s own path.
+fn filter_entry(value: serde_yaml::Value) -> Result<FilterEntry, FilterError> {
+    serde_yaml::from_value(value).map_err(|e| FilterError::from(format!("mcp: generated chain entry: {e}")))
+}
+
+/// Rewrite a current-profile `tools/call` for its backend and swap the
+/// gateway session for the backend session.
+fn forward_current_tools_call(
+    ctx: &mut HttpFilterContext<'_>,
+    value: &mut serde_json::Value,
+    body: &mut Option<Bytes>,
+    tool: &CatalogTool,
+    init: &BackendInit,
+) {
+    trace!(
+        exposed = tool.exposed_name,
+        original = tool.original_name,
+        cluster = tool.cluster,
+        server = tool.server_name,
+        "routing current-profile tools/call"
+    );
+    ctx.cluster = Some(Arc::from(tool.cluster.as_str()));
+    ctx.rewritten_path = Some(tool.backend_path.clone());
+
+    if tool.original_name != tool.exposed_name {
+        if let Some(p) = value.get_mut("params").and_then(|p| p.as_object_mut()) {
+            p.insert("name".to_owned(), serde_json::Value::String(tool.original_name.clone()));
+        }
+        *body = Some(Bytes::from(value.to_string()));
+    }
+
+    match init.session_id.as_ref() {
+        Some(session_id) => ctx.request_headers_to_set.push((MCP_SESSION_ID, session_id.clone())),
+        None => ctx.request_headers_to_remove.push(MCP_SESSION_ID),
+    }
+    if let Ok(version) = http::HeaderValue::from_str(&init.protocol_version) {
+        ctx.request_headers_to_set.push((MCP_PROTOCOL_VERSION, version));
+    }
+}
+
+/// Record a forwarded session-bearing call so the header phase can pin its
+/// endpoint and the response can invalidate an expired or unreachable session.
+fn record_forwarded_call(
+    ctx: &mut HttpFilterContext<'_>,
+    key: BackendSessionKey,
+    slot: Arc<SessionSlot>,
+    init: BackendInit,
+) {
+    if let Some(session_id) = init.session_id {
+        ctx.insert_filter_state(ForwardedCall {
+            answered: false,
+            key,
+            slot,
+            session_id,
+            endpoint: init.endpoint,
+        });
+    }
+}
+
+/// The client's gateway `Mcp-Session-Id`, when present and well formed.
+fn gateway_session_id<'a>(ctx: &'a HttpFilterContext<'_>) -> Option<&'a str> {
+    let value = ctx.request.headers.get(&MCP_SESSION_ID)?;
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_GATEWAY_SESSION_ID_LEN || !bytes.iter().all(|b| (0x21..=0x7E).contains(b))
+    {
+        return None;
+    }
+    value.to_str().ok()
+}
+
+/// JSON-RPC error for a failed backend handshake. `data` carries only the
+/// server name and a fixed reason label, never backend payloads.
+fn backend_error_action(envelope: &JsonRpcEnvelope, server: &str, error: &McpBackendError) -> FilterAction {
+    let mut data = serde_json::Map::new();
+    data.insert("server".to_owned(), serde_json::Value::from(server));
+    data.insert("reason".to_owned(), serde_json::Value::from(error.reason()));
+    if let McpBackendError::Rejected { status } = error {
+        data.insert("status".to_owned(), serde_json::Value::from(*status));
+    }
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "error": {
+            "code": ERR_INTERNAL,
+            "message": "backend session initialization failed",
+            "data": data,
+        },
+        "id": id_value(envelope),
+    });
+
+    FilterAction::Reject(
+        Rejection::status(200)
+            .with_header("content-type", "application/json")
+            .with_body(Bytes::from(response.to_string())),
+    )
 }
 
 // -----------------------------------------------------------------------------

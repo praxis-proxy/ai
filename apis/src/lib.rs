@@ -58,6 +58,7 @@ pub const MODEL_PROVIDER_CLIENT_MODEL_METADATA: &str = "model_to_provider.client
 
 pub use callout_credentials::{CalloutCredentials, CalloutCredentialsFilter};
 pub use callout_identity::credential_authority;
+pub use openai::sse::buffered_sse_event_data;
 pub use praxis_ai_store::{StateOwner, StateOwnerError};
 pub use project_state_owner_headers::ProjectStateOwnerHeadersFilter;
 pub use state_owner::{StateOwnerFilter, project_state_owner};
