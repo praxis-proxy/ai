@@ -16,9 +16,10 @@
 use std::time::Duration;
 
 use praxis_ai_store::{CleanupClaim, CleanupState, StateOwner};
+use praxis_core::time::SystemTimeSource;
 use sqlx::{AssertSqlSafe, Row as _, postgres::PgRow};
 
-use super::{NOW, PostgresFileCatalog, invalid, retry::PgBackendError, schema::claim_sequence, secs_ceil};
+use super::{NOW, PostgresFileCatalog, invalid, retry::PgBackendError, secs_ceil};
 
 /// Stored value of a cleanup state.
 const fn state_name(state: CleanupState) -> &'static str {
@@ -109,19 +110,21 @@ pub(super) async fn claim_cleanup_once(
 ) -> Result<Vec<CleanupClaim>, PgBackendError> {
     let files = &c.files;
     let lease_secs = secs_ceil(lease)?;
-    let seq = claim_sequence(files);
+    // One token per batch: a row's token only has to differ from its own previous one.
+    let token = c.id_generator.generate(&SystemTimeSource);
     let mut tx = c.begin().await?;
     let rows = sqlx::query(AssertSqlSafe(format!(
         "WITH batch AS ( \
            SELECT id FROM {files} \
            WHERE state IN ('failed', 'deletion_pending') AND lease_until <= {NOW} \
            ORDER BY lease_until LIMIT $2 FOR UPDATE SKIP LOCKED) \
-         UPDATE {files} f SET lease_until = {NOW} + $1, claim_token = nextval('{seq}') \
+         UPDATE {files} f SET lease_until = {NOW} + $1, claim_token = $3 \
          FROM batch WHERE f.id = batch.id AND f.state IN ('failed', 'deletion_pending') \
          RETURNING f.id, f.tenant_id, f.owner_issuer, f.owner_subject, f.storage_key, f.state, f.claim_token"
     )))
     .bind(lease_secs)
     .bind(i64::from(limit))
+    .bind(&token)
     .fetch_all(&mut *tx)
     .await
     .map_err(|e| c.pg_err(&e))?;
@@ -145,7 +148,7 @@ pub(super) async fn complete_cleanup_once(
     .bind(&claim.id)
     .bind(state_name(claim.state))
     .bind(&claim.storage_key)
-    .bind(claim.claim_token)
+    .bind(&claim.claim_token)
     .execute(&mut *tx)
     .await
     .map_err(|e| c.pg_err(&e))?

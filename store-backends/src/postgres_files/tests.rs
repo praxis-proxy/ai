@@ -28,20 +28,19 @@ mod schema {
         for index in [list_index, expiry_index, pending_index, lease_index] {
             assert!(index(&name).len() <= POSTGRES_MAX_IDENTIFIER_LEN);
         }
-        assert!(claim_sequence(&name).len() <= POSTGRES_MAX_IDENTIFIER_LEN);
     }
 
     #[test]
     fn ddl_has_table_indexes_sequence_and_version_table() {
         let ddl = generate_files_ddl("f1").unwrap();
-        assert_eq!(ddl.len(), 7);
-        let [table, list, expiry, pending, lease, sequence, versions] = &*ddl else {
+        assert_eq!(ddl.len(), 6);
+        let [table, list, expiry, pending, lease, versions] = &*ddl else {
             panic!("unexpected statement count");
         };
         assert!(table.starts_with("CREATE TABLE IF NOT EXISTS f1 ("));
         assert!(table.contains("storage_key   TEXT   NOT NULL UNIQUE"));
         assert!(table.contains("extract(epoch FROM now())::bigint"));
-        assert!(table.contains("claim_token   BIGINT\n"));
+        assert!(table.contains("claim_token   TEXT\n"));
         assert_eq!(
             list,
             "CREATE INDEX IF NOT EXISTS f1_list_idx ON f1 (tenant_id, state, created_at, id)"
@@ -49,7 +48,6 @@ mod schema {
         assert!(expiry.contains("f1_expiry_idx ON f1 (expires_at) WHERE state = 'ready' AND expires_at IS NOT NULL"));
         assert!(pending.contains("f1_pending_idx ON f1 (created_at) WHERE state = 'pending'"));
         assert!(lease.contains("f1_lease_idx ON f1 (lease_until) WHERE state IN ('failed', 'deletion_pending')"));
-        assert_eq!(sequence, "CREATE SEQUENCE IF NOT EXISTS f1_claim_seq");
         assert_eq!(
             versions,
             "CREATE TABLE IF NOT EXISTS f1_schema_version (version BIGINT PRIMARY KEY)"
@@ -108,47 +106,6 @@ mod schema {
         exec(&pool, &table.replace("TEXT   PRIMARY KEY", "TEXT")).await;
         let err = initialize_files_schema(&pool, &files).await.unwrap_err();
         assert!(err.to_string().contains("primary key"), "unexpected error: {err}");
-        pool.close().await;
-    }
-
-    #[tokio::test]
-    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
-    async fn initialization_seeds_claim_sequence_above_stored_tokens() {
-        let pool = pool().await;
-        let files = unique_name("files_seed");
-        initialize_files_schema(&pool, &files).await.unwrap();
-        exec(
-            &pool,
-            &format!(
-                "INSERT INTO {files} (id, tenant_id, owner_issuer, owner_subject, storage_key, filename, state, \
-                 bytes, claim_token) VALUES ('a', 't', 'i', 's', 'k', 'f', 'failed', 1, 500)"
-            ),
-        )
-        .await;
-        // Recreated behind the stored token.
-        exec(&pool, &format!("DROP SEQUENCE {}", claim_sequence(&files))).await;
-        initialize_files_schema(&pool, &files).await.unwrap();
-        let next: i64 = sqlx::query_scalar(AssertSqlSafe(format!("SELECT nextval('{}')", claim_sequence(&files))))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(next > 500, "sequence not seeded: {next}");
-        // A fresh sequence next to a stored token 1 must not reissue it.
-        exec(&pool, &format!("UPDATE {files} SET claim_token = 1")).await;
-        exec(&pool, &format!("DROP SEQUENCE {}", claim_sequence(&files))).await;
-        initialize_files_schema(&pool, &files).await.unwrap();
-        let fresh: i64 = sqlx::query_scalar(AssertSqlSafe(format!("SELECT nextval('{}')", claim_sequence(&files))))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(fresh > 1, "token 1 reissued");
-        // An ahead sequence is left alone.
-        initialize_files_schema(&pool, &files).await.unwrap();
-        let after: i64 = sqlx::query_scalar(AssertSqlSafe(format!("SELECT nextval('{}')", claim_sequence(&files))))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(after, fresh + 1);
         pool.close().await;
     }
 

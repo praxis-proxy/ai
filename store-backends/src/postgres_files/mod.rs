@@ -25,6 +25,7 @@ mod tests;
 use std::time::Duration;
 
 use praxis_ai_store::{CatalogError, PoolConfig};
+use praxis_core::id::IdGenerator;
 
 use crate::{
     PgTlsConfig,
@@ -48,6 +49,8 @@ pub struct PostgresFileCatalog {
     tenant_limit_bytes: i64,
     /// Connection URL, held only to redact it from runtime query errors.
     redact_url: String,
+    /// Generates cleanup claim tokens; owned because the catalog runs outside a filter context.
+    id_generator: IdGenerator,
 }
 
 /// Omits `redact_url`, which can carry the connection password.
@@ -116,6 +119,7 @@ impl PostgresFileCatalog {
             files: files_table.to_owned(),
             tenant_limit_bytes,
             redact_url: database_url.to_owned(),
+            id_generator: IdGenerator::new(),
         })
     }
 

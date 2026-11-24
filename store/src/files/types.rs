@@ -133,6 +133,6 @@ pub struct CleanupClaim {
     pub storage_key: String,
     /// Cleanup state, checked again by the conditional purge.
     pub state: CleanupState,
-    /// Fencing token issued with this claim; the purge must match it.
-    pub claim_token: i64,
+    /// Opaque fencing token issued with this claim; the purge must match it.
+    pub claim_token: String,
 }
