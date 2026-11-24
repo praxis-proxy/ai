@@ -84,12 +84,14 @@ fn echo_listener(address: &str) -> Listener {
         downstream_read_timeout_ms: None,
         forward_proxy: None,
         filter_chains: vec!["echo".into()],
+        job_queue: None,
         max_connections: None,
         name: "echo".into(),
         protocol: ProtocolKind::default(),
         tcp_session_timeout_ms: None,
         tcp_max_duration_secs: None,
         tls: None,
+        upgrade_policy: None,
         upstream: None,
     }
 }
@@ -226,6 +228,8 @@ mod tests {
         };
         let config = build_config(&args);
         assert_eq!(config.listeners.len(), 1, "should have exactly one listener");
+        assert!(config.listeners[0].job_queue.is_none());
+        assert!(config.listeners[0].upgrade_policy.is_none());
         assert_eq!(
             config.listeners[0].address, "127.0.0.1:8080",
             "listener address should match"
