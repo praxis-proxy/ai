@@ -261,7 +261,7 @@ does not exist yet, it falls back to building from source.
 
 In the main suite, every GPU job goes through
 [`prepare-vllm-gpu-image`](../../.github/actions/prepare-vllm-gpu-image/action.yml),
-which wraps that check with the GHCR login and the build fallback. The jobs run
+which builds the image if resolution fails, including when GHCR login fails. The jobs run
 one after another on the same instance, so the client acceptance jobs first
 look for an image an earlier job already prepared there and serve it without
 pulling; after a local build that matters, because the registry still holds the

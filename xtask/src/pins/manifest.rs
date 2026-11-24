@@ -78,16 +78,24 @@ impl Vllm {
             .map_err(|e| format!("--max-model-len in vllm.launch.flags must be followed by an integer: {e}"))
     }
 
-    /// The value following `flag` in the launch flags.
+    /// The value of a single launch option, in either CLI spelling.
     pub(crate) fn flag_value(&self, flag: &str) -> Result<&str, String> {
         let flags = &self.launch.flags;
-        let index = flags
-            .iter()
-            .position(|f| f == flag)
+        let mut matches = flags.iter().enumerate().filter_map(|(index, arg)| {
+            let (name, inline) = arg
+                .split_once('=')
+                .map_or((arg.as_str(), None), |(name, value)| (name, Some(value)));
+            (name == flag).then_some((index, inline))
+        });
+        let (index, inline) = matches
+            .next()
             .ok_or_else(|| format!("vllm.launch.flags must pass {flag}"))?;
-        flags
-            .get(index + 1)
-            .map(String::as_str)
+        if matches.next().is_some() {
+            return Err(format!("vllm.launch.flags must pass {flag} exactly once"));
+        }
+        inline
+            .or_else(|| flags.get(index + 1).map(String::as_str))
+            .filter(|value| !value.is_empty() && !value.starts_with("--"))
             .ok_or_else(|| format!("{flag} in vllm.launch.flags must be followed by a value"))
     }
 }

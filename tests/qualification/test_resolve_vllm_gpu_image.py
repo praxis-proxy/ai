@@ -47,6 +47,11 @@ if args[:2] == ["image", "inspect"]:
     elif "RepoDigests" in (fmt or ""):
         print("ghcr.io/praxis-proxy/vllm-gpu@sha256:" + "d" * 64)
     sys.exit(0)
+if args[0] == "login":
+    save()
+    assert args[1:] == ["ghcr.io", "--username", "tester", "--password-stdin"]
+    assert sys.stdin.read().strip() == "test-token"
+    sys.exit(0 if state["login_ok"] else 1)
 if args[0] == "pull":
     state["local"] = state["registry"]
     save()
@@ -84,17 +89,18 @@ def labels(**overrides):
 
 
 class ResolveVllmGpuImageTest(unittest.TestCase):
-    def resolve(self, local, registry, reuse_local):
+    def resolve(self, local, registry, reuse_local, *, runtime_name="docker", auth=False, login_ok=True):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
-            runtime = directory / "runtime"
+            runtime = directory / runtime_name
             runtime.write_text(FAKE_RUNTIME, encoding="utf-8")
             runtime.chmod(0o755)
             state = directory / "state.json"
-            state.write_text(json.dumps({"local": local, "registry": registry, "calls": []}))
+            state.write_text(json.dumps({"local": local, "registry": registry, "calls": [], "login_ok": login_ok}))
             output = directory / "output"
             output.touch()
             env = dict(os.environ, IMAGE=IMAGE, EXPECTED_MODEL=MODEL, EXPECTED_REVISION="",
+                       GHCR_USERNAME="tester" if auth else "", GHCR_TOKEN="test-token" if auth else "",
                        CONTAINER_RUNTIME=str(runtime), REUSE_LOCAL=reuse_local,
                        GITHUB_OUTPUT=str(output), FAKE_RUNTIME_STATE=str(state),
                        PATH=f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}")
@@ -111,6 +117,20 @@ class ResolveVllmGpuImageTest(unittest.TestCase):
         self.assertEqual(outputs, {"build-required": "false", "digest": "", "source": "runner"})
         self.assertNotIn("pull", state["calls"])
         self.assertEqual(state["local"], labels())
+
+    def test_registry_login_only_after_local_miss(self):
+        for runtime in ("docker", "podman"):
+            with self.subTest(runtime=runtime):
+                outputs, state = self.resolve(labels(), None, "true", runtime_name=runtime, auth=True, login_ok=False)
+                self.assertEqual(outputs["source"], "runner")
+                self.assertNotIn("login", state["calls"])
+                outputs, state = self.resolve(None, labels(), "true", runtime_name=runtime, auth=True, login_ok=False)
+                self.assertEqual(outputs, {"build-required": "true", "digest": "", "source": "build"})
+                self.assertIn("login", state["calls"])
+                self.assertNotIn("pull", state["calls"])
+                outputs, state = self.resolve(None, labels(), "true", runtime_name=runtime, auth=True)
+                self.assertEqual(outputs["source"], "registry")
+                self.assertLess(state["calls"].index("login"), state["calls"].index("pull"))
 
     def test_pulls_when_the_local_image_is_stale(self):
         outputs, state = self.resolve(labels(**{"praxis.vllm.containerfile-sha256": "0" * 64}), labels(), "true")

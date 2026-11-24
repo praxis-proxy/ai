@@ -176,6 +176,12 @@ fn check_vllm_image(manifests: &Manifests, errors: &mut Vec<String>) {
 /// workflow appends itself.
 fn check_baked_images(manifests: &Manifests, errors: &mut Vec<String>) {
     for (path, vllm) in manifests.vllm_blocks() {
+        // The workflow exports a space-joined string and splits it into argv.
+        if vllm.launch.flags.iter().any(|arg| arg.contains([' ', '\t', '\n'])) {
+            errors.push(format!(
+                "{path}: vllm.launch.flags entries must not contain shell whitespace"
+            ));
+        }
         let Some(baked) = manifests.images.images.get(&vllm.baked_image) else {
             errors.push(format!(
                 "{path}: vllm.baked_image `{}` is not an image in {}",
@@ -193,7 +199,7 @@ fn check_baked_images(manifests: &Manifests, errors: &mut Vec<String>) {
             Err(e) => errors.push(format!("{path}: {e}")),
         }
         for (flag, reason) in FORBIDDEN_VLLM_FLAGS {
-            if vllm.launch.flags.iter().any(|f| f == flag) {
+            if vllm.launch.flags.iter().any(|arg| arg.split('=').next() == Some(flag)) {
                 errors.push(format!("{path}: vllm.launch.flags must not pass {flag}: {reason}"));
             }
         }
@@ -560,10 +566,29 @@ fn check_pi_models(repo: &Repo, manifests: &Manifests, errors: &mut Vec<String>)
 fn check_codex(manifests: &Manifests, errors: &mut Vec<String>) {
     let path = manifest::CODEX;
     let codex = &manifests.codex.codex;
-    let vllm = &manifests.codex.vllm;
+    check_codex_backend(path, &manifests.codex.vllm, errors);
+    if codex.install != "github-release" || codex.release_tag_prefix.is_empty() {
+        errors.push(format!(
+            "{path}: Codex must install from a GitHub release with a non-empty release_tag_prefix"
+        ));
+    }
+    if codex.archive != format!("codex-{}.tar.gz", codex.platform) {
+        errors.push(format!("{path}: codex.archive must be the platform release archive"));
+    }
+}
+
+/// Check that the Codex launch arguments honor its advertised backend pins.
+fn check_codex_backend(path: &str, vllm: &Vllm, errors: &mut Vec<String>) {
     match vllm.flag_context() {
         Ok(flag) if flag != vllm.context_length => errors.push(format!(
             "{path}: vllm.context_length must match --max-model-len in vllm.launch.flags"
+        )),
+        Ok(_) => {},
+        Err(e) => errors.push(format!("{path}: {e}")),
+    }
+    match vllm.flag_value("--tool-call-parser") {
+        Ok(parser) if parser != vllm.tool_call_parser => errors.push(format!(
+            "{path}: vllm.tool_call_parser must match --tool-call-parser in vllm.launch.flags"
         )),
         Ok(_) => {},
         Err(e) => errors.push(format!("{path}: {e}")),
@@ -573,14 +598,6 @@ fn check_codex(manifests: &Manifests, errors: &mut Vec<String>) {
             "{path}: the Codex backend must serve tool calls: set vllm.tool_call_parser and pass \
              --enable-auto-tool-choice"
         ));
-    }
-    if codex.install != "github-release" || codex.release_tag_prefix.is_empty() {
-        errors.push(format!(
-            "{path}: Codex must install from a GitHub release with a non-empty release_tag_prefix"
-        ));
-    }
-    if codex.archive != format!("codex-{}.tar.gz", codex.platform) {
-        errors.push(format!("{path}: codex.archive must be the platform release archive"));
     }
 }
 

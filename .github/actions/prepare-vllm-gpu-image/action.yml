@@ -69,25 +69,6 @@ runs:
       with:
         key: ${{ inputs.key }}
 
-    - name: Log in to GHCR (docker)
-      if: inputs.runtime == 'docker'
-      uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
-      with:
-        registry: ghcr.io
-        username: ${{ inputs.registry-username }}
-        password: ${{ inputs.registry-token }}
-
-    - name: Log in to GHCR (podman)
-      if: inputs.runtime == 'podman'
-      shell: bash
-      env:
-        GHCR_USERNAME: ${{ inputs.registry-username }}
-        GHCR_TOKEN: ${{ inputs.registry-token }}
-      run: |
-        set -euo pipefail
-        echo "$GHCR_TOKEN" | podman login ghcr.io \
-          --username "$GHCR_USERNAME" --password-stdin
-
     - name: Resolve image
       id: resolve
       uses: ./.github/actions/resolve-vllm-gpu-image
@@ -97,6 +78,8 @@ runs:
         revision: ${{ steps.spec.outputs.revision }}
         runtime: ${{ inputs.runtime }}
         reuse-local: "true"
+        registry-username: ${{ inputs.registry-username }}
+        registry-token: ${{ inputs.registry-token }}
 
     # Only reached when neither the runner nor GHCR holds an image matching this
     # checkout: the vllm-full-suite label on a PR that edits vllm/Containerfile,

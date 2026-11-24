@@ -172,13 +172,39 @@ fn launch_must_follow_the_baked_model() {
 #[test]
 fn launch_flags_the_workflow_appends_are_rejected() {
     for flag in ["--api-key", "--served-model-name", "--revision", "--download-dir"] {
-        let errors = errors_with(
-            manifest::CODEX,
-            "  \"--seed\", \"0\",\n",
-            &format!("  \"{flag}\", \"x\",\n"),
-        );
-        assert_reported(&errors, &[manifest::CODEX, &format!("must not pass {flag}")]);
+        for form in [format!(r#""{flag}", "x""#), format!(r#""{flag}=x""#)] {
+            let errors = errors_with(manifest::CODEX, r#""--seed", "0""#, &form);
+            assert_reported(&errors, &[manifest::CODEX, &format!("must not pass {flag}")]);
+        }
     }
+}
+
+#[test]
+fn launch_flags_must_survive_shell_word_splitting() {
+    for separator in [" ", r"\t", r"\n"] {
+        let bundled = format!(r#""--model{separator}other""#);
+        let errors = errors_with(manifest::CODEX, r#""--seed", "0""#, &bundled);
+        assert_reported(&errors, &[manifest::CODEX, "shell whitespace"]);
+    }
+}
+
+#[test]
+fn launch_rejects_a_second_model() {
+    for form in [r#""--model", "other""#, r#""--model=other""#] {
+        let errors = errors_with(manifest::CODEX, r#""--seed", "0""#, form);
+        assert_reported(&errors, &[manifest::CODEX, "--model", "exactly once"]);
+    }
+}
+
+#[test]
+fn codex_launch_must_select_the_pinned_tool_parser() {
+    let parser = r#""--tool-call-parser", "hermes""#;
+    for replacement in ["", r#""--tool-call-parser", "other","#] {
+        let errors = errors_with(manifest::CODEX, &format!("{parser},"), replacement);
+        assert_reported(&errors, &[manifest::CODEX, "--tool-call-parser"]);
+    }
+    let errors = errors_with(manifest::CODEX, parser, r#""--tool-call-parser=hermes""#);
+    assert!(errors.is_empty(), "pins should agree: {errors:#?}");
 }
 
 #[test]

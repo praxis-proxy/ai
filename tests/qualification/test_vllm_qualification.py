@@ -450,6 +450,23 @@ class QualificationTest(unittest.TestCase):
         # A lane that recorded no image renders as before.
         self.assertNotIn("backend", finished["suites"]["claude_acceptance"])
 
+    def test_acceptance_only_dispatch_reports_client_outcome_and_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw = Path(directory) / "codex.json"
+            raw.write_text(json.dumps({"run_id": 17, "attempt": 2, "checkout_sha": "a" * 40,
+                                       "cases": [{"id": "codex_native", "status": "failure"}],
+                                       "backend": {"local_image_id": "sha256:abc", "image_source": "registry",
+                                                   "registry_digest": "sha256:def"}}))
+            finished = qualification.finish(None, False, "success", "skipped", "skipped", "failure",
+                                            17, 2, "https://example.test/run", "a" * 40, codex_raw=raw)
+        for detailed in (False, True):
+            rendered = qualification.render(finished, detailed=detailed)
+            self.assertIn("Full Responses GPU suite was not requested", rendered)
+            self.assertIn("Codex Acceptance: failure (0/1 scenarios succeeded); "
+                          "vLLM image `sha256:abc` (registry, digest `sha256:def`).", rendered)
+            self.assertNotIn("Claude Acceptance:", rendered)
+            self.assertNotIn("Native Responses:", rendered)
+
     def test_pi_acceptance_is_reported_beside_the_other_clients(self):
         with tempfile.TemporaryDirectory() as directory:
             raw = Path(directory) / "raw.json"
