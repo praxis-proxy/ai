@@ -26,14 +26,16 @@ mod schema {
         generate_files_ddl(&name).unwrap();
         assert!(version_table(&name).len() <= POSTGRES_MAX_IDENTIFIER_LEN);
         assert!(tenant_index(&name).len() <= POSTGRES_MAX_IDENTIFIER_LEN);
+        assert!(claim_sequence(&name).len() <= POSTGRES_MAX_IDENTIFIER_LEN);
     }
 
     #[test]
-    fn ddl_has_table_index_and_version_table() {
+    fn ddl_has_table_index_sequence_and_version_table() {
         let ddl = generate_files_ddl("f1").unwrap();
-        assert_eq!(ddl.len(), 3);
+        assert_eq!(ddl.len(), 4);
         let mut statements = ddl.iter();
-        let (table, index, versions) = (
+        let (table, index, sequence, versions) = (
+            statements.next().unwrap(),
             statements.next().unwrap(),
             statements.next().unwrap(),
             statements.next().unwrap(),
@@ -41,7 +43,9 @@ mod schema {
         assert!(table.starts_with("CREATE TABLE IF NOT EXISTS f1 ("));
         assert!(table.contains("storage_key   TEXT   NOT NULL UNIQUE"));
         assert!(table.contains("extract(epoch FROM now())::bigint"));
+        assert!(table.contains("claim_token   BIGINT\n"));
         assert_eq!(index, "CREATE INDEX IF NOT EXISTS f1_tenant_idx ON f1 (tenant_id)");
+        assert_eq!(sequence, "CREATE SEQUENCE IF NOT EXISTS f1_claim_seq");
         assert_eq!(
             versions,
             "CREATE TABLE IF NOT EXISTS f1_schema_version (version BIGINT PRIMARY KEY)"
@@ -100,6 +104,47 @@ mod schema {
         exec(&pool, &table.replace("TEXT   PRIMARY KEY", "TEXT")).await;
         let err = initialize_files_schema(&pool, &files).await.unwrap_err();
         assert!(err.to_string().contains("primary key"), "unexpected error: {err}");
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    async fn initialization_seeds_claim_sequence_above_stored_tokens() {
+        let pool = pool().await;
+        let files = unique_name("files_seed");
+        initialize_files_schema(&pool, &files).await.unwrap();
+        exec(
+            &pool,
+            &format!(
+                "INSERT INTO {files} (id, tenant_id, owner_issuer, owner_subject, storage_key, filename, state, \
+                 bytes, claim_token) VALUES ('a', 't', 'i', 's', 'k', 'f', 'failed', 1, 500)"
+            ),
+        )
+        .await;
+        // Recreated behind the stored token.
+        exec(&pool, &format!("DROP SEQUENCE {}", claim_sequence(&files))).await;
+        initialize_files_schema(&pool, &files).await.unwrap();
+        let next: i64 = sqlx::query_scalar(AssertSqlSafe(format!("SELECT nextval('{}')", claim_sequence(&files))))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(next > 500, "sequence not seeded: {next}");
+        // A fresh sequence next to a stored token 1 must not reissue it.
+        exec(&pool, &format!("UPDATE {files} SET claim_token = 1")).await;
+        exec(&pool, &format!("DROP SEQUENCE {}", claim_sequence(&files))).await;
+        initialize_files_schema(&pool, &files).await.unwrap();
+        let fresh: i64 = sqlx::query_scalar(AssertSqlSafe(format!("SELECT nextval('{}')", claim_sequence(&files))))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(fresh > 1, "token 1 reissued");
+        // An ahead sequence is left alone.
+        initialize_files_schema(&pool, &files).await.unwrap();
+        let after: i64 = sqlx::query_scalar(AssertSqlSafe(format!("SELECT nextval('{}')", claim_sequence(&files))))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, fresh + 1);
         pool.close().await;
     }
 
@@ -930,7 +975,9 @@ mod operations {
         // The worker crashed and the lease ran out.
         exec(&c, "UPDATE {f} SET lease_until = 1").await;
         let second = c.claim_cleanup(LONG, 10).await.unwrap();
-        assert_eq!(second, first);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].id, first[0].id);
+        assert_ne!(second[0].claim_token, first[0].claim_token);
         c.close().await;
     }
 
@@ -965,6 +1012,32 @@ mod operations {
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
+    async fn stale_claim_cannot_purge_a_reused_id() {
+        let c = catalog().await;
+        let alice = owner("t1", "alice");
+        deletion_pending(&c, &alice, 1).await;
+        let stale = c.claim_cleanup(LONG, 10).await.unwrap().remove(0);
+        // Another worker reclaims and purges.
+        exec(&c, "UPDATE {f} SET lease_until = 1").await;
+        let current = c.claim_cleanup(LONG, 10).await.unwrap().remove(0);
+        assert!(c.complete_cleanup(&current).await.unwrap());
+        // A caller breaks the contract: same ID and key, same cleanup state.
+        c.create_pending(&new_file(&stale.id, &alice, 10)).await.unwrap();
+        c.fail_upload(&alice, &stale.id).await.unwrap();
+        exec(&c, "UPDATE {f} SET state = 'deletion_pending'").await;
+        let usage_before = usage(&c, "t1").await;
+        // Matches ID, key and state, but not the token.
+        assert!(!c.complete_cleanup(&stale).await.unwrap());
+        assert_eq!(usage(&c, "t1").await, usage_before);
+        // The new row purges with its own token.
+        exec(&c, "UPDATE {f} SET lease_until = 1").await;
+        let fresh = c.claim_cleanup(LONG, 10).await.unwrap().remove(0);
+        assert!(c.complete_cleanup(&fresh).await.unwrap());
+        c.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via DATABASE_URL"]
     async fn claim_lease_is_the_retry_delay() {
         let c = catalog().await;
         deletion_pending(&c, &owner("t1", "alice"), 1).await;
@@ -976,8 +1049,10 @@ mod operations {
         exec(&c, "UPDATE {f} SET lease_until = 1").await;
         let second = c.claim_cleanup(LONG, 10).await.unwrap();
         assert_eq!(second.len(), 1);
-        // The first worker's late purge succeeds once; the second finds it gone.
-        assert!(c.complete_cleanup(&first[0]).await.unwrap());
+        // The reclaim fences the first worker.
+        assert_ne!(first[0].claim_token, second[0].claim_token);
+        assert!(!c.complete_cleanup(&first[0]).await.unwrap());
+        assert!(c.complete_cleanup(&second[0]).await.unwrap());
         assert!(!c.complete_cleanup(&second[0]).await.unwrap());
         // Failed rows are claimed too.
         c.create_pending(&new_file("p", &owner("t1", "alice"), 1))

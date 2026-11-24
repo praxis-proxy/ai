@@ -37,7 +37,9 @@ use crate::owner::StateOwner;
 /// 3. A tenant's usage equals the sum of the charged bytes of all its rows (pending, ready, failed and
 ///    deletion-pending).
 ///
-/// IDs and storage keys are never reused, including after cleanup.
+/// IDs and storage keys are never reused, including after cleanup. The caller
+/// ensures this by generating both randomly (for example a UUID), never from
+/// client input: unique constraints cover only live rows.
 ///
 /// Implementations make every state transition atomic and use the database
 /// clock for every timestamp.
@@ -99,7 +101,9 @@ pub trait FileCatalog: Send + Sync {
     async fn get_ready(&self, owner: &StateOwner, id: &str) -> Result<Option<StoredFile>, CatalogError>;
 
     /// List unexpired ready files, ordered by `(created_at, id)` in the
-    /// requested direction. `after` is resolved within the tenant.
+    /// requested direction. `after` is resolved within the tenant and must
+    /// name an existing row: once a deleted file is purged, a cursor pointing
+    /// at it is invalid.
     ///
     /// # Errors
     ///
@@ -109,7 +113,8 @@ pub trait FileCatalog: Send + Sync {
 
     /// Atomically hide a ready file and mark it for physical deletion.
     /// [`DeletionOutcome::AlreadyPending`] lets a retry after an ambiguous
-    /// commit succeed instead of reporting not-found.
+    /// commit succeed instead of reporting not-found, until the row is purged;
+    /// a retry after the purge reports [`DeletionOutcome::NotFound`].
     ///
     /// # Errors
     ///
@@ -138,7 +143,8 @@ pub trait FileCatalog: Send + Sync {
     /// tenants. The lease doubles as the retry delay: a worker whose byte-store
     /// deletion fails does nothing, and the row becomes claimable again when
     /// the lease expires, as it does for a crashed worker. Only claiming writes
-    /// a lease, so a stale worker cannot shorten another's.
+    /// a lease, so a stale worker cannot shorten another's. Each claim carries
+    /// a fresh token; a reclaim invalidates the earlier claim.
     ///
     /// # Errors
     ///
@@ -147,8 +153,8 @@ pub trait FileCatalog: Send + Sync {
 
     /// Purge a row after byte-store deletion succeeded and release its charged
     /// bytes, in one transaction. The row must still match the claim's ID,
-    /// state and storage key. Returns `false` if another worker already purged
-    /// it, in which case nothing is released.
+    /// state, storage key and token. Returns `false` if it was already purged
+    /// or reclaimed, in which case nothing is released.
     ///
     /// # Errors
     ///

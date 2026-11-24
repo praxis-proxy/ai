@@ -30,6 +30,9 @@ const VERSION_SUFFIX: &str = "_schema_version";
 /// Suffix appended to the files table name for the tenant index.
 const TENANT_INDEX_SUFFIX: &str = "_tenant_idx";
 
+/// Suffix appended to the files table name for the claim token sequence.
+const CLAIM_SEQUENCE_SUFFIX: &str = "_claim_seq";
+
 /// `PostgreSQL` truncates identifiers longer than this many bytes.
 pub(super) const POSTGRES_MAX_IDENTIFIER_LEN: usize = 63;
 
@@ -50,6 +53,7 @@ const FILES_COLUMNS: &[&str] = &[
     "created_at",
     "expires_at",
     "lease_until",
+    "claim_token",
 ];
 
 /// The files table contract: primary key `id` and a unique `storage_key`.
@@ -69,6 +73,11 @@ pub(super) fn tenant_index(files: &str) -> String {
     format!("{files}{TENANT_INDEX_SUFFIX}")
 }
 
+/// Derive the claim token sequence name from the files table name.
+pub(super) fn claim_sequence(files: &str) -> String {
+    format!("{files}{CLAIM_SEQUENCE_SUFFIX}")
+}
+
 /// Validate the files table name against shared and `PostgreSQL` rules.
 ///
 /// The name is interpolated unquoted into DDL, so it must be a plain
@@ -84,6 +93,7 @@ pub(super) fn generate_files_ddl(files: &str) -> Result<Vec<String>, StoreError>
     validate_files_table(files)?;
     let versions = version_table(files);
     let tenant_idx = tenant_index(files);
+    let claim_seq = claim_sequence(files);
     Ok(vec![
         format!(
             "CREATE TABLE IF NOT EXISTS {files} (\n\
@@ -99,10 +109,12 @@ pub(super) fn generate_files_ddl(files: &str) -> Result<Vec<String>, StoreError>
              \x20 bytes         BIGINT NOT NULL CHECK (bytes >= 0),\n\
              \x20 created_at    BIGINT NOT NULL DEFAULT extract(epoch FROM now())::bigint,\n\
              \x20 expires_at    BIGINT,\n\
-             \x20 lease_until  BIGINT NOT NULL DEFAULT extract(epoch FROM now())::bigint\n\
+             \x20 lease_until  BIGINT NOT NULL DEFAULT extract(epoch FROM now())::bigint,\n\
+             \x20 claim_token   BIGINT\n\
              )"
         ),
         format!("CREATE INDEX IF NOT EXISTS {tenant_idx} ON {files} (tenant_id)"),
+        format!("CREATE SEQUENCE IF NOT EXISTS {claim_seq}"),
         format!("CREATE TABLE IF NOT EXISTS {versions} (version BIGINT PRIMARY KEY)"),
     ])
 }
@@ -123,8 +135,24 @@ pub(crate) async fn initialize_files_schema(pool: &sqlx::PgPool, files: &str) ->
     run_ddl(&mut initialization, &ddl).await?;
     validate_expected_tables(&mut initialization, &[(files.to_owned(), FILES_TABLE)]).await?;
     check_schema_version(&mut initialization, &version_table(files), FILES_SCHEMA_VERSION).await?;
+    seed_claim_sequence(&mut initialization, files).await?;
     initialization
         .commit()
         .await
         .map_err(|e| StoreError::Database(e.to_string()))
+}
+
+/// Move the claim sequence above every stored token, if it is behind
+/// (for example after being recreated).
+async fn seed_claim_sequence(connection: &mut sqlx::PgConnection, files: &str) -> Result<(), StoreError> {
+    let seq = claim_sequence(files);
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT setval('{seq}'::regclass, max_token) \
+         FROM (SELECT max(claim_token) AS max_token FROM {files}) t \
+         WHERE max_token > (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM {seq})"
+    )))
+    .execute(connection)
+    .await
+    .map_err(|e| StoreError::Database(e.to_string()))?;
+    Ok(())
 }

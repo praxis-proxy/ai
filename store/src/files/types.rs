@@ -26,11 +26,11 @@ pub enum SortDirection {
 /// creation timestamp and the reservation are assigned by the catalog.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NewFile {
-    /// New public file identifier, unique across all tenants.
+    /// New public file identifier, unique across all tenants, never reused.
     pub id: String,
     /// Trusted creating owner. The full owner is stored for audit.
     pub owner: StateOwner,
-    /// Immutable, globally unique and opaque byte-store key.
+    /// Immutable, globally unique and opaque byte-store key, never reused.
     pub storage_key: String,
     /// Original client filename.
     pub filename: String,
@@ -133,4 +133,6 @@ pub struct CleanupClaim {
     pub storage_key: String,
     /// Cleanup state, checked again by the conditional purge.
     pub state: CleanupState,
+    /// Fencing token issued with this claim; the purge must match it.
+    pub claim_token: i64,
 }
