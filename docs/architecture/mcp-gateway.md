@@ -84,7 +84,7 @@ sequenceDiagram
         Catalog-->>Classifier: Canonical identity and route target
     end
     Classifier->>Policy: Request + trusted MCP metadata
-    Policy->>Policy: Verify identity; map roles to capabilities
+    Policy->>Policy: Verify identity and map roles to capabilities
     Policy-->>Broker: Continue with request-scoped capabilities
 
     alt tools/list
@@ -192,15 +192,50 @@ use private cache scope.
 
 ## Telemetry
 
-The restricted-user `tools/list` trace from a smoke run is
-`1fa0b970186b0a7e7ac21f3e5618cd02` (trace IDs change on each run). On its
-`mcp_poc.respond` span, the event `filtered MCP tools/list by authorization`
-records `operation=tools/list`, `tools_before=24`, and `tools_after=1`. A
-forwarded FastMCP call trace, `c27f4cde38f2669b8ecfab2f5c2bf6bc`, has the
-classifier/response spans and core upstream spans.
+The opt-in `mcp-poc-filter` feature registers the broker. The `opentelemetry`
+feature enables Praxis core OTLP export and Praxis AI semantic spans. The
+local POC config sets the OTLP endpoint, service identity, and sampling rate:
 
-Praxis core exposes HTTP request and upstream metrics. For example, this query
-shows request counts by method, status class, and cluster:
+```yaml
+telemetry:
+  otlp_endpoint: "http://127.0.0.1:4317"
+  batch_interval_secs: 1
+  sampling_rate: 1.0
+  service_name: praxis-mcp-poc
+  service_version: "0.11.0"
+  environment: local
+```
+
+OTLP uses gRPC by default. `OTEL_EXPORTER_OTLP_ENDPOINT` supplies a fallback
+endpoint when `otlp_endpoint` is unset; set
+`OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` to use HTTP/protobuf. A W3C
+`traceparent` propagates or supplies a parent context; it does not enable
+exporting. The POC samples root requests and honors the sampled flag on an
+incoming parent.
+
+The MCP filter emits two child spans:
+
+- `mcp_poc.classify` records the bounded `mcp.method` and `mcp.outcome` (`route`
+  or `respond`). For a catalog-routed call, it also records the validated public
+  tool name in `mcp.tool` and backend tool name in `mcp.backend.tool`.
+- `mcp_poc.respond` records the bounded method and outcome (`forward`, `deny`,
+  or `local_response`) while it serves the local response or checks a call.
+
+The method label is limited to `server/discover`, `tools/list`, `tools/call`,
+or `other`. The MCP spans omit JSON-RPC IDs, request bodies, tool arguments,
+credentials, and results. Praxis core adds the inbound HTTP span and, for a
+forwarded call, the outbound request spans. The policy filter does not create a
+dedicated authorization span.
+
+The restricted-user `tools/list` trace from a smoke run is
+`b43521f2af1caec5f3e69522eb2e1785` (trace IDs change between runs). Its
+`mcp_poc.respond` span contains the event `filtered MCP tools/list by
+authorization`, with `operation=tools/list`, `tools_before=24`, and
+`tools_after=1`. The forwarded FastMCP call trace is
+`3cf5f0740bb8affaa05c8628e267940e`.
+
+Praxis core exposes HTTP request and upstream metrics. This PromQL query shows
+request counts by method, status class, and cluster:
 
 ```promql
 sum by (method, status_class, cluster) (
@@ -209,5 +244,5 @@ sum by (method, status_class, cluster) (
 ```
 
 There is no MCP-specific Prometheus authorization metric; the list-filter
-counts are recorded in the trace event. Policy-filter authorization/assertion
-events are also available at their configured tracing levels and flow to logs.
+counts are recorded in the trace event. Policy-filter authorization events
+also flow to logs at their configured tracing levels.

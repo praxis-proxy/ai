@@ -1,21 +1,15 @@
-# OpenTelemetry trace export and routing semantics
+# OpenTelemetry Routing Semantics
 
-Praxis AI can add AI routing decisions to the HTTP trace created by Praxis core. Build the proxy with:
+Praxis AI can add AI routing decisions to the request trace created and
+exported by Praxis core. Build the proxy with:
 
 ```sh
 cargo build --release -p praxis-ai-proxy --features opentelemetry
 ```
 
-The opt-in `opentelemetry` feature enables both Praxis core’s OTLP tracing support and Praxis AI’s semantic spans. Exporting requires an endpoint in the top-level `telemetry` config; the core exporter also accepts `OTEL_EXPORTER_OTLP_ENDPOINT` as a fallback:
-
-```yaml
-telemetry:
-  otlp_endpoint: "http://localhost:4317"
-  service_name: praxis-ai
-  sampling_rate: 1.0
-```
-
-The exporter defaults to OTLP gRPC. Set `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` to use OTLP HTTP/protobuf instead. `traceparent` propagates or supplies a W3C parent context; it does not enable exporting.
+The feature is disabled by default. It does not install an exporter or parse
+OpenTelemetry environment variables. Configure exporting, propagation,
+sampling, and request lifecycle tracing through Praxis core.
 
 After `intelligent_route` successfully selects a provider, the feature emits a
 short `routing.select` child span. The span contains bounded routing identity,
@@ -84,16 +78,6 @@ into isolated web-search, OGX file-search, OGX file-resolution, and MCP child
 requests. Praxis core then emits the same `x-request-id` and W3C trace ID with a
 fresh span ID for every outbound hop. No ambient request extensions, provider
 credentials, or MCP authorization assertions are copied into trace fields.
-
-## Development MCP POC spans
-
-When the development-only `mcp_poc` filter is enabled, it emits two semantic child spans:
-
-- `mcp_poc.classify` covers stateless JSON-RPC classification and route preparation. It records the bounded `mcp.method` label and `mcp.outcome` (`route` or `respond`).
-- `mcp_poc.respond` covers local discovery/list responses or passing a classified tool call onward. It records the bounded method label and `mcp.outcome` (`forward`, `deny`, or `local_response`).
-
-The method label is restricted to `server/discover`, `tools/list`, `tools/call`, or `other`. For a valid catalog-routed call, `mcp_poc.classify` also records the public prefixed `mcp.tool` and the catalog's upstream `mcp.backend.tool` names. These span fields are sourced from the validated catalog, not raw request strings. The spans omit JSON-RPC IDs, request bodies, tool arguments, credentials, and results. They are POC-specific; the production `mcp` filter does not emit these spans. PPE remains a separate filter and has no dedicated decision span here.
-
 
 ## Token rate limiting
 
