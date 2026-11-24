@@ -63,7 +63,8 @@ exercises AWS credentials and inference independently of the gateway.
 
 ## Anthropic Messages passthrough
 
-The nightly uses the `ANTHROPIC_API_KEY` Actions secret and the
+The Anthropic job runs on Mondays at cron `43 5 * * 1` (UTC) and
+on manual dispatch. It uses the `ANTHROPIC_API_KEY` Actions secret and the
 [local gateway fixture](../../tests/integration/fixtures/anthropic/messages-live.yaml).
 The [SDK case](../../tests/integration/sdk/anthropic/test_official_anthropic_live.py)
 uses `claude-haiku-4-5-20251001` and API version `2023-06-01`. It makes at most two

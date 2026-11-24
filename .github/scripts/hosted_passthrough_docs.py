@@ -23,6 +23,7 @@ def render():
     workflow = (ROOT / WORKFLOW).read_text()
     suite = (ROOT / SUITE).read_text()
     cron = field(r'^\s+- cron: "([^"]+)"$', workflow)
+    anthropic_cron = field(r'^    - cron: "([^"]+ 1)"$', workflow)
     runner = field(r"^\s+runs-on: (\S+)$", workflow)
     secret = field(r"secrets\.([A-Z_]+)", workflow)
     artifact = field(r"^\s+name: (hosted-\S+-results)$", workflow)
@@ -99,7 +100,8 @@ exercises AWS credentials and inference independently of the gateway.
 
 ## Anthropic Messages passthrough
 
-The nightly uses the `ANTHROPIC_API_KEY` Actions secret and the
+The Anthropic job runs on Mondays at cron `{anthropic_cron}` (UTC) and
+on manual dispatch. It uses the `ANTHROPIC_API_KEY` Actions secret and the
 [local gateway fixture](../../tests/integration/fixtures/anthropic/messages-live.yaml).
 The [SDK case](../../tests/integration/sdk/anthropic/test_official_anthropic_live.py)
 uses `claude-haiku-4-5-20251001` and API version `2023-06-01`. It makes at most two

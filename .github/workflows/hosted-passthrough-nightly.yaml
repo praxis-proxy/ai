@@ -4,6 +4,7 @@ name: Hosted Passthrough Nightly
 on:
   schedule:
     - cron: "43 5 * * *"
+    - cron: "43 5 * * 1"
   workflow_dispatch:
 
 permissions: {}
@@ -14,7 +15,7 @@ concurrency:
 jobs:
   openai-chat:
     name: Official OpenAI API passthrough
-    if: github.repository == 'praxis-proxy/ai' || github.event_name == 'workflow_dispatch'
+    if: (github.repository == 'praxis-proxy/ai' || github.event_name == 'workflow_dispatch') && github.event.schedule != '43 5 * * 1'
     permissions:
       contents: read
     runs-on: ubuntu-24.04
@@ -94,7 +95,7 @@ jobs:
 
   bedrock-runtime:
     name: Bedrock Runtime Chat Completions passthrough
-    if: github.repository == 'praxis-proxy/ai' && github.ref == 'refs/heads/main'
+    if: (github.repository == 'praxis-proxy/ai' && github.ref == 'refs/heads/main') && github.event.schedule != '43 5 * * 1'
     permissions:
       contents: read
       id-token: write
@@ -195,7 +196,7 @@ jobs:
 
   anthropic-passthrough:
     name: Anthropic Messages passthrough
-    if: github.repository == 'praxis-proxy/ai' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || (github.repository == 'praxis-proxy/ai' && github.event.schedule == '43 5 * * 1')
     permissions:
       contents: read
     runs-on: ubuntu-24.04

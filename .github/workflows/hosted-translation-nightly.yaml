@@ -4,6 +4,7 @@ name: Hosted Translation Nightly
 on:
   schedule:
     - cron: "53 5 * * *"
+    - cron: "53 5 * * 1"
   workflow_dispatch:
 
 permissions: {}
@@ -14,7 +15,7 @@ concurrency:
 jobs:
   messages-to-openai:
     name: Anthropic Messages to OpenAI Chat Completions
-    if: github.repository == 'praxis-proxy/ai' || github.event_name == 'workflow_dispatch'
+    if: (github.repository == 'praxis-proxy/ai' || github.event_name == 'workflow_dispatch') && github.event.schedule != '53 5 * * 1'
     permissions:
       contents: read
     runs-on: ubuntu-24.04
@@ -94,7 +95,7 @@ jobs:
 
   responses-to-chat:
     name: OpenAI Responses to OpenAI Chat Completions
-    if: github.repository == 'praxis-proxy/ai' || github.event_name == 'workflow_dispatch'
+    if: (github.repository == 'praxis-proxy/ai' || github.event_name == 'workflow_dispatch') && github.event.schedule != '53 5 * * 1'
     permissions:
       contents: read
     runs-on: ubuntu-24.04
@@ -175,7 +176,7 @@ jobs:
 
   anthropic-translation:
     name: OpenAI Chat Completions to Anthropic Messages
-    if: github.repository == 'praxis-proxy/ai' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || (github.repository == 'praxis-proxy/ai' && github.event.schedule == '53 5 * * 1')
     permissions:
       contents: read
     runs-on: ubuntu-24.04
