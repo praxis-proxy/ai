@@ -46,6 +46,15 @@ reviews:
     - "!tests/integration/fixtures/inference/recordings/**"
 
   path_instructions:
+    - path: "{apis,filters}/src/**"
+      instructions: |
+        Review against the protocol spec Praxis speaks (SSE, MCP, OpenAI,
+        Anthropic, etc.). Let upstream violations fail. Decline suggestions
+        for lenient parsing, synthetic terminators, or retries that only help
+        a spec-violating upstream, and cite the relevant spec section.
+        Flag gaps for permitted behavior, including SHOULD-level choices such
+        as an MCP server keeping an SSE stream open after its response.
+
     # ---------------------------------------------------------------
     # Cross-cutting apis/ conventions
     # ---------------------------------------------------------------

@@ -299,23 +299,23 @@ behavior, restoration, and tool paths. They test protocol outcomes; they are
 not measurements of whole-process peak memory under concurrent load.
 
 [agentic-loop example]: ../../examples/configs/openai/responses/agentic-loop.yaml
-[filter configuration reference]: ../filters/openai_agentic_loop.md
+[filter configuration reference]: ../filters/agents/openai_agentic_loop.md
 [agentic-loop integration tests]: ../../tests/integration/tests/suite/examples/openai_agentic_loop.rs
-[`openai_responses_request`]: ../filters/openai_responses_request.md
-[`openai_responses_model_rewrite`]: ../filters/openai_responses_model_rewrite.md
-[`prompt_enrich`]: ../filters/prompt_enrich.md
-[`openai_doc_extract`]: ../filters/openai_doc_extract.md
-[`openai_file_resolve`]: ../filters/openai_file_resolve.md
-[`openai_responses_rehydrate`]: ../filters/openai_responses_rehydrate.md
-[`openai_responses_compact`]: ../filters/openai_responses_compact.md
-[`openai_client_tool_compat`]: ../filters/openai_client_tool_compat.md
-[`openai_mcp_tool_resolve`]: ../filters/openai_mcp_tool_resolve.md
-[`openai_agentic_loop`]: ../filters/openai_agentic_loop.md
-[`openai_stream_events`]: ../filters/openai_stream_events.md
-[`openai_mcp_dispatch`]: ../filters/openai_mcp_dispatch.md
-[`openai_file_search_dispatch`]: ../filters/openai_file_search_dispatch.md
-[`openai_web_search_dispatch`]: ../filters/openai_web_search_dispatch.md
-[`openai_responses_to_chat_completions`]: ../filters/openai_responses_to_chat_completions.md
-[`openai_conversations`]: ../filters/openai_conversations.md
-[`openai_responses_store`]: ../filters/openai_responses_store.md
-[`anthropic_web_search`]: ../filters/anthropic_web_search.md
+[`openai_responses_request`]: ../filters/apis/openai_responses_request.md
+[`openai_responses_model_rewrite`]: ../filters/apis/openai_responses_model_rewrite.md
+[`prompt_enrich`]: ../filters/core/prompt_enrich.md
+[`openai_doc_extract`]: ../filters/agents/openai_doc_extract.md
+[`openai_file_resolve`]: ../filters/agents/openai_file_resolve.md
+[`openai_responses_rehydrate`]: ../filters/agents/openai_responses_rehydrate.md
+[`openai_responses_compact`]: ../filters/agents/openai_responses_compact.md
+[`openai_client_tool_compat`]: ../filters/apis/openai_client_tool_compat.md
+[`openai_mcp_tool_resolve`]: ../filters/agents/openai_mcp_tool_resolve.md
+[`openai_agentic_loop`]: ../filters/agents/openai_agentic_loop.md
+[`openai_stream_events`]: ../filters/apis/openai_stream_events.md
+[`openai_mcp_dispatch`]: ../filters/agents/openai_mcp_dispatch.md
+[`openai_file_search_dispatch`]: ../filters/agents/openai_file_search_dispatch.md
+[`openai_web_search_dispatch`]: ../filters/agents/openai_web_search_dispatch.md
+[`openai_responses_to_chat_completions`]: ../filters/apis/openai_responses_to_chat_completions.md
+[`openai_conversations`]: ../filters/agents/openai_conversations.md
+[`openai_responses_store`]: ../filters/agents/openai_responses_store.md
+[`anthropic_web_search`]: ../filters/agents/anthropic_web_search.md

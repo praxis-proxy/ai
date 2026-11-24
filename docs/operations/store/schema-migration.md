@@ -5,7 +5,7 @@ store. Schema upgrades are recreate-only: Praxis does not migrate an existing
 store in place, and it fails closed rather than auto-stamping a newer version.
 
 Schema version 5 adds the owner-scoped SSE replay event-log table used by
-[streaming replay](../architecture/response-store.md#sse-replay) on top of the
+[streaming replay](../../architecture/response-store.md#sse-replay) on top of the
 version-4 layout. Version 4 (shipped after Praxis AI v0.4.1's version 3) changed
 the conversation-item layout and cannot reuse the older tables.
 

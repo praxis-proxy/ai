@@ -98,7 +98,7 @@ filter_chains:
         #   Upgrading an existing database: schema version 3 and later store
         #   these responses columns as binary. Databases created under an older
         #   schema version must be migrated before the proxy will start — see
-        #   docs/store/schema-migration.md.
+        #   docs/operations/store/schema-migration.md.
         #
         # TTL and automatic purge (optional, off by default):
         #   Time-to-live retention policy that purges records older than the

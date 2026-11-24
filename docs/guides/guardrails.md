@@ -1,16 +1,19 @@
-# Screen requests and observe token usage
+# Screen requests with guardrails
 
-This recipe combines the existing [NeMo request-screening example](../../examples/configs/nemo-guardrails.yaml)
+This guide combines the existing [NeMo request-screening example](../../examples/configs/nemo-guardrails.yaml)
 and [token-counting example](../../examples/configs/token-counting.yaml).
 It screens supported Chat Completions text before inference, then extracts
 OpenAI-format usage into metrics. It does not enable response screening.
+To observe the extracted usage, continue with
+[Observe and meter token usage](token-usage.md); to enforce budgets, see
+[Limit token usage](token-limits.md).
 
 ## Prerequisites and build
 
-Follow the [recipe prerequisites](README.md). Start an OpenAI-compatible Chat
+Follow the [guide prerequisites](README.md). Start an OpenAI-compatible Chat
 backend at `127.0.0.1:3000`, and NeMo Guardrails **0.24.0+** at
 `127.0.0.1:3001`. Deploy a NeMo configuration and replace `your-config` below
-with its actual ID. The [guardrails reference](../filters/ai_guardrails.md)
+with its actual ID. The [guardrails reference](../filters/control/ai_guardrails.md)
 describes the service contract and failure modes. Choose known passing and
 blocking prompts from your deployed rails; a generic prompt is not guaranteed
 to trigger a particular policy.
@@ -111,31 +114,17 @@ runs before forwarding. Do not enable response screening for this streaming
 recipe: Chat response-phase screening rejects streaming requests with 422
 until incremental output evaluation is supported.
 
-## Limits, identity, and accounting
-
-`token_count` reads JSON/SSE usage from the configured provider dialect. Choose
-the dialect it actually observes when composing translators. Provider-reported
-cache and reasoning fields may be missing, and translation can lose details;
-review the [compatibility matrix](../conformance/translation-matrix.md).
-Body-derived counts arrive after response headers: `token_usage_headers`
-does not turn these metrics into `Praxis-Token-*` headers merely by reordering
-filters. The Bedrock InvokeModel header-only path is a separate case.
-
-For bounded per-tenant counters, declare [token_usage_metrics](../filters/token_usage_metrics.md)
-before `token_count`, provide explicit tenant/model allowlists, and derive
-identity from authenticated metadata. Client headers are insufficient.
-Prometheus labels do not provide authorization or billing-grade settlement.
-[External metering](../../examples/configs/external-metering-file-key.yaml)
-adds balance checks and usage reporting to a separate service.
-
-Usage extraction does not enforce token limits. Experimental
-[token_rate_limit](../filters/token_rate_limit.md) reserves estimated budgets
-and reconciles them; [token_ceiling](../filters/token_ceiling.md) constrains
-the final provider-bound body. Both require their own features and policies.
-
 ## Cleanup
 
 Stop the proxy with Ctrl+C, then stop services you started solely for the
 recipe. Unset `BACKEND_API_KEY` in the proxy shell and `MODEL` in the client
 shell; remove `guardrails-usage.yaml` if no longer needed. Keep the admin
 metrics endpoint private in a deployed service.
+
+## Filter reference
+
+- [`ai_operation`](../filters/core/ai_operation.md)
+- [`model_to_header`](../filters/routing/model_to_header.md)
+- [`ai_guardrails`](../filters/control/ai_guardrails.md)
+- [`stream_usage_inject`](../filters/observability/stream_usage_inject.md)
+- [`token_count`](../filters/observability/token_count.md)

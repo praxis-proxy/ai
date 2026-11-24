@@ -11,7 +11,7 @@ The release workflow attaches its chosen report to the GitHub Release for
 longer term access.
 
 This is the GPU-specific report. Releases also publish a broader
-[CI evidence report](../release.md#changelog) with exact-commit workflow, job,
+[CI evidence report](release.md#changelog) with exact-commit workflow, job,
 and step outcomes in `release-qualification.md` and `release-qualification.json`.
 An unavailable GPU result does not hide successful unit, integration, SDK,
 security, or other CI results. The CI report never counts simulator or CPU

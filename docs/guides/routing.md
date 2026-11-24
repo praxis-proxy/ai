@@ -6,7 +6,7 @@ model string translates a protocol.
 
 ## Start with a static alias
 
-Follow the [recipe prerequisites](README.md) and build the standard binary:
+Follow the [guide prerequisites](README.md) and build the standard binary:
 
 ```console
 cargo build -p praxis-ai-proxy
@@ -50,7 +50,7 @@ Keep `model_to_provider` before `load_balancer`; do not add a competing router.
 Endpoint health checks and retries belong to the load balancer. An unmatched
 request uses `fallback_upstream`; that setting does not mean automatic retry
 of a failed mapped inference on another provider. See the
-[exact contract](../filters/model_to_provider.md).
+[exact contract](../filters/routing/model_to_provider.md).
 
 ## Dynamic selection, failover, and affinity
 
@@ -63,7 +63,7 @@ where needed, then `credential_inject` and endpoint selection. The
 shows gateway-owned credentials without embedding keys in YAML. This is a
 different credential mechanism from core `credential_injection`.
 
-Read the [routing reference](../filters/intelligent_route.md) before deploying:
+Read the [routing reference](../filters/routing/intelligent_route.md) before deploying:
 capability matching, admission, serving snapshots, and selection policy all
 constrain eligibility. Session affinity is disabled by default. When enabled,
 it requires `store: local` plus a header or cookie source. Bindings live in
@@ -87,3 +87,14 @@ credential validity, or cross-provider semantic equivalence.
 Stop the proxy and the two test backends with Ctrl+C. Remove only your local
 recordings and temporary configurations. If you added provider keys, unset
 them in the proxy shell. The committed example remains unchanged.
+
+## Filter reference
+
+- [`model_to_provider`](../filters/routing/model_to_provider.md)
+- [`model_to_header`](../filters/routing/model_to_header.md)
+- [`intelligent_route`](../filters/routing/intelligent_route.md)
+- [`credential_inject`](../filters/providers/credential_inject.md)
+- [`provider_route`](../filters/routing/provider_route.md)
+
+Core filters such as `router`, `headers`, `credential_injection`, and
+`load_balancer` are documented in the [Praxis core filter reference](https://github.com/praxis-proxy/praxis/blob/main/docs/filters/reference.md).

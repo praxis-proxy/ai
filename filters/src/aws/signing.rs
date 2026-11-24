@@ -22,7 +22,7 @@
 //! and string-to-sign types private, so there is no seam at which only the
 //! cryptography could be swapped. Praxis AI performs all of its cryptography
 //! in the system OpenSSL (the validated module on a FIPS host, see
-//! `docs/fips.md`), and the FIPS build rejects a binary whose dependency
+//! `docs/operations/fips.md`), and the FIPS build rejects a binary whose dependency
 //! graph names `sha2` or `hmac` at all. Signing therefore has to be
 //! assembled here, over the OpenSSL-backed primitives in
 //! [`praxis_ai_apis::hash`]. The protocol part (canonicalization, scope,

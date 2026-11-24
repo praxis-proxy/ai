@@ -8,7 +8,7 @@ configuration, and qualification evidence.
 
 ## Prerequisites and build
 
-Follow the [recipe prerequisites](README.md). Start a keyed backend on
+Follow the [guide prerequisites](README.md). Start a keyed backend on
 `127.0.0.1:8000` with a model you have qualified. Native mode needs `/v1/messages`;
 translated mode needs `/v1/chat/completions`. Model serving and GPU setup follow
 [the existing vLLM guide](../developing/cli-vllm-through-praxis.md), including
@@ -116,7 +116,7 @@ The adapter consumes the trusted profile from `intelligent_route`; a model name
 or an arbitrary client header cannot enable it. See the
 [compatibility contract](../developing/openai-anthropic-compatibility.md).
 
-Prerequisites are a trusted, versioned [routing overlay](../filters/intelligent_route.md#credentials-and-provider-gateways)
+Prerequisites are a trusted, versioned [routing overlay](../filters/routing/intelligent_route.md#credentials-and-provider-gateways)
 with a `messages` provider profile, the selected model available on the backend,
 and the referenced API key mounted under
 `<mount-base>/<namespace>/<secret-name>/<key>`. The overlay must contain the
@@ -190,3 +190,19 @@ unset GATEWAY_AUTH_PASSWORD VLLM_API_KEY MODEL ANTHROPIC_API_KEY
 ```
 
 Delete only locally created copies such as `anthropic-hosted.yaml`.
+
+## Filter reference
+
+- [`ai_operation`](../filters/core/ai_operation.md)
+- [`anthropic_messages_protocol`](../filters/apis/anthropic_messages_protocol.md)
+- [`anthropic_messages_request`](../filters/apis/anthropic_messages_request.md)
+- [`anthropic_messages_to_chat_completions`](../filters/apis/anthropic_messages_to_chat_completions.md)
+- [`anthropic_messages_to_chat_completions_stream`](../filters/apis/anthropic_messages_to_chat_completions_stream.md)
+- [`model_to_header`](../filters/routing/model_to_header.md)
+- [`intelligent_route`](../filters/routing/intelligent_route.md)
+- [`credential_inject`](../filters/providers/credential_inject.md)
+- [`openai_chat_completions_to_anthropic`](../filters/apis/openai_chat_completions_to_anthropic.md)
+- [`openai_chat_completions_to_anthropic_stream`](../filters/apis/openai_chat_completions_to_anthropic_stream.md)
+
+Core filters such as `router`, `headers`, `credential_injection`, and
+`load_balancer` are documented in the [Praxis core filter reference](https://github.com/praxis-proxy/praxis/blob/main/docs/filters/reference.md).
