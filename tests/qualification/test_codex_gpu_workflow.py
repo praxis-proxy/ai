@@ -99,7 +99,7 @@ class CodexGpuDispatchTest(unittest.TestCase):
                     "--model", "openai/gpt-oss-120b", "--served-model-name", "gpt-oss-120b",
                     "--max-model-len", "24576", "--gpu-memory-utilization", "0.9", "--seed", "0",
                     "--api-key", "synthetic-credential", "--revision", "a" * 40,
-                    "--tensor-parallel-size", "4",
+                    "--tokenizer-revision", "a" * 40, "--tensor-parallel-size", "4",
                     "--enable-auto-tool-choice", "--tool-call-parser", "openai",
                     "--reasoning-parser", "openai_gptoss",
                 ])

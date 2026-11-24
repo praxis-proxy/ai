@@ -1528,7 +1528,7 @@ jobs:
             --api-key "$CODEX_BACKEND_TOKEN"
           )
           if [ -n "${CODEX_MODEL_REVISION:-}" ]; then
-            vllm_args+=(--revision "$CODEX_MODEL_REVISION")
+            vllm_args+=(--revision "$CODEX_MODEL_REVISION" --tokenizer-revision "$CODEX_MODEL_REVISION")
           fi
           if [ "$CODEX_TENSOR_PARALLEL_SIZE" -gt 1 ]; then
             vllm_args+=(--tensor-parallel-size "$CODEX_TENSOR_PARALLEL_SIZE")
