@@ -43,7 +43,7 @@ use crate::{
 pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     #[cfg(feature = "token-quota-filter")]
     crate::token_quota::register_factory();
-    register_agentic_filters(registry);
+    register_agentic_filters(registry, subrequest_client);
     #[cfg(feature = "aws-sigv4-filter")]
     register_aws_filters(registry);
     #[cfg(feature = "azure-ad-filter")]
@@ -122,14 +122,29 @@ pub fn build_ai_registry() -> FilterRegistry {
 }
 
 /// Register agentic protocol filters (A2A, MCP).
-fn register_agentic_filters(registry: &mut FilterRegistry) {
+///
+/// `mcp` is chain-binding so the static catalog broker can bind its
+/// `backend_sessions` handshake chain against top-level clusters. The
+/// generated chain starts with `mcp_broker_backend`, which is registered as a
+/// plain filter so the chain can instantiate it.
+#[expect(clippy::panic, reason = "matches register_filters! macro convention")]
+fn register_agentic_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     praxis_filter::register_filters!(
         @register registry,
         http "a2a" => A2aFilter::from_config
     );
+    let shared = subrequest_client.cloned();
+    registry
+        .register_chain_binding(
+            "mcp",
+            std::sync::Arc::new(move |config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
+                McpFilter::from_config_with_binding(config, Some(ctx), shared.clone())
+            }),
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'mcp'"));
     praxis_filter::register_filters!(
         @register registry,
-        http "mcp" => McpFilter::from_config
+        http "mcp_broker_backend" => crate::agentic::mcp::McpBrokerBackendSelectorFilter::from_config
     );
 }
 
