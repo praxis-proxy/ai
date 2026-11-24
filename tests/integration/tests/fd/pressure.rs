@@ -109,7 +109,7 @@ fn disabling_shedding_lets_requests_fail_at_the_limit() {
             port,
             admin,
             backend,
-            "max_open_files: 256\n  shed_on_fd_pressure: false",
+            "max_open_files: 128\n  shed_on_fd_pressure: false",
         ),
         &addr(port),
     );
