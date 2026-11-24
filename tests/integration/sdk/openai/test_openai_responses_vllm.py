@@ -681,6 +681,8 @@ class MCPHandler(BaseHTTPRequestHandler):
     assertion_headers: ClassVar[list[str | None]] = []
     # Attached as ``structuredContent`` to text tool results when set.
     structured_content: ClassVar[dict | None] = None
+    result_content: ClassVar[list[dict] | None] = None
+    mcp_protocol_version: ClassVar[str] = "2025-03-26"
 
     _request_count = 0
     _request_count_lock = threading.Lock()
@@ -713,7 +715,7 @@ class MCPHandler(BaseHTTPRequestHandler):
             self._json_rpc(
                 rid,
                 {
-                    "protocolVersion": "2025-03-26",
+                    "protocolVersion": self.mcp_protocol_version,
                     "capabilities": {"tools": {"listChanged": False}},
                     "serverInfo": {"name": "weather-mock", "version": "0.1.0"},
                 },
@@ -794,6 +796,8 @@ class MCPHandler(BaseHTTPRequestHandler):
                     else f"72F and sunny in {city}"
                 )
                 tool_result = {"content": [{"type": "text", "text": result}]}
+                if self.result_content is not None:
+                    tool_result["content"] = self.result_content
                 if self.structured_content is not None:
                     tool_result["structuredContent"] = self.structured_content
                 self._json_rpc(rid, tool_result)
@@ -894,18 +898,38 @@ class McpInvalidArgsBackendHandler(BaseHTTPRequestHandler):
         request_body = json.loads(body) if body else {}
 
         output = self._output(request_body)
-        payload = json.dumps(
-            {
-                "id": f"resp_mcp_invalid_{time.time_ns()}",
-                "object": "response",
-                "created_at": int(time.time()),
-                "model": request_body.get("model", VLLM_MODEL),
-                "status": "completed",
-                "output": output,
-            }
-        ).encode()
+        response = {
+            "id": f"resp_mcp_invalid_{time.time_ns()}",
+            "object": "response",
+            "created_at": int(time.time()),
+            "model": request_body.get("model", VLLM_MODEL),
+            "status": "completed",
+            "output": output,
+        }
+        if request_body.get("stream"):
+            events = [
+                {"type": "response.created", "sequence_number": 0,
+                 "response": {**response, "status": "in_progress", "output": []}},
+            ]
+            for index, item in enumerate(output):
+                events.extend([
+                    {"type": "response.output_item.added", "sequence_number": len(events),
+                     "output_index": index, "item": item},
+                    {"type": "response.output_item.done", "sequence_number": len(events) + 1,
+                     "output_index": index, "item": item},
+                ])
+            events.append({"type": "response.completed", "sequence_number": len(events),
+                           "response": response})
+            payload = b"".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+                for event in events
+            )
+            content_type = "text/event-stream"
+        else:
+            payload = json.dumps(response).encode()
+            content_type = "application/json"
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -958,6 +982,7 @@ class StructuredMCPHandler(MCPHandler):
     """MCP mock whose text tool results carry a Kubernetes-shaped
     ``structuredContent`` of ~5 KiB and ~550 JSON nodes (issue #1847)."""
 
+    mcp_protocol_version = "2025-06-18"
     structured_content: ClassVar[dict | None] = {
         "kind": "Deployment",
         "containers": [
@@ -972,12 +997,46 @@ class StructuredMCPHandler(MCPHandler):
     }
 
 
+class StructuredOnlyMCPHandler(StructuredMCPHandler):
+    """Valid MCP 2025-06-18 result with no duplicate text (issue #1899)."""
+
+    result_content: ClassVar[list[dict] | None] = []
+    structured_content: ClassVar[dict | None] = {"temperature": 22.5}
+
+
+class StructuredMixedMCPHandler(StructuredOnlyMCPHandler):
+    """Structured content and distinct ordered text/resource-link blocks."""
+
+    result_content: ClassVar[list[dict] | None] = [
+        {"type": "text", "text": "Weather fetched"},
+        {"type": "resource_link", "uri": "file:///weather/map.png", "name": "map"},
+    ]
+
+
+class OversizedStructuredMCPHandler(StructuredOnlyMCPHandler):
+    """A structured-only result that exceeds the full-flow dispatch allowance."""
+
+    structured_content: ClassVar[dict | None] = {"payload": "x" * 2_097_152}
+
+    def _json_rpc(self, rid, result, error=None):
+        try:
+            super()._json_rpc(rid, result, error)
+        except (BrokenPipeError, ConnectionResetError):
+            # The proxy can close the callout as soon as its byte cap is exceeded.
+            pass
+
+
 class McpStructuredResultBackendHandler(McpInvalidArgsBackendHandler):
     """Scripts one valid ``get_weather`` call, then a final message."""
 
     call_arguments: ClassVar[dict] = {"city": "Paris"}
     final_text: ClassVar[str] = "done"
     request_count = 0
+    captured_requests: ClassVar[list[dict]] = []
+
+    def _output(self, request_body):
+        type(self).captured_requests.append(request_body)
+        return super()._output(request_body)
 
     def do_POST(self):
         type(self).request_count += 1
@@ -8086,7 +8145,8 @@ def structured_mcp_client(tmp_path_factory, request, nemo_guardrails_server):
     """Full-flow agentic proxy with a 10 MiB retained budget, a scripted model,
     and an MCP server returning ``structuredContent``."""
     servers = []
-    for handler in (StructuredMCPHandler, McpStructuredResultBackendHandler):
+    mcp_handler = getattr(request, "param", StructuredMCPHandler)
+    for handler in (mcp_handler, McpStructuredResultBackendHandler):
         server = HTTPServer(("127.0.0.1", _free_port()), handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         servers.append(server)
@@ -8169,6 +8229,76 @@ def test_retained_budget_admits_structured_mcp_result(structured_mcp_client):
     assert StructuredMCPHandler.tool_call_count() == calls_before + 1
     assert McpStructuredResultBackendHandler.request_count == model_requests_before + 2
     assert response.output_text == "done"
+
+
+@qualification_profile("supporting")
+@pytest.mark.parametrize(
+    ("structured_mcp_client", "expected_output"),
+    [
+        (StructuredOnlyMCPHandler, {"content": [], "structuredContent": {"temperature": 22.5}}),
+        (StructuredMCPHandler, {
+            "content": [{"type": "text", "text": "72F and sunny in Paris"}],
+            "structuredContent": StructuredMCPHandler.structured_content,
+        }),
+        (StructuredMixedMCPHandler, {
+            "content": StructuredMixedMCPHandler.result_content,
+            "structuredContent": {"temperature": 22.5},
+        }),
+        (MCPHandler, "72F and sunny in Paris"),
+    ],
+    indirect=["structured_mcp_client"],
+    ids=["structured-only", "text-and-structured", "mixed-and-structured", "text-only-control"],
+)
+@pytest.mark.parametrize("stream", [False, True], ids=["finite", "streaming"])
+def test_structured_mcp_result_is_preserved_in_model_and_public_output(
+    structured_mcp_client, expected_output, stream
+):
+    """Issue #1899: the real proxy preserves both MCP result representations."""
+    requests_before = len(McpStructuredResultBackendHandler.captured_requests)
+    response = structured_mcp_client.responses.create(
+        model=VLLM_MODEL,
+        input="What is the weather in Paris?",
+        tools=[{"type": "mcp", "server_label": "weather", "connector_id": "trusted-mcp",
+                "allowed_tools": ["get_weather"], "require_approval": "never"}],
+        store=False, stream=stream,
+    )
+    if stream:
+        events = list(response)
+        completed = [event for event in events if event.type == "response.completed"]
+        assert len(completed) == 1, [event.type for event in events]
+        assert sum(event.type == "response.created" for event in events) == 1
+        assert not any(event.type in {"error", "response.failed"} for event in events)
+        response = completed[0].response
+    assert response.status == "completed", response
+    assert response.output_text == "done", response
+    calls = [item for item in response.output if item.type == "mcp_call"]
+    assert len(calls) == 1, response.output
+    assert calls[0].error is None, calls[0]
+    if isinstance(expected_output, str):
+        assert calls[0].output == expected_output
+    else:
+        assert json.loads(calls[0].output) == expected_output
+    requests = McpStructuredResultBackendHandler.captured_requests[requests_before:]
+    assert len(requests) == 2, requests
+    model_outputs = [item for item in requests[1]["input"] if item["type"] == "function_call_output"]
+    assert len(model_outputs) == 1, requests[1]
+    assert model_outputs[0]["output"] == calls[0].output
+
+
+@qualification_profile("supporting")
+@pytest.mark.parametrize("structured_mcp_client", [OversizedStructuredMCPHandler], indirect=True)
+def test_oversized_structured_mcp_result_still_stops_before_model_continuation(structured_mcp_client):
+    """Preserving structured content must not bypass existing dispatch limits."""
+    requests_before = len(McpStructuredResultBackendHandler.captured_requests)
+    with pytest.raises(APIStatusError) as error:
+        structured_mcp_client.responses.create(
+            model=VLLM_MODEL, input="Weather?", store=False,
+            tools=[{"type": "mcp", "server_label": "weather", "connector_id": "trusted-mcp",
+                    "allowed_tools": ["get_weather"], "require_approval": "never"}],
+        )
+    assert error.value.status_code == 502, error.value
+    assert "processing limit" in error.value.response.json()["error"]["message"]
+    assert len(McpStructuredResultBackendHandler.captured_requests) == requests_before + 1
 
 
 class TestAgenticLoopVLLM:

@@ -476,7 +476,7 @@ pub(crate) fn process_call_result<R: McpCallOutcome>(
         Ok(r) => {
             let is_error = r.is_error.unwrap_or(false);
             let content_count = r.content.len();
-            let output = content_blocks_to_output(&r.content, max_result_bytes);
+            let output = call_result_to_output(&r, max_result_bytes);
             drop(r);
             match output {
                 Ok(output_text) => {
@@ -685,6 +685,35 @@ pub(crate) async fn execute_single_call<R: McpCallOutcome>(
 // Result Normalization
 // -----------------------------------------------------------------------------
 
+/// Preserve both MCP result representations when structured content is present.
+/// Text duplication is only a SHOULD in MCP 2025-06-18, so `content` may be empty
+/// or carry information distinct from `structuredContent`.
+fn call_result_to_output(result: &rmcp::model::CallToolResult, max_result_bytes: usize) -> Result<String, String> {
+    /// MCP result fields represented together in one output object.
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct StructuredResult<'content> {
+        /// Ordered unstructured MCP blocks.
+        content: &'content [rmcp::model::ContentBlock],
+        /// Structured MCP result data.
+        structured_content: &'content Value,
+    }
+
+    let Some(structured_content) = &result.structured_content else {
+        return content_blocks_to_output(&result.content, max_result_bytes);
+    };
+
+    let output = StructuredResult {
+        content: &result.content,
+        structured_content,
+    };
+    let output_bytes = serialized_len(&output).map_err(|e| format!("failed to size MCP result content: {e}"))?;
+    if output_bytes > max_result_bytes {
+        return Err(MCP_RESULT_TOO_LARGE.to_owned());
+    }
+    serde_json::to_string(&output).map_err(|e| format!("failed to serialize MCP result content: {e}"))
+}
+
 /// Serialize rmcp `ContentBlock` values into one lossless output string.
 ///
 /// Text-only results keep the simple newline-joined form for readability and
@@ -733,3 +762,6 @@ pub(crate) fn content_blocks_to_output(
     }
     serde_json::to_string(blocks).map_err(|e| format!("failed to serialize MCP content blocks: {e}"))
 }
+
+#[cfg(test)]
+mod tests;

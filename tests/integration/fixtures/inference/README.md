@@ -123,6 +123,7 @@ The manifest declares **100 features** across **11 scopes**, linked to **77 scen
 | `responses_native_passthrough` | `responses.request.object_document_input` | `synthetic_only` | `responses/object-document-input` | `synthetic`: `synthetic_only` |
 | `responses_agentic_loop` | `responses.agentic.mcp_rewrite_preservation` | `synthetic_only` | `responses/mcp-request-preservation` | `synthetic`: `synthetic_only` |
 | `messages_to_chat_completions` | `messages.request.degrade_mid_conversation_system` | `synthetic_only` | `messages/degrade-features` | `synthetic`: `synthetic_only` |
+| `responses_native_passthrough` | `responses.native.mcp_structured_result_projection` | `synthetic_only` | `responses/mcp-structured-result-projection` | `synthetic`: `synthetic_only` |
 <!-- END GENERATED INFERENCE COVERAGE -->
 
 ## Layout
