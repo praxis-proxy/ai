@@ -3999,15 +3999,23 @@ class TestOpenAIResponsesVLLM:
                 # or rejects the already-forwarded prompt: a clean 400 when it
                 # validates up front, a bare 502 when it raises post-prefill and
                 # drops the connection, or a 504 when the prefill outruns an IRR
-                # deadline. All are legitimate backend outcomes; #532 only
-                # requires Praxis to forward the complete history, which the
-                # assertions below verify regardless of the backend's verdict.
+                # deadline. Since vLLM 0.32 the truncated prompt can also leave
+                # room for a single output token, so the turn ends `incomplete`
+                # on max_output_tokens with no output items. All are legitimate
+                # backend outcomes; #532 only requires Praxis to forward the
+                # complete history, which the assertions below verify
+                # regardless of the backend's verdict.
                 try:
                     response = client.with_options(timeout=720).responses.create(
                         **options
                     )
                     assert response.status in {"completed", "incomplete"}
-                    assert response.output, response
+                    output_budget_exhausted = (
+                        response.status == "incomplete"
+                        and response.incomplete_details is not None
+                        and response.incomplete_details.reason == "max_output_tokens"
+                    )
+                    assert response.output or output_budget_exhausted, response
                     if response.status == "completed":
                         # A successful managed turn must append only its new
                         # input/output items. Existing over-context history is
