@@ -166,6 +166,110 @@ fn provider_owned_round_sends_only_the_borrowed_delta() {
 }
 
 #[test]
+fn preprocessed_current_input_still_appends_tool_results() {
+    // Document extraction rewrites the working history in place while the
+    // immutable client snapshot stays as the original input_file item.
+    let original = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_file",
+            "filename": "source.txt",
+            "file_data": "data:text/plain;base64,aGVsbG8="
+        }]
+    });
+    let rewritten = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": "[Source: source.txt]\nhello"
+        }]
+    });
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": [original]
+    }));
+    *state.messages.get_mut(0).unwrap() = rewritten.clone();
+    state.messages.push(json!({
+        "type": "function_call",
+        "id": "fc_preprocessed",
+        "call_id": "call_preprocessed",
+        "name": "file_search",
+        "arguments": "{\"query\":\"q\"}",
+        "status": "completed"
+    }));
+    state.messages.push(json!({
+        "type": "function_call_output",
+        "call_id": "call_preprocessed",
+        "output": "PREPROCESSED_TOOL_RESULT"
+    }));
+
+    let body = serde_json::to_vec(&json!({"input": [rewritten]})).unwrap();
+    let members = scan_top_level_object(&body).unwrap();
+    let selected = reconcile(&body, &members, &state, false).unwrap();
+    assert_eq!(selected.len(), 3);
+    assert_eq!(selected[0]["content"][0]["type"], "input_text");
+    assert_eq!(selected[1]["type"], "function_call");
+    assert_eq!(selected[2]["output"], "PREPROCESSED_TOOL_RESULT");
+    assert!(
+        std::ptr::eq(selected[1].as_ref(), state.messages.get(1).unwrap()),
+        "unchanged tool call must remain borrowed from messages"
+    );
+    assert!(
+        std::ptr::eq(selected[2].as_ref(), state.messages.get(2).unwrap()),
+        "unchanged tool result must remain borrowed from messages"
+    );
+}
+
+#[test]
+fn preprocessed_rehydrated_history_still_appends_tool_results() {
+    let original = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_file",
+            "filename": "source.txt",
+            "file_data": "data:text/plain;base64,aGVsbG8="
+        }]
+    });
+    let rewritten = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": "[Source: source.txt]\nhello"
+        }]
+    });
+    let earlier = json!({"type": "message", "role": "assistant", "content": "earlier"});
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": [original]
+    }));
+    state.messages = vec![
+        earlier.clone(),
+        rewritten.clone(),
+        json!({
+            "type": "function_call_output",
+            "call_id": "call_hist",
+            "output": "HISTORY_TOOL_RESULT"
+        }),
+    ]
+    .into();
+    state.history_rehydrated = true;
+
+    // Live body includes the rehydrated history prefix plus the rewritten
+    // current input, matching the production rebuild shape.
+    let body = serde_json::to_vec(&json!({"input": [earlier, rewritten]})).unwrap();
+    let members = scan_top_level_object(&body).unwrap();
+    let selected = reconcile(&body, &members, &state, false).unwrap();
+    assert_eq!(selected.len(), 3);
+    assert_eq!(selected[0]["content"], "earlier");
+    assert_eq!(selected[1]["content"][0]["type"], "input_text");
+    assert_eq!(selected[2]["output"], "HISTORY_TOOL_RESULT");
+}
+
+#[test]
 fn compaction_projection_keeps_unedited_neighbors_borrowed() {
     let mut state = ResponsesState::from_request_body(json!({"input":"latest"}));
     state.messages = vec![

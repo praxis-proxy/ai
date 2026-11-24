@@ -65,6 +65,25 @@ impl MessageHistory {
         })
     }
 
+    /// Find the highest position whose contiguous run equals `needle` item-by-item.
+    ///
+    /// Used when a live rewritten input no longer matches the immutable client
+    /// snapshot stored in another [`MessageHistory`].
+    #[must_use]
+    pub fn rposition_items(&self, needle: &[&Value]) -> Option<usize> {
+        let needle_len = needle.len();
+        if needle_len == 0 || needle_len > self.len() {
+            return None;
+        }
+        (0..=self.len().saturating_sub(needle_len)).rev().find(|&start| {
+            (0..needle_len).all(|offset| {
+                self.get(start + offset)
+                    .zip(needle.get(offset).copied())
+                    .is_some_and(|(item, want)| item == want)
+            })
+        })
+    }
+
     /// Mutably borrow one item, copying its payload only if shared.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut Value> {
         self.0.get_mut(index).map(Arc::make_mut)

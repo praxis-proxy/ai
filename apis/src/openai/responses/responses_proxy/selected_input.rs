@@ -152,14 +152,7 @@ fn merge<'a>(
     canonical: Vec<Cow<'a, Value>>,
     native: bool,
 ) -> Vec<Cow<'a, Value>> {
-    let appended_start = if state.input.is_empty() {
-        0
-    } else {
-        state
-            .messages
-            .rposition_run(&state.input)
-            .map_or(state.messages.len(), |start| start + state.input.len())
-    };
+    let appended_start = appended_tool_start(&live, state);
     let appended: Vec<_> = state.messages.iter().skip(appended_start).map(Cow::Borrowed).collect();
     if state.history_rehydrated {
         let history_len = state.messages.len().saturating_sub(state.input.len() + appended.len());
@@ -175,6 +168,33 @@ fn merge<'a>(
         append(&mut live, appended);
     }
     live
+}
+
+/// Index where agentic results begin after the current-input run in `messages`.
+///
+/// Prefer the immutable client snapshot. When preprocessing rewrote that run in
+/// place (for example `input_file` → `input_text`) without updating the snapshot,
+/// fall back to locating the live current-input items so tool results still append.
+///
+/// Use the trailing `state.input.len()` items of `live` so a rehydrated history
+/// prefix (which may already be compaction-projected) does not prevent the match,
+/// and always advance by `state.input.len()` so the current-input span stays aligned
+/// with the rest of merge's history arithmetic.
+fn appended_tool_start(live: &[Cow<'_, Value>], state: &ResponsesState) -> usize {
+    let input_len = state.input.len();
+    if input_len == 0 {
+        return 0;
+    }
+    if let Some(start) = state.messages.rposition_run(&state.input) {
+        return start + input_len;
+    }
+    if let Some(live_input) = live.len().checked_sub(input_len).and_then(|start| live.get(start..)) {
+        let live_refs: Vec<&Value> = live_input.iter().map(AsRef::as_ref).collect();
+        if let Some(start) = state.messages.rposition_items(&live_refs) {
+            return start + input_len;
+        }
+    }
+    state.messages.len()
 }
 
 /// Recognize an already-rehydrated prefix without materializing that history.

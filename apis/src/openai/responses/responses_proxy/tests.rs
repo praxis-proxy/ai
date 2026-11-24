@@ -618,6 +618,80 @@ async fn selected_rebuild_preserves_agentic_results_after_later_input_edit() {
 }
 
 #[tokio::test]
+async fn selected_rebuild_preserves_agentic_results_after_document_preprocessing() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let original = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_file",
+            "filename": "source.txt",
+            "file_data": "data:text/plain;base64,aGVsbG8="
+        }]
+    });
+    let rewritten = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": "[Source: source.txt]\nhello"
+        }]
+    });
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": [original]
+    }));
+    *state.messages.get_mut(0).unwrap() = rewritten.clone();
+    state.messages.push(json!({
+        "type": "function_call",
+        "id": "fc_doc",
+        "call_id": "call_doc",
+        "name": "file_search",
+        "arguments": "{\"query\":\"q\"}",
+        "status": "completed"
+    }));
+    state.messages.push(json!({
+        "type": "function_call_output",
+        "call_id": "call_doc",
+        "output": "PREPROCESSED_TOOL_RESULT"
+    }));
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "gpt-4.1",
+            "input": [rewritten]
+        }))
+        .unwrap(),
+    ));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "selected rebuild should continue after document preprocessing"
+    );
+    let selected_backend_body: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        selected_backend_body["input"][0]["content"][0]["type"], "input_text",
+        "selected backend must keep the preprocessed document text"
+    );
+    assert_eq!(
+        selected_backend_body["input"][1]["type"], "function_call",
+        "selected backend must retain the executed tool call after preprocessing"
+    );
+    assert_eq!(
+        selected_backend_body["input"][2]["output"], "PREPROCESSED_TOOL_RESULT",
+        "selected backend must retain the executed tool result after preprocessing"
+    );
+}
+
+#[tokio::test]
 async fn selected_rebuild_keeps_selector_only_body_valid_when_adding_state_fields() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
