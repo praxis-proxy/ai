@@ -184,22 +184,30 @@ class SupportReportTest(unittest.TestCase):
         guide = SCRIPT.parents[2] / "docs/getting-started/choose-client-and-provider.md"
         self.assertIn("\n".join(support.codex_inventory()), guide.read_text())
 
-    def test_compaction_evidence_is_scoped_to_assertion_and_checkout(self):
+    def test_compaction_evidence_requires_success_and_valid_data(self):
         evidence = {
-            "checkout_sha": SHA, "client_version": "0.170.0", "client_model": "qwen3-8b",
+            "client_version": "0.170.0", "client_model": "qwen3-8b",
             "served_model": "qwen3-8b", "checkpoint": "Qwen/Qwen3-8B", "transport": "HTTP/SSE",
             "sandbox": "danger-full-access", "web_search": "disabled", "example": "client-tool-compat.yaml",
             "outcomes": [["client compaction observed", "passed"], ["post-compaction task completion", "unverified"]],
         }
         live = qualification()
         cases = live["suites"]["codex_acceptance"]["cases"]
-        cases.append({"id": "codex_compaction", "status": "success", "capabilities": evidence})
-        for tested_sha, expected in [(SHA, "**Verified**"), ("b" * 40, "Unverified")]:
-            with self.subTest(tested_sha=tested_sha), tempfile.TemporaryDirectory() as directory:
-                evidence["checkout_sha"] = tested_sha
+        case = {"id": "codex_compaction"}
+        cases.append(case)
+        variants = [
+            ("success", evidence, "**Verified**"),
+            ("failure", evidence, "Unverified"),
+            ("success", {**evidence, "outcomes": [["invalid"]]}, "Unverified"),
+            ("success", {key: value for key, value in evidence.items() if key != "web_search"}, "Unverified"),
+        ]
+        for status, capabilities, expected in variants:
+            with self.subTest(status=status, capabilities=capabilities), tempfile.TemporaryDirectory() as directory:
+                case.update(status=status, capabilities=capabilities)
                 write_fixtures(directory, qualification_value=live)
                 _, markdown = generate(arguments(directory, qualification=str(Path(directory) / "qualification.json")))
                 self.assertIn(f"| Compact a session | {expected} | Outside test scope |", markdown)
+                self.assertEqual("Tested setups" in markdown, expected == "**Verified**")
                 self.assertIn("| Finish a task after compaction | Unverified | Outside test scope |", markdown)
                 self.assertIn("| Apply a file patch | Unverified | Unverified |", markdown)
 

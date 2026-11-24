@@ -249,16 +249,16 @@ def capture(args):
 def capture_codex(output):
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     cases = []
-    checkpoint = os.environ["VLLM_GPU_MODEL"]
+    checkpoint = os.environ.get("VLLM_GPU_MODEL")
     revision = model_revision(os.environ.get("CONTAINER_RUNTIME", "docker"), checkpoint)
     for name in ("CODEX_NATIVE", "CODEX_TRANSLATED", "CODEX_COMPACTION"):
         case = {"id": name.lower(), "status": os.environ.get(name) or "unexecuted"}
         evidence = read_json(os.environ.get(name + "_EVIDENCE"))
-        if evidence:
-            evidence.update(checkout_sha=sha, checkpoint=checkpoint, resolved_revision=revision,
-                            served_model=os.environ["CODEX_VLLM_MODEL"], image=os.environ["VLLM_GPU_IMAGE"],
-                            tool_parser=os.environ["CODEX_TOOL_PARSER"],
-                            reasoning_parser=os.environ["CODEX_REASONING_PARSER"])
+        if isinstance(evidence, dict):
+            evidence.update(checkpoint=checkpoint, resolved_revision=revision,
+                            served_model=os.environ.get("CODEX_VLLM_MODEL"), image=os.environ.get("VLLM_GPU_IMAGE"),
+                            tool_parser=os.environ.get("CODEX_TOOL_PARSER"),
+                            reasoning_parser=os.environ.get("CODEX_REASONING_PARSER"))
             case["capabilities"] = evidence
         cases.append(case)
     write_json(output, {"run_id": int(os.environ["GITHUB_RUN_ID"]),

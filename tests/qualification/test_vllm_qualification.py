@@ -75,12 +75,27 @@ class QualificationTest(unittest.TestCase):
                 qualification.capture_codex(output)
             suite = qualification.acceptance(output, "success", 17, 2, "abcd", "Codex")
             native, translated, compaction = suite["cases"]
-            self.assertEqual(native["capabilities"]["checkout_sha"], "abcd")
+            self.assertEqual(suite["cases"][0]["capabilities"]["checkpoint"], "checkpoint")
+            self.assertNotIn("checkout_sha", native["capabilities"])
             self.assertEqual(native["capabilities"]["outcomes"], [["verified file edit", "passed"]])
             self.assertEqual(native["capabilities"]["served_model"], "served")
             self.assertIsNone(native["capabilities"]["resolved_revision"])
             self.assertEqual(translated, {"id": "codex_translated", "status": "skipped"})
             self.assertEqual(compaction, {"id": "codex_compaction", "status": "unexecuted"})
+
+    def test_codex_capture_keeps_step_status_without_enrichment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            invalid = Path(directory, "invalid.json")
+            invalid.write_text("[]")
+            output = Path(directory, "acceptance.json")
+            env = {"GITHUB_RUN_ID": "17", "GITHUB_RUN_ATTEMPT": "2", "CODEX_NATIVE": "failure",
+                   "CODEX_NATIVE_EVIDENCE": str(invalid)}
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+                subprocess, "check_output", return_value="abcd"
+            ):
+                qualification.capture_codex(output)
+            suite = qualification.acceptance(output, "failure", 17, 2, "abcd", "Codex")
+            self.assertEqual(suite["cases"][0], {"id": "codex_native", "status": "failure"})
 
     def test_release_uses_recent_ancestor_nightly_and_discloses_newer_failure(self):
         timestamp = qualification.now()

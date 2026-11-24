@@ -25,6 +25,7 @@ are out of scope and named as such in the output.
 """
 
 import argparse
+from collections import namedtuple
 import json
 from pathlib import Path
 import re
@@ -700,32 +701,43 @@ def render_live(report, lines):
 
 
 CODEX_ROUTES = ("Native Responses", "Responses → Chat Completions")
+CodexCapability = namedtuple("CodexCapability", "label assertion native translated proof")
 CODEX_CAPABILITIES = (
-    ("Apply a file patch", "verified file edit", "codex_native", "codex_translated",
+    CodexCapability("Apply a file patch", "verified file edit", "codex_native", "codex_translated",
      "Codex applies the patch, returns tool output through Praxis, and writes the exact expected file."),
-    ("Compact a session", "client compaction observed", "codex_compaction", None,
+    CodexCapability("Compact a session", "client compaction observed", "codex_compaction", None,
      "Codex sends a summarization request and resumes with compacted history."),
-    ("Finish a task after compaction", "post-compaction task completion", "codex_compaction", None,
+    CodexCapability("Finish a task after compaction", "post-compaction task completion", "codex_compaction", None,
      "Codex finishes the task and verifies the resulting file."),
 )
 
 
 def codex_inventory():
     return table(("Capability", *CODEX_ROUTES, "What the test verifies"),
-                 [(label, "Release report", "Release report" if translated else "Outside test scope", proof)
-                  for label, _, _, translated, proof in CODEX_CAPABILITIES])
+                 [(item.label, "Release report", "Release report" if item.translated else "Outside test scope", item.proof)
+                  for item in CODEX_CAPABILITIES])
 
 
 def render_codex_capabilities(report, lines):
     """Use only per-assertion evidence from the release checkout, including partial runs."""
     live = report.get("live_validation") or {}
     cases = ((live.get("suites") or {}).get("codex_acceptance") or {}).get("cases") or []
-    sha = (report.get("release") or {}).get("commit")
     evidence_by_scenario = {}
+    setup_fields = ("client_version", "client_model", "served_model", "checkpoint",
+                    "transport", "sandbox", "web_search", "example")
     for case in cases:
-        evidence = case.get("capabilities") or {}
-        if sha and evidence.get("checkout_sha") == sha:
-            evidence_by_scenario[case.get("id")] = evidence
+        evidence = case.get("capabilities")
+        if case.get("status") != "success" or not isinstance(evidence, dict):
+            continue
+        if not all(isinstance(evidence.get(key), str) and evidence[key] for key in setup_fields):
+            continue
+        outcomes = evidence.get("outcomes")
+        if not isinstance(outcomes, list) or not all(
+            isinstance(pair, list) and len(pair) == 2 and all(isinstance(value, str) for value in pair)
+            for pair in outcomes
+        ):
+            continue
+        evidence_by_scenario[case.get("id")] = evidence
 
     def outcome(scenario, capability):
         if scenario is None:
@@ -736,25 +748,20 @@ def render_codex_capabilities(report, lines):
 
     lines += ["### Codex CLI capabilities", ""]
     lines += table(("Capability", *CODEX_ROUTES),
-                   [(label, outcome(native, capability), outcome(translated, capability))
-                    for label, capability, native, translated, _ in CODEX_CAPABILITIES])
+                   [(item.label, outcome(item.native, item.assertion), outcome(item.translated, item.assertion))
+                    for item in CODEX_CAPABILITIES])
     lines += ["", "**Unverified** means the release evidence does not establish the capability.",
               "**Outside test scope** means this route has no scenario for the capability.", ""]
-    if evidence_by_scenario:
-        lines += ["Tested setups", ""]
-    setup_labels = {
-        "codex_native": "Native file edit",
-        "codex_translated": "Translated file edit",
-        "codex_compaction": "Native compaction",
-    }
-    for scenario, label in setup_labels.items():
-        evidence = evidence_by_scenario.get(scenario)
-        if evidence:
-            config = ("Codex {client_version}, {client_model} → {served_model} ({checkpoint}), "
-                      "{transport}, sandbox `{sandbox}`, web search {web_search}, example `{example}`").format(**evidence)
-            lines.append(f"- **{label}** · {config}")
-    if evidence_by_scenario:
-        lines.append("")
+    setups = {}
+    for item in CODEX_CAPABILITIES:
+        for route, scenario in zip(CODEX_ROUTES, (item.native, item.translated)):
+            evidence = evidence_by_scenario.get(scenario)
+            if evidence and scenario not in setups:
+                config = ("Codex {client_version}, {client_model} → {served_model} ({checkpoint}), "
+                          "{transport}, sandbox `{sandbox}`, web search {web_search}, example `{example}`").format(**evidence)
+                setups[scenario] = f"- **{route} · {item.label}** · {config}"
+    if setups:
+        lines += ["Tested setups", "", *setups.values(), ""]
 
 
 def render_pins(report, lines):

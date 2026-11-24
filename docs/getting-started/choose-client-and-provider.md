@@ -60,12 +60,11 @@ and read **Codex CLI capabilities** in the attached `support-report.md`.
 | Finish a task after compaction | Release report | Outside test scope | Codex finishes the task and verifies the resulting file. |
 
 All scenarios use HTTP/SSE, disable web search, and run with Codex's full-access
-sandbox. The Qwen3-8B native compaction scenario verifies that the session
-resumes with compacted history and leaves task completion unverified.
+sandbox. The release report gives the outcome for the model tested on that release.
 
 The matching `support-report.json` records the per-case configuration under
-`live_validation.suites.codex_acceptance.cases[].capabilities`, including the
-tested commit, model names, vLLM image, parsers and example configuration.
+`live_validation.suites.codex_acceptance.cases[].capabilities`, including model names, vLLM image, parsers and example configuration. The
+report’s live validation section identifies the tested commit.
 See the [GPU scenario guide](../developing/gpu-nightly-suite.md) for the test setup.
 
 ## Inference clients

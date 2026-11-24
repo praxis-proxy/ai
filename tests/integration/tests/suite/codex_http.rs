@@ -179,6 +179,7 @@ async fn pinned_codex_uses_responses_http_through_full_flow() {
     let output = run_codex(
         &codex_bin,
         CodexRunOptions {
+            web_search: CODEX_WEB_SEARCH,
             proxy_base_url: &proxy_base_url,
             model: CODEX_APPLY_PATCH_MODEL,
             working_dir: working_dir.path(),
@@ -249,6 +250,7 @@ async fn pinned_codex_completes_chat_backend_coding_workflow_over_http() {
     let output = run_codex(
         &codex_bin,
         CodexRunOptions {
+            web_search: CODEX_WEB_SEARCH,
             proxy_base_url: &proxy_base_url,
             model: "test-model",
             working_dir: workspace.path(),
@@ -307,8 +309,7 @@ async fn pinned_codex_completes_native_vllm_apply_patch_workflow_over_http() {
     let patched = patch_live_apply_patch_model_alias(&patched, &live.model);
     let config = praxis_core::config::Config::from_yaml(&patched).expect("live native Codex config should parse");
 
-    run_live_codex_apply_patch_workflow(&live, proxy_port, config).await;
-    record_codex_capabilities(example, CODEX_APPLY_PATCH_MODEL, &[("verified file edit", "passed")]);
+    run_live_codex_apply_patch_workflow(&live, proxy_port, config, example).await;
 }
 
 /// Prove pinned Codex applies the same patch through Praxis's rich-client-tool
@@ -344,23 +345,24 @@ async fn pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http()
     let patched = patch_live_apply_patch_model_alias(&patched, &live.model);
     let config = praxis_core::config::Config::from_yaml(&patched).expect("live Codex config should parse");
 
-    run_live_codex_apply_patch_workflow(&live, proxy_port, config).await;
-    record_codex_capabilities(example, CODEX_APPLY_PATCH_MODEL, &[("verified file edit", "passed")]);
+    run_live_codex_apply_patch_workflow(&live, proxy_port, config, example).await;
 }
 
 /// Persist only assertions reached by this invocation for the CI qualification artifact.
-fn record_codex_capabilities(example: &str, client_model: &str, outcomes: &[(&str, &str)]) {
+fn record_codex_capabilities(example: &str, options: &CodexRunOptions<'_>, transport: &str, outcomes: &[(&str, &str)]) {
     if let Some(path) = std::env::var_os("PRAXIS_TEST_CODEX_EVIDENCE") {
         let evidence = serde_json::json!({
             "example": example,
             "client_version": CODEX_PINNED_VERSION,
-            "client_model": client_model,
-            "transport": "HTTP/SSE",
-            "sandbox": CODEX_EDIT_SANDBOX,
-            "web_search": CODEX_WEB_SEARCH,
+            "client_model": options.model,
+            "transport": transport,
+            "sandbox": options.sandbox,
+            "web_search": options.web_search,
             "outcomes": outcomes,
         });
-        std::fs::write(path, evidence.to_string()).expect("write Codex capability evidence");
+        if let Err(error) = std::fs::write(path, evidence.to_string()) {
+            eprintln!("Could not write Codex capability evidence: {error}");
+        }
     }
 }
 
@@ -410,6 +412,7 @@ async fn run_live_codex_apply_patch_workflow(
     live: &CodexLiveConfig,
     proxy_port: u16,
     config: praxis_core::config::Config,
+    example: &str,
 ) {
     let workspace = TempWorkspace::new().expect("temporary coding workspace should be created");
     std::fs::remove_file(workspace.path().join("result.txt"))
@@ -431,22 +434,20 @@ async fn run_live_codex_apply_patch_workflow(
     );
     let proxy_base_url = format!("http://{}:{}", live.listen_address, observer.port());
     let no_proxy = format!("127.0.0.1,localhost,{}", live.listen_address);
-    let output = run_codex(
-        &live.codex_bin,
-        CodexRunOptions {
-            proxy_base_url: &proxy_base_url,
-            model: CODEX_APPLY_PATCH_MODEL,
-            working_dir: workspace.path(),
-            prompt: &prompt,
-            sandbox: CODEX_EDIT_SANDBOX,
-            execution_timeout: LIVE_CHILD_TIMEOUT,
-            no_proxy: &no_proxy,
-            netns: live.netns.as_deref(),
-            tolerate_timeout: false,
-            compaction_limits: None,
-        },
-    )
-    .await;
+    let options = CodexRunOptions {
+        web_search: CODEX_WEB_SEARCH,
+        proxy_base_url: &proxy_base_url,
+        model: CODEX_APPLY_PATCH_MODEL,
+        working_dir: workspace.path(),
+        prompt: &prompt,
+        sandbox: CODEX_EDIT_SANDBOX,
+        execution_timeout: LIVE_CHILD_TIMEOUT,
+        no_proxy: &no_proxy,
+        netns: live.netns.as_deref(),
+        tolerate_timeout: false,
+        compaction_limits: None,
+    };
+    let output = run_codex(&live.codex_bin, options).await;
     assert!(
         output.status.success(),
         "Codex failed with status {status:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
@@ -460,7 +461,7 @@ async fn run_live_codex_apply_patch_workflow(
         "Codex live apply_patch stdout:\n{}\nstderr:\n{}",
         output.stdout, output.stderr
     );
-    observer.assert_http_only();
+    let transport = observer.assert_http_only();
     // Check the client-visible tool lifecycle and workspace result before the wire
     // observer assertion. If the model completes without returning a client-tool
     // result, this reports Codex's JSONL trace instead of masking it with the more
@@ -473,6 +474,7 @@ async fn run_live_codex_apply_patch_workflow(
     );
     observer.assert_apply_patch_output_traversed_praxis();
     workspace.assert_successful_completion();
+    record_codex_capabilities(example, &options, transport, &[("verified file edit", "passed")]);
 }
 
 /// Drive a pinned-Codex coding task whose growing context forces the client's own
@@ -529,25 +531,23 @@ async fn run_live_codex_compaction_workflow(
     );
     let proxy_base_url = format!("http://{}:{}", live.listen_address, observer.port());
     let no_proxy = format!("127.0.0.1,localhost,{}", live.listen_address);
-    let output = run_codex(
-        &live.codex_bin,
-        CodexRunOptions {
-            proxy_base_url: &proxy_base_url,
-            model: &live.model,
-            working_dir: workspace.path(),
-            prompt: &prompt,
-            sandbox: CODEX_EDIT_SANDBOX,
-            execution_timeout,
-            no_proxy: &no_proxy,
-            netns: live.netns.as_deref(),
-            tolerate_timeout: true,
-            compaction_limits: Some(CodexCompactionLimits {
-                context_window: CODEX_COMPACTION_CONTEXT_WINDOW,
-                auto_compact_token_limit: CODEX_COMPACTION_AUTO_COMPACT_LIMIT,
-            }),
-        },
-    )
-    .await;
+    let options = CodexRunOptions {
+        web_search: CODEX_WEB_SEARCH,
+        proxy_base_url: &proxy_base_url,
+        model: &live.model,
+        working_dir: workspace.path(),
+        prompt: &prompt,
+        sandbox: CODEX_EDIT_SANDBOX,
+        execution_timeout,
+        no_proxy: &no_proxy,
+        netns: live.netns.as_deref(),
+        tolerate_timeout: true,
+        compaction_limits: Some(CodexCompactionLimits {
+            context_window: CODEX_COMPACTION_CONTEXT_WINDOW,
+            auto_compact_token_limit: CODEX_COMPACTION_AUTO_COMPACT_LIMIT,
+        }),
+    };
+    let output = run_codex(&live.codex_bin, options).await;
 
     // Wire assertions can fail before the completion checks that include this
     // output. Keep the captured client evidence in the uploaded test log too.
@@ -566,14 +566,15 @@ async fn run_live_codex_compaction_workflow(
     // compaction mid-flight rather than being a batched pre-compaction write. All
     // three are proven on the wire and do not depend on the model finishing the
     // downstream task, so they gate the XFAIL path too.
-    observer.assert_http_only();
+    let transport = observer.assert_http_only();
     observer.assert_compaction_traversed_praxis();
     observer.assert_compaction_preceded_result_write();
 
     let record = |completion| {
         record_codex_capabilities(
             example,
-            &live.model,
+            &options,
+            transport,
             &[
                 ("client compaction observed", "passed"),
                 ("post-compaction task completion", completion),
@@ -1158,7 +1159,9 @@ struct CodexOutput {
 }
 
 /// Inputs controlling one isolated Codex child process.
+#[derive(Clone, Copy)]
 struct CodexRunOptions<'a> {
+    web_search: &'a str,
     /// Praxis base URL visible to the Codex child, without `/v1`.
     proxy_base_url: &'a str,
     /// Model name Codex sends through Praxis.
@@ -1307,11 +1310,12 @@ impl HttpTransportObserver {
     }
 
     /// Fail even when Codex recovered from an attempted WebSocket via HTTP.
-    fn assert_http_only(&self) {
+    fn assert_http_only(&self) -> &'static str {
         assert!(
             !self.websocket_attempted(),
             "Codex attempted a WebSocket upgrade before or during the successful HTTP workflow"
         );
+        "HTTP"
     }
 
     /// Return whether an opening request contained `Upgrade: websocket`.
@@ -2203,6 +2207,7 @@ async fn assert_pinned_codex_version(codex_bin: &OsStr) {
 /// Run Codex with isolated configuration, credentials, input, and workspace.
 async fn run_codex(codex_bin: &OsStr, options: CodexRunOptions<'_>) -> CodexOutput {
     let CodexRunOptions {
+        web_search,
         proxy_base_url,
         model,
         working_dir,
@@ -2225,7 +2230,7 @@ async fn run_codex(codex_bin: &OsStr, options: CodexRunOptions<'_>) -> CodexOutp
         r#"model = "{model}"
 model_provider = "praxis"
 approval_policy = "never"
-web_search = "{CODEX_WEB_SEARCH}"
+web_search = "{web_search}"
 {compaction_keys}
 [features]
 apps = false
