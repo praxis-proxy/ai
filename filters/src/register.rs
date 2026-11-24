@@ -43,7 +43,7 @@ use crate::{
 pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     #[cfg(feature = "token-quota-filter")]
     crate::token_quota::register_factory();
-    register_agentic_filters(registry);
+    register_agentic_filters(registry, subrequest_client);
     #[cfg(feature = "aws-sigv4-filter")]
     register_aws_filters(registry);
     #[cfg(feature = "azure-ad-filter")]
@@ -122,14 +122,29 @@ pub fn build_ai_registry() -> FilterRegistry {
 }
 
 /// Register agentic protocol filters (A2A, MCP).
-fn register_agentic_filters(registry: &mut FilterRegistry) {
+///
+/// `mcp` is chain-binding so the static catalog broker can bind its
+/// `backend_sessions` handshake chain against top-level clusters. The
+/// generated chain starts with `mcp_broker_backend`, which is registered as a
+/// plain filter so the chain can instantiate it.
+#[expect(clippy::panic, reason = "matches register_filters! macro convention")]
+fn register_agentic_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     praxis_filter::register_filters!(
         @register registry,
         http "a2a" => A2aFilter::from_config
     );
+    let shared = subrequest_client.cloned();
+    registry
+        .register_chain_binding(
+            "mcp",
+            std::sync::Arc::new(move |config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
+                McpFilter::from_config_with_binding(config, Some(ctx), shared.clone())
+            }),
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'mcp'"));
     praxis_filter::register_filters!(
         @register registry,
-        http "mcp" => McpFilter::from_config
+        http "mcp_broker_backend" => crate::agentic::mcp::McpBrokerBackendSelectorFilter::from_config
     );
 }
 
@@ -355,6 +370,28 @@ fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: 
         http "openai_chat_completions_to_anthropic_stream" => praxis_ai_apis::anthropic::OpenaiChatCompletionsToAnthropicStreamFilter::from_config
     );
     register_anthropic_web_search(registry, subrequest_client);
+    #[cfg(feature = "anthropic-mcp-connector-filter")]
+    register_anthropic_mcp_connector(registry);
+    #[cfg(any(feature = "openai-mcp-tools", feature = "anthropic-mcp-connector-filter"))]
+    register_mcp_streaming_selector(registry);
+}
+
+/// Register `anthropic_mcp_connector` as a chain-binding filter.
+///
+/// It runs inside an `iterative_request_router` step, where Praxis core binds
+/// an inline `outbound_chain` at step-build time. Every MCP `tools/list` and
+/// `tools/call` runs through that chain.
+#[cfg(feature = "anthropic-mcp-connector-filter")]
+#[expect(clippy::panic, reason = "matches register_filters! macro convention")]
+fn register_anthropic_mcp_connector(registry: &mut FilterRegistry) {
+    registry
+        .register_chain_binding(
+            "anthropic_mcp_connector",
+            ::std::sync::Arc::new(|config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
+                praxis_ai_apis::anthropic::AnthropicMcpConnectorFilter::from_config_with_binding(config, ctx)
+            }),
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'anthropic_mcp_connector'"));
 }
 
 /// Register Vertex AI translation filters.
@@ -542,9 +579,18 @@ fn register_mcp_callout_filters(registry: &mut FilterRegistry) {
             }),
         )
         .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_mcp_dispatch'"));
+}
+
+/// Register the selector that every MCP outbound chain auto-injects.
+///
+/// OpenAI Responses `mcp` tools and the Anthropic MCP connector both bind
+/// outbound chains that start with it, so it registers when either adapter
+/// is built.
+#[cfg(any(feature = "openai-mcp-tools", feature = "anthropic-mcp-connector-filter"))]
+fn register_mcp_streaming_selector(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
-        http "openai_mcp_streaming_selector" => praxis_ai_apis::openai::McpStreamingSelectorFilter::from_config
+        http "openai_mcp_streaming_selector" => praxis_ai_apis::McpStreamingSelectorFilter::from_config
     );
 }
 
@@ -983,7 +1029,17 @@ provider:
         ("openai_responses_compact", cfg!(feature = "openai-compact")),
         ("openai_mcp_tool_resolve", cfg!(feature = "openai-mcp-tools")),
         ("openai_mcp_dispatch", cfg!(feature = "openai-mcp-tools")),
-        ("openai_mcp_streaming_selector", cfg!(feature = "openai-mcp-tools")),
+        (
+            "openai_mcp_streaming_selector",
+            cfg!(any(
+                feature = "openai-mcp-tools",
+                feature = "anthropic-mcp-connector-filter"
+            )),
+        ),
+        (
+            "anthropic_mcp_connector",
+            cfg!(feature = "anthropic-mcp-connector-filter"),
+        ),
     ];
 
     /// Opt-in filter groups register only when their cargo feature is enabled.

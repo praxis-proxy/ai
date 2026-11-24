@@ -988,7 +988,8 @@ class BraveSearchHandler(BaseHTTPRequestHandler):
     """Mock Brave Search API returning canned results.
 
     Counts every dispatched query so tests can assert the web-search
-    provider is invoked exactly once per agentic round.
+    provider is invoked exactly once per agentic round. Captures request
+    headers so country-forwarding tests can assert ``X-Loc-Country``.
     """
 
     #: Total queries served across all instances since the last reset.
@@ -1005,11 +1006,17 @@ class BraveSearchHandler(BaseHTTPRequestHandler):
         cls.successful_requests_remaining = None
         cls.extra_results = []
         cls.request_paths.clear()
+        cls.request_headers.clear()
 
     request_paths: ClassVar[list[str]] = []
+    #: Lower-cased header maps for each dispatched query (issue #1769).
+    request_headers: ClassVar[list[dict[str, str]]] = []
 
     def do_GET(self):
         type(self).request_paths.append(self.path)
+        type(self).request_headers.append(
+            {key.lower(): value for key, value in self.headers.items()}
+        )
         BraveSearchHandler.request_count += 1
         response_code = BraveSearchHandler.response_code
         if (
@@ -3574,6 +3581,138 @@ class TestOpenAIResponsesVLLM:
             )
         assert BraveSearchHandler.request_count == 0, "preflight must precede any callout"
         assert forwarded == [], "preflight must precede any inference round"
+
+    def test_hosted_web_search_skips_null_location_for_later_country(
+        self, witness_tool_client,
+    ):
+        """An earlier ``user_location: null`` must not mask a later country (#1769).
+
+        Chat Completions translation rejects more than one web-search tool, so
+        this covers the native Responses full-flow path. Dispatch must forward
+        ``FR`` as Brave's ``X-Loc-Country`` header rather than inventing a US
+        default for the unset earlier tool.
+        """
+        client, forwarded = witness_tool_client
+        BraveSearchHandler.reset()
+        ResponsesWitnessHandler.tool_round_count = 0
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-tool-stream",
+                input="COUNTRY-PICK-NULL-LOCATION-1769",
+                tools=[
+                    {"type": "web_search", "user_location": None},
+                    {
+                        "type": "web_search_preview",
+                        "user_location": {
+                            "type": "approximate",
+                            "country": "FR",
+                        },
+                    },
+                ],
+                max_tool_calls=1,
+                store=False,
+                extra_headers={"x-user-brave-key": "controlled-test-only"},
+            )
+            assert response.status == "completed", (
+                "null-then-FR country pick should complete: "
+                f"{getattr(response, 'error', None)}"
+            )
+            assert BraveSearchHandler.request_count == 1, (
+                "the dispatcher should issue exactly one provider request"
+            )
+            assert BraveSearchHandler.request_headers[-1].get("x-loc-country") == "FR", (
+                "first real country must reach Brave as X-Loc-Country; "
+                f"headers={BraveSearchHandler.request_headers[-1]!r}"
+            )
+            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
+        finally:
+            BraveSearchHandler.reset()
+
+    def test_hosted_web_search_skips_null_country_for_later_country(
+        self, witness_tool_client,
+    ):
+        """An earlier ``country: null`` must not mask a later country (#1769)."""
+        client, forwarded = witness_tool_client
+        BraveSearchHandler.reset()
+        ResponsesWitnessHandler.tool_round_count = 0
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-tool-stream",
+                input="COUNTRY-PICK-NULL-COUNTRY-1769",
+                tools=[
+                    {
+                        "type": "web_search",
+                        "user_location": {
+                            "type": "approximate",
+                            "country": None,
+                        },
+                    },
+                    {
+                        "type": "web_search_preview",
+                        "user_location": {
+                            "type": "approximate",
+                            "country": "FR",
+                        },
+                    },
+                ],
+                max_tool_calls=1,
+                store=False,
+                extra_headers={"x-user-brave-key": "controlled-test-only"},
+            )
+            assert response.status == "completed", (
+                "null-country-then-FR pick should complete: "
+                f"{getattr(response, 'error', None)}"
+            )
+            assert BraveSearchHandler.request_count == 1, (
+                "the dispatcher should issue exactly one provider request"
+            )
+            assert BraveSearchHandler.request_headers[-1].get("x-loc-country") == "FR", (
+                "first real country must reach Brave as X-Loc-Country; "
+                f"headers={BraveSearchHandler.request_headers[-1]!r}"
+            )
+            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
+        finally:
+            BraveSearchHandler.reset()
+
+    def test_hosted_web_search_omits_country_when_every_location_is_unset(
+        self, witness_tool_client,
+    ):
+        """All-unset locations must leave ``X-Loc-Country`` off the callout (#1769)."""
+        client, forwarded = witness_tool_client
+        BraveSearchHandler.reset()
+        ResponsesWitnessHandler.tool_round_count = 0
+        try:
+            response = client.responses.create(
+                model="sdk-conversation-tool-stream",
+                input="COUNTRY-PICK-ALL-UNSET-1769",
+                tools=[
+                    {"type": "web_search", "user_location": None},
+                    {
+                        "type": "web_search_preview",
+                        "user_location": {
+                            "type": "approximate",
+                            "country": None,
+                        },
+                    },
+                ],
+                max_tool_calls=1,
+                store=False,
+                extra_headers={"x-user-brave-key": "controlled-test-only"},
+            )
+            assert response.status == "completed", (
+                "all-unset country pick should complete: "
+                f"{getattr(response, 'error', None)}"
+            )
+            assert BraveSearchHandler.request_count == 1, (
+                "the dispatcher should issue exactly one provider request"
+            )
+            assert "x-loc-country" not in BraveSearchHandler.request_headers[-1], (
+                "unset locations must not invent a country header; "
+                f"headers={BraveSearchHandler.request_headers[-1]!r}"
+            )
+            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
+        finally:
+            BraveSearchHandler.reset()
 
     @qualification_profile("supporting")
     @pytest.mark.parametrize("replay_limited", [False, True], ids=["default", "replay-limit"])

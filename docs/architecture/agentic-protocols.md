@@ -93,16 +93,125 @@ Client --> MCP Broker Filter
              +-- tools/list:  aggregated catalog
              |                from all servers
              +-- ping:        local response (current profile only)
-             +-- tools/call:  stateless routes by
-             |                configured catalog tool
-             |                current profile returns -32601
-             +-- DELETE:      session termination
+             +-- tools/call:  routes by configured
+             |                catalog tool; current profile
+             |                needs backend_sessions, else
+             |                returns -32601
+             +-- DELETE:      session termination (and
+                              backend session cleanup)
 ```
 
 Each server entry specifies a name, upstream cluster,
 path prefix, tool prefix (for namespace isolation),
 and tool list. The broker aggregates tools from all
 configured servers into a single catalog response.
+
+### Current-Profile Backend Sessions
+
+Stateful MCP backends reject `tools/call` without a
+prior `initialize` on a backend session. With
+`backend_sessions` configured, the broker maps each
+`(gateway Mcp-Session-Id, server)` pair to one backend
+session:
+
+```text
+tools/call (gateway session G, tool weather_x)
+  |
+  +-- mapping (G, weather) missing?
+  |     initialize            --> weather cluster
+  |     capture Mcp-Session-Id B
+  |     notifications/initialized (B) --> weather cluster
+  |
+  +-- forward tools/call with Mcp-Session-Id B
+  |   through the main chain (streams, policies apply)
+  |
+  +-- backend 404 --> drop (G, weather); the next call
+                      runs a fresh handshake
+```
+
+The handshake runs as a filtered subrequest through a
+generated outbound chain: the `mcp_broker_backend`
+selector, any `outbound_filters`, and a `load_balancer`
+that references each server cluster by name, so server
+clusters must be declared in top-level `clusters:`.
+Each reply is bounded by `max_response_bytes`; oversized
+or chunked replies are rejected before the full body is
+retained. `handshake_timeout_ms` is one budget for the
+whole handshake, not for each exchange: it starts before
+the broker waits on a concurrent handshake for the same
+pair, time `initialize` spends is no longer available to
+`notifications/initialized`, and a parent agent-loop
+deadline can shorten it. Each background session
+termination gets a fresh budget of the same length.
+
+A backend session exists only on the endpoint that
+issued it, so the broker records the endpoint the
+handshake's `load_balancer` dialed and pins
+`notifications/initialized`, session `DELETE`, and
+every forwarded call to it through core's
+`pinned_endpoint_address` (the cluster's TLS and
+connection settings still apply). Clusters with
+several endpoints therefore keep each session on one
+replica. A `502` from the pinned endpoint drops the
+mapping like a `404`, and so does a proxy `502` or
+`504` for a call that got no backend response at all
+(refused connection, reset, TLS failure, or timeout),
+so the next call initializes on a reachable replica.
+Sessionless backends are not pinned.
+
+A backend that answers `initialize` with a protocol
+version outside the broker's `supported_versions` is
+never confirmed: the broker terminates that session and
+returns a `unsupported_protocol_version` error instead
+of forwarding the call. A client `MCP-Protocol-Version`
+the broker does not support is rejected with HTTP 400
+before any handshake; without the header the broker
+offers its default version. SSE replies are decoded with
+the shared conforming parser (CR, LF, or CRLF line
+endings and an optional leading BOM); as the SSE
+specification requires, an event the backend never
+terminated with a blank line is discarded.
+
+Concurrent first calls for one pair share a single
+handshake. A mapping is bound to a SHA-256 fingerprint
+of the forwarded credential headers, so a different
+credential on the same gateway session runs its own
+handshake, and the session it replaces is terminated. A
+gateway `DELETE` terminates only the backend sessions
+created with the caller's own credentials, including one
+whose handshake is still in flight: that handshake
+terminates its session instead of publishing it, and its
+call fails with `session_closed`. A backend `404` drops
+the mapping even while another handshake for the pair is
+running.
+
+The map is in memory, per filter instance, capped by
+`max_sessions` (least recently used entries are evicted)
+and expired after `idle_timeout_ms`. A mapping in use by
+an in-flight handshake or forwarded call is never
+evicted or expired until that request completes. A
+credential change can still replace it, so a call that
+started earlier may finish on the replaced session while
+new calls use the new one. When every
+mapping is in use, a call for a new pair fails with
+`session_capacity`. Idle time counts from the end of the
+last call that used the mapping. Evicted, expired, and
+credential-replaced sessions are terminated in the
+background with the credentials that created them, which
+the broker keeps in memory (marked sensitive) for the
+session's lifetime. Termination is best effort: at most 16
+run at once, and a session whose termination is skipped
+because all 16 are busy, fails, or is lost to a restart or
+reload is left to the backend's own idle expiry. Idle
+entries are swept on traffic, at most once per
+`idle_timeout_ms`.
+
+Running several broker replicas behind one gateway
+address is not supported yet: gateway sessions and their
+backend mappings live in one broker instance, so clients
+must reach the same replica for a session's lifetime.
+The broker also does not yet track which gateway
+`Mcp-Session-Id` values it issued.
 
 ### Filter Results
 

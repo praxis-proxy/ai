@@ -282,7 +282,7 @@ impl BodyMutation {
     clippy::too_many_lines,
     reason = "the lexical scan keeps string and number state without allocating"
 )]
-#[cfg(feature = "openai-responses")]
+#[cfg(any(feature = "openai-responses", feature = "mcp"))]
 pub(crate) fn json_node_count(bytes: &[u8]) -> Option<usize> {
     let mut nodes = 0_usize;
     let mut in_string = false;

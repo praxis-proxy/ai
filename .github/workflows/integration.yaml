@@ -549,6 +549,12 @@ jobs:
       - name: Run Anthropic web-search Python SDK tests
         run: uv run tests/integration/sdk/anthropic/test_anthropic_web_search.py -s
 
+      - name: Build experimental MCP connector
+        run: cargo build -p praxis-ai-proxy --features anthropic-mcp-connector-filter
+
+      - name: Run Anthropic MCP connector Python SDK tests
+        run: uv run tests/integration/sdk/anthropic/test_anthropic_mcp_connector.py -s
+
       - name: Build experimental Vertex adapter
         run: cargo build -p praxis-ai-proxy --features vertex-anthropic-filter
 
