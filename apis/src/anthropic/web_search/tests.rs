@@ -773,6 +773,43 @@ async fn pending_search_executes_and_appends_tool_result() {
     );
 }
 
+#[test]
+fn reentry_normalizes_tool_choice_without_dropping_parallel_setting() {
+    let cases = [
+        (
+            json!({"type":"tool","name":"WebSearch","disable_parallel_tool_use":true}),
+            json!({"type":"auto","disable_parallel_tool_use":true}),
+        ),
+        (
+            json!({"type":"auto","disable_parallel_tool_use":true}),
+            json!({"type":"auto","disable_parallel_tool_use":true}),
+        ),
+        (
+            json!({"type":"any","disable_parallel_tool_use":false}),
+            json!({"type":"auto","disable_parallel_tool_use":false}),
+        ),
+        (json!("any"), json!({"type":"auto"})),
+        (Value::Null, json!({"type":"auto"})),
+    ];
+
+    for (tool_choice, expected) in cases {
+        let mut rebuilt = base_request();
+        rebuilt["tool_choice"] = tool_choice;
+
+        for _ in 0..2 {
+            append_search_turns(
+                &mut rebuilt,
+                assistant_content("potato"),
+                pending_search("potato"),
+                &SearchOutcome::Results(Vec::new()),
+            )
+            .unwrap();
+
+            assert_eq!(rebuilt["tool_choice"], expected);
+        }
+    }
+}
+
 #[tokio::test]
 async fn provider_failure_appends_is_error_tool_result() {
     let search = start_you_search_stub(503, "unavailable".to_owned());
