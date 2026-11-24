@@ -1,6 +1,6 @@
 version: 1
 id: responses/chat-web-search-stream
-description: Streaming hosted Responses web search is synthesized as a bounded Chat Completions function tool and re-emitted as canonical web_search_call SSE items.
+description: Streaming live hosted Responses web search is synthesized as a bounded Chat Completions function tool and re-emitted as canonical web_search_call SSE items.
 protocol: openai_responses
 example_config: openai/responses/web-search-chat-completions-fixture.yaml
 upstream_authority: 127.0.0.1:3001
@@ -23,6 +23,7 @@ turns:
           stream: true
           tools:
             - type: web_search
+              external_web_access: true
               search_context_size: high
           tool_choice:
             type: web_search

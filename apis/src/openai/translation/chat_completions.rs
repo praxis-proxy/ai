@@ -427,11 +427,15 @@ fn translate_responses_request(
     let tools = overrides
         .tools
         .or_else(|| obj.get("tools").and_then(Value::as_array).map(Vec::as_slice));
+    let choice = overrides.tool_choice.or_else(|| obj.get("tool_choice"));
     let BuiltChatTools {
         value: built_tools,
         has_web_search,
         has_file_search,
-    } = tools.map(build_chat_tools).transpose()?.unwrap_or_default();
+    } = tools
+        .map(|tools| build_chat_tools(tools, choice))
+        .transpose()?
+        .unwrap_or_default();
     if let Some(tools) = built_tools {
         chat.insert("tools".to_owned(), tools);
     }
@@ -1252,9 +1256,22 @@ struct BuiltChatTools {
     has_file_search: bool,
 }
 
+/// Whether this Chat inference round cannot select the synthesized search function.
+fn choice_excludes_web_search(choice: Option<&Value>) -> bool {
+    // An object choice forces one specific tool in this inference round.
+    // The dispatcher separately checks eligibility across gateway continuations.
+    choice.is_some_and(|choice| {
+        choice.as_str() == Some("none")
+            || choice
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| !is_web_search_tool_type(kind))
+    })
+}
+
 /// Build Chat Completions tool definitions from `Responses` tools.
-fn build_chat_tools(tools: &[Value]) -> Result<BuiltChatTools, TranslationError> {
-    validate_web_search_tools(tools)?;
+fn build_chat_tools(tools: &[Value], choice: Option<&Value>) -> Result<BuiltChatTools, TranslationError> {
+    validate_web_search_tools(tools, choice_excludes_web_search(choice))?;
     validate_file_search_tools(tools)?;
 
     let mut chat_tools = Vec::new();
@@ -1289,7 +1306,7 @@ fn build_chat_tools(tools: &[Value]) -> Result<BuiltChatTools, TranslationError>
 }
 
 /// Reject ambiguous or structurally unusable web-search declarations.
-fn validate_web_search_tools(tools: &[Value]) -> Result<(), TranslationError> {
+fn validate_web_search_tools(tools: &[Value], search_excluded: bool) -> Result<(), TranslationError> {
     let mut web_search_count = 0_usize;
     let mut has_web_search_function = false;
 
@@ -1300,7 +1317,7 @@ fn validate_web_search_tools(tools: &[Value]) -> Result<(), TranslationError> {
             },
             Some(tool_type) if is_web_search_tool_type(tool_type) => {
                 web_search_count = web_search_count.saturating_add(1);
-                validate_web_search_tool(tool)?;
+                validate_web_search_tool(tool, search_excluded)?;
             },
             _ => {},
         }
@@ -1360,13 +1377,22 @@ fn function_tool_name(tool: &Map<String, Value>) -> Option<&str> {
 }
 
 /// Validate fields understood by the existing local web-search executor.
-fn validate_web_search_tool(tool: &Map<String, Value>) -> Result<(), TranslationError> {
+fn validate_web_search_tool(tool: &Map<String, Value>, search_excluded: bool) -> Result<(), TranslationError> {
     for field in tool.keys() {
-        if !matches!(field.as_str(), "type" | "search_context_size" | "user_location") {
+        if !matches!(
+            field.as_str(),
+            "type" | "search_context_size" | "user_location" | "external_web_access"
+        ) {
             return Err(TranslationError::InvalidWebSearchTool(format!(
                 "field `{field}` is not supported by openai_web_search_dispatch"
             )));
         }
+    }
+
+    let access = tool.get("external_web_access");
+    if !(search_excluded && access.and_then(Value::as_bool) == Some(false)) {
+        crate::web_search::validate_external_web_access(access)
+            .map_err(|message| TranslationError::InvalidWebSearchTool(message.to_owned()))?;
     }
 
     if let Some(context_size) = tool.get("search_context_size")

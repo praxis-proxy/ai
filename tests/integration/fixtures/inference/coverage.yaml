@@ -340,7 +340,7 @@ features:
     status: synthetic_only
     scenarios:
       - responses/chat-web-search
-      - responses/chat-web-search-stream
+      - responses/chat-web-search-stream # Explicit live access
     providers:
       synthetic:
         status: synthetic_only

@@ -225,6 +225,7 @@ def capture(args):
                                   "examples/configs/openai/responses/web-search-chat-completions.yaml",
                                   "examples/configs/openai/responses/client-tool-compat.yaml",
                                   "examples/configs/openai/responses/client-tool-compat-chat-completions.yaml",
+                                  "examples/configs/openai/responses/client-tool-compat-chat-web-search.yaml",
                               )},
                           "effective_overrides": {"VLLM_MODEL": model, "VLLM_TEST_BACKEND": "live", "DATABASE_URL": "PostgreSQL (credential redacted)"},
                           "ogx_constraints_sha256": file_hash("tests/integration/ogx-constraints.txt"),
@@ -314,7 +315,7 @@ def finish(raw, requested, start_result, suite_result, claude_result, codex_resu
         "Anthropic SDK and optional tools")
     report["suites"]["codex_acceptance"] = acceptance(
         codex_raw, codex_result, run_id, attempt, sha,
-        "native Responses and translated Chat")
+        "native Responses and translated Chat, including translated search with a controlled provider")
     report["suites"]["opencode_acceptance"] = acceptance(
         opencode_raw, opencode_result, run_id, attempt, sha,
         "native Chat Completions text turn and tool-call round trip, pinned 1.x and 2.x clients")
@@ -426,7 +427,11 @@ def render(report, detailed=False):
             if cases:
                 lines += ["", f"{suite_name.replace('_', ' ').title()} scenarios:"]
                 for case in cases:
-                    lines.append(f"- `{case['id']}`: {case['status']}")
+                    route = f" | {case['route']}" if case.get("route") else ""
+                    client = f" | CLI {case['client_version']}" if case.get("client_version") else ""
+                    model = f" | client model {case['client_model']}" if case.get("client_model") else ""
+                    weights = f" | backend weights {case['backend_weights']}" if case.get("backend_weights") else ""
+                    lines.append(f"- `{case['id']}`: {case['status']}{route}{client}{model}{weights}")
                     pytest_cases = case.get("pytest", {}).get("selected", [])
                     for item in pytest_cases:
                         if item.get("outcome") != "passed":

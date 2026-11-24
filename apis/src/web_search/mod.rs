@@ -63,6 +63,15 @@ pub(crate) fn is_web_search_tool_type(tool_type: &str) -> bool {
     WEB_SEARCH_TOOL_TYPES.contains(&tool_type)
 }
 
+/// Validate the external access policy of a gateway-executed Responses search.
+pub(crate) fn validate_external_web_access(access: Option<&serde_json::Value>) -> Result<(), &'static str> {
+    match access {
+        None | Some(serde_json::Value::Bool(true)) => Ok(()),
+        Some(serde_json::Value::Bool(false)) => Err("cached-only web search is unavailable"),
+        Some(_) => Err("external_web_access must be a boolean"),
+    }
+}
+
 /// Outcome of validating one model-generated search query against the shared
 /// dispatch policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

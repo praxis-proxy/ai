@@ -156,6 +156,11 @@ const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before 
 /// executes them on re-entry via the `iterative_request_router`
 /// agentic loop.
 ///
+/// An eligible search with `external_web_access: false` receives HTTP 400
+/// because the configured providers offer live search. An omitted setting keeps
+/// the provider's default live behavior. Declaring a live search tool alone
+/// does not issue a provider request.
+///
 /// Each provider request is executed through the shared filtered-subrequest
 /// executor, which enforces destination authority, DNS/SSRF, TLS/SNI, and
 /// `Host` centrally. An optional `outbound_chain` runs operator-managed
@@ -710,14 +715,35 @@ impl HttpFilter for WebSearchDispatchFilter {
             return Ok(FilterAction::Continue);
         };
 
+        let preflight = is_initial_request(ctx) && request_declares_eligible_web_search(state);
+        // Honor tool_choice on admission and enforce the original policy again
+        // on any selected call before executing it.
+        if (preflight || !state.web_search_calls.is_empty())
+            && let Some(message) = state
+                .tools
+                .iter()
+                .filter(|tool| {
+                    tool.get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_web_search_tool_type)
+                })
+                .find_map(|tool| crate::web_search::validate_external_web_access(tool.get("external_web_access")).err())
+        {
+            return Ok(FilterAction::Reject(responses_error_rejection_with_code(
+                400,
+                "invalid_request_error",
+                "invalid_value",
+                message,
+            )));
+        }
+
         // Round-0 location and domain-filter preflight. The canonical web-search
         // state preserves the full `user_location` and `filters`, but the dispatcher
         // only forwards a supported ISO `country` and enforces `allowed_domains`
         // and `blocked_domains`. Reject anything else explicitly rather than
         // silently changing search semantics by dropping constraints dispatch
         // cannot honor (issues #1548, #1768).
-        if is_initial_request(ctx)
-            && request_declares_eligible_web_search(state)
+        if preflight
             && let Err(rejection) = self
                 .preflight_location_support(state)
                 .and_then(|()| preflight_domain_filters(state))
@@ -731,8 +757,7 @@ impl HttpFilter for WebSearchDispatchFilter {
         // credential fails closed BEFORE any inference round runs — the re-entry
         // check would otherwise fire only after streaming has committed HTTP 200.
         if self.user_credential_slot.is_some()
-            && is_initial_request(ctx)
-            && request_declares_eligible_web_search(state)
+            && preflight
             && let Err(rejection) = self.preflight_managed_credential(ctx)
         {
             return Ok(FilterAction::Reject(rejection));

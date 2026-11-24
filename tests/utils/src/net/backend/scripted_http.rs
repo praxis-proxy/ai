@@ -180,6 +180,20 @@ pub async fn start_scripted_http_backend_turns(
     expected_path: &str,
     turns: Vec<HttpServerAction>,
 ) -> HttpBackendGuard {
+    start_scripted_http_backend_with_final_response(expected_method, expected_path, turns, None).await
+}
+
+/// Replay fixed turns followed by an optional response computed from the last request.
+///
+/// # Panics
+///
+/// Panics if the loopback listener cannot bind or report its local address.
+pub async fn start_scripted_http_backend_with_final_response(
+    expected_method: &str,
+    expected_path: &str,
+    turns: Vec<HttpServerAction>,
+    final_response: Option<fn(&CapturedHttpRequest) -> HttpServerAction>,
+) -> HttpBackendGuard {
     let listener = bind_listener().await;
     let port = listener
         .local_addr()
@@ -187,7 +201,9 @@ pub async fn start_scripted_http_backend_turns(
         .port();
     let (event_tx, event_rx) = mpsc::channel(256);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let state = Arc::new(ScriptState::new(expected_method, expected_path, turns));
+    let mut state = ScriptState::new(expected_method, expected_path, turns);
+    state.final_response = final_response;
+    let state = Arc::new(state);
     let handle = tokio::spawn(run_listener(listener, state, event_tx, shutdown_rx));
     debug!(port, "scripted HTTP backend listening");
 
@@ -281,6 +297,8 @@ struct ScriptState {
     turn_index: AtomicUsize,
     /// Ordered response actions, shared across every connection.
     turns: Box<[HttpServerAction]>,
+    /// Optional last turn whose output depends on its request.
+    final_response: Option<fn(&CapturedHttpRequest) -> HttpServerAction>,
 }
 
 impl ScriptState {
@@ -293,6 +311,7 @@ impl ScriptState {
             },
             turn_index: AtomicUsize::new(0),
             turns: turns.into_boxed_slice(),
+            final_response: None,
         }
     }
 
@@ -349,10 +368,6 @@ async fn run_listener(
 }
 
 /// Complete one HTTP request/response cycle against a single connection.
-#[expect(
-    clippy::large_stack_frames,
-    reason = "bounded test-backend connection state is only slightly above the workspace threshold"
-)]
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     state: Arc<ScriptState>,
@@ -384,11 +399,7 @@ async fn handle_connection(
     let Some(request) = read_full_request(&mut stream, peek).await else {
         return;
     };
-    if event_tx.send(HttpBackendEvent::Request(request)).await.is_err() {
-        return;
-    }
-
-    respond_to_turn(&mut stream, &state, &event_tx).await;
+    respond_to_turn(&mut stream, &state, &event_tx, request).await;
 }
 
 /// Reject a syntactically malformed request head.
@@ -443,9 +454,17 @@ async fn respond_to_turn(
     stream: &mut tokio::net::TcpStream,
     state: &ScriptState,
     event_tx: &mpsc::Sender<HttpBackendEvent>,
+    request: CapturedHttpRequest,
 ) {
     let index = state.turn_index.fetch_add(1, Ordering::SeqCst);
-    let Some(script) = state.turns.get(index) else {
+    let final_action = state
+        .final_response
+        .filter(|_| index == state.turns.len())
+        .map(|respond| respond(&request));
+    if event_tx.send(HttpBackendEvent::Request(request)).await.is_err() {
+        return;
+    }
+    let Some(script) = state.turns.get(index).or(final_action.as_ref()) else {
         let _queued = event_tx.send(HttpBackendEvent::ScriptExhausted { turn: index }).await;
         let _written = stream
             .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")

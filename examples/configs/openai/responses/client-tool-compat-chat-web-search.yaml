@@ -1,0 +1,103 @@
+# Codex Live Web Search via Chat Completions
+# Requires `--features openai-agentic-loop`.
+# Configure Codex with web_search = "live" and set WEB_SEARCH_API_KEY to a
+# Brave Search API key. The dispatcher runs only when inference selects search.
+# Set VLLM_API_KEY to the backend credential and configure the inference endpoint.
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [client-tool-compat-chat]
+
+filter_chains:
+  - name: client-tool-compat-chat
+    filters:
+      # Publishes the typed operation consumed by openai_responses_request.
+      - filter: ai_operation
+
+      - filter: openai_responses_request
+        initialize_state: false
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
+
+      - filter: iterative_request_router
+        initial_step: inference
+        # Initial inference plus one resumed inference for each allowed search round.
+        max_iterations: 5
+        timeout_ms: 120000
+        step_timeout_ms: 60000
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_stream_events
+                # Must exceed the translator's complete-frame ceiling below.
+                max_buffer_bytes: 4194304
+                max_events: 1000
+                timeout_secs: 60
+
+              - filter: openai_web_search_dispatch
+                provider: brave
+                api_key:
+                  env_var: WEB_SEARCH_API_KEY
+
+              - filter: openai_agentic_loop
+                max_infer_iters: 4
+
+              - filter: openai_client_tool_compat
+                max_rewritten_body_bytes: 67108864
+                max_client_tools: 512
+
+              - filter: openai_responses_to_chat_completions
+                max_rewritten_body_bytes: 1048576
+                max_emitted_sse_frame_bytes: 2097152
+                max_stream_events: 500
+                stream_timeout_secs: 60
+
+              - filter: path_rewrite
+                replace:
+                  pattern: "^/v1/responses/?$"
+                  replacement: "/v1/chat/completions"
+                conditions:
+                  - when:
+                      path_prefix: "/v1/responses"
+                      methods: [POST]
+
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: chat-provider
+
+              - filter: credential_injection
+                clusters:
+                  - name: chat-provider
+                    header: Authorization
+                    env_var: VLLM_API_KEY
+                    header_prefix: "Bearer "
+                    strip_client_credential: true
+
+              - filter: load_balancer
+                clusters:
+                  - name: chat-provider
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - filter: openai_agentic_loop
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local scripted backend

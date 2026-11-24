@@ -6256,7 +6256,7 @@ class TestResponsesToChatCompletionsVLLM:
                 "Praxis Proxy release, then answer. Do not answer directly. "
                 "/no_think"
             ),
-            tools=[{"type": "web_search"}],
+            tools=[{"type": "web_search", "external_web_access": True}],
             tool_choice={"type": "web_search"},
             max_tool_calls=1,
             store=False,
@@ -6316,6 +6316,22 @@ class TestResponsesToChatCompletionsVLLM:
             "streamed terminal output should contain the final assistant "
             f"message; got: {output_types}"
         )
+
+    @pytest.mark.parametrize(("access", "message"), [
+        (False, "cached-only web search is unavailable"),
+        (None, "external_web_access must be a boolean"),
+    ])
+    def test_web_search_external_access_rejection(self, web_search_chat_streaming_client, access, message):
+        BraveSearchHandler.reset()
+        with pytest.raises(BadRequestError, match=message):
+            web_search_chat_streaming_client.responses.create(
+                model=VLLM_MODEL,
+                input="Search for current releases.",
+                tools=[{"type": "web_search", "external_web_access": access}],
+                store=False,
+                stream=True,
+            )
+        assert BraveSearchHandler.request_count == 0
 
     def test_web_search_unsupported_user_location_is_rejected(
         self, web_search_chat_streaming_client,

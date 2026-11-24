@@ -1555,6 +1555,7 @@ jobs:
           for test_name in \
             codex_http::pinned_codex_completes_native_vllm_apply_patch_workflow_over_http \
             codex_http::pinned_codex_completes_translated_vllm_apply_patch_workflow_over_http \
+            codex_http::pinned_codex_live_search_through_translated_vllm \
             codex_http::pinned_codex_compaction_crosses_context_window_over_http; do
             if ! "$TEST_BIN" "$test_name" --list --exact | grep -Fx "$test_name: test"; then
               echo "::error::missing Codex acceptance test: $test_name"
@@ -1611,6 +1612,30 @@ jobs:
           grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;" \
             "$RUNNER_TEMP/codex-acceptance-translated.log"
 
+      - name: Run Codex translated-Chat vLLM web search with a controlled provider (once, no retry)
+        id: codex_translated_search
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
+        env:
+          PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
+          PRAXIS_TEST_CODEX_DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
+          PRAXIS_TEST_CODEX_NETNS: ${{ env.CODEX_NS }}
+          PRAXIS_TEST_CODEX_LISTEN_ADDRESS: 10.201.0.1
+          PRAXIS_TEST_CODEX_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            codex_http::pinned_codex_live_search_through_translated_vllm \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-translated-search.log"
+          test_status=${PIPESTATUS[0]}
+          if [ "$test_status" -ne 0 ]; then
+            exit "$test_status"
+          fi
+          grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;" \
+            "$RUNNER_TEMP/codex-acceptance-translated-search.log"
+
       - name: Run Codex native-Responses compaction acceptance test (once, no retry)
         id: codex_compaction
         if: ${{ always() && !cancelled() && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
@@ -1646,7 +1671,7 @@ jobs:
         run: |
           "$CONTAINER_RUNTIME" logs vllm > "$RUNNER_TEMP/codex-vllm.log" 2>&1 || true
           "$CONTAINER_RUNTIME" logs praxis-postgres > "$RUNNER_TEMP/codex-postgres.log" 2>&1 || true
-          for log in codex-acceptance-native codex-acceptance-translated codex-acceptance-compaction; do
+          for log in codex-acceptance-native codex-acceptance-translated codex-acceptance-translated-search codex-acceptance-compaction; do
             echo "=== $log ==="
             tail -n 400 "$RUNNER_TEMP/$log.log" 2>/dev/null || true
           done
@@ -1663,6 +1688,7 @@ jobs:
           path: |
             ${{ runner.temp }}/codex-acceptance-native.log
             ${{ runner.temp }}/codex-acceptance-translated.log
+            ${{ runner.temp }}/codex-acceptance-translated-search.log
             ${{ runner.temp }}/codex-acceptance-compaction.log
             ${{ runner.temp }}/codex-vllm.log
             ${{ runner.temp }}/codex-postgres.log
@@ -1676,15 +1702,37 @@ jobs:
           CODEX_NATIVE: ${{ steps.codex_native.outcome }}
           CODEX_TRANSLATED: ${{ steps.codex_translated.outcome }}
           CODEX_COMPACTION: ${{ steps.codex_compaction.outcome }}
+          CODEX_TRANSLATED_SEARCH: ${{ steps.codex_translated_search.outcome }}
+          CODEX_NATIVE_SEARCH: unsupported
         run: |
           python3 - "$RUNNER_TEMP/codex-acceptance.json" <<'PY'
           import json, os, pathlib, subprocess, sys
-          names = ("CODEX_NATIVE", "CODEX_TRANSLATED", "CODEX_COMPACTION")
+          routes = {
+              "CODEX_NATIVE": "native Responses",
+              "CODEX_TRANSLATED": "translated Chat Completions",
+              "CODEX_COMPACTION": "native Responses",
+              "CODEX_NATIVE_SEARCH": "native Responses",
+              "CODEX_TRANSLATED_SEARCH": "translated Chat Completions",
+          }
           data = {
               "run_id": int(os.environ["GITHUB_RUN_ID"]),
               "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
               "checkout_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-              "cases": [{"id": name.lower(), "status": os.environ[name] or "unexecuted"} for name in names],
+              "cases": [
+                  {
+                      "id": name.lower(),
+                      "status": os.environ[name] or "unexecuted",
+                      "route": route,
+                      "client_version": os.environ["CODEX_VERSION"],
+                      "backend_weights": os.environ["VLLM_GPU_MODEL"],
+                      "client_model": (
+                          None if name == "CODEX_NATIVE_SEARCH"
+                          else "gpt-5.5" if name in ("CODEX_NATIVE", "CODEX_TRANSLATED")
+                          else os.environ["CODEX_VLLM_MODEL"]
+                      ),
+                  }
+                  for name, route in routes.items()
+              ],
           }
           pathlib.Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n")
           PY

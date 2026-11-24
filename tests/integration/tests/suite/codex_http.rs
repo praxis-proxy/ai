@@ -156,6 +156,26 @@ const CODEX_COMPACTION_BALLAST_BYTES: usize = 6_000;
 /// Prove the pinned Codex client completes an offline turn over HTTP.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pinned_codex_uses_responses_http_through_full_flow() {
+    assert_codex_http_search_mode("openai/responses/http-passthrough.yaml", Some("disabled"), None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pinned_codex_declares_hosted_search_over_http() {
+    for (mode, access) in [(None, false), (Some("cached"), false), (Some("live"), true)] {
+        assert_codex_http_search_mode("openai/responses/http-passthrough.yaml", mode, Some(access)).await;
+    }
+}
+
+/// Verify that the shipped native gateway can start a turn with the default
+/// declaration when the Responses backend accepts that hosted tool.
+#[cfg(feature = "store-sqlite")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pinned_codex_omitted_search_starts_through_native_example() {
+    assert_codex_http_search_mode("openai/responses/client-tool-compat.yaml", None, Some(false)).await;
+}
+
+/// Capture a pinned client turn and check the hosted tool declaration.
+async fn assert_codex_http_search_mode(example: &str, web_search: Option<&str>, expected_access: Option<bool>) {
     let Some(codex_bin) = std::env::var_os("PRAXIS_TEST_CODEX_BIN") else {
         eprintln!("skipping pinned Codex HTTP acceptance test; PRAXIS_TEST_CODEX_BIN is unset");
         return;
@@ -164,16 +184,21 @@ async fn pinned_codex_uses_responses_http_through_full_flow() {
 
     let mut backend = start_scripted_http_backend_turns("POST", "/v1/responses", http_response_script()).await;
     let proxy_port = free_port();
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/http-passthrough.yaml"))
-        .expect("http-passthrough example should exist");
+    let working_dir = tempfile::tempdir().expect("temporary working directory should be created");
+    let db_path = working_dir.path().join("responses.db");
+    let yaml = std::fs::read_to_string(example_config_path(example))
+        .expect("Responses example should exist")
+        .replace(
+            "sqlite://responses.db?mode=rwc",
+            &format!("sqlite://{}?mode=rwc", db_path.display()),
+        );
     let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", backend.port())]));
     let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
     let _proxy = start_proxy(&config);
     let observer = HttpTransportObserver::start(proxy_port).await;
 
-    let working_dir = tempfile::tempdir().expect("temporary working directory should be created");
     let proxy_base_url = format!("http://127.0.0.1:{}", observer.port());
-    let output = run_codex(
+    let output = Box::pin(run_codex(
         &codex_bin,
         CodexRunOptions {
             proxy_base_url: &proxy_base_url,
@@ -185,9 +210,10 @@ async fn pinned_codex_uses_responses_http_through_full_flow() {
             no_proxy: "127.0.0.1,localhost",
             netns: None,
             tolerate_timeout: false,
+            web_search,
             compaction_limits: None,
         },
-    )
+    ))
     .await;
     assert!(
         output.status.success(),
@@ -206,19 +232,304 @@ async fn pinned_codex_uses_responses_http_through_full_flow() {
     // Exercise the same catalog entry as GPU acceptance. A client pin bump can
     // remove a model's metadata and silently omit apply_patch before inference.
     let request: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("Codex request should parse");
-    assert!(
-        request["tools"]
-            .as_array()
-            .is_some_and(|tools| tools.iter().any(|tool| {
-                tool["name"] == "apply_patch"
-                    && tool["type"] == "custom"
-                    && tool.pointer("/format/type").and_then(serde_json::Value::as_str) == Some("grammar")
-            })),
-        "pinned Codex must declare grammar-based apply_patch for {CODEX_APPLY_PATCH_MODEL}"
+    if example == "openai/responses/http-passthrough.yaml" {
+        assert!(
+            request["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| {
+                    tool["name"] == "apply_patch"
+                        && tool["type"] == "custom"
+                        && tool.pointer("/format/type").and_then(serde_json::Value::as_str) == Some("grammar")
+                })),
+            "pinned Codex must declare grammar-based apply_patch for {CODEX_APPLY_PATCH_MODEL}"
+        );
+    }
+    let search_tools: Vec<_> = request["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|tool| tool["type"].as_str().is_some_and(|kind| kind.starts_with("web_search")))
+        .collect();
+    assert_eq!(
+        search_tools.len(),
+        usize::from(expected_access.is_some()),
+        "unexpected hosted tool count for {web_search:?}"
     );
+    if let Some(access) = expected_access {
+        assert_eq!(
+            search_tools[0]["type"], "web_search",
+            "Codex should declare the hosted search tool"
+        );
+        assert_eq!(
+            search_tools[0]["external_web_access"], access,
+            "wrong access for {web_search:?}"
+        );
+        assert_eq!(
+            search_tools[0]["search_content_types"],
+            serde_json::json!(["text", "image"]),
+            "the selected catalog model should request text and image search"
+        );
+    }
     assert_no_websocket_upgrades(&mut backend).await;
     assert_no_unexpected_methods(&mut backend).await;
     observer.assert_http_only();
+}
+
+/// Exercise gateway-owned search with the pinned CLI and controlled HTTP peers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pinned_codex_live_search_through_translated_chat() {
+    let Some(codex_bin) = std::env::var_os("PRAXIS_TEST_CODEX_BIN") else {
+        eprintln!("skipping pinned Codex search; PRAXIS_TEST_CODEX_BIN is unset");
+        return;
+    };
+    assert_pinned_codex_version(&codex_bin).await;
+
+    let marker = format!("SEARCH_RESULT_{:032x}", rand::random::<u128>());
+    let mut search = start_codex_search_provider(&marker).await;
+    let mut model = praxis_test_utils::start_scripted_http_backend_with_final_response(
+        "POST",
+        "/v1/chat/completions",
+        vec![
+            codex_search_chat_round(
+                "chat-no-search",
+                &serde_json::json!({"role": "assistant", "content": "No search needed."}),
+                "stop",
+            ),
+            codex_search_chat_round(
+                "chat-search",
+                &serde_json::json!({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_search",
+                        "type": "function",
+                        "function": {"name": "web_search", "arguments": "{\"query\":\"Praxis releases\"}"}
+                    }]
+                }),
+                "tool_calls",
+            ),
+        ],
+        Some(|request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).expect("valid Chat request");
+            let content = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "tool")
+                .and_then(|message| message["content"].as_str())
+                .unwrap_or("missing tool result");
+            codex_search_chat_round(
+                "chat-answer",
+                &serde_json::json!({"role":"assistant","content":content}),
+                "stop",
+            )
+        }),
+    )
+    .await;
+
+    let proxy_port = free_port();
+    let yaml = codex_search_yaml(proxy_port, search.port())
+        .replace("env_var: VLLM_API_KEY", "value: synthetic-provider-key")
+        .replace("127.0.0.1:3001", &format!("127.0.0.1:{}", model.port()));
+    let config = praxis_core::config::Config::from_yaml(&yaml).expect("search config should parse");
+    let _proxy = start_proxy(&config);
+    let observer = HttpTransportObserver::start(proxy_port).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let proxy_base_url = format!("http://127.0.0.1:{}", observer.port());
+    let options = |web_search, prompt| CodexRunOptions {
+        proxy_base_url: &proxy_base_url,
+        model: "qwen3-8b",
+        working_dir: workspace.path(),
+        prompt,
+        sandbox: "read-only",
+        execution_timeout: Duration::from_secs(30),
+        no_proxy: "127.0.0.1,localhost",
+        netns: None,
+        tolerate_timeout: false,
+        web_search,
+        compaction_limits: None,
+    };
+    for mode in [None, Some("cached")] {
+        let output = run_codex(&codex_bin, options(mode, "Reply ready.")).await;
+        assert!(!output.status.success(), "cached-only turn unexpectedly succeeded");
+        assert!(
+            output.stdout.contains("cached-only web search is unavailable"),
+            "{}",
+            output.stdout
+        );
+    }
+    let output = run_codex(&codex_bin, options(Some("live"), "Reply without searching.")).await;
+    assert!(output.status.success(), "{}\n{}", output.stdout, output.stderr);
+    assert!(output.stdout.contains("No search needed."));
+    let declaration_only = next_translated_request(&mut model).await;
+    let declaration: serde_json::Value = serde_json::from_slice(&declaration_only.body).unwrap();
+    assert!(
+        declaration["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| { tool["function"]["name"] == "web_search" })
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), search.next_event())
+            .await
+            .is_err(),
+        "cached or declaration-only mode reached the search provider"
+    );
+
+    let output = run_codex(
+        &codex_bin,
+        options(Some("live"), "Search for Praxis releases and report the result."),
+    )
+    .await;
+    assert!(output.status.success(), "{}\n{}", output.stdout, output.stderr);
+    assert_codex_search_answer(&output.stdout, &marker);
+
+    let first = next_translated_request(&mut model).await;
+    assert!(!String::from_utf8_lossy(&first.body).contains(&marker));
+    let second = next_translated_request(&mut model).await;
+    let resumed: serde_json::Value = serde_json::from_slice(&second.body).unwrap();
+    assert!(
+        resumed["messages"].as_array().unwrap().iter().any(|message| {
+            message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains(&marker))
+        }),
+        "search result did not reach resumed inference"
+    );
+    let provider_request = next_translated_request(&mut search).await;
+    let query = provider_request
+        .query
+        .as_deref()
+        .expect("Brave request should include a query");
+    let mut terms = query.split('&').filter_map(|pair| pair.strip_prefix("q="));
+    assert!(
+        matches!(terms.next(), Some("Praxis%20releases" | "Praxis+releases")) && terms.next().is_none(),
+        "Brave should receive the query selected by the model: {query}"
+    );
+    observer.assert_http_only();
+}
+
+/// Require the marker in a completed assistant message.
+fn assert_codex_search_answer(stdout: &str, marker: &str) {
+    assert!(
+        stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|event| {
+                event["type"] == "item.completed"
+                    && event["item"]["type"] == "agent_message"
+                    && event["item"]["text"].as_str().is_some_and(|text| text.contains(marker))
+            }),
+        "Codex did not receive the final marker: {stdout}"
+    );
+}
+
+/// Return a Brave-compatible response containing the per-test marker.
+async fn start_codex_search_provider(marker: &str) -> praxis_test_utils::HttpBackendGuard {
+    start_scripted_http_backend_turns(
+        "GET",
+        "/res/v1/web/search",
+        vec![HttpServerAction::Json {
+            status: 200,
+            body: serde_json::json!({"web":{"results":[{
+                "title": marker,
+                "url": "https://example.com/result",
+                "description": "Controlled search result"
+            }]}})
+            .to_string(),
+        }],
+    )
+    .await
+}
+
+/// Bind the search example to isolated gateway and provider ports.
+fn codex_search_yaml(proxy_port: u16, search_port: u16) -> String {
+    let yaml = std::fs::read_to_string(example_config_path(
+        "openai/responses/client-tool-compat-chat-web-search.yaml",
+    ))
+    .expect("translated Codex search example should exist");
+    patch_yaml(&yaml, proxy_port, &HashMap::new())
+        .replace(
+            "env_var: WEB_SEARCH_API_KEY",
+            &format!("value: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+        )
+        .replace(
+            "allow_private_endpoints: true",
+            "allow_private_endpoints: true\n  allow_private_upstreams: true",
+        )
+}
+
+/// Qualify translated search using the isolated pinned CLI and real vLLM.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_codex_live_search_through_translated_vllm() {
+    let Some(live) = CodexLiveConfig::from_env() else {
+        return;
+    };
+    assert_pinned_codex_version(&live.codex_bin).await;
+    live.require_egress_isolation_if_demanded();
+
+    let marker = format!("SEARCH_RESULT_{:032x}", rand::random::<u128>());
+    let mut search = start_codex_search_provider(&marker).await;
+    let proxy_port = free_port();
+    let yaml = codex_search_yaml(proxy_port, search.port())
+        .replace("127.0.0.1:3001", &live.vllm_authority)
+        .replace("env_var: VLLM_API_KEY", "env_var: CODEX_BACKEND_TOKEN");
+    let config = praxis_core::config::Config::from_yaml(&yaml).expect("live search config should parse");
+    let _proxy = start_proxy(&config);
+    let observer = HttpTransportObserver::start_on(proxy_port, live.listen_address).await;
+    if let Some(namespace) = &live.netns {
+        verify_egress_isolation(namespace);
+    }
+
+    let workspace = tempfile::tempdir().unwrap();
+    let output = run_codex(
+        &live.codex_bin,
+        CodexRunOptions {
+            proxy_base_url: &format!("http://{}:{}", live.listen_address, observer.port()),
+            model: &live.model,
+            working_dir: workspace.path(),
+            prompt: "Use the web search tool to search for Praxis Proxy releases. Reply with the exact title from the first search result. /no_think",
+            sandbox: "read-only",
+            execution_timeout: LIVE_CHILD_TIMEOUT,
+            no_proxy: &format!("127.0.0.1,localhost,{}", live.listen_address),
+            netns: live.netns.as_deref(),
+            tolerate_timeout: false,
+            web_search: Some("live"),
+            compaction_limits: None,
+        },
+    ).await;
+    assert!(output.status.success(), "{}\n{}", output.stdout, output.stderr);
+    next_translated_request(&mut search).await;
+    assert_codex_search_answer(&output.stdout, &marker);
+    observer.assert_http_only();
+}
+
+/// Stream a model delta and its terminal Chat Completions chunk.
+fn codex_search_chat_round(id: &str, delta: &serde_json::Value, finish_reason: &str) -> HttpServerAction {
+    let chunk = |choice| {
+        serde_json::json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "qwen3-8b",
+            "choices": [choice]
+        })
+    };
+    HttpServerAction::StreamSse {
+        events: vec![
+            chat_sse_data(&chunk(
+                serde_json::json!({"index": 0, "delta": delta, "finish_reason": null}),
+            )),
+            chat_sse_data(&chunk(
+                serde_json::json!({"index": 0, "delta": {}, "finish_reason": finish_reason}),
+            )),
+            "data: [DONE]\n".to_owned(),
+        ],
+        inter_event_delay: Duration::ZERO,
+    }
 }
 
 /// Prove the pinned client completes a translated, multi-turn coding workflow.
@@ -255,6 +566,7 @@ async fn pinned_codex_completes_chat_backend_coding_workflow_over_http() {
             no_proxy: "127.0.0.1,localhost",
             netns: None,
             tolerate_timeout: false,
+            web_search: Some("disabled"),
             compaction_limits: None,
         },
     )
@@ -421,6 +733,7 @@ async fn run_live_codex_apply_patch_workflow(
             no_proxy: &no_proxy,
             netns: live.netns.as_deref(),
             tolerate_timeout: false,
+            web_search: Some("disabled"),
             compaction_limits: None,
         },
     )
@@ -518,6 +831,7 @@ async fn run_live_codex_compaction_workflow(
             no_proxy: &no_proxy,
             netns: live.netns.as_deref(),
             tolerate_timeout: true,
+            web_search: Some("disabled"),
             compaction_limits: Some(CodexCompactionLimits {
                 context_window: CODEX_COMPACTION_CONTEXT_WINDOW,
                 auto_compact_token_limit: CODEX_COMPACTION_AUTO_COMPACT_LIMIT,
@@ -1123,6 +1437,8 @@ struct CodexOutput {
 
 /// Inputs controlling one isolated Codex child process.
 struct CodexRunOptions<'a> {
+    /// Hosted web search mode, or omit the setting.
+    web_search: Option<&'a str>,
     /// Praxis base URL visible to the Codex child, without `/v1`.
     proxy_base_url: &'a str,
     /// Model name Codex sends through Praxis.
@@ -2177,6 +2493,7 @@ async fn run_codex(codex_bin: &OsStr, options: CodexRunOptions<'_>) -> CodexOutp
         netns,
         tolerate_timeout,
         compaction_limits,
+        web_search,
     } = options;
     let codex_home = tempfile::tempdir().expect("temporary CODEX_HOME should be created");
     let compaction_keys = compaction_limits.map_or_else(String::new, |limits| {
@@ -2185,11 +2502,12 @@ async fn run_codex(codex_bin: &OsStr, options: CodexRunOptions<'_>) -> CodexOutp
             limits.context_window, limits.auto_compact_token_limit
         )
     });
+    let search_setting = web_search.map_or_else(String::new, |mode| format!("web_search = \"{mode}\""));
     let config = format!(
         r#"model = "{model}"
 model_provider = "praxis"
 approval_policy = "never"
-web_search = "disabled"
+{search_setting}
 {compaction_keys}
 [features]
 apps = false

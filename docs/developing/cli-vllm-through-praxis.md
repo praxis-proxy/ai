@@ -525,6 +525,54 @@ If you selected the translated Codex example instead, set
 Chat Completions, injects `VLLM_API_KEY`, and streams the translated response
 back.
 
+### Gateway-executed live web search
+
+For the translated route, start Praxis with
+`examples/configs/openai/responses/client-tool-compat-chat-web-search.yaml`
+and build with `--features openai-agentic-loop`. Point the example's inference
+cluster at vLLM. In the Praxis process environment, set `VLLM_API_KEY` to
+the backend credential and `WEB_SEARCH_API_KEY` to your Brave Search API key. The Codex provider still uses
+`wire_api = "responses"` and its base URL ends in `/v1`. Set
+`web_search = "live"` in the isolated Codex configuration and use the vLLM
+served model name, such as `qwen3-8b`. The `gpt-5.5` alias used by the apply-patch acceptance test
+also asks for image search. The translated search route supports text results,
+so it rejects that declaration. Start Praxis:
+
+```sh
+cargo run -p praxis-ai-proxy --features openai-agentic-loop -- \
+  -c examples/configs/openai/responses/client-tool-compat-chat-web-search.yaml
+```
+
+In the shell where you configured the isolated Codex home, run:
+
+```sh
+codex exec --ephemeral --skip-git-repo-check --json 'Use web search to find the latest Praxis Proxy release.'
+```
+
+Codex CLI 0.170.0 sent a hosted `web_search` declaration on
+`POST /v1/responses` with `external_web_access: true` in live mode. Both
+`cached` and an omitted setting sent `external_web_access: false`. The
+translated search pipeline rejects cached-only requests with HTTP 400 because
+its provider requires live access. In disabled mode Codex omits the tool.
+To code without search credentials, use the edit-only example for your route and set
+`web_search = "disabled"`.
+
+The translated example uses a Chat Completions function call to let Praxis
+execute the search and pass results into the next streamed inference round.
+The local acceptance test exercised Codex 0.170.0 with the `qwen3-8b` model
+name against a scripted Chat Completions backend and a controlled Brave
+response. It verified that the search result reached the next inference
+request and the final answer reached Codex over SSE. The scripted backend
+did not run model weights.
+The native Responses edit example passed an omitted-setting startup test
+with a scripted Responses backend that accepted Codex's cached declaration.
+Real vLLM startup with that declaration remains unverified. Use the explicit
+disabled setting for native coding. The native route has no gateway search
+bridge. The nightly GPU workflow reports
+translated Codex search with a controlled provider as its own scenario. GPU
+vLLM qualification, real Brave credentials, and downstream RHOAI 3.7 remain
+unverified.
+
 ### Codex behind the gateway's Basic auth
 
 The native Codex example has no `basic_auth` filter, so the client credential

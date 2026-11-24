@@ -760,6 +760,31 @@ mod tests {
     }
 
     #[test]
+    fn cached_only_search_is_inert_with_tool_choice_none() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": "hello",
+            "tools": [{"type": "web_search", "external_web_access": false}],
+            "tool_choice": "none"
+        }));
+        assert_eq!(mapped["tool_choice"], "none");
+    }
+
+    #[test]
+    fn cached_only_search_is_inert_when_a_client_function_is_forced() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": "hello",
+            "tools": [
+                {"type": "web_search", "external_web_access": false},
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+            ],
+            "tool_choice": {"type": "function", "name": "lookup"}
+        }));
+        assert_eq!(mapped["tool_choice"]["function"]["name"], "lookup");
+    }
+
+    #[test]
     fn web_search_function_name_collision_is_rejected() {
         let error = map_error(&json!({
             "model": "gpt-4o-mini",

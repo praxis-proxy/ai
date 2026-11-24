@@ -15,7 +15,7 @@ pub use echo::{
 };
 pub use scripted_http::{
     CapturedHttpRequest, HttpBackendEvent, HttpBackendGuard, HttpServerAction, start_scripted_http_backend,
-    start_scripted_http_backend_turns,
+    start_scripted_http_backend_turns, start_scripted_http_backend_with_final_response,
 };
 pub use simple::{
     Backend, CapturedRequest, ChunkedBackend, RoutedBackend, StatefulBackend, StatefulCapturingBackend,

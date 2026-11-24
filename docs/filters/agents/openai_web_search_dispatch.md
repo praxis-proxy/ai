@@ -9,6 +9,8 @@ Web search filter for model-driven `web_search_call` dispatch.
 
 Detects pending web search calls in the response phase and executes them on re-entry via the `iterative_request_router` agentic loop.
 
+An eligible search with `external_web_access: false` receives HTTP 400 because the configured providers offer live search. An omitted setting keeps the provider's default live behavior. Declaring a live search tool alone does not issue a provider request.
+
 Each provider request is executed through the shared filtered-subrequest executor, which enforces destination authority, DNS/SSRF, TLS/SNI, and `Host` centrally. An optional `outbound_chain` runs operator-managed cross-cutting filters (headers, credentials, logging) on the callout; when omitted it defaults to an empty inline chain (pure passthrough), so the central protections still apply.
 
 A client's web-search `filters.allowed_domains` and `filters.blocked_domains` are enforced by the proxy on every provider result, so a result outside the allow-list (or under a blocked domain) never reaches the model or `action.sources`. Malformed, unsupported, or conflicting `filters` are rejected with HTTP 400 before the first inference round whenever the request's `tool_choice` leaves a web-search tool eligible; a request that forbids every hosted search with `"none"` is not validated because no search can run. `filters` is accepted on every web-search tool type this filter executes, including the `web_search_preview` variants whose pinned schema does not declare it.

@@ -2489,6 +2489,39 @@ async fn preflight_ignores_null_and_empty_location_members() {
 }
 
 #[tokio::test]
+async fn preflight_rejects_cached_only_web_search() {
+    let yaml = make_filter_yaml("tavily", "tvly-test-key");
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "tools": [{"type": "web_search", "external_web_access": false}],
+        }),
+    )
+    .await;
+    assert!(matches!(action, FilterAction::Reject(_)), "got {action:?}");
+}
+
+#[tokio::test]
+async fn cached_only_declaration_with_tool_choice_none_can_reach_inference() {
+    let yaml = make_filter_yaml("tavily", "tvly-test-key");
+    let filter = WebSearchDispatchFilter::from_config(&yaml).unwrap();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "tool_choice": "none",
+            "tools": [{"type": "web_search", "external_web_access": false}],
+        }),
+    )
+    .await;
+    assert!(matches!(action, FilterAction::Continue), "got {action:?}");
+}
+
+#[tokio::test]
 async fn preflight_skips_when_no_user_location_is_declared() {
     // No `user_location` means nothing to translate or reject, even for Tavily.
     let filter = {
@@ -2500,7 +2533,7 @@ async fn preflight_skips_when_no_user_location_is_declared() {
         serde_json::json!({
             "model": "gpt-4o",
             "input": "hello",
-            "tools": [{"type": "web_search"}],
+            "tools": [{"type": "web_search", "external_web_access": true}],
         }),
     )
     .await;
