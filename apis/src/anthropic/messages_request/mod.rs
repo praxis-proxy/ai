@@ -82,6 +82,12 @@ const FILTER_NAME: &str = "anthropic_messages_request";
 /// state, survives `iterative_request_router` re-entry.
 pub(crate) const MCP_CONNECTOR_METADATA_KEY: &str = "anthropic_messages_request.mcp_connector";
 
+/// [`MCP_CONNECTOR_METADATA_KEY`] value once Praxis has resolved the connector.
+///
+/// `anthropic_mcp_connector` rewrites the connector into plain tools, so the
+/// backend no longer receives it and the protocol filter must not refuse it.
+pub(crate) const MCP_CONNECTOR_RESOLVED: &str = "resolved";
+
 /// Processes an Anthropic create-message body once and publishes its facts.
 ///
 /// The registry decides which operation this filter owns, so only

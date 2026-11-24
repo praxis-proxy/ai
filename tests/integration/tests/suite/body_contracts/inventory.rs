@@ -211,8 +211,24 @@ const REQUEST_MUTATORS: &[&str] = &[
     "openai_responses_to_chat_completions",
 ];
 
+/// Request mutators registered only by an opt-in experimental feature.
+const FEATURE_REQUEST_MUTATORS: &[(&str, bool)] = &[(
+    "anthropic_mcp_connector",
+    cfg!(feature = "anthropic-mcp-connector-filter"),
+)];
+
 fn covered_filters() -> BTreeSet<String> {
-    REQUEST_MUTATORS.iter().map(|name| (*name).to_owned()).collect()
+    REQUEST_MUTATORS
+        .iter()
+        .copied()
+        .chain(
+            FEATURE_REQUEST_MUTATORS
+                .iter()
+                .filter(|(_, enabled)| *enabled)
+                .map(|(name, _)| *name),
+        )
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The CI body-contract profile must exercise every audited mutator actively.
@@ -253,6 +269,11 @@ fn active_witnesses() -> BTreeSet<String> {
     let _ = super::mcp_broker_changes_only_the_routed_tool_name;
     let _ = super::anthropic_web_search_appends_only_messages_and_retains_tool_schemas;
     names.extend(["prompt_enrich", "ai_guardrails", "mcp", "anthropic_web_search"].map(str::to_owned));
+    #[cfg(feature = "anthropic-mcp-connector-filter")]
+    {
+        let _ = super::anthropic_mcp_connector_rewrites_only_tools_servers_and_messages;
+        names.insert("anthropic_mcp_connector".to_owned());
+    }
     names.extend(super::active::mutation_witnesses().into_iter().map(str::to_owned));
     let _ = super::super::inference_fixtures::all_inference_fixtures_preserve_retained_json_order;
     let _ = super::translations::every_translation_preserves_multiple_tools_and_nested_schema_order;

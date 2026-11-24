@@ -1884,6 +1884,7 @@ const DOC_CATEGORIES: &[(&str, &str, &str)] = &[
 
 /// Filters whose reader-facing category differs from their source category.
 const DOC_CATEGORY_OVERRIDES: &[(&str, &str)] = &[
+    ("anthropic_mcp_connector", "agents"),
     ("anthropic_web_search", "agents"),
     ("callout_credentials", "providers"),
     ("credential_inject", "providers"),
