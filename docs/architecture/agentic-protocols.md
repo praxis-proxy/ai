@@ -186,14 +186,17 @@ an in-flight handshake or forwarded call is never
 evicted or expired until that request completes, so one
 pair cannot end up on two backend sessions; when every
 mapping is in use, a call for a new pair fails with
-`session_capacity`. Evicted and expired sessions are
-terminated in the background with the credentials that
-created them, which the broker keeps in memory (marked
-sensitive) for the session's lifetime. At most 16 such
-terminations run at once; beyond that, and for sessions
-lost to a restart or reload, the backend's own idle
-expiry applies. Idle entries are swept on traffic, at
-most once per `idle_timeout_ms`.
+`session_capacity`. Idle time counts from the end of the
+last call that used the mapping. Evicted, expired, and
+credential-replaced sessions are terminated in the
+background with the credentials that created them, which
+the broker keeps in memory (marked sensitive) for the
+session's lifetime. Termination is best effort: at most 16
+run at once, and a session whose termination is skipped
+because all 16 are busy, fails, or is lost to a restart or
+reload is left to the backend's own idle expiry. Idle
+entries are swept on traffic, at most once per
+`idle_timeout_ms`.
 
 Running several broker replicas behind one gateway
 address is not supported yet: gateway sessions and their

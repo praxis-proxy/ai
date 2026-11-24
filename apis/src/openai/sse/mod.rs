@@ -28,9 +28,10 @@ pub(crate) use frame::{SseFrame, SseFrameParser, SseParseError};
 /// specification requires at end of stream, a final event without a
 /// terminating blank line is discarded.
 pub fn buffered_sse_event_data(body: &[u8]) -> Vec<Vec<u8>> {
-    // The limit covers the whole body, so the parser cannot overflow on input
-    // the caller already bounded.
-    let mut parser = SseFrameParser::new(body.len());
+    // The caller already bounded the body. The parser stores an `event:` value
+    // lossily decoded, and each invalid byte becomes a three-byte U+FFFD, so
+    // three times the body length covers any valid input.
+    let mut parser = SseFrameParser::new(body.len().saturating_mul(3));
     let frames = parser.parse_chunk(body).unwrap_or_default();
     frames.into_iter().map(|frame| frame.data).collect()
 }
@@ -64,6 +65,23 @@ mod buffered_tests {
             events,
             vec![b"first".to_vec()],
             "an event without a terminating blank line must be discarded"
+        );
+    }
+
+    #[test]
+    fn keeps_frames_when_invalid_event_bytes_expand() {
+        // SSE decodes the stream as UTF-8 with replacement (HTML §9.2.6), so
+        // each 0xFF in the event name grows to three bytes once stored.
+        let mut body = b"data: ok\n\nevent: ".to_vec();
+        body.extend([0xFF; 256]);
+        body.extend(b"\ndata: x\n\n");
+
+        let events = buffered_sse_event_data(&body);
+
+        assert_eq!(
+            events,
+            vec![b"ok".to_vec(), b"x".to_vec()],
+            "replacement expansion must not drop complete frames"
         );
     }
 }

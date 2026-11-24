@@ -523,15 +523,20 @@ impl McpBrokerFilter {
 
     /// Protocol version offered to the backend: the client's
     /// `MCP-Protocol-Version`, or the broker default when the header is absent.
-    /// A present but unsupported version is rejected with HTTP 400.
+    /// A present but unsupported or undecodable version is rejected with
+    /// HTTP 400.
     fn requested_backend_version(
         &self,
         ctx: &HttpFilterContext<'_>,
         envelope: &JsonRpcEnvelope,
     ) -> Result<&str, FilterAction> {
-        let Some(requested) = header_str(&ctx.request.headers, "mcp-protocol-version") else {
+        let Some(value) = ctx.request.headers.get("mcp-protocol-version") else {
             return Ok(self.default_version.as_str());
         };
+        // The raw bytes are not echoed back.
+        let requested = value
+            .to_str()
+            .map_err(|_invalid| unsupported_version_action(envelope, "", &self.supported_versions))?;
         self.supported_versions
             .iter()
             .find(|v| v.as_str() == requested)
@@ -862,7 +867,9 @@ impl HttpFilter for McpBrokerFilter {
         else {
             return;
         };
-        drop(slot);
+        if let Some(backend) = self.backend.as_ref() {
+            backend.store.release(&key, slot);
+        }
         if !answered
             && matches!(status, 502 | 504)
             && let Some(backend) = self.backend.as_ref()
@@ -987,7 +994,8 @@ impl BackendSessions {
     ) -> Result<(Option<Publish>, BackendInit), McpBackendError> {
         let _permit = tokio::time::timeout_at(callout.deadline.into(), slot.handshake_permit())
             .await
-            .map_err(|_elapsed| McpBackendError::Timeout)?;
+            .map_err(|_elapsed| McpBackendError::Timeout)?
+            .map_err(|_closed| McpBackendError::SessionClosed)?;
         let credential = credential_fingerprint(&callout.forwarded_headers);
         if let Some(init) = slot.current(&credential) {
             return Ok((None, init));
@@ -1088,8 +1096,12 @@ impl BackendSessions {
     }
 
     /// Best-effort termination of a backend session that will not be used.
+    ///
+    /// Runs with a fresh deadline: the handshake that failed may have used up
+    /// the request's.
     async fn abandon(&self, target: BackendTarget<'_>, init: &BackendInit, callout: &BackendCallout) {
-        if let Err(cleanup) = self.client.terminate(target, init, callout).await {
+        let cleanup = self.detached_callout(callout, callout.forwarded_headers.clone());
+        if let Err(cleanup) = self.client.terminate(target, init, &cleanup).await {
             debug!(reason = cleanup.reason(), "mcp backend session cleanup failed");
         }
     }

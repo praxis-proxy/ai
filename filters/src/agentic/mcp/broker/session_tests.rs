@@ -786,6 +786,26 @@ async fn unsupported_client_version_is_rejected_before_handshake() {
     );
 }
 
+#[tokio::test]
+async fn undecodable_client_version_is_rejected_before_handshake() {
+    let mock = Arc::new(MockBackend::default());
+    let filter = broker_with(Arc::clone(&mock));
+    let mut req = call_request(Some("gw-1"), None);
+    // RFC 9110 §5.5 allows obs-text bytes in a field value; `to_str` rejects them.
+    req.headers
+        .insert("mcp-protocol-version", HeaderValue::from_bytes(b"2025-\xff").unwrap());
+
+    let routed = route(&filter, &req, "weather_get_weather").await;
+
+    let (status, body) = rejection_json(&routed.action);
+    assert_eq!(status, 400, "a present but undecodable version must be HTTP 400");
+    assert_eq!(body["error"]["code"], -32022, "error must be unsupported version");
+    assert!(
+        mock.calls.lock().unwrap().is_empty(),
+        "no backend session may be created"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Failures
 // -----------------------------------------------------------------------------

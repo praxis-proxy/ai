@@ -115,12 +115,21 @@ struct SlotState {
 }
 
 /// One key's handshake serialization point and current session.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct SessionSlot {
-    /// Serializes handshakes; held across handshake I/O.
-    permit: tokio::sync::Mutex<()>,
+    /// Serializes handshakes: one permit, held across handshake I/O.
+    permit: tokio::sync::Semaphore,
     /// Session state; held only for short updates, never across I/O.
     state: Mutex<SlotState>,
+}
+
+impl Default for SessionSlot {
+    fn default() -> Self {
+        Self {
+            permit: tokio::sync::Semaphore::new(1),
+            state: Mutex::default(),
+        }
+    }
 }
 
 impl SessionSlot {
@@ -134,8 +143,8 @@ impl SessionSlot {
     }
 
     /// Wait for the handshake permit.
-    pub(crate) async fn handshake_permit(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.permit.lock().await
+    pub(crate) async fn handshake_permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::AcquireError> {
+        self.permit.acquire().await
     }
 
     /// Record that a handshake with `credential` started. Call while holding
@@ -321,6 +330,26 @@ impl BackendSessionStore {
             inner.retire(oldest.server, &entry);
         }
         true
+    }
+
+    /// Release a call's hold on `slot`. The idle interval of its entry starts
+    /// now, so a long call does not leave the session looking idle.
+    pub(crate) fn release(&self, key: &BackendSessionKey, slot: Arc<SessionSlot>) {
+        self.release_at(key, slot, Instant::now());
+    }
+
+    /// [`Self::release`] at a given instant.
+    fn release_at(&self, key: &BackendSessionKey, slot: Arc<SessionSlot>, now: Instant) {
+        let mut inner = self.lock();
+        if let Some(entry) = inner.entries.get_mut(key)
+            && Arc::ptr_eq(&entry.slot, &slot)
+        {
+            entry.last_used = now;
+        }
+        // Dropped under the map lock, so eviction never sees the entry idle
+        // with a stale timestamp.
+        drop(slot);
+        drop(inner);
     }
 
     /// Queue a session dropped outside the map (a credential change replaced
@@ -536,6 +565,22 @@ mod tests {
             Arc::ptr_eq(&held, &later),
             "a slot in use must outlive its idle timeout"
         );
+    }
+
+    #[test]
+    fn idle_interval_starts_when_the_last_call_releases() {
+        let store = BackendSessionStore::new(4, Duration::from_secs(10));
+        let start = Instant::now();
+        let held = store.slot_at(&key("g", 0), start).unwrap();
+        set(&held, bound("live"));
+        store.release_at(&key("g", 0), held, start + Duration::from_secs(20));
+        let later = store.slot_at(&key("g", 0), start + Duration::from_secs(25)).unwrap();
+        assert_eq!(
+            current_id(&later).as_deref(),
+            Some("live"),
+            "a session released 5s ago must not count as idle"
+        );
+        assert!(retired_ids(&store).is_empty(), "nothing may be retired");
     }
 
     #[test]
