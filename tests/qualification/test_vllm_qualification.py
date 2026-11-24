@@ -66,7 +66,7 @@ class QualificationTest(unittest.TestCase):
             evidence.write_text(json.dumps({"outcomes": [["verified file edit", "passed"]]}))
             output = Path(directory, "acceptance.json")
             env = {"GITHUB_RUN_ID": "17", "GITHUB_RUN_ATTEMPT": "2", "VLLM_GPU_MODEL": "checkpoint",
-                   "CODEX_VLLM_MODEL": "served", "VLLM_GPU_IMAGE": "image", "CODEX_TOOL_PARSER": "hermes",
+                   "CODEX_VLLM_MODEL": "served", "VLLM_GPU_IMAGE": "image", "CODEX_TOOL_CALL_PARSER": "hermes",
                    "CODEX_REASONING_PARSER": "deepseek_r1", "CODEX_NATIVE": "success",
                    "CODEX_NATIVE_EVIDENCE": str(evidence), "CODEX_TRANSLATED": "skipped"}
             with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
@@ -468,6 +468,35 @@ class QualificationTest(unittest.TestCase):
             self.assertEqual([case["status"] for case in result["cases"]], ["success", "failure"])
             wrong_attempt = qualification.acceptance(path, "success", 17, 3, "a" * 40, "Codex")
             self.assertEqual(wrong_attempt["status"], "unreported")
+
+    def test_codex_provenance_is_separate_from_full_suite_and_requires_current_run(self):
+        provenance = {
+            "codex_version": "0.170.0",
+            "backend": {
+                "model": "openai/gpt-oss-120b", "served_model_name": "gpt-oss-120b",
+                "vllm_image": "vllm-openai@sha256:" + "b" * 64,
+                "tool_call_parser": "openai", "reasoning_parser": "openai_gptoss",
+                "tensor_parallel_size": 1, "max_model_len": 32768,
+            },
+            "runner": {"instance_type": "p5.4xlarge"},
+            "filter_chains": {"codex_native": ["ai_operation", "openai_client_tool_compat"]},
+            "candidate": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codex-acceptance.json"
+            path.write_text(json.dumps({
+                "run_id": 17, "attempt": 2, "checkout_sha": "a" * 40,
+                "cases": [{"id": "codex_native", "status": "success"}],
+                "provenance": provenance,
+            }))
+            finished = qualification.finish(None, False, "success", "skipped", "skipped", "success",
+                                            17, 2, "https://example.test/run", "a" * 40, codex_raw=path)
+            self.assertEqual(finished["status"], "not_requested")
+            self.assertEqual(finished["suites"]["codex_acceptance"]["provenance"], provenance)
+            for run_id, attempt, sha in ((18, 2, "a" * 40), (17, 3, "a" * 40), (17, 2, "c" * 40)):
+                stale = qualification.acceptance(path, "success", run_id, attempt, sha, "Codex")
+                self.assertEqual(stale["status"], "unreported")
+                self.assertNotIn("provenance", stale)
 
     def test_pi_acceptance_is_reported_beside_the_other_clients(self):
         with tempfile.TemporaryDirectory() as directory:
