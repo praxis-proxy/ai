@@ -1,0 +1,36 @@
+listeners:
+  - name: proxy
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: model_to_header
+        header: X-Model
+
+      - filter: intelligent_route
+        overlay_file: tests/integration/fixtures/anthropic/chat-to-anthropic-overlay.json
+        model_header: X-Model
+        clusters: [anthropic-backend]
+        reload: {enabled: false}
+
+      - filter: openai_chat_completions_to_anthropic_stream
+        max_partial_event_bytes: 1048576
+        max_tool_blocks: 256
+
+      - filter: openai_chat_completions_to_anthropic
+        max_body_bytes: 1048576
+
+      - filter: credential_inject
+        credentials: []
+        projected_credential_mount_base: /tmp/praxis-hosted-anthropic
+
+      - filter: load_balancer
+        clusters:
+          - name: anthropic-backend
+            endpoints: ["api.anthropic.com:443"]
+            http:
+              authority: api.anthropic.com
+            tls:
+              sni: api.anthropic.com

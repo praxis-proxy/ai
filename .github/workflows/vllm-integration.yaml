@@ -82,8 +82,8 @@ on:
       run_codex_acceptance:
         description: >-
           Run pinned Codex through native Responses and translated Chat paths
-          against real Qwen3-8B. When run_live_vllm is false, this skips the
-          complete Responses SDK suite.
+          against Qwen3-8B by default. For a candidate checkpoint, set
+          codex_model and leave all other run_* inputs false.
         required: false
         default: false
         type: boolean
@@ -116,10 +116,61 @@ on:
       gpu_instance_type:
         description: >-
           Optional EC2 GPU instance-type override for transient capacity
-          shortages (for example, g5.2xlarge).
+          shortages or larger candidate models (for example, g5.2xlarge,
+          g6e.12xlarge, or p5.4xlarge).
         required: false
         default: g5.xlarge
         type: string
+      codex_model:
+        description: >-
+          Optional Hugging Face model ID override for vllm-gpu-codex-acceptance
+          (empty uses VLLM_GPU_MODEL, Qwen/Qwen3-8B; for example,
+          openai/gpt-oss-120b).
+        required: false
+        default: ""
+        type: string
+      codex_served_model_name:
+        description: >-
+          Slash-free served alias, required when codex_model is set
+          (for example, gpt-oss-120b). Otherwise defaults to qwen3-8b.
+        required: false
+        default: ""
+        type: string
+      codex_tool_call_parser:
+        description: >-
+          vLLM --tool-call-parser for vllm-gpu-codex-acceptance (use "openai"
+          for gpt-oss-120b, "none" to omit).
+        required: false
+        default: hermes
+        type: string
+      codex_reasoning_parser:
+        description: >-
+          vLLM --reasoning-parser for vllm-gpu-codex-acceptance (use
+          "openai_gptoss" for gpt-oss-120b, "none" to omit).
+        required: false
+        default: deepseek_r1
+        type: string
+      codex_tensor_parallel_size:
+        description: >-
+          vLLM --tensor-parallel-size for vllm-gpu-codex-acceptance (for
+          example, 1 on p5.4xlarge or 4 on g6e.12xlarge).
+        required: false
+        default: "1"
+        type: string
+      codex_max_model_len:
+        description: >-
+          vLLM --max-model-len for vllm-gpu-codex-acceptance (must exceed the
+          16000-token compaction window in codex_http.rs).
+        required: false
+        default: "16384"
+        type: string
+      codex_skip_translated:
+        description: >-
+          Skip the translated Chat Completions Codex step (runs native
+          apply_patch and compaction only).
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -1341,7 +1392,13 @@ jobs:
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
       CODEX_VERSION: "0.170.0"
-      CODEX_VLLM_MODEL: qwen3-8b
+      CODEX_CANDIDATE: >-
+        ${{ github.event_name == 'workflow_dispatch' && inputs.codex_model != '' }}
+      CODEX_VLLM_MODEL: ${{ inputs.codex_served_model_name || 'qwen3-8b' }}
+      CODEX_TOOL_CALL_PARSER: ${{ inputs.codex_tool_call_parser || 'hermes' }}
+      CODEX_REASONING_PARSER: ${{ inputs.codex_reasoning_parser || 'deepseek_r1' }}
+      CODEX_TENSOR_PARALLEL_SIZE: ${{ inputs.codex_tensor_parallel_size || '1' }}
+      CODEX_MAX_MODEL_LEN: ${{ inputs.codex_max_model_len || '16384' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1422,8 +1479,29 @@ jobs:
           echo "::add-mask::$token"
           echo "CODEX_BACKEND_TOKEN=$token" >> "$GITHUB_ENV"
 
+      - name: Resolve Codex candidate snapshot
+        if: env.CODEX_CANDIDATE == 'true'
+        env:
+          CODEX_MODEL: ${{ inputs.codex_model }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth=()
+          if [ -n "$HUGGING_FACE_HUB_TOKEN" ]; then
+            auth=(-H "Authorization: Bearer $HUGGING_FACE_HUB_TOKEN")
+          fi
+          revision=$(curl --fail --silent --show-error --retry 3 --max-time 30 \
+            "${auth[@]}" "https://huggingface.co/api/models/$CODEX_MODEL" | \
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["sha"])')
+          if ! [[ "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Hugging Face did not return a model commit SHA'
+            exit 1
+          fi
+          echo "CODEX_MODEL_REVISION=$revision" >> "$GITHUB_ENV"
+
       - name: Start keyed vLLM for Codex
         env:
+          CODEX_MODEL: ${{ inputs.codex_model || env.VLLM_GPU_MODEL }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -1433,9 +1511,33 @@ jobs:
           else
             gpu_args=(--gpus all)
           fi
+          if [ "$CODEX_TENSOR_PARALLEL_SIZE" -gt 1 ]; then
+            # Multi-GPU NCCL all-reduce needs more than the default 64 MiB /dev/shm.
+            gpu_args+=(--ipc=host)
+          fi
           cache_mount="$GPU_HF_CACHE_DIR:/root/.cache/huggingface"
           if [ "$CONTAINER_RUNTIME" = "podman" ]; then
             cache_mount="${cache_mount}:Z"
+          fi
+          vllm_args=(
+            --model "$CODEX_MODEL"
+            --served-model-name "$CODEX_VLLM_MODEL"
+            --max-model-len "$CODEX_MAX_MODEL_LEN"
+            --gpu-memory-utilization 0.9
+            --seed 0
+            --api-key "$CODEX_BACKEND_TOKEN"
+          )
+          if [ -n "${CODEX_MODEL_REVISION:-}" ]; then
+            vllm_args+=(--revision "$CODEX_MODEL_REVISION" --tokenizer-revision "$CODEX_MODEL_REVISION")
+          fi
+          if [ "$CODEX_TENSOR_PARALLEL_SIZE" -gt 1 ]; then
+            vllm_args+=(--tensor-parallel-size "$CODEX_TENSOR_PARALLEL_SIZE")
+          fi
+          if [ -n "$CODEX_TOOL_CALL_PARSER" ] && [ "$CODEX_TOOL_CALL_PARSER" != "none" ]; then
+            vllm_args+=(--enable-auto-tool-choice --tool-call-parser "$CODEX_TOOL_CALL_PARSER")
+          fi
+          if [ -n "$CODEX_REASONING_PARSER" ] && [ "$CODEX_REASONING_PARSER" != "none" ]; then
+            vllm_args+=(--reasoning-parser "$CODEX_REASONING_PARSER")
           fi
           mkdir -p "$GPU_HF_CACHE_DIR"
           "$CONTAINER_RUNTIME" pull "$VLLM_GPU_IMAGE"
@@ -1445,18 +1547,12 @@ jobs:
             -e HUGGING_FACE_HUB_TOKEN \
             -v "$cache_mount" \
             "$VLLM_GPU_IMAGE" \
-            --model "$VLLM_GPU_MODEL" \
-            --served-model-name "$CODEX_VLLM_MODEL" \
-            --max-model-len 16384 \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            --reasoning-parser deepseek_r1 \
-            --gpu-memory-utilization 0.9 \
-            --seed 0 \
-            --api-key "$CODEX_BACKEND_TOKEN"
+            "${vllm_args[@]}"
 
       - name: Preflight vLLM Responses and Chat Completions
         id: codex_vllm_preflight
+        env:
+          CODEX_SKIP_TRANSLATED: ${{ inputs.codex_skip_translated }}
         run: |
           set -euo pipefail
           deadline=$((SECONDS + 1200))
@@ -1478,9 +1574,15 @@ jobs:
           curl -sf -H "$auth" -H 'content-type: application/json' \
             -d "{\"model\":\"${CODEX_VLLM_MODEL}\",\"input\":\"reply ready /no_think\",\"max_output_tokens\":64}" \
             http://127.0.0.1:8000/v1/responses >/dev/null
-          curl -sf -H "$auth" -H 'content-type: application/json' \
-            -d "{\"model\":\"${CODEX_VLLM_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"reply ready\"}],\"max_tokens\":1}" \
-            http://127.0.0.1:8000/v1/chat/completions >/dev/null
+          if [ "${CODEX_SKIP_TRANSLATED:-false}" != "true" ]; then
+            chat_probe_tokens=1
+            if [ "$CODEX_CANDIDATE" = "true" ]; then
+              chat_probe_tokens=16
+            fi
+            curl -sf -H "$auth" -H 'content-type: application/json' \
+              -d "{\"model\":\"${CODEX_VLLM_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"reply ready\"}],\"max_tokens\":${chat_probe_tokens}}" \
+              http://127.0.0.1:8000/v1/chat/completions >/dev/null
+          fi
 
       - name: Build Praxis and Codex acceptance test
         run: |
@@ -1574,9 +1676,10 @@ jobs:
           PRAXIS_TEST_CODEX_LISTEN_ADDRESS: 10.201.0.1
           PRAXIS_TEST_CODEX_REQUIRE_LIVE: "1"
           PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+          PRAXIS_TEST_CODEX_CANDIDATE: ${{ env.CODEX_CANDIDATE }}
         run: |
           set -uo pipefail
-          sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+          sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION,PRAXIS_TEST_CODEX_CANDIDATE \
             "$TEST_BIN" \
             codex_http::pinned_codex_completes_native_vllm_apply_patch_workflow_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-native.log"
@@ -1589,7 +1692,7 @@ jobs:
 
       - name: Run Codex translated-Chat vLLM acceptance test (once, no retry)
         id: codex_translated
-        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && !inputs.run_compaction_only && !inputs.codex_skip_translated && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
@@ -1622,6 +1725,7 @@ jobs:
           PRAXIS_TEST_CODEX_LISTEN_ADDRESS: 10.201.0.1
           PRAXIS_TEST_CODEX_REQUIRE_LIVE: "1"
           PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+          PRAXIS_TEST_CODEX_CANDIDATE: ${{ env.CODEX_CANDIDATE }}
         run: |
           set -uo pipefail
           # Grow accepted context over many turns until Codex crosses its own
@@ -1630,7 +1734,7 @@ jobs:
           # test-local HTTP observer between Codex and Praxis captures the
           # compaction request on the wire; the egress namespace guarantees the
           # client's only route is Praxis.
-          sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+          sudo --preserve-env=PRAXIS_TEST_CODEX_BIN,PRAXIS_TEST_CODEX_VLLM_BASE_URL,PRAXIS_TEST_CODEX_VLLM_MODEL,PRAXIS_TEST_CODEX_DATABASE_URL,CODEX_BACKEND_TOKEN,PRAXIS_TEST_CODEX_NETNS,PRAXIS_TEST_CODEX_LISTEN_ADDRESS,PRAXIS_TEST_CODEX_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION,PRAXIS_TEST_CODEX_CANDIDATE \
             "$TEST_BIN" \
             codex_http::pinned_codex_compaction_crosses_context_window_over_http \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/codex-acceptance-compaction.log"
@@ -1676,17 +1780,55 @@ jobs:
           CODEX_NATIVE: ${{ steps.codex_native.outcome }}
           CODEX_TRANSLATED: ${{ steps.codex_translated.outcome }}
           CODEX_COMPACTION: ${{ steps.codex_compaction.outcome }}
+          CODEX_MODEL: ${{ inputs.codex_model || env.VLLM_GPU_MODEL }}
+          CODEX_GPU_INSTANCE_TYPE: >-
+            ${{ inputs.gpu_instance_type || env.GPU_INSTANCE_TYPE }}
         run: |
           python3 - "$RUNNER_TEMP/codex-acceptance.json" <<'PY'
           import json, os, pathlib, subprocess, sys
-          names = ("CODEX_NATIVE", "CODEX_TRANSLATED", "CODEX_COMPACTION")
+          cases = []
+          filter_chains = {}
+          missing_chains = []
+          prefix = "Codex acceptance filter chain: "
+          for path in ("native", "translated", "compaction"):
+              name = f"codex_{path}"
+              status = os.environ[name.upper()] or "unexecuted"
+              cases.append({"id": name, "status": status})
+              log = pathlib.Path(os.environ["RUNNER_TEMP"]) / f"codex-acceptance-{path}.log"
+              if log.is_file():
+                  with log.open(errors="replace") as lines:
+                      for line in lines:
+                          if line.startswith(prefix):
+                              filter_chains[name] = json.loads(line.removeprefix(prefix))
+                              break
+              if status == "success" and not filter_chains.get(name):
+                  missing_chains.append(name)
           data = {
               "run_id": int(os.environ["GITHUB_RUN_ID"]),
               "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
               "checkout_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-              "cases": [{"id": name.lower(), "status": os.environ[name] or "unexecuted"} for name in names],
+              "cases": cases,
+              "provenance": {
+                  "candidate": os.environ["CODEX_CANDIDATE"] == "true",
+                  "codex_version": os.environ["CODEX_VERSION"],
+                  "backend": {
+                      "model": os.environ["CODEX_MODEL"],
+                      "resolved_revision": os.environ.get("CODEX_MODEL_REVISION"),
+                      "served_model_name": os.environ["CODEX_VLLM_MODEL"],
+                      "vllm_image": os.environ["VLLM_GPU_IMAGE"],
+                      "tensor_parallel_size": int(os.environ["CODEX_TENSOR_PARALLEL_SIZE"]),
+                      "max_model_len": int(os.environ["CODEX_MAX_MODEL_LEN"]),
+                      "tool_call_parser": os.environ["CODEX_TOOL_CALL_PARSER"],
+                      "reasoning_parser": os.environ["CODEX_REASONING_PARSER"],
+                  },
+                  "runner": {"instance_type": os.environ["CODEX_GPU_INSTANCE_TYPE"],
+                             "name": os.environ.get("RUNNER_NAME")},
+                  "filter_chains": filter_chains,
+              },
           }
           pathlib.Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n")
+          if missing_chains:
+              sys.exit("Missing filter-chain evidence for: " + ", ".join(missing_chains))
           PY
 
       - name: Upload Codex acceptance results
@@ -2610,7 +2752,7 @@ jobs:
       github.event_name == 'schedule' ||
       (
         github.event_name == 'workflow_dispatch' &&
-        (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_codex_acceptance || inputs.run_opencode_acceptance || inputs.run_pi_acceptance || inputs.run_degradation_acceptance || inputs.run_compaction_only)
+        (inputs.run_live_vllm || inputs.run_claude_acceptance || inputs.run_codex_acceptance || inputs.run_opencode_acceptance || inputs.run_pi_acceptance || inputs.run_degradation_acceptance || inputs.run_compaction_only || inputs.codex_model != '')
       ) ||
       (
         github.event_name == 'pull_request' &&
@@ -2629,6 +2771,45 @@ jobs:
       ec2-instance-id: ${{ steps.start.outputs.ec2-instance-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate Codex dispatch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RUN_CODEX: ${{ inputs.run_codex_acceptance }}
+          RUN_LIVE: ${{ inputs.run_live_vllm }}
+          RUN_CLAUDE: ${{ inputs.run_claude_acceptance }}
+          RUN_OPENCODE: ${{ inputs.run_opencode_acceptance }}
+          RUN_PI: ${{ inputs.run_pi_acceptance }}
+          RUN_DEGRADATION: ${{ inputs.run_degradation_acceptance }}
+          RUN_COMPACTION_ONLY: ${{ inputs.run_compaction_only }}
+          CODEX_MODEL: ${{ inputs.codex_model }}
+          CODEX_VLLM_MODEL: ${{ inputs.codex_served_model_name }}
+          CODEX_TENSOR_PARALLEL_SIZE: ${{ inputs.codex_tensor_parallel_size || '1' }}
+          CODEX_MAX_MODEL_LEN: ${{ inputs.codex_max_model_len || '16384' }}
+        run: |
+          set -euo pipefail
+          alias_pattern='^[a-zA-Z0-9][a-zA-Z0-9._-]*$'
+          if [ -n "$CODEX_MODEL" ]; then
+            if [ "$RUN_CODEX" != true ] || [[ " $RUN_LIVE $RUN_CLAUDE $RUN_OPENCODE $RUN_PI $RUN_DEGRADATION $RUN_COMPACTION_ONLY " == *' true '* ]]; then
+              echo '::error::codex_model requires run_codex_acceptance=true and all other run_* inputs false' >&2
+              exit 1
+            fi
+            if ! [[ "$CODEX_MODEL" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]*$ && "$CODEX_VLLM_MODEL" =~ $alias_pattern ]]; then
+              echo '::error::Set codex_model to an org/checkpoint ID and codex_served_model_name to a slash-free alias' >&2
+              exit 1
+            fi
+          elif [ -n "$CODEX_VLLM_MODEL" ]; then
+            echo '::error::codex_served_model_name requires codex_model' >&2
+            exit 1
+          fi
+          if ! [[ "$CODEX_TENSOR_PARALLEL_SIZE" =~ ^[1-9][0-9]{0,8}$ ]]; then
+            echo '::error::codex_tensor_parallel_size must be a positive integer' >&2
+            exit 1
+          fi
+          if ! [[ "$CODEX_MAX_MODEL_LEN" =~ ^[1-9][0-9]{0,8}$ ]] || [ "$CODEX_MAX_MODEL_LEN" -le 16000 ]; then
+            echo '::error::codex_max_model_len must be an integer greater than the 16000-token Codex window' >&2
+            exit 1
+          fi
 
       - name: Start EC2 GPU runner
         id: start

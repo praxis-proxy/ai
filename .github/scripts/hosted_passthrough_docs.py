@@ -23,6 +23,7 @@ def render():
     workflow = (ROOT / WORKFLOW).read_text()
     suite = (ROOT / SUITE).read_text()
     cron = field(r'^\s+- cron: "([^"]+)"$', workflow)
+    anthropic_cron = field(r'^    - cron: "([^"]+ 1)"$', workflow)
     runner = field(r"^\s+runs-on: (\S+)$", workflow)
     secret = field(r"secrets\.([A-Z_]+)", workflow)
     artifact = field(r"^\s+name: (hosted-\S+-results)$", workflow)
@@ -96,6 +97,18 @@ for Bedrock Runtime.
 The check requires a completed Responses resource with output text.
 Tenant isolation and retries remain unqualified by this job. The separate [direct connectivity probe](../../.github/workflows/bedrock-runtime-smoke.yaml)
 exercises AWS credentials and inference independently of the gateway.
+
+## Anthropic Messages passthrough
+
+The Anthropic job runs on Mondays at cron `{anthropic_cron}` (UTC) and
+on manual dispatch. It uses the `ANTHROPIC_API_KEY` Actions secret and the
+[local gateway fixture](../../tests/integration/fixtures/anthropic/messages-live.yaml).
+The [SDK case](../../tests/integration/sdk/anthropic/test_official_anthropic_live.py)
+uses `claude-haiku-4-5-20251001` and API version `2023-06-01`. It makes at most two
+inference requests with a 64-token output cap per request and SDK retries
+disabled. It checks tool arguments, streamed tool-result continuation,
+completion, and usage. JUnit results are in `hosted-anthropic-passthrough-results`.
+A separate unknown-model request checks the native Anthropic 404 error.
 """
 
 
